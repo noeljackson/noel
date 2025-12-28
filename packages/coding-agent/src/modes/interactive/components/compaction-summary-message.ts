@@ -1,18 +1,17 @@
-import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
-import type { CompactionSummaryMessage } from "packages/coding-agent/src/core/messages.js";
+import { Box, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
+import type { CompactionSummaryMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 
 /**
  * Component that renders a compaction message with collapsed/expanded state.
- * Collapsed: shows "Context compacted from X tokens"
- * Expanded: shows the full summary rendered as markdown (like a user message)
+ * Uses same background color as hook messages for visual consistency.
  */
-export class CompactionSummaryMessageComponent extends Container {
+export class CompactionSummaryMessageComponent extends Box {
 	private expanded = false;
 	private message: CompactionSummaryMessage;
 
 	constructor(message: CompactionSummaryMessage) {
-		super();
+		super(1, 1, (t) => theme.bg("customMessageBg", t));
 		this.message = message;
 		this.updateDisplay();
 	}
@@ -25,26 +24,21 @@ export class CompactionSummaryMessageComponent extends Container {
 	private updateDisplay(): void {
 		this.clear();
 
+		const tokenStr = this.message.tokensBefore.toLocaleString();
+		const label = theme.fg("customMessageLabel", `\x1b[1m[compaction]\x1b[22m`);
+		this.addChild(new Text(label, 0, 0));
+		this.addChild(new Spacer(1));
+
 		if (this.expanded) {
-			// Show header + summary as markdown (like user message)
-			this.addChild(new Spacer(1));
-			const header = `**Context compacted from ${this.message.tokensBefore.toLocaleString()} tokens**\n\n`;
+			const header = `**Compacted from ${tokenStr} tokens**\n\n`;
 			this.addChild(
-				new Markdown(header + this.message.summary, 1, 1, getMarkdownTheme(), {
-					bgColor: (text: string) => theme.bg("userMessageBg", text),
-					color: (text: string) => theme.fg("userMessageText", text),
+				new Markdown(header + this.message.summary, 0, 0, getMarkdownTheme(), {
+					color: (text: string) => theme.fg("customMessageText", text),
 				}),
 			);
-			this.addChild(new Spacer(1));
 		} else {
-			// Collapsed: simple text in warning color with token count
-			const tokenStr = this.message.tokensBefore.toLocaleString();
 			this.addChild(
-				new Text(
-					theme.fg("warning", `Earlier messages compacted from ${tokenStr} tokens (ctrl+o to expand)`),
-					1,
-					1,
-				),
+				new Text(theme.fg("customMessageText", `Compacted from ${tokenStr} tokens (ctrl+o to expand)`), 0, 0),
 			);
 		}
 	}
