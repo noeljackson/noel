@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/noeljackson/pi/internal/agent"
+	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
 const (
@@ -172,12 +173,12 @@ drained:
 		output = appendStatus(output, "Command cancelled")
 	}
 	duration := time.Since(start).Milliseconds()
-	details, err := json.Marshal(map[string]interface{}{
-		"exit_code":    exitCode,
-		"stdout_bytes": stdoutBytes,
-		"stderr_bytes": stderrBytes,
-		"command":      args.Command,
-		"duration_ms":  duration,
+	details, err := toolcontract.MarshalDetails(toolcontract.BashDetails{
+		ExitCode:    exitCode,
+		StdoutBytes: stdoutBytes,
+		StderrBytes: stderrBytes,
+		Command:     args.Command,
+		DurationMS:  int(duration),
 	})
 	if err != nil {
 		return agent.ToolResult{}, err

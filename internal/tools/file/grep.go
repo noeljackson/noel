@@ -12,9 +12,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/noeljackson/pi/internal/agent"
+	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
 var grepSchema = json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"type":{"type":"string"},"output_mode":{"type":"string","enum":["content","files_with_matches","count"]},"head_limit":{"type":"integer"}},"required":["pattern"],"additionalProperties":false}`)
@@ -86,9 +88,12 @@ func (GrepTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 	if output == "" {
 		output = "No matches found"
 	}
-	return textResult(tc.CallID, truncateText(output, maxContentBytes), map[string]interface{}{
-		"path":        root,
-		"output_mode": args.OutputMode,
+	files, matches := grepStats(output, args.OutputMode)
+	return textResult(tc.CallID, truncateText(output, maxContentBytes), toolcontract.GrepDetails{
+		Pattern:    args.Pattern,
+		Files:      files,
+		Matches:    matches,
+		OutputMode: args.OutputMode,
 	}, false)
 }
 
@@ -307,6 +312,35 @@ func limitLines(text string, limit int) string {
 		return strings.Join(lines, "\n")
 	}
 	return strings.Join(lines[:limit], "\n")
+}
+
+func grepStats(output string, outputMode string) (int, int) {
+	if output == "" || output == "No matches found" {
+		return 0, 0
+	}
+	files := make(map[string]struct{})
+	matches := 0
+	for _, line := range strings.Split(strings.TrimRight(output, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		matches++
+		file := line
+		if outputMode == "content" || outputMode == "count" {
+			if index := strings.Index(line, ":"); index > 0 {
+				file = line[:index]
+			}
+		}
+		files[file] = struct{}{}
+		if outputMode == "count" {
+			if index := strings.LastIndex(line, ":"); index > 0 {
+				if count, err := strconv.Atoi(line[index+1:]); err == nil {
+					matches += count - 1
+				}
+			}
+		}
+	}
+	return len(files), matches
 }
 
 var _ agent.Tool = (*GrepTool)(nil)

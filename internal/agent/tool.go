@@ -24,6 +24,21 @@ type Tool interface {
 	Execute(ctx context.Context, input json.RawMessage, tc ToolCallContext) (ToolResult, error)
 }
 
+// ToolCardState describes the renderer-facing state for a tool execution card.
+type ToolCardState struct {
+	ID          string
+	Name        string
+	ArgsSummary string
+	Status      string
+	Body        []string
+	Err         string
+}
+
+// ToolRenderer can be implemented by tools that provide their own TUI card renderer.
+type ToolRenderer interface {
+	RenderCard(state ToolCardState, width int) string
+}
+
 // ToolCallContext describes execution context passed to every tool call.
 type ToolCallContext struct {
 	CallID   string

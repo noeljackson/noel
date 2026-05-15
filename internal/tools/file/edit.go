@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/noeljackson/pi/internal/agent"
+	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
 var editSchema = json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"],"additionalProperties":false}`)
@@ -79,8 +80,10 @@ func (EditTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 		}
 
 		replaceCount := 1
+		editsApplied := 1
 		if args.ReplaceAll {
 			replaceCount = -1
+			editsApplied = count
 		}
 		edited := strings.Replace(normalized, oldString, newString, replaceCount)
 		if edited == normalized {
@@ -92,10 +95,11 @@ func (EditTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 		}
 
 		diff := summarizeReplacement(oldString, newString, count, args.ReplaceAll)
-		details := map[string]interface{}{
-			"path":         path,
-			"replacements": count,
-			"diff":         diff,
+		details := toolcontract.EditDetails{
+			Path:         path,
+			EditsApplied: editsApplied,
+			BeforeLines:  lineCount(normalized),
+			AfterLines:   lineCount(edited),
 		}
 		result, err = textResult(tc.CallID, fmt.Sprintf("replaced %d occurrence(s) in %s\n%s", count, args.Path, diff), details, false)
 		return err

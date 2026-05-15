@@ -121,12 +121,16 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 			return assistant, nil
 		}
 
-		toolResultMessage := ToolResultMessage{Results: executeToolCalls(ctx, cfg.Tools, toolCalls, emit)}
+		toolResults := executeToolCalls(ctx, cfg.Tools, toolCalls, emit)
+		toolResultMessage := ToolResultMessage{Results: toolResults}
 		messages = append(messages, toolResultMessage)
 		if cfg.SessionWriter != nil {
 			if err := cfg.SessionWriter.AppendMessage(toolResultMessage); err != nil {
 				return nil, err
 			}
+		}
+		if hasTerminatingToolResult(toolResults) {
+			return assistant, nil
 		}
 	}
 
@@ -189,14 +193,18 @@ func lookupTool(registry ToolRegistry, name string) (Tool, bool) {
 
 func executeToolCall(ctx context.Context, tool Tool, call ToolUseContent, emit func(Event)) ToolResult {
 	emit(ToolExecutionStartEvent{CallID: call.ID, Name: call.Name, Input: call.Input})
-	result, err := tool.Execute(ctx, call.Input, ToolCallContext{
-		CallID: call.ID,
-		Cwd:    currentWorkingDirectory(),
-		OnUpdate: func(partial json.RawMessage) {
-			emit(ToolExecutionUpdateEvent{CallID: call.ID, Partial: partial})
-		},
-		Logger: slog.Default(),
-	})
+	input, err := ValidateAndCoerceToolArguments(tool.Schema(), call.Input)
+	var result ToolResult
+	if err == nil {
+		result, err = tool.Execute(ctx, input, ToolCallContext{
+			CallID: call.ID,
+			Cwd:    currentWorkingDirectory(),
+			OnUpdate: func(partial json.RawMessage) {
+				emit(ToolExecutionUpdateEvent{CallID: call.ID, Partial: partial})
+			},
+			Logger: slog.Default(),
+		})
+	}
 	if err != nil {
 		result = ToolResult{
 			ToolUseID: call.ID,
@@ -209,6 +217,15 @@ func executeToolCall(ctx context.Context, tool Tool, call ToolUseContent, emit f
 	}
 	emit(ToolExecutionEndEvent{CallID: call.ID, Result: result, Err: err})
 	return result
+}
+
+func hasTerminatingToolResult(results []ToolResult) bool {
+	for _, result := range results {
+		if result.Terminate {
+			return true
+		}
+	}
+	return false
 }
 
 func missingToolResult(call ToolUseContent) ToolResult {

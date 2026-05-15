@@ -13,9 +13,10 @@ import (
 	"strings"
 
 	"github.com/noeljackson/pi/internal/agent"
+	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
-var findSchema = json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"type":{"type":"string","enum":["f","d"]}},"required":["pattern"],"additionalProperties":false}`)
+var findSchema = json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"type":{"type":"string","enum":["f","d"]},"limit":{"type":"integer"}},"required":["pattern"],"additionalProperties":false}`)
 
 // FindTool finds files and directories by name.
 type FindTool struct{}
@@ -46,6 +47,7 @@ func (FindTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 		Pattern string `json:"pattern"`
 		Path    string `json:"path"`
 		Type    string `json:"type"`
+		Limit   int    `json:"limit"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return agent.ToolResult{}, err
@@ -55,6 +57,10 @@ func (FindTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 	}
 	if args.Type != "" && args.Type != "f" && args.Type != "d" {
 		return agent.ToolResult{}, fmt.Errorf("type must be f or d")
+	}
+	limit := args.Limit
+	if limit <= 0 {
+		limit = 1000
 	}
 	rootInput := args.Path
 	if rootInput == "" {
@@ -67,12 +73,17 @@ func (FindTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 		return agent.ToolResult{}, err
 	}
 	if len(results) == 0 {
-		return textResult(tc.CallID, "No files found matching pattern", nil, false)
+		return textResult(tc.CallID, "No files found matching pattern", toolcontract.FindDetails{
+			Pattern: args.Pattern,
+			Hits:    0,
+			Limit:   limit,
+		}, false)
 	}
 	sort.Strings(results)
-	return textResult(tc.CallID, strings.Join(results, "\n"), map[string]interface{}{
-		"path":    root,
-		"matches": len(results),
+	return textResult(tc.CallID, strings.Join(results, "\n"), toolcontract.FindDetails{
+		Pattern: args.Pattern,
+		Hits:    len(results),
+		Limit:   limit,
 	}, false)
 }
 

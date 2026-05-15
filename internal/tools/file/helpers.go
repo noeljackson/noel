@@ -1,10 +1,11 @@
 package file
 
 import (
-	"encoding/json"
 	"path/filepath"
+	"strings"
 
 	"github.com/noeljackson/pi/internal/agent"
+	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
 const maxContentBytes = 30 * 1024
@@ -19,14 +20,10 @@ func resolvePath(path string, cwd string) string {
 	return filepath.Clean(filepath.Join(cwd, path))
 }
 
-func textResult(callID string, text string, details map[string]interface{}, isError bool) (agent.ToolResult, error) {
-	var rawDetails json.RawMessage
-	if details != nil {
-		encoded, err := json.Marshal(details)
-		if err != nil {
-			return agent.ToolResult{}, err
-		}
-		rawDetails = encoded
+func textResult(callID string, text string, details interface{}, isError bool) (agent.ToolResult, error) {
+	rawDetails, err := toolcontract.MarshalDetails(details)
+	if err != nil {
+		return agent.ToolResult{}, err
 	}
 	return agent.ToolResult{
 		ToolUseID: callID,
@@ -46,4 +43,15 @@ func truncateText(text string, limit int) string {
 	}
 	start := len(text) - (limit - len(marker))
 	return marker + text[start:]
+}
+
+func lineCount(text string) int {
+	if text == "" {
+		return 0
+	}
+	count := strings.Count(text, "\n") + 1
+	if strings.HasSuffix(text, "\n") {
+		count--
+	}
+	return count
 }

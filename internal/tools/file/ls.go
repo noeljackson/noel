@@ -9,9 +9,10 @@ import (
 	"strings"
 
 	"github.com/noeljackson/pi/internal/agent"
+	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
-var lsSchema = json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"ignore":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}`)
+var lsSchema = json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"ignore":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"}},"additionalProperties":false}`)
 
 // LsTool lists directory entries.
 type LsTool struct{}
@@ -41,6 +42,7 @@ func (LsTool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolC
 	var args struct {
 		Path   string   `json:"path"`
 		Ignore []string `json:"ignore"`
+		Limit  int      `json:"limit"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return agent.ToolResult{}, err
@@ -76,9 +78,11 @@ func (LsTool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolC
 		return strings.ToLower(listed[i].name) < strings.ToLower(listed[j].name)
 	})
 
-	limit := 1000
-	truncated := len(listed) > limit
-	if truncated {
+	limit := args.Limit
+	if limit <= 0 {
+		limit = 1000
+	}
+	if len(listed) > limit {
 		listed = listed[:limit]
 	}
 	lines := make([]string, 0, len(listed))
@@ -92,11 +96,7 @@ func (LsTool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolC
 	if len(lines) == 0 {
 		lines = append(lines, "(empty directory)")
 	}
-	details := map[string]interface{}{
-		"path":      dir,
-		"entries":   len(lines),
-		"truncated": truncated,
-	}
+	details := toolcontract.LsDetails{Path: dir, Entries: len(lines), Limit: limit}
 	return textResult(tc.CallID, strings.Join(lines, "\n"), details, false)
 }
 
