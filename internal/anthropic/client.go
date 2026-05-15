@@ -3,7 +3,9 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 
 	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -12,13 +14,11 @@ import (
 )
 
 type Client struct {
-	client anthropicsdk.Client
+	auth AuthSource
 }
 
-func NewClient(apiKey string) *Client {
-	return &Client{
-		client: anthropicsdk.NewClient(option.WithAPIKey(apiKey)),
-	}
+func NewClient(auth AuthSource) *Client {
+	return &Client{auth: auth}
 }
 
 func (c *Client) Stream(ctx context.Context, req agent.StreamRequest, emit func(agent.Event)) (*agent.AssistantMessage, error) {
@@ -27,7 +27,12 @@ func (c *Client) Stream(ctx context.Context, req agent.StreamRequest, emit func(
 		return nil, err
 	}
 
-	stream := c.client.Messages.NewStreaming(ctx, params)
+	opts, err := c.requestOptions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client := anthropicsdk.NewClient(opts...)
+	stream := client.Messages.NewStreaming(ctx, params)
 	accumulated := anthropicsdk.Message{}
 	messageID := ""
 
@@ -77,6 +82,41 @@ func (c *Client) Stream(ctx context.Context, req agent.StreamRequest, emit func(
 
 	message := convertAssistantMessage(accumulated)
 	return &message, nil
+}
+
+func (c *Client) requestOptions(ctx context.Context) ([]option.RequestOption, error) {
+	if c.auth == nil {
+		return nil, errors.New("anthropic: missing auth source")
+	}
+	headers, err := c.auth.Headers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := []option.RequestOption{option.WithoutEnvironmentDefaults()}
+	if key, ok := apiKeyFromAuth(c.auth); ok {
+		return append(opts, option.WithAPIKey(key)), nil
+	}
+
+	for key, value := range headers {
+		if strings.EqualFold(key, "anthropic-beta") {
+			opts = append(opts, option.WithHeaderAdd(key, value))
+			continue
+		}
+		opts = append(opts, option.WithHeader(key, value))
+	}
+	return opts, nil
+}
+
+func apiKeyFromAuth(auth AuthSource) (string, bool) {
+	switch a := auth.(type) {
+	case APIKeyAuth:
+		return a.Key, true
+	case *APIKeyAuth:
+		return a.Key, true
+	default:
+		return "", false
+	}
 }
 
 func emitContentDelta(messageID string, event anthropicsdk.ContentBlockDeltaEvent, emit func(agent.Event)) {
