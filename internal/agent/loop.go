@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+
+	authstore "github.com/noeljackson/pi/internal/auth"
 )
 
 const defaultMaxTurns = 100
@@ -60,6 +62,7 @@ type LoopConfig struct {
 	MaxTurns      int
 	SessionWriter SessionWriter
 	Compactor     Compactor
+	AuthStore     *authstore.Store
 
 	PrepareNextTurn     func(ctx context.Context, messages []Message) (NextTurnDirective, error)
 	ShouldStopAfterTurn func(turn int, last *AssistantMessage) bool

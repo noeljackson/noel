@@ -1,0 +1,34 @@
+{
+  "models": [
+    {
+      "id": "claude-opus-4-7",
+      "provider": "anthropic",
+      "display": "Claude Opus 4.7",
+      "contextWindow": 200000,
+      "maxOutput": 8192,
+      "thinking": true,
+      "pricing": { "input": 15.0, "output": 75.0, "cacheRead": 1.5, "cacheWrite": 18.75 },
+      "aliases": ["opus"]
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "provider": "anthropic",
+      "display": "Claude Sonnet 4.6",
+      "contextWindow": 200000,
+      "maxOutput": 8192,
+      "thinking": true,
+      "pricing": { "input": 3.0, "output": 15.0, "cacheRead": 0.3, "cacheWrite": 3.75 },
+      "aliases": ["sonnet"]
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "provider": "anthropic",
+      "display": "Claude Haiku 4.5",
+      "contextWindow": 200000,
+      "maxOutput": 8192,
+      "thinking": true,
+      "pricing": { "input": 1.0, "output": 5.0, "cacheRead": 0.1, "cacheWrite": 1.25 },
+      "aliases": ["haiku"]
+    }
+  ]
+}

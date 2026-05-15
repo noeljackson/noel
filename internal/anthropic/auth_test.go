@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	authstore "github.com/noeljackson/pi/internal/auth"
 )
 
 func TestAPIKeyAuthHeaders(t *testing.T) {
@@ -83,6 +85,51 @@ func TestPickAuthUsesEnvAPIKey(t *testing.T) {
 	}
 	if apiKeyAuth.Key != "sk-ant-env" {
 		t.Fatalf("key = %q, want %q", apiKeyAuth.Key, "sk-ant-env")
+	}
+}
+
+func TestPickAuthWithStorePrefersStoredAPIKeyOverEnv(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+	store := authstore.New(filepath.Join(t.TempDir(), "auth.json"))
+	if err := store.Set("anthropic", authstore.ProviderAuth{Type: "api_key", Key: "sk-ant-stored"}); err != nil {
+		t.Fatal(err)
+	}
+
+	auth, err := PickAuthWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKeyAuth, ok := auth.(APIKeyAuth)
+	if !ok {
+		t.Fatalf("auth type = %T, want APIKeyAuth", auth)
+	}
+	if apiKeyAuth.Key != "sk-ant-stored" {
+		t.Fatalf("key = %q, want stored key", apiKeyAuth.Key)
+	}
+}
+
+func TestPickAuthWithStoreUsesStoredOAuthAfterEnv(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("HOME", t.TempDir())
+	store := authstore.New(filepath.Join(t.TempDir(), "auth.json"))
+	if err := store.Set("anthropic-oauth", authstore.ProviderAuth{
+		Type:        "oauth",
+		AccessToken: "stored-access",
+		ExpiresAt:   time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	auth, err := PickAuthWithStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := auth.(StoredOAuth)
+	if !ok {
+		t.Fatalf("auth type = %T, want StoredOAuth", auth)
+	}
+	if stored.AccessToken != "stored-access" {
+		t.Fatalf("access token = %q", stored.AccessToken)
 	}
 }
 
