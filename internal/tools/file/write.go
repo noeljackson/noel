@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/noeljackson/pi/internal/agent"
+	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
 var writeSchema = json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}`)
@@ -61,9 +62,10 @@ func (WriteTool) Execute(ctx context.Context, input json.RawMessage, tc agent.To
 			return err
 		}
 		var err error
-		result, err = textResult(tc.CallID, fmt.Sprintf("wrote %d bytes to %s", len(bytes), args.Path), map[string]interface{}{
-			"path":  path,
-			"bytes": len(bytes),
+		result, err = textResult(tc.CallID, fmt.Sprintf("wrote %d bytes to %s", len(bytes), args.Path), toolcontract.WriteDetails{
+			Path:  path,
+			Bytes: len(bytes),
+			Lines: lineCount(args.Content),
 		}, false)
 		return err
 	})

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/noeljackson/pi/internal/agent"
+	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
 const maxReadBytes = 10 * 1024 * 1024
@@ -98,7 +99,13 @@ func (ReadTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 		return agent.ToolResult{}, fmt.Errorf("offset %d is beyond end of file (%d lines total)", offset, len(lines))
 	}
 	if len(lines) == 0 {
-		return textResult(tc.CallID, "", nil, false)
+		return textResult(tc.CallID, "", toolcontract.ReadDetails{
+			Path:      path,
+			Lines:     0,
+			Bytes:     len(data),
+			Truncated: false,
+			StartLine: offset,
+		}, false)
 	}
 
 	start := offset - 1
@@ -114,11 +121,12 @@ func (ReadTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 		}
 		fmt.Fprintf(&builder, "%6d\t%s", i+1, lines[i])
 	}
-	return textResult(tc.CallID, builder.String(), map[string]interface{}{
-		"path":        path,
-		"offset":      offset,
-		"limit":       limit,
-		"total_lines": len(lines),
+	return textResult(tc.CallID, builder.String(), toolcontract.ReadDetails{
+		Path:      path,
+		Lines:     end - start,
+		Bytes:     len(data),
+		Truncated: end < len(lines),
+		StartLine: offset,
 	}, false)
 }
 

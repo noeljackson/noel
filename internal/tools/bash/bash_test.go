@@ -19,7 +19,7 @@ func TestBashExitCodePropagation(t *testing.T) {
 	}
 
 	var details struct {
-		ExitCode int `json:"exit_code"`
+		ExitCode int `json:"exitCode"`
 	}
 	if err := json.Unmarshal(result.Details, &details); err != nil {
 		t.Fatalf("unmarshal details: %v", err)
@@ -43,7 +43,7 @@ func TestBashTimeout(t *testing.T) {
 	}
 
 	var details struct {
-		ExitCode int `json:"exit_code"`
+		ExitCode int `json:"exitCode"`
 	}
 	if err := json.Unmarshal(result.Details, &details); err != nil {
 		t.Fatalf("unmarshal details: %v", err)

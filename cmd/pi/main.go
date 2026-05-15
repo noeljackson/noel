@@ -255,16 +255,20 @@ func newSessionStore() (*session.JSONLStore, error) {
 
 func builtinRegistry() (*tools.Registry, error) {
 	registry := tools.NewRegistry()
-	for _, tool := range []agent.Tool{
-		bash.NewTool(),
-		filetools.NewReadTool(),
-		filetools.NewWriteTool(),
-		filetools.NewEditTool(),
-		filetools.NewGrepTool(),
-		filetools.NewFindTool(),
-		filetools.NewLsTool(),
-	} {
-		if err := registry.Register(tool); err != nil {
+	registrations := []struct {
+		tool agent.Tool
+		sets []tools.ToolSet
+	}{
+		{tool: bash.NewTool(), sets: []tools.ToolSet{tools.ToolSetCoding}},
+		{tool: filetools.NewReadTool(), sets: []tools.ToolSet{tools.ToolSetReadOnly, tools.ToolSetCoding}},
+		{tool: filetools.NewWriteTool(), sets: []tools.ToolSet{tools.ToolSetCoding}},
+		{tool: filetools.NewEditTool(), sets: []tools.ToolSet{tools.ToolSetCoding}},
+		{tool: filetools.NewGrepTool(), sets: []tools.ToolSet{tools.ToolSetReadOnly, tools.ToolSetCoding}},
+		{tool: filetools.NewFindTool(), sets: []tools.ToolSet{tools.ToolSetReadOnly, tools.ToolSetCoding}},
+		{tool: filetools.NewLsTool(), sets: []tools.ToolSet{tools.ToolSetReadOnly, tools.ToolSetCoding}},
+	}
+	for _, registration := range registrations {
+		if err := registry.RegisterInSet(registration.tool, registration.sets...); err != nil {
 			return nil, err
 		}
 	}
