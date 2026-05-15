@@ -3,6 +3,7 @@ package file
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,7 +28,7 @@ func (LsTool) Name() string {
 }
 
 func (LsTool) Description() string {
-	return "List directory entries sorted with directories first."
+	return "List directory entries sorted alphabetically."
 }
 
 func (LsTool) Schema() json.RawMessage {
@@ -72,9 +73,6 @@ func (LsTool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolC
 		listed = append(listed, listedEntry{name: entry.Name(), isDir: entry.IsDir()})
 	}
 	sort.Slice(listed, func(i int, j int) bool {
-		if listed[i].isDir != listed[j].isDir {
-			return listed[i].isDir
-		}
 		return strings.ToLower(listed[i].name) < strings.ToLower(listed[j].name)
 	})
 
@@ -82,8 +80,11 @@ func (LsTool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolC
 	if limit <= 0 {
 		limit = 1000
 	}
+	total := len(listed)
+	truncated := false
 	if len(listed) > limit {
 		listed = listed[:limit]
+		truncated = true
 	}
 	lines := make([]string, 0, len(listed))
 	for _, entry := range listed {
@@ -96,7 +97,10 @@ func (LsTool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolC
 	if len(lines) == 0 {
 		lines = append(lines, "(empty directory)")
 	}
-	details := toolcontract.LsDetails{Path: dir, Entries: len(lines), Limit: limit}
+	if truncated {
+		lines = append(lines, fmt.Sprintf("(showing %d of %d entries)", len(listed), total))
+	}
+	details := toolcontract.LsDetails{Path: dir, Entries: len(listed), Limit: limit, Total: total, Truncated: truncated}
 	return textResult(tc.CallID, strings.Join(lines, "\n"), details, false)
 }
 

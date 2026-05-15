@@ -4,6 +4,8 @@ import "encoding/json"
 
 type BashDetails struct {
 	ExitCode    int    `json:"exitCode"`
+	Stdout      string `json:"stdout,omitempty"`
+	Stderr      string `json:"stderr,omitempty"`
 	StdoutBytes int    `json:"stdoutBytes"`
 	StderrBytes int    `json:"stderrBytes"`
 	Command     string `json:"command"`
@@ -34,27 +36,37 @@ type EditDetails struct {
 }
 
 type EditHunk struct {
-	OldText string `json:"oldText,omitempty"`
-	NewText string `json:"newText,omitempty"`
+	OldStart int    `json:"oldStart,omitempty"`
+	OldLines int    `json:"oldLines,omitempty"`
+	NewStart int    `json:"newStart,omitempty"`
+	NewLines int    `json:"newLines,omitempty"`
+	Method   string `json:"method,omitempty"`
+	Diff     string `json:"diff,omitempty"`
+	OldText  string `json:"oldText,omitempty"`
+	NewText  string `json:"newText,omitempty"`
 }
 
 type GrepDetails struct {
-	Pattern    string `json:"pattern"`
-	Files      int    `json:"files"`
-	Matches    int    `json:"matches"`
-	OutputMode string `json:"outputMode"`
+	Pattern    string   `json:"pattern,omitempty"`
+	Files      []string `json:"files,omitempty"`
+	Matches    int      `json:"matches"`
+	Truncated  bool     `json:"truncated"`
+	OutputMode string   `json:"outputMode"`
 }
 
 type FindDetails struct {
-	Pattern string `json:"pattern"`
-	Hits    int    `json:"hits"`
-	Limit   int    `json:"limit"`
+	Pattern   string `json:"pattern"`
+	Hits      int    `json:"hits"`
+	Limit     int    `json:"limit"`
+	Truncated bool   `json:"truncated"`
 }
 
 type LsDetails struct {
-	Path    string `json:"path"`
-	Entries int    `json:"entries"`
-	Limit   int    `json:"limit"`
+	Path      string `json:"path"`
+	Entries   int    `json:"entries"`
+	Limit     int    `json:"limit"`
+	Total     int    `json:"total,omitempty"`
+	Truncated bool   `json:"truncated"`
 }
 
 func MarshalDetails(details interface{}) (json.RawMessage, error) {

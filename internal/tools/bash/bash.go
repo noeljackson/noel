@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -15,11 +16,12 @@ import (
 )
 
 const (
-	defaultTimeout = 120000
-	maxOutputBytes = 30 * 1024
+	defaultTimeoutSeconds = 120
+	maxOutputBytes        = 50 * 1024
+	maxDetailBytes        = 4 * 1024
 )
 
-var bashSchema = json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer"},"cwd":{"type":"string"}},"required":["command"],"additionalProperties":false}`)
+var bashSchema = json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number"},"timeout_ms":{"type":"integer"},"cwd":{"type":"string"}},"required":["command"],"additionalProperties":false}`)
 
 // Tool executes bash commands.
 type Tool struct{}
@@ -47,9 +49,10 @@ func (Tool) ParallelSafe() bool {
 
 func (Tool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolCallContext) (agent.ToolResult, error) {
 	var args struct {
-		Command   string `json:"command"`
-		TimeoutMS int    `json:"timeout_ms"`
-		Cwd       string `json:"cwd"`
+		Command   string  `json:"command"`
+		Timeout   float64 `json:"timeout"`
+		TimeoutMS int     `json:"timeout_ms"`
+		Cwd       string  `json:"cwd"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return agent.ToolResult{}, err
@@ -57,9 +60,15 @@ func (Tool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolCal
 	if args.Command == "" {
 		return agent.ToolResult{}, fmt.Errorf("command is required")
 	}
-	timeout := args.TimeoutMS
+	timeout := time.Duration(args.Timeout * float64(time.Second))
+	timeoutLabel := fmt.Sprintf("%g", args.Timeout)
+	if args.Timeout <= 0 && args.TimeoutMS > 0 {
+		timeout = time.Duration(args.TimeoutMS) * time.Millisecond
+		timeoutLabel = fmt.Sprintf("%g", timeout.Seconds())
+	}
 	if timeout <= 0 {
-		timeout = defaultTimeout
+		timeout = defaultTimeoutSeconds * time.Second
+		timeoutLabel = fmt.Sprintf("%d", defaultTimeoutSeconds)
 	}
 	cwd := tc.Cwd
 	if args.Cwd != "" {
@@ -86,12 +95,14 @@ func (Tool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolCal
 		waitCh <- cmd.Wait()
 	}()
 
-	timer := time.NewTimer(time.Duration(timeout) * time.Millisecond)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 
 	var combined bytes.Buffer
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
 	var pendingStdout bytes.Buffer
 	var pendingStderr bytes.Buffer
 	stdoutBytes := 0
@@ -125,9 +136,11 @@ func (Tool) Execute(ctx context.Context, input json.RawMessage, tc agent.ToolCal
 		combined.Write(chunk.data)
 		if chunk.stream == "stdout" {
 			stdoutBytes += len(chunk.data)
+			stdout.Write(chunk.data)
 			pendingStdout.Write(chunk.data)
 		} else {
 			stderrBytes += len(chunk.data)
+			stderr.Write(chunk.data)
 			pendingStderr.Write(chunk.data)
 		}
 	}
@@ -167,18 +180,30 @@ drained:
 	emit(&exitCode)
 
 	output := truncateOutput(combined.String())
+	outputFile := ""
+	if output != combined.String() {
+		var outputErr error
+		outputFile, outputErr = writeFullOutput(combined.Bytes())
+		if outputErr != nil {
+			return agent.ToolResult{}, outputErr
+		}
+		output = appendStatus(output, fmt.Sprintf("[Full output: %s]", outputFile))
+	}
 	if timedOut {
-		output = appendStatus(output, fmt.Sprintf("Command timed out after %dms", timeout))
+		output = appendStatus(output, fmt.Sprintf("Command timed out after %s seconds", timeoutLabel))
 	} else if cancelled {
 		output = appendStatus(output, "Command cancelled")
 	}
 	duration := time.Since(start).Milliseconds()
 	details, err := toolcontract.MarshalDetails(toolcontract.BashDetails{
 		ExitCode:    exitCode,
+		Stdout:      tailString(stdout.String(), maxDetailBytes),
+		Stderr:      tailString(stderr.String(), maxDetailBytes),
 		StdoutBytes: stdoutBytes,
 		StderrBytes: stderrBytes,
 		Command:     args.Command,
 		DurationMS:  int(duration),
+		OutputFile:  outputFile,
 	})
 	if err != nil {
 		return agent.ToolResult{}, err
@@ -247,6 +272,35 @@ func appendStatus(text string, status string) string {
 		return status
 	}
 	return text + "\n\n" + status
+}
+
+func writeFullOutput(data []byte) (string, error) {
+	file, err := os.CreateTemp("", "pi-bash-*.log")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+func tailString(text string, limit int) string {
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	start := len(text) - limit
+	for start < len(text) && (text[start]&0xc0) == 0x80 {
+		start++
+	}
+	return text[start:]
 }
 
 var _ agent.Tool = (*Tool)(nil)

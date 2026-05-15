@@ -16,7 +16,7 @@ import (
 	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
-var findSchema = json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"type":{"type":"string","enum":["f","d"]},"limit":{"type":"integer"}},"required":["pattern"],"additionalProperties":false}`)
+var findSchema = json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"type":{"type":"string","enum":["f","d","l"]},"limit":{"type":"integer"}},"required":["pattern"],"additionalProperties":false}`)
 
 // FindTool finds files and directories by name.
 type FindTool struct{}
@@ -55,8 +55,8 @@ func (FindTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 	if args.Pattern == "" {
 		return agent.ToolResult{}, fmt.Errorf("pattern is required")
 	}
-	if args.Type != "" && args.Type != "f" && args.Type != "d" {
-		return agent.ToolResult{}, fmt.Errorf("type must be f or d")
+	if args.Type != "" && args.Type != "f" && args.Type != "d" && args.Type != "l" {
+		return agent.ToolResult{}, fmt.Errorf("type must be f, d, or l")
 	}
 	limit := args.Limit
 	if limit <= 0 {
@@ -68,7 +68,7 @@ func (FindTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 	}
 	root := resolvePath(rootInput, tc.Cwd)
 
-	results, err := runFind(ctx, root, args.Pattern, args.Type)
+	results, err := runFind(ctx, root, args.Pattern, args.Type, limit)
 	if err != nil {
 		return agent.ToolResult{}, err
 	}
@@ -80,17 +80,23 @@ func (FindTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 		}, false)
 	}
 	sort.Strings(results)
-	return textResult(tc.CallID, strings.Join(results, "\n"), toolcontract.FindDetails{
-		Pattern: args.Pattern,
-		Hits:    len(results),
-		Limit:   limit,
+	truncated := len(results) >= limit
+	output := strings.Join(results, "\n")
+	if truncated {
+		output += fmt.Sprintf("\n\n[%d results limit reached. Use limit=%d for more, or refine pattern]", limit, limit*2)
+	}
+	return textResult(tc.CallID, output, toolcontract.FindDetails{
+		Pattern:   args.Pattern,
+		Hits:      len(results),
+		Limit:     limit,
+		Truncated: truncated,
 	}, false)
 }
 
-func runFind(ctx context.Context, root string, pattern string, entryType string) ([]string, error) {
+func runFind(ctx context.Context, root string, pattern string, entryType string, limit int) ([]string, error) {
 	fdPath, err := exec.LookPath("fd")
 	if err == nil {
-		args := []string{"--color=never", "--hidden"}
+		args := []string{"--glob", "--color=never", "--hidden", "--max-results", fmt.Sprint(limit)}
 		if entryType != "" {
 			args = append(args, "--type", entryType)
 		}
@@ -112,12 +118,12 @@ func runFind(ctx context.Context, root string, pattern string, entryType string)
 				return nil, fmt.Errorf("fd failed: %s", message)
 			}
 		}
-		return parseFindOutput(root, stdout.Bytes()), nil
+		return parseFindOutput(root, stdout.Bytes(), entryType), nil
 	}
-	return walkFind(ctx, root, pattern, entryType)
+	return walkFind(ctx, root, pattern, entryType, limit)
 }
 
-func parseFindOutput(root string, output []byte) []string {
+func parseFindOutput(root string, output []byte, entryType string) []string {
 	scanner := bufio.NewScanner(bytes.NewReader(output))
 	results := []string{}
 	for scanner.Scan() {
@@ -129,12 +135,15 @@ func parseFindOutput(root string, output []byte) []string {
 		if rel, err := filepath.Rel(root, line); err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			line = rel
 		}
+		if entryType == "d" && !strings.HasSuffix(line, string(filepath.Separator)) && !strings.HasSuffix(line, "/") {
+			line += string(filepath.Separator)
+		}
 		results = append(results, filepath.ToSlash(line))
 	}
 	return results
 }
 
-func walkFind(ctx context.Context, root string, pattern string, entryType string) ([]string, error) {
+func walkFind(ctx context.Context, root string, pattern string, entryType string, limit int) ([]string, error) {
 	results := []string{}
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -149,10 +158,18 @@ func walkFind(ctx context.Context, root string, pattern string, entryType string
 		if entry.Name() == ".git" && entry.IsDir() {
 			return filepath.SkipDir
 		}
-		if entryType == "f" && entry.IsDir() {
+		entryInfo, infoErr := entry.Info()
+		isSymlink := entry.Type()&os.ModeSymlink != 0
+		if infoErr == nil {
+			isSymlink = entryInfo.Mode()&os.ModeSymlink != 0
+		}
+		if entryType == "f" && (entry.IsDir() || isSymlink) {
 			return nil
 		}
 		if entryType == "d" && !entry.IsDir() {
+			return nil
+		}
+		if entryType == "l" && !isSymlink {
 			return nil
 		}
 		if !nameMatches(pattern, entry.Name()) {
@@ -166,6 +183,9 @@ func walkFind(ctx context.Context, root string, pattern string, entryType string
 			rel += string(filepath.Separator)
 		}
 		results = append(results, filepath.ToSlash(rel))
+		if len(results) >= limit {
+			return filepath.SkipAll
+		}
 		return nil
 	})
 	return results, err

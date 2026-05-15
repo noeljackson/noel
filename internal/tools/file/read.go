@@ -5,18 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/noeljackson/pi/internal/agent"
 	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
-const maxReadBytes = 10 * 1024 * 1024
-
 var readSchema = json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"],"additionalProperties":false}`)
 
-// ReadTool reads text files with line-numbered output.
+// ReadTool reads text files and supported images.
 type ReadTool struct{}
 
 // NewReadTool returns a read tool.
@@ -29,7 +26,7 @@ func (ReadTool) Name() string {
 }
 
 func (ReadTool) Description() string {
-	return "Read a text file with line numbers. Supports offset and limit for line ranges."
+	return "Read a file. Supports text plus jpg, png, gif, and webp images."
 }
 
 func (ReadTool) Schema() json.RawMessage {
@@ -56,10 +53,6 @@ func (ReadTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 		return agent.ToolResult{}, err
 	}
 
-	if isImagePath(args.Path) {
-		return agent.ToolResult{}, fmt.Errorf("image files are not supported by read")
-	}
-
 	path := resolvePath(args.Path, tc.Cwd)
 	info, err := os.Stat(path)
 	if err != nil {
@@ -67,9 +60,6 @@ func (ReadTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 	}
 	if info.IsDir() {
 		return agent.ToolResult{}, fmt.Errorf("not a file: %s", path)
-	}
-	if info.Size() > maxReadBytes {
-		return agent.ToolResult{}, fmt.Errorf("file is too large: %d bytes exceeds %d bytes", info.Size(), maxReadBytes)
 	}
 
 	data, err := os.ReadFile(path)
@@ -79,11 +69,34 @@ func (ReadTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 	if err := ctx.Err(); err != nil {
 		return agent.ToolResult{}, err
 	}
+	if mime := detectImageMime(path, data); mime != "" {
+		if !modelSupportsImages(tc.Model) {
+			return textResult(tc.CallID, fmt.Sprintf("[image: %s, %d bytes — current model doesn't accept images]", path, len(data)), toolcontract.ReadDetails{
+				Path:  path,
+				Bytes: len(data),
+			}, false)
+		}
+		imageData, mediaType, _ := resizeImageIfNeeded(data, mime)
+		payload := imageContent(imageData, mediaType)
+		rawDetails, err := toolcontract.MarshalDetails(toolcontract.ReadDetails{
+			Path:  path,
+			Bytes: len(data),
+		})
+		if err != nil {
+			return agent.ToolResult{}, err
+		}
+		return agent.ToolResult{
+			ToolUseID: tc.CallID,
+			Content: []agent.Content{agent.ImageContent{Source: agent.ImageSource{
+				Type:      "base64",
+				MediaType: payload.MediaType,
+				Data:      payload.Data,
+			}}},
+			Details: rawDetails,
+		}, nil
+	}
 
 	limit := args.Limit
-	if limit <= 0 {
-		limit = 2000
-	}
 	offset := args.Offset
 	if offset <= 0 {
 		offset = 1
@@ -92,51 +105,52 @@ func (ReadTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
 	lines := strings.Split(text, "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
+	if offset > len(lines) {
+		return agent.ToolResult{}, fmt.Errorf("Offset %d is beyond end of file (%d lines total)", args.Offset, len(lines))
 	}
-	if offset > len(lines) && len(lines) > 0 {
-		return agent.ToolResult{}, fmt.Errorf("offset %d is beyond end of file (%d lines total)", offset, len(lines))
-	}
-	if len(lines) == 0 {
-		return textResult(tc.CallID, "", toolcontract.ReadDetails{
-			Path:      path,
-			Lines:     0,
-			Bytes:     len(data),
-			Truncated: false,
-			StartLine: offset,
-		}, false)
-	}
-
 	start := offset - 1
-	end := start + limit
-	if end > len(lines) {
-		end = len(lines)
+	selected := lines[start:]
+	userLimitedLines := 0
+	if limit > 0 {
+		end := start + limit
+		if end > len(lines) {
+			end = len(lines)
+		}
+		selected = lines[start:end]
+		userLimitedLines = end - start
 	}
 
-	var builder strings.Builder
-	for i := start; i < end; i++ {
-		if builder.Len() > 0 {
-			builder.WriteByte('\n')
+	truncation := truncateHead(strings.Join(selected, "\n"), defaultMaxLines, defaultMaxBytes)
+	startLineDisplay := start + 1
+	output := truncation.Content
+	truncated := truncation.Truncated
+	if truncation.FirstLineExceedsLimit {
+		firstLineSize := formatSize(len([]byte(lines[start])))
+		output = fmt.Sprintf("[Line %d is %s, exceeds %s limit. Use bash: sed -n '%dp' %s | head -c %d]", startLineDisplay, firstLineSize, formatSize(defaultMaxBytes), startLineDisplay, args.Path, defaultMaxBytes)
+	} else if truncation.Truncated {
+		endLineDisplay := startLineDisplay + truncation.OutputLines - 1
+		nextOffset := endLineDisplay + 1
+		if truncation.TruncatedBy == "lines" {
+			output += fmt.Sprintf("\n\n[Showing lines %d-%d of %d. Use offset=%d to continue.]", startLineDisplay, endLineDisplay, len(lines), nextOffset)
+		} else {
+			output += fmt.Sprintf("\n\n[Showing lines %d-%d of %d (%s limit). Use offset=%d to continue.]", startLineDisplay, endLineDisplay, len(lines), formatSize(defaultMaxBytes), nextOffset)
 		}
-		fmt.Fprintf(&builder, "%6d\t%s", i+1, lines[i])
+	} else if userLimitedLines > 0 && start+userLimitedLines < len(lines) {
+		remaining := len(lines) - (start + userLimitedLines)
+		nextOffset := start + userLimitedLines + 1
+		output += fmt.Sprintf("\n\n[%d more lines in file. Use offset=%d to continue.]", remaining, nextOffset)
 	}
-	return textResult(tc.CallID, builder.String(), toolcontract.ReadDetails{
+	return textResult(tc.CallID, output, toolcontract.ReadDetails{
 		Path:      path,
-		Lines:     end - start,
+		Lines:     truncation.OutputLines,
 		Bytes:     len(data),
-		Truncated: end < len(lines),
+		Truncated: truncated,
 		StartLine: offset,
 	}, false)
 }
 
-func isImagePath(path string) bool {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico", ".avif":
-		return true
-	default:
-		return false
-	}
+func modelSupportsImages(model string) bool {
+	return !strings.Contains(strings.ToLower(model), "text-only")
 }
 
 var _ agent.Tool = (*ReadTool)(nil)
