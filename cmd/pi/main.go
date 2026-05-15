@@ -151,7 +151,7 @@ func runTUI(resumeID string) error {
 	})
 
 	programDone := make(chan error, 1)
-	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithContext(rootCtx))
+	program := tea.NewProgram(model, tea.WithContext(rootCtx))
 	go func() {
 		_, err := program.Run()
 		programDone <- err
