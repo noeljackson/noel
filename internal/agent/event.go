@@ -45,9 +45,12 @@ type MessageUpdateEvent struct {
 
 // MessageDelta describes incremental message content.
 type MessageDelta struct {
-	TextDelta     string
-	ThinkingDelta string
-	ToolUseDelta  *ToolUseDelta
+	TextDelta             string
+	ThinkingDelta         string
+	SignatureDelta        string
+	RedactedThinkingDelta string
+	Usage                 *Usage
+	ToolUseDelta          *ToolUseDelta
 }
 
 // ToolUseDelta describes incremental tool-use content.
