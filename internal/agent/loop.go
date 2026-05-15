@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+
+	"github.com/noeljackson/pi/internal/session/schema"
 )
 
 const defaultMaxTurns = 100
@@ -51,15 +53,16 @@ type Compactor interface {
 }
 
 type LoopConfig struct {
-	Provider      Provider
-	Tools         ToolRegistry
-	Model         string
-	Thinking      string
-	System        string
-	MaxTokens     int
-	MaxTurns      int
-	SessionWriter SessionWriter
-	Compactor     Compactor
+	Provider         Provider
+	Tools            ToolRegistry
+	Model            string
+	Thinking         string
+	System           string
+	MaxTokens        int
+	MaxTurns         int
+	SessionWriter    SessionWriter
+	Compactor        Compactor
+	BranchSummarizer schema.BranchSummarizer
 
 	PrepareNextTurn     func(ctx context.Context, messages []Message) (NextTurnDirective, error)
 	ShouldStopAfterTurn func(turn int, last *AssistantMessage) bool
