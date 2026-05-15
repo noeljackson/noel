@@ -17,11 +17,33 @@ type Provider interface {
 }
 
 type StreamRequest struct {
-	Model     string
-	Messages  []Message
-	System    string
-	Tools     []Tool
-	MaxTokens int
+	Model       string
+	Messages    []Message
+	System      string
+	Tools       []Tool
+	MaxTokens   int
+	Thinking    *ThinkingConfig
+	Metadata    map[string]string
+	ToolChoice  *ToolChoice
+	Temperature *float64
+	// FineGrainedToolStreaming asks Anthropic for legacy fine-grained tool input
+	// deltas when eager_input_streaming is not available.
+	FineGrainedToolStreaming bool
+}
+
+// ThinkingConfig describes provider reasoning controls.
+type ThinkingConfig struct {
+	Enabled      bool
+	Adaptive     bool
+	BudgetTokens int
+	Display      string
+	Effort       string
+}
+
+// ToolChoice describes provider tool selection controls.
+type ToolChoice struct {
+	Type string
+	Name string
 }
 
 type Compactor interface {
