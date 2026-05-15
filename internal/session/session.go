@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,9 @@ type Session struct {
 
 	cwd       string
 	createdAt time.Time
+	leafID    string
+	labels    map[string]string
+	name      string
 
 	records             []Record
 	byID                map[string]Record
@@ -56,10 +60,16 @@ func newSession(id string, path string, currentTurnPath string, file *os.File, r
 		file:               file,
 		records:            make([]Record, 0, len(records)),
 		byID:               make(map[string]Record, len(records)),
+		labels:             make(map[string]string),
 		activeStreamModels: make(map[string]string),
 	}
 	for _, record := range records {
 		session.indexRecord(record)
+	}
+	if len(records) > 0 && records[0].Type == RecordTypeSessionHeader {
+		if header, ok := decodeSessionHeader(records[0]); ok && header.LeafID != "" {
+			session.leafID = header.LeafID
+		}
 	}
 	return session
 }
@@ -73,7 +83,75 @@ func (s *Session) ID() string {
 func (s *Session) AppendMessage(message agent.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.appendMessageLocked(message, s.lastRecordID)
+	return s.appendMessageLocked(message, s.leafID)
+}
+
+// AppendThinkingChange appends a thinking-level change record.
+func (s *Session) AppendThinkingChange(level string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendRecordLocked(RecordTypeThinkingChange, thinkingChangePayload{ThinkingLevel: level}, s.leafID)
+}
+
+// AppendModelChange appends a model change record.
+func (s *Session) AppendModelChange(model, provider, api, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendRecordLocked(RecordTypeModelChange, modelChangePayload{
+		Model:    model,
+		ModelID:  model,
+		Provider: provider,
+		API:      api,
+		Reason:   reason,
+	}, s.leafID)
+}
+
+// AppendLabel appends or clears a label for a session entry.
+func (s *Session) AppendLabel(leafID, label string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if leafID != "" {
+		if _, ok := s.byID[leafID]; !ok {
+			return fmt.Errorf("entry %s not found", leafID)
+		}
+	}
+	return s.appendRecordLocked(RecordTypeLabel, labelPayload{TargetID: leafID, Label: label}, s.leafID)
+}
+
+// AppendSessionName appends the session display name.
+func (s *Session) AppendSessionName(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendRecordLocked(RecordTypeSessionName, sessionNamePayload{Name: strings.TrimSpace(name)}, s.leafID)
+}
+
+// AppendCustomEntry appends an app-defined session entry.
+func (s *Session) AppendCustomEntry(kind string, data json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendRecordLocked(RecordTypeCustomEntry, customEntryPayload{Kind: kind, Data: data}, s.leafID)
+}
+
+// AppendCustomMessage appends an app-defined message entry.
+func (s *Session) AppendCustomMessage(message agent.CustomMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	payload, err := customMessageToPayload(message)
+	if err != nil {
+		return err
+	}
+	return s.appendRawPayloadRecordLocked(RecordTypeCustomMessage, payload, s.leafID)
+}
+
+// AppendBashExecution appends a shell execution message entry.
+func (s *Session) AppendBashExecution(message agent.BashExecutionMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	payload, err := encodeMessagePayload(message)
+	if err != nil {
+		return err
+	}
+	return s.appendRawPayloadRecordLocked(RecordTypeBashExecution, payload, s.leafID)
 }
 
 // AppendRunState appends opaque run state.
@@ -132,12 +210,57 @@ func (s *Session) ClearCurrentTurn() error {
 	return s.clearCurrentTurnLocked()
 }
 
-// Messages reconstructs persisted messages from the JSONL record stream.
+// Messages reconstructs persisted messages from the current branch.
 func (s *Session) Messages() ([]agent.Message, error) {
-	records, _, _, err := loadRecords(s.path)
+	records, err := s.PathToCurrentLeaf()
 	if err != nil {
 		return nil, err
 	}
+	return messagesFromRecords(records)
+}
+
+// PathToLeaf returns the record chain from the root to leafID.
+func (s *Session) PathToLeaf(leafID string) ([]Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pathToLeafLocked(leafID)
+}
+
+// PathToCurrentLeaf returns the record chain for the current branch leaf.
+func (s *Session) PathToCurrentLeaf() ([]Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pathToLeafLocked(s.leafID)
+}
+
+func (s *Session) pathToLeafLocked(leafID string) ([]Record, error) {
+	if leafID == "" {
+		return nil, nil
+	}
+	path := make([]Record, 0)
+	seen := make(map[string]struct{})
+	currentID := leafID
+	for currentID != "" {
+		if _, ok := seen[currentID]; ok {
+			return nil, fmt.Errorf("cycle in session branch at %s", currentID)
+		}
+		seen[currentID] = struct{}{}
+		record, ok := s.byID[currentID]
+		if !ok {
+			return nil, fmt.Errorf("entry %s not found", currentID)
+		}
+		if record.Type != RecordTypeSessionHeader {
+			path = append(path, record)
+		}
+		currentID = record.ParentID
+	}
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	return path, nil
+}
+
+func messagesFromRecords(records []Record) ([]agent.Message, error) {
 	messages := make([]agent.Message, 0)
 	for _, record := range records {
 		switch record.Type {
@@ -145,6 +268,24 @@ func (s *Session) Messages() ([]agent.Message, error) {
 			message, err := decodeMessagePayload(record.Payload)
 			if err != nil {
 				return nil, err
+			}
+			messages = append(messages, message)
+		case RecordTypeCustomMessage:
+			message, err := payloadToCustomMessage(record.Payload)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, message)
+		case RecordTypeBashExecution:
+			message, err := decodeMessagePayload(record.Payload)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, message)
+		case RecordTypeBranchSummary:
+			message, ok := decodeBranchSummaryPayload(record.Payload, record.Timestamp)
+			if !ok || message.Summary == "" {
+				continue
 			}
 			messages = append(messages, message)
 		case RecordTypeCompaction:
@@ -198,6 +339,56 @@ func (s *Session) LastMessageRecordID() string {
 	return s.lastMessageRecordID
 }
 
+// LeafID returns the current branch leaf record ID.
+func (s *Session) LeafID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leafID
+}
+
+// SetLeafID moves the current branch leaf to an existing record.
+func (s *Session) SetLeafID(leafID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if leafID != "" {
+		if _, ok := s.byID[leafID]; !ok {
+			return fmt.Errorf("entry %s not found", leafID)
+		}
+	}
+	previousLeafID := s.leafID
+	s.leafID = leafID
+	s.lastRecordID = leafID
+	if err := s.persistHeaderLocked(); err != nil {
+		s.leafID = previousLeafID
+		s.lastRecordID = previousLeafID
+		return err
+	}
+	return nil
+}
+
+// Labels returns a copy of the label cache keyed by entry ID.
+func (s *Session) Labels() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	labels := make(map[string]string, len(s.labels))
+	for id, label := range s.labels {
+		labels[id] = label
+	}
+	return labels
+}
+
+// Name returns the latest session display name.
+func (s *Session) Name() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.name
+}
+
+// SetName appends and applies the session display name.
+func (s *Session) SetName(name string) error {
+	return s.AppendSessionName(name)
+}
+
 func (s *Session) appendMessageLocked(message agent.Message, parentID string) error {
 	payload, err := encodeMessagePayload(message)
 	if err != nil {
@@ -217,6 +408,9 @@ func (s *Session) appendRecordLocked(recordType string, payload any, parentID st
 func (s *Session) appendRawPayloadRecordLocked(recordType string, payload json.RawMessage, parentID string) error {
 	if s.closed {
 		return errors.New("session is closed")
+	}
+	if parentID == "" && recordType != RecordTypeSessionHeader {
+		parentID = s.leafID
 	}
 	id, err := randomHexID()
 	if err != nil {
@@ -239,10 +433,49 @@ func (s *Session) appendRawPayloadRecordLocked(recordType string, payload json.R
 func (s *Session) indexRecord(record Record) {
 	s.records = append(s.records, record)
 	s.byID[record.ID] = record
+	if record.Type == RecordTypeSessionHeader {
+		if header, ok := decodeSessionHeader(record); ok {
+			s.cwd = header.Cwd
+			s.createdAt = header.CreatedAt
+			if header.LeafID != "" {
+				s.leafID = header.LeafID
+			}
+			for id, label := range header.Labels {
+				if strings.TrimSpace(label) != "" {
+					s.labels[id] = strings.TrimSpace(label)
+				}
+			}
+		}
+		return
+	}
 	s.lastRecordID = record.ID
+	s.leafID = record.ID
 	if record.Type == RecordTypeMessage {
 		s.lastMessageRecordID = record.ID
 		s.messageRecords = append(s.messageRecords, record)
+	}
+	s.indexPayloadRecord(record)
+}
+
+func (s *Session) indexPayloadRecord(record Record) {
+	switch record.Type {
+	case RecordTypeLabel:
+		var payload labelPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return
+		}
+		label := strings.TrimSpace(payload.Label)
+		if label == "" {
+			delete(s.labels, payload.TargetID)
+		} else {
+			s.labels[payload.TargetID] = label
+		}
+	case RecordTypeSessionName:
+		var payload sessionNamePayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return
+		}
+		s.name = strings.TrimSpace(payload.Name)
 	}
 }
 
@@ -300,6 +533,84 @@ func (s *Session) clearCurrentTurnLocked() error {
 		return err
 	}
 	return syncDir(filepath.Dir(s.currentTurnPath))
+}
+
+func (s *Session) persistHeaderLocked() error {
+	if s.closed {
+		return errors.New("session is closed")
+	}
+	if len(s.records) == 0 || s.records[0].Type != RecordTypeSessionHeader {
+		return nil
+	}
+	header, ok := decodeSessionHeader(s.records[0])
+	if !ok {
+		return errors.New("session file missing session header")
+	}
+	header.LeafID = s.leafID
+	header.Labels = make(map[string]string, len(s.labels))
+	for id, label := range s.labels {
+		header.Labels[id] = label
+	}
+	payload, err := json.Marshal(header)
+	if err != nil {
+		return err
+	}
+	s.records[0].Payload = payload
+	s.byID[s.records[0].ID] = s.records[0]
+	return s.rewriteRecordsLocked()
+}
+
+func (s *Session) rewriteRecordsLocked() error {
+	tmpName, err := randomHexID()
+	if err != nil {
+		return err
+	}
+	tmpPath := fmt.Sprintf("%s.tmp-%s", s.path, tmpName)
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	for _, record := range s.records {
+		data, err := json.Marshal(record)
+		if err != nil {
+			_ = file.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		data = append(data, '\n')
+		if err := writeFull(file, data); err != nil {
+			_ = file.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := s.file.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		reopened, reopenErr := os.OpenFile(s.path, os.O_RDWR|os.O_APPEND, 0o600)
+		if reopenErr == nil {
+			s.file = reopened
+		}
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	reopened, err := os.OpenFile(s.path, os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	s.file = reopened
+	return syncDir(filepath.Dir(s.path))
 }
 
 func writeRecordLine(file *os.File, record Record) error {
@@ -403,12 +714,50 @@ func loadHeaderRecord(path string) (Record, bool) {
 }
 
 type compactionPayload struct {
-	Summary             string    `json:"summary"`
-	DroppedMessageCount int       `json:"dropped_message_count,omitempty"`
-	CompactedAt         time.Time `json:"compacted_at,omitempty"`
+	Summary             string          `json:"summary"`
+	DroppedMessageCount int             `json:"dropped_message_count,omitempty"`
+	CompactedAt         time.Time       `json:"compacted_at,omitempty"`
+	FirstKeptEntryID    string          `json:"firstKeptEntryId,omitempty"`
+	TokensBefore        int             `json:"tokensBefore,omitempty"`
+	Details             json.RawMessage `json:"details,omitempty"`
+	FromHook            bool            `json:"fromHook,omitempty"`
+	FileOps             json.RawMessage `json:"fileOps,omitempty"`
 }
 
 type savePointPayload struct{}
+
+type thinkingChangePayload struct {
+	ThinkingLevel string `json:"thinkingLevel"`
+}
+
+type modelChangePayload struct {
+	Model    string `json:"model,omitempty"`
+	ModelID  string `json:"modelId,omitempty"`
+	Provider string `json:"provider"`
+	API      string `json:"api,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+type labelPayload struct {
+	TargetID string `json:"targetId"`
+	Label    string `json:"label,omitempty"`
+}
+
+type sessionNamePayload struct {
+	Name string `json:"name,omitempty"`
+}
+
+type customEntryPayload struct {
+	Kind string          `json:"customType"`
+	Data json.RawMessage `json:"data,omitempty"`
+}
+
+type branchSummaryPayload struct {
+	FromID   string          `json:"fromId"`
+	Summary  string          `json:"summary"`
+	Details  json.RawMessage `json:"details,omitempty"`
+	FromHook bool            `json:"fromHook,omitempty"`
+}
 
 func decodeCompactionPayload(raw json.RawMessage) (compactionPayload, bool) {
 	var payload compactionPayload
@@ -416,4 +765,18 @@ func decodeCompactionPayload(raw json.RawMessage) (compactionPayload, bool) {
 		return compactionPayload{}, false
 	}
 	return payload, true
+}
+
+func decodeBranchSummaryPayload(raw json.RawMessage, timestamp time.Time) (agent.BranchSummaryMessage, bool) {
+	var payload branchSummaryPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return agent.BranchSummaryMessage{}, false
+	}
+	return agent.BranchSummaryMessage{
+		Timestamp:    timestamp,
+		Summary:      payload.Summary,
+		SourceLeafID: payload.FromID,
+		Details:      payload.Details,
+		FromHook:     payload.FromHook,
+	}, true
 }
