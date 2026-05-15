@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/noeljackson/pi/internal/resources"
 )
 
 type fakeProvider struct {
@@ -79,6 +82,15 @@ type memorySession struct {
 	modelChanges    []string
 	thinkingChanges []string
 	runStates       []any
+}
+
+type fakeResourceLoader struct {
+	resources resources.Resources
+	err       error
+}
+
+func (l fakeResourceLoader) Load() (resources.Resources, error) {
+	return l.resources, l.err
 }
 
 func (s *memorySession) AppendMessage(message Message) error {
@@ -264,6 +276,64 @@ func TestAgentAbortLeavesAbortedState(t *testing.T) {
 	}
 	if len(session.runStates) == 0 {
 		t.Fatal("expected abort run state")
+	}
+}
+
+func TestAgentInjectsResourcesIntoSystemPrompt(t *testing.T) {
+	provider := &fakeProvider{responses: []fakeResponse{{
+		message: AssistantMessage{Content: []Content{TextContent{Text: "ok"}}, StopReason: StopEndTurn},
+	}}}
+	agent := NewAgent(LoopConfig{
+		Provider:     provider,
+		Model:        "m",
+		SystemPrompt: "base",
+		Resources: resources.Resources{
+			ContextFiles: []resources.ContextFile{{Path: "/repo/AGENTS.md", Content: "rules"}},
+			Skills: []resources.Skill{{
+				Name:        "review-code",
+				Path:        "/skills/review-code/SKILL.md",
+				Description: "Review code",
+				Frontmatter: map[string]any{},
+			}},
+		},
+	})
+	if err := agent.Prompt(context.Background(), "ping"); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.WaitForIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	system := provider.lastRequest().System
+	if !strings.Contains(system, "# Project Context") || !strings.Contains(system, "<available_skills>") {
+		t.Fatalf("system prompt missing resources:\n%s", system)
+	}
+}
+
+func TestAgentReloadResourcesUpdatesStateAndEmitsEvent(t *testing.T) {
+	loaded := resources.Resources{
+		Diagnostics: []resources.Diagnostic{{Level: "warning", Source: "x", Message: "parse"}},
+	}
+	agent := NewAgent(LoopConfig{ResourceLoader: fakeResourceLoader{resources: loaded}})
+	events := make(chan Event, 1)
+	agent.Subscribe(func(event Event) {
+		if _, ok := event.(ResourcesReloadEvent); ok {
+			events <- event
+		}
+	})
+	if err := agent.ReloadResources(); err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.Resources().Diagnostics) != 1 {
+		t.Fatalf("resources = %#v", agent.Resources())
+	}
+	select {
+	case event := <-events:
+		reload := event.(ResourcesReloadEvent)
+		if len(reload.Diagnostics) != 1 {
+			t.Fatalf("reload diagnostics = %#v", reload.Diagnostics)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing reload event")
 	}
 }
 

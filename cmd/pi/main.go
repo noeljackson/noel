@@ -6,12 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/noeljackson/pi/internal/agent"
 	anthropicprovider "github.com/noeljackson/pi/internal/anthropic"
+	"github.com/noeljackson/pi/internal/config"
+	"github.com/noeljackson/pi/internal/resources"
 	"github.com/noeljackson/pi/internal/session"
 	"github.com/noeljackson/pi/internal/tools"
 	"github.com/noeljackson/pi/internal/tools/bash"
@@ -172,7 +173,11 @@ func sendEvent(ctx context.Context, eventCh chan<- agent.Event, event agent.Even
 }
 
 func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*session.Session, agent.LoopConfig, error) {
-	store, err := newSessionStore()
+	paths, err := config.DefaultPaths()
+	if err != nil {
+		return nil, agent.LoopConfig{}, err
+	}
+	store, err := newSessionStore(paths)
 	if err != nil {
 		return nil, agent.LoopConfig{}, err
 	}
@@ -199,23 +204,40 @@ func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*sess
 		_ = sess.Close()
 		return nil, agent.LoopConfig{}, err
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		_ = sess.Close()
+		return nil, agent.LoopConfig{}, err
+	}
+	resourceLoader := &resources.ResourceLoader{
+		Paths:       paths,
+		ProjectRoot: cwd,
+	}
+	loadedResources, err := resourceLoader.Load()
+	if err != nil {
+		_ = sess.Close()
+		return nil, agent.LoopConfig{}, err
+	}
+	for _, diagnostic := range loadedResources.Diagnostics {
+		if diagnostic.Level == "error" {
+			fmt.Fprintf(os.Stderr, "resource error: %s: %s\n", diagnostic.Source, diagnostic.Message)
+		}
+	}
 
 	cfg := agent.LoopConfig{
-		Provider:      anthropicprovider.NewClient(auth),
-		Tools:         registry,
-		Model:         modelName(),
-		MaxTokens:     defaultMaxTokens,
-		SessionWriter: sess,
+		Provider:       anthropicprovider.NewClient(auth),
+		Tools:          registry,
+		Model:          modelName(),
+		Resources:      loadedResources,
+		ResourceLoader: resourceLoader,
+		MaxTokens:      defaultMaxTokens,
+		SessionWriter:  sess,
 	}
 	return sess, cfg, nil
 }
 
-func newSessionStore() (*session.JSONLStore, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	return session.NewJSONLStore(filepath.Join(home, ".pi", "sessions")), nil
+func newSessionStore(paths config.Paths) (*session.JSONLStore, error) {
+	return session.NewJSONLStore(paths.SessionDir), nil
 }
 
 func builtinRegistry() (*tools.Registry, error) {

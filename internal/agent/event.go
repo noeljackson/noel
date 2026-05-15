@@ -1,6 +1,10 @@
 package agent
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/noeljackson/pi/internal/resources"
+)
 
 // Event describes an agent stream event.
 type Event interface {
@@ -89,6 +93,10 @@ type ToolExecutionEndEvent struct {
 	Err    error
 }
 
+type ResourcesReloadEvent struct {
+	Diagnostics []resources.Diagnostic
+}
+
 func (AgentStartEvent) isEvent()          {}
 func (AgentEndEvent) isEvent()            {}
 func (TurnStartEvent) isEvent()           {}
@@ -99,3 +107,4 @@ func (MessageEndEvent) isEvent()          {}
 func (ToolExecutionStartEvent) isEvent()  {}
 func (ToolExecutionUpdateEvent) isEvent() {}
 func (ToolExecutionEndEvent) isEvent()    {}
+func (ResourcesReloadEvent) isEvent()     {}
