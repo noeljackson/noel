@@ -17,6 +17,7 @@ import (
 type Options struct {
 	EventSource <-chan agent.Event
 	Messages    []agent.Message
+	Model       string
 	Submit      func(text string)
 	Abort       func()
 }
@@ -54,6 +55,7 @@ const (
 	entryUser entryKind = iota
 	entryAssistant
 	entryTool
+	entryError
 )
 
 type eventMsg struct {
@@ -72,6 +74,10 @@ func New(opts Options) Model {
 
 	vp := viewport.New(80, 20)
 
+	initialModel := opts.Model
+	if initialModel == "" {
+		initialModel = "unknown"
+	}
 	model := Model{
 		opts:             opts,
 		keys:             defaultKeyMap(),
@@ -79,7 +85,7 @@ func New(opts Options) Model {
 		editor:           editor,
 		assistantEntries: make(map[string]int),
 		tools:            make(map[string]components.ToolCardState),
-		modelName:        "unknown",
+		modelName:        initialModel,
 		turn:             "idle",
 	}
 	model.loadMessages(opts.Messages)
@@ -277,6 +283,9 @@ func (m *Model) applyEvent(event agent.Event) {
 		m.flushQueued()
 	case agent.AgentEndEvent:
 		m.turn = "idle"
+		if value.Err != nil {
+			m.entries = append(m.entries, chatEntry{kind: entryError, text: value.Err.Error()})
+		}
 	}
 }
 
@@ -384,6 +393,8 @@ func (m *Model) refreshHistory(scrollBottom bool) {
 			if ok {
 				text = components.ToolCard(card, m.width)
 			}
+		case entryError:
+			text = components.ErrorMessageView(entry.text)
 		}
 		if strings.TrimSpace(text) != "" {
 			rendered = append(rendered, text)

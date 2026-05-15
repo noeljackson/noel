@@ -140,6 +140,7 @@ func runTUI(resumeID string) error {
 	model := tui.New(tui.Options{
 		EventSource: eventCh,
 		Messages:    messages,
+		Model:       cfg.Model,
 		Submit: func(text string) {
 			select {
 			case submitCh <- text:
@@ -168,9 +169,6 @@ func runTUI(resumeID string) error {
 			cancelTurn()
 			setTurnCancel(nil)
 			if err != nil && !errors.Is(err, context.Canceled) {
-				fmt.Fprintf(os.Stderr, "pi: %v\n", err)
-			}
-			if err != nil {
 				sendEvent(rootCtx, eventCh, agent.AgentEndEvent{Reason: "error", Err: err})
 			}
 		}

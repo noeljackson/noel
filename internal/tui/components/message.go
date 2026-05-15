@@ -11,7 +11,17 @@ var (
 	messageUserStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("238")).Padding(0, 1)
 	messageAssistantStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	messageThinkingStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Italic(true)
+	messageErrorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
 )
+
+// ErrorMessageView renders an error that occurred during the agent loop.
+func ErrorMessageView(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	return messageErrorStyle.Render("⚠ " + text)
+}
 
 // UserMessageView renders a user-authored prompt.
 func UserMessageView(text string) string {
