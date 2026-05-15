@@ -90,6 +90,17 @@ func (s *Session) AppendCompaction(summary string, parentID string) error {
 	return s.appendRecordLocked(RecordTypeCompaction, compactionPayload{Summary: summary}, parentID)
 }
 
+// AppendCompactionRecord appends a compaction summary with reconstruction data.
+func (s *Session) AppendCompactionRecord(summary string, droppedCount int, compactedAt time.Time, parentID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendRecordLocked(RecordTypeCompaction, compactionPayload{
+		Summary:             summary,
+		DroppedMessageCount: droppedCount,
+		CompactedAt:         compactedAt,
+	}, parentID)
+}
+
 // AppendSavePoint appends a save point record.
 func (s *Session) AppendSavePoint(parentID string) error {
 	s.mu.Lock()
@@ -129,14 +140,30 @@ func (s *Session) Messages() ([]agent.Message, error) {
 	}
 	messages := make([]agent.Message, 0)
 	for _, record := range records {
-		if record.Type != RecordTypeMessage {
+		switch record.Type {
+		case RecordTypeMessage:
+			message, err := decodeMessagePayload(record.Payload)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, message)
+		case RecordTypeCompaction:
+			payload, ok := decodeCompactionPayload(record.Payload)
+			if !ok || payload.DroppedMessageCount <= 0 {
+				continue
+			}
+			droppedCount := payload.DroppedMessageCount
+			if droppedCount > len(messages) {
+				droppedCount = len(messages)
+			}
+			summaryMessage := agent.SystemMessage{Content: []agent.Content{agent.TextContent{Text: payload.Summary}}}
+			compacted := make([]agent.Message, 0, 1+len(messages)-droppedCount)
+			compacted = append(compacted, summaryMessage)
+			compacted = append(compacted, messages[droppedCount:]...)
+			messages = compacted
+		default:
 			continue
 		}
-		message, err := decodeMessagePayload(record.Payload)
-		if err != nil {
-			return nil, err
-		}
-		messages = append(messages, message)
 	}
 	return messages, nil
 }
@@ -162,6 +189,13 @@ func (s *Session) Close() error {
 	}
 	s.closed = true
 	return s.file.Close()
+}
+
+// LastMessageRecordID returns the record ID for the latest persisted message.
+func (s *Session) LastMessageRecordID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastMessageRecordID
 }
 
 func (s *Session) appendMessageLocked(message agent.Message, parentID string) error {
@@ -369,7 +403,17 @@ func loadHeaderRecord(path string) (Record, bool) {
 }
 
 type compactionPayload struct {
-	Summary string `json:"summary"`
+	Summary             string    `json:"summary"`
+	DroppedMessageCount int       `json:"dropped_message_count,omitempty"`
+	CompactedAt         time.Time `json:"compacted_at,omitempty"`
 }
 
 type savePointPayload struct{}
+
+func decodeCompactionPayload(raw json.RawMessage) (compactionPayload, bool) {
+	var payload compactionPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return compactionPayload{}, false
+	}
+	return payload, true
+}
