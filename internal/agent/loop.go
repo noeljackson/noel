@@ -32,12 +32,15 @@ type LoopConfig struct {
 	MaxTokens     int
 	MaxTurns      int
 	SessionWriter SessionWriter
+	Compactor     Compactor
 }
 
 type SessionWriter interface {
 	AppendMessage(Message) error
 	AppendEvent(Event) error
 }
+
+type Compactor func(ctx context.Context, messages []Message, system string) ([]Message, error)
 
 func Run(ctx context.Context, cfg LoopConfig, initial UserMessage, emit func(Event)) (*AssistantMessage, error) {
 	return run(ctx, cfg, []Message{initial}, true, emit)
@@ -74,6 +77,13 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 	for turn := 1; turn <= maxTurns; turn++ {
 		turnID := fmt.Sprintf("turn-%d", turn)
 		emit(TurnStartEvent{TurnID: turnID})
+		if cfg.Compactor != nil {
+			compacted, err := cfg.Compactor(ctx, messages, cfg.System)
+			if err != nil {
+				return nil, err
+			}
+			messages = compacted
+		}
 		assistant, err := cfg.Provider.Stream(ctx, StreamRequest{
 			Model:     cfg.Model,
 			Messages:  messages,
