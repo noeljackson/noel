@@ -16,6 +16,7 @@ import (
 
 type Options struct {
 	EventSource <-chan agent.Event
+	Messages    []agent.Message
 	Submit      func(text string)
 	Abort       func()
 }
@@ -71,7 +72,7 @@ func New(opts Options) Model {
 
 	vp := viewport.New(80, 20)
 
-	return Model{
+	model := Model{
 		opts:             opts,
 		keys:             defaultKeyMap(),
 		viewport:         vp,
@@ -81,6 +82,8 @@ func New(opts Options) Model {
 		modelName:        "unknown",
 		turn:             "idle",
 	}
+	model.loadMessages(opts.Messages)
+	return model
 }
 
 func (m Model) Init() tea.Cmd {
@@ -187,6 +190,43 @@ func (m *Model) submitEditor() {
 	m.entries = append(m.entries, chatEntry{kind: entryUser, text: text})
 	if m.opts.Submit != nil {
 		m.opts.Submit(text)
+	}
+}
+
+func (m *Model) loadMessages(messages []agent.Message) {
+	for _, message := range messages {
+		switch msg := message.(type) {
+		case agent.UserMessage:
+			m.entries = append(m.entries, chatEntry{kind: entryUser, text: messageText(msg.Content)})
+		case agent.AssistantMessage:
+			m.entries = append(m.entries, chatEntry{kind: entryAssistant, content: msg.Content})
+			if msg.Model != "" {
+				m.modelName = msg.Model
+			}
+			if msg.Usage != (agent.Usage{}) {
+				m.usage = msg.Usage
+			}
+			for _, content := range msg.Content {
+				toolUse, ok := content.(agent.ToolUseContent)
+				if !ok {
+					continue
+				}
+				card := m.ensureTool(toolUse.ID, toolUse.Name)
+				card.ArgsSummary = components.CompactJSON(toolUse.Input)
+				m.tools[toolUse.ID] = card
+			}
+		case agent.ToolResultMessage:
+			for _, result := range msg.Results {
+				card := m.ensureTool(result.ToolUseID, "")
+				card.Status = components.ToolDone
+				if result.IsError {
+					card.Status = components.ToolError
+				}
+				card.Body = appendResultContent(card.Body, result.Content)
+				applyResultDetails(&card, result.Details)
+				m.tools[result.ToolUseID] = card
+			}
+		}
 	}
 }
 
@@ -407,6 +447,23 @@ func appendResultContent(body []string, content []agent.Content) []string {
 		}
 	}
 	return body
+}
+
+func messageText(content []agent.Content) string {
+	var parts []string
+	for _, block := range content {
+		switch value := block.(type) {
+		case agent.TextContent:
+			if strings.TrimSpace(value.Text) != "" {
+				parts = append(parts, value.Text)
+			}
+		case agent.ThinkingContent:
+			if strings.TrimSpace(value.Thinking) != "" {
+				parts = append(parts, value.Thinking)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func applyResultDetails(card *components.ToolCardState, raw json.RawMessage) {
