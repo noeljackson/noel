@@ -70,7 +70,7 @@ func (c *Client) Stream(ctx context.Context, req agent.StreamRequest, emit func(
 			emit(agent.MessageEndEvent{
 				MessageID:    messageID,
 				FinalContent: message.Content,
-				StopReason:   message.StopReason,
+				StopReason:   message.StopReason.String(),
 				Usage:        message.Usage,
 			})
 		case anthropicsdk.ContentBlockStopEvent:
@@ -302,7 +302,7 @@ func convertToolSchema(schema json.RawMessage) anthropicsdk.ToolInputSchemaParam
 func convertAssistantMessage(message anthropicsdk.Message) agent.AssistantMessage {
 	return agent.AssistantMessage{
 		Content:    convertResponseContent(message.Content),
-		StopReason: string(message.StopReason),
+		StopReason: agent.StopReason(message.StopReason),
 		Model:      string(message.Model),
 		Usage:      convertUsage(message.Usage),
 	}
