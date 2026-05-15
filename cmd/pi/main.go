@@ -75,12 +75,12 @@ func parseOptions(args []string) (cliOptions, error) {
 }
 
 func runHeadless(prompt string) error {
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		return errors.New("ANTHROPIC_API_KEY is not set")
+	auth, err := anthropicprovider.PickAuth()
+	if err != nil {
+		return err
 	}
 
-	sess, cfg, err := newSessionConfig("", apiKey)
+	sess, cfg, err := newSessionConfig("", auth)
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,12 @@ func runTUI(resumeID string) error {
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sess, cfg, err := newSessionConfig(resumeID, os.Getenv("ANTHROPIC_API_KEY"))
+	auth, err := anthropicprovider.PickAuth()
+	if err != nil {
+		return err
+	}
+
+	sess, cfg, err := newSessionConfig(resumeID, auth)
 	if err != nil {
 		return err
 	}
@@ -203,7 +208,7 @@ func runTurn(ctx context.Context, sess *session.Session, cfg agent.LoopConfig, p
 	return agent.Continue(ctx, cfg, messages, emit)
 }
 
-func newSessionConfig(resumeID string, apiKey string) (*session.Session, agent.LoopConfig, error) {
+func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*session.Session, agent.LoopConfig, error) {
 	store, err := newSessionStore()
 	if err != nil {
 		return nil, agent.LoopConfig{}, err
@@ -233,7 +238,7 @@ func newSessionConfig(resumeID string, apiKey string) (*session.Session, agent.L
 	}
 
 	cfg := agent.LoopConfig{
-		Provider:      anthropicprovider.NewClient(apiKey),
+		Provider:      anthropicprovider.NewClient(auth),
 		Tools:         registry,
 		Model:         modelName(),
 		MaxTokens:     defaultMaxTokens,
