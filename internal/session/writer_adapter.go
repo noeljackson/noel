@@ -75,16 +75,7 @@ func (s *Session) AppendEvent(event agent.Event) error {
 		s.lastCurrentTurnWrite = now
 		return nil
 	case agent.MessageEndEvent:
-		model := s.activeStreamModels[evt.MessageID]
 		delete(s.activeStreamModels, evt.MessageID)
-		if err := s.appendMessageLocked(agent.AssistantMessage{
-			Content:    evt.FinalContent,
-			StopReason: evt.StopReason,
-			Model:      model,
-			Usage:      evt.Usage,
-		}, s.lastRecordID); err != nil {
-			return err
-		}
 		return s.clearCurrentTurnLocked()
 	case agent.ToolExecutionStartEvent:
 		return s.appendRecordLocked(RecordTypeRunState, runStatePayload{
@@ -94,7 +85,7 @@ func (s *Session) AppendEvent(event agent.Event) error {
 			Args:   evt.Input,
 		}, s.lastRecordID)
 	case agent.ToolExecutionEndEvent:
-		return s.appendMessageLocked(agent.ToolResultMessage{Results: []agent.ToolResult{evt.Result}}, s.lastRecordID)
+		return nil
 	case agent.ToolExecutionUpdateEvent:
 		return nil
 	default:
