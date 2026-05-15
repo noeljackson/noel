@@ -160,6 +160,7 @@ type ToolResult struct {
 	Content   []Content
 	Details   json.RawMessage
 	IsError   bool
+	Terminate bool
 }
 
 // SystemMessage contains system-level instructions.

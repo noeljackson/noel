@@ -32,11 +32,25 @@ type LoopConfig struct {
 	Provider      Provider
 	Tools         ToolRegistry
 	Model         string
+	Thinking      string
 	System        string
 	MaxTokens     int
 	MaxTurns      int
 	SessionWriter SessionWriter
 	Compactor     Compactor
+
+	PrepareNextTurn     func(ctx context.Context, messages []Message) (NextTurnDirective, error)
+	ShouldStopAfterTurn func(turn int, last *AssistantMessage) bool
+	BeforeToolCall      func(ctx context.Context, call ToolUseContent) error
+	AfterToolCall       func(ctx context.Context, call ToolUseContent, result ToolResult)
+	ActiveTools         []string
+}
+
+type NextTurnDirective struct {
+	InsertMessages []Message
+	NewModel       string
+	NewThinking    string
+	Stop           bool
 }
 
 type SessionWriter interface {
@@ -65,79 +79,164 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 	if emit == nil {
 		emit = func(Event) {}
 	}
+	emitEvent := func(event Event) error {
+		emit(event)
+		if cfg.SessionWriter != nil {
+			return cfg.SessionWriter.AppendEvent(event)
+		}
+		return nil
+	}
 	maxTurns := cfg.MaxTurns
 	if maxTurns == 0 {
 		maxTurns = defaultMaxTurns
 	}
 
+	if err := emitEvent(AgentStartEvent{}); err != nil {
+		return nil, err
+	}
+	var finalAssistant *AssistantMessage
+	var finalErr error
+	defer func() {
+		reason := "complete"
+		if finalErr != nil {
+			reason = "error"
+		}
+		_ = emitEvent(AgentEndEvent{Reason: reason, Err: finalErr})
+	}()
+
 	if appendInitial && cfg.SessionWriter != nil {
 		if err := cfg.SessionWriter.AppendMessage(messages[0]); err != nil {
+			finalErr = err
 			return nil, err
 		}
 	}
 
 	for turn := 1; turn <= maxTurns; turn++ {
 		turnID := fmt.Sprintf("turn-%d", turn)
-		emit(TurnStartEvent{TurnID: turnID})
+		if err := emitEvent(TurnStartEvent{TurnID: turnID}); err != nil {
+			finalErr = err
+			return nil, err
+		}
 		streamMessages := messages
 		if cfg.Compactor != nil {
 			compacted, err := cfg.Compactor.MaybeCompact(ctx, messages, cfg.System)
 			if err != nil {
+				finalErr = err
 				return nil, err
 			}
 			streamMessages = compacted
 		}
 		assistant, err := cfg.Provider.Stream(ctx, StreamRequest{
 			Model:     cfg.Model,
-			Messages:  streamMessages,
+			Messages:  ConvertToLLM(streamMessages),
 			System:    cfg.System,
-			Tools:     toolsFromRegistry(cfg.Tools),
+			Tools:     toolsFromConfig(cfg),
 			MaxTokens: cfg.MaxTokens,
 		}, func(event Event) {
 			if start, ok := event.(MessageStartEvent); ok {
 				start.TurnID = turnID
 				event = start
 			}
-			emit(event)
-			if cfg.SessionWriter != nil {
-				_ = cfg.SessionWriter.AppendEvent(event)
-			}
+			_ = emitEvent(event)
 		})
 		if err != nil {
+			finalErr = err
 			return nil, err
 		}
 
 		messages = append(messages, *assistant)
 		if cfg.SessionWriter != nil {
 			if err := cfg.SessionWriter.AppendMessage(*assistant); err != nil {
+				finalErr = err
 				return nil, err
 			}
 		}
 
 		toolCalls := toolUses(assistant.Content)
-		hasPendingToolCalls := assistant.StopReason == "tool_use" && len(toolCalls) > 0
-		emit(TurnEndEvent{TurnID: turnID, ToolCallsPending: hasPendingToolCalls})
-		if !hasPendingToolCalls {
-			return assistant, nil
+		hasPendingToolCalls := assistant.StopReason == StopToolUse && len(toolCalls) > 0
+		var toolResults []ToolResult
+		terminate := false
+		if hasPendingToolCalls {
+			toolResults = executeToolCalls(ctx, cfg, toolCalls, emitEvent)
+			toolResultMessage := ToolResultMessage{Results: toolResults}
+			messages = append(messages, toolResultMessage)
+			if cfg.SessionWriter != nil {
+				if err := cfg.SessionWriter.AppendMessage(toolResultMessage); err != nil {
+					finalErr = err
+					return nil, err
+				}
+			}
+			terminate = hasTerminatingResult(toolResults)
 		}
 
-		toolResultMessage := ToolResultMessage{Results: executeToolCalls(ctx, cfg.Tools, toolCalls, emit)}
-		messages = append(messages, toolResultMessage)
-		if cfg.SessionWriter != nil {
-			if err := cfg.SessionWriter.AppendMessage(toolResultMessage); err != nil {
+		if err := emitEvent(TurnEndEvent{TurnID: turnID, ToolCallsPending: hasPendingToolCalls && !terminate, ToolResults: toolResults}); err != nil {
+			finalErr = err
+			return nil, err
+		}
+
+		if cfg.PrepareNextTurn != nil {
+			directive, err := cfg.PrepareNextTurn(ctx, append([]Message(nil), messages...))
+			if err != nil {
+				finalErr = err
 				return nil, err
 			}
+			if len(directive.InsertMessages) > 0 {
+				for _, message := range directive.InsertMessages {
+					messages = append(messages, message)
+					if cfg.SessionWriter != nil {
+						if err := cfg.SessionWriter.AppendMessage(message); err != nil {
+							finalErr = err
+							return nil, err
+						}
+					}
+				}
+			}
+			if directive.NewModel != "" {
+				cfg.Model = directive.NewModel
+			}
+			if directive.NewThinking != "" {
+				cfg.Thinking = directive.NewThinking
+			}
+			if directive.Stop {
+				finalAssistant = assistant
+				return assistant, nil
+			}
+		}
+
+		if cfg.ShouldStopAfterTurn != nil && cfg.ShouldStopAfterTurn(turn, assistant) {
+			finalAssistant = assistant
+			return assistant, nil
+		}
+		if terminate || !hasPendingToolCalls {
+			finalAssistant = assistant
+			return assistant, nil
 		}
 	}
 
-	return nil, fmt.Errorf("agent exceeded max turns: %d", maxTurns)
+	err := fmt.Errorf("agent exceeded max turns: %d", maxTurns)
+	finalErr = err
+	return finalAssistant, err
 }
 
-func toolsFromRegistry(registry ToolRegistry) []Tool {
-	if registry == nil {
+func toolsFromConfig(cfg LoopConfig) []Tool {
+	if cfg.Tools == nil {
 		return nil
 	}
-	return registry.All()
+	all := cfg.Tools.All()
+	if len(cfg.ActiveTools) == 0 {
+		return all
+	}
+	active := make(map[string]struct{}, len(cfg.ActiveTools))
+	for _, name := range cfg.ActiveTools {
+		active[name] = struct{}{}
+	}
+	tools := make([]Tool, 0, len(all))
+	for _, tool := range all {
+		if _, ok := active[tool.Name()]; ok {
+			tools = append(tools, tool)
+		}
+	}
+	return tools
 }
 
 func toolUses(content []Content) []ToolUseContent {
@@ -150,30 +249,30 @@ func toolUses(content []Content) []ToolUseContent {
 	return uses
 }
 
-func executeToolCalls(ctx context.Context, registry ToolRegistry, calls []ToolUseContent, emit func(Event)) []ToolResult {
+func executeToolCalls(ctx context.Context, cfg LoopConfig, calls []ToolUseContent, emit func(Event) error) []ToolResult {
 	results := make([]ToolResult, len(calls))
 
 	for i, call := range calls {
-		tool, ok := lookupTool(registry, call.Name)
+		tool, ok := lookupTool(cfg.Tools, call.Name)
 		if !ok {
 			results[i] = missingToolResult(call)
 			continue
 		}
 		if !tool.ParallelSafe() {
-			results[i] = executeToolCall(ctx, tool, call, emit)
+			results[i] = executeToolCall(ctx, cfg, tool, call, emit)
 		}
 	}
 
 	var parallel sync.WaitGroup
 	for i, call := range calls {
-		tool, ok := lookupTool(registry, call.Name)
+		tool, ok := lookupTool(cfg.Tools, call.Name)
 		if !ok || !tool.ParallelSafe() {
 			continue
 		}
 		parallel.Add(1)
 		go func(index int, currentTool Tool, currentCall ToolUseContent) {
 			defer parallel.Done()
-			results[index] = executeToolCall(ctx, currentTool, currentCall, emit)
+			results[index] = executeToolCall(ctx, cfg, currentTool, currentCall, emit)
 		}(i, tool, call)
 	}
 	parallel.Wait()
@@ -187,13 +286,24 @@ func lookupTool(registry ToolRegistry, name string) (Tool, bool) {
 	return registry.Get(name)
 }
 
-func executeToolCall(ctx context.Context, tool Tool, call ToolUseContent, emit func(Event)) ToolResult {
-	emit(ToolExecutionStartEvent{CallID: call.ID, Name: call.Name, Input: call.Input})
+func executeToolCall(ctx context.Context, cfg LoopConfig, tool Tool, call ToolUseContent, emit func(Event) error) ToolResult {
+	_ = emit(ToolExecutionStartEvent{CallID: call.ID, Name: call.Name, Input: call.Input})
+	if cfg.BeforeToolCall != nil {
+		if err := cfg.BeforeToolCall(ctx, call); err != nil {
+			result := ToolResult{
+				ToolUseID: call.ID,
+				Content:   []Content{TextContent{Text: err.Error()}},
+				IsError:   true,
+			}
+			_ = emit(ToolExecutionEndEvent{CallID: call.ID, Result: result, Err: err})
+			return result
+		}
+	}
 	result, err := tool.Execute(ctx, call.Input, ToolCallContext{
 		CallID: call.ID,
 		Cwd:    currentWorkingDirectory(),
 		OnUpdate: func(partial json.RawMessage) {
-			emit(ToolExecutionUpdateEvent{CallID: call.ID, Partial: partial})
+			_ = emit(ToolExecutionUpdateEvent{CallID: call.ID, Partial: partial})
 		},
 		Logger: slog.Default(),
 	})
@@ -207,7 +317,10 @@ func executeToolCall(ctx context.Context, tool Tool, call ToolUseContent, emit f
 	if result.ToolUseID == "" {
 		result.ToolUseID = call.ID
 	}
-	emit(ToolExecutionEndEvent{CallID: call.ID, Result: result, Err: err})
+	if cfg.AfterToolCall != nil {
+		cfg.AfterToolCall(ctx, call, result)
+	}
+	_ = emit(ToolExecutionEndEvent{CallID: call.ID, Result: result, Err: err})
 	return result
 }
 
@@ -217,6 +330,15 @@ func missingToolResult(call ToolUseContent) ToolResult {
 		Content:   []Content{TextContent{Text: fmt.Sprintf("Tool %s not found", call.Name)}},
 		IsError:   true,
 	}
+}
+
+func hasTerminatingResult(results []ToolResult) bool {
+	for _, result := range results {
+		if result.Terminate {
+			return true
+		}
+	}
+	return false
 }
 
 func currentWorkingDirectory() string {

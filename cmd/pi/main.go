@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/noeljackson/pi/internal/agent"
@@ -86,16 +85,23 @@ func runHeadless(prompt string) error {
 	}
 	defer sess.Close()
 
-	emit := func(event agent.Event) {
+	runner := agent.NewAgent(cfg)
+	runner.Subscribe(func(event agent.Event) {
 		if update, ok := event.(agent.MessageUpdateEvent); ok && update.Delta.TextDelta != "" {
 			fmt.Fprint(os.Stdout, update.Delta.TextDelta)
 		}
+	})
+	if err := runner.Prompt(context.Background(), prompt); err != nil {
+		return err
 	}
-	_, err = runTurn(context.Background(), sess, cfg, prompt, emit)
-	if err == nil {
-		fmt.Fprintln(os.Stdout)
+	if err := runner.WaitForIdle(context.Background()); err != nil {
+		return err
 	}
-	return err
+	if err := runner.LastError(); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout)
+	return nil
 }
 
 func runTUI(resumeID string) error {
@@ -120,22 +126,10 @@ func runTUI(resumeID string) error {
 
 	eventCh := make(chan agent.Event, 256)
 	submitCh := make(chan string, 32)
-
-	var turnMu sync.Mutex
-	var turnCancel context.CancelFunc
-	setTurnCancel := func(cancel context.CancelFunc) {
-		turnMu.Lock()
-		defer turnMu.Unlock()
-		turnCancel = cancel
-	}
-	abort := func() {
-		turnMu.Lock()
-		cancelTurn := turnCancel
-		turnMu.Unlock()
-		if cancelTurn != nil {
-			cancelTurn()
-		}
-	}
+	runner := agent.NewAgent(cfg)
+	runner.Subscribe(func(event agent.Event) {
+		sendEvent(rootCtx, eventCh, event)
+	})
 
 	model := tui.New(tui.Options{
 		EventSource: eventCh,
@@ -147,7 +141,7 @@ func runTUI(resumeID string) error {
 			case <-rootCtx.Done():
 			}
 		},
-		Abort: abort,
+		Abort: runner.Abort,
 	})
 
 	programDone := make(chan error, 1)
@@ -163,24 +157,11 @@ func runTUI(resumeID string) error {
 			cancel()
 			return err
 		case text := <-submitCh:
-			turnCtx, cancelTurn := context.WithCancel(rootCtx)
-			setTurnCancel(cancelTurn)
-			err := runTUITurn(turnCtx, sess, cfg, text, eventCh)
-			cancelTurn()
-			setTurnCancel(nil)
-			if err != nil && !errors.Is(err, context.Canceled) {
+			if err := runner.Prompt(rootCtx, text); err != nil && !errors.Is(err, context.Canceled) {
 				sendEvent(rootCtx, eventCh, agent.AgentEndEvent{Reason: "error", Err: err})
 			}
 		}
 	}
-}
-
-func runTUITurn(ctx context.Context, sess *session.Session, cfg agent.LoopConfig, prompt string, eventCh chan<- agent.Event) error {
-	emit := func(event agent.Event) {
-		sendEvent(ctx, eventCh, event)
-	}
-	_, err := runTurn(ctx, sess, cfg, prompt, emit)
-	return err
 }
 
 func sendEvent(ctx context.Context, eventCh chan<- agent.Event, event agent.Event) {
@@ -188,22 +169,6 @@ func sendEvent(ctx context.Context, eventCh chan<- agent.Event, event agent.Even
 	case eventCh <- event:
 	case <-ctx.Done():
 	}
-}
-
-func runTurn(ctx context.Context, sess *session.Session, cfg agent.LoopConfig, prompt string, emit func(agent.Event)) (*agent.AssistantMessage, error) {
-	user := agent.UserMessage{Content: []agent.Content{agent.TextContent{Text: prompt}}}
-	messages, err := sess.Messages()
-	if err != nil {
-		return nil, err
-	}
-	if len(messages) == 0 {
-		return agent.Run(ctx, cfg, user, emit)
-	}
-	messages = append(messages, user)
-	if err := sess.AppendMessage(user); err != nil {
-		return nil, err
-	}
-	return agent.Continue(ctx, cfg, messages, emit)
 }
 
 func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*session.Session, agent.LoopConfig, error) {

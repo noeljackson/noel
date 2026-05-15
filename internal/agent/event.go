@@ -27,6 +27,7 @@ type TurnStartEvent struct {
 type TurnEndEvent struct {
 	TurnID           string
 	ToolCallsPending bool
+	ToolResults      []ToolResult
 }
 
 // MessageStartEvent indicates that a streamed message has started.
