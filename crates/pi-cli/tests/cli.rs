@@ -317,6 +317,38 @@ fn print_mode_expands_at_file_and_exports_session() {
 }
 
 #[test]
+fn print_mode_respects_block_images_setting() {
+    let root = test_dir("pi-cli-block-images");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"images":{"blockImages":true}}"#,
+    )
+    .expect("write settings");
+
+    let output = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args([
+            "--no-session",
+            "-p",
+            "--model",
+            "faux/echo",
+            "--image",
+            "blocked.png",
+            "describe",
+        ])
+        .output()
+        .expect("run pi");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("images are blocked by settings"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn print_mode_exports_html_and_jsonl_sessions() {
     let root = test_dir("pi-cli-export-formats");
     let sessions = root.join("sessions");

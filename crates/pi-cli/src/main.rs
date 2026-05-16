@@ -441,7 +441,7 @@ async fn main() -> Result<()> {
     }
 
     let mut initial_prompt = expand_message_inputs(&cwd, &cli.messages)?;
-    let initial_media = load_media_inputs(&cwd, &cli.image)?;
+    let initial_media = load_media_inputs(&cwd, &cli.image, &config)?;
     if !stdin_is_terminal && !matches!(cli.mode, OutputMode::Rpc) {
         let mut stdin = String::new();
         io::stdin().read_to_string(&mut stdin)?;
@@ -724,11 +724,27 @@ fn expand_message_inputs(cwd: &Path, messages: &[String]) -> Result<String> {
     Ok(parts.join(" "))
 }
 
-fn load_media_inputs(cwd: &Path, paths: &[PathBuf]) -> Result<Vec<MediaInput>> {
+fn load_media_inputs(
+    cwd: &Path,
+    paths: &[PathBuf],
+    config: &LoadedConfig,
+) -> Result<Vec<MediaInput>> {
+    if images_blocked(config) && !paths.is_empty() {
+        return Err(anyhow!("images are blocked by settings"));
+    }
     paths
         .iter()
         .map(|path| load_media_input(cwd, path))
         .collect()
+}
+
+fn images_blocked(config: &LoadedConfig) -> bool {
+    config
+        .settings
+        .images
+        .as_ref()
+        .and_then(|images| images.block_images)
+        .unwrap_or(false)
 }
 
 fn load_media_input(cwd: &Path, path: &Path) -> Result<MediaInput> {
@@ -1672,7 +1688,12 @@ async fn handle_tui_submission(
         _ if line.starts_with("/image ") => {
             let rest = line.trim_start_matches("/image ").trim();
             let (path, prompt) = split_once_text(rest);
-            match load_media_input(&runtime.session().cwd, Path::new(path)) {
+            let media_result = if images_blocked(config) {
+                Err(anyhow!("images are blocked by settings"))
+            } else {
+                load_media_input(&runtime.session().cwd, Path::new(path))
+            };
+            match media_result {
                 Ok(media) => {
                     app.push(TuiEntryKind::System, format_media_fallback(&media));
                     if !prompt.is_empty() {
