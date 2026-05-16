@@ -84,6 +84,30 @@ fn list_models_accepts_optional_search() {
 }
 
 #[test]
+fn ts_style_multi_letter_cli_aliases_are_accepted() {
+    let output = pi_command()
+        .args([
+            "-nt",
+            "-nbt",
+            "-ne",
+            "-ns",
+            "-np",
+            "-nc",
+            "--list-models",
+            "faux",
+        ])
+        .output()
+        .expect("run pi");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("faux/echo"));
+}
+
+#[test]
 fn package_commands_manage_settings_sources() {
     let root = test_dir("pi-cli-package-commands");
     let agent = root.join("agent");

@@ -401,7 +401,7 @@ async fn main() -> Result<()> {
     if try_run_package_command()? {
         return Ok(());
     }
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalized_cli_args(std::env::args()));
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd.clone(), cli.session_dir.clone())?;
     let mut config = load_config(paths)?;
@@ -668,15 +668,14 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
     }
     if cli.no_extensions {
         config.extensions.clear();
-    } else {
-        for extension in &cli.extension {
-            if extension.is_file() {
-                config.extensions.push(ResourceFile {
-                    name: resource_name(extension),
-                    path: extension.clone(),
-                    content: fs::read_to_string(extension)?,
-                });
-            }
+    }
+    for extension in &cli.extension {
+        if extension.is_file() {
+            config.extensions.push(ResourceFile {
+                name: resource_name(extension),
+                path: extension.clone(),
+                content: fs::read_to_string(extension)?,
+            });
         }
     }
     if let Some(api_key) = &cli.api_key {
@@ -691,6 +690,20 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
         );
     }
     Ok(())
+}
+
+fn normalized_cli_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    args.into_iter()
+        .map(|arg| match arg.as_str() {
+            "-nt" => "--no-tools".to_string(),
+            "-nbt" => "--no-builtin-tools".to_string(),
+            "-ne" => "--no-extensions".to_string(),
+            "-ns" => "--no-skills".to_string(),
+            "-np" => "--no-prompt-templates".to_string(),
+            "-nc" => "--no-context-files".to_string(),
+            _ => arg,
+        })
+        .collect()
 }
 
 fn infer_cli_provider(cli: &Cli, config: &LoadedConfig) -> Option<String> {
