@@ -8,8 +8,12 @@ func FromTeaKey(msg tea.KeyMsg) Event {
 	if msg.Alt {
 		mod |= ModAlt
 	}
-	if msg.Type == tea.KeyRunes {
-		return Event{Type: TypeKey, Key: KeyRune, Runes: msg.Runes, Modifiers: mod, Raw: raw}
+	if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+		runes := msg.Runes
+		if len(runes) == 0 && msg.Type == tea.KeySpace {
+			runes = []rune{' '}
+		}
+		return Event{Type: TypeKey, Key: KeyRune, Runes: runes, Modifiers: mod, Raw: raw}
 	}
 	switch msg.Type {
 	case tea.KeyEnter:
@@ -65,7 +69,10 @@ func FromTeaKey(msg tea.KeyMsg) Event {
 	if msg.Type >= tea.KeyF1 && msg.Type <= tea.KeyF20 {
 		return Event{Type: TypeKey, Key: Key(int(KeyF1) + int(msg.Type-tea.KeyF1)), Modifiers: mod, Raw: raw}
 	}
-	return Event{Type: TypeKey, Raw: raw}
+	if len(msg.Runes) > 0 {
+		return Event{Type: TypeKey, Key: KeyRune, Runes: msg.Runes, Modifiers: mod, Raw: raw}
+	}
+	return Event{Type: TypeKey, Key: KeyUnknown, Raw: raw}
 }
 
 func FromTeaMouse(msg tea.MouseMsg) Event {

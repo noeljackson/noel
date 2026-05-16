@@ -23,7 +23,8 @@ const (
 type Key int
 
 const (
-	KeyEnter Key = iota
+	KeyUnknown Key = iota
+	KeyEnter
 	KeyEscape
 	KeyBackspace
 	KeyTab
