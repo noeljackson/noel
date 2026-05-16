@@ -16,15 +16,13 @@
 After code changes, run:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
+make check
 ```
 
 For TTY behavior changes, also run:
 
 ```bash
-scripts/e2e-tmux.sh
+make e2e
 ```
 
 ## Architecture

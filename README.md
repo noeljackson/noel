@@ -174,22 +174,19 @@ or an object map:
 ## Validation
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
+make check
 ```
 
 TTY e2e test:
 
 ```bash
-scripts/e2e-tmux.sh
+make e2e
 ```
 
 Dockerized TTY e2e test:
 
 ```bash
-docker build -f Dockerfile.e2e -t pi-e2e .
-docker run --rm pi-e2e
+make docker-e2e
 ```
 
 ## Development Notes

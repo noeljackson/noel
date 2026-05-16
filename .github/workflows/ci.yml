@@ -24,13 +24,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux
 
       - name: Format
-        run: cargo fmt --all -- --check
+        run: make fmt
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: make lint
 
       - name: Test
-        run: cargo test --all
+        run: make test
 
       - name: TTY e2e
-        run: scripts/e2e-tmux.sh
+        run: make e2e
