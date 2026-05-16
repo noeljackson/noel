@@ -250,13 +250,16 @@ func runTUI(resumeID string) error {
 		Messages:    messages,
 		Model:       cfg.Model,
 		Resources:   cfg.Resources,
+		Agent:       runner,
+		OpenBrowser: openBrowser,
 		Submit: func(text string) {
 			select {
 			case submitCh <- text:
 			case <-rootCtx.Done():
 			}
 		},
-		Abort: runner.Abort,
+		Abort:  runner.Abort,
+		Logout: runLogout,
 	})
 
 	programDone := make(chan error, 1)
