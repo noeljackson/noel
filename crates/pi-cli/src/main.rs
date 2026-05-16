@@ -1609,6 +1609,7 @@ async fn handle_tui_submission(
         ),
         "/model" | "/scoped-models" => open_tui_selector(app, config, runtime, "model", "")?,
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
+        "/changelog" => app.push(TuiEntryKind::System, format_changelog()),
         "/settings" => app.push(TuiEntryKind::System, format_settings(config, runtime)),
         "/status" => app.push(
             TuiEntryKind::System,
@@ -2253,6 +2254,74 @@ fn format_session(runtime: &Runtime) -> String {
             .store()
             .map(|store| store.path().display().to_string()),
     })
+}
+
+fn format_changelog() -> String {
+    let entries = changelog_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|content| parse_changelog_entries(&content))
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return "What's New\n\nNo changelog entries found.".to_string();
+    }
+    format!(
+        "What's New\n\n{}",
+        entries.into_iter().rev().collect::<Vec<_>>().join("\n\n")
+    )
+}
+
+fn changelog_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("CHANGELOG.md"));
+    }
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../CHANGELOG.md"));
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            candidates.push(ancestor.join("CHANGELOG.md"));
+        }
+    }
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn parse_changelog_entries(content: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = Vec::new();
+    let mut in_version = false;
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            if in_version && !current.is_empty() {
+                entries.push(current.join("\n").trim().to_string());
+            }
+            in_version = changelog_header_has_version(line);
+            current.clear();
+            if in_version {
+                current.push(line.to_string());
+            }
+        } else if in_version {
+            current.push(line.to_string());
+        }
+    }
+    if in_version && !current.is_empty() {
+        entries.push(current.join("\n").trim().to_string());
+    }
+    entries.retain(|entry| !entry.is_empty());
+    entries
+}
+
+fn changelog_header_has_version(line: &str) -> bool {
+    let version = line
+        .trim_start_matches("## ")
+        .trim()
+        .trim_start_matches('[')
+        .split([']', ' '])
+        .next()
+        .unwrap_or_default();
+    let parts = version.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|value| value.is_ascii_digit()))
 }
 
 fn format_sessions(session_dir: &Path) -> Result<String> {

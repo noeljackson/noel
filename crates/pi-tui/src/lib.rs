@@ -197,6 +197,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "show session info",
     },
     CommandHelp {
+        command: "/changelog",
+        description: "show changelog entries",
+    },
+    CommandHelp {
         command: "/new",
         description: "start a new session",
     },

@@ -234,6 +234,7 @@ or an object map:
 - `/model <provider/id>`
 - `/multiline`
 - `/session`
+- `/changelog`
 - `/new`
 - `/resume [id|name|path]`
 - `/fork [id|name|path]`
