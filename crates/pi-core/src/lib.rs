@@ -1301,6 +1301,7 @@ async fn complete_with_retry(
     loop {
         match provider.complete(request.clone()).await {
             Ok(events) => return Ok(events),
+            Err(error) if is_context_overflow_error(&error) => return Err(error),
             Err(error) if attempt + 1 >= max_attempts => return Err(error),
             Err(_) => {
                 let delay_ms = retry_delay_ms(retry.base_delay_ms, attempt);
@@ -1311,6 +1312,47 @@ async fn complete_with_retry(
             }
         }
     }
+}
+
+fn is_context_overflow_error(error: &ProviderError) -> bool {
+    let message = error.to_string().to_lowercase();
+    let non_overflow = [
+        "throttling error:",
+        "service unavailable:",
+        "rate limit",
+        "too many requests",
+    ];
+    if non_overflow.iter().any(|pattern| message.contains(pattern)) {
+        return false;
+    }
+    [
+        "prompt is too long",
+        "request_too_large",
+        "input is too long for requested model",
+        "exceeds the context window",
+        "input token count",
+        "maximum prompt length is",
+        "reduce the length of the messages",
+        "maximum context length is",
+        "longer than the model's context length",
+        "longer than the models context length",
+        "exceeds the limit of",
+        "exceeds the available context size",
+        "greater than the context length",
+        "context window exceeds limit",
+        "exceeded model token limit",
+        "too large for model with",
+        "model_context_window_exceeded",
+        "prompt too long; exceeded context length",
+        "prompt too long; exceeded max context length",
+        "context_length_exceeded",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+        "413",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 fn retry_delay_ms(base_delay_ms: u64, attempt: u64) -> u64 {
@@ -1888,6 +1930,37 @@ mod tests {
         assert_eq!(runtime.session().messages[0].role, MessageRole::User);
     }
 
+    #[tokio::test]
+    async fn provider_retry_skips_context_overflow_errors() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems {
+                retry: RuntimeRetrySettings {
+                    enabled: true,
+                    max_retries: 3,
+                    base_delay_ms: 0,
+                },
+                ..ReloadableSystems::default()
+            },
+        );
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let provider = OverflowProvider {
+            attempts: Arc::clone(&attempts),
+        };
+
+        let error = run_user_turn(&mut runtime, &provider, "hello".to_string())
+            .await
+            .expect_err("context overflow should not retry");
+
+        assert!(matches!(
+            error,
+            AgentError::Provider(ProviderError::InvalidResponse(_))
+        ));
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(runtime.session().messages.len(), 1);
+        assert_eq!(runtime.session().messages[0].role, MessageRole::User);
+    }
+
     #[test]
     fn queued_messages_are_persisted_and_clearable() {
         let base = std::env::temp_dir().join(format!("pi-queue-test-{}", new_session_id()));
@@ -1989,6 +2062,23 @@ mod tests {
                     reason: "stop".to_string(),
                 },
             ])
+        }
+    }
+
+    struct OverflowProvider {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for OverflowProvider {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(ProviderError::InvalidResponse(
+                "Your input exceeds the context window of this model".to_string(),
+            ))
         }
     }
 }
