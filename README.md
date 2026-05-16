@@ -176,8 +176,12 @@ or an object map:
 
 - `/help`
 - `/settings`
+- `/status`
 - `/diagnostics`
 - `/hotkeys`
+- `/complete <prefix>`
+- `/history`
+- `/editor [text]`
 - `/skills`
 - `/skill:<name> [input]`
 - `/prompts`
@@ -189,6 +193,8 @@ or an object map:
 - `/interrupt`
 - `/models`
 - `/scoped-models`
+- `/selector <kind>`
+- `/select <kind> <query>`
 - `/model <provider/id>`
 - `/multiline`
 - `/session`
@@ -222,7 +228,7 @@ or an object map:
 
 `/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
 
-Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries.
+Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; `/editor` uses `PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`.
 
 ## RPC Methods
 

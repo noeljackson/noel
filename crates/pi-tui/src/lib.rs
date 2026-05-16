@@ -97,12 +97,28 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "show active settings",
     },
     CommandHelp {
+        command: "/status",
+        description: "show footer status",
+    },
+    CommandHelp {
         command: "/diagnostics",
         description: "show resource reload diagnostics",
     },
     CommandHelp {
         command: "/hotkeys",
         description: "show keybindings",
+    },
+    CommandHelp {
+        command: "/complete <prefix>",
+        description: "complete slash commands",
+    },
+    CommandHelp {
+        command: "/history",
+        description: "show prompt history",
+    },
+    CommandHelp {
+        command: "/editor [text]",
+        description: "compose a prompt in an external editor",
     },
     CommandHelp {
         command: "/skills",
@@ -147,6 +163,14 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     CommandHelp {
         command: "/scoped-models",
         description: "list scoped models",
+    },
+    CommandHelp {
+        command: "/selector <kind>",
+        description: "show selector options",
+    },
+    CommandHelp {
+        command: "/select <kind> <query>",
+        description: "select model, session, theme, or auth",
     },
     CommandHelp {
         command: "/model <provider/id>",
@@ -270,6 +294,136 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     },
 ];
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EditorState {
+    draft: String,
+    history: Vec<String>,
+    undo_stack: Vec<String>,
+    kill_ring: Vec<String>,
+}
+
+impl EditorState {
+    pub fn draft(&self) -> &str {
+        &self.draft
+    }
+
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
+    pub fn kill_ring(&self) -> &[String] {
+        &self.kill_ring
+    }
+
+    pub fn set_draft(&mut self, value: impl Into<String>) {
+        self.undo_stack.push(self.draft.clone());
+        self.draft = value.into();
+    }
+
+    pub fn insert(&mut self, value: &str) {
+        self.undo_stack.push(self.draft.clone());
+        self.draft.push_str(value);
+    }
+
+    pub fn kill_line(&mut self) -> Option<String> {
+        if self.draft.is_empty() {
+            return None;
+        }
+        self.undo_stack.push(self.draft.clone());
+        let killed = std::mem::take(&mut self.draft);
+        self.kill_ring.push(killed.clone());
+        Some(killed)
+    }
+
+    pub fn undo(&mut self) -> bool {
+        if let Some(previous) = self.undo_stack.pop() {
+            self.draft = previous;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn record_history(&mut self, value: impl Into<String>) {
+        let value = value.into();
+        if !value.trim().is_empty() {
+            self.history.push(value);
+        }
+    }
+
+    pub fn command_completions(prefix: &str) -> Vec<&'static str> {
+        COMMAND_HELP
+            .iter()
+            .map(|entry| entry.command)
+            .filter(|command| command.starts_with(prefix))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorItem {
+    pub label: String,
+    pub value: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selector {
+    pub title: String,
+    pub items: Vec<SelectorItem>,
+    pub selected: usize,
+}
+
+impl Selector {
+    pub fn new(title: impl Into<String>, items: Vec<SelectorItem>) -> Self {
+        Self {
+            title: title.into(),
+            items,
+            selected: 0,
+        }
+    }
+
+    pub fn filter(&self, query: &str) -> Self {
+        let query = query.to_lowercase();
+        let items = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.label.to_lowercase().contains(&query)
+                    || item.value.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+        Self {
+            title: self.title.clone(),
+            items,
+            selected: 0,
+        }
+    }
+
+    pub fn selected(&self) -> Option<&SelectorItem> {
+        self.items.get(self.selected)
+    }
+
+    pub fn select_query(&self, query: &str) -> Option<&SelectorItem> {
+        if let Ok(index) = query.parse::<usize>() {
+            if index > 0 {
+                return self.items.get(index - 1);
+            }
+        }
+        self.items
+            .iter()
+            .find(|item| item.value == query || item.label == query)
+            .or_else(|| {
+                self.filter(query).items.first().and_then(|item| {
+                    self.items
+                        .iter()
+                        .find(|candidate| candidate.value == item.value)
+                })
+            })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TerminalRenderer {
     theme: TerminalTheme,
@@ -356,6 +510,21 @@ impl TerminalRenderer {
         ]
         .join("\n")
     }
+
+    pub fn selector(&self, selector: &Selector) -> String {
+        let mut lines = vec![format!("{} selector", selector.title)];
+        lines.extend(selector.items.iter().enumerate().map(|(index, item)| {
+            let selected = if index == selector.selected { ">" } else { " " };
+            let active = if item.active { "*" } else { " " };
+            format!(
+                "{:>2}. {selected}{active} {}\t{}",
+                index + 1,
+                item.label,
+                item.value
+            )
+        }));
+        lines.join("\n")
+    }
 }
 
 pub fn default_keybindings() -> KeybindingMap {
@@ -420,5 +589,46 @@ mod tests {
         assert!(session.contains("session: s1"));
         assert!(session.contains("labels: a, b"));
         assert!(renderer.help().contains("/reload"));
+    }
+
+    #[test]
+    fn editor_tracks_history_undo_kill_ring_and_completions() {
+        let mut editor = EditorState::default();
+        editor.insert("hello");
+        editor.record_history(editor.draft().to_string());
+        assert_eq!(editor.history(), ["hello"]);
+        assert_eq!(editor.kill_line(), Some("hello".to_string()));
+        assert_eq!(editor.kill_ring(), ["hello"]);
+        assert!(editor.undo());
+        assert_eq!(editor.draft(), "hello");
+        assert!(EditorState::command_completions("/mo").contains(&"/model <provider/id>"));
+    }
+
+    #[test]
+    fn selector_filters_and_selects_items() {
+        let selector = Selector::new(
+            "model",
+            vec![
+                SelectorItem {
+                    label: "faux/echo".to_string(),
+                    value: "faux/echo".to_string(),
+                    active: true,
+                },
+                SelectorItem {
+                    label: "openai/gpt".to_string(),
+                    value: "openai/gpt".to_string(),
+                    active: false,
+                },
+            ],
+        );
+
+        assert_eq!(
+            selector.select_query("2").map(|item| item.value.as_str()),
+            Some("openai/gpt")
+        );
+        assert_eq!(selector.filter("faux").items.len(), 1);
+        assert!(TerminalRenderer::default()
+            .selector(&selector)
+            .contains("model selector"));
     }
 }

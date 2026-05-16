@@ -18,8 +18,8 @@ use pi_core::{
     CompactionKind, MessageRole, ReloadableSystems, Runtime, SessionState, SessionStore,
 };
 use pi_tui::{
-    Keybinding as TuiKeybinding, KeybindingMap, ModelView, SessionView, SettingsView,
-    TerminalRenderer, TerminalTheme,
+    EditorState, Keybinding as TuiKeybinding, KeybindingMap, ModelView, Selector, SelectorItem,
+    SessionView, SettingsView, TerminalRenderer, TerminalTheme,
 };
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -560,6 +560,7 @@ async fn run_interactive(
     println!("type /help for commands, /reload to reload config, /quit to exit");
     let stdin = io::stdin();
     let mut last_shell_command: Option<String> = None;
+    let mut editor_state = EditorState::default();
     loop {
         print!("{}", renderer.prompt());
         io::stdout().flush()?;
@@ -617,12 +618,50 @@ async fn run_interactive(
                 print_settings(&config, &runtime);
                 continue;
             }
+            "/status" => {
+                print_status(&config, &runtime, &editor_state);
+                continue;
+            }
             "/diagnostics" => {
                 print_diagnostics(&config);
                 continue;
             }
             "/hotkeys" => {
                 print_hotkeys(&config);
+                continue;
+            }
+            _ if line.starts_with("/complete ") => {
+                let prefix = line.trim_start_matches("/complete ").trim();
+                let completions = EditorState::command_completions(prefix);
+                if completions.is_empty() {
+                    println!("no completions");
+                } else {
+                    for completion in completions {
+                        println!("{completion}");
+                    }
+                }
+                continue;
+            }
+            "/history" => {
+                print_history(&editor_state);
+                continue;
+            }
+            _ if line.starts_with("/editor") => {
+                let initial = line.trim_start_matches("/editor").trim();
+                match read_external_editor_prompt(initial) {
+                    Ok(prompt) if !prompt.trim().is_empty() => {
+                        run_prompt_and_print(
+                            &mut runtime,
+                            &config,
+                            &mut editor_state,
+                            prompt,
+                            offline,
+                        )
+                        .await;
+                    }
+                    Ok(_) => println!("editor returned an empty prompt"),
+                    Err(error) => eprintln!("error: {error}"),
+                }
                 continue;
             }
             "/skills" => {
@@ -661,6 +700,15 @@ async fn run_interactive(
                 print_scoped_models(&config, &runtime);
                 continue;
             }
+            _ if line.starts_with("/selector ") => {
+                let kind = line.trim_start_matches("/selector ").trim();
+                print_selector(&config, &runtime, kind)?;
+                continue;
+            }
+            _ if line.starts_with("/select ") => {
+                select_from_selector(&mut config, &mut runtime, &line)?;
+                continue;
+            }
             _ if line.starts_with("/model ") => {
                 let reference = line.trim_start_matches("/model ").trim();
                 let model = resolve_model_reference(&config, reference)
@@ -678,7 +726,8 @@ async fn run_interactive(
                 } else {
                     format!("{}\n\n{}", skill.content, input)
                 };
-                run_prompt_and_print(&mut runtime, &config, prompt, offline).await;
+                run_prompt_and_print(&mut runtime, &config, &mut editor_state, prompt, offline)
+                    .await;
                 continue;
             }
             _ if line.starts_with("/prompt ") => {
@@ -687,7 +736,8 @@ async fn run_interactive(
                 let template = find_resource(&config.prompt_templates, name)
                     .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
                 let prompt = expand_prompt_template(&template.content, input);
-                run_prompt_and_print(&mut runtime, &config, prompt, offline).await;
+                run_prompt_and_print(&mut runtime, &config, &mut editor_state, prompt, offline)
+                    .await;
                 continue;
             }
             _ if line.starts_with("/theme ") => {
@@ -700,7 +750,8 @@ async fn run_interactive(
             }
             "/multiline" => {
                 let prompt = read_multiline_prompt(&stdin)?;
-                run_prompt_and_print(&mut runtime, &config, prompt, offline).await;
+                run_prompt_and_print(&mut runtime, &config, &mut editor_state, prompt, offline)
+                    .await;
                 continue;
             }
             _ if line.starts_with("/new") => {
@@ -862,7 +913,7 @@ async fn run_interactive(
             _ => {}
         }
 
-        run_prompt_and_print(&mut runtime, &config, line, offline).await;
+        run_prompt_and_print(&mut runtime, &config, &mut editor_state, line, offline).await;
     }
     Ok(())
 }
@@ -916,9 +967,11 @@ async fn run_prompt(
 async fn run_prompt_and_print(
     runtime: &mut Runtime,
     config: &LoadedConfig,
+    editor_state: &mut EditorState,
     prompt: String,
     offline: bool,
 ) {
+    editor_state.record_history(prompt.clone());
     if let Err(error) = run_prompt_with_queue(runtime, config, prompt, offline, true).await {
         eprintln!("error: {error}");
     }
@@ -1195,6 +1248,80 @@ fn print_hotkeys(config: &LoadedConfig) {
     );
 }
 
+fn print_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) {
+    println!(
+        "status\tmodel:{}\ttheme:{}\tqueue:{}\thistory:{}\tdiagnostics:{}",
+        runtime
+            .session()
+            .active_model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .unwrap_or_else(|| "-".to_string()),
+        config
+            .settings
+            .theme
+            .clone()
+            .unwrap_or_else(|| "-".to_string()),
+        runtime.session().queued_messages.len(),
+        editor_state.history().len(),
+        config.diagnostics.len()
+    );
+}
+
+fn print_history(editor_state: &EditorState) {
+    if editor_state.history().is_empty() {
+        println!("history is empty");
+        return;
+    }
+    for (index, entry) in editor_state.history().iter().enumerate() {
+        println!("{}.\t{}", index + 1, entry);
+    }
+}
+
+fn read_external_editor_prompt(initial: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(format!(
+        "pi-editor-{}-{}.txt",
+        std::process::id(),
+        unique_temp_suffix()
+    ));
+    fs::write(&path, initial)?;
+    if let Ok(command) = std::env::var("PI_EDITOR_COMMAND") {
+        let command = command.replace("{file}", &shell_quote(&path.display().to_string()));
+        run_editor_command(&command)?;
+    } else {
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .map_err(|_| anyhow!("set PI_EDITOR_COMMAND, VISUAL, or EDITOR"))?;
+        run_editor_command(&format!(
+            "{editor} {}",
+            shell_quote(&path.display().to_string())
+        ))?;
+    }
+    let content = fs::read_to_string(&path)?;
+    let _ = fs::remove_file(path);
+    Ok(content.trim().to_string())
+}
+
+fn run_editor_command(command: &str) -> Result<()> {
+    let status = Command::new("sh").arg("-c").arg(command).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("editor command failed: {command}"))
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn unique_temp_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
 fn print_diagnostics(config: &LoadedConfig) {
     if config.diagnostics.is_empty() {
         println!("no diagnostics");
@@ -1202,6 +1329,121 @@ fn print_diagnostics(config: &LoadedConfig) {
     }
     for diagnostic in &config.diagnostics {
         println!("diagnostic: {diagnostic}");
+    }
+}
+
+fn print_selector(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Result<()> {
+    let selector = selector_for_kind(config, runtime, kind)?;
+    println!("{}", terminal_renderer(config).selector(&selector));
+    Ok(())
+}
+
+fn select_from_selector(
+    config: &mut LoadedConfig,
+    runtime: &mut Runtime,
+    line: &str,
+) -> Result<()> {
+    let rest = line.trim_start_matches("/select ").trim();
+    let (kind, query) = split_once_text(rest);
+    if query.is_empty() {
+        return Err(anyhow!("usage: /select <kind> <query>"));
+    }
+    let selector = selector_for_kind(config, runtime, kind)?;
+    let item = selector
+        .select_query(query)
+        .ok_or_else(|| anyhow!("selector item not found: {query}"))?;
+    match kind {
+        "model" | "models" | "scoped-models" => {
+            let model = resolve_model_reference(config, &item.value)
+                .ok_or_else(|| anyhow!("model not found: {}", item.value))?;
+            runtime.set_active_model(Some(model.clone()))?;
+            println!("model: {}/{}", model.provider, model.id);
+        }
+        "theme" | "themes" => {
+            config.settings.theme = Some(item.value.clone());
+            println!("theme: {}", item.value);
+        }
+        "session" | "sessions" => {
+            let path = resolve_session_reference(&config.paths.session_dir, &item.value)?;
+            let (store, state) = SessionStore::open(path)?;
+            runtime.replace_session(state, Some(store));
+            print_session(runtime);
+        }
+        "auth" => {
+            println!("auth: {}", item.value);
+        }
+        _ => return Err(anyhow!("unknown selector: {kind}")),
+    }
+    Ok(())
+}
+
+fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Result<Selector> {
+    match kind {
+        "model" | "models" | "scoped-models" => Ok(Selector::new(
+            "model",
+            config
+                .models
+                .iter()
+                .map(|model| {
+                    let value = format!("{}/{}", model.provider, model.id);
+                    SelectorItem {
+                        label: value.clone(),
+                        value,
+                        active: runtime
+                            .session()
+                            .active_model
+                            .as_ref()
+                            .map(|active| {
+                                active.provider == model.provider && active.id == model.id
+                            })
+                            .unwrap_or(false),
+                    }
+                })
+                .collect(),
+        )),
+        "theme" | "themes" => Ok(Selector::new(
+            "theme",
+            config
+                .themes
+                .iter()
+                .map(|theme| SelectorItem {
+                    label: theme.name.clone(),
+                    value: theme.name.clone(),
+                    active: config.settings.theme.as_deref() == Some(theme.name.as_str()),
+                })
+                .collect(),
+        )),
+        "session" | "sessions" => Ok(Selector::new(
+            "session",
+            SessionStore::list(&config.paths.session_dir)?
+                .into_iter()
+                .map(|session| SelectorItem {
+                    label: session.name.unwrap_or_else(|| session.session_id.clone()),
+                    value: session.session_id.clone(),
+                    active: runtime.session().session_id == session.session_id,
+                })
+                .collect(),
+        )),
+        "auth" => Ok(Selector::new(
+            "auth",
+            config
+                .models
+                .iter()
+                .map(|model| model.provider.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|provider| SelectorItem {
+                    label: provider.clone(),
+                    value: if auth_for_provider(&config.auth, &provider).is_some() {
+                        format!("{provider}: available")
+                    } else {
+                        format!("{provider}: missing")
+                    },
+                    active: auth_for_provider(&config.auth, &provider).is_some(),
+                })
+                .collect(),
+        )),
+        _ => Err(anyhow!("unknown selector: {kind}")),
     }
 }
 

@@ -29,7 +29,7 @@ printf '{"name":"dark"}\n' > "${agent_dir}/themes/dark.json"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${repo_root}' && PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${repo_root}' && PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -53,6 +53,10 @@ send_line() {
 
 send_line "/session"
 send_line "hello from tmux e2e"
+send_line "/complete /mo"
+send_line "/status"
+send_line "/editor draft"
+send_line "/history"
 send_line "/write target/e2e-tmux-work/file.txt e2e-ok"
 send_line "/read target/e2e-tmux-work/file.txt"
 send_line "/reload"
@@ -74,8 +78,12 @@ send_line "/skill:review skill input"
 send_line "/prompts"
 send_line "/prompt fix broken thing"
 send_line "/themes"
+send_line "/selector theme"
+send_line "/select theme 1"
 send_line "/theme dark"
 send_line "/scoped-models"
+send_line "/selector model"
+send_line "/select model 1"
 send_line "/model"
 send_line "/model 1"
 send_line "/hotkeys"
@@ -122,6 +130,10 @@ require_output() {
 
 require_output "pi rust cli"
 require_output "[faux/echo] hello from tmux e2e"
+require_output "/model <provider/id>"
+require_output "status"
+require_output "[faux/echo] editor-prompt"
+require_output "hello from tmux e2e"
 require_output "wrote ${repo_root}/target/e2e-tmux-work/file.txt"
 require_output "e2e-ok"
 require_output "reloaded"
@@ -143,6 +155,8 @@ require_output "skill input"
 require_output "fix"
 require_output "fix broken thing"
 require_output "theme: dark"
+require_output "theme selector"
+require_output "model selector"
 require_output "* faux/echo"
 require_output "model: faux/echo"
 require_output "submit"
