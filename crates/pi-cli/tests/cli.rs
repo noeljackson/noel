@@ -67,6 +67,23 @@ fn json_mode_prints_structured_response() {
 }
 
 #[test]
+fn list_models_accepts_optional_search() {
+    let output = pi_command()
+        .args(["--list-models", "faux"])
+        .output()
+        .expect("run pi");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("faux/echo"));
+    assert!(!stdout.contains("openai/gpt"));
+}
+
+#[test]
 fn package_commands_manage_settings_sources() {
     let root = test_dir("pi-cli-package-commands");
     let agent = root.join("agent");

@@ -91,8 +91,8 @@ struct Cli {
     #[arg(long)]
     thinking: Option<String>,
 
-    #[arg(long)]
-    list_models: bool,
+    #[arg(long, num_args = 0..=1, value_name = "SEARCH")]
+    list_models: Option<Option<String>>,
 
     #[arg(long)]
     system_prompt: Option<String>,
@@ -416,8 +416,22 @@ async fn main() -> Result<()> {
         eprintln!("session dir: {}", config.paths.session_dir.display());
     }
 
-    if cli.list_models {
+    if let Some(search) = &cli.list_models {
+        let search = search.as_deref().map(str::to_lowercase);
         for model in &config.models {
+            if let Some(search) = &search {
+                let display = format!(
+                    "{}/{} {} {:?}",
+                    model.provider,
+                    model.id,
+                    model.name.as_deref().unwrap_or_default(),
+                    model.api
+                )
+                .to_lowercase();
+                if !display.contains(search) {
+                    continue;
+                }
+            }
             println!("{}/{}\t{:?}", model.provider, model.id, model.api);
         }
         return Ok(());
