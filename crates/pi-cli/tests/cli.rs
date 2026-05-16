@@ -67,6 +67,88 @@ fn json_mode_prints_structured_response() {
 }
 
 #[test]
+fn package_commands_manage_settings_sources() {
+    let root = test_dir("pi-cli-package-commands");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+
+    let install_user = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["install", "./user-plugin"])
+        .output()
+        .expect("install user package");
+    assert!(
+        install_user.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install_user.stderr)
+    );
+
+    let install_project = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["install", "./project-plugin", "--local"])
+        .output()
+        .expect("install project package");
+    assert!(
+        install_project.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install_project.stderr)
+    );
+
+    let user_settings = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(agent.join("settings.json")).expect("user settings"),
+    )
+    .expect("parse user settings");
+    assert_eq!(user_settings["packages"][0], "./user-plugin");
+    let project_settings = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(root.join(".pi/settings.json")).expect("project settings"),
+    )
+    .expect("parse project settings");
+    assert_eq!(project_settings["packages"][0], "./project-plugin");
+
+    let list = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .arg("list")
+        .output()
+        .expect("list packages");
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(stdout.contains("user: ./user-plugin"));
+    assert!(stdout.contains("project: ./project-plugin"));
+
+    let remove = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["remove", "./user-plugin"])
+        .output()
+        .expect("remove user package");
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let user_settings = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(agent.join("settings.json")).expect("user settings after remove"),
+    )
+    .expect("parse user settings after remove");
+    assert_eq!(
+        user_settings["packages"]
+            .as_array()
+            .expect("packages")
+            .len(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn continue_reopens_most_recent_session() {
     let root = test_dir("pi-cli-continue");
     let sessions = root.join("sessions");

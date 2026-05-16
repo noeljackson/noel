@@ -19,7 +19,8 @@ use pi_ai::{
 };
 use pi_config::{
     auth_for_provider, has_auth_for_provider, load_config, AuthCredential, ConfigPaths,
-    LoadedConfig, ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, ENV_SESSION_DIR,
+    LoadedConfig, ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, Settings,
+    ENV_SESSION_DIR,
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
@@ -145,8 +146,254 @@ struct Cli {
     messages: Vec<String>,
 }
 
+fn try_run_package_command() -> Result<bool> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(false);
+    };
+    match command {
+        "install" => {
+            run_package_install(&args[1..])?;
+            Ok(true)
+        }
+        "remove" | "uninstall" => {
+            run_package_remove(&args[1..])?;
+            Ok(true)
+        }
+        "update" => {
+            run_package_update(&args[1..])?;
+            Ok(true)
+        }
+        "list" => {
+            run_package_list(&args[1..])?;
+            Ok(true)
+        }
+        "config" => {
+            run_package_config(&args[1..])?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn run_package_install(args: &[String]) -> Result<()> {
+    let (local, rest) = parse_package_scope_args(args)?;
+    if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_package_help("install");
+        return Ok(());
+    }
+    let source = single_package_source("install", &rest)?;
+    let path = package_settings_path(local)?;
+    mutate_settings_packages(&path, |packages| {
+        if !packages.iter().any(|package| package == &source) {
+            packages.push(source.clone());
+        }
+    })?;
+    println!(
+        "recorded package source in {} settings: {source}",
+        if local { "project" } else { "user" }
+    );
+    Ok(())
+}
+
+fn run_package_remove(args: &[String]) -> Result<()> {
+    let (local, rest) = parse_package_scope_args(args)?;
+    if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_package_help("remove");
+        return Ok(());
+    }
+    let source = single_package_source("remove", &rest)?;
+    let path = package_settings_path(local)?;
+    let mut removed = false;
+    mutate_settings_packages(&path, |packages| {
+        let before = packages.len();
+        packages.retain(|package| package != &source);
+        removed = packages.len() != before;
+    })?;
+    if removed {
+        println!(
+            "removed package source from {} settings: {source}",
+            if local { "project" } else { "user" }
+        );
+    } else {
+        println!(
+            "package source not present in {} settings: {source}",
+            if local { "project" } else { "user" }
+        );
+    }
+    Ok(())
+}
+
+fn run_package_update(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_package_help("update");
+        return Ok(());
+    }
+    if let Some(invalid) = args.iter().find(|arg| arg.starts_with('-')) {
+        return Err(anyhow!("unknown update option: {invalid}"));
+    }
+    let target = args.first().map(String::as_str).unwrap_or("all");
+    println!("update target '{target}' is recorded; Rust no-npm builds reload local resources at startup");
+    Ok(())
+}
+
+fn run_package_list(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_package_help("list");
+        return Ok(());
+    }
+    if let Some(invalid) = args.first() {
+        return Err(anyhow!("unknown list argument: {invalid}"));
+    }
+    let cwd = std::env::current_dir()?;
+    let paths = ConfigPaths::discover(cwd, None)?;
+    print_package_sources("user", &paths.settings_path)?;
+    print_package_sources("project", &paths.project_settings_path)?;
+    Ok(())
+}
+
+fn run_package_config(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_package_help("config");
+        return Ok(());
+    }
+    if let Some(invalid) = args.first() {
+        return Err(anyhow!("unknown config argument: {invalid}"));
+    }
+    let cwd = std::env::current_dir()?;
+    let paths = ConfigPaths::discover(cwd, None)?;
+    let config = load_config(paths)?;
+    println!("agent dir: {}", config.paths.agent_dir.display());
+    println!(
+        "project settings: {}",
+        config.paths.project_settings_path.display()
+    );
+    println!("user settings: {}", config.paths.settings_path.display());
+    println!(
+        "packages: {}",
+        if config.settings.packages.is_empty() {
+            "-".to_string()
+        } else {
+            config.settings.packages.join(", ")
+        }
+    );
+    println!("skills: {}", config.skills.len());
+    println!("prompts: {}", config.prompt_templates.len());
+    println!("themes: {}", config.themes.len());
+    Ok(())
+}
+
+fn parse_package_scope_args(args: &[String]) -> Result<(bool, Vec<String>)> {
+    let mut local = false;
+    let mut rest = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-l" | "--local" => local = true,
+            _ if arg.starts_with('-') && arg != "-h" && arg != "--help" => {
+                return Err(anyhow!("unknown package option: {arg}"));
+            }
+            _ => rest.push(arg.clone()),
+        }
+    }
+    Ok((local, rest))
+}
+
+fn single_package_source(command: &str, args: &[String]) -> Result<String> {
+    match args {
+        [source] => Ok(source.clone()),
+        [] => Err(anyhow!("usage: pi {command} <source> [-l]")),
+        [_, extra, ..] => Err(anyhow!("unexpected package argument: {extra}")),
+    }
+}
+
+fn package_settings_path(local: bool) -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let paths = ConfigPaths::discover(cwd, None)?;
+    Ok(if local {
+        paths.project_settings_path
+    } else {
+        paths.settings_path
+    })
+}
+
+fn mutate_settings_packages(path: &Path, mutate: impl FnOnce(&mut Vec<String>)) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut settings = if path.exists() {
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path)?)?
+    } else {
+        serde_json::json!({})
+    };
+    if !settings.is_object() {
+        return Err(anyhow!(
+            "settings file must contain a JSON object: {}",
+            path.display()
+        ));
+    }
+    let current = settings
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut packages = current;
+    mutate(&mut packages);
+    packages.sort();
+    settings["packages"] = serde_json::Value::Array(
+        packages
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect(),
+    );
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?),
+    )?;
+    Ok(())
+}
+
+fn print_package_sources(scope: &str, path: &Path) -> Result<()> {
+    let packages = read_settings_packages(path)?;
+    if packages.is_empty() {
+        println!("{scope}: no packages");
+    } else {
+        for package in packages {
+            println!("{scope}: {package}");
+        }
+    }
+    Ok(())
+}
+
+fn read_settings_packages(path: &Path) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let settings = serde_json::from_str::<Settings>(&fs::read_to_string(path)?)?;
+    Ok(settings.packages)
+}
+
+fn print_package_help(command: &str) {
+    match command {
+        "install" => println!("usage: pi install <source> [-l]\n\nRecord a package source in settings."),
+        "remove" => println!("usage: pi remove <source> [-l]\n\nRemove a package source from settings."),
+        "update" => println!("usage: pi update [source|self|pi]\n\nRust no-npm builds reload local resources at startup."),
+        "list" => println!("usage: pi list\n\nList package sources from user and project settings."),
+        "config" => println!("usage: pi config\n\nShow active resource configuration."),
+        _ => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if try_run_package_command()? {
+        return Ok(());
+    }
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd.clone(), cli.session_dir.clone())?;

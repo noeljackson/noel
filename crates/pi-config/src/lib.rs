@@ -101,6 +101,8 @@ pub struct Settings {
     pub quiet_startup: Option<bool>,
     #[serde(default)]
     pub session_dir: Option<String>,
+    #[serde(default)]
+    pub packages: Vec<String>,
 }
 
 impl Settings {
@@ -124,6 +126,11 @@ impl Settings {
             theme: overrides.theme.or(self.theme),
             quiet_startup: overrides.quiet_startup.or(self.quiet_startup),
             session_dir: overrides.session_dir.or(self.session_dir),
+            packages: if overrides.packages.is_empty() {
+                self.packages
+            } else {
+                overrides.packages
+            },
         }
     }
 }
