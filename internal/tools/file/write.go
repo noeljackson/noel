@@ -62,7 +62,7 @@ func (WriteTool) Execute(ctx context.Context, input json.RawMessage, tc agent.To
 			return err
 		}
 		var err error
-		result, err = textResult(tc.CallID, fmt.Sprintf("wrote %d bytes to %s", len(bytes), args.Path), toolcontract.WriteDetails{
+		result, err = textResult(tc.CallID, fmt.Sprintf("Successfully wrote %d bytes to %s", len(bytes), args.Path), toolcontract.WriteDetails{
 			Path:  path,
 			Bytes: len(bytes),
 			Lines: lineCount(args.Content),

@@ -330,6 +330,7 @@ func executeToolCall(ctx context.Context, cfg LoopConfig, tool Tool, call ToolUs
 		result, err = tool.Execute(ctx, input, ToolCallContext{
 			CallID: call.ID,
 			Cwd:    currentWorkingDirectory(),
+			Model:  cfg.Model,
 			OnUpdate: func(partial json.RawMessage) {
 				_ = emit(ToolExecutionUpdateEvent{CallID: call.ID, Partial: partial})
 			},

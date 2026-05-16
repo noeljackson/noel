@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/noeljackson/pi/internal/agent"
@@ -42,5 +43,34 @@ func TestWriteAtomicRename(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary files remain: %v", matches)
+	}
+	if !strings.Contains(toolText(t, result), "Successfully wrote 11 bytes to nested/file.txt") {
+		t.Fatalf("content = %q", toolText(t, result))
+	}
+	var details struct {
+		Path  string `json:"path"`
+		Bytes int    `json:"bytes"`
+		Lines int    `json:"lines"`
+	}
+	if err := json.Unmarshal(result.Details, &details); err != nil {
+		t.Fatalf("unmarshal details: %v", err)
+	}
+	if details.Bytes != 11 || details.Lines != 1 {
+		t.Fatalf("details = %#v", details)
+	}
+}
+
+func TestWriteCreatesParentDirectories(t *testing.T) {
+	dir := t.TempDir()
+	_, err := NewWriteTool().Execute(context.Background(), json.RawMessage(`{"path":"a/b/c.txt","content":"created"}`), agent.ToolCallContext{Cwd: dir})
+	if err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "a", "b", "c.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "created" {
+		t.Fatalf("content = %q", string(content))
 	}
 }

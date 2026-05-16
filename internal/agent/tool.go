@@ -43,6 +43,7 @@ type ToolRenderer interface {
 type ToolCallContext struct {
 	CallID   string
 	Cwd      string
+	Model    string
 	OnUpdate func(partial json.RawMessage)
 	Logger   *slog.Logger
 }

@@ -12,14 +12,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/noeljackson/pi/internal/agent"
 	toolcontract "github.com/noeljackson/pi/internal/tools"
 )
 
-var grepSchema = json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"type":{"type":"string"},"output_mode":{"type":"string","enum":["content","files_with_matches","count"]},"head_limit":{"type":"integer"}},"required":["pattern"],"additionalProperties":false}`)
+var grepSchema = json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"type":{"type":"string"},"output_mode":{"type":"string","enum":["content","files_with_matches","count"]},"head_limit":{"type":"integer"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer"},"limit":{"type":"integer"}},"required":["pattern"],"additionalProperties":false}`)
 
 // GrepTool searches file contents.
 type GrepTool struct{}
@@ -53,6 +52,10 @@ func (GrepTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 		Type       string `json:"type"`
 		OutputMode string `json:"output_mode"`
 		HeadLimit  int    `json:"head_limit"`
+		IgnoreCase bool   `json:"ignoreCase"`
+		Literal    bool   `json:"literal"`
+		Context    int    `json:"context"`
+		Limit      int    `json:"limit"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return agent.ToolResult{}, err
@@ -66,8 +69,12 @@ func (GrepTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 	if args.OutputMode != "content" && args.OutputMode != "files_with_matches" && args.OutputMode != "count" {
 		return agent.ToolResult{}, fmt.Errorf("output_mode must be content, files_with_matches, or count")
 	}
-	if args.HeadLimit <= 0 {
-		args.HeadLimit = 100
+	limit := args.Limit
+	if limit <= 0 {
+		limit = args.HeadLimit
+	}
+	if limit <= 0 {
+		limit = 100
 	}
 	rootInput := args.Path
 	if rootInput == "" {
@@ -75,24 +82,30 @@ func (GrepTool) Execute(ctx context.Context, input json.RawMessage, tc agent.Too
 	}
 	root := resolvePath(rootInput, tc.Cwd)
 
-	output, err := runGrep(ctx, root, grepOptions{
+	run, err := runGrep(ctx, root, grepOptions{
 		pattern:    args.Pattern,
 		glob:       args.Glob,
 		fileType:   args.Type,
 		outputMode: args.OutputMode,
-		headLimit:  args.HeadLimit,
+		limit:      limit,
+		ignoreCase: args.IgnoreCase,
+		literal:    args.Literal,
+		context:    args.Context,
 	})
 	if err != nil {
 		return agent.ToolResult{}, err
 	}
+	output := run.output
 	if output == "" {
 		output = "No matches found"
 	}
-	files, matches := grepStats(output, args.OutputMode)
-	return textResult(tc.CallID, truncateText(output, maxContentBytes), toolcontract.GrepDetails{
+	truncatedOutput := truncateText(output, maxContentBytes)
+	truncated := run.truncated || truncatedOutput != output
+	return textResult(tc.CallID, truncatedOutput, toolcontract.GrepDetails{
 		Pattern:    args.Pattern,
-		Files:      files,
-		Matches:    matches,
+		Files:      run.files,
+		Matches:    run.matches,
+		Truncated:  truncated,
 		OutputMode: args.OutputMode,
 	}, false)
 }
@@ -102,10 +115,20 @@ type grepOptions struct {
 	glob       string
 	fileType   string
 	outputMode string
-	headLimit  int
+	limit      int
+	ignoreCase bool
+	literal    bool
+	context    int
 }
 
-func runGrep(ctx context.Context, root string, options grepOptions) (string, error) {
+type grepRunResult struct {
+	output    string
+	files     []string
+	matches   int
+	truncated bool
+}
+
+func runGrep(ctx context.Context, root string, options grepOptions) (grepRunResult, error) {
 	rgPath, err := exec.LookPath("rg")
 	if err == nil {
 		return runRipgrep(ctx, rgPath, root, options)
@@ -113,19 +136,19 @@ func runGrep(ctx context.Context, root string, options grepOptions) (string, err
 	return walkGrep(ctx, root, options)
 }
 
-func runRipgrep(ctx context.Context, rgPath string, root string, options grepOptions) (string, error) {
-	args := []string{"--color=never", "--line-number"}
+func runRipgrep(ctx context.Context, rgPath string, root string, options grepOptions) (grepRunResult, error) {
+	args := []string{"--json", "--line-number", "--color=never", "--hidden"}
 	if options.glob != "" {
 		args = append(args, "--glob", options.glob)
 	}
 	if options.fileType != "" {
 		args = append(args, "--type", options.fileType)
 	}
-	switch options.outputMode {
-	case "files_with_matches":
-		args = append(args, "--files-with-matches")
-	case "count":
-		args = append(args, "--count")
+	if options.ignoreCase {
+		args = append(args, "--ignore-case")
+	}
+	if options.literal {
+		args = append(args, "--fixed-strings")
 	}
 	args = append(args, "--", options.pattern, root)
 
@@ -136,50 +159,72 @@ func runRipgrep(ctx context.Context, rgPath string, root string, options grepOpt
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			return grepRunResult{}, ctx.Err()
 		}
 		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
 			message := strings.TrimSpace(stderr.String())
 			if message == "" {
 				message = err.Error()
 			}
-			return "", fmt.Errorf("rg failed: %s", message)
+			return grepRunResult{}, fmt.Errorf("rg failed: %s", message)
 		}
 	}
-	return limitLines(relativizeGrepOutput(root, stdout.String(), options.outputMode), options.headLimit), nil
+	return formatRipgrepJSON(root, stdout.String(), options)
 }
 
-func relativizeGrepOutput(root string, output string, outputMode string) string {
+func formatRipgrepJSON(root string, output string, options grepOptions) (grepRunResult, error) {
 	scanner := bufio.NewScanner(strings.NewReader(output))
-	lines := []string{}
+	matches := []grepMatch{}
 	for scanner.Scan() {
-		line := strings.TrimRight(scanner.Text(), "\r")
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
-		if outputMode == "content" || outputMode == "count" {
-			index := strings.Index(line, ":")
-			if index > 0 {
-				prefix := line[:index]
-				if rel, ok := relativeUnder(root, prefix); ok {
-					line = filepath.ToSlash(rel) + line[index:]
-				}
-			}
-		} else if rel, ok := relativeUnder(root, line); ok {
-			line = filepath.ToSlash(rel)
+		var event struct {
+			Type string `json:"type"`
+			Data struct {
+				Path struct {
+					Text string `json:"text"`
+				} `json:"path"`
+				LineNumber int `json:"line_number"`
+				Lines      struct {
+					Text string `json:"text"`
+				} `json:"lines"`
+			} `json:"data"`
 		}
-		lines = append(lines, line)
+		if err := json.Unmarshal([]byte(line), &event); err != nil || event.Type != "match" {
+			continue
+		}
+		matches = append(matches, grepMatch{
+			path: event.Data.Path.Text,
+			line: event.Data.LineNumber,
+			text: strings.TrimSuffix(strings.ReplaceAll(event.Data.Lines.Text, "\r", ""), "\n"),
+			rel:  displayGrepPath(root, event.Data.Path.Text),
+		})
+		if len(matches) >= options.limit {
+			break
+		}
 	}
-	return strings.Join(lines, "\n")
+	return formatGrepMatches(root, matches, options), nil
 }
 
-func walkGrep(ctx context.Context, root string, options grepOptions) (string, error) {
-	pattern, err := regexp.Compile(options.pattern)
-	if err != nil {
-		return "", err
+type grepMatch struct {
+	path string
+	rel  string
+	line int
+	text string
+}
+
+func walkGrep(ctx context.Context, root string, options grepOptions) (grepRunResult, error) {
+	patternText := options.pattern
+	if options.ignoreCase {
+		patternText = "(?i)" + patternText
 	}
-	matchesByFile := map[string]int{}
-	lines := []string{}
+	pattern, err := regexp.Compile(patternText)
+	if err != nil {
+		return grepRunResult{}, err
+	}
+	matches := []grepMatch{}
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -214,47 +259,32 @@ func walkGrep(ctx context.Context, root string, options grepOptions) (string, er
 		for scanner.Scan() {
 			lineNumber++
 			line := scanner.Text()
-			if !pattern.MatchString(line) {
+			found := false
+			if options.literal {
+				haystack := line
+				needle := options.pattern
+				if options.ignoreCase {
+					haystack = strings.ToLower(haystack)
+					needle = strings.ToLower(needle)
+				}
+				found = strings.Contains(haystack, needle)
+			} else {
+				found = pattern.MatchString(line)
+			}
+			if !found {
 				continue
 			}
-			matchesByFile[displayPath]++
-			if options.outputMode == "content" {
-				lines = append(lines, fmt.Sprintf("%s:%d:%s", displayPath, lineNumber, line))
-				if len(lines) >= options.headLimit {
-					return filepath.SkipAll
-				}
+			matches = append(matches, grepMatch{path: path, rel: displayPath, line: lineNumber, text: line})
+			if len(matches) >= options.limit {
+				return filepath.SkipAll
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return grepRunResult{}, err
 	}
-
-	switch options.outputMode {
-	case "content":
-		return strings.Join(lines, "\n"), nil
-	case "files_with_matches":
-		files := make([]string, 0, len(matchesByFile))
-		for file := range matchesByFile {
-			files = append(files, file)
-		}
-		sort.Strings(files)
-		return limitLines(strings.Join(files, "\n"), options.headLimit), nil
-	case "count":
-		files := make([]string, 0, len(matchesByFile))
-		for file := range matchesByFile {
-			files = append(files, file)
-		}
-		sort.Strings(files)
-		counts := make([]string, 0, len(files))
-		for _, file := range files {
-			counts = append(counts, fmt.Sprintf("%s:%d", file, matchesByFile[file]))
-		}
-		return limitLines(strings.Join(counts, "\n"), options.headLimit), nil
-	default:
-		return "", fmt.Errorf("unsupported output mode: %s", options.outputMode)
-	}
+	return formatGrepMatches(root, matches, options), nil
 }
 
 func relativeUnder(root string, path string) (string, bool) {
@@ -303,44 +333,104 @@ func typeMatches(path string, fileType string) bool {
 	}
 }
 
-func limitLines(text string, limit int) string {
-	if limit <= 0 || text == "" {
-		return text
+func formatGrepMatches(root string, matches []grepMatch, options grepOptions) grepRunResult {
+	fileSet := map[string]struct{}{}
+	counts := map[string]int{}
+	for _, match := range matches {
+		fileSet[match.rel] = struct{}{}
+		counts[match.rel]++
 	}
-	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
-	if len(lines) <= limit {
-		return strings.Join(lines, "\n")
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
 	}
-	return strings.Join(lines[:limit], "\n")
+	sort.Strings(files)
+
+	linesTruncated := false
+	outputLines := []string{}
+	switch options.outputMode {
+	case "files_with_matches":
+		outputLines = append(outputLines, files...)
+	case "count":
+		for _, file := range files {
+			outputLines = append(outputLines, fmt.Sprintf("%s:%d", file, counts[file]))
+		}
+	default:
+		for _, match := range matches {
+			if options.context <= 0 {
+				text, truncated := truncateGrepLine(match.text)
+				linesTruncated = linesTruncated || truncated
+				outputLines = append(outputLines, fmt.Sprintf("%s:%d: %s", match.rel, match.line, text))
+				continue
+			}
+			block, truncated := grepContextBlock(match, options.context)
+			linesTruncated = linesTruncated || truncated
+			outputLines = append(outputLines, block...)
+		}
+	}
+	output := strings.Join(outputLines, "\n")
+	truncation := truncateHead(output, 1<<30, defaultMaxBytes)
+	truncated := len(matches) >= options.limit || truncation.Truncated || linesTruncated
+	if truncation.Truncated {
+		output = truncation.Content
+	}
+	notices := []string{}
+	if len(matches) >= options.limit && len(matches) > 0 {
+		notices = append(notices, fmt.Sprintf("%d matches limit reached. Use limit=%d for more, or refine pattern", options.limit, options.limit*2))
+	}
+	if truncation.Truncated {
+		notices = append(notices, fmt.Sprintf("%s limit reached", formatSize(defaultMaxBytes)))
+	}
+	if linesTruncated {
+		notices = append(notices, "Some lines truncated to 500 chars. Use read tool to see full lines")
+	}
+	if len(notices) > 0 && output != "" {
+		output += "\n\n[" + strings.Join(notices, ". ") + "]"
+	}
+	return grepRunResult{output: output, files: files, matches: len(matches), truncated: truncated}
 }
 
-func grepStats(output string, outputMode string) (int, int) {
-	if output == "" || output == "No matches found" {
-		return 0, 0
+func displayGrepPath(root string, path string) string {
+	if rel, ok := relativeUnder(root, path); ok {
+		return filepath.ToSlash(rel)
 	}
-	files := make(map[string]struct{})
-	matches := 0
-	for _, line := range strings.Split(strings.TrimRight(output, "\n"), "\n") {
-		if line == "" {
-			continue
-		}
-		matches++
-		file := line
-		if outputMode == "content" || outputMode == "count" {
-			if index := strings.Index(line, ":"); index > 0 {
-				file = line[:index]
-			}
-		}
-		files[file] = struct{}{}
-		if outputMode == "count" {
-			if index := strings.LastIndex(line, ":"); index > 0 {
-				if count, err := strconv.Atoi(line[index+1:]); err == nil {
-					matches += count - 1
-				}
-			}
+	return filepath.ToSlash(filepath.Base(path))
+}
+
+func grepContextBlock(match grepMatch, contextLines int) ([]string, bool) {
+	data, err := os.ReadFile(match.path)
+	if err != nil {
+		return []string{fmt.Sprintf("%s:%d: (unable to read file)", match.rel, match.line)}, false
+	}
+	lines := strings.Split(strings.ReplaceAll(strings.ReplaceAll(string(data), "\r\n", "\n"), "\r", "\n"), "\n")
+	start := match.line - contextLines
+	if start < 1 {
+		start = 1
+	}
+	end := match.line + contextLines
+	if end > len(lines) {
+		end = len(lines)
+	}
+	output := make([]string, 0, end-start+1)
+	truncatedAny := false
+	for current := start; current <= end; current++ {
+		text, truncated := truncateGrepLine(lines[current-1])
+		truncatedAny = truncatedAny || truncated
+		if current == match.line {
+			output = append(output, fmt.Sprintf("%s:%d: %s", match.rel, current, text))
+		} else {
+			output = append(output, fmt.Sprintf("%s-%d- %s", match.rel, current, text))
 		}
 	}
-	return len(files), matches
+	return output, truncatedAny
+}
+
+func truncateGrepLine(line string) (string, bool) {
+	const limit = 500
+	if len(line) <= limit {
+		return line, false
+	}
+	return line[:limit] + "... [truncated]", true
 }
 
 var _ agent.Tool = (*GrepTool)(nil)
