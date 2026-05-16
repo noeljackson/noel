@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -41,7 +41,21 @@ pub struct ProviderConfig {
     pub model: ModelRef,
     pub api: ProviderApi,
     pub base_url: Option<String>,
-    pub api_key: Option<String>,
+    pub auth: ProviderAuth,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ProviderAuth {
+    #[default]
+    None,
+    ApiKey(String),
+    ClaudeCodeOAuth {
+        access_token: String,
+    },
+    ChatGptOAuth {
+        access_token: String,
+        account_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +85,11 @@ pub enum ProviderError {
     MissingApiKey { provider: String },
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("request failed with status {status}: {body}")]
+    Status {
+        status: reqwest::StatusCode,
+        body: String,
+    },
     #[error("invalid header value: {0}")]
     Header(#[from] reqwest::header::InvalidHeaderValue),
     #[error("provider returned an invalid response: {0}")]
@@ -124,6 +143,9 @@ struct OpenAiProvider {
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
+        if let ProviderAuth::ChatGptOAuth { .. } = &self.config.auth {
+            return self.complete_with_chatgpt(request).await;
+        }
         let api_key = self.api_key()?;
         let url = format!(
             "{}/chat/completions",
@@ -142,8 +164,9 @@ impl Provider for OpenAiProvider {
                 "messages": messages,
             }))
             .send()
+            .await?;
+        let response = error_for_status_with_body(response)
             .await?
-            .error_for_status()?
             .json::<Value>()
             .await?;
         let text = response
@@ -164,13 +187,57 @@ impl Provider for OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    fn api_key(&self) -> Result<String, ProviderError> {
-        self.config
-            .api_key
-            .clone()
-            .ok_or_else(|| ProviderError::MissingApiKey {
-                provider: self.config.model.provider.clone(),
+    async fn complete_with_chatgpt(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        let url = format!(
+            "{}/responses",
+            self.config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://chatgpt.com/backend-api/codex")
+                .trim_end_matches('/')
+        );
+        let response = reqwest::Client::new()
+            .post(url)
+            .headers(chatgpt_headers(&self.config.auth)?)
+            .json(&json!({
+                "model": self.config.model.id,
+                "instructions": request.system_prompt.clone().unwrap_or_default(),
+                "input": openai_responses_input(&request),
+                "tools": [],
+                "tool_choice": "auto",
+                "parallel_tool_calls": false,
+                "store": false,
+                "stream": true,
+                "include": [],
+            }))
+            .send()
+            .await?;
+        let body = error_for_status_with_body(response).await?.text().await?;
+        let text = parse_openai_responses_sse_text(&body)
+            .or_else(|| {
+                serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|response| parse_openai_responses_text(&response))
             })
+            .ok_or_else(|| ProviderError::InvalidResponse(body.clone()))?;
+        Ok(vec![
+            StreamEvent::Text(text),
+            StreamEvent::Stop {
+                reason: "completed".to_string(),
+            },
+        ])
+    }
+
+    fn api_key(&self) -> Result<String, ProviderError> {
+        match &self.config.auth {
+            ProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
+            _ => Err(ProviderError::MissingApiKey {
+                provider: self.config.model.provider.clone(),
+            }),
+        }
     }
 }
 
@@ -191,7 +258,26 @@ impl Provider for AnthropicProvider {
                 .trim_end_matches('/')
         );
         let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", HeaderValue::from_str(&api_key)?);
+        match &self.config.auth {
+            ProviderAuth::ApiKey(_) => {
+                headers.insert("x-api-key", HeaderValue::from_str(&api_key)?);
+            }
+            ProviderAuth::ClaudeCodeOAuth { access_token } => {
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {access_token}"))?,
+                );
+                headers.insert(
+                    "anthropic-beta",
+                    HeaderValue::from_static("oauth-2025-04-20"),
+                );
+            }
+            _ => {
+                return Err(ProviderError::MissingApiKey {
+                    provider: self.config.model.provider.clone(),
+                });
+            }
+        }
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -205,8 +291,9 @@ impl Provider for AnthropicProvider {
                 "messages": anthropic_messages(&request.messages),
             }))
             .send()
+            .await?;
+        let response = error_for_status_with_body(response)
             .await?
-            .error_for_status()?
             .json::<Value>()
             .await?;
         let text = response
@@ -236,12 +323,13 @@ impl Provider for AnthropicProvider {
 
 impl AnthropicProvider {
     fn api_key(&self) -> Result<String, ProviderError> {
-        self.config
-            .api_key
-            .clone()
-            .ok_or_else(|| ProviderError::MissingApiKey {
+        match &self.config.auth {
+            ProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
+            ProviderAuth::ClaudeCodeOAuth { .. } => Ok(String::new()),
+            _ => Err(ProviderError::MissingApiKey {
                 provider: self.config.model.provider.clone(),
-            })
+            }),
+        }
     }
 }
 
@@ -271,8 +359,9 @@ impl Provider for GoogleProvider {
                 "contents": google_messages(&request.messages),
             }))
             .send()
+            .await?;
+        let response = error_for_status_with_body(response)
             .await?
-            .error_for_status()?
             .json::<Value>()
             .await?;
         let text = response
@@ -302,12 +391,12 @@ impl Provider for GoogleProvider {
 
 impl GoogleProvider {
     fn api_key(&self) -> Result<String, ProviderError> {
-        self.config
-            .api_key
-            .clone()
-            .ok_or_else(|| ProviderError::MissingApiKey {
+        match &self.config.auth {
+            ProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
+            _ => Err(ProviderError::MissingApiKey {
                 provider: self.config.model.provider.clone(),
-            })
+            }),
+        }
     }
 }
 
@@ -318,6 +407,40 @@ fn bearer_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
         HeaderValue::from_str(&format!("Bearer {api_key}"))?,
     );
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(headers)
+}
+
+async fn error_for_status_with_body(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, ProviderError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(ProviderError::Status { status, body })
+}
+
+fn chatgpt_headers(auth: &ProviderAuth) -> Result<HeaderMap, ProviderError> {
+    let ProviderAuth::ChatGptOAuth {
+        access_token,
+        account_id,
+    } = auth
+    else {
+        return Err(ProviderError::MissingApiKey {
+            provider: "openai".to_string(),
+        });
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {access_token}"))?,
+    );
+    if let Some(account_id) = account_id {
+        headers.insert("ChatGPT-Account-ID", HeaderValue::from_str(account_id)?);
+    }
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     Ok(headers)
 }
 
@@ -333,6 +456,94 @@ fn openai_messages(request: &ProviderRequest) -> Vec<Value> {
         })
     }));
     messages
+}
+
+fn openai_responses_input(request: &ProviderRequest) -> Vec<Value> {
+    request
+        .messages
+        .iter()
+        .map(|message| {
+            json!({
+                "role": role_name(&message.role),
+                "content": [{
+                    "type": if message.role == ChatRole::Assistant { "output_text" } else { "input_text" },
+                    "text": message.content,
+                }],
+            })
+        })
+        .collect()
+}
+
+fn parse_openai_responses_text(response: &Value) -> Option<String> {
+    if let Some(text) = response.get("output_text").and_then(Value::as_str) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let text = response
+        .get("output")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn parse_openai_responses_sse_text(body: &str) -> Option<String> {
+    let mut text = String::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") | Some("output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    text.push_str(delta);
+                }
+            }
+            Some("response.output_item.done") | Some("output_item.done") if text.is_empty() => {
+                if let Some(item_text) =
+                    event.get("item").and_then(parse_openai_responses_item_text)
+                {
+                    text.push_str(&item_text);
+                }
+            }
+            _ => {}
+        }
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn parse_openai_responses_item_text(item: &Value) -> Option<String> {
+    let text = item
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
@@ -383,7 +594,7 @@ mod tests {
             },
             api: ProviderApi::Faux,
             base_url: None,
-            api_key: None,
+            auth: ProviderAuth::None,
         });
 
         let events = provider
@@ -400,6 +611,66 @@ mod tests {
         assert_eq!(
             events[0],
             StreamEvent::Text("[faux/echo] hello".to_string())
+        );
+    }
+
+    #[test]
+    fn chatgpt_oauth_headers_include_bearer_and_account_id() {
+        let headers = chatgpt_headers(&ProviderAuth::ChatGptOAuth {
+            access_token: "access-token".to_string(),
+            account_id: Some("account-id".to_string()),
+        })
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer access-token")
+        );
+        assert_eq!(
+            headers
+                .get("ChatGPT-Account-ID")
+                .and_then(|value| value.to_str().ok()),
+            Some("account-id")
+        );
+    }
+
+    #[test]
+    fn parses_openai_responses_text_shapes() {
+        let direct = json!({ "output_text": "hello" });
+        assert_eq!(
+            parse_openai_responses_text(&direct),
+            Some("hello".to_string())
+        );
+
+        let nested = json!({
+            "output": [{
+                "content": [
+                    { "type": "output_text", "text": "hel" },
+                    { "type": "output_text", "text": "lo" }
+                ]
+            }]
+        });
+        assert_eq!(
+            parse_openai_responses_text(&nested),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_openai_responses_sse_delta_text() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+            "data: [DONE]\n"
+        );
+
+        assert_eq!(
+            parse_openai_responses_sse_text(body),
+            Some("hello".to_string())
         );
     }
 }

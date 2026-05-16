@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
-use pi_ai::{create_provider, ModelRef, ProviderApi as AiProviderApi, ProviderConfig};
+use pi_ai::{
+    create_provider, ModelRef, ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig,
+};
 use pi_config::{
-    api_key_for_provider, load_config, ConfigPaths, LoadedConfig, ProviderApi as ConfigProviderApi,
-    ENV_SESSION_DIR,
+    auth_for_provider, has_auth_for_provider, load_config, ConfigPaths, LoadedConfig,
+    ProviderApi as ConfigProviderApi, ResolvedAuth, ENV_SESSION_DIR,
 };
 use pi_core::{run_user_turn, ReloadableSystems, Runtime, SessionState, SessionStore};
 
@@ -309,7 +311,7 @@ fn select_initial_model(runtime: &mut Runtime, config: &LoadedConfig, cli: &Cli)
                 config
                     .models
                     .iter()
-                    .find(|model| api_key_for_provider(&config.auth, &model.provider).is_some())
+                    .find(|model| has_auth_for_provider(&config.auth, &model.provider))
             })
             .map(|model| ModelRef {
                 provider: model.provider.clone(),
@@ -444,8 +446,25 @@ fn provider_for_runtime(
         model,
         api: map_provider_api(&definition.api),
         base_url: definition.base_url.clone(),
-        api_key: api_key_for_provider(&config.auth, &definition.provider),
+        auth: map_provider_auth(auth_for_provider(&config.auth, &definition.provider)),
     }))
+}
+
+fn map_provider_auth(auth: Option<ResolvedAuth>) -> ProviderAuth {
+    match auth {
+        Some(ResolvedAuth::ApiKey(api_key)) => ProviderAuth::ApiKey(api_key),
+        Some(ResolvedAuth::ClaudeCodeOAuth { access_token }) => {
+            ProviderAuth::ClaudeCodeOAuth { access_token }
+        }
+        Some(ResolvedAuth::ChatGptOAuth {
+            access_token,
+            account_id,
+        }) => ProviderAuth::ChatGptOAuth {
+            access_token,
+            account_id,
+        },
+        None => ProviderAuth::None,
+    }
 }
 
 fn map_provider_api(api: &ConfigProviderApi) -> AiProviderApi {

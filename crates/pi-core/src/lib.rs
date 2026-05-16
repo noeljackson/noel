@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pi_ai::{
     ChatMessage, ChatRole, ModelRef, Provider, ProviderError, ProviderRequest, StreamEvent,
 };
-use pi_config::{api_key_for_provider, LoadedConfig};
+use pi_config::{has_auth_for_provider, LoadedConfig};
 use pi_tools::{
     builtin_tool_definitions, execute_tool, ToolError, ToolRequest, ToolRuntimeOptions,
 };
@@ -93,8 +93,7 @@ impl ReloadableSystems {
             .models
             .iter()
             .filter(|model| {
-                model.provider == "faux"
-                    || api_key_for_provider(&config.auth, &model.provider).is_some()
+                model.provider == "faux" || has_auth_for_provider(&config.auth, &model.provider)
             })
             .map(|model| model.provider.clone())
             .collect();
@@ -620,7 +619,7 @@ fn new_session_id() -> String {
 mod tests {
     use std::collections::BTreeSet;
 
-    use pi_ai::{create_provider, ProviderApi, ProviderConfig};
+    use pi_ai::{create_provider, ProviderApi, ProviderAuth, ProviderConfig};
 
     use super::*;
 
@@ -757,7 +756,7 @@ mod tests {
             },
             api: ProviderApi::Faux,
             base_url: None,
-            api_key: None,
+            auth: ProviderAuth::None,
         });
 
         let response = run_user_turn(&mut runtime, provider.as_ref(), "hello".to_string())
@@ -784,7 +783,7 @@ mod tests {
             },
             api: ProviderApi::Faux,
             base_url: None,
-            api_key: None,
+            auth: ProviderAuth::None,
         });
 
         let error = run_user_turn(

@@ -108,6 +108,13 @@ Provider API keys can be stored in `auth.json`:
 }
 ```
 
+When no explicit API key is configured, `pi` can reuse existing CLI login credentials:
+
+- Claude Code: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or `~/.claude/.credentials.json`
+- Codex/ChatGPT: `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json`
+
+Explicit API keys still take precedence over login tokens.
+
 `models.json` may override the built-in model list:
 
 ```json

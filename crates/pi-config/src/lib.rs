@@ -131,11 +131,30 @@ impl Settings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum AuthCredential {
-    ApiKey { key: String },
-    OAuth { access_token: String, expires: u64 },
+    ApiKey {
+        key: String,
+    },
+    OAuth {
+        access_token: String,
+        expires: u64,
+        #[serde(default)]
+        account_id: Option<String>,
+    },
 }
 
 pub type AuthData = BTreeMap<String, AuthCredential>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedAuth {
+    ApiKey(String),
+    ClaudeCodeOAuth {
+        access_token: String,
+    },
+    ChatGptOAuth {
+        access_token: String,
+        account_id: Option<String>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -261,14 +280,32 @@ fn filter_enabled_models(
 }
 
 pub fn api_key_for_provider(auth: &AuthData, provider: &str) -> Option<String> {
-    if let Some(AuthCredential::ApiKey { key }) = auth.get(provider) {
-        return Some(resolve_config_value(key));
+    match auth_for_provider(auth, provider) {
+        Some(ResolvedAuth::ApiKey(api_key)) => Some(api_key),
+        _ => None,
     }
-    env_api_key(provider).or_else(|| {
-        env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|_| provider == "openai")
-    })
+}
+
+pub fn auth_for_provider(auth: &AuthData, provider: &str) -> Option<ResolvedAuth> {
+    if let Some(credential) = auth.get(provider) {
+        return match credential {
+            AuthCredential::ApiKey { key } => Some(ResolvedAuth::ApiKey(resolve_config_value(key))),
+            AuthCredential::OAuth {
+                access_token,
+                account_id,
+                ..
+            } => Some(oauth_for_provider(
+                provider,
+                resolve_config_value(access_token),
+                account_id.clone(),
+            )),
+        };
+    }
+    env_auth(provider).or_else(|| login_auth(provider))
+}
+
+pub fn has_auth_for_provider(auth: &AuthData, provider: &str) -> bool {
+    auth_for_provider(auth, provider).is_some()
 }
 
 fn env_api_key(provider: &str) -> Option<String> {
@@ -283,11 +320,117 @@ fn env_api_key(provider: &str) -> Option<String> {
     names.iter().find_map(|name| env::var(name).ok())
 }
 
+fn env_auth(provider: &str) -> Option<ResolvedAuth> {
+    if let Some(api_key) = env_api_key(provider) {
+        return Some(ResolvedAuth::ApiKey(api_key));
+    }
+    match provider {
+        "anthropic" => read_non_empty_env("ANTHROPIC_AUTH_TOKEN")
+            .or_else(|| read_non_empty_env("CLAUDE_CODE_OAUTH_TOKEN"))
+            .map(|access_token| ResolvedAuth::ClaudeCodeOAuth { access_token }),
+        "openai" => read_non_empty_env("CODEX_API_KEY")
+            .map(ResolvedAuth::ApiKey)
+            .or_else(|| {
+                read_non_empty_env("CODEX_ACCESS_TOKEN").map(|access_token| {
+                    ResolvedAuth::ChatGptOAuth {
+                        access_token,
+                        account_id: read_non_empty_env("CHATGPT_ACCOUNT_ID"),
+                    }
+                })
+            }),
+        _ => None,
+    }
+}
+
+fn login_auth(provider: &str) -> Option<ResolvedAuth> {
+    match provider {
+        "anthropic" => read_claude_code_oauth(),
+        "openai" => read_codex_chatgpt_oauth(),
+        _ => None,
+    }
+}
+
+fn oauth_for_provider(
+    provider: &str,
+    access_token: String,
+    account_id: Option<String>,
+) -> ResolvedAuth {
+    match provider {
+        "anthropic" => ResolvedAuth::ClaudeCodeOAuth { access_token },
+        "openai" => ResolvedAuth::ChatGptOAuth {
+            access_token,
+            account_id,
+        },
+        _ => ResolvedAuth::ApiKey(access_token),
+    }
+}
+
 fn resolve_config_value(value: &str) -> String {
     if let Some(name) = value.strip_prefix("env:") {
         return env::var(name).unwrap_or_default();
     }
     value.to_string()
+}
+
+fn read_non_empty_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeCredentialsFile {
+    claude_ai_oauth: Option<ClaudeAiOAuth>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeAiOAuth {
+    access_token: String,
+}
+
+fn read_claude_code_oauth() -> Option<ResolvedAuth> {
+    let path = home_dir().ok()?.join(".claude").join(".credentials.json");
+    read_claude_code_oauth_from_path(&path)
+}
+
+fn read_claude_code_oauth_from_path(path: &Path) -> Option<ResolvedAuth> {
+    let credentials = read_optional_json::<ClaudeCredentialsFile>(path)
+        .ok()
+        .flatten()?;
+    let access_token = credentials.claude_ai_oauth?.access_token;
+    if access_token.trim().is_empty() {
+        return None;
+    }
+    Some(ResolvedAuth::ClaudeCodeOAuth { access_token })
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAuthFile {
+    tokens: Option<CodexAuthTokens>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAuthTokens {
+    access_token: String,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+fn read_codex_chatgpt_oauth() -> Option<ResolvedAuth> {
+    let path = home_dir().ok()?.join(".codex").join("auth.json");
+    read_codex_chatgpt_oauth_from_path(&path)
+}
+
+fn read_codex_chatgpt_oauth_from_path(path: &Path) -> Option<ResolvedAuth> {
+    let auth = read_optional_json::<CodexAuthFile>(path).ok().flatten()?;
+    let tokens = auth.tokens?;
+    if tokens.access_token.trim().is_empty() {
+        return None;
+    }
+    Some(ResolvedAuth::ChatGptOAuth {
+        access_token: tokens.access_token,
+        account_id: tokens.account_id,
+    })
 }
 
 fn read_optional_json<T>(path: &Path) -> Result<Option<T>, ConfigError>
@@ -369,8 +512,15 @@ fn default_models() -> Vec<ModelDefinition> {
         },
         ModelDefinition {
             provider: "openai".to_string(),
+            id: "gpt-5.4".to_string(),
+            name: Some("OpenAI GPT 5.4".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: None,
+        },
+        ModelDefinition {
+            provider: "openai".to_string(),
             id: "gpt-4.1".to_string(),
-            name: Some("OpenAI GPT".to_string()),
+            name: Some("OpenAI GPT 4.1".to_string()),
             api: ProviderApi::OpenAi,
             base_url: None,
         },
@@ -489,6 +639,85 @@ mod tests {
 
         assert_eq!(next.session_dir, cwd.join("local-sessions"));
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn explicit_oauth_maps_to_provider_specific_auth() {
+        let auth = BTreeMap::from([
+            (
+                "anthropic".to_string(),
+                AuthCredential::OAuth {
+                    access_token: "claude-token".to_string(),
+                    expires: 0,
+                    account_id: None,
+                },
+            ),
+            (
+                "openai".to_string(),
+                AuthCredential::OAuth {
+                    access_token: "codex-token".to_string(),
+                    expires: 0,
+                    account_id: Some("account-id".to_string()),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            auth_for_provider(&auth, "anthropic"),
+            Some(ResolvedAuth::ClaudeCodeOAuth {
+                access_token: "claude-token".to_string()
+            })
+        );
+        assert_eq!(
+            auth_for_provider(&auth, "openai"),
+            Some(ResolvedAuth::ChatGptOAuth {
+                access_token: "codex-token".to_string(),
+                account_id: Some("account-id".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn reads_claude_code_oauth_credentials_file() {
+        let root = test_dir("pi-config-claude-oauth");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".credentials.json");
+        fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"claude-access","refreshToken":"redacted","expiresAt":1}}"#,
+        )
+        .expect("write credentials");
+
+        assert_eq!(
+            read_claude_code_oauth_from_path(&path),
+            Some(ResolvedAuth::ClaudeCodeOAuth {
+                access_token: "claude-access".to_string()
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reads_codex_chatgpt_oauth_auth_file() {
+        let root = test_dir("pi-config-codex-oauth");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("auth.json");
+        fs::write(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"codex-access","refresh_token":"redacted","account_id":"account-id"}}"#,
+        )
+        .expect("write auth");
+
+        assert_eq!(
+            read_codex_chatgpt_oauth_from_path(&path),
+            Some(ResolvedAuth::ChatGptOAuth {
+                access_token: "codex-access".to_string(),
+                account_id: Some("account-id".to_string())
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_dir(name: &str) -> PathBuf {
