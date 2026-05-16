@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 
+	authstore "github.com/noeljackson/pi/internal/auth"
 	"github.com/noeljackson/pi/internal/session/schema"
 )
 
@@ -63,6 +64,7 @@ type LoopConfig struct {
 	SessionWriter    SessionWriter
 	Compactor        Compactor
 	BranchSummarizer schema.BranchSummarizer
+	AuthStore        *authstore.Store
 
 	PrepareNextTurn     func(ctx context.Context, messages []Message) (NextTurnDirective, error)
 	ShouldStopAfterTurn func(turn int, last *AssistantMessage) bool

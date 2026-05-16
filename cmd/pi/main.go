@@ -6,12 +6,16 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
+	"os/exec"
+	"runtime"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/noeljackson/pi/internal/agent"
 	anthropicprovider "github.com/noeljackson/pi/internal/anthropic"
+	authstore "github.com/noeljackson/pi/internal/auth"
+	"github.com/noeljackson/pi/internal/config"
+	"github.com/noeljackson/pi/internal/models"
 	"github.com/noeljackson/pi/internal/session"
 	"github.com/noeljackson/pi/internal/tools"
 	"github.com/noeljackson/pi/internal/tools/bash"
@@ -25,9 +29,12 @@ const (
 )
 
 type cliOptions struct {
-	headless bool
-	resumeID string
-	prompt   string
+	headless   bool
+	resumeID   string
+	prompt     string
+	login      string
+	logout     string
+	listModels bool
 }
 
 func main() {
@@ -42,6 +49,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if opts.login != "" {
+		return runLogin(opts.login)
+	}
+	if opts.logout != "" {
+		return runLogout(opts.logout)
+	}
+	if opts.listModels {
+		return runListModels()
+	}
 	if opts.headless {
 		return runHeadless(opts.prompt)
 	}
@@ -53,11 +69,26 @@ func parseOptions(args []string) (cliOptions, error) {
 	flags.SetOutput(os.Stderr)
 	headless := flags.Bool("headless", false, "run one prompt without the TUI")
 	resumeID := flags.String("resume", "", "resume a session by id")
+	login := flags.String("login", "", "login to a provider")
+	logout := flags.String("logout", "", "logout from a provider")
+	listModels := flags.Bool("list-models", false, "list available models")
 	if err := flags.Parse(args); err != nil {
 		return cliOptions{}, err
 	}
 
 	remaining := flags.Args()
+	actionCount := 0
+	for _, active := range []bool{*login != "", *logout != "", *listModels} {
+		if active {
+			actionCount++
+		}
+	}
+	if actionCount > 0 {
+		if actionCount > 1 || *headless || *resumeID != "" || len(remaining) != 0 {
+			return cliOptions{}, errors.New("usage: pi [--login <provider> | --logout <provider> | --list-models]")
+		}
+		return cliOptions{login: *login, logout: *logout, listModels: *listModels}, nil
+	}
 	if *headless {
 		if *resumeID != "" {
 			return cliOptions{}, errors.New("--headless cannot be combined with --resume")
@@ -71,6 +102,80 @@ func parseOptions(args []string) (cliOptions, error) {
 		return cliOptions{}, errors.New("usage: pi [--resume <session-id>] or pi --headless \"prompt\"")
 	}
 	return cliOptions{resumeID: *resumeID}, nil
+}
+
+func runLogin(provider string) error {
+	if provider != "anthropic" {
+		return fmt.Errorf("unsupported login provider %q", provider)
+	}
+	paths, err := config.ResolvePaths()
+	if err != nil {
+		return err
+	}
+	store := authstore.New(paths.AuthFile)
+	result, err := authstore.LoginAnthropic(context.Background(), openBrowser)
+	if err != nil {
+		return err
+	}
+	metadata := map[string]any{}
+	if len(result.Scopes) > 0 {
+		metadata["scopes"] = result.Scopes
+	}
+	if result.Subscription != "" {
+		metadata["subscription"] = result.Subscription
+	}
+	if err := store.Set("anthropic-oauth", authstore.ProviderAuth{
+		Type:         "oauth",
+		AccessToken:  result.AccessToken,
+		RefreshToken: result.RefreshToken,
+		ExpiresAt:    result.ExpiresAt,
+		Metadata:     metadata,
+	}); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, "Logged in to Anthropic")
+	return nil
+}
+
+func runLogout(provider string) error {
+	if provider != "anthropic" {
+		return fmt.Errorf("unsupported logout provider %q", provider)
+	}
+	paths, err := config.ResolvePaths()
+	if err != nil {
+		return err
+	}
+	store := authstore.New(paths.AuthFile)
+	if existing, ok, err := store.Get("anthropic-oauth"); err != nil {
+		return err
+	} else if ok {
+		_ = authstore.LogoutAnthropic(context.Background(), existing.RefreshToken)
+	}
+	if err := store.Delete("anthropic-oauth"); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, "Logged out from Anthropic")
+	return nil
+}
+
+func runListModels() error {
+	paths, err := config.ResolvePaths()
+	if err != nil {
+		return err
+	}
+	registry, err := models.Load(paths.ModelsFile)
+	if err != nil {
+		return err
+	}
+	for _, model := range registry.All() {
+		thinking := ""
+		if model.Thinking {
+			thinking = " thinking"
+		}
+		fmt.Fprintf(os.Stdout, "%s/%s\t%s\tcontext=%d max_output=%d%s\n",
+			model.Provider, model.ID, model.Display, model.ContextWindow, model.MaxOutput, thinking)
+	}
+	return nil
 }
 
 func runHeadless(prompt string) error {
@@ -207,15 +312,18 @@ func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*sess
 		MaxTokens:     defaultMaxTokens,
 		SessionWriter: sess,
 	}
+	if paths, err := config.ResolvePaths(); err == nil {
+		cfg.AuthStore = authstore.New(paths.AuthFile)
+	}
 	return sess, cfg, nil
 }
 
 func newSessionStore() (*session.JSONLStore, error) {
-	home, err := os.UserHomeDir()
+	paths, err := config.ResolvePaths()
 	if err != nil {
 		return nil, err
 	}
-	return session.NewJSONLStore(filepath.Join(home, ".pi", "sessions")), nil
+	return session.NewJSONLStore(paths.SessionDir), nil
 }
 
 func builtinRegistry() (*tools.Registry, error) {
@@ -242,8 +350,35 @@ func builtinRegistry() (*tools.Registry, error) {
 
 func modelName() string {
 	model := os.Getenv("PI_MODEL")
-	if model == "" {
-		return defaultModel
+	if model != "" {
+		return model
 	}
-	return model
+	paths, err := config.ResolvePaths()
+	if err == nil {
+		manager, err := config.NewManager(paths.SettingsFile)
+		if err == nil {
+			settings := manager.Get()
+			if settings.Model != "" {
+				return settings.Model
+			}
+		}
+	}
+	return defaultModel
+}
+
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stdout, "Open this URL: %s\n", url)
+		return nil
+	}
+	return nil
 }
