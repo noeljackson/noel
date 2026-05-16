@@ -640,6 +640,32 @@ async fn run_interactive(
                 print_session_tree(&config.paths.session_dir)?;
                 continue;
             }
+            _ if line.starts_with("/delete") => {
+                let reference = line.trim_start_matches("/delete").trim();
+                let target = if reference.is_empty() {
+                    runtime
+                        .store()
+                        .map(|store| store.path().to_path_buf())
+                        .ok_or_else(|| anyhow!("ephemeral session cannot be deleted"))?
+                } else {
+                    resolve_session_reference(&config.paths.session_dir, reference)?
+                };
+                let deleting_current = runtime
+                    .store()
+                    .map(|store| store.path() == target)
+                    .unwrap_or(false);
+                fs::remove_file(&target)?;
+                println!("deleted {}", target.display());
+                if deleting_current {
+                    let (store, state) = SessionStore::create(
+                        &config.paths.session_dir,
+                        runtime.session().cwd.clone(),
+                    )?;
+                    runtime.replace_session(state, Some(store));
+                    print_session(&runtime);
+                }
+                continue;
+            }
             _ if line.starts_with("/name") => {
                 let name = line.trim_start_matches("/name").trim();
                 runtime.rename_session((!name.is_empty()).then(|| name.to_string()))?;

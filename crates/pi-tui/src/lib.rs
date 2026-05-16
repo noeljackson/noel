@@ -137,6 +137,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "list session tree",
     },
     CommandHelp {
+        command: "/delete [id|name|path]",
+        description: "delete a session",
+    },
+    CommandHelp {
         command: "/name <name>",
         description: "rename current session",
     },

@@ -181,6 +181,7 @@ or an object map:
 - `/fork [id|name|path]`
 - `/clone [id|name|path]`
 - `/tree`
+- `/delete [id|name|path]`
 - `/name <name>`
 - `/labels <labels...>`
 - `/export <file>`
