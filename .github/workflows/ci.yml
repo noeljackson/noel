@@ -20,6 +20,9 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -28,3 +31,6 @@ jobs:
 
       - name: Test
         run: cargo test --all
+
+      - name: TTY e2e
+        run: scripts/e2e-tmux.sh

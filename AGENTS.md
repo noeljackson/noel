@@ -21,6 +21,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
+For TTY behavior changes, also run:
+
+```bash
+scripts/e2e-tmux.sh
+```
+
 ## Architecture
 
 - Keep durable session state separate from reloadable systems.

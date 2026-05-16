@@ -179,6 +179,19 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
+TTY e2e test:
+
+```bash
+scripts/e2e-tmux.sh
+```
+
+Dockerized TTY e2e test:
+
+```bash
+docker build -f Dockerfile.e2e -t pi-e2e .
+docker run --rm pi-e2e
+```
+
 ## Development Notes
 
 The old TypeScript implementation is preserved on the `ts-reference` branch for behavioral reference. Active development on `main` is Rust-only.
