@@ -3,6 +3,7 @@ DOCKER ?= docker
 E2E_IMAGE ?= pi-e2e
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
+INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 
 .PHONY: help build release install run fmt lint test check ci e2e docker-build docker-e2e clean
 
@@ -28,7 +29,8 @@ build:
 release:
 	$(CARGO) build --release -p pi-cli
 
-install: release
+install:
+	CARGO="$(CARGO)" $(INSTALL_BUILD_SCRIPT)
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/pi "$(BINDIR)/pi"
 
