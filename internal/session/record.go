@@ -51,6 +51,8 @@ const (
 	RecordTypeBashExecution = "bash_execution"
 	// RecordTypeQueueState identifies a queue state record.
 	RecordTypeQueueState = "queue_state"
+	// RecordTypeTodoState identifies persisted todo tool state.
+	RecordTypeTodoState = "todo_state"
 	// RecordTypeSavePoint identifies a save point record.
 	RecordTypeSavePoint = "save_point"
 	// RecordTypeLeaf identifies an explicit empty branch leaf.

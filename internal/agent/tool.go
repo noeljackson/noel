@@ -41,11 +41,12 @@ type ToolRenderer interface {
 
 // ToolCallContext describes execution context passed to every tool call.
 type ToolCallContext struct {
-	CallID   string
-	Cwd      string
-	Model    string
-	OnUpdate func(partial json.RawMessage)
-	Logger   *slog.Logger
+	CallID    string
+	SessionID string
+	Cwd       string
+	Model     string
+	OnUpdate  func(partial json.RawMessage)
+	Logger    *slog.Logger
 }
 
 // ToolRegistry describes a registry of executable tools.
