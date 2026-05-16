@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ type Session struct {
 	currentTurnPath string
 	file            *os.File
 	closed          bool
+	inMemory        bool
 
 	cwd       string
 	createdAt time.Time
@@ -71,6 +73,39 @@ func newSession(id string, path string, currentTurnPath string, file *os.File, r
 			session.leafID = header.LeafID
 		}
 	}
+	return session
+}
+
+// NewInMemorySession returns an ephemeral session that keeps conversation state
+// in process memory and never writes JSONL records to disk.
+func NewInMemorySession(cwd string) *Session {
+	id, err := randomHexID()
+	if err != nil {
+		id = fmt.Sprintf("memory-%d", time.Now().UnixNano())
+	}
+	recordID, err := randomHexID()
+	if err != nil {
+		recordID = fmt.Sprintf("header-%d", time.Now().UnixNano())
+	}
+	createdAt := time.Now().UTC()
+	header := SessionHeader{
+		Version:   3,
+		ID:        id,
+		CreatedAt: createdAt,
+		Cwd:       cwd,
+		GoVersion: runtime.Version(),
+	}
+	payload, _ := json.Marshal(header)
+	record := Record{
+		Type:      RecordTypeSessionHeader,
+		ID:        recordID,
+		Timestamp: createdAt,
+		Payload:   payload,
+	}
+	session := newSession(id, "", "", nil, []Record{record})
+	session.cwd = cwd
+	session.createdAt = createdAt
+	session.inMemory = true
 	return session
 }
 
@@ -366,6 +401,9 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
+	if s.file == nil {
+		return nil
+	}
 	return s.file.Close()
 }
 
@@ -460,8 +498,13 @@ func (s *Session) appendRawPayloadRecordLocked(recordType string, payload json.R
 		Timestamp: time.Now().UTC(),
 		Payload:   payload,
 	}
-	if err := writeRecordLine(s.file, record); err != nil {
-		return err
+	if !s.inMemory {
+		if s.file == nil {
+			return errors.New("session file is not configured")
+		}
+		if err := writeRecordLine(s.file, record); err != nil {
+			return err
+		}
 	}
 	s.indexRecord(record)
 	if s.headerHasLeafIDLocked() {
@@ -531,6 +574,9 @@ func (s *Session) writeCurrentTurnLocked(partial CurrentTurn) error {
 	if s.closed {
 		return errors.New("session is closed")
 	}
+	if s.inMemory {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(s.currentTurnPath), 0o700); err != nil {
 		return err
 	}
@@ -573,6 +619,9 @@ func (s *Session) writeCurrentTurnLocked(partial CurrentTurn) error {
 func (s *Session) clearCurrentTurnLocked() error {
 	s.currentTurn = CurrentTurn{}
 	s.lastCurrentTurnWrite = time.Time{}
+	if s.inMemory {
+		return nil
+	}
 	err := os.Remove(s.currentTurnPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -605,6 +654,9 @@ func (s *Session) persistHeaderLocked() error {
 	}
 	s.records[0].Payload = payload
 	s.byID[s.records[0].ID] = s.records[0]
+	if s.inMemory {
+		return nil
+	}
 	return s.rewriteRecordsLocked()
 }
 

@@ -39,6 +39,8 @@ type Options struct {
 	Help         bool
 	Version      bool
 	Headless     bool
+	QuietStartup bool
+	StartupProbe bool
 }
 
 // ToolsFlag contains CLI tool-selection flags.
@@ -213,6 +215,10 @@ func Parse(args []string) (Options, error) {
 				}
 			case "verbose":
 				opts.Verbose = true
+			case "quiet-startup":
+				opts.QuietStartup = true
+			case "startup-probe":
+				opts.StartupProbe = true
 			case "offline":
 				opts.Offline = true
 			default:
@@ -353,7 +359,15 @@ func validate(opts Options, explicitMode string) error {
 	if opts.Mode == ModeRPC && len(opts.Files) > 0 {
 		return errors.New("@file and --file arguments are not supported in RPC mode")
 	}
+	if opts.StartupProbe && (opts.Print || opts.Headless || opts.Mode == ModeJSON || opts.Mode == ModeRPC || opts.Session.Continue || opts.Session.Resume != "" || opts.Session.SessionID != "" || opts.Prompt != "" || len(opts.Files) > 0 || len(opts.ExtraArgs) > 0) {
+		return errors.New("usage: pi --startup-probe [--quiet-startup]")
+	}
 	return nil
+}
+
+// PrintHelp writes CLI help text for the pi executable.
+func PrintHelp(out interface{ Write([]byte) (int, error) }) {
+	_, _ = fmt.Fprint(out, HelpText("pi"))
 }
 
 // HelpText returns CLI help text.

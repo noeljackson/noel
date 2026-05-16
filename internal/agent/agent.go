@@ -328,6 +328,10 @@ func (a *Agent) Subscribe(handler func(Event)) func() {
 
 func (a *Agent) SetModel(model string) error {
 	a.mu.Lock()
+	if a.cfg.Model == model {
+		a.mu.Unlock()
+		return nil
+	}
 	a.cfg.Model = model
 	a.mu.Unlock()
 	if writer, ok := a.cfg.SessionWriter.(modelChangeWriter); ok {
@@ -351,6 +355,10 @@ func (a *Agent) SetThinking(level string) error {
 		return fmt.Errorf("invalid thinking level %q (expected one of: %s)", level, strings.Join(ValidThinkingLevels, ", "))
 	}
 	a.mu.Lock()
+	if a.cfg.Thinking == level {
+		a.mu.Unlock()
+		return nil
+	}
 	a.cfg.Thinking = level
 	a.mu.Unlock()
 	if writer, ok := a.cfg.SessionWriter.(thinkingChangeWriter); ok {
@@ -362,15 +370,7 @@ func (a *Agent) SetThinking(level string) error {
 func (a *Agent) ActivateTools(names []string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	active := make(map[string]struct{}, len(a.cfg.ActiveTools)+len(names))
-	for _, name := range a.cfg.ActiveTools {
-		active[name] = struct{}{}
-	}
-	if len(a.cfg.ActiveTools) == 0 {
-		for _, tool := range toolsFromConfig(a.cfg) {
-			active[tool.Name()] = struct{}{}
-		}
-	}
+	active := make(map[string]struct{}, len(names))
 	for _, name := range names {
 		if _, ok := lookupTool(a.cfg.Tools, name); !ok {
 			return fmt.Errorf("unknown tool: %s", name)

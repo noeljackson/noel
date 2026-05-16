@@ -39,9 +39,7 @@ func ApplyOptions(runner runner, opts cli.Options) error {
 		}
 	}
 	if opts.Tools.NoTools {
-		if err := runner.ActivateTools(nil); err != nil {
-			return err
-		}
+		return runner.ActivateTools([]string{})
 	}
 	if len(opts.Tools.Allow) > 0 {
 		if err := runner.ActivateTools(opts.Tools.Allow); err != nil {
