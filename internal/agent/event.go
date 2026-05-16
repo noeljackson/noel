@@ -89,6 +89,24 @@ type ToolExecutionEndEvent struct {
 	Err    error
 }
 
+// SessionForkEvent indicates that the session tree forked.
+type SessionForkEvent struct {
+	NewLeafID  string
+	FromLeafID string
+}
+
+// SessionMoveEvent indicates that the current session leaf changed.
+type SessionMoveEvent struct {
+	FromLeafID string
+	ToLeafID   string
+}
+
+// BranchSummaryEvent indicates that an abandoned branch was summarized.
+type BranchSummaryEvent struct {
+	LeafID  string
+	Summary string
+}
+
 func (AgentStartEvent) isEvent()          {}
 func (AgentEndEvent) isEvent()            {}
 func (TurnStartEvent) isEvent()           {}
@@ -99,3 +117,6 @@ func (MessageEndEvent) isEvent()          {}
 func (ToolExecutionStartEvent) isEvent()  {}
 func (ToolExecutionUpdateEvent) isEvent() {}
 func (ToolExecutionEndEvent) isEvent()    {}
+func (SessionForkEvent) isEvent()         {}
+func (SessionMoveEvent) isEvent()         {}
+func (BranchSummaryEvent) isEvent()       {}

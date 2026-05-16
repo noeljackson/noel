@@ -2,18 +2,23 @@
 package session
 
 import (
-	"encoding/json"
 	"time"
+
+	"github.com/noeljackson/pi/internal/session/schema"
 )
 
 // Record describes one JSONL session record.
-type Record struct {
-	Type      string          `json:"type"`
-	ID        string          `json:"id"`
-	ParentID  string          `json:"parentId,omitempty"`
-	Timestamp time.Time       `json:"timestamp"`
-	Payload   json.RawMessage `json:"payload"`
-}
+type Record = schema.Record
+
+// Leaf identifies a tip of a branch within a session.
+type Leaf = schema.Leaf
+
+// BranchSummaryRequest carries the inputs needed to summarize an abandoned
+// branch when the user moves away from a leaf.
+type BranchSummaryRequest = schema.BranchSummaryRequest
+
+// BranchSummarizer produces a textual summary of an abandoned branch.
+type BranchSummarizer = schema.BranchSummarizer
 
 const (
 	// RecordTypeSessionHeader identifies a session header record.
@@ -48,6 +53,8 @@ const (
 	RecordTypeQueueState = "queue_state"
 	// RecordTypeSavePoint identifies a save point record.
 	RecordTypeSavePoint = "save_point"
+	// RecordTypeLeaf identifies an explicit empty branch leaf.
+	RecordTypeLeaf = "leaf"
 )
 
 // SessionHeader describes session metadata stored at the start of a session file.

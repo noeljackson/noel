@@ -409,7 +409,7 @@ func (s *Session) appendRawPayloadRecordLocked(recordType string, payload json.R
 	if s.closed {
 		return errors.New("session is closed")
 	}
-	if parentID == "" && recordType != RecordTypeSessionHeader {
+	if parentID == "" && recordType != RecordTypeSessionHeader && recordType != RecordTypeLeaf && recordType != RecordTypeBranchSummary {
 		parentID = s.leafID
 	}
 	id, err := randomHexID()
@@ -427,6 +427,9 @@ func (s *Session) appendRawPayloadRecordLocked(recordType string, payload json.R
 		return err
 	}
 	s.indexRecord(record)
+	if s.headerHasLeafIDLocked() {
+		return s.persistHeaderLocked()
+	}
 	return nil
 }
 
@@ -455,6 +458,14 @@ func (s *Session) indexRecord(record Record) {
 		s.messageRecords = append(s.messageRecords, record)
 	}
 	s.indexPayloadRecord(record)
+}
+
+func (s *Session) headerHasLeafIDLocked() bool {
+	if len(s.records) == 0 || s.records[0].Type != RecordTypeSessionHeader {
+		return false
+	}
+	header, ok := decodeSessionHeader(s.records[0])
+	return ok && header.LeafID != ""
 }
 
 func (s *Session) indexPayloadRecord(record Record) {
