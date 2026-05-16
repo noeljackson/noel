@@ -87,11 +87,15 @@ pub struct Settings {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub default_thinking_level: Option<String>,
+    pub transport: Option<String>,
+    pub steering_mode: Option<String>,
+    pub follow_up_mode: Option<String>,
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub append_system_prompt: Vec<String>,
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
+    pub hide_thinking_block: Option<bool>,
     #[serde(default)]
     pub enabled_tools: Option<Vec<String>>,
     #[serde(default)]
@@ -103,6 +107,27 @@ pub struct Settings {
     pub session_dir: Option<String>,
     #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default)]
+    pub compaction: Option<CompactionSettings>,
+    #[serde(default)]
+    pub branch_summary: Option<BranchSummarySettings>,
+    #[serde(default)]
+    pub retry: Option<RetrySettings>,
+    #[serde(default)]
+    pub terminal: Option<TerminalSettings>,
+    #[serde(default)]
+    pub images: Option<ImageSettings>,
+    pub double_escape_action: Option<String>,
+    pub tree_filter_mode: Option<String>,
+    #[serde(default)]
+    pub thinking_budgets: Option<ThinkingBudgetsSettings>,
+    pub editor_padding_x: Option<u16>,
+    pub autocomplete_max_visible: Option<u16>,
+    pub show_hardware_cursor: Option<bool>,
+    #[serde(default)]
+    pub markdown: Option<MarkdownSettings>,
+    #[serde(default)]
+    pub warnings: Option<WarningSettings>,
 }
 
 impl Settings {
@@ -113,6 +138,9 @@ impl Settings {
             default_thinking_level: overrides
                 .default_thinking_level
                 .or(self.default_thinking_level),
+            transport: overrides.transport.or(self.transport),
+            steering_mode: overrides.steering_mode.or(self.steering_mode),
+            follow_up_mode: overrides.follow_up_mode.or(self.follow_up_mode),
             system_prompt: overrides.system_prompt.or(self.system_prompt),
             append_system_prompt: if overrides.append_system_prompt.is_empty() {
                 self.append_system_prompt
@@ -121,6 +149,7 @@ impl Settings {
             },
             shell_path: overrides.shell_path.or(self.shell_path),
             shell_command_prefix: overrides.shell_command_prefix.or(self.shell_command_prefix),
+            hide_thinking_block: overrides.hide_thinking_block.or(self.hide_thinking_block),
             enabled_tools: overrides.enabled_tools.or(self.enabled_tools),
             enabled_models: overrides.enabled_models.or(self.enabled_models),
             theme: overrides.theme.or(self.theme),
@@ -131,6 +160,197 @@ impl Settings {
             } else {
                 overrides.packages
             },
+            compaction: merge_optional_settings(self.compaction, overrides.compaction),
+            branch_summary: merge_optional_settings(self.branch_summary, overrides.branch_summary),
+            retry: merge_optional_settings(self.retry, overrides.retry),
+            terminal: merge_optional_settings(self.terminal, overrides.terminal),
+            images: merge_optional_settings(self.images, overrides.images),
+            double_escape_action: overrides.double_escape_action.or(self.double_escape_action),
+            tree_filter_mode: overrides.tree_filter_mode.or(self.tree_filter_mode),
+            thinking_budgets: merge_optional_settings(
+                self.thinking_budgets,
+                overrides.thinking_budgets,
+            ),
+            editor_padding_x: overrides.editor_padding_x.or(self.editor_padding_x),
+            autocomplete_max_visible: overrides
+                .autocomplete_max_visible
+                .or(self.autocomplete_max_visible),
+            show_hardware_cursor: overrides.show_hardware_cursor.or(self.show_hardware_cursor),
+            markdown: merge_optional_settings(self.markdown, overrides.markdown),
+            warnings: merge_optional_settings(self.warnings, overrides.warnings),
+        }
+    }
+}
+
+trait MergeSettings {
+    fn merge(self, overrides: Self) -> Self;
+}
+
+fn merge_optional_settings<T: MergeSettings>(base: Option<T>, overrides: Option<T>) -> Option<T> {
+    match (base, overrides) {
+        (Some(base), Some(overrides)) => Some(base.merge(overrides)),
+        (None, Some(overrides)) => Some(overrides),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionSettings {
+    pub enabled: Option<bool>,
+    pub reserve_tokens: Option<u64>,
+    pub keep_recent_tokens: Option<u64>,
+}
+
+impl MergeSettings for CompactionSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            enabled: overrides.enabled.or(self.enabled),
+            reserve_tokens: overrides.reserve_tokens.or(self.reserve_tokens),
+            keep_recent_tokens: overrides.keep_recent_tokens.or(self.keep_recent_tokens),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchSummarySettings {
+    pub reserve_tokens: Option<u64>,
+    pub skip_prompt: Option<bool>,
+}
+
+impl MergeSettings for BranchSummarySettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            reserve_tokens: overrides.reserve_tokens.or(self.reserve_tokens),
+            skip_prompt: overrides.skip_prompt.or(self.skip_prompt),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRetrySettings {
+    pub timeout_ms: Option<u64>,
+    pub max_retries: Option<u64>,
+    pub max_retry_delay_ms: Option<u64>,
+}
+
+impl MergeSettings for ProviderRetrySettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            timeout_ms: overrides.timeout_ms.or(self.timeout_ms),
+            max_retries: overrides.max_retries.or(self.max_retries),
+            max_retry_delay_ms: overrides.max_retry_delay_ms.or(self.max_retry_delay_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrySettings {
+    pub enabled: Option<bool>,
+    pub max_retries: Option<u64>,
+    pub base_delay_ms: Option<u64>,
+    pub provider: Option<ProviderRetrySettings>,
+}
+
+impl MergeSettings for RetrySettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            enabled: overrides.enabled.or(self.enabled),
+            max_retries: overrides.max_retries.or(self.max_retries),
+            base_delay_ms: overrides.base_delay_ms.or(self.base_delay_ms),
+            provider: merge_optional_settings(self.provider, overrides.provider),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSettings {
+    pub show_images: Option<bool>,
+    pub image_width_cells: Option<u16>,
+    pub clear_on_shrink: Option<bool>,
+    pub show_terminal_progress: Option<bool>,
+}
+
+impl MergeSettings for TerminalSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            show_images: overrides.show_images.or(self.show_images),
+            image_width_cells: overrides.image_width_cells.or(self.image_width_cells),
+            clear_on_shrink: overrides.clear_on_shrink.or(self.clear_on_shrink),
+            show_terminal_progress: overrides
+                .show_terminal_progress
+                .or(self.show_terminal_progress),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageSettings {
+    pub auto_resize: Option<bool>,
+    pub block_images: Option<bool>,
+}
+
+impl MergeSettings for ImageSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            auto_resize: overrides.auto_resize.or(self.auto_resize),
+            block_images: overrides.block_images.or(self.block_images),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingBudgetsSettings {
+    pub minimal: Option<u64>,
+    pub low: Option<u64>,
+    pub medium: Option<u64>,
+    pub high: Option<u64>,
+}
+
+impl MergeSettings for ThinkingBudgetsSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            minimal: overrides.minimal.or(self.minimal),
+            low: overrides.low.or(self.low),
+            medium: overrides.medium.or(self.medium),
+            high: overrides.high.or(self.high),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownSettings {
+    pub code_block_indent: Option<String>,
+}
+
+impl MergeSettings for MarkdownSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            code_block_indent: overrides.code_block_indent.or(self.code_block_indent),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarningSettings {
+    pub anthropic_extra_usage: Option<bool>,
+}
+
+impl MergeSettings for WarningSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            anthropic_extra_usage: overrides
+                .anthropic_extra_usage
+                .or(self.anthropic_extra_usage),
         }
     }
 }
@@ -838,6 +1058,98 @@ mod tests {
 
         assert_eq!(next.session_dir, cwd.join("local-sessions"));
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn nested_settings_deep_merge_like_ts_reference() {
+        let root = test_dir("pi-config-nested-settings");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(cwd.join(".pi")).expect("create project settings dir");
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{
+                "transport":"auto",
+                "steeringMode":"all",
+                "compaction":{"enabled":true,"reserveTokens":100},
+                "retry":{"enabled":true,"provider":{"timeoutMs":1000}},
+                "terminal":{"showImages":true},
+                "images":{"autoResize":true},
+                "thinkingBudgets":{"minimal":1000},
+                "markdown":{"codeBlockIndent":"  "},
+                "warnings":{"anthropicExtraUsage":true}
+            }"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            cwd.join(".pi/settings.json"),
+            r#"{
+                "followUpMode":"one-at-a-time",
+                "compaction":{"keepRecentTokens":200},
+                "retry":{"provider":{"maxRetries":2}},
+                "terminal":{"imageWidthCells":40},
+                "images":{"blockImages":true},
+                "thinkingBudgets":{"high":4000},
+                "warnings":{"anthropicExtraUsage":false}
+            }"#,
+        )
+        .expect("write project settings");
+
+        let config = load_config(ConfigPaths {
+            cwd: cwd.clone(),
+            agent_dir: agent_dir.clone(),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: cwd.join(".pi/settings.json"),
+            auth_path: root.join("missing-auth.json"),
+            models_path: root.join("missing-models.json"),
+            keybindings_path: root.join("missing-keybindings.json"),
+        })
+        .expect("load config");
+
+        assert_eq!(config.settings.transport.as_deref(), Some("auto"));
+        assert_eq!(config.settings.steering_mode.as_deref(), Some("all"));
+        assert_eq!(
+            config.settings.follow_up_mode.as_deref(),
+            Some("one-at-a-time")
+        );
+        let compaction = config.settings.compaction.expect("compaction");
+        assert_eq!(compaction.enabled, Some(true));
+        assert_eq!(compaction.reserve_tokens, Some(100));
+        assert_eq!(compaction.keep_recent_tokens, Some(200));
+        let retry = config.settings.retry.expect("retry");
+        let provider = retry.provider.expect("provider retry");
+        assert_eq!(provider.timeout_ms, Some(1000));
+        assert_eq!(provider.max_retries, Some(2));
+        let terminal = config.settings.terminal.expect("terminal");
+        assert_eq!(terminal.show_images, Some(true));
+        assert_eq!(terminal.image_width_cells, Some(40));
+        let images = config.settings.images.expect("images");
+        assert_eq!(images.auto_resize, Some(true));
+        assert_eq!(images.block_images, Some(true));
+        let thinking = config.settings.thinking_budgets.expect("thinking budgets");
+        assert_eq!(thinking.minimal, Some(1000));
+        assert_eq!(thinking.high, Some(4000));
+        assert_eq!(
+            config
+                .settings
+                .markdown
+                .expect("markdown")
+                .code_block_indent
+                .as_deref(),
+            Some("  ")
+        );
+        assert_eq!(
+            config
+                .settings
+                .warnings
+                .expect("warnings")
+                .anthropic_extra_usage,
+            Some(false)
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
