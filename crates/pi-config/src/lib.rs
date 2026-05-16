@@ -170,12 +170,27 @@ pub struct ModelDefinition {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum ProviderApi {
+    #[serde(rename = "openai-completions", alias = "open-ai")]
     #[default]
     OpenAi,
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
+    #[serde(rename = "openai-codex-responses")]
+    OpenAiCodexResponses,
+    #[serde(rename = "azure-openai-responses")]
+    AzureOpenAiResponses,
+    #[serde(rename = "anthropic-messages", alias = "anthropic")]
     Anthropic,
+    #[serde(rename = "google-generative-ai", alias = "google")]
     Google,
+    #[serde(rename = "google-vertex")]
+    GoogleVertex,
+    #[serde(rename = "bedrock-converse-stream", alias = "amazon-bedrock")]
+    Bedrock,
+    #[serde(rename = "mistral-conversations", alias = "mistral")]
+    Mistral,
+    #[serde(rename = "faux")]
     Faux,
 }
 
@@ -330,8 +345,14 @@ pub fn has_auth_for_provider(auth: &AuthData, provider: &str) -> bool {
 fn env_api_key(provider: &str) -> Option<String> {
     let names = match provider {
         "anthropic" => &["ANTHROPIC_API_KEY"][..],
+        "amazon-bedrock" => &["AWS_BEARER_TOKEN_BEDROCK"][..],
+        "azure-openai-responses" => &["AZURE_OPENAI_API_KEY"][..],
+        "cloudflare-ai-gateway" | "cloudflare-workers-ai" => &["CLOUDFLARE_API_KEY"][..],
+        "github-copilot" => &["COPILOT_GITHUB_TOKEN"][..],
         "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "google-vertex" => &["GOOGLE_CLOUD_API_KEY"][..],
         "openai" => &["OPENAI_API_KEY"],
+        "openai-codex" => &["CODEX_API_KEY"][..],
         "openrouter" => &["OPENROUTER_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
         _ => &[],
@@ -357,6 +378,12 @@ fn env_auth(provider: &str) -> Option<ResolvedAuth> {
                     }
                 })
             }),
+        "openai-codex" => read_non_empty_env("CODEX_ACCESS_TOKEN").map(|access_token| {
+            ResolvedAuth::ChatGptOAuth {
+                access_token,
+                account_id: read_non_empty_env("CHATGPT_ACCOUNT_ID"),
+            }
+        }),
         _ => None,
     }
 }
@@ -364,7 +391,7 @@ fn env_auth(provider: &str) -> Option<ResolvedAuth> {
 fn login_auth(provider: &str) -> Option<ResolvedAuth> {
     match provider {
         "anthropic" => read_claude_code_oauth(),
-        "openai" => read_codex_chatgpt_oauth(),
+        "openai" | "openai-codex" => read_codex_chatgpt_oauth(),
         _ => None,
     }
 }
@@ -377,6 +404,10 @@ fn oauth_for_provider(
     match provider {
         "anthropic" => ResolvedAuth::ClaudeCodeOAuth { access_token },
         "openai" => ResolvedAuth::ChatGptOAuth {
+            access_token,
+            account_id,
+        },
+        "openai-codex" => ResolvedAuth::ChatGptOAuth {
             access_token,
             account_id,
         },
@@ -592,7 +623,7 @@ fn default_models() -> Vec<ModelDefinition> {
             provider: "openai".to_string(),
             id: "gpt-5.4".to_string(),
             name: Some("OpenAI GPT 5.4".to_string()),
-            api: ProviderApi::OpenAi,
+            api: ProviderApi::OpenAiResponses,
             base_url: None,
         },
         ModelDefinition {
@@ -603,6 +634,20 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.2-codex".to_string(),
+            name: Some("OpenAI Codex GPT 5.2".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "azure-openai-responses".to_string(),
+            id: "gpt-5.2".to_string(),
+            name: Some("Azure OpenAI GPT 5.2".to_string()),
+            api: ProviderApi::AzureOpenAiResponses,
+            base_url: None,
+        },
+        ModelDefinition {
             provider: "anthropic".to_string(),
             id: "claude-sonnet-4-5".to_string(),
             name: Some("Claude Sonnet".to_string()),
@@ -610,11 +655,66 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            provider: "github-copilot".to_string(),
+            id: "gpt-5.4".to_string(),
+            name: Some("GitHub Copilot GPT 5.4".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.individual.githubcopilot.com".to_string()),
+        },
+        ModelDefinition {
+            provider: "openrouter".to_string(),
+            id: "moonshotai/kimi-k2.6".to_string(),
+            name: Some("OpenRouter Kimi K2.6".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+        },
+        ModelDefinition {
             provider: "google".to_string(),
             id: "gemini-2.5-pro".to_string(),
             name: Some("Gemini Pro".to_string()),
             api: ProviderApi::Google,
             base_url: None,
+        },
+        ModelDefinition {
+            provider: "google-vertex".to_string(),
+            id: "gemini-2.5-pro".to_string(),
+            name: Some("Gemini Pro Vertex".to_string()),
+            api: ProviderApi::GoogleVertex,
+            base_url: Some("https://{GOOGLE_CLOUD_LOCATION}-aiplatform.googleapis.com".to_string()),
+        },
+        ModelDefinition {
+            provider: "amazon-bedrock".to_string(),
+            id: "us.anthropic.claude-opus-4-6-v1".to_string(),
+            name: Some("Bedrock Claude Opus 4.6".to_string()),
+            api: ProviderApi::Bedrock,
+            base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
+        },
+        ModelDefinition {
+            provider: "mistral".to_string(),
+            id: "devstral-medium-latest".to_string(),
+            name: Some("Mistral Devstral Medium".to_string()),
+            api: ProviderApi::Mistral,
+            base_url: Some("https://api.mistral.ai/v1".to_string()),
+        },
+        ModelDefinition {
+            provider: "cloudflare-workers-ai".to_string(),
+            id: "@cf/moonshotai/kimi-k2.6".to_string(),
+            name: Some("Cloudflare Workers AI Kimi K2.6".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some(
+                "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+                    .to_string(),
+            ),
+        },
+        ModelDefinition {
+            provider: "cloudflare-ai-gateway".to_string(),
+            id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
+            name: Some("Cloudflare AI Gateway Kimi K2.6".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some(
+                "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat"
+                    .to_string(),
+            ),
         },
     ]
 }
@@ -639,6 +739,9 @@ fn home_dir() -> Result<PathBuf, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn load_config_accepts_keybinding_map_and_filters_enabled_models() {
@@ -767,6 +870,121 @@ mod tests {
     }
 
     #[test]
+    fn provider_api_names_match_ts_reference_names() {
+        let models = serde_json::from_str::<Vec<ModelDefinition>>(
+            r#"[
+                {"provider":"openai","id":"gpt","api":"openai-responses"},
+                {"provider":"openai-codex","id":"codex","api":"openai-codex-responses"},
+                {"provider":"azure-openai-responses","id":"gpt","api":"azure-openai-responses"},
+                {"provider":"anthropic","id":"claude","api":"anthropic-messages"},
+                {"provider":"google","id":"gemini","api":"google-generative-ai"},
+                {"provider":"google-vertex","id":"gemini","api":"google-vertex"},
+                {"provider":"amazon-bedrock","id":"claude","api":"bedrock-converse-stream"},
+                {"provider":"mistral","id":"devstral","api":"mistral-conversations"}
+            ]"#,
+        )
+        .expect("parse models");
+
+        assert_eq!(models[0].api, ProviderApi::OpenAiResponses);
+        assert_eq!(models[1].api, ProviderApi::OpenAiCodexResponses);
+        assert_eq!(models[2].api, ProviderApi::AzureOpenAiResponses);
+        assert_eq!(models[3].api, ProviderApi::Anthropic);
+        assert_eq!(models[4].api, ProviderApi::Google);
+        assert_eq!(models[5].api, ProviderApi::GoogleVertex);
+        assert_eq!(models[6].api, ProviderApi::Bedrock);
+        assert_eq!(models[7].api, ProviderApi::Mistral);
+    }
+
+    #[test]
+    fn default_models_include_provider_parity_targets() {
+        let providers = default_models()
+            .into_iter()
+            .map(|model| model.provider)
+            .collect::<Vec<_>>();
+
+        for provider in [
+            "openai-codex",
+            "azure-openai-responses",
+            "github-copilot",
+            "openrouter",
+            "google-vertex",
+            "amazon-bedrock",
+            "mistral",
+            "cloudflare-workers-ai",
+            "cloudflare-ai-gateway",
+        ] {
+            assert!(providers.iter().any(|candidate| candidate == provider));
+        }
+    }
+
+    #[test]
+    fn env_auth_detects_provider_parity_targets() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let empty_auth = BTreeMap::new();
+        let saved = [
+            save_env("AZURE_OPENAI_API_KEY"),
+            save_env("COPILOT_GITHUB_TOKEN"),
+            save_env("OPENROUTER_API_KEY"),
+            save_env("GOOGLE_CLOUD_API_KEY"),
+            save_env("AWS_BEARER_TOKEN_BEDROCK"),
+            save_env("MISTRAL_API_KEY"),
+            save_env("CLOUDFLARE_API_KEY"),
+            save_env("CODEX_ACCESS_TOKEN"),
+            save_env("CHATGPT_ACCOUNT_ID"),
+        ];
+
+        env::set_var("AZURE_OPENAI_API_KEY", "azure-key");
+        env::set_var("COPILOT_GITHUB_TOKEN", "copilot-key");
+        env::set_var("OPENROUTER_API_KEY", "openrouter-key");
+        env::set_var("GOOGLE_CLOUD_API_KEY", "vertex-key");
+        env::set_var("AWS_BEARER_TOKEN_BEDROCK", "bedrock-token");
+        env::set_var("MISTRAL_API_KEY", "mistral-key");
+        env::set_var("CLOUDFLARE_API_KEY", "cloudflare-key");
+        env::set_var("CODEX_ACCESS_TOKEN", "codex-token");
+        env::set_var("CHATGPT_ACCOUNT_ID", "account-id");
+
+        assert_eq!(
+            auth_for_provider(&empty_auth, "azure-openai-responses"),
+            Some(ResolvedAuth::ApiKey("azure-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "github-copilot"),
+            Some(ResolvedAuth::ApiKey("copilot-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "openrouter"),
+            Some(ResolvedAuth::ApiKey("openrouter-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "google-vertex"),
+            Some(ResolvedAuth::ApiKey("vertex-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "amazon-bedrock"),
+            Some(ResolvedAuth::ApiKey("bedrock-token".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "mistral"),
+            Some(ResolvedAuth::ApiKey("mistral-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "cloudflare-ai-gateway"),
+            Some(ResolvedAuth::ApiKey("cloudflare-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "openai-codex"),
+            Some(ResolvedAuth::ChatGptOAuth {
+                access_token: "codex-token".to_string(),
+                account_id: Some("account-id".to_string())
+            })
+        );
+
+        for (name, value) in saved {
+            restore_env(name, value);
+        }
+    }
+
+    #[test]
     fn reads_claude_code_oauth_credentials_file() {
         let root = test_dir("pi-config-claude-oauth");
         fs::create_dir_all(&root).expect("create root");
@@ -818,5 +1036,16 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default()
+    }
+
+    fn save_env(name: &'static str) -> (&'static str, Option<String>) {
+        (name, env::var(name).ok())
+    }
+
+    fn restore_env(name: &str, value: Option<String>) {
+        match value {
+            Some(value) => env::set_var(name, value),
+            None => env::remove_var(name),
+        }
     }
 }

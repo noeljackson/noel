@@ -1,3 +1,5 @@
+use std::env;
+
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -32,8 +34,14 @@ pub enum StreamEvent {
 pub enum ProviderApi {
     Faux,
     OpenAi,
+    OpenAiResponses,
+    OpenAiCodexResponses,
+    AzureOpenAiResponses,
     Anthropic,
     Google,
+    GoogleVertex,
+    Bedrock,
+    Mistral,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +111,8 @@ pub enum ProviderError {
     },
     #[error("invalid header value: {0}")]
     Header(#[from] reqwest::header::InvalidHeaderValue),
+    #[error("provider config error: {0}")]
+    Config(String),
     #[error("provider returned an invalid response: {0}")]
     InvalidResponse(String),
 }
@@ -116,8 +126,23 @@ pub fn create_provider(config: ProviderConfig) -> Box<dyn Provider> {
     match config.api {
         ProviderApi::Faux => Box::new(FauxProvider { config }),
         ProviderApi::OpenAi => Box::new(OpenAiProvider { config }),
+        ProviderApi::OpenAiResponses => Box::new(OpenAiResponsesProvider {
+            config,
+            endpoint: OpenAiResponsesEndpoint::OpenAi,
+        }),
+        ProviderApi::OpenAiCodexResponses => Box::new(OpenAiResponsesProvider {
+            config,
+            endpoint: OpenAiResponsesEndpoint::Codex,
+        }),
+        ProviderApi::AzureOpenAiResponses => Box::new(OpenAiResponsesProvider {
+            config,
+            endpoint: OpenAiResponsesEndpoint::Azure,
+        }),
         ProviderApi::Anthropic => Box::new(AnthropicProvider { config }),
         ProviderApi::Google => Box::new(GoogleProvider { config }),
+        ProviderApi::GoogleVertex => Box::new(GoogleVertexProvider { config }),
+        ProviderApi::Bedrock => Box::new(BedrockProvider { config }),
+        ProviderApi::Mistral => Box::new(MistralProvider { config }),
     }
 }
 
@@ -167,16 +192,16 @@ impl Provider for OpenAiProvider {
         let api_key = self.api_key()?;
         let url = format!(
             "{}/chat/completions",
-            self.config
-                .base_url
-                .as_deref()
-                .unwrap_or("https://api.openai.com/v1")
-                .trim_end_matches('/')
+            self.chat_base_url()?.trim_end_matches('/')
         );
         let messages = openai_messages(&request);
         let response = reqwest::Client::new()
             .post(url)
-            .headers(bearer_headers(&api_key)?)
+            .headers(openai_compatible_headers(
+                &self.config,
+                &api_key,
+                request_has_media(&request),
+            )?)
             .json(&json!({
                 "model": self.config.model.id,
                 "messages": messages,
@@ -247,6 +272,117 @@ impl OpenAiProvider {
                 reason: "completed".to_string(),
             },
         ])
+    }
+
+    fn api_key(&self) -> Result<String, ProviderError> {
+        match &self.config.auth {
+            ProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
+            _ => Err(ProviderError::MissingApiKey {
+                provider: self.config.model.provider.clone(),
+            }),
+        }
+    }
+
+    fn chat_base_url(&self) -> Result<String, ProviderError> {
+        resolve_env_placeholders(
+            self.config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://api.openai.com/v1"),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiResponsesEndpoint {
+    OpenAi,
+    Codex,
+    Azure,
+}
+
+struct OpenAiResponsesProvider {
+    config: ProviderConfig,
+    endpoint: OpenAiResponsesEndpoint,
+}
+
+#[async_trait]
+impl Provider for OpenAiResponsesProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
+        let (url, headers, model) = self.request_parts()?;
+        let response = reqwest::Client::new()
+            .post(url)
+            .headers(headers)
+            .json(&json!({
+                "model": model,
+                "instructions": request.system_prompt.clone().unwrap_or_default(),
+                "input": openai_responses_input(&request),
+                "tools": [],
+                "tool_choice": "auto",
+                "parallel_tool_calls": false,
+                "store": false,
+                "stream": true,
+                "include": [],
+            }))
+            .send()
+            .await?;
+        let body = error_for_status_with_body(response).await?.text().await?;
+        let text = parse_openai_responses_sse_text(&body)
+            .or_else(|| {
+                serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|response| parse_openai_responses_text(&response))
+            })
+            .ok_or_else(|| ProviderError::InvalidResponse(body.clone()))?;
+        Ok(vec![
+            StreamEvent::Text(text),
+            StreamEvent::Stop {
+                reason: "completed".to_string(),
+            },
+        ])
+    }
+}
+
+impl OpenAiResponsesProvider {
+    fn request_parts(&self) -> Result<(String, HeaderMap, String), ProviderError> {
+        match self.endpoint {
+            OpenAiResponsesEndpoint::OpenAi => {
+                let api_key = self.api_key()?;
+                let base_url = resolve_env_placeholders(
+                    self.config
+                        .base_url
+                        .as_deref()
+                        .unwrap_or("https://api.openai.com/v1"),
+                )?;
+                Ok((
+                    format!("{}/responses", base_url.trim_end_matches('/')),
+                    bearer_headers(&api_key)?,
+                    self.config.model.id.clone(),
+                ))
+            }
+            OpenAiResponsesEndpoint::Codex => {
+                let url = codex_responses_url(
+                    self.config
+                        .base_url
+                        .as_deref()
+                        .unwrap_or("https://chatgpt.com/backend-api"),
+                )?;
+                Ok((
+                    url,
+                    codex_headers(&self.config.auth)?,
+                    self.config.model.id.clone(),
+                ))
+            }
+            OpenAiResponsesEndpoint::Azure => {
+                let api_key = self.api_key()?;
+                let base_url = azure_openai_base_url(self.config.base_url.as_deref())?;
+                let url = azure_openai_responses_url(&base_url);
+                Ok((
+                    url,
+                    azure_openai_headers(&api_key)?,
+                    azure_deployment_name(&self.config.model.id),
+                ))
+            }
+        }
     }
 
     fn api_key(&self) -> Result<String, ProviderError> {
@@ -378,32 +514,12 @@ impl Provider for GoogleProvider {
             }))
             .send()
             .await?;
-        let response = error_for_status_with_body(response)
-            .await?
-            .json::<Value>()
-            .await?;
-        let text = response
-            .pointer("/candidates/0/content/parts")
-            .and_then(Value::as_array)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .filter(|text| !text.is_empty())
-            .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
-        Ok(vec![
-            StreamEvent::Text(text),
-            StreamEvent::Stop {
-                reason: response
-                    .pointer("/candidates/0/finishReason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("STOP")
-                    .to_string(),
-            },
-        ])
+        parse_google_response(
+            error_for_status_with_body(response)
+                .await?
+                .json::<Value>()
+                .await?,
+        )
     }
 }
 
@@ -418,12 +534,258 @@ impl GoogleProvider {
     }
 }
 
+struct GoogleVertexProvider {
+    config: ProviderConfig,
+}
+
+#[async_trait]
+impl Provider for GoogleVertexProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
+        let api_key = self.api_key()?;
+        let url = google_vertex_url(&self.config)?;
+        let response = reqwest::Client::new()
+            .post(format!("{url}?key={api_key}"))
+            .json(&json!({
+                "systemInstruction": request.system_prompt.map(|text| json!({ "parts": [{ "text": text }] })),
+                "contents": google_messages(&request.messages),
+            }))
+            .send()
+            .await?;
+        parse_google_response(
+            error_for_status_with_body(response)
+                .await?
+                .json::<Value>()
+                .await?,
+        )
+    }
+}
+
+impl GoogleVertexProvider {
+    fn api_key(&self) -> Result<String, ProviderError> {
+        match &self.config.auth {
+            ProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
+            _ => Err(ProviderError::MissingApiKey {
+                provider: self.config.model.provider.clone(),
+            }),
+        }
+    }
+}
+
+struct MistralProvider {
+    config: ProviderConfig,
+}
+
+#[async_trait]
+impl Provider for MistralProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
+        let api_key = self.api_key()?;
+        let base_url = resolve_env_placeholders(
+            self.config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://api.mistral.ai/v1"),
+        )?;
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/chat/completions",
+                base_url.trim_end_matches('/')
+            ))
+            .headers(bearer_headers(&api_key)?)
+            .json(&json!({
+                "model": self.config.model.id,
+                "messages": openai_messages(&request),
+                "stream": false,
+            }))
+            .send()
+            .await?;
+        parse_openai_chat_response(
+            error_for_status_with_body(response)
+                .await?
+                .json::<Value>()
+                .await?,
+        )
+    }
+}
+
+impl MistralProvider {
+    fn api_key(&self) -> Result<String, ProviderError> {
+        match &self.config.auth {
+            ProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
+            _ => Err(ProviderError::MissingApiKey {
+                provider: self.config.model.provider.clone(),
+            }),
+        }
+    }
+}
+
+struct BedrockProvider {
+    config: ProviderConfig,
+}
+
+#[async_trait]
+impl Provider for BedrockProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
+        let bearer_token = self.bearer_token()?;
+        let base_url = resolve_env_placeholders(
+            self.config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://bedrock-runtime.us-east-1.amazonaws.com"),
+        )?;
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/model/{}/converse",
+                base_url.trim_end_matches('/'),
+                encode_path_segment(&self.config.model.id)
+            ))
+            .headers(bearer_headers(&bearer_token)?)
+            .json(&json!({
+                "modelId": self.config.model.id,
+                "system": request.system_prompt.map(|text| vec![json!({ "text": text })]).unwrap_or_default(),
+                "messages": bedrock_messages(&request.messages),
+                "inferenceConfig": {
+                    "maxTokens": 4096,
+                },
+            }))
+            .send()
+            .await?;
+        parse_bedrock_response(
+            error_for_status_with_body(response)
+                .await?
+                .json::<Value>()
+                .await?,
+        )
+    }
+}
+
+impl BedrockProvider {
+    fn bearer_token(&self) -> Result<String, ProviderError> {
+        match &self.config.auth {
+            ProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
+            _ => Err(ProviderError::MissingApiKey {
+                provider: self.config.model.provider.clone(),
+            }),
+        }
+    }
+}
+
+fn parse_openai_chat_response(response: Value) -> Result<Vec<StreamEvent>, ProviderError> {
+    let text = response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
+    Ok(vec![
+        StreamEvent::Text(text.to_string()),
+        StreamEvent::Stop {
+            reason: response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_string(),
+        },
+    ])
+}
+
+fn parse_google_response(response: Value) -> Result<Vec<StreamEvent>, ProviderError> {
+    let text = response
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
+    Ok(vec![
+        StreamEvent::Text(text),
+        StreamEvent::Stop {
+            reason: response
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str)
+                .unwrap_or("STOP")
+                .to_string(),
+        },
+    ])
+}
+
+fn parse_bedrock_response(response: Value) -> Result<Vec<StreamEvent>, ProviderError> {
+    let text = response
+        .pointer("/output/message/content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
+    Ok(vec![
+        StreamEvent::Text(text),
+        StreamEvent::Stop {
+            reason: response
+                .get("stopReason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_string(),
+        },
+    ])
+}
+
 fn bearer_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {api_key}"))?,
     );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(headers)
+}
+
+fn openai_compatible_headers(
+    config: &ProviderConfig,
+    api_key: &str,
+    has_media: bool,
+) -> Result<HeaderMap, ProviderError> {
+    let mut headers = HeaderMap::new();
+    if config.model.provider == "cloudflare-ai-gateway" {
+        headers.insert(
+            "cf-aig-authorization",
+            HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+        );
+    } else {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+        );
+    }
+    if config.model.provider == "github-copilot" {
+        headers.insert(
+            "User-Agent",
+            HeaderValue::from_static("GitHubCopilotChat/0.35.0"),
+        );
+        headers.insert("Editor-Version", HeaderValue::from_static("vscode/1.107.0"));
+        headers.insert(
+            "Editor-Plugin-Version",
+            HeaderValue::from_static("copilot-chat/0.35.0"),
+        );
+        headers.insert(
+            "Copilot-Integration-Id",
+            HeaderValue::from_static("vscode-chat"),
+        );
+        headers.insert("X-Initiator", HeaderValue::from_static("user"));
+        headers.insert(
+            "Openai-Intent",
+            HeaderValue::from_static("conversation-edits"),
+        );
+        if has_media {
+            headers.insert("Copilot-Vision-Request", HeaderValue::from_static("true"));
+        }
+    }
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(headers)
 }
@@ -437,6 +799,13 @@ async fn error_for_status_with_body(
     }
     let body = response.text().await.unwrap_or_default();
     Err(ProviderError::Status { status, body })
+}
+
+fn request_has_media(request: &ProviderRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|message| !message.media.is_empty())
 }
 
 fn chatgpt_headers(auth: &ProviderAuth) -> Result<HeaderMap, ProviderError> {
@@ -460,6 +829,202 @@ fn chatgpt_headers(auth: &ProviderAuth) -> Result<HeaderMap, ProviderError> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     Ok(headers)
+}
+
+fn codex_headers(auth: &ProviderAuth) -> Result<HeaderMap, ProviderError> {
+    let mut headers = match auth {
+        ProviderAuth::ApiKey(api_key) => bearer_headers(api_key)?,
+        ProviderAuth::ChatGptOAuth { .. } => chatgpt_headers(auth)?,
+        _ => {
+            return Err(ProviderError::MissingApiKey {
+                provider: "openai-codex".to_string(),
+            });
+        }
+    };
+    headers.insert(
+        "OpenAI-Beta",
+        HeaderValue::from_static("responses=experimental"),
+    );
+    headers.insert("originator", HeaderValue::from_static("pi"));
+    headers.insert("User-Agent", HeaderValue::from_static("pi"));
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    Ok(headers)
+}
+
+fn azure_openai_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
+    let mut headers = HeaderMap::new();
+    headers.insert("api-key", HeaderValue::from_str(api_key)?);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    Ok(headers)
+}
+
+fn codex_responses_url(base_url: &str) -> Result<String, ProviderError> {
+    let normalized = resolve_env_placeholders(base_url)?
+        .trim_end_matches('/')
+        .to_string();
+    if normalized.ends_with("/codex/responses") {
+        Ok(normalized)
+    } else if normalized.ends_with("/codex") {
+        Ok(format!("{normalized}/responses"))
+    } else {
+        Ok(format!("{normalized}/codex/responses"))
+    }
+}
+
+fn azure_openai_base_url(config_base_url: Option<&str>) -> Result<String, ProviderError> {
+    let raw = config_base_url
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| env::var("AZURE_OPENAI_BASE_URL").ok())
+        .or_else(|| {
+            env::var("AZURE_OPENAI_RESOURCE_NAME")
+                .ok()
+                .map(|name| format!("https://{name}.openai.azure.com/openai/v1"))
+        })
+        .ok_or_else(|| {
+            ProviderError::Config(
+                "Azure OpenAI base URL is required; set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME"
+                    .to_string(),
+            )
+        })?;
+    let normalized = resolve_env_placeholders(&raw)?
+        .trim_end_matches('/')
+        .to_string();
+    if (normalized.contains(".openai.azure.com")
+        || normalized.contains(".cognitiveservices.azure.com"))
+        && !normalized.ends_with("/openai/v1")
+    {
+        if normalized.ends_with("/openai") {
+            Ok(format!("{normalized}/v1"))
+        } else {
+            Ok(format!("{normalized}/openai/v1"))
+        }
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn azure_openai_responses_url(base_url: &str) -> String {
+    let api_version = env::var("AZURE_OPENAI_API_VERSION").unwrap_or_else(|_| "v1".to_string());
+    format!(
+        "{}/responses?api-version={}",
+        base_url.trim_end_matches('/'),
+        api_version
+    )
+}
+
+fn azure_deployment_name(model_id: &str) -> String {
+    if let Ok(deployment) = env::var("AZURE_OPENAI_DEPLOYMENT_NAME") {
+        if !deployment.trim().is_empty() {
+            return deployment;
+        }
+    }
+    if let Ok(map) = env::var("AZURE_OPENAI_DEPLOYMENT_NAME_MAP") {
+        for entry in map
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            if let Some((model, deployment)) = entry.split_once('=') {
+                if model.trim() == model_id && !deployment.trim().is_empty() {
+                    return deployment.trim().to_string();
+                }
+            }
+        }
+    }
+    model_id.to_string()
+}
+
+fn google_vertex_url(config: &ProviderConfig) -> Result<String, ProviderError> {
+    let project = env::var("GOOGLE_CLOUD_PROJECT")
+        .or_else(|_| env::var("GCLOUD_PROJECT"))
+        .map_err(|_| {
+            ProviderError::Config(
+                "GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT is required for google-vertex".to_string(),
+            )
+        })?;
+    let location = env::var("GOOGLE_CLOUD_LOCATION").map_err(|_| {
+        ProviderError::Config("GOOGLE_CLOUD_LOCATION is required for google-vertex".to_string())
+    })?;
+    let base_url = resolve_env_placeholders(
+        config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://{GOOGLE_CLOUD_LOCATION}-aiplatform.googleapis.com"),
+    )?;
+    Ok(format!(
+        "{}/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+        base_url.trim_end_matches('/'),
+        encode_path_segment(&project),
+        encode_path_segment(&location),
+        encode_path_segment(&config.model.id)
+    ))
+}
+
+fn resolve_env_placeholders(value: &str) -> Result<String, ProviderError> {
+    let mut output = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find('{') {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            return Err(ProviderError::Config(format!(
+                "unclosed environment placeholder in {value}"
+            )));
+        };
+        let name = &after_start[..end];
+        if !name.chars().all(|character| {
+            character == '_' || character.is_ascii_uppercase() || character.is_ascii_digit()
+        }) {
+            return Err(ProviderError::Config(format!(
+                "invalid environment placeholder {{{name}}}"
+            )));
+        }
+        let replacement = env::var(name)
+            .map_err(|_| ProviderError::Config(format!("{name} is required but is not set")))?;
+        output.push_str(&replacement);
+        rest = &after_start[end + 1..];
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+fn bedrock_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|message| message.role != ChatRole::System)
+        .map(|message| {
+            let mut content = vec![json!({ "text": message.content })];
+            content.extend(message.media.iter().filter_map(|media| {
+                let format = media.mime_type.strip_prefix("image/")?;
+                Some(json!({
+                    "image": {
+                        "format": format,
+                        "source": {
+                            "bytes": media.data_base64,
+                        },
+                    }
+                }))
+            }));
+            json!({
+                "role": if message.role == ChatRole::Assistant { "assistant" } else { "user" },
+                "content": content,
+            })
+        })
+        .collect()
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn openai_messages(request: &ProviderRequest) -> Vec<Value> {
@@ -778,6 +1343,118 @@ mod tests {
         assert_eq!(
             google[0]["parts"][1]["inline_data"]["mime_type"],
             "image/png"
+        );
+    }
+
+    #[test]
+    fn provider_parity_request_helpers_match_expected_shapes() {
+        assert_eq!(
+            codex_responses_url("https://chatgpt.com/backend-api").expect("codex url"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            azure_openai_responses_url("https://example.openai.azure.com/openai/v1"),
+            "https://example.openai.azure.com/openai/v1/responses?api-version=v1"
+        );
+        assert_eq!(
+            encode_path_segment("us.anthropic.claude-opus-4-6-v1"),
+            "us.anthropic.claude-opus-4-6-v1"
+        );
+        assert_eq!(
+            encode_path_segment("workers-ai/@cf/model"),
+            "workers-ai%2F%40cf%2Fmodel"
+        );
+    }
+
+    #[test]
+    fn openai_compatible_headers_cover_copilot_and_cloudflare() {
+        let copilot = ProviderConfig {
+            model: ModelRef {
+                provider: "github-copilot".to_string(),
+                id: "gpt-5.4".to_string(),
+            },
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.individual.githubcopilot.com".to_string()),
+            auth: ProviderAuth::ApiKey("token".to_string()),
+        };
+        let headers = openai_compatible_headers(&copilot, "token", true).expect("copilot headers");
+        assert_eq!(
+            headers
+                .get("Copilot-Integration-Id")
+                .and_then(|value| value.to_str().ok()),
+            Some("vscode-chat")
+        );
+        assert_eq!(
+            headers
+                .get("Copilot-Vision-Request")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let cloudflare = ProviderConfig {
+            model: ModelRef {
+                provider: "cloudflare-ai-gateway".to_string(),
+                id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
+            },
+            api: ProviderApi::OpenAi,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+        };
+        let headers =
+            openai_compatible_headers(&cloudflare, "token", false).expect("cloudflare headers");
+        assert_eq!(
+            headers
+                .get("cf-aig-authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+        assert!(headers.get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn codex_headers_accept_login_tokens_and_api_keys() {
+        let login_headers = codex_headers(&ProviderAuth::ChatGptOAuth {
+            access_token: "access-token".to_string(),
+            account_id: Some("account-id".to_string()),
+        })
+        .expect("login headers");
+        assert_eq!(
+            login_headers
+                .get("ChatGPT-Account-ID")
+                .and_then(|value| value.to_str().ok()),
+            Some("account-id")
+        );
+
+        let api_key_headers =
+            codex_headers(&ProviderAuth::ApiKey("api-key".to_string())).expect("api key headers");
+        assert_eq!(
+            api_key_headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer api-key")
+        );
+        assert!(api_key_headers.get("ChatGPT-Account-ID").is_none());
+    }
+
+    #[test]
+    fn bedrock_messages_include_image_payloads() {
+        let messages = bedrock_messages(&[ChatMessage {
+            role: ChatRole::User,
+            content: "describe".to_string(),
+            media: vec![MediaInput {
+                mime_type: "image/png".to_string(),
+                data_base64: "aW1hZ2U=".to_string(),
+                path: None,
+                width: None,
+                height: None,
+            }],
+        }]);
+
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][1]["image"]["format"], "png");
+        assert_eq!(
+            messages[0]["content"][1]["image"]["source"]["bytes"],
+            "aW1hZ2U="
         );
     }
 }

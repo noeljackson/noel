@@ -1302,8 +1302,14 @@ fn map_provider_api(api: &ConfigProviderApi) -> AiProviderApi {
     match api {
         ConfigProviderApi::Faux => AiProviderApi::Faux,
         ConfigProviderApi::OpenAi => AiProviderApi::OpenAi,
+        ConfigProviderApi::OpenAiResponses => AiProviderApi::OpenAiResponses,
+        ConfigProviderApi::OpenAiCodexResponses => AiProviderApi::OpenAiCodexResponses,
+        ConfigProviderApi::AzureOpenAiResponses => AiProviderApi::AzureOpenAiResponses,
         ConfigProviderApi::Anthropic => AiProviderApi::Anthropic,
         ConfigProviderApi::Google => AiProviderApi::Google,
+        ConfigProviderApi::GoogleVertex => AiProviderApi::GoogleVertex,
+        ConfigProviderApi::Bedrock => AiProviderApi::Bedrock,
+        ConfigProviderApi::Mistral => AiProviderApi::Mistral,
     }
 }
 

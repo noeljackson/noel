@@ -16,7 +16,7 @@ Current Rust implementation:
 - Config/auth/model loading from `~/.pi/agent`
 - `AGENTS.md` and `CLAUDE.md` context discovery
 - Built-in local tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
-- Providers: faux test provider, OpenAI-compatible chat completions, Anthropic Messages, Google Gemini
+- Providers: faux test provider, OpenAI chat/responses/Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini/Vertex, OpenRouter, GitHub Copilot, Amazon Bedrock bearer-token Converse, Mistral, and Cloudflare Workers AI/AI Gateway
 
 Intentionally removed:
 
@@ -132,17 +132,33 @@ Provider API keys can be stored in `auth.json`:
 ```json
 {
   "openai": { "type": "api_key", "key": "env:OPENAI_API_KEY" },
+  "openai-codex": { "type": "oauth", "access_token": "env:CODEX_ACCESS_TOKEN", "expires": 0 },
+  "azure-openai-responses": { "type": "api_key", "key": "env:AZURE_OPENAI_API_KEY" },
   "anthropic": { "type": "api_key", "key": "env:ANTHROPIC_API_KEY" },
-  "google": { "type": "api_key", "key": "env:GEMINI_API_KEY" }
+  "google": { "type": "api_key", "key": "env:GEMINI_API_KEY" },
+  "google-vertex": { "type": "api_key", "key": "env:GOOGLE_CLOUD_API_KEY" },
+  "github-copilot": { "type": "api_key", "key": "env:COPILOT_GITHUB_TOKEN" },
+  "openrouter": { "type": "api_key", "key": "env:OPENROUTER_API_KEY" },
+  "amazon-bedrock": { "type": "api_key", "key": "env:AWS_BEARER_TOKEN_BEDROCK" },
+  "mistral": { "type": "api_key", "key": "env:MISTRAL_API_KEY" },
+  "cloudflare-workers-ai": { "type": "api_key", "key": "env:CLOUDFLARE_API_KEY" },
+  "cloudflare-ai-gateway": { "type": "api_key", "key": "env:CLOUDFLARE_API_KEY" }
 }
 ```
 
 When no explicit API key is configured, `pi` can reuse existing CLI login credentials:
 
 - Claude Code: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or `~/.claude/.credentials.json`
-- Codex/ChatGPT: `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json`
+- Codex/ChatGPT: `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json` for `openai` and `openai-codex`
 
 Explicit API keys still take precedence over login tokens.
+
+Provider-specific environment:
+
+- Azure OpenAI: set `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`; optionally set `AZURE_OPENAI_DEPLOYMENT_NAME`, `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`, and `AZURE_OPENAI_API_VERSION`.
+- Google Vertex: set `GOOGLE_CLOUD_PROJECT` or `GCLOUD_PROJECT`, plus `GOOGLE_CLOUD_LOCATION`.
+- Cloudflare: set `CLOUDFLARE_ACCOUNT_ID`; AI Gateway also needs `CLOUDFLARE_GATEWAY_ID`.
+- Amazon Bedrock: Rust direct calls currently use Bedrock bearer-token auth via `AWS_BEARER_TOKEN_BEDROCK`.
 
 `models.json` may override the built-in model list:
 
@@ -150,13 +166,19 @@ Explicit API keys still take precedence over login tokens.
 [
   {
     "provider": "openai",
-    "id": "gpt-4.1",
-    "api": "open-ai"
+    "id": "gpt-5.4",
+    "api": "openai-responses"
   },
   {
     "provider": "anthropic",
     "id": "claude-sonnet-4-5",
-    "api": "anthropic"
+    "api": "anthropic-messages"
+  },
+  {
+    "provider": "openrouter",
+    "id": "moonshotai/kimi-k2.6",
+    "api": "openai-completions",
+    "baseUrl": "https://openrouter.ai/api/v1"
   }
 ]
 ```

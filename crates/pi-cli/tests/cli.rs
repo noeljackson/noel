@@ -11,6 +11,14 @@ fn pi_command() -> Command {
     command.env_remove("ANTHROPIC_API_KEY");
     command.env_remove("GEMINI_API_KEY");
     command.env_remove("GOOGLE_API_KEY");
+    command.env_remove("AZURE_OPENAI_API_KEY");
+    command.env_remove("COPILOT_GITHUB_TOKEN");
+    command.env_remove("OPENROUTER_API_KEY");
+    command.env_remove("GOOGLE_CLOUD_API_KEY");
+    command.env_remove("AWS_BEARER_TOKEN_BEDROCK");
+    command.env_remove("MISTRAL_API_KEY");
+    command.env_remove("CLOUDFLARE_API_KEY");
+    command.env_remove("CODEX_ACCESS_TOKEN");
     command
 }
 
