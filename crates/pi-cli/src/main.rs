@@ -27,15 +27,15 @@ use pi_core::{
     SessionStore,
 };
 use pi_tui::{
-    EditorState, Keybinding as TuiKeybinding, KeybindingMap, ModelView, Selector, SelectorItem,
-    SessionView, SettingsView, TerminalRenderer, TerminalTheme,
+    EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector, SelectorItem, SessionView,
+    SettingsView, TerminalRenderer, TerminalTheme,
 };
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 
@@ -736,6 +736,84 @@ struct TuiEntry {
     text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiSelectorState {
+    kind: String,
+    title: String,
+    items: Vec<SelectorItem>,
+    filtered_indices: Vec<usize>,
+    selected: usize,
+    query: String,
+}
+
+impl TuiSelectorState {
+    fn new(kind: impl Into<String>, selector: Selector, query: impl Into<String>) -> Self {
+        let mut state = Self {
+            kind: kind.into(),
+            title: selector.title,
+            items: selector.items,
+            filtered_indices: Vec::new(),
+            selected: 0,
+            query: query.into(),
+        };
+        state.refresh_filter();
+        state
+    }
+
+    fn refresh_filter(&mut self) {
+        let query = self.query.to_lowercase();
+        self.filtered_indices = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                if query.is_empty()
+                    || item.label.to_lowercase().contains(&query)
+                    || item.value.to_lowercase().contains(&query)
+                {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if self.selected >= self.filtered_indices.len() {
+            self.selected = self.filtered_indices.len().saturating_sub(1);
+        }
+    }
+
+    fn selected_item(&self) -> Option<&SelectorItem> {
+        self.filtered_indices
+            .get(self.selected)
+            .and_then(|index| self.items.get(*index))
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let len = self.filtered_indices.len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        self.selected = if delta.is_negative() {
+            self.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            (self.selected + delta as usize).min(len - 1)
+        };
+    }
+
+    fn push_query_char(&mut self, ch: char) {
+        self.query.push(ch);
+        self.selected = 0;
+        self.refresh_filter();
+    }
+
+    fn pop_query_char(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+        self.refresh_filter();
+    }
+}
+
 #[derive(Debug, Default)]
 struct TuiApp {
     entries: Vec<TuiEntry>,
@@ -743,6 +821,7 @@ struct TuiApp {
     editor_state: EditorState,
     last_shell_command: Option<String>,
     multiline: Option<Vec<String>>,
+    selector: Option<TuiSelectorState>,
     status: String,
 }
 
@@ -802,6 +881,7 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig, runtime:
     draw_chat(frame, root[1], app);
     draw_input(frame, root[2], app);
     draw_footer(frame, root[3], app);
+    draw_selector_overlay(frame, app);
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, config: &LoadedConfig, runtime: &Runtime) {
@@ -892,6 +972,86 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(footer, area);
 }
 
+fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
+    let Some(selector) = &app.selector else {
+        return;
+    };
+    let area = centered_rect(frame.area(), 82, 68);
+    frame.render_widget(Clear, area);
+    let available = area.height.saturating_sub(5) as usize;
+    let start = selector
+        .selected
+        .saturating_sub(available.saturating_sub(1));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("filter ", Style::default().fg(Color::DarkGray)),
+            Span::raw(selector.query.as_str()),
+        ]),
+        Line::from(""),
+    ];
+    for (position, item_index) in selector
+        .filtered_indices
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(available)
+    {
+        let item = &selector.items[*item_index];
+        let marker = if position == selector.selected {
+            ">"
+        } else {
+            " "
+        };
+        let active = if item.active { "*" } else { " " };
+        let style = if position == selector.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else if item.active {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{:>2}. {marker}{active} {}\t{}",
+                position + 1,
+                item.label,
+                item.value
+            ),
+            style,
+        )));
+    }
+    if selector.filtered_indices.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no matches",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let title = format!(" {} selector  enter select  esc cancel ", selector.title);
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(paragraph, area);
+}
+
+fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
 async fn handle_tui_key(
     key: KeyEvent,
     app: &mut TuiApp,
@@ -899,6 +1059,11 @@ async fn handle_tui_key(
     config: &mut LoadedConfig,
     offline: bool,
 ) -> Result<bool> {
+    if app.selector.is_some() {
+        handle_tui_selector_key(key, app, runtime, config)?;
+        app.status = footer_status(config, runtime, &app.editor_state);
+        return Ok(false);
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
         KeyCode::Esc => {
@@ -930,6 +1095,122 @@ async fn handle_tui_key(
     }
     app.status = footer_status(config, runtime, &app.editor_state);
     Ok(false)
+}
+
+fn handle_tui_selector_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    runtime: &mut Runtime,
+    config: &mut LoadedConfig,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            app.selector = None;
+        }
+        KeyCode::Up => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.move_selection(-1);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.move_selection(1);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.pop_query_char();
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(selector) = app.selector.take() {
+                apply_tui_selector_selection(app, runtime, config, selector)?;
+            }
+        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.push_query_char(ch);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn open_tui_selector(
+    app: &mut TuiApp,
+    config: &LoadedConfig,
+    runtime: &Runtime,
+    kind: &str,
+    query: &str,
+) -> Result<()> {
+    let selector = selector_for_kind(config, runtime, kind)?;
+    if selector.items.is_empty() {
+        app.push(TuiEntryKind::System, format!("no {kind}"));
+        return Ok(());
+    }
+    let state = TuiSelectorState::new(kind, selector, query);
+    app.push(TuiEntryKind::System, format!("{} selector", state.title));
+    app.selector = Some(state);
+    Ok(())
+}
+
+fn apply_tui_selector_selection(
+    app: &mut TuiApp,
+    runtime: &mut Runtime,
+    config: &mut LoadedConfig,
+    selector: TuiSelectorState,
+) -> Result<()> {
+    let Some(item) = selector.selected_item().cloned() else {
+        app.push(TuiEntryKind::System, "no selector match");
+        return Ok(());
+    };
+    match selector.kind.as_str() {
+        "model" | "models" | "scoped-models" => {
+            let model = resolve_model_reference(config, &item.value)
+                .ok_or_else(|| anyhow!("model not found: {}", item.value))?;
+            runtime.set_active_model(Some(model.clone()))?;
+            app.push(
+                TuiEntryKind::System,
+                format!("model: {}/{}", model.provider, model.id),
+            );
+        }
+        "theme" | "themes" => {
+            config.settings.theme = Some(item.value.clone());
+            app.push(TuiEntryKind::System, format!("theme: {}", item.value));
+        }
+        "session" | "sessions" | "resume" | "tree" => {
+            let path = resolve_session_reference(&config.paths.session_dir, &item.value)?;
+            let (store, state) = SessionStore::open(path)?;
+            runtime.replace_session(state, Some(store));
+            app.push(TuiEntryKind::System, format_session(runtime));
+        }
+        "auth" | "login" => {
+            app.push(
+                TuiEntryKind::System,
+                format_login_status(config, &item.value),
+            );
+        }
+        "logout" => {
+            if config.auth.remove(&item.value).is_some() {
+                write_auth_file(config)?;
+                app.push(
+                    TuiEntryKind::System,
+                    format!("removed stored auth for {}", item.value),
+                );
+            } else {
+                app.push(
+                    TuiEntryKind::System,
+                    format!("no stored auth for {}", item.value),
+                );
+            }
+        }
+        _ => app.push(
+            TuiEntryKind::System,
+            format!("selected {}: {}", selector.title, item.value),
+        ),
+    }
+    Ok(())
 }
 
 async fn handle_tui_submission(
@@ -966,9 +1247,7 @@ async fn handle_tui_submission(
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
-        "/model" | "/scoped-models" => {
-            app.push(TuiEntryKind::System, format_scoped_models(config, runtime));
-        }
+        "/model" | "/scoped-models" => open_tui_selector(app, config, runtime, "model", "")?,
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
         "/settings" => app.push(TuiEntryKind::System, format_settings(config, runtime)),
         "/status" => app.push(
@@ -1021,6 +1300,7 @@ async fn handle_tui_submission(
             );
         }
         "/copy" => app.push(TuiEntryKind::System, copy_last_assistant_message(runtime)?),
+        "/theme" => open_tui_selector(app, config, runtime, "theme", "")?,
         "/multiline" => {
             app.multiline = Some(Vec::new());
             app.push(
@@ -1099,10 +1379,7 @@ async fn handle_tui_submission(
         }
         _ if line.starts_with("/selector ") => {
             let kind = line.trim_start_matches("/selector ").trim();
-            app.push(
-                TuiEntryKind::System,
-                terminal_renderer(config).selector(&selector_for_kind(config, runtime, kind)?),
-            );
+            open_tui_selector(app, config, runtime, kind, "")?;
         }
         _ if line.starts_with("/select ") => {
             app.push(
@@ -1213,12 +1490,16 @@ async fn handle_tui_submission(
         }
         _ if line.starts_with("/login") => {
             let provider = line.trim_start_matches("/login").trim();
-            app.push(TuiEntryKind::System, format_login_status(config, provider));
+            if provider.is_empty() {
+                open_tui_selector(app, config, runtime, "login", "")?;
+            } else {
+                app.push(TuiEntryKind::System, format_login_status(config, provider));
+            }
         }
         _ if line.starts_with("/logout") => {
             let provider = line.trim_start_matches("/logout").trim();
             if provider.is_empty() {
-                app.push(TuiEntryKind::System, "usage: /logout <provider>");
+                open_tui_selector(app, config, runtime, "logout", "")?;
             } else if config.auth.remove(provider).is_some() {
                 write_auth_file(config)?;
                 app.push(
@@ -1743,13 +2024,21 @@ fn select_from_selector_message(
             config.settings.theme = Some(item.value.clone());
             Ok(format!("theme: {}", item.value))
         }
-        "session" | "sessions" => {
+        "session" | "sessions" | "resume" | "tree" => {
             let path = resolve_session_reference(&config.paths.session_dir, &item.value)?;
             let (store, state) = SessionStore::open(path)?;
             runtime.replace_session(state, Some(store));
             Ok(format_session(runtime))
         }
-        "auth" => Ok(format!("auth: {}", item.value)),
+        "auth" | "login" => Ok(format_login_status(config, &item.value)),
+        "logout" => {
+            if config.auth.remove(&item.value).is_some() {
+                write_auth_file(config)?;
+                Ok(format!("removed stored auth for {}", item.value))
+            } else {
+                Ok(format!("no stored auth for {}", item.value))
+            }
+        }
         _ => Err(anyhow!("unknown selector: {kind}")),
     }
 }
@@ -1790,7 +2079,7 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
                 })
                 .collect(),
         )),
-        "session" | "sessions" => Ok(Selector::new(
+        "session" | "sessions" | "resume" | "tree" => Ok(Selector::new(
             "session",
             SessionStore::list(&config.paths.session_dir)?
                 .into_iter()
@@ -1801,8 +2090,8 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
                 })
                 .collect(),
         )),
-        "auth" => Ok(Selector::new(
-            "auth",
+        "auth" | "login" | "logout" => Ok(Selector::new(
+            if kind == "logout" { "logout" } else { "auth" },
             config
                 .models
                 .iter()
@@ -1810,12 +2099,12 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .map(|provider| SelectorItem {
-                    label: provider.clone(),
-                    value: if auth_for_provider(&config.auth, &provider).is_some() {
+                    label: if auth_for_provider(&config.auth, &provider).is_some() {
                         format!("{provider}: available")
                     } else {
                         format!("{provider}: missing")
                     },
+                    value: provider.clone(),
                     active: auth_for_provider(&config.auth, &provider).is_some(),
                 })
                 .collect(),
@@ -1874,24 +2163,6 @@ fn expand_prompt_template(template: &str, input: &str) -> String {
     } else {
         format!("{template}\n\n{input}")
     }
-}
-
-fn format_scoped_models(config: &LoadedConfig, runtime: &Runtime) -> String {
-    let models = config
-        .models
-        .iter()
-        .map(|model| ModelView {
-            provider: model.provider.clone(),
-            id: model.id.clone(),
-            active: runtime
-                .session()
-                .active_model
-                .as_ref()
-                .map(|active| active.provider == model.provider && active.id == model.id)
-                .unwrap_or(false),
-        })
-        .collect::<Vec<_>>();
-    terminal_renderer(config).models(&models)
 }
 
 fn format_login_status(config: &LoadedConfig, provider: &str) -> String {

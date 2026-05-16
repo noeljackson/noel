@@ -64,6 +64,11 @@ send_line() {
   sleep 0.35
 }
 
+send_enter() {
+  tmux send-keys -t "${session_name}" Enter
+  sleep 0.35
+}
+
 send_line "/session"
 send_line "hello from tmux e2e"
 send_line "/complete /mo"
@@ -92,13 +97,17 @@ send_line "/skill:review skill input"
 send_line "/prompts"
 send_line "/prompt fix broken thing"
 send_line "/themes"
-send_line "/selector theme"
 send_line "/select theme 1"
+send_line "/selector theme"
+send_enter
 send_line "/theme dark"
 send_line "/scoped-models"
+send_enter
 send_line "/selector model"
+send_enter
 send_line "/select model 1"
 send_line "/model"
+send_enter
 send_line "/model 1"
 send_line "/hotkeys"
 send_line "/copy"
@@ -176,7 +185,6 @@ require_output "fix broken thing"
 require_output "theme: dark"
 require_output "theme selector"
 require_output "model selector"
-require_output "* faux/echo"
 require_output "model: faux/echo"
 require_output "submit"
 require_output "reload"
