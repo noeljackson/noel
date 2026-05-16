@@ -29,7 +29,7 @@ printf '{"name":"dark"}\n' > "${agent_dir}/themes/dark.json"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${repo_root}' && PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${repo_root}' && PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -74,11 +74,16 @@ send_line "/model 1"
 send_line "/hotkeys"
 send_line "/copy"
 send_line "/export target/e2e-tmux-work/session-export.json"
+send_line "/export target/e2e-tmux-work/session-export.jsonl"
+send_line "/export target/e2e-tmux-work/session-export.html"
+send_line "/share target/e2e-tmux-work/session-share.html"
 send_line "/clone"
 send_line "/session"
 send_line "/resume 1"
 send_line "/session"
 send_line "/import target/e2e-tmux-work/session-export.json"
+send_line "/session"
+send_line "/import target/e2e-tmux-work/session-export.jsonl"
 send_line "/session"
 send_line "/fork"
 send_line "/session"
@@ -127,7 +132,11 @@ require_output "model: faux/echo"
 require_output "submit"
 require_output "reload"
 require_output "[faux/echo] after reload"
+require_output "copied to clipboard via cat > ${work_dir}/clipboard.txt"
 require_output "exported target/e2e-tmux-work/session-export.json"
+require_output "exported target/e2e-tmux-work/session-export.jsonl"
+require_output "exported target/e2e-tmux-work/session-export.html"
+require_output "share exported target/e2e-tmux-work/session-share.html"
 require_output "parent:"
 require_output "compacted"
 require_output "enter multiline prompt"
@@ -136,9 +145,9 @@ require_output "multi two"
 require_output "deleted ${session_dir}/"
 
 mapfile -t session_lines < <(grep '^session: ' "${work_dir}/pane.txt")
-if [ "${#session_lines[@]}" -lt 13 ]; then
+if [ "${#session_lines[@]}" -lt 15 ]; then
   cat "${work_dir}/pane.txt" >&2
-  echo "expected at least thirteen session lines" >&2
+  echo "expected at least fifteen session lines" >&2
   exit 1
 fi
 
@@ -147,8 +156,9 @@ second_session="${session_lines[1]#session: }"
 clone_session="${session_lines[4]#session: }"
 resumed_session="${session_lines[6]#session: }"
 imported_session="${session_lines[8]#session: }"
-fork_session="${session_lines[10]#session: }"
-post_delete_session="${session_lines[12]#session: }"
+jsonl_imported_session="${session_lines[10]#session: }"
+fork_session="${session_lines[12]#session: }"
+post_delete_session="${session_lines[14]#session: }"
 if [ "${first_session}" != "${second_session}" ]; then
   cat "${work_dir}/pane.txt" >&2
   echo "session changed across reload: ${first_session} != ${second_session}" >&2
@@ -167,6 +177,11 @@ fi
 if [ "${imported_session}" != "${first_session}" ]; then
   cat "${work_dir}/pane.txt" >&2
   echo "import did not restore exported session id: ${imported_session} != ${first_session}" >&2
+  exit 1
+fi
+if [ "${jsonl_imported_session}" != "${first_session}" ]; then
+  cat "${work_dir}/pane.txt" >&2
+  echo "jsonl import did not restore exported session id: ${jsonl_imported_session} != ${first_session}" >&2
   exit 1
 fi
 if [ "${first_session}" = "${fork_session}" ]; then
@@ -208,6 +223,26 @@ if [ ! -f "${work_dir}/session-export.json" ]; then
   exit 1
 fi
 grep -Fq "${first_session}" "${work_dir}/session-export.json"
+if [ ! -f "${work_dir}/session-export.jsonl" ]; then
+  echo "missing exported jsonl session" >&2
+  exit 1
+fi
+grep -Fq "${first_session}" "${work_dir}/session-export.jsonl"
+if [ ! -f "${work_dir}/session-export.html" ]; then
+  echo "missing exported html session" >&2
+  exit 1
+fi
+grep -Fq "pi session export" "${work_dir}/session-export.html"
+if [ ! -f "${work_dir}/session-share.html" ]; then
+  echo "missing shared html session" >&2
+  exit 1
+fi
+grep -Fq "pi session export" "${work_dir}/session-share.html"
+if [ ! -f "${work_dir}/clipboard.txt" ]; then
+  echo "missing clipboard capture" >&2
+  exit 1
+fi
+grep -Fq "[faux/echo] fix broken thing" "${work_dir}/clipboard.txt"
 
 disabled_session="pi-e2e-disabled-${$}"
 tmux new-session -d -s "${disabled_session}" -x 100 -y 20

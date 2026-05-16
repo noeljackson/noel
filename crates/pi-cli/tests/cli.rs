@@ -227,6 +227,67 @@ fn print_mode_expands_at_file_and_exports_session() {
 }
 
 #[test]
+fn print_mode_exports_html_and_jsonl_sessions() {
+    let root = test_dir("pi-cli-export-formats");
+    let sessions = root.join("sessions");
+    let html = root.join("export.html");
+    let jsonl = root.join("export.jsonl");
+    let sessions_arg = path_text(&sessions);
+    let html_arg = path_text(&html);
+    let jsonl_arg = path_text(&jsonl);
+    fs::create_dir_all(&root).expect("create root");
+
+    let html_output = pi_command()
+        .current_dir(&root)
+        .args([
+            "-p",
+            "--session-dir",
+            sessions_arg.as_str(),
+            "--model",
+            "faux/echo",
+            "--export",
+            html_arg.as_str(),
+            "html export",
+        ])
+        .output()
+        .expect("run pi html export");
+    assert!(
+        html_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&html_output.stderr)
+    );
+
+    let jsonl_output = pi_command()
+        .current_dir(&root)
+        .args([
+            "-p",
+            "--session-dir",
+            sessions_arg.as_str(),
+            "--model",
+            "faux/echo",
+            "--export",
+            jsonl_arg.as_str(),
+            "jsonl export",
+        ])
+        .output()
+        .expect("run pi jsonl export");
+    assert!(
+        jsonl_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&jsonl_output.stderr)
+    );
+
+    let html_content = fs::read_to_string(html).expect("read html export");
+    assert!(html_content.contains("<!doctype html>"));
+    assert!(html_content.contains("html export"));
+    let jsonl_content = fs::read_to_string(jsonl).expect("read jsonl export");
+    assert!(jsonl_content.contains("\"type\":\"started\""));
+    assert!(jsonl_content.contains("jsonl export"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn session_reference_and_fork_flags_preserve_parent_context() {
     let root = test_dir("pi-cli-session-ref-fork");
     let sessions = root.join("sessions");

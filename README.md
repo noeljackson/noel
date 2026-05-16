@@ -80,6 +80,8 @@ cargo run -p pi-cli -- --models faux/echo --tools read,write -p "hello"
 cargo run -p pi-cli -- --no-tools -p "no tools"
 cargo run -p pi-cli -- --system-prompt prompt.md --append-system-prompt extra.md -p "hello"
 cargo run -p pi-cli -- --export session.json -p "hello"
+cargo run -p pi-cli -- --export session.html -p "hello"
+cargo run -p pi-cli -- --export session.jsonl -p "hello"
 ```
 
 Prompt arguments starting with `@` are expanded from files:
@@ -198,6 +200,7 @@ or an object map:
 - `/export <file>`
 - `/import <file>`
 - `/copy`
+- `/share [file]`
 - `/compact`
 - `/login [provider]`
 - `/logout <provider>`
@@ -244,4 +247,4 @@ make docker-e2e
 
 The old TypeScript implementation is preserved on the `ts-reference` branch for behavioral reference. Active development on `main` is Rust-only.
 
-Rust sessions use a new append-only JSONL schema plus JSON export/import. Legacy TypeScript session logs are not migrated automatically; keep `ts-reference` for reading old session behavior and export/import only through the Rust schema.
+Rust sessions use a new append-only JSONL schema plus JSON, JSONL, and HTML export/import where applicable. Legacy TypeScript session logs are not migrated automatically; keep `ts-reference` for reading old session behavior and export/import only through the Rust schema. `/share` writes a local HTML export; web or gist sharing is intentionally unsupported in the Rust-only CLI.

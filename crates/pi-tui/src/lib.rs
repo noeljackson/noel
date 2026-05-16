@@ -190,7 +190,11 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "/copy",
-        description: "print last assistant message",
+        description: "copy last assistant message",
+    },
+    CommandHelp {
+        command: "/share [file]",
+        description: "export a local HTML session share",
     },
     CommandHelp {
         command: "/compact",

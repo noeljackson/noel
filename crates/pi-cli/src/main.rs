@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
@@ -13,8 +14,8 @@ use pi_config::{
     LoadedConfig, ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, ENV_SESSION_DIR,
 };
 use pi_core::{
-    run_user_turn, ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionExport,
-    SessionState, SessionStore,
+    run_user_turn, write_session_export, ConversationMessage, MessageRole, ReloadableSystems,
+    Runtime, SessionState, SessionStore,
 };
 use pi_tui::{
     Keybinding as TuiKeybinding, KeybindingMap, ModelView, SessionView, SettingsView,
@@ -776,9 +777,7 @@ async fn run_interactive(
             }
             _ if line.starts_with("/import ") => {
                 let path = PathBuf::from(line.trim_start_matches("/import ").trim());
-                let content = fs::read_to_string(&path)?;
-                let export = serde_json::from_str::<SessionExport>(&content)?;
-                let (store, state) = SessionStore::import(&config.paths.session_dir, export)?;
+                let (store, state) = SessionStore::import_path(&config.paths.session_dir, &path)?;
                 runtime.replace_session(state, Some(store));
                 print_session(&runtime);
                 continue;
@@ -792,6 +791,11 @@ async fn run_interactive(
                     .find(|message| message.role == MessageRole::Assistant)
                 {
                     println!("{}", message.content);
+                    if let Some(command) = copy_to_clipboard(&message.content)? {
+                        println!("copied to clipboard via {command}");
+                    } else {
+                        println!("clipboard unavailable");
+                    }
                 } else {
                     println!("no assistant message");
                 }
@@ -819,8 +823,18 @@ async fn run_interactive(
                 }
                 continue;
             }
-            "/share" => {
-                println!("share is not available in the Rust-only CLI");
+            _ if line.starts_with("/share") => {
+                let requested = line.trim_start_matches("/share").trim();
+                let path = if requested.is_empty() {
+                    config
+                        .paths
+                        .session_dir
+                        .join(format!("{}.html", runtime.session().session_id))
+                } else {
+                    PathBuf::from(requested)
+                };
+                export_session(&runtime, &path)?;
+                println!("share exported {}", path.display());
                 continue;
             }
             _ => {}
@@ -1137,10 +1151,58 @@ fn export_session(runtime: &Runtime, path: &Path) -> Result<()> {
     if let Some(store) = runtime.store() {
         store.export_state(runtime.session(), path)?;
     } else {
-        let content = serde_json::to_string_pretty(&SessionExport::from(runtime.session()))?;
-        fs::write(path, content)?;
+        write_session_export(runtime.session(), path)?;
     }
     Ok(())
+}
+
+fn copy_to_clipboard(text: &str) -> Result<Option<String>> {
+    if let Ok(command) = std::env::var("PI_CLIPBOARD_COMMAND") {
+        run_clipboard_command(&command, text)?;
+        return Ok(Some(command));
+    }
+    for command in clipboard_commands() {
+        if run_clipboard_command(&command, text).is_ok() {
+            return Ok(Some(command));
+        }
+    }
+    Ok(None)
+}
+
+fn clipboard_commands() -> Vec<String> {
+    let mut commands = Vec::new();
+    if cfg!(target_os = "macos") {
+        commands.push("pbcopy".to_string());
+    }
+    if cfg!(target_os = "windows") {
+        commands.push("clip.exe".to_string());
+    }
+    commands.extend([
+        "wl-copy".to_string(),
+        "xclip -selection clipboard".to_string(),
+        "xsel --clipboard --input".to_string(),
+    ]);
+    commands
+}
+
+fn run_clipboard_command(command: &str, text: &str) -> Result<()> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let Some(stdin) = child.stdin.as_mut() else {
+        return Err(anyhow!("clipboard command did not open stdin"));
+    };
+    stdin.write_all(text.as_bytes())?;
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("clipboard command failed: {command}"))
+    }
 }
 
 fn compact_session(runtime: &mut Runtime) -> Result<()> {

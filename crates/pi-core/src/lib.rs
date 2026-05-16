@@ -380,17 +380,29 @@ impl SessionStore {
     }
 
     pub fn export_state(&self, state: &SessionState, path: &Path) -> Result<(), SessionError> {
-        let content =
-            serde_json::to_string_pretty(&SessionExport::from(state)).map_err(|source| {
+        write_session_export(state, path)
+    }
+
+    pub fn import_path(
+        session_dir: &Path,
+        path: &Path,
+    ) -> Result<(Self, SessionState), SessionError> {
+        let export = if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+            let (_store, state) = Self::open(path.to_path_buf())?;
+            SessionExport::from(&state)
+        } else {
+            let content = fs::read_to_string(path).map_err(|source| SessionError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            serde_json::from_str::<SessionExport>(&content).map_err(|source| {
                 SessionError::Parse {
                     path: path.to_path_buf(),
                     source,
                 }
-            })?;
-        fs::write(path, content).map_err(|source| SessionError::Write {
-            path: path.to_path_buf(),
-            source,
-        })
+            })?
+        };
+        Self::import(session_dir, export)
     }
 
     pub fn list(session_dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
@@ -537,6 +549,10 @@ impl SessionStore {
     }
 
     fn write_full_state(&self, state: &SessionState) -> Result<(), SessionError> {
+        File::create(&self.path).map_err(|source| SessionError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
         self.append(&SessionRecord::Started {
             session_id: state.session_id.clone(),
             cwd: state.cwd.clone(),
@@ -576,6 +592,143 @@ impl SessionStore {
             source,
         })
     }
+}
+
+pub fn write_session_export(state: &SessionState, path: &Path) -> Result<(), SessionError> {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("html") | Some("htm") => write_html_export(state, path),
+        Some("jsonl") => write_jsonl_export(state, path),
+        _ => {
+            let content =
+                serde_json::to_string_pretty(&SessionExport::from(state)).map_err(|source| {
+                    SessionError::Parse {
+                        path: path.to_path_buf(),
+                        source,
+                    }
+                })?;
+            fs::write(path, content).map_err(|source| SessionError::Write {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    }
+}
+
+fn write_jsonl_export(state: &SessionState, path: &Path) -> Result<(), SessionError> {
+    let mut file = File::create(path).map_err(|source| SessionError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut records = vec![
+        SessionRecord::Started {
+            session_id: state.session_id.clone(),
+            cwd: state.cwd.clone(),
+        },
+        SessionRecord::Metadata {
+            name: state.name.clone(),
+            labels: state.labels.iter().cloned().collect(),
+            parent_session_id: state.parent_session_id.clone(),
+        },
+        SessionRecord::ActiveModel {
+            model: state.active_model.clone(),
+        },
+        SessionRecord::ActiveTools {
+            tools: state.active_tool_names.iter().cloned().collect(),
+        },
+    ];
+    records.extend(
+        state
+            .messages
+            .iter()
+            .cloned()
+            .map(|message| SessionRecord::Message { message }),
+    );
+    records.extend(
+        state
+            .tool_history
+            .iter()
+            .cloned()
+            .map(|event| SessionRecord::Tool { event }),
+    );
+    records.extend(
+        state
+            .queued_messages
+            .iter()
+            .cloned()
+            .map(|message| SessionRecord::QueuedMessage { message }),
+    );
+    for record in records {
+        let line = serde_json::to_string(&record).map_err(|source| SessionError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        writeln!(file, "{line}").map_err(|source| SessionError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn write_html_export(state: &SessionState, path: &Path) -> Result<(), SessionError> {
+    let mut content = String::new();
+    content.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
+    content.push_str("<title>pi session export</title>");
+    content.push_str("<style>body{font-family:system-ui,sans-serif;line-height:1.45;margin:2rem;max-width:960px}pre{white-space:pre-wrap;background:#f5f5f5;padding:1rem;border-radius:6px}.message,.tool{border-top:1px solid #ddd;padding:1rem 0}.role{font-weight:700;text-transform:uppercase;font-size:.8rem;color:#555}.meta{color:#555}</style>");
+    content.push_str("</head><body>");
+    content.push_str("<h1>pi session export</h1>");
+    content.push_str(&format!(
+        "<p class=\"meta\">session: {}<br>cwd: {}</p>",
+        escape_html(&state.session_id),
+        escape_html(&state.cwd.display().to_string())
+    ));
+    if let Some(name) = &state.name {
+        content.push_str(&format!(
+            "<p class=\"meta\">name: {}</p>",
+            escape_html(name)
+        ));
+    }
+    if !state.labels.is_empty() {
+        content.push_str(&format!(
+            "<p class=\"meta\">labels: {}</p>",
+            escape_html(&state.labels.iter().cloned().collect::<Vec<_>>().join(", "))
+        ));
+    }
+    for message in &state.messages {
+        content.push_str("<section class=\"message\">");
+        content.push_str(&format!(
+            "<div class=\"role\">{:?}</div><pre>{}</pre>",
+            message.role,
+            escape_html(&message.content)
+        ));
+        content.push_str("</section>");
+    }
+    if !state.tool_history.is_empty() {
+        content.push_str("<h2>tool history</h2>");
+        for event in &state.tool_history {
+            content.push_str("<section class=\"tool\">");
+            content.push_str(&format!(
+                "<div class=\"role\">{}</div><pre>{}</pre>",
+                escape_html(&event.name),
+                escape_html(&event.result)
+            ));
+            content.push_str("</section>");
+        }
+    }
+    content.push_str("</body></html>");
+    fs::write(path, content).map_err(|source| SessionError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[derive(Debug, Clone)]
@@ -1050,6 +1203,60 @@ mod tests {
         assert_eq!(loaded.cwd, PathBuf::from("/repo"));
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].content, "hello");
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn session_exports_jsonl_and_html_and_imports_jsonl() {
+        let base =
+            std::env::temp_dir().join(format!("pi-session-export-test-{}", new_session_id()));
+        let export_dir = base.join("exports");
+        fs::create_dir_all(&export_dir).expect("create export dir");
+        let (store, mut state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        state.name = Some("exported".to_string());
+        state.messages.push(ConversationMessage {
+            role: MessageRole::User,
+            content: "hello <world>".to_string(),
+        });
+        state.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            content: "done".to_string(),
+        });
+        state.tool_history.push(ToolEvent {
+            id: "tool-1".to_string(),
+            name: "read".to_string(),
+            result: "content".to_string(),
+        });
+        store.record_metadata(&state).expect("record metadata");
+        store
+            .record_message(state.messages[0].clone())
+            .expect("record user");
+        store
+            .record_message(state.messages[1].clone())
+            .expect("record assistant");
+        store
+            .record_tool(state.tool_history[0].clone())
+            .expect("record tool");
+
+        let jsonl = export_dir.join("session.jsonl");
+        let html = export_dir.join("session.html");
+        store.export_state(&state, &jsonl).expect("export jsonl");
+        store.export_state(&state, &html).expect("export html");
+
+        let jsonl_content = fs::read_to_string(&jsonl).expect("read jsonl");
+        assert!(jsonl_content.contains("\"type\":\"message\""));
+        let html_content = fs::read_to_string(&html).expect("read html");
+        assert!(html_content.contains("hello &lt;world&gt;"));
+        assert!(html_content.contains("tool history"));
+
+        let import_dir = base.join("imported");
+        let (_import_store, imported) =
+            SessionStore::import_path(&import_dir, &jsonl).expect("import jsonl");
+        assert_eq!(imported.session_id, state.session_id);
+        assert_eq!(imported.messages, state.messages);
+        assert_eq!(imported.tool_history, state.tool_history);
 
         let _ = fs::remove_dir_all(base);
     }
