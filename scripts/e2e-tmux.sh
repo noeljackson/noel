@@ -28,7 +28,7 @@ tmux send-keys -t "${session_name}" \
   Enter
 
 for _ in $(seq 1 80); do
-  if tmux capture-pane -t "${session_name}" -p | grep -q "pi>"; then
+  if tmux capture-pane -t "${session_name}" -p -S -2000 | grep -q "pi>"; then
     touch "${prompt_file}"
     break
   fi
@@ -36,7 +36,7 @@ for _ in $(seq 1 80); do
 done
 
 if [ ! -f "${prompt_file}" ]; then
-  tmux capture-pane -t "${session_name}" -p >&2
+  tmux capture-pane -t "${session_name}" -p -S -2000 >&2
   echo "pi prompt did not appear" >&2
   exit 1
 fi
@@ -53,10 +53,20 @@ send_line "/read target/e2e-tmux-work/file.txt"
 send_line "/reload"
 send_line "after reload"
 send_line "/session"
+send_line "/name tmux-session"
+send_line "/labels e2e tty"
+send_line "/settings"
+send_line "/scoped-models"
+send_line "/hotkeys"
+send_line "/export target/e2e-tmux-work/session-export.json"
+send_line "/fork"
+send_line "/session"
+send_line "/tree"
+send_line "/compact"
 send_line "/quit"
 sleep 0.5
 
-pane_output="$(tmux capture-pane -t "${session_name}" -p 2>/dev/null || true)"
+pane_output="$(tmux capture-pane -t "${session_name}" -p -S -2000 2>/dev/null || true)"
 printf '%s\n' "${pane_output}" > "${work_dir}/pane.txt"
 
 require_output() {
@@ -74,6 +84,14 @@ require_output "wrote ${repo_root}/target/e2e-tmux-work/file.txt"
 require_output "e2e-ok"
 require_output "reloaded"
 require_output "[faux/echo] after reload"
+require_output "name: tmux-session"
+require_output "labels: e2e, tty"
+require_output "agent dir:"
+require_output "* faux/echo"
+require_output "no custom keybindings"
+require_output "exported target/e2e-tmux-work/session-export.json"
+require_output "parent:"
+require_output "compacted"
 
 mapfile -t session_lines < <(grep '^session: ' "${work_dir}/pane.txt")
 if [ "${#session_lines[@]}" -lt 2 ]; then
@@ -83,10 +101,16 @@ if [ "${#session_lines[@]}" -lt 2 ]; then
 fi
 
 first_session="${session_lines[0]#session: }"
-last_session="${session_lines[-1]#session: }"
-if [ "${first_session}" != "${last_session}" ]; then
+second_session="${session_lines[1]#session: }"
+fork_session="${session_lines[-1]#session: }"
+if [ "${first_session}" != "${second_session}" ]; then
   cat "${work_dir}/pane.txt" >&2
-  echo "session changed across reload: ${first_session} != ${last_session}" >&2
+  echo "session changed across reload: ${first_session} != ${second_session}" >&2
+  exit 1
+fi
+if [ "${first_session}" = "${fork_session}" ]; then
+  cat "${work_dir}/pane.txt" >&2
+  echo "fork did not create a new session: ${first_session}" >&2
   exit 1
 fi
 
@@ -99,5 +123,21 @@ fi
 grep -Fq "hello from tmux e2e" "${session_log}"
 grep -Fq "after reload" "${session_log}"
 grep -Fq "e2e-ok" "${session_log}"
+
+fork_log="${session_dir}/${fork_session}.jsonl"
+if [ ! -f "${fork_log}" ]; then
+  echo "missing fork log: ${fork_log}" >&2
+  exit 1
+fi
+
+grep -Fq "${first_session}" "${fork_log}"
+grep -Fq "tmux-session" "${fork_log}"
+grep -Fq "tty" "${fork_log}"
+
+if [ ! -f "${work_dir}/session-export.json" ]; then
+  echo "missing exported session" >&2
+  exit 1
+fi
+grep -Fq "${first_session}" "${work_dir}/session-export.json"
 
 echo "tmux e2e passed: ${first_session}"

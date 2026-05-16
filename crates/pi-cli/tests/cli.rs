@@ -183,6 +183,139 @@ fn rpc_mode_accepts_json_line_requests_from_stdin() {
     assert_eq!(second["result"]["id"], "ephemeral");
 }
 
+#[test]
+fn print_mode_expands_at_file_and_exports_session() {
+    let root = test_dir("pi-cli-at-file-export");
+    let sessions = root.join("sessions");
+    let export = root.join("export.json");
+    let prompt = root.join("prompt.txt");
+    let sessions_arg = path_text(&sessions);
+    let export_arg = path_text(&export);
+    fs::create_dir_all(&root).expect("create root");
+    fs::write(&prompt, "from file").expect("write prompt");
+
+    let output = pi_command()
+        .current_dir(&root)
+        .args([
+            "-p",
+            "--session-dir",
+            sessions_arg.as_str(),
+            "--model",
+            "faux/echo",
+            "--export",
+            export_arg.as_str(),
+            "@prompt.txt",
+        ])
+        .output()
+        .expect("run pi");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[faux/echo] from file\n"
+    );
+    let exported =
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(export).expect("export"))
+            .expect("parse export");
+    assert_eq!(exported["messages"][0]["content"], "from file");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn session_reference_and_fork_flags_preserve_parent_context() {
+    let root = test_dir("pi-cli-session-ref-fork");
+    let sessions = root.join("sessions");
+    let sessions_arg = path_text(&sessions);
+    fs::create_dir_all(&root).expect("create root");
+
+    let first = pi_command()
+        .current_dir(&root)
+        .args([
+            "-p",
+            "--session-dir",
+            sessions_arg.as_str(),
+            "--model",
+            "faux/echo",
+            "first",
+        ])
+        .output()
+        .expect("run first turn");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let session_path = fs::read_dir(&sessions)
+        .expect("read sessions")
+        .next()
+        .expect("session entry")
+        .expect("session entry")
+        .path();
+    let session_id = session_path
+        .file_stem()
+        .expect("session file stem")
+        .to_string_lossy()
+        .to_string();
+    let prefix = &session_id[..8];
+
+    let second = pi_command()
+        .current_dir(&root)
+        .args([
+            "-p",
+            "--session-dir",
+            sessions_arg.as_str(),
+            "--session",
+            prefix,
+            "--model",
+            "faux/echo",
+            "second",
+        ])
+        .output()
+        .expect("run second turn");
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let forked = pi_command()
+        .current_dir(&root)
+        .args([
+            "-p",
+            "--session-dir",
+            sessions_arg.as_str(),
+            "--fork",
+            prefix,
+            "--model",
+            "faux/echo",
+            "forked",
+        ])
+        .output()
+        .expect("run forked turn");
+    assert!(
+        forked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forked.stderr)
+    );
+
+    let logs = fs::read_dir(&sessions)
+        .expect("read sessions")
+        .map(|entry| fs::read_to_string(entry.expect("entry").path()).expect("read log"))
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().any(|log| log.contains("second")));
+    assert!(logs.iter().any(|log| {
+        log.contains("forked") && log.contains("parent_session_id") && log.contains(&session_id)
+    }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }

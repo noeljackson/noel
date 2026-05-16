@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -7,10 +9,13 @@ use pi_ai::{
     create_provider, ModelRef, ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig,
 };
 use pi_config::{
-    auth_for_provider, has_auth_for_provider, load_config, ConfigPaths, LoadedConfig,
-    ProviderApi as ConfigProviderApi, ResolvedAuth, ENV_SESSION_DIR,
+    auth_for_provider, has_auth_for_provider, load_config, AuthCredential, ConfigPaths,
+    LoadedConfig, ProviderApi as ConfigProviderApi, ResolvedAuth, ENV_SESSION_DIR,
 };
-use pi_core::{run_user_turn, ReloadableSystems, Runtime, SessionState, SessionStore};
+use pi_core::{
+    run_user_turn, ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionExport,
+    SessionState, SessionStore,
+};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum OutputMode {
@@ -37,10 +42,13 @@ struct Cli {
     resume: bool,
 
     #[arg(long)]
+    fork: Option<String>,
+
+    #[arg(long)]
     no_session: bool,
 
     #[arg(long)]
-    session: Option<PathBuf>,
+    session: Option<String>,
 
     #[arg(long)]
     session_dir: Option<PathBuf>,
@@ -51,11 +59,62 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
+    #[arg(long, value_delimiter = ',')]
+    models: Vec<String>,
+
+    #[arg(long)]
+    api_key: Option<String>,
+
+    #[arg(long)]
+    thinking: Option<String>,
+
     #[arg(long)]
     list_models: bool,
 
     #[arg(long)]
     system_prompt: Option<String>,
+
+    #[arg(long)]
+    append_system_prompt: Vec<String>,
+
+    #[arg(long)]
+    no_tools: bool,
+
+    #[arg(short = 't', long, value_delimiter = ',')]
+    tools: Vec<String>,
+
+    #[arg(long)]
+    no_builtin_tools: bool,
+
+    #[arg(long)]
+    skill: Vec<PathBuf>,
+
+    #[arg(long)]
+    no_skills: bool,
+
+    #[arg(long)]
+    prompt_template: Vec<PathBuf>,
+
+    #[arg(long)]
+    no_prompt_templates: bool,
+
+    #[arg(long)]
+    theme: Option<String>,
+
+    #[arg(long)]
+    no_themes: bool,
+
+    #[arg(long)]
+    no_context_files: bool,
+
+    #[arg(long)]
+    export: Option<PathBuf>,
+
+    #[arg(long)]
+    verbose: bool,
+
+    #[arg(long)]
+    offline: bool,
 
     #[arg()]
     messages: Vec<String>,
@@ -72,8 +131,10 @@ async fn main() -> Result<()> {
             config.paths = config.paths.with_session_dir(session_dir)?;
         }
     }
-    if let Some(system_prompt) = &cli.system_prompt {
-        config.system_prompt = Some(system_prompt.clone());
+    apply_cli_overrides(&cli, &cwd, &mut config)?;
+    if cli.verbose {
+        eprintln!("agent dir: {}", config.paths.agent_dir.display());
+        eprintln!("session dir: {}", config.paths.session_dir.display());
     }
 
     if cli.list_models {
@@ -93,10 +154,10 @@ async fn main() -> Result<()> {
         && !cli.print
         && cli.messages.is_empty()
     {
-        return run_rpc(runtime, config).await;
+        return run_rpc(runtime, config, cli.offline).await;
     }
 
-    let mut initial_prompt = cli.messages.join(" ");
+    let mut initial_prompt = expand_message_inputs(&cwd, &cli.messages)?;
     if !stdin_is_terminal && !matches!(cli.mode, OutputMode::Rpc) {
         let mut stdin = String::new();
         io::stdin().read_to_string(&mut stdin)?;
@@ -111,15 +172,18 @@ async fn main() -> Result<()> {
         if initial_prompt.is_empty() {
             return Err(anyhow!("print mode requires a prompt"));
         }
-        let response = run_prompt(&mut runtime, &config, initial_prompt).await?;
+        let response = run_prompt(&mut runtime, &config, initial_prompt, cli.offline).await?;
+        if let Some(path) = &cli.export {
+            export_session(&runtime, path)?;
+        }
         print_response(&cli.mode, &response);
         return Ok(());
     }
 
-    run_interactive(runtime, config).await
+    run_interactive(runtime, config, cli.offline).await
 }
 
-async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig) -> Result<()> {
+async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) -> Result<()> {
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
@@ -146,7 +210,7 @@ async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig) -> Result<()> {
         };
         let result = match method {
             "prompt" => match rpc_prompt(&request) {
-                Ok(prompt) => match run_prompt(&mut runtime, &config, prompt).await {
+                Ok(prompt) => match run_prompt(&mut runtime, &config, prompt, offline).await {
                     Ok(message) => Ok(serde_json::json!({ "message": message })),
                     Err(error) => Err((1, error.to_string())),
                 },
@@ -238,6 +302,114 @@ fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Val
     })
 }
 
+fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Result<()> {
+    if let Some(system_prompt) = &cli.system_prompt {
+        config.system_prompt = Some(resolve_text_or_file(cwd, system_prompt)?);
+    }
+    for prompt in &cli.append_system_prompt {
+        config
+            .append_system_prompt
+            .push(resolve_text_or_file(cwd, prompt)?);
+    }
+    if cli.no_context_files {
+        config.context_files.clear();
+    }
+    if !cli.models.is_empty() {
+        config.models.retain(|model| {
+            cli.models.iter().any(|pattern| {
+                pattern == &model.id
+                    || pattern == &model.provider
+                    || pattern == &format!("{}/{}", model.provider, model.id)
+                    || model.name.as_deref() == Some(pattern.as_str())
+            })
+        });
+    }
+    if cli.no_tools || cli.no_builtin_tools {
+        config.settings.enabled_tools = Some(Vec::new());
+    }
+    if !cli.tools.is_empty() {
+        config.settings.enabled_tools = Some(cli.tools.clone());
+    }
+    if let Some(theme) = &cli.theme {
+        config.settings.theme = Some(theme.clone());
+    }
+    if cli.no_themes {
+        config.settings.theme = None;
+    }
+    if let Some(thinking) = &cli.thinking {
+        config.settings.default_thinking_level = Some(thinking.clone());
+    }
+    if !cli.no_skills {
+        for skill in &cli.skill {
+            if skill.is_file() {
+                config.context_files.push(pi_config::ContextFile {
+                    path: skill.clone(),
+                    content: fs::read_to_string(skill)?,
+                });
+            }
+        }
+    }
+    if !cli.no_prompt_templates {
+        for prompt_template in &cli.prompt_template {
+            if prompt_template.is_file() {
+                config
+                    .append_system_prompt
+                    .push(fs::read_to_string(prompt_template)?);
+            }
+        }
+    }
+    if let Some(api_key) = &cli.api_key {
+        let provider = infer_cli_provider(cli, config).ok_or_else(|| {
+            anyhow!("--api-key requires --provider, --model, or configured default provider")
+        })?;
+        config.auth.insert(
+            provider,
+            AuthCredential::ApiKey {
+                key: api_key.clone(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn infer_cli_provider(cli: &Cli, config: &LoadedConfig) -> Option<String> {
+    cli.provider
+        .clone()
+        .or_else(|| {
+            cli.model.as_deref().and_then(|model| {
+                model
+                    .split_once('/')
+                    .map(|(provider, _)| provider.to_string())
+            })
+        })
+        .or_else(|| config.settings.default_provider.clone())
+}
+
+fn resolve_text_or_file(cwd: &Path, value: &str) -> Result<String> {
+    let path = Path::new(value);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    if path.exists() {
+        return fs::read_to_string(path).map_err(Into::into);
+    }
+    Ok(value.to_string())
+}
+
+fn expand_message_inputs(cwd: &Path, messages: &[String]) -> Result<String> {
+    let mut parts = Vec::new();
+    for message in messages {
+        if let Some(path) = message.strip_prefix('@').filter(|path| !path.is_empty()) {
+            parts.push(resolve_text_or_file(cwd, path)?);
+        } else {
+            parts.push(message.clone());
+        }
+    }
+    Ok(parts.join(" "))
+}
+
 fn create_runtime(
     cli: &Cli,
     cwd: &Path,
@@ -251,13 +423,28 @@ fn create_runtime(
         ));
     }
 
-    if let Some(path) = &cli.session {
-        let (store, state) = SessionStore::open(path.clone())?;
+    if let Some(reference) = &cli.fork {
+        let path = resolve_session_reference(&config.paths.session_dir, reference)?;
+        let (_store, source_state) = SessionStore::open(path)?;
+        let (store, state) = SessionStore::fork(&config.paths.session_dir, &source_state, false)?;
         return Ok(Runtime::with_store(state, systems, store));
     }
 
-    if cli.r#continue || cli.resume {
-        if let Some(path) = most_recent_session(&config.paths.session_dir)? {
+    if let Some(reference) = &cli.session {
+        let path = resolve_session_reference(&config.paths.session_dir, reference)?;
+        let (store, state) = SessionStore::open(path)?;
+        return Ok(Runtime::with_store(state, systems, store));
+    }
+
+    if cli.r#continue {
+        if let Some(path) = most_recent_session(&config.paths.session_dir, Some(cwd))? {
+            let (store, state) = SessionStore::open(path)?;
+            return Ok(Runtime::with_store(state, systems, store));
+        }
+    }
+
+    if cli.resume {
+        if let Some(path) = most_recent_session(&config.paths.session_dir, None)? {
             let (store, state) = SessionStore::open(path)?;
             return Ok(Runtime::with_store(state, systems, store));
         }
@@ -267,26 +454,23 @@ fn create_runtime(
     Ok(Runtime::with_store(state, systems, store))
 }
 
-fn most_recent_session(session_dir: &Path) -> Result<Option<PathBuf>> {
-    if !session_dir.exists() {
-        return Ok(None);
+fn resolve_session_reference(session_dir: &Path, reference: &str) -> Result<PathBuf> {
+    SessionStore::resolve(session_dir, reference)?
+        .ok_or_else(|| anyhow!("session not found or ambiguous: {reference}"))
+}
+
+fn most_recent_session(session_dir: &Path, cwd: Option<&Path>) -> Result<Option<PathBuf>> {
+    let mut sessions = SessionStore::list(session_dir)?;
+    if let Some(cwd) = cwd {
+        sessions.retain(|session| session.cwd == cwd);
     }
-    let mut sessions = std::fs::read_dir(session_dir)?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            if !metadata.is_file() {
-                return None;
-            }
-            let modified = metadata.modified().ok()?;
-            Some((modified, entry.path()))
-        })
-        .collect::<Vec<_>>();
-    sessions.sort_by_key(|(modified, _)| *modified);
-    Ok(sessions.pop().map(|(_, path)| path))
+    Ok(sessions.pop().map(|summary| summary.path))
 }
 
 fn select_initial_model(runtime: &mut Runtime, config: &LoadedConfig, cli: &Cli) -> Result<()> {
+    if runtime.session().active_model.is_some() && cli.provider.is_none() && cli.model.is_none() {
+        return Ok(());
+    }
     let model = if let (Some(provider), Some(id)) = (&cli.provider, &cli.model) {
         Some(ModelRef {
             provider: provider.clone(),
@@ -339,7 +523,11 @@ fn resolve_model_reference(config: &LoadedConfig, reference: &str) -> Option<Mod
         })
 }
 
-async fn run_interactive(mut runtime: Runtime, mut config: LoadedConfig) -> Result<()> {
+async fn run_interactive(
+    mut runtime: Runtime,
+    mut config: LoadedConfig,
+    offline: bool,
+) -> Result<()> {
     println!("pi rust cli");
     println!("type /help for commands, /reload to reload config, /quit to exit");
     let stdin = io::stdin();
@@ -368,11 +556,7 @@ async fn run_interactive(mut runtime: Runtime, mut config: LoadedConfig) -> Resu
                 continue;
             }
             "/session" => {
-                println!("session: {}", runtime.session().session_id);
-                println!("cwd: {}", runtime.session().cwd.display());
-                if let Some(store) = runtime.store() {
-                    println!("file: {}", store.path().display());
-                }
+                print_session(&runtime);
                 continue;
             }
             "/reload" => {
@@ -392,6 +576,18 @@ async fn run_interactive(mut runtime: Runtime, mut config: LoadedConfig) -> Resu
                 println!("reloaded");
                 continue;
             }
+            "/settings" => {
+                print_settings(&config, &runtime);
+                continue;
+            }
+            "/hotkeys" => {
+                print_hotkeys(&config);
+                continue;
+            }
+            "/scoped-models" => {
+                print_scoped_models(&config, &runtime);
+                continue;
+            }
             _ if line.starts_with("/model ") => {
                 let reference = line.trim_start_matches("/model ").trim();
                 let model = resolve_model_reference(&config, reference)
@@ -400,10 +596,120 @@ async fn run_interactive(mut runtime: Runtime, mut config: LoadedConfig) -> Resu
                 println!("model: {}/{}", model.provider, model.id);
                 continue;
             }
+            _ if line.starts_with("/new") => {
+                let (store, state) =
+                    SessionStore::create(&config.paths.session_dir, runtime.session().cwd.clone())?;
+                runtime.replace_session(state, Some(store));
+                print_session(&runtime);
+                continue;
+            }
+            _ if line.starts_with("/resume") => {
+                let reference = line.trim_start_matches("/resume").trim();
+                if reference.is_empty() {
+                    print_sessions(&config.paths.session_dir)?;
+                } else {
+                    let path = resolve_session_reference(&config.paths.session_dir, reference)?;
+                    let (store, state) = SessionStore::open(path)?;
+                    runtime.replace_session(state, Some(store));
+                    print_session(&runtime);
+                }
+                continue;
+            }
+            _ if line.starts_with("/fork") => {
+                let source =
+                    resolve_source_session(&config.paths.session_dir, &runtime, &line, "/fork")?;
+                let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, false)?;
+                runtime.replace_session(state, Some(store));
+                print_session(&runtime);
+                continue;
+            }
+            _ if line.starts_with("/clone") => {
+                let source =
+                    resolve_source_session(&config.paths.session_dir, &runtime, &line, "/clone")?;
+                let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, true)?;
+                runtime.replace_session(state, Some(store));
+                print_session(&runtime);
+                continue;
+            }
+            "/tree" => {
+                print_session_tree(&config.paths.session_dir)?;
+                continue;
+            }
+            _ if line.starts_with("/name") => {
+                let name = line.trim_start_matches("/name").trim();
+                runtime.rename_session((!name.is_empty()).then(|| name.to_string()))?;
+                print_session(&runtime);
+                continue;
+            }
+            _ if line.starts_with("/labels") => {
+                let labels = line
+                    .trim_start_matches("/labels")
+                    .split_whitespace()
+                    .map(ToString::to_string)
+                    .collect();
+                runtime.set_labels(labels)?;
+                print_session(&runtime);
+                continue;
+            }
+            _ if line.starts_with("/export ") => {
+                let path = PathBuf::from(line.trim_start_matches("/export ").trim());
+                export_session(&runtime, &path)?;
+                println!("exported {}", path.display());
+                continue;
+            }
+            _ if line.starts_with("/import ") => {
+                let path = PathBuf::from(line.trim_start_matches("/import ").trim());
+                let content = fs::read_to_string(&path)?;
+                let export = serde_json::from_str::<SessionExport>(&content)?;
+                let (store, state) = SessionStore::import(&config.paths.session_dir, export)?;
+                runtime.replace_session(state, Some(store));
+                print_session(&runtime);
+                continue;
+            }
+            "/copy" => {
+                if let Some(message) = runtime
+                    .session()
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == MessageRole::Assistant)
+                {
+                    println!("{}", message.content);
+                } else {
+                    println!("no assistant message");
+                }
+                continue;
+            }
+            "/compact" => {
+                compact_session(&mut runtime)?;
+                println!("compacted");
+                continue;
+            }
+            _ if line.starts_with("/login") => {
+                let provider = line.trim_start_matches("/login").trim();
+                print_login_status(&config, provider);
+                continue;
+            }
+            _ if line.starts_with("/logout") => {
+                let provider = line.trim_start_matches("/logout").trim();
+                if provider.is_empty() {
+                    println!("usage: /logout <provider>");
+                } else if config.auth.remove(provider).is_some() {
+                    write_auth_file(&config)?;
+                    println!("removed stored auth for {provider}");
+                } else {
+                    println!("no stored auth for {provider}");
+                }
+                continue;
+            }
+            "/share" => {
+                println!("share is not available in the Rust-only CLI");
+                continue;
+            }
             _ => {}
         }
 
-        match run_prompt(&mut runtime, &config, line).await {
+        match run_prompt(&mut runtime, &config, line, offline).await {
             Ok(response) => println!("{response}"),
             Err(error) => eprintln!("error: {error}"),
         }
@@ -415,8 +721,9 @@ async fn run_prompt(
     runtime: &mut Runtime,
     config: &LoadedConfig,
     prompt: String,
+    offline: bool,
 ) -> Result<String> {
-    let provider = provider_for_runtime(runtime, config)?;
+    let provider = provider_for_runtime(runtime, config, offline)?;
     run_user_turn(runtime, provider.as_ref(), prompt)
         .await
         .map_err(Into::into)
@@ -425,12 +732,20 @@ async fn run_prompt(
 fn provider_for_runtime(
     runtime: &Runtime,
     config: &LoadedConfig,
+    offline: bool,
 ) -> Result<Box<dyn pi_ai::Provider>> {
     let model = runtime
         .session()
         .active_model
         .clone()
         .ok_or_else(|| anyhow!("no active model; configure auth or use --model faux/echo"))?;
+    if offline && model.provider != "faux" {
+        return Err(anyhow!(
+            "offline mode only allows local faux models; active model is {}/{}",
+            model.provider,
+            model.id
+        ));
+    }
     let definition = config
         .models
         .iter()
@@ -485,11 +800,210 @@ fn print_response(mode: &OutputMode, response: &str) {
     }
 }
 
+fn print_session(runtime: &Runtime) {
+    println!("session: {}", runtime.session().session_id);
+    println!("cwd: {}", runtime.session().cwd.display());
+    if let Some(name) = &runtime.session().name {
+        println!("name: {name}");
+    }
+    if !runtime.session().labels.is_empty() {
+        println!(
+            "labels: {}",
+            runtime
+                .session()
+                .labels
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if let Some(parent) = &runtime.session().parent_session_id {
+        println!("parent: {parent}");
+    }
+    if let Some(store) = runtime.store() {
+        println!("file: {}", store.path().display());
+    }
+}
+
+fn print_sessions(session_dir: &Path) -> Result<()> {
+    for session in SessionStore::list(session_dir)? {
+        let name = session.name.unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}\t{}\t{}",
+            session.session_id,
+            name,
+            session.cwd.display()
+        );
+    }
+    Ok(())
+}
+
+fn print_session_tree(session_dir: &Path) -> Result<()> {
+    for session in SessionStore::list(session_dir)? {
+        let parent = session.parent_session_id.unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}\tparent:{parent}\t{}",
+            session.session_id,
+            session.cwd.display()
+        );
+    }
+    Ok(())
+}
+
+fn print_settings(config: &LoadedConfig, runtime: &Runtime) {
+    println!("agent dir: {}", config.paths.agent_dir.display());
+    println!("session dir: {}", config.paths.session_dir.display());
+    println!("config generation: {}", runtime.systems().config_generation);
+    println!(
+        "active model: {}",
+        runtime
+            .session()
+            .active_model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "theme: {}",
+        config
+            .settings
+            .theme
+            .clone()
+            .unwrap_or_else(|| "-".to_string())
+    );
+}
+
+fn print_hotkeys(config: &LoadedConfig) {
+    if config.keybindings.is_empty() {
+        println!("no custom keybindings");
+        return;
+    }
+    for binding in &config.keybindings {
+        println!("{}\t{}", binding.action, binding.keys.join(", "));
+    }
+}
+
+fn print_scoped_models(config: &LoadedConfig, runtime: &Runtime) {
+    for model in &config.models {
+        let active = runtime
+            .session()
+            .active_model
+            .as_ref()
+            .map(|active| active.provider == model.provider && active.id == model.id)
+            .unwrap_or(false);
+        let marker = if active { "*" } else { " " };
+        println!("{marker} {}/{}", model.provider, model.id);
+    }
+}
+
+fn print_login_status(config: &LoadedConfig, provider: &str) {
+    let providers = if provider.is_empty() {
+        config
+            .models
+            .iter()
+            .map(|model| model.provider.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        vec![provider.to_string()]
+    };
+    for provider in providers {
+        let status = if auth_for_provider(&config.auth, &provider).is_some() {
+            "available"
+        } else {
+            "missing"
+        };
+        println!("{provider}: {status}");
+    }
+}
+
+fn resolve_source_session(
+    session_dir: &Path,
+    runtime: &Runtime,
+    line: &str,
+    command: &str,
+) -> Result<SessionState> {
+    let reference = line.trim_start_matches(command).trim();
+    if reference.is_empty() {
+        return Ok(runtime.session().clone());
+    }
+    let path = resolve_session_reference(session_dir, reference)?;
+    Ok(SessionStore::open(path)?.1)
+}
+
+fn export_session(runtime: &Runtime, path: &Path) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(store) = runtime.store() {
+        store.export_state(runtime.session(), path)?;
+    } else {
+        let content = serde_json::to_string_pretty(&SessionExport::from(runtime.session()))?;
+        fs::write(path, content)?;
+    }
+    Ok(())
+}
+
+fn compact_session(runtime: &mut Runtime) -> Result<()> {
+    if runtime.session().messages.len() <= 6 {
+        return Ok(());
+    }
+    let omitted = runtime.session().messages.len().saturating_sub(4);
+    let mut messages = vec![ConversationMessage {
+        role: MessageRole::System,
+        content: format!("Compacted {omitted} earlier messages. Preserve established context from the session log when needed."),
+    }];
+    messages.extend(
+        runtime
+            .session()
+            .messages
+            .iter()
+            .rev()
+            .take(4)
+            .cloned()
+            .rev(),
+    );
+    runtime.replace_messages(messages)?;
+    Ok(())
+}
+
+fn write_auth_file(config: &LoadedConfig) -> Result<()> {
+    if let Some(parent) = config.paths.auth_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &config.paths.auth_path,
+        serde_json::to_string_pretty(&config.auth)?,
+    )?;
+    Ok(())
+}
+
 fn print_help() {
     println!("/help                  show commands");
+    println!("/settings              show active settings");
+    println!("/hotkeys               show custom keybindings");
     println!("/models                list configured models");
+    println!("/scoped-models         list scoped models");
     println!("/model <provider/id>   switch model");
     println!("/session               show session info");
+    println!("/new                   start a new session");
+    println!("/resume [id|name|path] resume or list sessions");
+    println!("/fork [id|name|path]   fork a session");
+    println!("/clone [id|name|path]  clone a session without changing parent");
+    println!("/tree                  list session tree");
+    println!("/name <name>           rename current session");
+    println!("/labels <labels...>    replace current session labels");
+    println!("/export <file>         export current session");
+    println!("/import <file>         import a session export");
+    println!("/copy                  print last assistant message");
+    println!("/compact               compact older messages");
+    println!("/login [provider]      show auth status");
+    println!("/logout <provider>     remove stored auth");
     println!("/reload                reload config without clearing context");
     println!("/read <path>           read file");
     println!("/write <path> <text>   write file");

@@ -65,6 +65,29 @@ List models:
 cargo run -p pi-cli -- --list-models
 ```
 
+Resume or fork sessions:
+
+```bash
+cargo run -p pi-cli -- --continue
+cargo run -p pi-cli -- --session <id-prefix|name|path>
+cargo run -p pi-cli -- --fork <id-prefix|name|path>
+```
+
+Useful CLI scope flags:
+
+```bash
+cargo run -p pi-cli -- --models faux/echo --tools read,write -p "hello"
+cargo run -p pi-cli -- --no-tools -p "no tools"
+cargo run -p pi-cli -- --system-prompt prompt.md --append-system-prompt extra.md -p "hello"
+cargo run -p pi-cli -- --export session.json -p "hello"
+```
+
+Prompt arguments starting with `@` are expanded from files:
+
+```bash
+cargo run -p pi-cli -- -p --model faux/echo @prompt.txt
+```
+
 ## Configuration
 
 Default config root:
@@ -147,9 +170,25 @@ or an object map:
 ## Interactive Commands
 
 - `/help`
+- `/settings`
+- `/hotkeys`
 - `/models`
+- `/scoped-models`
 - `/model <provider/id>`
 - `/session`
+- `/new`
+- `/resume [id|name|path]`
+- `/fork [id|name|path]`
+- `/clone [id|name|path]`
+- `/tree`
+- `/name <name>`
+- `/labels <labels...>`
+- `/export <file>`
+- `/import <file>`
+- `/copy`
+- `/compact`
+- `/login [provider]`
+- `/logout <provider>`
 - `/reload`
 - `/read <path>`
 - `/write <path> <text>`
@@ -192,3 +231,5 @@ make docker-e2e
 ## Development Notes
 
 The old TypeScript implementation is preserved on the `ts-reference` branch for behavioral reference. Active development on `main` is Rust-only.
+
+Rust sessions use a new append-only JSONL schema plus JSON export/import. Legacy TypeScript session logs are not migrated automatically; keep `ts-reference` for reading old session behavior and export/import only through the Rust schema.

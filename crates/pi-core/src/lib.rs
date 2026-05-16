@@ -41,6 +41,9 @@ pub struct ToolEvent {
 pub struct SessionState {
     pub session_id: String,
     pub cwd: PathBuf,
+    pub name: Option<String>,
+    pub labels: BTreeSet<String>,
+    pub parent_session_id: Option<String>,
     pub messages: Vec<ConversationMessage>,
     pub tool_history: Vec<ToolEvent>,
     pub queued_messages: Vec<String>,
@@ -53,6 +56,9 @@ impl SessionState {
         Self {
             session_id: session_id.into(),
             cwd,
+            name: None,
+            labels: BTreeSet::new(),
+            parent_session_id: None,
             messages: Vec::new(),
             tool_history: Vec::new(),
             queued_messages: Vec::new(),
@@ -61,6 +67,48 @@ impl SessionState {
                 .into_iter()
                 .map(|definition| definition.name)
                 .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub path: PathBuf,
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub name: Option<String>,
+    pub labels: BTreeSet<String>,
+    pub parent_session_id: Option<String>,
+    pub modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExport {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub name: Option<String>,
+    pub labels: BTreeSet<String>,
+    pub parent_session_id: Option<String>,
+    pub messages: Vec<ConversationMessage>,
+    pub tool_history: Vec<ToolEvent>,
+    pub queued_messages: Vec<String>,
+    pub active_model: Option<ModelRef>,
+    pub active_tool_names: BTreeSet<String>,
+}
+
+impl From<&SessionState> for SessionExport {
+    fn from(state: &SessionState) -> Self {
+        Self {
+            session_id: state.session_id.clone(),
+            cwd: state.cwd.clone(),
+            name: state.name.clone(),
+            labels: state.labels.clone(),
+            parent_session_id: state.parent_session_id.clone(),
+            messages: state.messages.clone(),
+            tool_history: state.tool_history.clone(),
+            queued_messages: state.queued_messages.clone(),
+            active_model: state.active_model.clone(),
+            active_tool_names: state.active_tool_names.clone(),
         }
     }
 }
@@ -185,12 +233,33 @@ pub enum AgentError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 enum SessionRecord {
-    Started { session_id: String, cwd: PathBuf },
-    Message { message: ConversationMessage },
-    Tool { event: ToolEvent },
-    ActiveModel { model: Option<ModelRef> },
-    ActiveTools { tools: Vec<String> },
-    QueuedMessage { message: String },
+    Started {
+        session_id: String,
+        cwd: PathBuf,
+    },
+    Metadata {
+        name: Option<String>,
+        labels: Vec<String>,
+        parent_session_id: Option<String>,
+    },
+    Message {
+        message: ConversationMessage,
+    },
+    MessagesSnapshot {
+        messages: Vec<ConversationMessage>,
+    },
+    Tool {
+        event: ToolEvent,
+    },
+    ActiveModel {
+        model: Option<ModelRef>,
+    },
+    ActiveTools {
+        tools: Vec<String>,
+    },
+    QueuedMessage {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +284,60 @@ impl SessionStore {
         Ok((store, state))
     }
 
+    pub fn fork(
+        session_dir: &Path,
+        source: &SessionState,
+        clone_parent: bool,
+    ) -> Result<(Self, SessionState), SessionError> {
+        fs::create_dir_all(session_dir).map_err(|source| SessionError::CreateDir {
+            path: session_dir.to_path_buf(),
+            source,
+        })?;
+        let session_id = new_session_id();
+        let path = session_dir.join(format!("{session_id}.jsonl"));
+        let store = Self { path };
+        let mut state = source.clone();
+        state.session_id = session_id.clone();
+        state.parent_session_id = if clone_parent {
+            source.parent_session_id.clone()
+        } else {
+            Some(source.session_id.clone())
+        };
+        store.write_full_state(&state)?;
+        Ok((store, state))
+    }
+
+    pub fn import(
+        session_dir: &Path,
+        export: SessionExport,
+    ) -> Result<(Self, SessionState), SessionError> {
+        fs::create_dir_all(session_dir).map_err(|source| SessionError::CreateDir {
+            path: session_dir.to_path_buf(),
+            source,
+        })?;
+        let session_id = if export.session_id.trim().is_empty() {
+            new_session_id()
+        } else {
+            export.session_id
+        };
+        let path = session_dir.join(format!("{session_id}.jsonl"));
+        let store = Self { path };
+        let state = SessionState {
+            session_id,
+            cwd: export.cwd,
+            name: export.name,
+            labels: export.labels,
+            parent_session_id: export.parent_session_id,
+            messages: export.messages,
+            tool_history: export.tool_history,
+            queued_messages: export.queued_messages,
+            active_model: export.active_model,
+            active_tool_names: export.active_tool_names,
+        };
+        store.write_full_state(&state)?;
+        Ok((store, state))
+    }
+
     pub fn open(path: PathBuf) -> Result<(Self, SessionState), SessionError> {
         let store = Self { path };
         let state = store.load()?;
@@ -229,12 +352,110 @@ impl SessionStore {
         self.append(&SessionRecord::Message { message })
     }
 
+    pub fn record_messages_snapshot(
+        &self,
+        messages: Vec<ConversationMessage>,
+    ) -> Result<(), SessionError> {
+        self.append(&SessionRecord::MessagesSnapshot { messages })
+    }
+
     pub fn record_tool(&self, event: ToolEvent) -> Result<(), SessionError> {
         self.append(&SessionRecord::Tool { event })
     }
 
     pub fn record_active_model(&self, model: Option<ModelRef>) -> Result<(), SessionError> {
         self.append(&SessionRecord::ActiveModel { model })
+    }
+
+    pub fn record_active_tools(&self, tools: Vec<String>) -> Result<(), SessionError> {
+        self.append(&SessionRecord::ActiveTools { tools })
+    }
+
+    pub fn record_metadata(&self, state: &SessionState) -> Result<(), SessionError> {
+        self.append(&SessionRecord::Metadata {
+            name: state.name.clone(),
+            labels: state.labels.iter().cloned().collect(),
+            parent_session_id: state.parent_session_id.clone(),
+        })
+    }
+
+    pub fn export_state(&self, state: &SessionState, path: &Path) -> Result<(), SessionError> {
+        let content =
+            serde_json::to_string_pretty(&SessionExport::from(state)).map_err(|source| {
+                SessionError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+        fs::write(path, content).map_err(|source| SessionError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    pub fn list(session_dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
+        if !session_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut summaries = Vec::new();
+        for entry in fs::read_dir(session_dir).map_err(|source| SessionError::Read {
+            path: session_dir.to_path_buf(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| SessionError::Read {
+                path: session_dir.to_path_buf(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok());
+            let store = Self { path: path.clone() };
+            let state = store.load()?;
+            summaries.push(SessionSummary {
+                path,
+                session_id: state.session_id,
+                cwd: state.cwd,
+                name: state.name,
+                labels: state.labels,
+                parent_session_id: state.parent_session_id,
+                modified,
+            });
+        }
+        summaries.sort_by_key(|summary| summary.modified.unwrap_or(UNIX_EPOCH));
+        Ok(summaries)
+    }
+
+    pub fn resolve(session_dir: &Path, reference: &str) -> Result<Option<PathBuf>, SessionError> {
+        let reference_path = PathBuf::from(reference);
+        if reference_path.exists() {
+            return Ok(Some(reference_path));
+        }
+        let candidate = session_dir.join(reference);
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+        let jsonl_candidate = session_dir.join(format!("{reference}.jsonl"));
+        if jsonl_candidate.exists() {
+            return Ok(Some(jsonl_candidate));
+        }
+        let matches = Self::list(session_dir)?
+            .into_iter()
+            .filter(|summary| {
+                summary.session_id.starts_with(reference)
+                    || summary.name.as_deref() == Some(reference)
+            })
+            .map(|summary| summary.path)
+            .collect::<Vec<_>>();
+        Ok(if matches.len() == 1 {
+            matches.into_iter().next()
+        } else {
+            None
+        })
     }
 
     fn load(&self) -> Result<SessionState, SessionError> {
@@ -261,9 +482,25 @@ impl SessionStore {
                 SessionRecord::Started { session_id, cwd } => {
                     state = Some(SessionState::new(session_id, cwd));
                 }
+                SessionRecord::Metadata {
+                    name,
+                    labels,
+                    parent_session_id,
+                } => {
+                    if let Some(state) = &mut state {
+                        state.name = name;
+                        state.labels = labels.into_iter().collect();
+                        state.parent_session_id = parent_session_id;
+                    }
+                }
                 SessionRecord::Message { message } => {
                     if let Some(state) = &mut state {
                         state.messages.push(message);
+                    }
+                }
+                SessionRecord::MessagesSnapshot { messages } => {
+                    if let Some(state) = &mut state {
+                        state.messages = messages;
                     }
                 }
                 SessionRecord::Tool { event } => {
@@ -289,6 +526,28 @@ impl SessionStore {
             }
         }
         Ok(state.unwrap_or_else(|| SessionState::new("recovered", PathBuf::from("."))))
+    }
+
+    fn write_full_state(&self, state: &SessionState) -> Result<(), SessionError> {
+        self.append(&SessionRecord::Started {
+            session_id: state.session_id.clone(),
+            cwd: state.cwd.clone(),
+        })?;
+        self.record_metadata(state)?;
+        self.record_active_model(state.active_model.clone())?;
+        self.record_active_tools(state.active_tool_names.iter().cloned().collect())?;
+        for message in &state.messages {
+            self.record_message(message.clone())?;
+        }
+        for event in &state.tool_history {
+            self.record_tool(event.clone())?;
+        }
+        for message in &state.queued_messages {
+            self.append(&SessionRecord::QueuedMessage {
+                message: message.clone(),
+            })?;
+        }
+        Ok(())
     }
 
     fn append(&self, record: &SessionRecord) -> Result<(), SessionError> {
@@ -363,6 +622,17 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn replace_messages(
+        &mut self,
+        messages: Vec<ConversationMessage>,
+    ) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_messages_snapshot(messages.clone())?;
+        }
+        self.session.messages = messages;
+        Ok(())
+    }
+
     pub fn push_tool_event(&mut self, event: ToolEvent) -> Result<(), SessionError> {
         if let Some(store) = &self.store {
             store.record_tool(event.clone())?;
@@ -376,6 +646,39 @@ impl Runtime {
             store.record_active_model(model.clone())?;
         }
         self.session.active_model = model;
+        Ok(())
+    }
+
+    pub fn set_active_tools(&mut self, tools: BTreeSet<String>) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_active_tools(tools.iter().cloned().collect())?;
+        }
+        self.session.active_tool_names = tools;
+        Ok(())
+    }
+
+    pub fn set_store(&mut self, store: SessionStore) {
+        self.store = Some(store);
+    }
+
+    pub fn replace_session(&mut self, session: SessionState, store: Option<SessionStore>) {
+        self.session = session;
+        self.store = store;
+    }
+
+    pub fn rename_session(&mut self, name: Option<String>) -> Result<(), SessionError> {
+        self.session.name = name;
+        if let Some(store) = &self.store {
+            store.record_metadata(&self.session)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_labels(&mut self, labels: BTreeSet<String>) -> Result<(), SessionError> {
+        self.session.labels = labels;
+        if let Some(store) = &self.store {
+            store.record_metadata(&self.session)?;
+        }
         Ok(())
     }
 
@@ -739,6 +1042,85 @@ mod tests {
         assert_eq!(loaded.cwd, PathBuf::from("/repo"));
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].content, "hello");
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn session_store_forks_with_metadata_and_parent() {
+        let base = std::env::temp_dir().join(format!("pi-session-fork-test-{}", new_session_id()));
+        let (store, mut state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        state.name = Some("main".to_string());
+        state.labels = BTreeSet::from(["feature".to_string()]);
+        state.messages.push(ConversationMessage {
+            role: MessageRole::User,
+            content: "parent prompt".to_string(),
+        });
+        store.record_metadata(&state).expect("record metadata");
+        store
+            .record_message(state.messages[0].clone())
+            .expect("record message");
+
+        let (fork_store, forked) = SessionStore::fork(&base, &state, false).expect("fork session");
+        let (_opened_store, opened) =
+            SessionStore::open(fork_store.path().to_path_buf()).expect("open fork");
+
+        assert_ne!(forked.session_id, state.session_id);
+        assert_eq!(opened.parent_session_id, Some(state.session_id));
+        assert_eq!(opened.name, Some("main".to_string()));
+        assert_eq!(opened.labels, BTreeSet::from(["feature".to_string()]));
+        assert_eq!(opened.messages[0].content, "parent prompt");
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn session_store_resolves_id_prefix_and_name() {
+        let base =
+            std::env::temp_dir().join(format!("pi-session-resolve-test-{}", new_session_id()));
+        let (store, mut state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        state.name = Some("named-session".to_string());
+        store.record_metadata(&state).expect("record metadata");
+
+        let prefix = &state.session_id[..8];
+        assert_eq!(
+            SessionStore::resolve(&base, prefix).expect("resolve prefix"),
+            Some(store.path().to_path_buf())
+        );
+        assert_eq!(
+            SessionStore::resolve(&base, "named-session").expect("resolve name"),
+            Some(store.path().to_path_buf())
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn messages_snapshot_replaces_loaded_messages() {
+        let base =
+            std::env::temp_dir().join(format!("pi-session-snapshot-test-{}", new_session_id()));
+        let (store, _state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        store
+            .record_message(ConversationMessage {
+                role: MessageRole::User,
+                content: "old".to_string(),
+            })
+            .expect("record message");
+        store
+            .record_messages_snapshot(vec![ConversationMessage {
+                role: MessageRole::System,
+                content: "summary".to_string(),
+            }])
+            .expect("record snapshot");
+
+        let (_store, loaded) =
+            SessionStore::open(store.path().to_path_buf()).expect("open session");
+
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].content, "summary");
 
         let _ = fs::remove_dir_all(base);
     }
