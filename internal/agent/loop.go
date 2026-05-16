@@ -167,6 +167,7 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 			System:    effectiveSystemPrompt(cfg),
 			Tools:     toolsFromConfig(cfg),
 			MaxTokens: cfg.MaxTokens,
+			Thinking:  thinkingFromLevel(cfg.Thinking),
 		}, func(event Event) {
 			if start, ok := event.(MessageStartEvent); ok {
 				start.TurnID = turnID
@@ -254,6 +255,27 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 	err := fmt.Errorf("agent exceeded max turns: %d", maxTurns)
 	finalErr = err
 	return finalAssistant, err
+}
+
+func thinkingFromLevel(level string) *ThinkingConfig {
+	switch level {
+	case "", "auto":
+		return nil
+	case "off":
+		return &ThinkingConfig{Enabled: false}
+	case "minimal":
+		return &ThinkingConfig{Enabled: true, Adaptive: true, Effort: "minimal", Display: "summarized"}
+	case "low":
+		return &ThinkingConfig{Enabled: true, Adaptive: true, Effort: "low", BudgetTokens: 1024, Display: "summarized"}
+	case "medium":
+		return &ThinkingConfig{Enabled: true, Adaptive: true, Effort: "medium", BudgetTokens: 4096, Display: "summarized"}
+	case "high":
+		return &ThinkingConfig{Enabled: true, Adaptive: true, Effort: "high", BudgetTokens: 8192, Display: "summarized"}
+	case "xhigh":
+		return &ThinkingConfig{Enabled: true, Adaptive: true, Effort: "xhigh", BudgetTokens: 16384, Display: "summarized"}
+	default:
+		return nil
+	}
 }
 
 func effectiveSystemPrompt(cfg LoopConfig) string {
