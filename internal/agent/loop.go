@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	authstore "github.com/noeljackson/pi/internal/auth"
+	"github.com/noeljackson/pi/internal/resources"
 	"github.com/noeljackson/pi/internal/session/schema"
 )
 
@@ -53,12 +54,19 @@ type Compactor interface {
 	MaybeCompact(ctx context.Context, messages []Message, system string) ([]Message, error)
 }
 
+type ResourceLoader interface {
+	Load() (resources.Resources, error)
+}
+
 type LoopConfig struct {
 	Provider         Provider
 	Tools            ToolRegistry
 	Model            string
 	Thinking         string
 	System           string
+	SystemPrompt     string
+	Resources        resources.Resources
+	ResourceLoader   ResourceLoader
 	MaxTokens        int
 	MaxTurns         int
 	SessionWriter    SessionWriter
@@ -146,7 +154,7 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 		}
 		streamMessages := messages
 		if cfg.Compactor != nil {
-			compacted, err := cfg.Compactor.MaybeCompact(ctx, messages, cfg.System)
+			compacted, err := cfg.Compactor.MaybeCompact(ctx, messages, effectiveSystemPrompt(cfg))
 			if err != nil {
 				finalErr = err
 				return nil, err
@@ -156,7 +164,7 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 		assistant, err := cfg.Provider.Stream(ctx, StreamRequest{
 			Model:     cfg.Model,
 			Messages:  ConvertToLLM(streamMessages),
-			System:    cfg.System,
+			System:    effectiveSystemPrompt(cfg),
 			Tools:     toolsFromConfig(cfg),
 			MaxTokens: cfg.MaxTokens,
 		}, func(event Event) {
@@ -246,6 +254,21 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 	err := fmt.Errorf("agent exceeded max turns: %d", maxTurns)
 	finalErr = err
 	return finalAssistant, err
+}
+
+func effectiveSystemPrompt(cfg LoopConfig) string {
+	base := cfg.SystemPrompt
+	if base == "" {
+		base = cfg.System
+	}
+	if len(cfg.Resources.ContextFiles) == 0 && len(cfg.Resources.Skills) == 0 {
+		return base
+	}
+	return (&resources.SystemPromptBuilder{
+		BasePrompt: base,
+		Context:    cfg.Resources.ContextFiles,
+		Skills:     cfg.Resources.Skills,
+	}).Build()
 }
 
 func toolsFromConfig(cfg LoopConfig) []Tool {

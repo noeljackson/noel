@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/noeljackson/pi/internal/resources"
 )
 
 type AgentState string
@@ -203,6 +205,30 @@ func (a *Agent) LastError() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.lastError
+}
+
+func (a *Agent) Resources() resources.Resources {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Resources
+}
+
+func (a *Agent) ReloadResources() error {
+	a.mu.Lock()
+	loader := a.cfg.ResourceLoader
+	a.mu.Unlock()
+	if loader == nil {
+		return errors.New("resource loader is not configured")
+	}
+	loaded, err := loader.Load()
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.cfg.Resources = loaded
+	a.mu.Unlock()
+	a.publish(ResourcesReloadEvent{Diagnostics: loaded.Diagnostics})
+	return nil
 }
 
 func (a *Agent) Abort() {
@@ -444,6 +470,21 @@ func (a *Agent) processEvent(event Event) {
 	a.cond.Broadcast()
 	a.mu.Unlock()
 
+	publishTo(subscribers, event)
+}
+
+func (a *Agent) publish(event Event) {
+	a.mu.Lock()
+	subscribers := make([]func(Event), 0, len(a.subscribers))
+	for _, subscriber := range a.subscribers {
+		subscribers = append(subscribers, subscriber)
+	}
+	a.cond.Broadcast()
+	a.mu.Unlock()
+	publishTo(subscribers, event)
+}
+
+func publishTo(subscribers []func(Event), event Event) {
 	for _, subscriber := range subscribers {
 		subscriber(event)
 	}

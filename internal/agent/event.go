@@ -1,6 +1,10 @@
 package agent
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/noeljackson/pi/internal/resources"
+)
 
 // Event describes an agent stream event.
 type Event interface {
@@ -107,6 +111,11 @@ type BranchSummaryEvent struct {
 	Summary string
 }
 
+// ResourcesReloadEvent indicates that resources were re-discovered.
+type ResourcesReloadEvent struct {
+	Diagnostics []resources.Diagnostic
+}
+
 func (AgentStartEvent) isEvent()          {}
 func (AgentEndEvent) isEvent()            {}
 func (TurnStartEvent) isEvent()           {}
@@ -120,3 +129,4 @@ func (ToolExecutionEndEvent) isEvent()    {}
 func (SessionForkEvent) isEvent()         {}
 func (SessionMoveEvent) isEvent()         {}
 func (BranchSummaryEvent) isEvent()       {}
+func (ResourcesReloadEvent) isEvent()     {}
