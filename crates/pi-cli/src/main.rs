@@ -690,7 +690,8 @@ async fn run_interactive(
     terminal.clear()?;
 
     loop {
-        terminal.draw(|frame| draw_tui(frame, &app, &config, &runtime))?;
+        app.refresh_chrome(&config, &runtime);
+        terminal.draw(|frame| draw_tui(frame, &app))?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -700,7 +701,16 @@ async fn run_interactive(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        if handle_tui_key(key, &mut app, &mut runtime, &mut config, offline).await? {
+        if handle_tui_key(
+            key,
+            &mut terminal,
+            &mut app,
+            &mut runtime,
+            &mut config,
+            offline,
+        )
+        .await?
+        {
             break;
         }
     }
@@ -822,6 +832,8 @@ struct TuiApp {
     last_shell_command: Option<String>,
     multiline: Option<Vec<String>>,
     selector: Option<TuiSelectorState>,
+    header_title: String,
+    header_line: String,
     status: String,
 }
 
@@ -831,6 +843,7 @@ impl TuiApp {
             status: "Ready".to_string(),
             ..Self::default()
         };
+        app.refresh_chrome(config, runtime);
         app.push(
             TuiEntryKind::System,
             format!(
@@ -842,10 +855,59 @@ impl TuiApp {
         app
     }
 
+    fn refresh_chrome(&mut self, config: &LoadedConfig, runtime: &Runtime) {
+        let model = runtime
+            .session()
+            .active_model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .unwrap_or_else(|| "no model".to_string());
+        self.header_title = format!(
+            " pi  {}  {} ",
+            config
+                .settings
+                .theme
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+            model
+        );
+        let session = runtime.session();
+        self.header_line = format!(
+            "{}  {}  queue:{}",
+            session.cwd.display(),
+            session
+                .name
+                .clone()
+                .unwrap_or_else(|| session.session_id.chars().take(8).collect()),
+            session.queued_messages.len()
+        );
+        self.status = footer_status(config, runtime, &self.editor_state);
+    }
+
     fn push(&mut self, kind: TuiEntryKind, text: impl Into<String>) {
         let text = text.into();
         if !text.trim().is_empty() {
             self.entries.push(TuiEntry { kind, text });
+        }
+    }
+
+    fn push_placeholder(&mut self, kind: TuiEntryKind, text: impl Into<String>) -> usize {
+        self.entries.push(TuiEntry {
+            kind,
+            text: text.into(),
+        });
+        self.entries.len() - 1
+    }
+
+    fn replace_entry(&mut self, index: usize, text: impl Into<String>) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.text = text.into();
+        }
+    }
+
+    fn append_entry(&mut self, index: usize, text: &str) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.text.push_str(text);
         }
     }
 
@@ -867,7 +929,9 @@ impl TuiApp {
     }
 }
 
-fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig, runtime: &Runtime) {
+type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -877,42 +941,21 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig, runtime:
             Constraint::Length(2),
         ])
         .split(frame.area());
-    draw_header(frame, root[0], config, runtime);
+    draw_header(frame, root[0], app);
     draw_chat(frame, root[1], app);
     draw_input(frame, root[2], app);
     draw_footer(frame, root[3], app);
     draw_selector_overlay(frame, app);
 }
 
-fn draw_header(frame: &mut Frame<'_>, area: Rect, config: &LoadedConfig, runtime: &Runtime) {
-    let model = runtime
-        .session()
-        .active_model
-        .as_ref()
-        .map(|model| format!("{}/{}", model.provider, model.id))
-        .unwrap_or_else(|| "no model".to_string());
-    let title = format!(
-        " pi  {}  {} ",
-        config
-            .settings
-            .theme
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
-        model
-    );
-    let session = runtime.session();
-    let line = format!(
-        "{}  {}  queue:{}",
-        session.cwd.display(),
-        session
-            .name
-            .clone()
-            .unwrap_or_else(|| session.session_id.chars().take(8).collect()),
-        session.queued_messages.len()
-    );
-    let paragraph = Paragraph::new(line)
+fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let paragraph = Paragraph::new(app.header_line.as_str())
         .style(Style::default().fg(Color::Gray))
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.header_title.as_str()),
+        );
     frame.render_widget(paragraph, area);
 }
 
@@ -1054,6 +1097,7 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 
 async fn handle_tui_key(
     key: KeyEvent,
+    terminal: &mut TuiTerminal,
     app: &mut TuiApp,
     runtime: &mut Runtime,
     config: &mut LoadedConfig,
@@ -1077,14 +1121,18 @@ async fn handle_tui_key(
             let line = app.input.trim().to_string();
             app.input.clear();
             if !line.is_empty() {
-                let quit = match handle_tui_submission(app, runtime, config, offline, line).await {
+                let quit = match handle_tui_submission(
+                    app, terminal, runtime, config, offline, line,
+                )
+                .await
+                {
                     Ok(quit) => quit,
                     Err(error) => {
                         app.push(TuiEntryKind::Error, format!("{error}"));
                         false
                     }
                 };
-                app.status = footer_status(config, runtime, &app.editor_state);
+                app.refresh_chrome(config, runtime);
                 return Ok(quit);
             }
         }
@@ -1093,7 +1141,7 @@ async fn handle_tui_key(
         }
         _ => {}
     }
-    app.status = footer_status(config, runtime, &app.editor_state);
+    app.refresh_chrome(config, runtime);
     Ok(false)
 }
 
@@ -1215,6 +1263,7 @@ fn apply_tui_selector_selection(
 
 async fn handle_tui_submission(
     app: &mut TuiApp,
+    terminal: &mut TuiTerminal,
     runtime: &mut Runtime,
     config: &mut LoadedConfig,
     offline: bool,
@@ -1224,7 +1273,7 @@ async fn handle_tui_submission(
         if line == "." {
             let prompt = lines.join("\n");
             app.multiline = None;
-            submit_tui_prompt(app, runtime, config, prompt, Vec::new(), offline).await;
+            submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline).await;
         } else {
             lines.push(line);
         }
@@ -1342,7 +1391,8 @@ async fn handle_tui_submission(
             let initial = line.trim_start_matches("/editor").trim();
             match read_external_editor_prompt(initial) {
                 Ok(prompt) if !prompt.trim().is_empty() => {
-                    submit_tui_prompt(app, runtime, config, prompt, Vec::new(), offline).await;
+                    submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline)
+                        .await;
                 }
                 Ok(_) => app.push(TuiEntryKind::System, "editor returned an empty prompt"),
                 Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
@@ -1357,6 +1407,7 @@ async fn handle_tui_submission(
                     if !prompt.is_empty() {
                         submit_tui_prompt(
                             app,
+                            terminal,
                             runtime,
                             config,
                             prompt.to_string(),
@@ -1406,7 +1457,7 @@ async fn handle_tui_submission(
             } else {
                 format!("{}\n\n{}", skill.content, input)
             };
-            submit_tui_prompt(app, runtime, config, prompt, Vec::new(), offline).await;
+            submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline).await;
         }
         _ if line.starts_with("/prompt ") => {
             let rest = line.trim_start_matches("/prompt ").trim();
@@ -1414,7 +1465,7 @@ async fn handle_tui_submission(
             let template = find_resource(&config.prompt_templates, name)
                 .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
             let prompt = expand_prompt_template(&template.content, input);
-            submit_tui_prompt(app, runtime, config, prompt, Vec::new(), offline).await;
+            submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline).await;
         }
         _ if line.starts_with("/theme ") => {
             let name = line.trim_start_matches("/theme ").trim();
@@ -1529,7 +1580,7 @@ async fn handle_tui_submission(
                 format!("share exported {}", path.display()),
             );
         }
-        _ => submit_tui_prompt(app, runtime, config, line, Vec::new(), offline).await,
+        _ => submit_tui_prompt(app, terminal, runtime, config, line, Vec::new(), offline).await,
     }
     Ok(false)
 }
@@ -1558,6 +1609,7 @@ async fn handle_tui_bang(app: &mut TuiApp, runtime: &mut Runtime, line: &str) ->
 
 async fn submit_tui_prompt(
     app: &mut TuiApp,
+    terminal: &mut TuiTerminal,
     runtime: &mut Runtime,
     config: &LoadedConfig,
     prompt: String,
@@ -1567,7 +1619,7 @@ async fn submit_tui_prompt(
     app.editor_state.record_history(prompt.clone());
     app.push(TuiEntryKind::User, prompt.clone());
     if let Err(error) =
-        run_prompt_with_queue_tui(app, runtime, config, prompt, media, offline).await
+        run_prompt_with_queue_tui(app, terminal, runtime, config, prompt, media, offline).await
     {
         app.push(TuiEntryKind::Error, format!("{error}"));
     }
@@ -1575,6 +1627,7 @@ async fn submit_tui_prompt(
 
 async fn run_prompt_with_queue_tui(
     app: &mut TuiApp,
+    terminal: &mut TuiTerminal,
     runtime: &mut Runtime,
     config: &LoadedConfig,
     prompt: String,
@@ -1582,8 +1635,7 @@ async fn run_prompt_with_queue_tui(
     offline: bool,
 ) -> Result<()> {
     maybe_auto_compact(runtime, false)?;
-    let response = run_prompt_once(runtime, config, prompt.clone(), media, offline, false).await?;
-    app.push(response_kind_for_prompt(&prompt), response);
+    run_prompt_once_tui(app, terminal, runtime, config, prompt, media, offline).await?;
     while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
         let remaining = runtime
             .session()
@@ -1594,10 +1646,55 @@ async fn run_prompt_with_queue_tui(
             .collect();
         runtime.replace_queued_messages(remaining)?;
         app.push(TuiEntryKind::System, format!("queued> {prompt}"));
-        let response =
-            run_prompt_once(runtime, config, prompt.clone(), Vec::new(), offline, false).await?;
-        app.push(response_kind_for_prompt(&prompt), response);
+        run_prompt_once_tui(app, terminal, runtime, config, prompt, Vec::new(), offline).await?;
     }
+    Ok(())
+}
+
+async fn run_prompt_once_tui(
+    app: &mut TuiApp,
+    terminal: &mut TuiTerminal,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    prompt: String,
+    media: Vec<MediaInput>,
+    offline: bool,
+) -> Result<()> {
+    let kind = response_kind_for_prompt(&prompt);
+    let entry_index = app.push_placeholder(
+        kind.clone(),
+        if kind == TuiEntryKind::Tool {
+            "running..."
+        } else {
+            "Working..."
+        },
+    );
+    terminal.draw(|frame| draw_tui(frame, app))?;
+    let provider = provider_for_runtime(runtime, config, offline)?;
+    if kind == TuiEntryKind::Tool {
+        let response =
+            run_user_turn_streaming_with_media(runtime, provider.as_ref(), prompt, media, |_| {})
+                .await?;
+        app.replace_entry(entry_index, response);
+        terminal.draw(|frame| draw_tui(frame, app))?;
+        return Ok(());
+    }
+
+    let mut saw_delta = false;
+    let response =
+        run_user_turn_streaming_with_media(runtime, provider.as_ref(), prompt, media, |delta| {
+            if !saw_delta {
+                app.replace_entry(entry_index, "");
+                saw_delta = true;
+            }
+            app.append_entry(entry_index, delta);
+            let _ = terminal.draw(|frame| draw_tui(frame, app));
+        })
+        .await?;
+    if !saw_delta {
+        app.replace_entry(entry_index, response);
+    }
+    terminal.draw(|frame| draw_tui(frame, app))?;
     Ok(())
 }
 
