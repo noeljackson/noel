@@ -38,6 +38,18 @@ The binary is:
 target/release/pi
 ```
 
+Install system-wide:
+
+```bash
+make install
+```
+
+Install under a different prefix:
+
+```bash
+make install PREFIX="$HOME/.local"
+```
+
 ## Run
 
 Interactive mode:

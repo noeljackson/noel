@@ -1,14 +1,17 @@
 CARGO ?= cargo
 DOCKER ?= docker
 E2E_IMAGE ?= pi-e2e
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
 
-.PHONY: help build release run fmt lint test check ci e2e docker-build docker-e2e clean
+.PHONY: help build release install run fmt lint test check ci e2e docker-build docker-e2e clean
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  build        Build the workspace' \
 		'  release      Build the pi CLI release binary' \
+		'  install      Install the pi CLI release binary to $$(PREFIX)/bin' \
 		'  run          Run the pi CLI' \
 		'  fmt          Check Rust formatting' \
 		'  lint         Run clippy with warnings denied' \
@@ -24,6 +27,10 @@ build:
 
 release:
 	$(CARGO) build --release -p pi-cli
+
+install: release
+	install -d "$(BINDIR)"
+	install -m 0755 target/release/pi "$(BINDIR)/pi"
 
 run:
 	$(CARGO) run -p pi-cli
