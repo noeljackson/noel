@@ -6,27 +6,30 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/noeljackson/pi/internal/agent"
+	"github.com/noeljackson/pi/internal/resources"
+	"github.com/noeljackson/pi/internal/tui/autocomplete"
 	"github.com/noeljackson/pi/internal/tui/components"
+	tuieditor "github.com/noeljackson/pi/internal/tui/editor"
+	"github.com/noeljackson/pi/internal/tui/keys"
+	"github.com/noeljackson/pi/internal/tui/slash"
 )
 
 type Options struct {
 	EventSource <-chan agent.Event
 	Messages    []agent.Message
 	Model       string
+	Resources   resources.Resources
 	Submit      func(text string)
 	Abort       func()
 }
 
 type Model struct {
 	opts     Options
-	keys     keyMap
 	viewport viewport.Model
-	editor   textarea.Model
+	editor   *tuieditor.Editor
 
 	width  int
 	height int
@@ -64,13 +67,15 @@ type eventMsg struct {
 }
 
 func New(opts Options) Model {
-	editor := textarea.New()
-	editor.Placeholder = "Message pi..."
-	editor.Prompt = "> "
-	editor.ShowLineNumbers = false
-	editor.CharLimit = 0
-	editor.SetHeight(3)
+	keyMap := keys.Default()
+	editor := tuieditor.New(tuieditor.Options{
+		Placeholder:    "Message pi...",
+		MaxHistorySize: 100,
+		LineWrapping:   true,
+		KeyMap:         keyMap,
+	})
 	editor.Focus()
+	editor.SetAutocompleteProvider(newAutocompleteProvider(opts.Resources))
 
 	vp := viewport.New(80, 20)
 
@@ -80,7 +85,6 @@ func New(opts Options) Model {
 	}
 	model := Model{
 		opts:             opts,
-		keys:             defaultKeyMap(),
 		viewport:         vp,
 		editor:           editor,
 		assistantEntries: make(map[string]int),
@@ -93,7 +97,7 @@ func New(opts Options) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, waitForEvent(m.opts.EventSource))
+	return waitForEvent(m.opts.EventSource)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -106,8 +110,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resize()
 		m.refreshHistory(true)
 	case tea.KeyMsg:
-		switch {
-		case key.Matches(value, m.keys.abortOrQuit):
+		event := keys.FromTeaKey(value)
+		consumed, command := m.editor.HandleKey(event)
+		switch command {
+		case tuieditor.CommandAbort:
 			if m.turn != "idle" {
 				m.turn = "aborting"
 				if m.opts.Abort != nil {
@@ -116,24 +122,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, tea.Quit
-		case key.Matches(value, m.keys.submit):
+		case tuieditor.CommandSubmit:
 			m.submitEditor()
 			m.resize()
 			m.refreshHistory(true)
 			return m, nil
-		case key.Matches(value, m.keys.newline):
-			m.editor.InsertString("\n")
-			return m, nil
-		case key.Matches(value, m.keys.pageUp):
+		case tuieditor.CommandPageUp:
 			m.viewport.PageUp()
 			return m, nil
-		case key.Matches(value, m.keys.pageDown):
+		case tuieditor.CommandPageDown:
 			m.viewport.PageDown()
 			return m, nil
-		case key.Matches(value, m.keys.clear):
+		case tuieditor.CommandClear:
 			m.refreshHistory(true)
 			return m, tea.ClearScreen
 		}
+		if consumed {
+			return m, nil
+		}
+	case tea.MouseMsg:
+		_ = keys.FromTeaMouse(value)
 	case eventMsg:
 		if !value.ok {
 			return m, tea.Quit
@@ -145,9 +153,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
-	m.editor, cmd = m.editor.Update(msg)
-	cmds = append(cmds, cmd)
-
 	m.viewport, cmd = m.viewport.Update(msg)
 	cmds = append(cmds, cmd)
 
@@ -168,7 +173,7 @@ func (m Model) View() string {
 	if queue != "" {
 		parts = append(parts, queue)
 	}
-	parts = append(parts, defaultTheme.panel.Render(m.editor.View()), footer)
+	parts = append(parts, defaultTheme.panel.Render(m.editor.View(max(1, m.width-4), m.editorVisibleHeight())), footer)
 	return strings.Join(parts, "\n")
 }
 
@@ -183,10 +188,11 @@ func waitForEvent(source <-chan agent.Event) tea.Cmd {
 }
 
 func (m *Model) submitEditor() {
-	text := strings.TrimSpace(m.editor.Value())
+	text := strings.TrimSpace(m.editor.ExpandedValue())
 	if text == "" {
 		return
 	}
+	m.editor.PushHistory(text)
 	m.editor.Reset()
 
 	if m.turn != "idle" {
@@ -362,11 +368,8 @@ func (m *Model) resize() {
 	if m.width <= 0 {
 		return
 	}
-	editorWidth := max(1, m.width-4)
-	m.editor.SetWidth(editorWidth)
-
 	footerHeight := 1
-	editorHeight := m.editor.Height() + 2
+	editorHeight := m.editorVisibleHeight() + 2
 	queueHeight := 0
 	if len(m.queued) > 0 {
 		queueHeight = min(3, len(m.queued)+1)
@@ -377,6 +380,35 @@ func (m *Model) resize() {
 	}
 	m.viewport.Width = m.width
 	m.viewport.Height = viewportHeight
+}
+
+func (m Model) editorVisibleHeight() int {
+	if m.height <= 0 {
+		return 3
+	}
+	return max(3, min(8, m.height/4))
+}
+
+func newAutocompleteProvider(loaded resources.Resources) *autocomplete.CombinedProvider {
+	registry := slash.New()
+	commands := make([]autocomplete.SlashCommand, 0, len(registry.Commands()))
+	for _, command := range registry.Commands() {
+		args := make([]autocomplete.ArgSpec, 0, len(command.Args))
+		for _, arg := range command.Args {
+			args = append(args, autocomplete.ArgSpec{Name: arg.Name, Description: arg.Description})
+		}
+		commands = append(commands, autocomplete.SlashCommand{
+			Name:        command.Name,
+			Description: command.Description,
+			Args:        args,
+		})
+	}
+	return autocomplete.NewCombinedProvider(
+		autocomplete.NewSlashProvider(commands),
+		autocomplete.NewFileProvider(""),
+		autocomplete.SkillProvider{Skills: loaded.Skills},
+		autocomplete.PromptTemplateProvider{Templates: loaded.PromptTemplates},
+	)
 }
 
 func (m *Model) refreshHistory(scrollBottom bool) {

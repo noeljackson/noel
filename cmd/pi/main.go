@@ -241,6 +241,7 @@ func runTUI(resumeID string) error {
 		EventSource: eventCh,
 		Messages:    messages,
 		Model:       cfg.Model,
+		Resources:   cfg.Resources,
 		Submit: func(text string) {
 			select {
 			case submitCh <- text:
