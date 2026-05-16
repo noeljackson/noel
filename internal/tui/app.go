@@ -735,8 +735,9 @@ func (m *Model) handleSlash(text string) bool {
 	} else {
 		if msg != "" {
 			m.status = msg
+		} else {
+			m.status = "/" + name + " complete"
 		}
-		m.status = "/" + name + " complete"
 		if name == "model" {
 			m.modelName = args
 		}

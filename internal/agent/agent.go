@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -335,7 +336,20 @@ func (a *Agent) SetModel(model string) error {
 	return nil
 }
 
+// ValidThinkingLevels enumerates the values SetThinking accepts.
+var ValidThinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh", "auto"}
+
 func (a *Agent) SetThinking(level string) error {
+	valid := false
+	for _, v := range ValidThinkingLevels {
+		if v == level {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return fmt.Errorf("invalid thinking level %q (expected one of: %s)", level, strings.Join(ValidThinkingLevels, ", "))
+	}
 	a.mu.Lock()
 	a.cfg.Thinking = level
 	a.mu.Unlock()
