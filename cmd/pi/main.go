@@ -6,10 +6,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,9 +20,13 @@ import (
 	anthropicprovider "github.com/noeljackson/pi/internal/anthropic"
 	authstore "github.com/noeljackson/pi/internal/auth"
 	"github.com/noeljackson/pi/internal/config"
+	"github.com/noeljackson/pi/internal/diagnostics"
+	"github.com/noeljackson/pi/internal/exporter"
 	"github.com/noeljackson/pi/internal/models"
+	"github.com/noeljackson/pi/internal/observability"
 	"github.com/noeljackson/pi/internal/resources"
 	"github.com/noeljackson/pi/internal/session"
+	"github.com/noeljackson/pi/internal/timings"
 	"github.com/noeljackson/pi/internal/tools"
 	"github.com/noeljackson/pi/internal/tools/bash"
 	filetools "github.com/noeljackson/pi/internal/tools/file"
@@ -28,6 +34,8 @@ import (
 	"github.com/noeljackson/pi/internal/tools/task"
 	"github.com/noeljackson/pi/internal/tools/todo"
 	"github.com/noeljackson/pi/internal/tui"
+	"github.com/noeljackson/pi/internal/tui/slash"
+	"github.com/noeljackson/pi/internal/version"
 )
 
 const (
@@ -36,12 +44,14 @@ const (
 )
 
 type cliOptions struct {
-	headless   bool
-	resumeID   string
-	prompt     string
-	login      string
-	logout     string
-	listModels bool
+	headless     bool
+	resumeID     string
+	prompt       string
+	login        string
+	logout       string
+	listModels   bool
+	quietStartup bool
+	startupProbe bool
 }
 
 func main() {
@@ -56,6 +66,31 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	paths, err := config.ResolvePaths()
+	if err != nil {
+		return err
+	}
+	collector := diagnostics.New()
+	timingCollector := timings.New()
+	logger := observability.NewLogger(observability.Options{
+		LogDir:    filepath.Join(paths.AgentDir, "logs"),
+		Level:     slog.LevelInfo,
+		Collector: collector,
+	})
+	defer logger.Close()
+	slog.SetDefault(logger.Slog())
+
+	quietStartup := opts.quietStartup || quietStartupFromSettings(paths)
+	for _, diagnostic := range diagnostics.StartupDiagnostics(paths) {
+		collector.Add(diagnostic)
+	}
+	if !quietStartup {
+		printStartupDiagnostics(os.Stderr, collector.Recent(100))
+	}
+	if opts.startupProbe {
+		fmt.Fprintln(os.Stdout, "prompt-ready")
+		return nil
+	}
 	if opts.login != "" {
 		return runLogin(opts.login)
 	}
@@ -66,9 +101,9 @@ func run() error {
 		return runListModels()
 	}
 	if opts.headless {
-		return runHeadless(opts.prompt)
+		return runHeadless(opts.prompt, paths, collector, timingCollector, logger.Slog())
 	}
-	return runTUI(opts.resumeID)
+	return runTUI(opts.resumeID, paths, collector, timingCollector, logger.Slog(), quietStartup)
 }
 
 func parseOptions(args []string) (cliOptions, error) {
@@ -79,6 +114,8 @@ func parseOptions(args []string) (cliOptions, error) {
 	login := flags.String("login", "", "login to a provider")
 	logout := flags.String("logout", "", "logout from a provider")
 	listModels := flags.Bool("list-models", false, "list available models")
+	quietStartup := flags.Bool("quiet-startup", false, "suppress startup diagnostics")
+	startupProbe := flags.Bool("startup-probe", false, "print prompt-ready after startup checks")
 	if err := flags.Parse(args); err != nil {
 		return cliOptions{}, err
 	}
@@ -91,10 +128,16 @@ func parseOptions(args []string) (cliOptions, error) {
 		}
 	}
 	if actionCount > 0 {
-		if actionCount > 1 || *headless || *resumeID != "" || len(remaining) != 0 {
+		if actionCount > 1 || *headless || *resumeID != "" || *startupProbe || len(remaining) != 0 {
 			return cliOptions{}, errors.New("usage: pi [--login <provider> | --logout <provider> | --list-models]")
 		}
-		return cliOptions{login: *login, logout: *logout, listModels: *listModels}, nil
+		return cliOptions{login: *login, logout: *logout, listModels: *listModels, quietStartup: *quietStartup}, nil
+	}
+	if *startupProbe {
+		if *headless || *resumeID != "" || len(remaining) != 0 {
+			return cliOptions{}, errors.New("usage: pi --startup-probe [--quiet-startup]")
+		}
+		return cliOptions{startupProbe: true, quietStartup: *quietStartup}, nil
 	}
 	if *headless {
 		if *resumeID != "" {
@@ -103,12 +146,12 @@ func parseOptions(args []string) (cliOptions, error) {
 		if len(remaining) == 0 {
 			return cliOptions{}, errors.New("usage: pi --headless \"prompt\"")
 		}
-		return cliOptions{headless: true, prompt: strings.Join(remaining, " ")}, nil
+		return cliOptions{headless: true, prompt: strings.Join(remaining, " "), quietStartup: *quietStartup}, nil
 	}
 	if len(remaining) != 0 {
 		return cliOptions{}, errors.New("usage: pi [--resume <session-id>] or pi --headless \"prompt\"")
 	}
-	return cliOptions{resumeID: *resumeID}, nil
+	return cliOptions{resumeID: *resumeID, quietStartup: *quietStartup}, nil
 }
 
 func runLogin(provider string) error {
@@ -185,13 +228,13 @@ func runListModels() error {
 	return nil
 }
 
-func runHeadless(prompt string) error {
+func runHeadless(prompt string, paths config.Paths, collector *diagnostics.Collector, timingCollector *timings.Timings, logger *slog.Logger) error {
 	auth, err := anthropicprovider.PickAuth()
 	if err != nil {
 		return err
 	}
 
-	sess, cfg, cleanup, err := newSessionConfig("", auth)
+	sess, cfg, cleanup, err := newSessionConfig("", auth, paths, collector, timingCollector, logger)
 	if err != nil {
 		return err
 	}
@@ -217,7 +260,7 @@ func runHeadless(prompt string) error {
 	return nil
 }
 
-func runTUI(resumeID string) error {
+func runTUI(resumeID string, paths config.Paths, collector *diagnostics.Collector, timingCollector *timings.Timings, logger *slog.Logger, quietStartup bool) error {
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -226,7 +269,7 @@ func runTUI(resumeID string) error {
 		return err
 	}
 
-	sess, cfg, cleanup, err := newSessionConfig(resumeID, auth)
+	sess, cfg, cleanup, err := newSessionConfig(resumeID, auth, paths, collector, timingCollector, logger)
 	if err != nil {
 		return err
 	}
@@ -244,12 +287,20 @@ func runTUI(resumeID string) error {
 	runner.Subscribe(func(event agent.Event) {
 		sendEvent(rootCtx, eventCh, event)
 	})
+	commands := slash.New()
+	registerSlashCommands(commands, collector, timingCollector, sess, session.NewJSONLStore(paths.SessionDir))
+	if !quietStartup && telemetryEnabled(paths) {
+		go checkVersionNotice(rootCtx, eventCh)
+	}
 
 	model := tui.New(tui.Options{
 		EventSource: eventCh,
 		Messages:    messages,
 		Model:       cfg.Model,
 		Resources:   cfg.Resources,
+		Slash:       commands,
+		Agent:       runner,
+		Timings:     timingCollector,
 		Submit: func(text string) {
 			select {
 			case submitCh <- text:
@@ -286,11 +337,148 @@ func sendEvent(ctx context.Context, eventCh chan<- agent.Event, event agent.Even
 	}
 }
 
-func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*session.Session, agent.LoopConfig, func(), error) {
-	paths, err := config.ResolvePaths()
-	if err != nil {
-		return nil, agent.LoopConfig{}, nil, err
+func printStartupDiagnostics(file *os.File, items []diagnostics.Diagnostic) {
+	for _, diagnostic := range items {
+		if diagnostic.Level < diagnostics.Warning {
+			continue
+		}
+		source := diagnostic.Source
+		if source == "" {
+			source = "startup"
+		}
+		fmt.Fprintf(file, "%s: %s: %s\n", diagnostic.Level.String(), source, diagnostic.Message)
 	}
+}
+
+func quietStartupFromSettings(paths config.Paths) bool {
+	manager, err := config.NewManager(paths.SettingsFile)
+	if err != nil {
+		return false
+	}
+	return manager.Get().QuietStartup
+}
+
+func telemetryEnabled(paths config.Paths) bool {
+	manager, err := config.NewManager(paths.SettingsFile)
+	if err != nil {
+		return false
+	}
+	return manager.Get().Telemetry
+}
+
+func checkVersionNotice(ctx context.Context, eventCh chan<- agent.Event) {
+	if version.BuildVersion == "dev" {
+		return
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	status, err := version.Check(checkCtx, "")
+	if err != nil || status == nil || !status.Available {
+		return
+	}
+	messageID := fmt.Sprintf("version-%d", time.Now().UnixNano())
+	sendEvent(ctx, eventCh, agent.MessageStartEvent{MessageID: messageID, Role: agent.RoleAssistant, Model: "system"})
+	sendEvent(ctx, eventCh, agent.MessageEndEvent{
+		MessageID:    messageID,
+		FinalContent: []agent.Content{agent.TextContent{Text: fmt.Sprintf("Update available: %s (current %s)", status.Latest, status.Current)}},
+	})
+}
+
+func registerSlashCommands(registry *slash.Registry, collector *diagnostics.Collector, timingCollector *timings.Timings, sess *session.Session, store *session.JSONLStore) {
+	registry.Register(slash.Command{
+		Name:        "diagnostics",
+		Description: "show recent diagnostics",
+		Handler: func(_ context.Context, _ string, _ *agent.Agent) (string, error) {
+			return formatDiagnostics(collector.Recent(50)), nil
+		},
+	})
+	registry.Register(slash.Command{
+		Name:        "timings",
+		Description: "show timing summary",
+		Handler: func(_ context.Context, _ string, _ *agent.Agent) (string, error) {
+			return formatTimings(timingCollector.Summary()), nil
+		},
+	})
+	registry.Register(slash.Command{
+		Name:        "export",
+		Description: "export current session as JSONL",
+		Args:        []slash.ArgSpec{{Name: "path", Description: "output path"}},
+		Handler: func(_ context.Context, args string, _ *agent.Agent) (string, error) {
+			path := strings.TrimSpace(args)
+			if path == "" {
+				path = fmt.Sprintf("pi-session-%s.jsonl", sess.ID())
+			}
+			if err := exporter.ExportPath(sess, path); err != nil {
+				return "", err
+			}
+			return "Exported session to " + path, nil
+		},
+	})
+	registry.Register(slash.Command{
+		Name:        "import",
+		Description: "import a JSONL session",
+		Args:        []slash.ArgSpec{{Name: "path", Description: "input path", Required: true}},
+		Handler: func(_ context.Context, args string, _ *agent.Agent) (string, error) {
+			path := strings.TrimSpace(args)
+			if path == "" {
+				return "", errors.New("usage: /import <path>")
+			}
+			id, err := exporter.ImportPath(store, path)
+			if err != nil {
+				return "", err
+			}
+			return "Imported session " + id, nil
+		},
+	})
+	registry.Register(slash.Command{
+		Name:        "export-html",
+		Description: "export current session as HTML",
+		Handler: func(_ context.Context, _ string, _ *agent.Agent) (string, error) {
+			return "HTML export is deferred; see EXPORT_HTML_FOLLOWUP.md", nil
+		},
+	})
+}
+
+func formatDiagnostics(items []diagnostics.Diagnostic) string {
+	if len(items) == 0 {
+		return "No diagnostics recorded."
+	}
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		source := item.Source
+		if source == "" {
+			source = "unknown"
+		}
+		lines = append(lines, fmt.Sprintf("%s %s: %s", item.Level.String(), source, item.Message))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatTimings(summary map[string]timings.Stats) string {
+	if len(summary) == 0 {
+		return "No timings recorded."
+	}
+	names := make([]string, 0, len(summary))
+	for name := range summary {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	lines := []string{"name count total mean p95 max"}
+	for _, name := range names {
+		stats := summary[name]
+		lines = append(lines, fmt.Sprintf("%s %d %s %s %s %s",
+			name,
+			stats.Count,
+			stats.Total.Round(time.Millisecond),
+			stats.Mean.Round(time.Millisecond),
+			stats.P95.Round(time.Millisecond),
+			stats.Max.Round(time.Millisecond),
+		))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource, paths config.Paths, collector *diagnostics.Collector, timingCollector *timings.Timings, logger *slog.Logger) (*session.Session, agent.LoopConfig, func(), error) {
 	store, err := newSessionStore(paths)
 	if err != nil {
 		return nil, agent.LoopConfig{}, nil, err
@@ -318,7 +506,7 @@ func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*sess
 		_ = sess.Close()
 		return nil, agent.LoopConfig{}, nil, err
 	}
-	cfg, cleanup, err := loopConfigForSession(sess, paths, store, auth, cwd)
+	cfg, cleanup, err := loopConfigForSession(sess, paths, store, auth, cwd, collector, timingCollector, logger)
 	if err != nil {
 		cleanup()
 		_ = sess.Close()
@@ -327,7 +515,7 @@ func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*sess
 	return sess, cfg, cleanup, nil
 }
 
-func loopConfigForSession(sess *session.Session, paths config.Paths, store *session.JSONLStore, auth anthropicprovider.AuthSource, cwd string) (agent.LoopConfig, func(), error) {
+func loopConfigForSession(sess *session.Session, paths config.Paths, store *session.JSONLStore, auth anthropicprovider.AuthSource, cwd string, collector *diagnostics.Collector, timingCollector *timings.Timings, logger *slog.Logger) (agent.LoopConfig, func(), error) {
 	moreBuffer := more.NewDiskBuffer(toolOutputDir(paths, sess.ID()))
 	cleanup := func() {
 		_ = moreBuffer.Cleanup()
@@ -351,8 +539,13 @@ func loopConfigForSession(sess *session.Session, paths config.Paths, store *sess
 		return agent.LoopConfig{}, cleanup, err
 	}
 	for _, diagnostic := range loadedResources.Diagnostics {
-		if diagnostic.Level == "error" {
-			fmt.Fprintf(os.Stderr, "resource error: %s: %s\n", diagnostic.Source, diagnostic.Message)
+		if collector != nil {
+			collector.Add(diagnostics.Diagnostic{
+				Level:   diagnostics.ParseLevel(diagnostic.Level),
+				Source:  diagnostic.Source,
+				Message: diagnostic.Message,
+				Time:    time.Now().UTC(),
+			})
 		}
 	}
 
@@ -365,6 +558,8 @@ func loopConfigForSession(sess *session.Session, paths config.Paths, store *sess
 		ResourceLoader: resourceLoader,
 		MaxTokens:      defaultMaxTokens,
 		SessionWriter:  sess,
+		Timings:        timingCollector,
+		Logger:         logger,
 		AfterToolCall: func(_ context.Context, call agent.ToolUseContent, result agent.ToolResult) {
 			storeToolOutput(moreBuffer, call, result)
 		},
@@ -430,7 +625,7 @@ func (s *cliTaskSpawner) Spawn(ctx context.Context, req task.SpawnRequest) (task
 	}
 	defer sess.Close()
 
-	cfg, cleanup, err := loopConfigForSession(sess, s.paths, s.store, s.auth, cwd)
+	cfg, cleanup, err := loopConfigForSession(sess, s.paths, s.store, s.auth, cwd, nil, nil, nil)
 	if err != nil {
 		cleanup()
 		return task.Result{SessionID: sess.ID()}, err

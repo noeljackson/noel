@@ -18,7 +18,7 @@ type Command struct {
 	Name        string
 	Description string
 	Args        []ArgSpec
-	Handler     func(ctx context.Context, args string, agent *agent.Agent) error
+	Handler     func(ctx context.Context, args string, agent *agent.Agent) (string, error)
 }
 
 type Registry struct {

@@ -13,6 +13,7 @@ import (
 	authstore "github.com/noeljackson/pi/internal/auth"
 	"github.com/noeljackson/pi/internal/resources"
 	"github.com/noeljackson/pi/internal/session/schema"
+	"github.com/noeljackson/pi/internal/timings"
 )
 
 const defaultMaxTurns = 100
@@ -77,6 +78,8 @@ type LoopConfig struct {
 	Compactor        Compactor
 	BranchSummarizer schema.BranchSummarizer
 	AuthStore        *authstore.Store
+	Timings          *timings.Timings
+	Logger           *slog.Logger
 
 	PrepareNextTurn     func(ctx context.Context, messages []Message) (NextTurnDirective, error)
 	ShouldStopAfterTurn func(turn int, last *AssistantMessage) bool
@@ -152,7 +155,9 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 
 	for turn := 1; turn <= maxTurns; turn++ {
 		turnID := fmt.Sprintf("turn-%d", turn)
+		stopTurn := cfg.Timings.Start("agent.turn")
 		if err := emitEvent(TurnStartEvent{TurnID: turnID}); err != nil {
+			stopTurn()
 			finalErr = err
 			return nil, err
 		}
@@ -160,11 +165,13 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 		if cfg.Compactor != nil {
 			compacted, err := cfg.Compactor.MaybeCompact(ctx, messages, effectiveSystemPrompt(cfg))
 			if err != nil {
+				stopTurn()
 				finalErr = err
 				return nil, err
 			}
 			if len(compacted) != len(messages) {
 				if err := recordCompactionIfPossible(cfg.SessionWriter, messages, compacted); err != nil {
+					stopTurn()
 					finalErr = err
 					return nil, err
 				}
@@ -188,16 +195,19 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 		})
 		if err != nil {
 			if cfg.Compactor == nil || !cfg.Compactor.ShouldRetryOnOverflow(err) {
+				stopTurn()
 				finalErr = err
 				return nil, err
 			}
 			retryMessages, compactErr := cfg.Compactor.AfterOverflowRetry(ctx, messages, effectiveSystemPrompt(cfg))
 			if compactErr != nil {
+				stopTurn()
 				finalErr = compactErr
 				return nil, compactErr
 			}
 			if len(retryMessages) != len(messages) {
 				if err := recordCompactionIfPossible(cfg.SessionWriter, messages, retryMessages); err != nil {
+					stopTurn()
 					finalErr = err
 					return nil, err
 				}
@@ -218,6 +228,7 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 				_ = emitEvent(event)
 			})
 			if err != nil {
+				stopTurn()
 				finalErr = err
 				return nil, err
 			}
@@ -226,6 +237,7 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 		messages = append(messages, *assistant)
 		if cfg.SessionWriter != nil {
 			if err := cfg.SessionWriter.AppendMessage(*assistant); err != nil {
+				stopTurn()
 				finalErr = err
 				return nil, err
 			}
@@ -241,6 +253,7 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 			messages = append(messages, toolResultMessage)
 			if cfg.SessionWriter != nil {
 				if err := cfg.SessionWriter.AppendMessage(toolResultMessage); err != nil {
+					stopTurn()
 					finalErr = err
 					return nil, err
 				}
@@ -249,9 +262,11 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 		}
 
 		if err := emitEvent(TurnEndEvent{TurnID: turnID, ToolCallsPending: hasPendingToolCalls && !terminate, ToolResults: toolResults}); err != nil {
+			stopTurn()
 			finalErr = err
 			return nil, err
 		}
+		stopTurn()
 
 		if cfg.PrepareNextTurn != nil {
 			directive, err := cfg.PrepareNextTurn(ctx, append([]Message(nil), messages...))
@@ -419,6 +434,8 @@ func lookupTool(registry ToolRegistry, name string) (Tool, bool) {
 }
 
 func executeToolCall(ctx context.Context, cfg LoopConfig, tool Tool, call ToolUseContent, emit func(Event) error) ToolResult {
+	stopTool := cfg.Timings.Start("tool." + call.Name)
+	defer stopTool()
 	_ = emit(ToolExecutionStartEvent{CallID: call.ID, Name: call.Name, Input: call.Input})
 	if cfg.BeforeToolCall != nil {
 		if err := cfg.BeforeToolCall(ctx, call); err != nil {
@@ -442,7 +459,7 @@ func executeToolCall(ctx context.Context, cfg LoopConfig, tool Tool, call ToolUs
 			OnUpdate: func(partial json.RawMessage) {
 				_ = emit(ToolExecutionUpdateEvent{CallID: call.ID, Partial: partial})
 			},
-			Logger: slog.Default(),
+			Logger: firstLogger(cfg.Logger),
 		})
 	}
 	if err != nil {
@@ -460,6 +477,13 @@ func executeToolCall(ctx context.Context, cfg LoopConfig, tool Tool, call ToolUs
 	}
 	_ = emit(ToolExecutionEndEvent{CallID: call.ID, Result: result, Err: err})
 	return result
+}
+
+func firstLogger(logger *slog.Logger) *slog.Logger {
+	if logger != nil {
+		return logger
+	}
+	return slog.Default()
 }
 
 func hasTerminatingToolResult(results []ToolResult) bool {
