@@ -20,7 +20,7 @@ func ErrorMessageView(text string) string {
 	if text == "" {
 		return ""
 	}
-	return messageErrorStyle.Render("⚠ " + text)
+	return messageErrorStyle.Render("Error: " + text)
 }
 
 // UserMessageView renders a user-authored prompt.
@@ -29,21 +29,54 @@ func UserMessageView(text string) string {
 	if text == "" {
 		return ""
 	}
-	return messageUserStyle.Render(text)
+	return messageUserStyle.Render(MarkdownView(text, 80))
+}
+
+type AssistantMessageOptions struct {
+	Width            int
+	ThinkingExpanded bool
+	HideThinking     bool
+}
+
+func UserMessageViewWidth(text string, width int) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	return messageUserStyle.Width(max(0, width-2)).Render(MarkdownView(text, max(1, width-4)))
 }
 
 // AssistantMessageView renders assistant content blocks.
-func AssistantMessageView(content []agent.Content) string {
+func AssistantMessageView(content []agent.Content, width ...int) string {
+	w := 80
+	if len(width) > 0 && width[0] > 0 {
+		w = width[0]
+	}
+	return AssistantMessageViewWithOptions(content, AssistantMessageOptions{
+		Width:            w,
+		ThinkingExpanded: true,
+	})
+}
+
+func AssistantMessageViewWithOptions(content []agent.Content, opts AssistantMessageOptions) string {
+	width := opts.Width
+	if width <= 0 {
+		width = 80
+	}
 	var parts []string
 	for _, block := range content {
 		switch value := block.(type) {
 		case agent.TextContent:
 			if strings.TrimSpace(value.Text) != "" {
-				parts = append(parts, messageAssistantStyle.Render(strings.TrimSpace(value.Text)))
+				parts = append(parts, messageAssistantStyle.Render(MarkdownView(value.Text, width)))
 			}
 		case agent.ThinkingContent:
 			if strings.TrimSpace(value.Thinking) != "" {
-				parts = append(parts, messageThinkingStyle.Render(strings.TrimSpace(value.Thinking)))
+				if opts.HideThinking {
+					parts = append(parts, messageThinkingStyle.Render("[thinking...]"))
+				} else {
+					parts = append(parts, ThinkingView(value, width, opts.ThinkingExpanded))
+				}
 			}
 		case agent.ToolUseContent:
 			continue

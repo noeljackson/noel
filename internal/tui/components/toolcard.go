@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/noeljackson/pi/internal/tools"
 )
 
 const maxToolBodyLines = 10
@@ -31,6 +32,7 @@ type ToolCardState struct {
 	ExitCode    *int
 	Bytes       *int
 	Err         string
+	Details     json.RawMessage
 }
 
 var (
@@ -67,9 +69,11 @@ func ToolCard(card ToolCardState, width int) string {
 	body := lastLines(card.Body, maxToolBodyLines)
 	if len(body) > 0 {
 		if len(card.Body) > len(body) {
-			lines = append(lines, toolDimStyle.Render("... show more"))
+			lines = append(lines, toolDimStyle.Render("... more output"))
 		}
-		lines = append(lines, body...)
+		for _, line := range body {
+			lines = append(lines, truncateWidth(line, max(1, width-6)))
+		}
 	}
 
 	footer := toolFooter(card)
@@ -137,6 +141,7 @@ func RawText(raw json.RawMessage) string {
 
 func toolFooter(card ToolCardState) string {
 	var parts []string
+	parts = append(parts, detailFooter(card.Details)...)
 	if !card.StartedAt.IsZero() {
 		end := card.EndedAt
 		if end.IsZero() {
@@ -154,6 +159,62 @@ func toolFooter(card ToolCardState) string {
 		parts = append(parts, card.Err)
 	}
 	return strings.Join(parts, " | ")
+}
+
+func detailFooter(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var bash tools.BashDetails
+	if json.Unmarshal(raw, &bash) == nil && bash.Command != "" {
+		parts := []string{fmt.Sprintf("%dms", bash.DurationMS)}
+		parts = append(parts, fmt.Sprintf("exit %d", bash.ExitCode))
+		if bash.OutputFile != "" {
+			parts = append(parts, "output: "+bash.OutputFile)
+		}
+		return parts
+	}
+	var read tools.ReadDetails
+	if json.Unmarshal(raw, &read) == nil && read.Path != "" {
+		parts := []string{read.Path, fmt.Sprintf("%d lines", read.Lines), fmt.Sprintf("%d bytes", read.Bytes)}
+		if read.Truncated {
+			parts = append(parts, "truncated")
+		}
+		return parts
+	}
+	var write tools.WriteDetails
+	if json.Unmarshal(raw, &write) == nil && write.Path != "" {
+		return []string{write.Path, fmt.Sprintf("%d lines", write.Lines), fmt.Sprintf("%d bytes written", write.Bytes)}
+	}
+	var edit tools.EditDetails
+	if json.Unmarshal(raw, &edit) == nil && edit.Path != "" {
+		return []string{edit.Path, fmt.Sprintf("%d edits", edit.EditsApplied)}
+	}
+	var grep tools.GrepDetails
+	if json.Unmarshal(raw, &grep) == nil && (grep.Pattern != "" || grep.Matches > 0) {
+		parts := []string{fmt.Sprintf("%d matches", grep.Matches)}
+		if grep.Truncated {
+			parts = append(parts, "truncated")
+		}
+		return parts
+	}
+	var find tools.FindDetails
+	if json.Unmarshal(raw, &find) == nil && find.Pattern != "" {
+		parts := []string{fmt.Sprintf("%d hits", find.Hits)}
+		if find.Truncated {
+			parts = append(parts, "truncated")
+		}
+		return parts
+	}
+	var ls tools.LsDetails
+	if json.Unmarshal(raw, &ls) == nil && ls.Path != "" {
+		parts := []string{fmt.Sprintf("%d entries", ls.Entries)}
+		if ls.Truncated {
+			parts = append(parts, "truncated")
+		}
+		return parts
+	}
+	return nil
 }
 
 func lastLines(lines []string, count int) []string {
