@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/noeljackson/pi/internal/agent"
@@ -21,6 +24,9 @@ import (
 	"github.com/noeljackson/pi/internal/tools"
 	"github.com/noeljackson/pi/internal/tools/bash"
 	filetools "github.com/noeljackson/pi/internal/tools/file"
+	"github.com/noeljackson/pi/internal/tools/more"
+	"github.com/noeljackson/pi/internal/tools/task"
+	"github.com/noeljackson/pi/internal/tools/todo"
 	"github.com/noeljackson/pi/internal/tui"
 )
 
@@ -185,10 +191,11 @@ func runHeadless(prompt string) error {
 		return err
 	}
 
-	sess, cfg, err := newSessionConfig("", auth)
+	sess, cfg, cleanup, err := newSessionConfig("", auth)
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	defer sess.Close()
 
 	runner := agent.NewAgent(cfg)
@@ -219,10 +226,11 @@ func runTUI(resumeID string) error {
 		return err
 	}
 
-	sess, cfg, err := newSessionConfig(resumeID, auth)
+	sess, cfg, cleanup, err := newSessionConfig(resumeID, auth)
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	defer sess.Close()
 
 	messages, err := sess.Messages()
@@ -278,42 +286,61 @@ func sendEvent(ctx context.Context, eventCh chan<- agent.Event, event agent.Even
 	}
 }
 
-func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*session.Session, agent.LoopConfig, error) {
+func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*session.Session, agent.LoopConfig, func(), error) {
 	paths, err := config.ResolvePaths()
 	if err != nil {
-		return nil, agent.LoopConfig{}, err
+		return nil, agent.LoopConfig{}, nil, err
 	}
 	store, err := newSessionStore(paths)
 	if err != nil {
-		return nil, agent.LoopConfig{}, err
+		return nil, agent.LoopConfig{}, nil, err
 	}
 
 	var sess *session.Session
 	if resumeID == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return nil, agent.LoopConfig{}, err
+			return nil, agent.LoopConfig{}, nil, err
 		}
 		sess, err = store.Create(cwd)
 		if err != nil {
-			return nil, agent.LoopConfig{}, err
+			return nil, agent.LoopConfig{}, nil, err
 		}
 	} else {
 		sess, err = store.Open(resumeID)
 		if err != nil {
-			return nil, agent.LoopConfig{}, err
+			return nil, agent.LoopConfig{}, nil, err
 		}
 	}
 
-	registry, err := builtinRegistry()
-	if err != nil {
-		_ = sess.Close()
-		return nil, agent.LoopConfig{}, err
-	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		_ = sess.Close()
-		return nil, agent.LoopConfig{}, err
+		return nil, agent.LoopConfig{}, nil, err
+	}
+	cfg, cleanup, err := loopConfigForSession(sess, paths, store, auth, cwd)
+	if err != nil {
+		cleanup()
+		_ = sess.Close()
+		return nil, agent.LoopConfig{}, nil, err
+	}
+	return sess, cfg, cleanup, nil
+}
+
+func loopConfigForSession(sess *session.Session, paths config.Paths, store *session.JSONLStore, auth anthropicprovider.AuthSource, cwd string) (agent.LoopConfig, func(), error) {
+	moreBuffer := more.NewDiskBuffer(toolOutputDir(paths, sess.ID()))
+	cleanup := func() {
+		_ = moreBuffer.Cleanup()
+	}
+	spawner := &cliTaskSpawner{
+		paths: paths,
+		store: store,
+		auth:  auth,
+		cwd:   cwd,
+	}
+	registry, err := builtinRegistry(spawner, todo.NewSessionStore(sess), moreBuffer)
+	if err != nil {
+		return agent.LoopConfig{}, cleanup, err
 	}
 	resourceLoader := &resources.ResourceLoader{
 		Paths:       paths,
@@ -321,8 +348,7 @@ func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*sess
 	}
 	loadedResources, err := resourceLoader.Load()
 	if err != nil {
-		_ = sess.Close()
-		return nil, agent.LoopConfig{}, err
+		return agent.LoopConfig{}, cleanup, err
 	}
 	for _, diagnostic := range loadedResources.Diagnostics {
 		if diagnostic.Level == "error" {
@@ -334,28 +360,35 @@ func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource) (*sess
 		Provider:       anthropicprovider.NewClient(auth),
 		Tools:          registry,
 		Model:          modelName(),
+		SessionID:      sess.ID(),
 		Resources:      loadedResources,
 		ResourceLoader: resourceLoader,
 		MaxTokens:      defaultMaxTokens,
 		SessionWriter:  sess,
+		AfterToolCall: func(_ context.Context, call agent.ToolUseContent, result agent.ToolResult) {
+			storeToolOutput(moreBuffer, call, result)
+		},
 	}
 	if paths, err := config.ResolvePaths(); err == nil {
 		cfg.AuthStore = authstore.New(paths.AuthFile)
 	}
-	return sess, cfg, nil
+	return cfg, cleanup, nil
 }
 
 func newSessionStore(paths config.Paths) (*session.JSONLStore, error) {
 	return session.NewJSONLStore(paths.SessionDir), nil
 }
 
-func builtinRegistry() (*tools.Registry, error) {
+func builtinRegistry(taskSpawner task.Spawner, todoStore todo.Store, moreBuffer more.Buffer) (*tools.Registry, error) {
 	registry := tools.NewRegistry()
 	registrations := []struct {
 		tool agent.Tool
 		sets []tools.ToolSet
 	}{
 		{tool: bash.NewTool(), sets: []tools.ToolSet{tools.ToolSetCoding}},
+		{tool: task.NewTool(taskSpawner), sets: []tools.ToolSet{tools.ToolSetCoding}},
+		{tool: todo.NewTool(todoStore), sets: []tools.ToolSet{tools.ToolSetCoding, tools.ToolSetReadOnly}},
+		{tool: more.NewTool(moreBuffer), sets: []tools.ToolSet{tools.ToolSetCoding, tools.ToolSetReadOnly}},
 		{tool: filetools.NewReadTool(), sets: []tools.ToolSet{tools.ToolSetReadOnly, tools.ToolSetCoding}},
 		{tool: filetools.NewWriteTool(), sets: []tools.ToolSet{tools.ToolSetCoding}},
 		{tool: filetools.NewEditTool(), sets: []tools.ToolSet{tools.ToolSetCoding}},
@@ -369,6 +402,161 @@ func builtinRegistry() (*tools.Registry, error) {
 		}
 	}
 	return registry, nil
+}
+
+type cliTaskSpawner struct {
+	paths config.Paths
+	store *session.JSONLStore
+	auth  anthropicprovider.AuthSource
+	cwd   string
+}
+
+func (s *cliTaskSpawner) Spawn(ctx context.Context, req task.SpawnRequest) (task.Result, error) {
+	if s == nil || s.store == nil {
+		return task.Result{}, errors.New("task spawner is not configured")
+	}
+	cwd := s.cwd
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return task.Result{}, err
+		}
+	}
+	start := time.Now()
+	sess, err := s.store.Create(cwd)
+	if err != nil {
+		return task.Result{}, err
+	}
+	defer sess.Close()
+
+	cfg, cleanup, err := loopConfigForSession(sess, s.paths, s.store, s.auth, cwd)
+	if err != nil {
+		cleanup()
+		return task.Result{SessionID: sess.ID()}, err
+	}
+	defer cleanup()
+	if req.Model != "" {
+		cfg.Model = req.Model
+	}
+	if req.SystemPrompt != "" {
+		cfg.SystemPrompt = req.SystemPrompt
+	}
+	if req.MaxTurns > 0 {
+		cfg.MaxTurns = req.MaxTurns
+	}
+	if len(req.Tools) > 0 {
+		if err := validateTools(cfg.Tools, req.Tools); err != nil {
+			return task.Result{SessionID: sess.ID()}, err
+		}
+		cfg.ActiveTools = append([]string(nil), req.Tools...)
+	}
+
+	runner := agent.NewAgent(cfg)
+	if err := runner.Prompt(ctx, req.Prompt); err != nil {
+		return task.Result{SessionID: sess.ID()}, err
+	}
+	if err := runner.WaitForIdle(ctx); err != nil {
+		return task.Result{SessionID: sess.ID()}, err
+	}
+	if err := runner.LastError(); err != nil {
+		return task.Result{SessionID: sess.ID()}, err
+	}
+	output, inputTokens, outputTokens, err := finalAssistantOutput(sess)
+	if err != nil {
+		return task.Result{SessionID: sess.ID()}, err
+	}
+	return task.Result{
+		Output:       output,
+		SessionID:    sess.ID(),
+		DurationMS:   int(time.Since(start).Milliseconds()),
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+	}, nil
+}
+
+func validateTools(registry agent.ToolRegistry, names []string) error {
+	for _, name := range names {
+		if _, ok := registry.Get(name); !ok {
+			return fmt.Errorf("tool %q is not registered", name)
+		}
+	}
+	return nil
+}
+
+func finalAssistantOutput(sess *session.Session) (string, int, int, error) {
+	messages, err := sess.Messages()
+	if err != nil {
+		return "", 0, 0, err
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		var msg agent.AssistantMessage
+		switch typed := messages[i].(type) {
+		case agent.AssistantMessage:
+			msg = typed
+		case *agent.AssistantMessage:
+			msg = *typed
+		default:
+			continue
+		}
+		return textFromContent(msg.Content), msg.Usage.InputTokens, msg.Usage.OutputTokens, nil
+	}
+	return "", 0, 0, nil
+}
+
+func storeToolOutput(buffer more.Buffer, call agent.ToolUseContent, result agent.ToolResult) {
+	if buffer == nil || call.ID == "" {
+		return
+	}
+	text := fullOutputFromDetails(result.Details)
+	if text == "" {
+		text = textFromContent(result.Content)
+	}
+	if text == "" {
+		return
+	}
+	_ = buffer.Put(call.ID, text)
+}
+
+func fullOutputFromDetails(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var details struct {
+		OutputFile string `json:"outputFile"`
+	}
+	if err := json.Unmarshal(raw, &details); err != nil || details.OutputFile == "" {
+		return ""
+	}
+	data, err := os.ReadFile(details.OutputFile)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func textFromContent(content []agent.Content) string {
+	var builder strings.Builder
+	for _, block := range content {
+		var value string
+		switch typed := block.(type) {
+		case agent.TextContent:
+			value = typed.Text
+		case *agent.TextContent:
+			value = typed.Text
+		default:
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteString("\n")
+		}
+		builder.WriteString(value)
+	}
+	return builder.String()
+}
+
+func toolOutputDir(paths config.Paths, sessionID string) string {
+	return filepath.Join(paths.AgentDir, "tool-outputs", sessionID)
 }
 
 func modelName() string {

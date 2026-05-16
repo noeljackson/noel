@@ -73,6 +73,7 @@ type LoopConfig struct {
 	MaxTokens        int
 	MaxTurns         int
 	SessionWriter    SessionWriter
+	SessionID        string
 	Compactor        Compactor
 	BranchSummarizer schema.BranchSummarizer
 	AuthStore        *authstore.Store
@@ -412,9 +413,10 @@ func executeToolCall(ctx context.Context, cfg LoopConfig, tool Tool, call ToolUs
 	var result ToolResult
 	if err == nil {
 		result, err = tool.Execute(ctx, input, ToolCallContext{
-			CallID: call.ID,
-			Cwd:    currentWorkingDirectory(),
-			Model:  cfg.Model,
+			CallID:    call.ID,
+			SessionID: cfg.SessionID,
+			Cwd:       currentWorkingDirectory(),
+			Model:     cfg.Model,
 			OnUpdate: func(partial json.RawMessage) {
 				_ = emit(ToolExecutionUpdateEvent{CallID: call.ID, Partial: partial})
 			},

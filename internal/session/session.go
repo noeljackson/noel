@@ -161,6 +161,13 @@ func (s *Session) AppendRunState(payload any, parentID string) error {
 	return s.appendRecordLocked(RecordTypeRunState, payload, parentID)
 }
 
+// AppendTodoState appends the latest todo tool state.
+func (s *Session) AppendTodoState(payload json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendRawPayloadRecordLocked(RecordTypeTodoState, payload, s.leafID)
+}
+
 // AppendCompaction appends a compaction summary record.
 func (s *Session) AppendCompaction(summary string, parentID string) error {
 	s.mu.Lock()
