@@ -814,6 +814,7 @@ dependencies = [
  "pi-ai",
  "pi-config",
  "pi-core",
+ "pi-tui",
  "serde_json",
  "tokio",
 ]

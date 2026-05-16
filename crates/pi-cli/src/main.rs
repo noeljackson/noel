@@ -16,6 +16,10 @@ use pi_core::{
     run_user_turn, ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionExport,
     SessionState, SessionStore,
 };
+use pi_tui::{
+    Keybinding as TuiKeybinding, KeybindingMap, ModelView, SessionView, SettingsView,
+    TerminalRenderer, TerminalTheme,
+};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum OutputMode {
@@ -528,11 +532,12 @@ async fn run_interactive(
     mut config: LoadedConfig,
     offline: bool,
 ) -> Result<()> {
-    println!("pi rust cli");
+    let renderer = terminal_renderer(&config);
+    println!("{}", renderer.banner());
     println!("type /help for commands, /reload to reload config, /quit to exit");
     let stdin = io::stdin();
     loop {
-        print!("pi> ");
+        print!("{}", renderer.prompt());
         io::stdout().flush()?;
         let mut line = String::new();
         let read = stdin.read_line(&mut line)?;
@@ -546,7 +551,7 @@ async fn run_interactive(
         match line.as_str() {
             "/quit" => break,
             "/help" => {
-                print_help();
+                println!("{}", renderer.help());
                 continue;
             }
             "/models" => {
@@ -800,30 +805,43 @@ fn print_response(mode: &OutputMode, response: &str) {
     }
 }
 
+fn terminal_renderer(config: &LoadedConfig) -> TerminalRenderer {
+    TerminalRenderer::new(TerminalTheme {
+        name: config
+            .settings
+            .theme
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+    })
+}
+
+fn keybinding_map(config: &LoadedConfig) -> KeybindingMap {
+    KeybindingMap::with_overrides(
+        config
+            .keybindings
+            .iter()
+            .map(|binding| TuiKeybinding {
+                action: binding.action.clone(),
+                keys: binding.keys.clone(),
+            })
+            .collect(),
+    )
+}
+
 fn print_session(runtime: &Runtime) {
-    println!("session: {}", runtime.session().session_id);
-    println!("cwd: {}", runtime.session().cwd.display());
-    if let Some(name) = &runtime.session().name {
-        println!("name: {name}");
-    }
-    if !runtime.session().labels.is_empty() {
-        println!(
-            "labels: {}",
-            runtime
-                .session()
-                .labels
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    if let Some(parent) = &runtime.session().parent_session_id {
-        println!("parent: {parent}");
-    }
-    if let Some(store) = runtime.store() {
-        println!("file: {}", store.path().display());
-    }
+    println!(
+        "{}",
+        TerminalRenderer::default().session(&SessionView {
+            id: runtime.session().session_id.clone(),
+            cwd: runtime.session().cwd.display().to_string(),
+            name: runtime.session().name.clone(),
+            labels: runtime.session().labels.iter().cloned().collect(),
+            parent: runtime.session().parent_session_id.clone(),
+            file: runtime
+                .store()
+                .map(|store| store.path().display().to_string()),
+        })
+    );
 }
 
 fn print_sessions(session_dir: &Path) -> Result<()> {
@@ -852,49 +870,45 @@ fn print_session_tree(session_dir: &Path) -> Result<()> {
 }
 
 fn print_settings(config: &LoadedConfig, runtime: &Runtime) {
-    println!("agent dir: {}", config.paths.agent_dir.display());
-    println!("session dir: {}", config.paths.session_dir.display());
-    println!("config generation: {}", runtime.systems().config_generation);
     println!(
-        "active model: {}",
-        runtime
-            .session()
-            .active_model
-            .as_ref()
-            .map(|model| format!("{}/{}", model.provider, model.id))
-            .unwrap_or_else(|| "-".to_string())
-    );
-    println!(
-        "theme: {}",
-        config
-            .settings
-            .theme
-            .clone()
-            .unwrap_or_else(|| "-".to_string())
+        "{}",
+        terminal_renderer(config).settings(&SettingsView {
+            agent_dir: config.paths.agent_dir.display().to_string(),
+            session_dir: config.paths.session_dir.display().to_string(),
+            config_generation: runtime.systems().config_generation,
+            active_model: runtime
+                .session()
+                .active_model
+                .as_ref()
+                .map(|model| format!("{}/{}", model.provider, model.id)),
+            theme: config.settings.theme.clone(),
+        })
     );
 }
 
 fn print_hotkeys(config: &LoadedConfig) {
-    if config.keybindings.is_empty() {
-        println!("no custom keybindings");
-        return;
-    }
-    for binding in &config.keybindings {
-        println!("{}\t{}", binding.action, binding.keys.join(", "));
-    }
+    println!(
+        "{}",
+        terminal_renderer(config).keybindings(&keybinding_map(config))
+    );
 }
 
 fn print_scoped_models(config: &LoadedConfig, runtime: &Runtime) {
-    for model in &config.models {
-        let active = runtime
-            .session()
-            .active_model
-            .as_ref()
-            .map(|active| active.provider == model.provider && active.id == model.id)
-            .unwrap_or(false);
-        let marker = if active { "*" } else { " " };
-        println!("{marker} {}/{}", model.provider, model.id);
-    }
+    let models = config
+        .models
+        .iter()
+        .map(|model| ModelView {
+            provider: model.provider.clone(),
+            id: model.id.clone(),
+            active: runtime
+                .session()
+                .active_model
+                .as_ref()
+                .map(|active| active.provider == model.provider && active.id == model.id)
+                .unwrap_or(false),
+        })
+        .collect::<Vec<_>>();
+    println!("{}", terminal_renderer(config).models(&models));
 }
 
 fn print_login_status(config: &LoadedConfig, provider: &str) {
@@ -981,36 +995,4 @@ fn write_auth_file(config: &LoadedConfig) -> Result<()> {
         serde_json::to_string_pretty(&config.auth)?,
     )?;
     Ok(())
-}
-
-fn print_help() {
-    println!("/help                  show commands");
-    println!("/settings              show active settings");
-    println!("/hotkeys               show custom keybindings");
-    println!("/models                list configured models");
-    println!("/scoped-models         list scoped models");
-    println!("/model <provider/id>   switch model");
-    println!("/session               show session info");
-    println!("/new                   start a new session");
-    println!("/resume [id|name|path] resume or list sessions");
-    println!("/fork [id|name|path]   fork a session");
-    println!("/clone [id|name|path]  clone a session without changing parent");
-    println!("/tree                  list session tree");
-    println!("/name <name>           rename current session");
-    println!("/labels <labels...>    replace current session labels");
-    println!("/export <file>         export current session");
-    println!("/import <file>         import a session export");
-    println!("/copy                  print last assistant message");
-    println!("/compact               compact older messages");
-    println!("/login [provider]      show auth status");
-    println!("/logout <provider>     remove stored auth");
-    println!("/reload                reload config without clearing context");
-    println!("/read <path>           read file");
-    println!("/write <path> <text>   write file");
-    println!("/edit <path> <a> <b>   replace text");
-    println!("/grep <text> [path]    search files");
-    println!("/find <text>           find files by substring");
-    println!("/ls [path]             list directory");
-    println!("/bash <command>        run shell command");
-    println!("/quit                  exit");
 }

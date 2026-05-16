@@ -14,5 +14,6 @@ clap.workspace = true
 pi-ai = { path = "../pi-ai" }
 pi-config = { path = "../pi-config" }
 pi-core = { path = "../pi-core" }
+pi-tui = { path = "../pi-tui" }
 serde_json.workspace = true
 tokio.workspace = true
