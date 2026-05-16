@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pi_ai::{
-    ChatMessage, ChatRole, ModelRef, Provider, ProviderError, ProviderRequest, StreamEvent,
+    ChatMessage, ChatRole, MediaInput, ModelRef, Provider, ProviderError, ProviderRequest,
+    StreamEvent,
 };
 use pi_config::{has_auth_for_provider, LoadedConfig};
 use pi_tools::{
@@ -19,6 +20,8 @@ use thiserror::Error;
 pub struct ConversationMessage {
     pub role: MessageRole,
     pub content: String,
+    #[serde(default)]
+    pub media: Vec<MediaInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1087,6 +1090,7 @@ impl Runtime {
             let mut messages = vec![ConversationMessage {
                 role: MessageRole::System,
                 content: summary,
+                media: Vec::new(),
             }];
             messages.extend(retained_messages);
             self.replace_messages(messages)?;
@@ -1143,11 +1147,22 @@ pub async fn run_user_turn_streaming(
     runtime: &mut Runtime,
     provider: &dyn Provider,
     prompt: String,
+    on_text: impl FnMut(&str),
+) -> Result<String, AgentError> {
+    run_user_turn_streaming_with_media(runtime, provider, prompt, Vec::new(), on_text).await
+}
+
+pub async fn run_user_turn_streaming_with_media(
+    runtime: &mut Runtime,
+    provider: &dyn Provider,
+    prompt: String,
+    media: Vec<MediaInput>,
     mut on_text: impl FnMut(&str),
 ) -> Result<String, AgentError> {
     runtime.push_message(ConversationMessage {
         role: MessageRole::User,
         content: prompt.clone(),
+        media,
     })?;
 
     if let Some(command) = parse_tool_command(&prompt)? {
@@ -1171,6 +1186,7 @@ pub async fn run_user_turn_streaming(
         runtime.push_message(ConversationMessage {
             role: MessageRole::Tool,
             content: result.output.clone(),
+            media: Vec::new(),
         })?;
         return Ok(result.output);
     }
@@ -1196,18 +1212,22 @@ pub async fn run_user_turn_streaming(
                 MessageRole::System => ChatMessage {
                     role: ChatRole::System,
                     content: message.content.clone(),
+                    media: message.media.clone(),
                 },
                 MessageRole::User => ChatMessage {
                     role: ChatRole::User,
                     content: message.content.clone(),
+                    media: message.media.clone(),
                 },
                 MessageRole::Assistant => ChatMessage {
                     role: ChatRole::Assistant,
                     content: message.content.clone(),
+                    media: message.media.clone(),
                 },
                 MessageRole::Tool => ChatMessage {
                     role: ChatRole::Tool,
                     content: message.content.clone(),
+                    media: message.media.clone(),
                 },
             })
             .collect(),
@@ -1223,6 +1243,7 @@ pub async fn run_user_turn_streaming(
     runtime.push_message(ConversationMessage {
         role: MessageRole::Assistant,
         content: text.clone(),
+        media: Vec::new(),
     })?;
     Ok(text)
 }
@@ -1382,6 +1403,7 @@ mod tests {
         session.messages.push(ConversationMessage {
             role: MessageRole::User,
             content: "keep this".to_string(),
+            media: Vec::new(),
         });
         session.tool_history.push(ToolEvent {
             id: "tool-1".to_string(),
@@ -1476,6 +1498,7 @@ mod tests {
         state.messages.push(ConversationMessage {
             role: MessageRole::User,
             content: "hello".to_string(),
+            media: Vec::new(),
         });
         store
             .record_message(state.messages[0].clone())
@@ -1503,10 +1526,12 @@ mod tests {
         state.messages.push(ConversationMessage {
             role: MessageRole::User,
             content: "hello <world>".to_string(),
+            media: Vec::new(),
         });
         state.messages.push(ConversationMessage {
             role: MessageRole::Assistant,
             content: "done".to_string(),
+            media: Vec::new(),
         });
         state.tool_history.push(ToolEvent {
             id: "tool-1".to_string(),
@@ -1555,6 +1580,7 @@ mod tests {
         state.messages.push(ConversationMessage {
             role: MessageRole::User,
             content: "parent prompt".to_string(),
+            media: Vec::new(),
         });
         store.record_metadata(&state).expect("record metadata");
         store
@@ -1586,6 +1612,7 @@ mod tests {
             state.messages.push(ConversationMessage {
                 role: MessageRole::User,
                 content: format!("message {index}"),
+                media: Vec::new(),
             });
             store
                 .record_message(state.messages[index].clone())
@@ -1646,12 +1673,14 @@ mod tests {
             .record_message(ConversationMessage {
                 role: MessageRole::User,
                 content: "old".to_string(),
+                media: Vec::new(),
             })
             .expect("record message");
         store
             .record_messages_snapshot(vec![ConversationMessage {
                 role: MessageRole::System,
                 content: "summary".to_string(),
+                media: Vec::new(),
             }])
             .expect("record snapshot");
 

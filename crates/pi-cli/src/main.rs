@@ -5,17 +5,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use clap::{Parser, ValueEnum};
 use pi_ai::{
-    create_provider, ModelRef, ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig,
+    create_provider, MediaInput, ModelRef, ProviderApi as AiProviderApi, ProviderAuth,
+    ProviderConfig,
 };
 use pi_config::{
     auth_for_provider, has_auth_for_provider, load_config, AuthCredential, ConfigPaths,
     LoadedConfig, ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, ENV_SESSION_DIR,
 };
 use pi_core::{
-    run_excluded_bash, run_user_turn, run_user_turn_streaming, write_session_export,
-    CompactionKind, MessageRole, ReloadableSystems, Runtime, SessionState, SessionStore,
+    run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
+    write_session_export, CompactionKind, MessageRole, ReloadableSystems, Runtime, SessionState,
+    SessionStore,
 };
 use pi_tui::{
     EditorState, Keybinding as TuiKeybinding, KeybindingMap, ModelView, Selector, SelectorItem,
@@ -113,6 +116,9 @@ struct Cli {
     no_context_files: bool,
 
     #[arg(long)]
+    image: Vec<PathBuf>,
+
+    #[arg(long)]
     export: Option<PathBuf>,
 
     #[arg(long)]
@@ -167,6 +173,7 @@ async fn main() -> Result<()> {
     }
 
     let mut initial_prompt = expand_message_inputs(&cwd, &cli.messages)?;
+    let initial_media = load_media_inputs(&cwd, &cli.image)?;
     if !stdin_is_terminal && !matches!(cli.mode, OutputMode::Rpc) {
         let mut stdin = String::new();
         io::stdin().read_to_string(&mut stdin)?;
@@ -181,7 +188,14 @@ async fn main() -> Result<()> {
         if initial_prompt.is_empty() {
             return Err(anyhow!("print mode requires a prompt"));
         }
-        let response = run_prompt(&mut runtime, &config, initial_prompt, cli.offline).await?;
+        let response = run_prompt_media(
+            &mut runtime,
+            &config,
+            initial_prompt,
+            initial_media,
+            cli.offline,
+        )
+        .await?;
         if let Some(path) = &cli.export {
             export_session(&runtime, path)?;
         }
@@ -429,6 +443,104 @@ fn expand_message_inputs(cwd: &Path, messages: &[String]) -> Result<String> {
     Ok(parts.join(" "))
 }
 
+fn load_media_inputs(cwd: &Path, paths: &[PathBuf]) -> Result<Vec<MediaInput>> {
+    paths
+        .iter()
+        .map(|path| load_media_input(cwd, path))
+        .collect()
+}
+
+fn load_media_input(cwd: &Path, path: &Path) -> Result<MediaInput> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let bytes = fs::read(&path)?;
+    let mime_type = media_mime_type(&path)?;
+    let (width, height) = image_dimensions(&bytes, &mime_type).unwrap_or((None, None));
+    Ok(MediaInput {
+        mime_type,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        path: Some(path.display().to_string()),
+        width,
+        height,
+    })
+}
+
+fn media_mime_type(path: &Path) -> Result<String> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_lowercase())
+        .as_deref()
+    {
+        Some("png") => Ok("image/png".to_string()),
+        Some("jpg") | Some("jpeg") => Ok("image/jpeg".to_string()),
+        Some("gif") => Ok("image/gif".to_string()),
+        Some("webp") => Ok("image/webp".to_string()),
+        Some(extension) => Err(anyhow!("unsupported image extension: {extension}")),
+        None => Err(anyhow!("image path has no extension: {}", path.display())),
+    }
+}
+
+fn image_dimensions(bytes: &[u8], mime_type: &str) -> Option<(Option<u32>, Option<u32>)> {
+    match mime_type {
+        "image/png" => png_dimensions(bytes).map(|(width, height)| (Some(width), Some(height))),
+        "image/jpeg" => jpeg_dimensions(bytes).map(|(width, height)| (Some(width), Some(height))),
+        _ => Some((None, None)),
+    }
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    Some((
+        u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+        u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+    ))
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return None;
+    }
+    let mut index = 2;
+    while index + 9 < bytes.len() {
+        if bytes[index] != 0xff {
+            index += 1;
+            continue;
+        }
+        let marker = bytes[index + 1];
+        let length = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            let height = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32;
+            let width = u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u32;
+            return Some((width, height));
+        }
+        if length < 2 {
+            return None;
+        }
+        index += length + 2;
+    }
+    None
+}
+
 fn create_runtime(
     cli: &Cli,
     cwd: &Path,
@@ -661,6 +773,24 @@ async fn run_interactive(
                     }
                     Ok(_) => println!("editor returned an empty prompt"),
                     Err(error) => eprintln!("error: {error}"),
+                }
+                continue;
+            }
+            _ if line.starts_with("/image ") => {
+                let rest = line.trim_start_matches("/image ").trim();
+                let (path, prompt) = split_once_text(rest);
+                let media = load_media_input(&runtime.session().cwd, Path::new(path))?;
+                print_media_fallback(&media);
+                if !prompt.is_empty() {
+                    run_prompt_media_and_print(
+                        &mut runtime,
+                        &config,
+                        &mut editor_state,
+                        prompt.to_string(),
+                        vec![media],
+                        offline,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -961,7 +1091,17 @@ async fn run_prompt(
     prompt: String,
     offline: bool,
 ) -> Result<String> {
-    run_prompt_once(runtime, config, prompt, offline, false).await
+    run_prompt_media(runtime, config, prompt, Vec::new(), offline).await
+}
+
+async fn run_prompt_media(
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    prompt: String,
+    media: Vec<MediaInput>,
+    offline: bool,
+) -> Result<String> {
+    run_prompt_once(runtime, config, prompt, media, offline, false).await
 }
 
 async fn run_prompt_and_print(
@@ -972,7 +1112,23 @@ async fn run_prompt_and_print(
     offline: bool,
 ) {
     editor_state.record_history(prompt.clone());
-    if let Err(error) = run_prompt_with_queue(runtime, config, prompt, offline, true).await {
+    if let Err(error) =
+        run_prompt_with_queue(runtime, config, prompt, Vec::new(), offline, true).await
+    {
+        eprintln!("error: {error}");
+    }
+}
+
+async fn run_prompt_media_and_print(
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    editor_state: &mut EditorState,
+    prompt: String,
+    media: Vec<MediaInput>,
+    offline: bool,
+) {
+    editor_state.record_history(prompt.clone());
+    if let Err(error) = run_prompt_with_queue(runtime, config, prompt, media, offline, true).await {
         eprintln!("error: {error}");
     }
 }
@@ -981,11 +1137,13 @@ async fn run_prompt_with_queue(
     runtime: &mut Runtime,
     config: &LoadedConfig,
     prompt: String,
+    media: Vec<MediaInput>,
     offline: bool,
     stream_output: bool,
 ) -> Result<String> {
     maybe_auto_compact(runtime, stream_output)?;
-    let first_response = run_prompt_once(runtime, config, prompt, offline, stream_output).await?;
+    let first_response =
+        run_prompt_once(runtime, config, prompt, media, offline, stream_output).await?;
     while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
         let remaining = runtime
             .session()
@@ -998,7 +1156,7 @@ async fn run_prompt_with_queue(
         if stream_output {
             println!("queued> {prompt}");
         }
-        run_prompt_once(runtime, config, prompt, offline, stream_output).await?;
+        run_prompt_once(runtime, config, prompt, Vec::new(), offline, stream_output).await?;
     }
     Ok(first_response)
 }
@@ -1022,22 +1180,43 @@ async fn run_prompt_once(
     runtime: &mut Runtime,
     config: &LoadedConfig,
     prompt: String,
+    media: Vec<MediaInput>,
     offline: bool,
     stream_output: bool,
 ) -> Result<String> {
     let provider = provider_for_runtime(runtime, config, offline)?;
     if !stream_output {
-        return run_user_turn(runtime, provider.as_ref(), prompt)
-            .await
-            .map_err(Into::into);
+        if media.is_empty() {
+            return run_user_turn(runtime, provider.as_ref(), prompt)
+                .await
+                .map_err(Into::into);
+        }
+        return run_user_turn_streaming_with_media(
+            runtime,
+            provider.as_ref(),
+            prompt,
+            media,
+            |_| {},
+        )
+        .await
+        .map_err(Into::into);
     }
     let mut printed = false;
-    let response = run_user_turn_streaming(runtime, provider.as_ref(), prompt, |delta| {
-        printed = true;
-        print!("{delta}");
-        let _ = io::stdout().flush();
-    })
-    .await?;
+    let response = if media.is_empty() {
+        run_user_turn_streaming(runtime, provider.as_ref(), prompt, |delta| {
+            printed = true;
+            print!("{delta}");
+            let _ = io::stdout().flush();
+        })
+        .await?
+    } else {
+        run_user_turn_streaming_with_media(runtime, provider.as_ref(), prompt, media, |delta| {
+            printed = true;
+            print!("{delta}");
+            let _ = io::stdout().flush();
+        })
+        .await?
+    };
     if printed {
         println!();
     } else if !response.is_empty() {
@@ -1265,6 +1444,19 @@ fn print_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorS
         runtime.session().queued_messages.len(),
         editor_state.history().len(),
         config.diagnostics.len()
+    );
+}
+
+fn print_media_fallback(media: &MediaInput) {
+    let dimensions = match (media.width, media.height) {
+        (Some(width), Some(height)) => format!("{width}x{height}"),
+        _ => "unknown-size".to_string(),
+    };
+    println!(
+        "image: {}\t{}\t{}\tterminal display fallback: attached to provider message",
+        media.path.as_deref().unwrap_or("-"),
+        media.mime_type,
+        dimensions
     );
 }
 

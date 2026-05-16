@@ -121,6 +121,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "compose a prompt in an external editor",
     },
     CommandHelp {
+        command: "/image <path> [prompt]",
+        description: "attach an image to a prompt",
+    },
+    CommandHelp {
         command: "/skills",
         description: "list loaded skills",
     },

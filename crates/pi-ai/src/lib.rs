@@ -62,6 +62,17 @@ pub enum ProviderAuth {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    #[serde(default)]
+    pub media: Vec<MediaInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaInput {
+    pub mime_type: String,
+    pub data_base64: String,
+    pub path: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,14 +133,20 @@ impl Provider for FauxProvider {
             .iter()
             .rev()
             .find(|message| message.role == ChatRole::User)
-            .map(|message| message.content.as_str())
-            .unwrap_or("");
+            .map(|message| {
+                if message.media.is_empty() {
+                    message.content.clone()
+                } else {
+                    format!("{} [media:{}]", message.content, message.media.len())
+                }
+            })
+            .unwrap_or_default();
         Ok(vec![
             StreamEvent::Text(format!(
                 "[{}/{}] ",
                 self.config.model.provider, self.config.model.id
             )),
-            StreamEvent::Text(last_user.to_string()),
+            StreamEvent::Text(last_user),
             StreamEvent::Stop {
                 reason: "stop".to_string(),
             },
@@ -451,9 +468,26 @@ fn openai_messages(request: &ProviderRequest) -> Vec<Value> {
         messages.push(json!({ "role": "system", "content": system_prompt }));
     }
     messages.extend(request.messages.iter().map(|message| {
+        let content = if message.media.is_empty() {
+            json!(message.content)
+        } else {
+            let mut parts = vec![json!({
+                "type": "text",
+                "text": message.content,
+            })];
+            parts.extend(message.media.iter().map(|media| {
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": media_data_url(media),
+                    },
+                })
+            }));
+            Value::Array(parts)
+        };
         json!({
             "role": role_name(&message.role),
-            "content": message.content,
+            "content": content,
         })
     }));
     messages
@@ -464,12 +498,19 @@ fn openai_responses_input(request: &ProviderRequest) -> Vec<Value> {
         .messages
         .iter()
         .map(|message| {
+            let mut content = vec![json!({
+                "type": if message.role == ChatRole::Assistant { "output_text" } else { "input_text" },
+                "text": message.content,
+            })];
+            content.extend(message.media.iter().map(|media| {
+                json!({
+                    "type": "input_image",
+                    "image_url": media_data_url(media),
+                })
+            }));
             json!({
                 "role": role_name(&message.role),
-                "content": [{
-                    "type": if message.role == ChatRole::Assistant { "output_text" } else { "input_text" },
-                    "text": message.content,
-                }],
+                "content": content,
             })
         })
         .collect()
@@ -552,9 +593,28 @@ fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
         .iter()
         .filter(|message| message.role != ChatRole::System)
         .map(|message| {
+            let content = if message.media.is_empty() {
+                json!(message.content)
+            } else {
+                let mut parts = vec![json!({
+                    "type": "text",
+                    "text": message.content,
+                })];
+                parts.extend(message.media.iter().map(|media| {
+                    json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media.mime_type,
+                            "data": media.data_base64,
+                        },
+                    })
+                }));
+                Value::Array(parts)
+            };
             json!({
                 "role": if message.role == ChatRole::Assistant { "assistant" } else { "user" },
-                "content": message.content,
+                "content": content,
             })
         })
         .collect()
@@ -565,12 +625,25 @@ fn google_messages(messages: &[ChatMessage]) -> Vec<Value> {
         .iter()
         .filter(|message| message.role != ChatRole::System)
         .map(|message| {
+            let mut parts = vec![json!({ "text": message.content })];
+            parts.extend(message.media.iter().map(|media| {
+                json!({
+                    "inline_data": {
+                        "mime_type": media.mime_type,
+                        "data": media.data_base64,
+                    },
+                })
+            }));
             json!({
                 "role": if message.role == ChatRole::Assistant { "model" } else { "user" },
-                "parts": [{ "text": message.content }],
+                "parts": parts,
             })
         })
         .collect()
+}
+
+fn media_data_url(media: &MediaInput) -> String {
+    format!("data:{};base64,{}", media.mime_type, media.data_base64)
 }
 
 fn role_name(role: &ChatRole) -> &'static str {
@@ -604,6 +677,7 @@ mod tests {
                 messages: vec![ChatMessage {
                     role: ChatRole::User,
                     content: "hello".to_string(),
+                    media: Vec::new(),
                 }],
             })
             .await
@@ -670,6 +744,40 @@ mod tests {
         assert_eq!(
             parse_openai_responses_sse_text(body),
             Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_message_converters_include_image_parts() {
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "describe".to_string(),
+                media: vec![MediaInput {
+                    mime_type: "image/png".to_string(),
+                    data_base64: "aW1hZ2U=".to_string(),
+                    path: Some("fixture.png".to_string()),
+                    width: Some(1),
+                    height: Some(1),
+                }],
+            }],
+        };
+
+        let openai = openai_messages(&request);
+        assert_eq!(
+            openai[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+        let anthropic = anthropic_messages(&request.messages);
+        assert_eq!(
+            anthropic[0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        let google = google_messages(&request.messages);
+        assert_eq!(
+            google[0]["parts"][1]["inline_data"]["mime_type"],
+            "image/png"
         );
     }
 }

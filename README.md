@@ -79,6 +79,7 @@ Useful CLI scope flags:
 cargo run -p pi-cli -- --models faux/echo --tools read,write -p "hello"
 cargo run -p pi-cli -- --no-tools -p "no tools"
 cargo run -p pi-cli -- --system-prompt prompt.md --append-system-prompt extra.md -p "hello"
+cargo run -p pi-cli -- --image screenshot.png -p "describe this"
 cargo run -p pi-cli -- --export session.json -p "hello"
 cargo run -p pi-cli -- --export session.html -p "hello"
 cargo run -p pi-cli -- --export session.jsonl -p "hello"
@@ -182,6 +183,7 @@ or an object map:
 - `/complete <prefix>`
 - `/history`
 - `/editor [text]`
+- `/image <path> [prompt]`
 - `/skills`
 - `/skill:<name> [input]`
 - `/prompts`
@@ -228,7 +230,7 @@ or an object map:
 
 `/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
 
-Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; `/editor` uses `PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`.
+Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; `/editor` uses `PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`. Image inputs are encoded as provider attachments with terminal text fallback.
 
 ## RPC Methods
 
