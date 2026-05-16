@@ -701,6 +701,7 @@ fn normalized_cli_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
             "-ns" => "--no-skills".to_string(),
             "-np" => "--no-prompt-templates".to_string(),
             "-nc" => "--no-context-files".to_string(),
+            "-v" => "--version".to_string(),
             _ => arg,
         })
         .collect()
