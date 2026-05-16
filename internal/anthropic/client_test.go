@@ -3,6 +3,7 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -208,6 +209,17 @@ func TestStreamErrorEvent(t *testing.T) {
 	end, ok := events[len(events)-1].(agent.AgentEndEvent)
 	if !ok || end.Reason != "error" || end.Err == nil {
 		t.Fatalf("last event = %#v", events[len(events)-1])
+	}
+}
+
+func TestStreamContextOverflowErrorEvent(t *testing.T) {
+	stream := sse("error", `{"type":"error","error":{"message":"prompt is too long for the context window"}}`)
+	_, _, _, _, err := runMockStream(t, APIKeyAuth{Key: "sk-ant-test"}, agent.StreamRequest{
+		Model:    "claude-sonnet-4-6",
+		Messages: []agent.Message{agent.UserMessage{Content: []agent.Content{agent.TextContent{Text: "error"}}}},
+	}, stream)
+	if !errors.Is(err, ErrContextOverflow) {
+		t.Fatalf("err = %v, want ErrContextOverflow", err)
 	}
 }
 

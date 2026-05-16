@@ -20,6 +20,7 @@ type fakeProvider struct {
 
 type fakeResponse struct {
 	message    AssistantMessage
+	err        error
 	block      chan struct{}
 	waitForCtx bool
 }
@@ -38,6 +39,9 @@ func (p *fakeProvider) Stream(ctx context.Context, req StreamRequest, emit func(
 	if response.waitForCtx {
 		<-ctx.Done()
 		return nil, ctx.Err()
+	}
+	if response.err != nil {
+		return nil, response.err
 	}
 	emit(MessageStartEvent{MessageID: "msg", Role: RoleAssistant, Model: req.Model})
 	for _, content := range response.message.Content {

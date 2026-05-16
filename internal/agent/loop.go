@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	authstore "github.com/noeljackson/pi/internal/auth"
 	"github.com/noeljackson/pi/internal/resources"
@@ -52,6 +53,8 @@ type ToolChoice struct {
 
 type Compactor interface {
 	MaybeCompact(ctx context.Context, messages []Message, system string) ([]Message, error)
+	ShouldRetryOnOverflow(err error) bool
+	AfterOverflowRetry(ctx context.Context, messages []Message, system string) ([]Message, error)
 }
 
 type ResourceLoader interface {
@@ -159,6 +162,13 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 				finalErr = err
 				return nil, err
 			}
+			if len(compacted) != len(messages) {
+				if err := recordCompactionIfPossible(cfg.SessionWriter, messages, compacted); err != nil {
+					finalErr = err
+					return nil, err
+				}
+				messages = compacted
+			}
 			streamMessages = compacted
 		}
 		assistant, err := cfg.Provider.Stream(ctx, StreamRequest{
@@ -175,8 +185,40 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 			_ = emitEvent(event)
 		})
 		if err != nil {
-			finalErr = err
-			return nil, err
+			if cfg.Compactor == nil || !cfg.Compactor.ShouldRetryOnOverflow(err) {
+				finalErr = err
+				return nil, err
+			}
+			retryMessages, compactErr := cfg.Compactor.AfterOverflowRetry(ctx, messages, effectiveSystemPrompt(cfg))
+			if compactErr != nil {
+				finalErr = compactErr
+				return nil, compactErr
+			}
+			if len(retryMessages) != len(messages) {
+				if err := recordCompactionIfPossible(cfg.SessionWriter, messages, retryMessages); err != nil {
+					finalErr = err
+					return nil, err
+				}
+			}
+			streamMessages = retryMessages
+			messages = retryMessages
+			assistant, err = cfg.Provider.Stream(ctx, StreamRequest{
+				Model:     cfg.Model,
+				Messages:  ConvertToLLM(streamMessages),
+				System:    effectiveSystemPrompt(cfg),
+				Tools:     toolsFromConfig(cfg),
+				MaxTokens: cfg.MaxTokens,
+			}, func(event Event) {
+				if start, ok := event.(MessageStartEvent); ok {
+					start.TurnID = turnID
+					event = start
+				}
+				_ = emitEvent(event)
+			})
+			if err != nil {
+				finalErr = err
+				return nil, err
+			}
 		}
 
 		messages = append(messages, *assistant)
@@ -254,6 +296,20 @@ func run(ctx context.Context, cfg LoopConfig, messages []Message, appendInitial 
 	err := fmt.Errorf("agent exceeded max turns: %d", maxTurns)
 	finalErr = err
 	return finalAssistant, err
+}
+
+func recordCompactionIfPossible(writer SessionWriter, before []Message, after []Message) error {
+	compactionWriter, ok := writer.(compactionRecordWriter)
+	if !ok || len(after) == 0 || len(after) >= len(before) {
+		return nil
+	}
+	dropped := len(before) - (len(after) - 1)
+	return compactionWriter.AppendCompactionRecord(
+		compactionSummaryText(after[0]),
+		dropped,
+		time.Now().UTC(),
+		compactionWriter.LastMessageRecordID(),
+	)
 }
 
 func effectiveSystemPrompt(cfg LoopConfig) string {

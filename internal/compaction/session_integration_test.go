@@ -94,7 +94,7 @@ func TestMaybeCompactRecordsAndReturnsCompactedMessages(t *testing.T) {
 		TargetTokens:    20,
 		SummaryProvider: &mockSummaryProvider{summary: "summary"},
 	})
-	got, err := compactor.MaybeCompact(context.Background(), sess, messages, "")
+	got, err := compactor.MaybeCompactSession(context.Background(), sess, messages, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestMaybeCompactRecordsAndReturnsCompactedMessages(t *testing.T) {
 	if len(restored) != 3 {
 		t.Fatalf("expected restored compacted messages, got %d", len(restored))
 	}
-	if _, ok := restored[0].(agent.SystemMessage); !ok {
-		t.Fatalf("expected restored first message to be system summary, got %T", restored[0])
+	if _, ok := restored[0].(agent.CompactionSummaryMessage); !ok {
+		t.Fatalf("expected restored first message to be compaction summary, got %T", restored[0])
 	}
 }

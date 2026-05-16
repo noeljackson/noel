@@ -33,6 +33,8 @@ const (
 	defaultAnthropicRequestMaxTokens = 4096
 )
 
+var ErrContextOverflow = errors.New("anthropic: context window exceeded")
+
 type Client struct {
 	auth       AuthSource
 	baseURL    string
@@ -65,7 +67,11 @@ func (c *Client) Stream(ctx context.Context, req agent.StreamRequest, emit func(
 
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		body, _ := io.ReadAll(response.Body)
-		return nil, fmt.Errorf("anthropic: HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+		bodyText := strings.TrimSpace(string(body))
+		if isContextOverflowText(bodyText) {
+			return nil, fmt.Errorf("%w: HTTP %d: %s", ErrContextOverflow, response.StatusCode, bodyText)
+		}
+		return nil, fmt.Errorf("anthropic: HTTP %d: %s", response.StatusCode, bodyText)
 	}
 
 	message, err := translateStream(ctx, response.Body, req, isOAuth, emit)
@@ -711,7 +717,11 @@ func translateStream(ctx context.Context, body io.Reader, req agent.StreamReques
 
 	err := iterateSSE(ctx, body, func(sse serverSentEvent) error {
 		if sse.Event == "error" {
-			return fmt.Errorf("anthropic stream error: %s", strings.TrimSpace(sse.Data))
+			data := strings.TrimSpace(sse.Data)
+			if isContextOverflowText(data) {
+				return fmt.Errorf("%w: %s", ErrContextOverflow, data)
+			}
+			return fmt.Errorf("anthropic stream error: %s", data)
 		}
 		if !isAnthropicMessageEvent(sse.Event) {
 			return nil
@@ -772,6 +782,18 @@ func translateStream(ctx context.Context, body io.Reader, req agent.StreamReques
 		message.ResponseModel = req.Model
 	}
 	return message, nil
+}
+
+func isContextOverflowText(text string) bool {
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "context_window_exceeded") ||
+		strings.Contains(lower, "context_length_exceeded") ||
+		strings.Contains(lower, "context window exceeded") ||
+		strings.Contains(lower, "prompt is too long") {
+		return true
+	}
+	return strings.Contains(lower, "context") &&
+		(strings.Contains(lower, "exceed") || strings.Contains(lower, "too long"))
 }
 
 func isAnthropicMessageEvent(event string) bool {

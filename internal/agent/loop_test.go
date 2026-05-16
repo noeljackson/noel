@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -179,6 +180,56 @@ func TestLoopShouldStopAfterTurnOverridesDefault(t *testing.T) {
 	if got := provider.requestCount(); got != 1 {
 		t.Fatalf("request count = %d, want 1", got)
 	}
+}
+
+func TestLoopCompactsAndRetriesOnOverflow(t *testing.T) {
+	overflow := errors.New("context window exceeded")
+	provider := &fakeProvider{responses: []fakeResponse{
+		{err: overflow},
+		{message: AssistantMessage{Content: []Content{TextContent{Text: "done"}}, StopReason: StopEndTurn}},
+	}}
+	compactor := &overflowCompactor{}
+	_, err := Continue(context.Background(), LoopConfig{
+		Provider:  provider,
+		Model:     "m",
+		Compactor: compactor,
+	}, []Message{
+		UserMessage{Content: []Content{TextContent{Text: "old"}}},
+		AssistantMessage{Content: []Content{TextContent{Text: "old answer"}}},
+		UserMessage{Content: []Content{TextContent{Text: "new"}}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.requestCount() != 2 {
+		t.Fatalf("request count = %d, want 2", provider.requestCount())
+	}
+	if !compactor.afterOverflowCalled {
+		t.Fatal("overflow compaction hook was not called")
+	}
+	if got := requestUserText(provider.lastRequest()); got != "compactednew" {
+		t.Fatalf("retry request user text = %q, want compactednew", got)
+	}
+}
+
+type overflowCompactor struct {
+	afterOverflowCalled bool
+}
+
+func (c *overflowCompactor) MaybeCompact(ctx context.Context, messages []Message, system string) ([]Message, error) {
+	return messages, nil
+}
+
+func (c *overflowCompactor) ShouldRetryOnOverflow(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "context window exceeded")
+}
+
+func (c *overflowCompactor) AfterOverflowRetry(ctx context.Context, messages []Message, system string) ([]Message, error) {
+	c.afterOverflowCalled = true
+	return []Message{
+		UserMessage{Content: []Content{TextContent{Text: "compacted"}}},
+		messages[len(messages)-1],
+	}, nil
 }
 
 func toolUseProvider(name string, id string) *fakeProvider {
