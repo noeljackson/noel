@@ -82,7 +82,11 @@ func (s *JSONLStore) Create(cwd string) (*Session, error) {
 
 // Open opens an existing session by id.
 func (s *JSONLStore) Open(id string) (*Session, error) {
-	path := s.sessionPath(id)
+	return s.OpenPath(s.sessionPath(id))
+}
+
+// OpenPath opens an existing session by file path.
+func (s *JSONLStore) OpenPath(path string) (*Session, error) {
 	records, validEnd, needsNewline, err := loadRecords(path)
 	if err != nil {
 		return nil, err
@@ -114,7 +118,8 @@ func (s *JSONLStore) Open(id string) (*Session, error) {
 		}
 	}
 
-	session := newSession(id, path, s.currentTurnPath(id), file, records)
+	header, _ := decodeSessionHeader(records[0])
+	session := newSession(header.ID, path, s.currentTurnPath(header.ID), file, records)
 	if header, ok := decodeSessionHeader(records[0]); ok {
 		session.cwd = header.Cwd
 		session.createdAt = header.CreatedAt
