@@ -9,17 +9,103 @@ import (
 )
 
 const (
-	messageEnvelopeTokens = 8
-	contentEnvelopeTokens = 4
-	imageTokens           = 1200
+	imageChars = 4800
 )
 
 type ContextEstimator struct{}
 
-// EstimateTokens returns an approximate token count for the given messages.
-// It uses a cheap 4-chars-per-token heuristic plus envelope overhead.
+// ContextUsageEstimate describes a TS-compatible context estimate.
+type ContextUsageEstimate struct {
+	Tokens         int
+	UsageTokens    int
+	TrailingTokens int
+	LastUsageIndex *int
+}
+
+// CalculateContextTokens returns provider-reported total context usage.
+func CalculateContextTokens(usage agent.Usage) int {
+	if usage.TotalTokens > 0 {
+		return usage.TotalTokens
+	}
+	return usage.InputTokens + usage.OutputTokens + usage.CacheReadInputTokens + usage.CacheCreationInputTokens
+}
+
+// EstimateContextTokens estimates context tokens from messages using the last
+// successful assistant usage as an anchor and estimating only trailing messages.
+func (e *ContextEstimator) EstimateContextTokens(messages []agent.Message) ContextUsageEstimate {
+	usage, index, ok := lastAssistantUsage(messages)
+	if !ok {
+		estimated := 0
+		for _, message := range messages {
+			estimated += estimateMessageTokens(message)
+		}
+		return ContextUsageEstimate{Tokens: estimated, TrailingTokens: estimated}
+	}
+
+	usageTokens := CalculateContextTokens(usage)
+	trailingTokens := 0
+	for i := index + 1; i < len(messages); i++ {
+		trailingTokens += estimateMessageTokens(messages[i])
+	}
+	lastUsageIndex := index
+	return ContextUsageEstimate{
+		Tokens:         usageTokens + trailingTokens,
+		UsageTokens:    usageTokens,
+		TrailingTokens: trailingTokens,
+		LastUsageIndex: &lastUsageIndex,
+	}
+}
+
+// EstimateTokens returns the TS-compatible estimate for the given messages.
+// The system prompt parameter is accepted for caller compatibility; TS
+// compaction estimates only conversation messages.
 func (e *ContextEstimator) EstimateTokens(messages []agent.Message, system string) int {
-	total := estimateTextTokens(system)
+	_ = system
+	return e.EstimateContextTokens(messages).Tokens
+}
+
+func lastAssistantUsage(messages []agent.Message) (agent.Usage, int, bool) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg, ok := asAssistant(messages[i])
+		if !ok {
+			continue
+		}
+		if msg.StopReason == agent.StopAbort || msg.StopReason == agent.StopError {
+			continue
+		}
+		if !usagePopulated(msg.Usage) {
+			continue
+		}
+		return msg.Usage, i, true
+	}
+	return agent.Usage{}, -1, false
+}
+
+func usagePopulated(usage agent.Usage) bool {
+	return usage.InputTokens != 0 ||
+		usage.OutputTokens != 0 ||
+		usage.CacheReadInputTokens != 0 ||
+		usage.CacheCreationInputTokens != 0 ||
+		usage.TotalTokens != 0 ||
+		usage.CacheWriteTokens != 0
+}
+
+func asAssistant(message agent.Message) (agent.AssistantMessage, bool) {
+	switch msg := message.(type) {
+	case agent.AssistantMessage:
+		return msg, true
+	case *agent.AssistantMessage:
+		if msg == nil {
+			return agent.AssistantMessage{}, false
+		}
+		return *msg, true
+	default:
+		return agent.AssistantMessage{}, false
+	}
+}
+
+func estimateMessagesTokens(messages []agent.Message) int {
+	total := 0
 	for _, message := range messages {
 		total += estimateMessageTokens(message)
 	}
@@ -30,68 +116,79 @@ func estimateMessageTokens(message agent.Message) int {
 	if message == nil {
 		return 0
 	}
-	total := messageEnvelopeTokens
+	chars := 0
 	switch msg := message.(type) {
 	case agent.UserMessage:
-		total += estimateContentsTokens(msg.Content)
+		chars += estimateTextContentsChars(msg.Content)
 	case *agent.UserMessage:
-		total += estimateContentsTokens(msg.Content)
+		chars += estimateTextContentsChars(msg.Content)
 	case agent.AssistantMessage:
-		total += estimateContentsTokens(msg.Content)
+		chars += estimateAssistantChars(msg.Content)
 	case *agent.AssistantMessage:
-		total += estimateContentsTokens(msg.Content)
+		chars += estimateAssistantChars(msg.Content)
 	case agent.ToolResultMessage:
-		for _, result := range msg.Results {
-			total += contentEnvelopeTokens + estimateTextTokens(result.ToolUseID)
-			total += estimateContentsTokens(result.Content)
-		}
+		chars += estimateToolResultChars(msg.Results)
 	case *agent.ToolResultMessage:
-		for _, result := range msg.Results {
-			total += contentEnvelopeTokens + estimateTextTokens(result.ToolUseID)
-			total += estimateContentsTokens(result.Content)
-		}
+		chars += estimateToolResultChars(msg.Results)
 	case agent.SystemMessage:
-		total += estimateContentsTokens(msg.Content)
+		chars += estimateToolResultContentChars(msg.Content)
 	case *agent.SystemMessage:
-		total += estimateContentsTokens(msg.Content)
+		chars += estimateToolResultContentChars(msg.Content)
+	case agent.BashExecutionMessage:
+		chars += len(msg.Command) + len(msg.Output)
+	case *agent.BashExecutionMessage:
+		chars += len(msg.Command) + len(msg.Output)
+	case agent.CustomMessage:
+		chars += estimateToolResultContentChars(msg.Content)
+	case *agent.CustomMessage:
+		chars += estimateToolResultContentChars(msg.Content)
+	case agent.BranchSummaryMessage:
+		chars += len(msg.Summary)
+	case *agent.BranchSummaryMessage:
+		chars += len(msg.Summary)
+	case agent.CompactionSummaryMessage:
+		chars += len(msg.Summary)
+	case *agent.CompactionSummaryMessage:
+		chars += len(msg.Summary)
 	}
-	return total
+	return estimateTextTokensFromChars(chars)
 }
 
-func estimateContentsTokens(contents []agent.Content) int {
-	total := 0
+func estimateTextContentsChars(contents []agent.Content) int {
+	chars := 0
 	for _, content := range contents {
-		total += contentEnvelopeTokens + estimateContentTokens(content)
+		switch block := content.(type) {
+		case agent.TextContent:
+			chars += len(block.Text)
+		case *agent.TextContent:
+			chars += len(block.Text)
+		}
 	}
-	return total
+	return chars
 }
 
-func estimateContentTokens(content agent.Content) int {
-	switch block := content.(type) {
-	case agent.TextContent:
-		return estimateTextTokens(block.Text)
-	case *agent.TextContent:
-		return estimateTextTokens(block.Text)
-	case agent.ThinkingContent:
-		return estimateTextTokens(block.Thinking)
-	case *agent.ThinkingContent:
-		return estimateTextTokens(block.Thinking)
-	case agent.ImageContent, *agent.ImageContent:
-		return imageTokens
-	case agent.ToolUseContent:
-		return estimateToolUseTokens(block)
-	case *agent.ToolUseContent:
-		return estimateToolUseTokens(*block)
-	case agent.ToolResultContent:
-		return estimateTextTokens(block.ToolUseID) + estimateContentsTokens(block.Content)
-	case *agent.ToolResultContent:
-		return estimateTextTokens(block.ToolUseID) + estimateContentsTokens(block.Content)
-	default:
-		return 0
+func estimateAssistantChars(contents []agent.Content) int {
+	chars := 0
+	for _, content := range contents {
+		switch block := content.(type) {
+		case agent.TextContent:
+			chars += len(block.Text)
+		case *agent.TextContent:
+			chars += len(block.Text)
+		case agent.ThinkingContent:
+			chars += len(block.Thinking)
+		case *agent.ThinkingContent:
+			chars += len(block.Thinking)
+		case agent.ToolUseContent:
+			chars += estimateToolUseChars(block)
+		case *agent.ToolUseContent:
+			chars += estimateToolUseChars(*block)
+		}
 	}
+	return chars
 }
 
-func estimateToolUseTokens(block agent.ToolUseContent) int {
+func estimateToolUseChars(block agent.ToolUseContent) int {
 	input := string(block.Input)
 	if len(block.Input) > 0 {
 		var decoded any
@@ -101,7 +198,30 @@ func estimateToolUseTokens(block agent.ToolUseContent) int {
 			}
 		}
 	}
-	return estimateTextTokens(block.Name + input)
+	return len(block.Name) + len(input)
+}
+
+func estimateToolResultChars(results []agent.ToolResult) int {
+	chars := 0
+	for _, result := range results {
+		chars += estimateToolResultContentChars(result.Content)
+	}
+	return chars
+}
+
+func estimateToolResultContentChars(contents []agent.Content) int {
+	chars := 0
+	for _, content := range contents {
+		switch block := content.(type) {
+		case agent.TextContent:
+			chars += len(block.Text)
+		case *agent.TextContent:
+			chars += len(block.Text)
+		case agent.ImageContent, *agent.ImageContent:
+			chars += imageChars
+		}
+	}
+	return chars
 }
 
 func estimateTextTokens(text string) int {
@@ -109,4 +229,11 @@ func estimateTextTokens(text string) int {
 		return 0
 	}
 	return int(math.Ceil(float64(len(text)) / 4))
+}
+
+func estimateTextTokensFromChars(chars int) int {
+	if chars <= 0 {
+		return 0
+	}
+	return int(math.Ceil(float64(chars) / 4))
 }

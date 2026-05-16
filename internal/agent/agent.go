@@ -79,6 +79,11 @@ type runStateWriter interface {
 	AppendRunState(payload any, parentID string) error
 }
 
+type compactionRecordWriter interface {
+	AppendCompactionRecord(summary string, droppedCount int, compactedAt time.Time, parentID string) error
+	LastMessageRecordID() string
+}
+
 func NewAgent(cfg LoopConfig) *Agent {
 	a := &Agent{
 		cfg:         cfg,
@@ -119,6 +124,49 @@ func (a *Agent) Continue(ctx context.Context) error {
 		QueuedSubmission: QueuedSubmission{Mode: QueueAppend, Text: "continue"},
 		kind:             queuedContinue,
 	})
+}
+
+// CompactNow runs compaction immediately and updates the in-memory session
+// context before returning.
+func (a *Agent) CompactNow(ctx context.Context) error {
+	a.Abort()
+	if err := a.WaitForIdle(ctx); err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	cfg := a.cfg
+	messages := append([]Message(nil), a.messages...)
+	a.mu.Unlock()
+	if cfg.Compactor == nil {
+		return errors.New("compactor is not configured")
+	}
+
+	compacted, err := cfg.Compactor.AfterOverflowRetry(ctx, messages, effectiveSystemPrompt(cfg))
+	if err != nil {
+		return err
+	}
+	if len(compacted) == len(messages) {
+		return nil
+	}
+
+	if writer, ok := cfg.SessionWriter.(compactionRecordWriter); ok {
+		parentID := writer.LastMessageRecordID()
+		dropped := len(messages) - (len(compacted) - 1)
+		if err := writer.AppendCompactionRecord(compactionSummaryText(compacted[0]), dropped, time.Now().UTC(), parentID); err != nil {
+			return err
+		}
+	}
+
+	a.mu.Lock()
+	a.messages = append([]Message(nil), compacted...)
+	a.mu.Unlock()
+	return nil
+}
+
+// QueueDuringCompaction enqueues a user submission to run after current work.
+func (a *Agent) QueueDuringCompaction(ctx context.Context, text string) error {
+	return a.FollowUp(ctx, text)
 }
 
 func (a *Agent) Retry(ctx context.Context) error {
@@ -587,4 +635,22 @@ func mapKeys(values map[string]struct{}) []string {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+func compactionSummaryText(message Message) string {
+	switch msg := message.(type) {
+	case CompactionSummaryMessage:
+		return msg.Summary
+	case *CompactionSummaryMessage:
+		if msg != nil {
+			return msg.Summary
+		}
+	case SystemMessage:
+		return userMessageText(UserMessage{Content: msg.Content})
+	case *SystemMessage:
+		if msg != nil {
+			return userMessageText(UserMessage{Content: msg.Content})
+		}
+	}
+	return ""
 }

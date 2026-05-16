@@ -297,7 +297,14 @@ func messagesFromRecords(records []Record) ([]agent.Message, error) {
 			if droppedCount > len(messages) {
 				droppedCount = len(messages)
 			}
-			summaryMessage := agent.SystemMessage{Content: []agent.Content{agent.TextContent{Text: payload.Summary}}}
+			summaryMessage := agent.CompactionSummaryMessage{
+				Timestamp:    record.Timestamp,
+				Summary:      payload.Summary,
+				TokensBefore: payload.TokensBefore,
+				DroppedCount: droppedCount,
+				FileOps:      payload.FileOps,
+				Details:      payload.Details,
+			}
 			compacted := make([]agent.Message, 0, 1+len(messages)-droppedCount)
 			compacted = append(compacted, summaryMessage)
 			compacted = append(compacted, messages[droppedCount:]...)
