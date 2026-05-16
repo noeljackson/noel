@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
@@ -6,6 +6,7 @@ use clap::{Parser, ValueEnum};
 use pi_ai::{create_provider, ModelRef, ProviderApi as AiProviderApi, ProviderConfig};
 use pi_config::{
     api_key_for_provider, load_config, ConfigPaths, LoadedConfig, ProviderApi as ConfigProviderApi,
+    ENV_SESSION_DIR,
 };
 use pi_core::{run_user_turn, ReloadableSystems, Runtime, SessionState, SessionStore};
 
@@ -64,6 +65,11 @@ async fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd.clone(), cli.session_dir.clone())?;
     let mut config = load_config(paths)?;
+    if cli.session_dir.is_none() && std::env::var_os(ENV_SESSION_DIR).is_none() {
+        if let Some(session_dir) = &config.settings.session_dir {
+            config.paths = config.paths.with_session_dir(session_dir)?;
+        }
+    }
     if let Some(system_prompt) = &cli.system_prompt {
         config.system_prompt = Some(system_prompt.clone());
     }
@@ -79,8 +85,17 @@ async fn main() -> Result<()> {
     let mut runtime = create_runtime(&cli, &cwd, &config, systems)?;
     select_initial_model(&mut runtime, &config, &cli)?;
 
+    let stdin_is_terminal = io::stdin().is_terminal();
+    if matches!(cli.mode, OutputMode::Rpc)
+        && !stdin_is_terminal
+        && !cli.print
+        && cli.messages.is_empty()
+    {
+        return run_rpc(runtime, config).await;
+    }
+
     let mut initial_prompt = cli.messages.join(" ");
-    if !io::stdin().is_terminal() && !matches!(cli.mode, OutputMode::Rpc) {
+    if !stdin_is_terminal && !matches!(cli.mode, OutputMode::Rpc) {
         let mut stdin = String::new();
         io::stdin().read_to_string(&mut stdin)?;
         initial_prompt = [initial_prompt, stdin.trim().to_string()]
@@ -90,7 +105,7 @@ async fn main() -> Result<()> {
             .join("\n\n");
     }
 
-    if cli.print || !initial_prompt.is_empty() || !io::stdin().is_terminal() {
+    if cli.print || !initial_prompt.is_empty() || !stdin_is_terminal {
         if initial_prompt.is_empty() {
             return Err(anyhow!("print mode requires a prompt"));
         }
@@ -100,6 +115,125 @@ async fn main() -> Result<()> {
     }
 
     run_interactive(runtime, config).await
+}
+
+async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig) -> Result<()> {
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                println!(
+                    "{}",
+                    rpc_error(serde_json::Value::Null, -32700, &error.to_string())
+                );
+                continue;
+            }
+        };
+        let id = request
+            .get("id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let Some(method) = request.get("method").and_then(serde_json::Value::as_str) else {
+            println!("{}", rpc_error(id, -32600, "missing method"));
+            continue;
+        };
+        let result = match method {
+            "prompt" => match rpc_prompt(&request) {
+                Ok(prompt) => match run_prompt(&mut runtime, &config, prompt).await {
+                    Ok(message) => Ok(serde_json::json!({ "message": message })),
+                    Err(error) => Err((1, error.to_string())),
+                },
+                Err(error) => Err((-32602, error)),
+            },
+            "reload" => {
+                config = load_config(config.paths.clone())?;
+                let next_generation = runtime.systems().config_generation + 1;
+                match runtime.reload(ReloadableSystems::from_config(&config, next_generation)) {
+                    Ok(report) => Ok(serde_json::json!({
+                        "activeModelValid": report.active_model_valid,
+                        "removedActiveTools": report.removed_active_tools,
+                    })),
+                    Err(error) => Err((1, error.to_string())),
+                }
+            }
+            "session" => Ok(serde_json::json!({
+                "id": runtime.session().session_id,
+                "cwd": runtime.session().cwd.display().to_string(),
+                "file": runtime.store().map(|store| store.path().display().to_string()),
+            })),
+            "model" => match rpc_model(&request) {
+                Ok(reference) => match resolve_model_reference(&config, &reference) {
+                    Some(model) => {
+                        runtime.set_active_model(Some(model.clone()))?;
+                        Ok(serde_json::json!({
+                            "provider": model.provider,
+                            "id": model.id,
+                        }))
+                    }
+                    None => Err((1, format!("model not found: {reference}"))),
+                },
+                Err(error) => Err((-32602, error)),
+            },
+            _ => Err((-32601, format!("method not found: {method}"))),
+        };
+        match result {
+            Ok(result) => println!("{}", rpc_result(id, result)),
+            Err((code, message)) => println!("{}", rpc_error(id, code, &message)),
+        }
+    }
+    Ok(())
+}
+
+fn rpc_prompt(request: &serde_json::Value) -> std::result::Result<String, String> {
+    let params = request
+        .get("params")
+        .ok_or_else(|| "missing params".to_string())?;
+    if let Some(prompt) = params.as_str() {
+        return Ok(prompt.to_string());
+    }
+    params
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| "missing prompt".to_string())
+}
+
+fn rpc_model(request: &serde_json::Value) -> std::result::Result<String, String> {
+    let params = request
+        .get("params")
+        .ok_or_else(|| "missing params".to_string())?;
+    if let Some(model) = params.as_str() {
+        return Ok(model.to_string());
+    }
+    params
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| "missing model".to_string())
+}
+
+fn rpc_result(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    })
 }
 
 fn create_runtime(
@@ -131,7 +265,7 @@ fn create_runtime(
     Ok(Runtime::with_store(state, systems, store))
 }
 
-fn most_recent_session(session_dir: &PathBuf) -> Result<Option<PathBuf>> {
+fn most_recent_session(session_dir: &Path) -> Result<Option<PathBuf>> {
     if !session_dir.exists() {
         return Ok(None);
     }

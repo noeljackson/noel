@@ -52,6 +52,13 @@ Print mode:
 cargo run -p pi-cli -- -p --model faux/echo "hello"
 ```
 
+JSON-line RPC mode:
+
+```bash
+printf '{"jsonrpc":"2.0","id":1,"method":"prompt","params":{"prompt":"hello"}}\n' \
+  | cargo run -p pi-cli -- --mode rpc --model faux/echo
+```
+
 List models:
 
 ```bash
@@ -78,6 +85,18 @@ Environment overrides:
 
 - `PI_CODING_AGENT_DIR`
 - `PI_CODING_AGENT_SESSION_DIR`
+
+`settings.json` supports default model selection, shell configuration, prompt inputs, enabled models/tools, and `sessionDir`:
+
+```json
+{
+  "defaultProvider": "faux",
+  "defaultModel": "echo",
+  "enabledModels": ["faux/echo"],
+  "enabledTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
+  "sessionDir": "sessions"
+}
+```
 
 Provider API keys can be stored in `auth.json`:
 
@@ -106,6 +125,18 @@ Provider API keys can be stored in `auth.json`:
 ]
 ```
 
+`keybindings.json` may be either an array:
+
+```json
+[{ "action": "submit", "keys": ["enter"] }]
+```
+
+or an object map:
+
+```json
+{ "submit": ["enter"], "cancel": ["escape"] }
+```
+
 ## Interactive Commands
 
 - `/help`
@@ -123,6 +154,15 @@ Provider API keys can be stored in `auth.json`:
 - `/quit`
 
 `/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
+
+## RPC Methods
+
+`--mode rpc` reads one JSON object per line from stdin and writes one JSON object per line to stdout.
+
+- `prompt` with `{ "prompt": "..." }`
+- `reload`
+- `session`
+- `model` with `{ "model": "provider/id" }`
 
 ## Validation
 

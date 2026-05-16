@@ -2,13 +2,16 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pi_ai::{
     ChatMessage, ChatRole, ModelRef, Provider, ProviderError, ProviderRequest, StreamEvent,
 };
 use pi_config::{api_key_for_provider, LoadedConfig};
-use pi_tools::{execute_tool, ToolError, ToolRequest, ToolRuntimeOptions};
+use pi_tools::{
+    builtin_tool_definitions, execute_tool, ToolError, ToolRequest, ToolRuntimeOptions,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -54,12 +57,10 @@ impl SessionState {
             tool_history: Vec::new(),
             queued_messages: Vec::new(),
             active_model: None,
-            active_tool_names: BTreeSet::from([
-                "read".to_string(),
-                "bash".to_string(),
-                "edit".to_string(),
-                "write".to_string(),
-            ]),
+            active_tool_names: builtin_tool_definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect(),
         }
     }
 }
@@ -97,15 +98,13 @@ impl ReloadableSystems {
             })
             .map(|model| model.provider.clone())
             .collect();
-        let available_tool_names = BTreeSet::from([
-            "read".to_string(),
-            "bash".to_string(),
-            "edit".to_string(),
-            "write".to_string(),
-            "grep".to_string(),
-            "find".to_string(),
-            "ls".to_string(),
-        ]);
+        let available_tool_names = match &config.settings.enabled_tools {
+            Some(enabled_tools) => enabled_tools.iter().cloned().collect(),
+            None => builtin_tool_definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect(),
+        };
         let context_messages = config
             .context_files
             .iter()
@@ -180,6 +179,8 @@ pub enum AgentError {
     UnknownCommand(String),
     #[error("missing argument for slash command: {0}")]
     MissingCommandArgument(String),
+    #[error("tool is disabled: {0}")]
+    DisabledTool(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,10 +423,13 @@ pub async fn run_user_turn(
         content: prompt.clone(),
     })?;
 
-    if let Some(request) = parse_tool_command(&prompt)? {
+    if let Some(command) = parse_tool_command(&prompt)? {
+        if !runtime.session.active_tool_names.contains(&command.name) {
+            return Err(AgentError::DisabledTool(command.name));
+        }
         let result = execute_tool(
             &runtime.session.cwd,
-            request,
+            command.request,
             &ToolRuntimeOptions {
                 shell_path: runtime.systems.shell_path.clone(),
                 shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
@@ -434,12 +438,7 @@ pub async fn run_user_turn(
         .await?;
         runtime.push_tool_event(ToolEvent {
             id: format!("tool-{}", runtime.session.tool_history.len() + 1),
-            name: prompt
-                .split_whitespace()
-                .next()
-                .unwrap_or("/tool")
-                .trim_start_matches('/')
-                .to_string(),
+            name: command.name,
             result: result.output.clone(),
         })?;
         runtime.push_message(ConversationMessage {
@@ -500,7 +499,13 @@ pub async fn run_user_turn(
     Ok(text)
 }
 
-fn parse_tool_command(prompt: &str) -> Result<Option<ToolRequest>, AgentError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedToolCommand {
+    name: String,
+    request: ToolRequest,
+}
+
+fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentError> {
     let trimmed = prompt.trim();
     if !trimmed.starts_with('/') {
         return Ok(None);
@@ -509,45 +514,66 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ToolRequest>, AgentError> {
     let command = parts.next().unwrap_or_default();
     let rest = parts.next().unwrap_or_default().trim();
     match command {
-        "/read" => Ok(Some(ToolRequest::Read {
-            path: required_arg(command, rest)?.to_string(),
+        "/read" => Ok(Some(ParsedToolCommand {
+            name: "read".to_string(),
+            request: ToolRequest::Read {
+                path: required_arg(command, rest)?.to_string(),
+            },
         })),
-        "/bash" => Ok(Some(ToolRequest::Bash {
-            command: required_arg(command, rest)?.to_string(),
-            timeout_ms: Some(120_000),
+        "/bash" => Ok(Some(ParsedToolCommand {
+            name: "bash".to_string(),
+            request: ToolRequest::Bash {
+                command: required_arg(command, rest)?.to_string(),
+                timeout_ms: Some(120_000),
+            },
         })),
         "/write" => {
             let (path, content) = split_once_arg(command, rest)?;
-            Ok(Some(ToolRequest::Write {
-                path: path.to_string(),
-                content: content.to_string(),
+            Ok(Some(ParsedToolCommand {
+                name: "write".to_string(),
+                request: ToolRequest::Write {
+                    path: path.to_string(),
+                    content: content.to_string(),
+                },
             }))
         }
         "/edit" => {
             let (path, rest) = split_once_arg(command, rest)?;
             let (find, replace) = split_once_arg(command, rest)?;
-            Ok(Some(ToolRequest::Edit {
-                path: path.to_string(),
-                find: find.to_string(),
-                replace: replace.to_string(),
+            Ok(Some(ParsedToolCommand {
+                name: "edit".to_string(),
+                request: ToolRequest::Edit {
+                    path: path.to_string(),
+                    find: find.to_string(),
+                    replace: replace.to_string(),
+                },
             }))
         }
         "/grep" => {
             let (pattern, path) = split_optional_arg(rest);
             let pattern = required_arg(command, pattern)?;
-            Ok(Some(ToolRequest::Grep {
-                path: path.map(ToString::to_string),
-                pattern: pattern.to_string(),
+            Ok(Some(ParsedToolCommand {
+                name: "grep".to_string(),
+                request: ToolRequest::Grep {
+                    path: path.map(ToString::to_string),
+                    pattern: pattern.to_string(),
+                },
             }))
         }
-        "/find" => Ok(Some(ToolRequest::Find {
-            pattern: required_arg(command, rest)?.to_string(),
+        "/find" => Ok(Some(ParsedToolCommand {
+            name: "find".to_string(),
+            request: ToolRequest::Find {
+                pattern: required_arg(command, rest)?.to_string(),
+            },
         })),
-        "/ls" => Ok(Some(ToolRequest::Ls {
-            path: if rest.is_empty() {
-                None
-            } else {
-                Some(rest.to_string())
+        "/ls" => Ok(Some(ParsedToolCommand {
+            name: "ls".to_string(),
+            request: ToolRequest::Ls {
+                path: if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.to_string())
+                },
             },
         })),
         "/reload" | "/quit" | "/help" => Ok(None),
@@ -581,16 +607,20 @@ fn split_optional_arg(value: &str) -> (&str, Option<&str>) {
 }
 
 fn new_session_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
-    format!("{millis}-{}", std::process::id())
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{millis}-{}-{counter}", std::process::id())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    use pi_ai::{create_provider, ProviderApi, ProviderConfig};
 
     use super::*;
 
@@ -712,5 +742,69 @@ mod tests {
         assert_eq!(loaded.messages[0].content, "hello");
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn run_user_turn_records_user_and_assistant_messages() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let provider = create_provider(ProviderConfig {
+            model: ModelRef {
+                provider: "faux".to_string(),
+                id: "echo".to_string(),
+            },
+            api: ProviderApi::Faux,
+            base_url: None,
+            api_key: None,
+        });
+
+        let response = run_user_turn(&mut runtime, provider.as_ref(), "hello".to_string())
+            .await
+            .expect("run turn");
+
+        assert_eq!(response, "[faux/echo] hello");
+        assert_eq!(runtime.session().messages.len(), 2);
+        assert_eq!(runtime.session().messages[0].role, MessageRole::User);
+        assert_eq!(runtime.session().messages[1].role, MessageRole::Assistant);
+    }
+
+    #[tokio::test]
+    async fn disabled_tool_command_is_rejected_before_execution() {
+        let cwd = std::env::temp_dir().join(format!("pi-disabled-tool-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let mut session = SessionState::new("session-1", cwd.clone());
+        session.active_tool_names.remove("write");
+        let mut runtime = Runtime::new(session, ReloadableSystems::default());
+        let provider = create_provider(ProviderConfig {
+            model: ModelRef {
+                provider: "faux".to_string(),
+                id: "echo".to_string(),
+            },
+            api: ProviderApi::Faux,
+            base_url: None,
+            api_key: None,
+        });
+
+        let error = run_user_turn(
+            &mut runtime,
+            provider.as_ref(),
+            "/write blocked.txt nope".to_string(),
+        )
+        .await
+        .expect_err("write tool should be disabled");
+
+        assert!(matches!(error, AgentError::DisabledTool(tool) if tool == "write"));
+        assert!(!cwd.join("blocked.txt").exists());
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn session_ids_are_unique_inside_one_process() {
+        let first = new_session_id();
+        let second = new_session_id();
+
+        assert_ne!(first, second);
     }
 }

@@ -128,17 +128,18 @@ async fn bash_tool(
         .clone()
         .or_else(|| std::env::var("SHELL").ok())
         .unwrap_or_else(|| "/bin/sh".to_string());
-    let child = Command::new(shell)
+    let mut process = Command::new(shell);
+    process
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|source| ToolError::Io {
-            path: cwd.to_path_buf(),
-            source,
-        })?;
+        .kill_on_drop(true);
+    let child = process.spawn().map_err(|source| ToolError::Io {
+        path: cwd.to_path_buf(),
+        source,
+    })?;
 
     let wait = child.wait_with_output();
     let output = if let Some(timeout_ms) = timeout_ms {
@@ -185,7 +186,7 @@ fn edit_tool(cwd: &Path, path: &str, find: &str, replace: &str) -> Result<ToolRe
 }
 
 fn write_tool(cwd: &Path, path: &str, content: &str) -> Result<ToolResult, ToolError> {
-    let path = resolve_under_cwd(cwd, path)?;
+    let path = resolve_under_cwd_for_write(cwd, path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ToolError::Io {
             path: parent.to_path_buf(),
@@ -317,6 +318,32 @@ fn resolve_under_cwd(cwd: &Path, input: &str) -> Result<PathBuf, ToolError> {
     Ok(canonical_parent.join(candidate.file_name().unwrap_or_default()))
 }
 
+fn resolve_under_cwd_for_write(cwd: &Path, input: &str) -> Result<PathBuf, ToolError> {
+    let candidate = if Path::new(input).is_absolute() {
+        PathBuf::from(input)
+    } else {
+        cwd.join(input)
+    };
+    let canonical_cwd = cwd.canonicalize().map_err(|source| ToolError::Io {
+        path: cwd.to_path_buf(),
+        source,
+    })?;
+    let mut existing_parent = candidate.parent().unwrap_or(cwd);
+    while !existing_parent.exists() {
+        existing_parent = existing_parent.parent().unwrap_or(cwd);
+    }
+    let canonical_parent = existing_parent
+        .canonicalize()
+        .map_err(|source| ToolError::Io {
+            path: existing_parent.to_path_buf(),
+            source,
+        })?;
+    if !canonical_parent.starts_with(&canonical_cwd) {
+        return Err(ToolError::PathEscapesCwd(input.to_string()));
+    }
+    Ok(candidate)
+}
+
 fn display_relative(cwd: &Path, path: &Path) -> String {
     path.strip_prefix(cwd)
         .unwrap_or(path)
@@ -365,6 +392,52 @@ mod tests {
         .expect("read");
 
         assert_eq!(result.output, "hello rust");
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn write_creates_nested_directories_inside_cwd() {
+        let cwd =
+            std::env::temp_dir().join(format!("pi-tools-nested-write-test-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+
+        execute_tool(
+            &cwd,
+            ToolRequest::Write {
+                path: "nested/child/file.txt".to_string(),
+                content: "content".to_string(),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("write nested file");
+
+        let content =
+            fs::read_to_string(cwd.join("nested/child/file.txt")).expect("read nested file");
+        assert_eq!(content, "content");
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn write_rejects_paths_outside_cwd() {
+        let cwd = std::env::temp_dir().join(format!(
+            "pi-tools-outside-write-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+
+        let error = execute_tool(
+            &cwd,
+            ToolRequest::Write {
+                path: "../outside.txt".to_string(),
+                content: "content".to_string(),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect_err("outside write should fail");
+
+        assert!(matches!(error, ToolError::PathEscapesCwd(_)));
         let _ = fs::remove_dir_all(cwd);
     }
 }

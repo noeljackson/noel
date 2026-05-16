@@ -68,6 +68,17 @@ impl ConfigPaths {
             session_dir,
         })
     }
+
+    pub fn with_session_dir(&self, session_dir: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+        let mut next = self.clone();
+        let path = expand_tilde(session_dir.into())?;
+        next.session_dir = if path.is_absolute() {
+            path
+        } else {
+            self.cwd.join(path)
+        };
+        Ok(next)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +166,25 @@ pub struct KeybindingConfig {
     pub keys: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum KeybindingsFile {
+    List(Vec<KeybindingConfig>),
+    Map(BTreeMap<String, Vec<String>>),
+}
+
+impl KeybindingsFile {
+    fn into_keybindings(self) -> Vec<KeybindingConfig> {
+        match self {
+            KeybindingsFile::List(bindings) => bindings,
+            KeybindingsFile::Map(bindings) => bindings
+                .into_iter()
+                .map(|(action, keys)| KeybindingConfig { action, keys })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub paths: ConfigPaths,
@@ -180,10 +210,14 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         .unwrap_or_default()
         .merge(project_settings.unwrap_or_default());
     let auth = read_optional_json::<AuthData>(&paths.auth_path)?.unwrap_or_default();
-    let models = read_optional_json::<Vec<ModelDefinition>>(&paths.models_path)?
-        .unwrap_or_else(default_models);
-    let keybindings =
-        read_optional_json::<Vec<KeybindingConfig>>(&paths.keybindings_path)?.unwrap_or_default();
+    let models = filter_enabled_models(
+        read_optional_json::<Vec<ModelDefinition>>(&paths.models_path)?
+            .unwrap_or_else(default_models),
+        settings.enabled_models.as_deref(),
+    );
+    let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
+        .map(KeybindingsFile::into_keybindings)
+        .unwrap_or_default();
     let context_files = load_context_files(&paths.cwd, &paths.agent_dir)?;
     let system_prompt = resolve_prompt_input(settings.system_prompt.as_deref())?;
     let append_system_prompt = settings
@@ -205,6 +239,25 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         system_prompt,
         append_system_prompt,
     })
+}
+
+fn filter_enabled_models(
+    models: Vec<ModelDefinition>,
+    enabled_models: Option<&[String]>,
+) -> Vec<ModelDefinition> {
+    let Some(enabled_models) = enabled_models else {
+        return models;
+    };
+    models
+        .into_iter()
+        .filter(|model| {
+            enabled_models.iter().any(|enabled| {
+                enabled == &model.id
+                    || enabled == &format!("{}/{}", model.provider, model.id)
+                    || model.name.as_deref() == Some(enabled.as_str())
+            })
+        })
+        .collect()
 }
 
 pub fn api_key_for_provider(auth: &AuthData, provider: &str) -> Option<String> {
@@ -353,4 +406,99 @@ fn home_dir() -> Result<PathBuf, ConfigError> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or(ConfigError::HomeUnavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_config_accepts_keybinding_map_and_filters_enabled_models() {
+        let root = test_dir("pi-config-load");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"enabledModels":["faux/echo","named"],"systemPrompt":"prompt"}"#,
+        )
+        .expect("write settings");
+        fs::write(
+            agent_dir.join("models.json"),
+            r#"[
+                {"provider":"faux","id":"echo","api":"faux"},
+                {"provider":"openai","id":"gpt-test","name":"named","api":"open-ai"},
+                {"provider":"anthropic","id":"claude-test","api":"anthropic"}
+            ]"#,
+        )
+        .expect("write models");
+        fs::write(
+            agent_dir.join("keybindings.json"),
+            r#"{"submit":["enter"],"cancel":["escape"]}"#,
+        )
+        .expect("write keybindings");
+
+        let config = load_config(ConfigPaths {
+            cwd,
+            agent_dir: agent_dir.clone(),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: root.join("missing-project-settings.json"),
+            auth_path: root.join("missing-auth.json"),
+            models_path: agent_dir.join("models.json"),
+            keybindings_path: agent_dir.join("keybindings.json"),
+        })
+        .expect("load config");
+
+        assert_eq!(config.system_prompt, Some("prompt".to_string()));
+        assert_eq!(
+            config
+                .models
+                .iter()
+                .map(|model| format!("{}/{}", model.provider, model.id))
+                .collect::<Vec<_>>(),
+            ["faux/echo", "openai/gpt-test"]
+        );
+        assert_eq!(config.keybindings.len(), 2);
+        assert!(config
+            .keybindings
+            .iter()
+            .any(|binding| binding.action == "submit" && binding.keys == ["enter"]));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn with_session_dir_expands_relative_paths_from_cwd() {
+        let cwd = test_dir("pi-config-session-dir");
+        let paths = ConfigPaths {
+            cwd: cwd.clone(),
+            agent_dir: cwd.join("agent"),
+            session_dir: cwd.join("agent/sessions"),
+            settings_path: cwd.join("agent/settings.json"),
+            project_settings_path: cwd.join(".pi/settings.json"),
+            auth_path: cwd.join("agent/auth.json"),
+            models_path: cwd.join("agent/models.json"),
+            keybindings_path: cwd.join("agent/keybindings.json"),
+        };
+
+        let next = paths
+            .with_session_dir("local-sessions")
+            .expect("apply session dir");
+
+        assert_eq!(next.session_dir, cwd.join("local-sessions"));
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{name}-{}-{}", std::process::id(), unique_suffix()))
+    }
+
+    fn unique_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    }
 }
