@@ -16,6 +16,7 @@ prompt_file="${work_dir}/prompt-ready"
 
 cleanup() {
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+  tmux kill-session -t "pi-e2e-disabled-${$}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -60,7 +61,14 @@ send_line "/scoped-models"
 send_line "/model"
 send_line "/model 1"
 send_line "/hotkeys"
+send_line "/copy"
 send_line "/export target/e2e-tmux-work/session-export.json"
+send_line "/clone"
+send_line "/session"
+send_line "/resume 1"
+send_line "/session"
+send_line "/import target/e2e-tmux-work/session-export.json"
+send_line "/session"
 send_line "/fork"
 send_line "/session"
 send_line "/tree"
@@ -70,6 +78,8 @@ send_line "/multiline"
 send_line "multi one"
 send_line "multi two"
 send_line "."
+send_line "/delete"
+send_line "/session"
 send_line "/quit"
 sleep 0.5
 
@@ -98,31 +108,57 @@ require_output "* faux/echo"
 require_output "model: faux/echo"
 require_output "submit"
 require_output "reload"
+require_output "[faux/echo] after reload"
 require_output "exported target/e2e-tmux-work/session-export.json"
 require_output "parent:"
 require_output "compacted"
 require_output "enter multiline prompt"
 require_output "[faux/echo] multi one"
 require_output "multi two"
+require_output "deleted ${session_dir}/"
 
 mapfile -t session_lines < <(grep '^session: ' "${work_dir}/pane.txt")
-if [ "${#session_lines[@]}" -lt 2 ]; then
+if [ "${#session_lines[@]}" -lt 13 ]; then
   cat "${work_dir}/pane.txt" >&2
-  echo "expected at least two session lines" >&2
+  echo "expected at least thirteen session lines" >&2
   exit 1
 fi
 
 first_session="${session_lines[0]#session: }"
 second_session="${session_lines[1]#session: }"
-fork_session="${session_lines[-1]#session: }"
+clone_session="${session_lines[4]#session: }"
+resumed_session="${session_lines[6]#session: }"
+imported_session="${session_lines[8]#session: }"
+fork_session="${session_lines[10]#session: }"
+post_delete_session="${session_lines[12]#session: }"
 if [ "${first_session}" != "${second_session}" ]; then
   cat "${work_dir}/pane.txt" >&2
   echo "session changed across reload: ${first_session} != ${second_session}" >&2
   exit 1
 fi
+if [ "${clone_session}" = "${first_session}" ]; then
+  cat "${work_dir}/pane.txt" >&2
+  echo "clone did not create a new session: ${clone_session}" >&2
+  exit 1
+fi
+if [ "${resumed_session}" != "${first_session}" ]; then
+  cat "${work_dir}/pane.txt" >&2
+  echo "numbered resume did not return to first session: ${resumed_session} != ${first_session}" >&2
+  exit 1
+fi
+if [ "${imported_session}" != "${first_session}" ]; then
+  cat "${work_dir}/pane.txt" >&2
+  echo "import did not restore exported session id: ${imported_session} != ${first_session}" >&2
+  exit 1
+fi
 if [ "${first_session}" = "${fork_session}" ]; then
   cat "${work_dir}/pane.txt" >&2
   echo "fork did not create a new session: ${first_session}" >&2
+  exit 1
+fi
+if [ "${post_delete_session}" = "${fork_session}" ]; then
+  cat "${work_dir}/pane.txt" >&2
+  echo "delete did not replace current session: ${post_delete_session}" >&2
   exit 1
 fi
 
@@ -136,20 +172,54 @@ grep -Fq "hello from tmux e2e" "${session_log}"
 grep -Fq "after reload" "${session_log}"
 grep -Fq "e2e-ok" "${session_log}"
 
-fork_log="${session_dir}/${fork_session}.jsonl"
-if [ ! -f "${fork_log}" ]; then
-  echo "missing fork log: ${fork_log}" >&2
+clone_log="${session_dir}/${clone_session}.jsonl"
+if [ ! -f "${clone_log}" ]; then
+  echo "missing clone log: ${clone_log}" >&2
   exit 1
 fi
+grep -Fq "tmux-session" "${clone_log}"
 
-grep -Fq "${first_session}" "${fork_log}"
-grep -Fq "tmux-session" "${fork_log}"
-grep -Fq "tty" "${fork_log}"
+fork_log="${session_dir}/${fork_session}.jsonl"
+if [ -f "${fork_log}" ]; then
+  echo "deleted fork log still exists: ${fork_log}" >&2
+  exit 1
+fi
 
 if [ ! -f "${work_dir}/session-export.json" ]; then
   echo "missing exported session" >&2
   exit 1
 fi
 grep -Fq "${first_session}" "${work_dir}/session-export.json"
+
+disabled_session="pi-e2e-disabled-${$}"
+tmux new-session -d -s "${disabled_session}" -x 100 -y 20
+tmux send-keys -t "${disabled_session}" \
+  "cd '${repo_root}' && '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo --no-tools" \
+  Enter
+
+for _ in $(seq 1 80); do
+  if tmux capture-pane -t "${disabled_session}" -p -S -2000 | grep -q "pi>"; then
+    break
+  fi
+  sleep 0.25
+done
+
+tmux send-keys -t "${disabled_session}" "/write target/e2e-tmux-work/blocked.txt blocked" Enter
+sleep 0.5
+tmux send-keys -t "${disabled_session}" "/quit" Enter
+sleep 0.5
+disabled_output="$(tmux capture-pane -t "${disabled_session}" -p -S -2000 2>/dev/null || true)"
+printf '%s\n' "${disabled_output}" > "${work_dir}/disabled-pane.txt"
+tmux kill-session -t "${disabled_session}" >/dev/null 2>&1 || true
+
+if ! grep -Fq "tool is disabled: write" "${work_dir}/disabled-pane.txt"; then
+  cat "${work_dir}/disabled-pane.txt" >&2
+  echo "disabled tool smoke did not fail as expected" >&2
+  exit 1
+fi
+if [ -f "${work_dir}/blocked.txt" ]; then
+  echo "disabled tool unexpectedly wrote blocked.txt" >&2
+  exit 1
+fi
 
 echo "tmux e2e passed: ${first_session}"

@@ -151,6 +151,10 @@ async fn main() -> Result<()> {
     let systems = ReloadableSystems::from_config(&config, 1);
     let mut runtime = create_runtime(&cli, &cwd, &config, systems)?;
     select_initial_model(&mut runtime, &config, &cli)?;
+    if cli.no_tools || cli.no_builtin_tools || !cli.tools.is_empty() {
+        let active_tools = runtime.systems().available_tool_names.clone();
+        runtime.set_active_tools(active_tools)?;
+    }
 
     let stdin_is_terminal = io::stdin().is_terminal();
     if matches!(cli.mode, OutputMode::Rpc)
