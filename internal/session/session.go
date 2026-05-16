@@ -79,6 +79,29 @@ func (s *Session) ID() string {
 	return s.id
 }
 
+// Path returns the JSONL file path for this session.
+func (s *Session) Path() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.path
+}
+
+// Cwd returns the working directory captured when the session was created.
+func (s *Session) Cwd() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cwd
+}
+
+// Records returns a copy of the persisted JSONL records.
+func (s *Session) Records() []Record {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records := make([]Record, len(s.records))
+	copy(records, s.records)
+	return records
+}
+
 // AppendMessage appends a persisted conversation message.
 func (s *Session) AppendMessage(message agent.Message) error {
 	s.mu.Lock()

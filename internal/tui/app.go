@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/noeljackson/pi/internal/agent"
 	"github.com/noeljackson/pi/internal/resources"
+	"github.com/noeljackson/pi/internal/timings"
 	"github.com/noeljackson/pi/internal/tui/autocomplete"
 	"github.com/noeljackson/pi/internal/tui/components"
 	tuieditor "github.com/noeljackson/pi/internal/tui/editor"
@@ -24,9 +25,11 @@ type Options struct {
 	Messages    []agent.Message
 	Model       string
 	Resources   resources.Resources
+	Slash       *slash.Registry
+	Agent       *agent.Agent
+	Timings     *timings.Timings
 	Submit      func(text string)
 	Abort       func()
-	Agent       *agent.Agent
 	OpenBrowser func(string) error
 	Logout      func(provider string) error
 }
@@ -96,7 +99,7 @@ func New(opts Options) Model {
 		KeyMap:         keyMap,
 	})
 	editor.Focus()
-	editor.SetAutocompleteProvider(newAutocompleteProvider(opts.Resources))
+	editor.SetAutocompleteProvider(newAutocompleteProvider(opts.Resources, opts.Slash))
 
 	vp := viewport.New(80, 20)
 
@@ -191,6 +194,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
+	stopRender := m.opts.Timings.Start("tui.render")
+	defer stopRender()
+
 	queue := m.queueView()
 	footer := components.FooterView(components.FooterState{
 		Model:            m.modelName,
@@ -248,6 +254,39 @@ func (m *Model) submitEditor() bool {
 		m.opts.Submit(text)
 	}
 	return false
+}
+
+func (m *Model) runSlashCommand(text string) bool {
+	registry := m.opts.Slash
+	if registry == nil {
+		return false
+	}
+	name, args := splitSlashCommand(text)
+	command, ok := registry.Lookup(name)
+	if !ok || command.Handler == nil {
+		return false
+	}
+	output, err := command.Handler(context.Background(), args, m.opts.Agent)
+	if err != nil {
+		m.entries = append(m.entries, chatEntry{kind: entryError, text: err.Error()})
+		return true
+	}
+	if strings.TrimSpace(output) != "" {
+		m.entries = append(m.entries, chatEntry{
+			kind:    entryAssistant,
+			content: []agent.Content{agent.TextContent{Text: output}},
+		})
+	}
+	return true
+}
+
+func splitSlashCommand(text string) (string, string) {
+	text = strings.TrimSpace(strings.TrimPrefix(text, "/"))
+	name, args, ok := strings.Cut(text, " ")
+	if !ok {
+		return name, ""
+	}
+	return name, strings.TrimSpace(args)
 }
 
 func (m *Model) loadMessages(messages []agent.Message) {
@@ -453,8 +492,10 @@ func (m Model) editorVisibleHeight() int {
 	return max(3, min(8, m.height/4))
 }
 
-func newAutocompleteProvider(loaded resources.Resources) *autocomplete.CombinedProvider {
-	registry := slash.Builtins()
+func newAutocompleteProvider(loaded resources.Resources, registry *slash.Registry) *autocomplete.CombinedProvider {
+	if registry == nil {
+		registry = slash.Builtins()
+	}
 	commands := make([]autocomplete.SlashCommand, 0, len(registry.Commands()))
 	for _, command := range registry.Commands() {
 		args := make([]autocomplete.ArgSpec, 0, len(command.Args))
@@ -688,9 +729,13 @@ func (m *Model) handleSlash(text string) bool {
 		m.status = "/" + name + " is not available in this build"
 		return false
 	}
-	if err := command.Handler(context.Background(), args, m.opts.Agent); err != nil {
+	msg, err := command.Handler(context.Background(), args, m.opts.Agent)
+	if err != nil {
 		m.entries = append(m.entries, chatEntry{kind: entryError, text: err.Error()})
 	} else {
+		if msg != "" {
+			m.status = msg
+		}
 		m.status = "/" + name + " complete"
 		if name == "model" {
 			m.modelName = args

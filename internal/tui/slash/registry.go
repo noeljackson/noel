@@ -19,7 +19,7 @@ type Command struct {
 	Name        string
 	Description string
 	Args        []ArgSpec
-	Handler     func(ctx context.Context, args string, agent *agent.Agent) error
+	Handler     func(ctx context.Context, args string, agent *agent.Agent) (string, error)
 }
 
 type Registry struct {
@@ -50,49 +50,49 @@ func (r *Registry) Register(command Command) {
 
 func builtinCommands() []Command {
 	return []Command{
-		{Name: "model", Description: "switch model", Args: []ArgSpec{{Name: "name", Description: "model id", Required: true}}, Handler: func(_ context.Context, args string, a *agent.Agent) error {
+		{Name: "model", Description: "switch model", Args: []ArgSpec{{Name: "name", Description: "model id", Required: true}}, Handler: func(_ context.Context, args string, a *agent.Agent) (string, error) {
 			if a == nil {
-				return errors.New("agent is not configured")
+				return "", errors.New("agent is not configured")
 			}
 			if args == "" {
-				return errors.New("usage: /model <name>")
+				return "", errors.New("usage: /model <name>")
 			}
-			return a.SetModel(args)
+			return "", a.SetModel(args)
 		}},
-		{Name: "thinking", Description: "set thinking level", Args: []ArgSpec{{Name: "level", Description: "off, low, medium, high", Required: true}}, Handler: func(_ context.Context, args string, a *agent.Agent) error {
+		{Name: "thinking", Description: "set thinking level", Args: []ArgSpec{{Name: "level", Description: "off, low, medium, high", Required: true}}, Handler: func(_ context.Context, args string, a *agent.Agent) (string, error) {
 			if a == nil {
-				return errors.New("agent is not configured")
+				return "", errors.New("agent is not configured")
 			}
 			if args == "" {
-				return errors.New("usage: /thinking <level>")
+				return "", errors.New("usage: /thinking <level>")
 			}
-			return a.SetThinking(args)
+			return "", a.SetThinking(args)
 		}},
-		{Name: "compact", Description: "compact context", Handler: func(ctx context.Context, _ string, a *agent.Agent) error {
+		{Name: "compact", Description: "compact context", Handler: func(ctx context.Context, _ string, a *agent.Agent) (string, error) {
 			if a == nil {
-				return errors.New("agent is not configured")
+				return "", errors.New("agent is not configured")
 			}
-			return a.CompactNow(ctx)
+			return "", a.CompactNow(ctx)
 		}},
-		{Name: "fork", Description: "fork at a leaf or entry", Args: []ArgSpec{{Name: "leaf-id", Description: "entry id"}}, Handler: func(ctx context.Context, args string, a *agent.Agent) error {
+		{Name: "fork", Description: "fork at a leaf or entry", Args: []ArgSpec{{Name: "leaf-id", Description: "entry id"}}, Handler: func(ctx context.Context, args string, a *agent.Agent) (string, error) {
 			if a == nil {
-				return errors.New("agent is not configured")
+				return "", errors.New("agent is not configured")
 			}
 			if args == "" {
-				return errors.New("usage: /fork <entry-id>")
+				return "", errors.New("usage: /fork <entry-id>")
 			}
 			_, err := a.Fork(ctx, args)
-			return err
+			return "", err
 		}},
 		{Name: "clone", Description: "clone current leaf"},
 		{Name: "tree", Description: "show session tree"},
 		{Name: "new", Description: "start a new session"},
 		{Name: "resume", Description: "resume a session", Args: []ArgSpec{{Name: "id", Description: "session id"}}},
-		{Name: "reload", Description: "reload resources", Handler: func(_ context.Context, _ string, a *agent.Agent) error {
+		{Name: "reload", Description: "reload resources", Handler: func(_ context.Context, _ string, a *agent.Agent) (string, error) {
 			if a == nil {
-				return errors.New("agent is not configured")
+				return "", errors.New("agent is not configured")
 			}
-			return a.ReloadResources()
+			return "", a.ReloadResources()
 		}},
 		{Name: "quit", Description: "quit"},
 		{Name: "help", Description: "show command list"},

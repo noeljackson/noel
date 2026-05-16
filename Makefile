@@ -1,4 +1,4 @@
-.PHONY: help build test vet check run demo clean tidy install sessions
+.PHONY: help build test vet bench check run demo clean tidy install sessions
 
 help:
 	@awk 'BEGIN{FS=":.*##"; printf "Targets:\n"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -13,7 +13,10 @@ test: ## Run the full test suite
 vet: ## go vet ./...
 	go vet ./...
 
-check: vet test ## Vet + test (CI-shaped local check)
+bench: ## Run performance benchmarks
+	./scripts/check-perf.sh
+
+check: vet test bench ## Vet + test + performance benchmarks (CI-shaped local check)
 
 run: ## Launch the interactive TUI against a fresh session
 	go run ./cmd/pi

@@ -29,6 +29,14 @@ func NewJSONLStore(dir string) *JSONLStore {
 	return &JSONLStore{dir: dir}
 }
 
+// Dir returns the store root directory.
+func (s *JSONLStore) Dir() string {
+	if s == nil {
+		return ""
+	}
+	return s.dir
+}
+
 // Create creates a new session file in the store root.
 func (s *JSONLStore) Create(cwd string) (*Session, error) {
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
