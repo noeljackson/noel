@@ -130,6 +130,12 @@ struct Cli {
     #[arg(long)]
     no_context_files: bool,
 
+    #[arg(short = 'e', long = "extension")]
+    extension: Vec<PathBuf>,
+
+    #[arg(long)]
+    no_extensions: bool,
+
     #[arg(long)]
     image: Vec<PathBuf>,
 
@@ -280,6 +286,7 @@ fn run_package_config(args: &[String]) -> Result<()> {
     println!("skills: {}", config.skills.len());
     println!("prompts: {}", config.prompt_templates.len());
     println!("themes: {}", config.themes.len());
+    println!("extensions: {}", config.extensions.len());
     Ok(())
 }
 
@@ -641,6 +648,19 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
                     name: resource_name(prompt_template),
                     path: prompt_template.clone(),
                     content: fs::read_to_string(prompt_template)?,
+                });
+            }
+        }
+    }
+    if cli.no_extensions {
+        config.extensions.clear();
+    } else {
+        for extension in &cli.extension {
+            if extension.is_file() {
+                config.extensions.push(ResourceFile {
+                    name: resource_name(extension),
+                    path: extension.clone(),
+                    content: fs::read_to_string(extension)?,
                 });
             }
         }
@@ -1565,6 +1585,10 @@ async fn handle_tui_submission(
             TuiEntryKind::System,
             format_resources("themes", &config.themes),
         ),
+        "/extensions" => app.push(
+            TuiEntryKind::System,
+            format_resources("extensions", &config.extensions),
+        ),
         "/queue" => app.push(TuiEntryKind::System, format_queue(runtime)),
         "/queue-clear" => {
             let cleared = runtime.clear_queued_messages()?;
@@ -1703,6 +1727,17 @@ async fn handle_tui_submission(
                 skill.content.clone()
             } else {
                 format!("{}\n\n{}", skill.content, input)
+            };
+            submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline).await;
+        }
+        _ if line.starts_with("/extension:") => {
+            let (name, input) = split_resource_command(&line, "/extension:");
+            let extension = find_resource(&config.extensions, name)
+                .ok_or_else(|| anyhow!("extension not found: {name}"))?;
+            let prompt = if input.is_empty() {
+                extension.content.clone()
+            } else {
+                format!("{}\n\n{}", extension.content, input)
             };
             submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline).await;
         }

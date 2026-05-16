@@ -129,6 +129,14 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "list loaded skills",
     },
     CommandHelp {
+        command: "/extensions",
+        description: "list loaded extensions",
+    },
+    CommandHelp {
+        command: "/extension:<name> [input]",
+        description: "invoke a loaded Rust extension prompt",
+    },
+    CommandHelp {
         command: "/skill:<name> [input]",
         description: "invoke a loaded skill",
     },

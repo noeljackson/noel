@@ -108,6 +108,14 @@ pub struct Settings {
     #[serde(default)]
     pub packages: Vec<String>,
     #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub prompts: Vec<String>,
+    #[serde(default)]
+    pub themes: Vec<String>,
+    #[serde(default)]
     pub compaction: Option<CompactionSettings>,
     #[serde(default)]
     pub branch_summary: Option<BranchSummarySettings>,
@@ -159,6 +167,26 @@ impl Settings {
                 self.packages
             } else {
                 overrides.packages
+            },
+            extensions: if overrides.extensions.is_empty() {
+                self.extensions
+            } else {
+                overrides.extensions
+            },
+            skills: if overrides.skills.is_empty() {
+                self.skills
+            } else {
+                overrides.skills
+            },
+            prompts: if overrides.prompts.is_empty() {
+                self.prompts
+            } else {
+                overrides.prompts
+            },
+            themes: if overrides.themes.is_empty() {
+                self.themes
+            } else {
+                overrides.themes
             },
             compaction: merge_optional_settings(self.compaction, overrides.compaction),
             branch_summary: merge_optional_settings(self.branch_summary, overrides.branch_summary),
@@ -454,6 +482,7 @@ pub struct LoadedConfig {
     pub models: Vec<ModelDefinition>,
     pub keybindings: Vec<KeybindingConfig>,
     pub context_files: Vec<ContextFile>,
+    pub extensions: Vec<ResourceFile>,
     pub skills: Vec<ResourceFile>,
     pub prompt_templates: Vec<ResourceFile>,
     pub themes: Vec<ResourceFile>,
@@ -478,9 +507,9 @@ pub struct ResourceFile {
 pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
     let global_settings = read_optional_json::<Settings>(&paths.settings_path)?;
     let project_settings = read_optional_json::<Settings>(&paths.project_settings_path)?;
-    let settings = global_settings
-        .unwrap_or_default()
-        .merge(project_settings.unwrap_or_default());
+    let global_settings = global_settings.unwrap_or_default();
+    let project_settings = project_settings.unwrap_or_default();
+    let settings = global_settings.clone().merge(project_settings.clone());
     let auth = read_optional_json::<AuthData>(&paths.auth_path)?.unwrap_or_default();
     let models = filter_enabled_models(
         read_optional_json::<Vec<ModelDefinition>>(&paths.models_path)?
@@ -492,9 +521,68 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         .unwrap_or_default();
     let mut diagnostics = Vec::new();
     let context_files = load_context_files(&paths.cwd, &paths.agent_dir)?;
-    let skills = load_resource_files(&paths, "skills", &mut diagnostics);
-    let prompt_templates = load_resource_files(&paths, "prompts", &mut diagnostics);
-    let themes = load_resource_files(&paths, "themes", &mut diagnostics);
+    let mut extensions = load_resource_files(&paths, "extensions", &mut diagnostics);
+    let mut skills = load_resource_files(&paths, "skills", &mut diagnostics);
+    let mut prompt_templates = load_resource_files(&paths, "prompts", &mut diagnostics);
+    let mut themes = load_resource_files(&paths, "themes", &mut diagnostics);
+    extend_resource_files(
+        &mut extensions,
+        &paths.agent_dir,
+        &global_settings.extensions,
+        &mut diagnostics,
+    );
+    extend_resource_files(
+        &mut skills,
+        &paths.agent_dir,
+        &global_settings.skills,
+        &mut diagnostics,
+    );
+    extend_resource_files(
+        &mut prompt_templates,
+        &paths.agent_dir,
+        &global_settings.prompts,
+        &mut diagnostics,
+    );
+    extend_resource_files(
+        &mut themes,
+        &paths.agent_dir,
+        &global_settings.themes,
+        &mut diagnostics,
+    );
+    let project_base = paths.cwd.join(CONFIG_DIR_NAME);
+    extend_resource_files(
+        &mut extensions,
+        &project_base,
+        &project_settings.extensions,
+        &mut diagnostics,
+    );
+    extend_resource_files(
+        &mut skills,
+        &project_base,
+        &project_settings.skills,
+        &mut diagnostics,
+    );
+    extend_resource_files(
+        &mut prompt_templates,
+        &project_base,
+        &project_settings.prompts,
+        &mut diagnostics,
+    );
+    extend_resource_files(
+        &mut themes,
+        &project_base,
+        &project_settings.themes,
+        &mut diagnostics,
+    );
+    load_package_resources(
+        &paths.cwd,
+        &settings.packages,
+        &mut extensions,
+        &mut skills,
+        &mut prompt_templates,
+        &mut themes,
+        &mut diagnostics,
+    );
     let system_prompt = resolve_prompt_input(settings.system_prompt.as_deref())?;
     let append_system_prompt = settings
         .append_system_prompt
@@ -512,6 +600,7 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         models,
         keybindings,
         context_files,
+        extensions,
         skills,
         prompt_templates,
         themes,
@@ -837,6 +926,206 @@ fn load_resource_files(
     resources.into_values().collect()
 }
 
+fn extend_resource_files(
+    resources: &mut Vec<ResourceFile>,
+    base_dir: &Path,
+    entries: &[String],
+    diagnostics: &mut Vec<String>,
+) {
+    let mut map = resources
+        .drain(..)
+        .map(|resource| (resource.name.clone(), resource))
+        .collect::<BTreeMap<_, _>>();
+    for entry in entries {
+        let path = match resolve_resource_path(base_dir, entry) {
+            Ok(path) => path,
+            Err(error) => {
+                diagnostics.push(format!("failed to resolve resource path {entry}: {error}"));
+                continue;
+            }
+        };
+        collect_resource_path(&mut map, &path, diagnostics);
+    }
+    resources.extend(map.into_values());
+}
+
+fn load_package_resources(
+    cwd: &Path,
+    packages: &[String],
+    extensions: &mut Vec<ResourceFile>,
+    skills: &mut Vec<ResourceFile>,
+    prompts: &mut Vec<ResourceFile>,
+    themes: &mut Vec<ResourceFile>,
+    diagnostics: &mut Vec<String>,
+) {
+    for package in packages {
+        let package_root = match resolve_resource_path(cwd, package) {
+            Ok(path) => path,
+            Err(error) => {
+                diagnostics.push(format!("failed to resolve package {package}: {error}"));
+                continue;
+            }
+        };
+        if package_root.is_file() {
+            extend_resource_files(extensions, cwd, std::slice::from_ref(package), diagnostics);
+            continue;
+        }
+        if !package_root.is_dir() {
+            diagnostics.push(format!(
+                "package path not found: {}",
+                package_root.display()
+            ));
+            continue;
+        }
+        if load_manifest_package_resources(
+            &package_root,
+            extensions,
+            skills,
+            prompts,
+            themes,
+            diagnostics,
+        ) {
+            continue;
+        }
+        extend_resource_files(
+            extensions,
+            &package_root,
+            &["extensions".to_string()],
+            diagnostics,
+        );
+        extend_resource_files(skills, &package_root, &["skills".to_string()], diagnostics);
+        extend_resource_files(
+            prompts,
+            &package_root,
+            &["prompts".to_string()],
+            diagnostics,
+        );
+        extend_resource_files(themes, &package_root, &["themes".to_string()], diagnostics);
+    }
+}
+
+fn load_manifest_package_resources(
+    package_root: &Path,
+    extensions: &mut Vec<ResourceFile>,
+    skills: &mut Vec<ResourceFile>,
+    prompts: &mut Vec<ResourceFile>,
+    themes: &mut Vec<ResourceFile>,
+    diagnostics: &mut Vec<String>,
+) -> bool {
+    let path = package_root.join("package.json");
+    if !path.exists() {
+        return false;
+    }
+    let manifest = match read_optional_json::<PackageJson>(&path) {
+        Ok(Some(package_json)) => package_json.pi,
+        Ok(None) => None,
+        Err(error) => {
+            diagnostics.push(format!(
+                "failed to read package manifest {}: {error}",
+                path.display()
+            ));
+            None
+        }
+    };
+    let Some(manifest) = manifest else {
+        return false;
+    };
+    extend_resource_files(extensions, package_root, &manifest.extensions, diagnostics);
+    extend_resource_files(skills, package_root, &manifest.skills, diagnostics);
+    extend_resource_files(prompts, package_root, &manifest.prompts, diagnostics);
+    extend_resource_files(themes, package_root, &manifest.themes, diagnostics);
+    true
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PackageJson {
+    pi: Option<PackageManifest>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PackageManifest {
+    #[serde(default)]
+    extensions: Vec<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+    #[serde(default)]
+    prompts: Vec<String>,
+    #[serde(default)]
+    themes: Vec<String>,
+}
+
+fn resolve_resource_path(base_dir: &Path, entry: &str) -> Result<PathBuf, ConfigError> {
+    let path = expand_tilde(PathBuf::from(entry))?;
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    })
+}
+
+fn collect_resource_path(
+    resources: &mut BTreeMap<String, ResourceFile>,
+    path: &Path,
+    diagnostics: &mut Vec<String>,
+) {
+    if path.is_file() {
+        push_resource_file(resources, path, diagnostics);
+        return;
+    }
+    if !path.is_dir() {
+        diagnostics.push(format!("resource path not found: {}", path.display()));
+        return;
+    }
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            diagnostics.push(format!("failed to read {}: {error}", path.display()));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "failed to read entry in {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let child = entry.path();
+        if child.is_dir() {
+            collect_resource_path(resources, &child, diagnostics);
+        } else if child.is_file() {
+            push_resource_file(resources, &child, diagnostics);
+        }
+    }
+}
+
+fn push_resource_file(
+    resources: &mut BTreeMap<String, ResourceFile>,
+    path: &Path,
+    diagnostics: &mut Vec<String>,
+) {
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return;
+    };
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            resources.insert(
+                stem.to_string(),
+                ResourceFile {
+                    name: stem.to_string(),
+                    path: path.to_path_buf(),
+                    content,
+                },
+            );
+        }
+        Err(error) => diagnostics.push(format!("failed to read {}: {error}", path.display())),
+    }
+}
+
 fn default_models() -> Vec<ModelDefinition> {
     vec![
         ModelDefinition {
@@ -998,9 +1287,11 @@ mod tests {
         .expect("write keybindings");
         fs::create_dir_all(agent_dir.join("skills")).expect("create skills");
         fs::create_dir_all(agent_dir.join("prompts")).expect("create prompts");
+        fs::create_dir_all(agent_dir.join("extensions")).expect("create extensions");
         fs::create_dir_all(cwd.join(".pi/themes")).expect("create project themes");
         fs::write(agent_dir.join("skills/review.md"), "review skill").expect("write skill");
         fs::write(agent_dir.join("prompts/fix.md"), "fix {{input}}").expect("write prompt");
+        fs::write(agent_dir.join("extensions/plan.md"), "plan extension").expect("write extension");
         fs::write(cwd.join(".pi/themes/dark.json"), r#"{"name":"dark"}"#).expect("write theme");
 
         let config = load_config(ConfigPaths {
@@ -1029,10 +1320,81 @@ mod tests {
             .keybindings
             .iter()
             .any(|binding| binding.action == "submit" && binding.keys == ["enter"]));
+        assert_eq!(config.extensions[0].name, "plan");
+        assert_eq!(config.extensions[0].content, "plan extension");
         assert_eq!(config.skills[0].name, "review");
         assert_eq!(config.skills[0].content, "review skill");
         assert_eq!(config.prompt_templates[0].name, "fix");
         assert_eq!(config.themes[0].name, "dark");
+        assert!(config.diagnostics.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_and_local_packages_extend_resource_paths() {
+        let root = test_dir("pi-config-package-resources");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        let package_dir = cwd.join("package");
+        fs::create_dir_all(agent_dir.join("custom-extensions")).expect("create extensions");
+        fs::create_dir_all(cwd.join(".pi/custom-prompts")).expect("create prompts");
+        fs::create_dir_all(package_dir.join("extensions")).expect("create package extensions");
+        fs::create_dir_all(package_dir.join("skills")).expect("create package skills");
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"extensions":["custom-extensions"],"packages":["package"]}"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            cwd.join(".pi/settings.json"),
+            r#"{"prompts":["custom-prompts"]}"#,
+        )
+        .expect("write project settings");
+        fs::write(
+            agent_dir.join("custom-extensions/global.md"),
+            "global extension",
+        )
+        .expect("write global extension");
+        fs::write(cwd.join(".pi/custom-prompts/local.md"), "local prompt")
+            .expect("write local prompt");
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{"pi":{"extensions":["extensions/pkg.md"],"skills":["skills/pkg.md"]}}"#,
+        )
+        .expect("write package manifest");
+        fs::write(package_dir.join("extensions/pkg.md"), "package extension")
+            .expect("write package extension");
+        fs::write(package_dir.join("skills/pkg.md"), "package skill").expect("write package skill");
+
+        let config = load_config(ConfigPaths {
+            cwd: cwd.clone(),
+            agent_dir: agent_dir.clone(),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: cwd.join(".pi/settings.json"),
+            auth_path: root.join("missing-auth.json"),
+            models_path: root.join("missing-models.json"),
+            keybindings_path: root.join("missing-keybindings.json"),
+        })
+        .expect("load config");
+
+        assert!(config
+            .extensions
+            .iter()
+            .any(|resource| resource.name == "global" && resource.content == "global extension"));
+        assert!(config
+            .extensions
+            .iter()
+            .any(|resource| resource.name == "pkg" && resource.content == "package extension"));
+        assert!(config
+            .skills
+            .iter()
+            .any(|resource| resource.name == "pkg" && resource.content == "package skill"));
+        assert!(config
+            .prompt_templates
+            .iter()
+            .any(|resource| resource.name == "local" && resource.content == "local prompt"));
         assert!(config.diagnostics.is_empty());
 
         let _ = fs::remove_dir_all(root);
