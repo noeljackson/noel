@@ -260,6 +260,9 @@ enum SessionRecord {
     QueuedMessage {
         message: String,
     },
+    QueuedMessagesSnapshot {
+        messages: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -377,6 +380,17 @@ impl SessionStore {
             labels: state.labels.iter().cloned().collect(),
             parent_session_id: state.parent_session_id.clone(),
         })
+    }
+
+    pub fn record_queued_message(&self, message: String) -> Result<(), SessionError> {
+        self.append(&SessionRecord::QueuedMessage { message })
+    }
+
+    pub fn record_queued_messages_snapshot(
+        &self,
+        messages: Vec<String>,
+    ) -> Result<(), SessionError> {
+        self.append(&SessionRecord::QueuedMessagesSnapshot { messages })
     }
 
     pub fn export_state(&self, state: &SessionState, path: &Path) -> Result<(), SessionError> {
@@ -541,6 +555,11 @@ impl SessionStore {
                 SessionRecord::QueuedMessage { message } => {
                     if let Some(state) = &mut state {
                         state.queued_messages.push(message);
+                    }
+                }
+                SessionRecord::QueuedMessagesSnapshot { messages } => {
+                    if let Some(state) = &mut state {
+                        state.queued_messages = messages;
                     }
                 }
             }
@@ -843,6 +862,28 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn queue_message(&mut self, message: String) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_queued_message(message.clone())?;
+        }
+        self.session.queued_messages.push(message);
+        Ok(())
+    }
+
+    pub fn replace_queued_messages(&mut self, messages: Vec<String>) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_queued_messages_snapshot(messages.clone())?;
+        }
+        self.session.queued_messages = messages;
+        Ok(())
+    }
+
+    pub fn clear_queued_messages(&mut self) -> Result<usize, SessionError> {
+        let count = self.session.queued_messages.len();
+        self.replace_queued_messages(Vec::new())?;
+        Ok(count)
+    }
+
     pub fn reload(&mut self, next: ReloadableSystems) -> Result<ReloadReport, ReloadError> {
         if next.config_generation < self.systems.config_generation {
             return Err(ReloadError::Invalid(
@@ -880,6 +921,15 @@ pub async fn run_user_turn(
     runtime: &mut Runtime,
     provider: &dyn Provider,
     prompt: String,
+) -> Result<String, AgentError> {
+    run_user_turn_streaming(runtime, provider, prompt, |_| {}).await
+}
+
+pub async fn run_user_turn_streaming(
+    runtime: &mut Runtime,
+    provider: &dyn Provider,
+    prompt: String,
+    mut on_text: impl FnMut(&str),
 ) -> Result<String, AgentError> {
     runtime.push_message(ConversationMessage {
         role: MessageRole::User,
@@ -952,6 +1002,7 @@ pub async fn run_user_turn(
     let mut text = String::new();
     for event in events {
         if let StreamEvent::Text(delta) = event {
+            on_text(&delta);
             text.push_str(&delta);
         }
     }
@@ -960,6 +1011,25 @@ pub async fn run_user_turn(
         content: text.clone(),
     })?;
     Ok(text)
+}
+
+pub async fn run_excluded_bash(runtime: &Runtime, command: String) -> Result<String, AgentError> {
+    if !runtime.session.active_tool_names.contains("bash") {
+        return Err(AgentError::DisabledTool("bash".to_string()));
+    }
+    let result = execute_tool(
+        &runtime.session.cwd,
+        ToolRequest::Bash {
+            command,
+            timeout_ms: Some(120_000),
+        },
+        &ToolRuntimeOptions {
+            shell_path: runtime.systems.shell_path.clone(),
+            shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
+        },
+    )
+    .await?;
+    Ok(result.output)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1368,6 +1438,79 @@ mod tests {
         assert_eq!(runtime.session().messages.len(), 2);
         assert_eq!(runtime.session().messages[0].role, MessageRole::User);
         assert_eq!(runtime.session().messages[1].role, MessageRole::Assistant);
+    }
+
+    #[tokio::test]
+    async fn run_user_turn_streams_text_deltas() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let provider = create_provider(ProviderConfig {
+            model: ModelRef {
+                provider: "faux".to_string(),
+                id: "echo".to_string(),
+            },
+            api: ProviderApi::Faux,
+            base_url: None,
+            auth: ProviderAuth::None,
+        });
+        let mut deltas = Vec::new();
+
+        let response = run_user_turn_streaming(
+            &mut runtime,
+            provider.as_ref(),
+            "hello".to_string(),
+            |delta| deltas.push(delta.to_string()),
+        )
+        .await
+        .expect("run streaming turn");
+
+        assert_eq!(deltas, ["[faux/echo] ", "hello"]);
+        assert_eq!(response, "[faux/echo] hello");
+        assert_eq!(runtime.session().messages[1].content, response);
+    }
+
+    #[test]
+    fn queued_messages_are_persisted_and_clearable() {
+        let base = std::env::temp_dir().join(format!("pi-queue-test-{}", new_session_id()));
+        let (store, state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store.clone());
+
+        runtime
+            .queue_message("first follow-up".to_string())
+            .expect("queue message");
+        runtime
+            .queue_message("second follow-up".to_string())
+            .expect("queue message");
+        let cleared = runtime.clear_queued_messages().expect("clear queue");
+
+        assert_eq!(cleared, 2);
+        assert!(runtime.session().queued_messages.is_empty());
+        let (_store, loaded) = SessionStore::open(store.path().to_path_buf()).expect("open queue");
+        assert!(loaded.queued_messages.is_empty());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn excluded_bash_does_not_enter_context() {
+        let cwd = std::env::temp_dir().join(format!("pi-excluded-bash-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+
+        let output = run_excluded_bash(&runtime, "printf shell-ok".to_string())
+            .await
+            .expect("run excluded bash");
+
+        assert_eq!(output, "shell-ok");
+        assert!(runtime.session().messages.is_empty());
+        assert!(runtime.session().tool_history.is_empty());
+        let _ = fs::remove_dir_all(cwd);
     }
 
     #[tokio::test]

@@ -125,6 +125,18 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "list themes",
     },
     CommandHelp {
+        command: "/queue [prompt]",
+        description: "list or queue a follow-up prompt",
+    },
+    CommandHelp {
+        command: "/queue-clear",
+        description: "clear queued follow-ups",
+    },
+    CommandHelp {
+        command: "/interrupt",
+        description: "cancel queued follow-ups",
+    },
+    CommandHelp {
         command: "/theme <name>",
         description: "switch theme",
     },
@@ -239,6 +251,14 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     CommandHelp {
         command: "/bash <command>",
         description: "run shell command",
+    },
+    CommandHelp {
+        command: "! <command>",
+        description: "run shell command outside context",
+    },
+    CommandHelp {
+        command: "!!",
+        description: "repeat last outside-context shell command",
     },
     CommandHelp {
         command: "/quit",

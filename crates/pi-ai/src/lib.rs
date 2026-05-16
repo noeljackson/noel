@@ -126,9 +126,10 @@ impl Provider for FauxProvider {
             .unwrap_or("");
         Ok(vec![
             StreamEvent::Text(format!(
-                "[{}/{}] {last_user}",
+                "[{}/{}] ",
                 self.config.model.provider, self.config.model.id
             )),
+            StreamEvent::Text(last_user.to_string()),
             StreamEvent::Stop {
                 reason: "stop".to_string(),
             },
@@ -608,10 +609,8 @@ mod tests {
             .await
             .expect("faux provider should complete");
 
-        assert_eq!(
-            events[0],
-            StreamEvent::Text("[faux/echo] hello".to_string())
-        );
+        assert_eq!(events[0], StreamEvent::Text("[faux/echo] ".to_string()));
+        assert_eq!(events[1], StreamEvent::Text("hello".to_string()));
     }
 
     #[test]

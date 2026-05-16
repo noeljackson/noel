@@ -56,7 +56,14 @@ send_line "hello from tmux e2e"
 send_line "/write target/e2e-tmux-work/file.txt e2e-ok"
 send_line "/read target/e2e-tmux-work/file.txt"
 send_line "/reload"
+send_line "/queue queued followup"
 send_line "after reload"
+send_line "/queue"
+send_line "/queue queued cancel"
+send_line "/queue"
+send_line "/interrupt"
+send_line "! printf shell-ok"
+send_line "!!"
 send_line "/session"
 send_line "/name tmux-session"
 send_line "/labels e2e tty"
@@ -116,7 +123,14 @@ require_output "[faux/echo] hello from tmux e2e"
 require_output "wrote ${repo_root}/target/e2e-tmux-work/file.txt"
 require_output "e2e-ok"
 require_output "reloaded"
+require_output "queued: 1"
 require_output "[faux/echo] after reload"
+require_output "queued> queued followup"
+require_output "[faux/echo] queued followup"
+require_output "queue is empty"
+require_output "queued cancel"
+require_output "interrupted; cleared 1 queued message(s)"
+require_output "shell-ok"
 require_output "name: tmux-session"
 require_output "labels: e2e, tty"
 require_output "agent dir:"
@@ -203,7 +217,12 @@ fi
 
 grep -Fq "hello from tmux e2e" "${session_log}"
 grep -Fq "after reload" "${session_log}"
+grep -Fq "queued followup" "${session_log}"
 grep -Fq "e2e-ok" "${session_log}"
+if grep -Fq "shell-ok" "${session_log}"; then
+  echo "excluded shell output entered session log" >&2
+  exit 1
+fi
 
 clone_log="${session_dir}/${clone_session}.jsonl"
 if [ ! -f "${clone_log}" ]; then

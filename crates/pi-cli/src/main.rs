@@ -14,8 +14,8 @@ use pi_config::{
     LoadedConfig, ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, ENV_SESSION_DIR,
 };
 use pi_core::{
-    run_user_turn, write_session_export, ConversationMessage, MessageRole, ReloadableSystems,
-    Runtime, SessionState, SessionStore,
+    run_excluded_bash, run_user_turn, run_user_turn_streaming, write_session_export,
+    ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionState, SessionStore,
 };
 use pi_tui::{
     Keybinding as TuiKeybinding, KeybindingMap, ModelView, SessionView, SettingsView,
@@ -559,6 +559,7 @@ async fn run_interactive(
     println!("{}", renderer.banner());
     println!("type /help for commands, /reload to reload config, /quit to exit");
     let stdin = io::stdin();
+    let mut last_shell_command: Option<String> = None;
     loop {
         print!("{}", renderer.prompt());
         io::stdout().flush()?;
@@ -569,6 +570,9 @@ async fn run_interactive(
         }
         let line = line.trim().to_string();
         if line.is_empty() {
+            continue;
+        }
+        if handle_bang_command(&mut runtime, &line, &mut last_shell_command).await? {
             continue;
         }
         match line.as_str() {
@@ -633,6 +637,26 @@ async fn run_interactive(
                 print_resources("themes", &config.themes);
                 continue;
             }
+            "/queue" => {
+                print_queue(&runtime);
+                continue;
+            }
+            _ if line.starts_with("/queue ") => {
+                let message = line.trim_start_matches("/queue ").trim().to_string();
+                runtime.queue_message(message)?;
+                println!("queued: {}", runtime.session().queued_messages.len());
+                continue;
+            }
+            "/queue-clear" => {
+                let cleared = runtime.clear_queued_messages()?;
+                println!("cleared {cleared} queued message(s)");
+                continue;
+            }
+            "/interrupt" => {
+                let cleared = runtime.clear_queued_messages()?;
+                println!("interrupted; cleared {cleared} queued message(s)");
+                continue;
+            }
             "/scoped-models" => {
                 print_scoped_models(&config, &runtime);
                 continue;
@@ -654,10 +678,7 @@ async fn run_interactive(
                 } else {
                     format!("{}\n\n{}", skill.content, input)
                 };
-                match run_prompt(&mut runtime, &config, prompt, offline).await {
-                    Ok(response) => println!("{response}"),
-                    Err(error) => eprintln!("error: {error}"),
-                }
+                run_prompt_and_print(&mut runtime, &config, prompt, offline).await;
                 continue;
             }
             _ if line.starts_with("/prompt ") => {
@@ -666,10 +687,7 @@ async fn run_interactive(
                 let template = find_resource(&config.prompt_templates, name)
                     .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
                 let prompt = expand_prompt_template(&template.content, input);
-                match run_prompt(&mut runtime, &config, prompt, offline).await {
-                    Ok(response) => println!("{response}"),
-                    Err(error) => eprintln!("error: {error}"),
-                }
+                run_prompt_and_print(&mut runtime, &config, prompt, offline).await;
                 continue;
             }
             _ if line.starts_with("/theme ") => {
@@ -682,10 +700,7 @@ async fn run_interactive(
             }
             "/multiline" => {
                 let prompt = read_multiline_prompt(&stdin)?;
-                match run_prompt(&mut runtime, &config, prompt, offline).await {
-                    Ok(response) => println!("{response}"),
-                    Err(error) => eprintln!("error: {error}"),
-                }
+                run_prompt_and_print(&mut runtime, &config, prompt, offline).await;
                 continue;
             }
             _ if line.starts_with("/new") => {
@@ -840,12 +855,46 @@ async fn run_interactive(
             _ => {}
         }
 
-        match run_prompt(&mut runtime, &config, line, offline).await {
-            Ok(response) => println!("{response}"),
-            Err(error) => eprintln!("error: {error}"),
-        }
+        run_prompt_and_print(&mut runtime, &config, line, offline).await;
     }
     Ok(())
+}
+
+async fn handle_bang_command(
+    runtime: &mut Runtime,
+    line: &str,
+    last_shell_command: &mut Option<String>,
+) -> Result<bool> {
+    if line == "!!" && last_shell_command.is_none() {
+        println!("no previous shell command");
+        return Ok(true);
+    }
+    if line == "!" {
+        println!("usage: ! <command>");
+        return Ok(true);
+    }
+    let Some(command) = resolve_bang_command(line, last_shell_command) else {
+        return Ok(false);
+    };
+    match run_excluded_bash(runtime, command.clone()).await {
+        Ok(output) => {
+            print!("{output}");
+            if !output.ends_with('\n') {
+                println!();
+            }
+            *last_shell_command = Some(command);
+        }
+        Err(error) => eprintln!("error: {error}"),
+    }
+    Ok(true)
+}
+
+fn resolve_bang_command(line: &str, last_shell_command: &Option<String>) -> Option<String> {
+    if line == "!!" {
+        return last_shell_command.clone();
+    }
+    let command = line.strip_prefix('!')?.trim();
+    Some(command.to_string())
 }
 
 async fn run_prompt(
@@ -854,10 +903,71 @@ async fn run_prompt(
     prompt: String,
     offline: bool,
 ) -> Result<String> {
+    run_prompt_once(runtime, config, prompt, offline, false).await
+}
+
+async fn run_prompt_and_print(
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    prompt: String,
+    offline: bool,
+) {
+    if let Err(error) = run_prompt_with_queue(runtime, config, prompt, offline, true).await {
+        eprintln!("error: {error}");
+    }
+}
+
+async fn run_prompt_with_queue(
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    prompt: String,
+    offline: bool,
+    stream_output: bool,
+) -> Result<String> {
+    let first_response = run_prompt_once(runtime, config, prompt, offline, stream_output).await?;
+    while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
+        let remaining = runtime
+            .session()
+            .queued_messages
+            .iter()
+            .skip(1)
+            .cloned()
+            .collect();
+        runtime.replace_queued_messages(remaining)?;
+        if stream_output {
+            println!("queued> {prompt}");
+        }
+        run_prompt_once(runtime, config, prompt, offline, stream_output).await?;
+    }
+    Ok(first_response)
+}
+
+async fn run_prompt_once(
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    prompt: String,
+    offline: bool,
+    stream_output: bool,
+) -> Result<String> {
     let provider = provider_for_runtime(runtime, config, offline)?;
-    run_user_turn(runtime, provider.as_ref(), prompt)
-        .await
-        .map_err(Into::into)
+    if !stream_output {
+        return run_user_turn(runtime, provider.as_ref(), prompt)
+            .await
+            .map_err(Into::into);
+    }
+    let mut printed = false;
+    let response = run_user_turn_streaming(runtime, provider.as_ref(), prompt, |delta| {
+        printed = true;
+        print!("{delta}");
+        let _ = io::stdout().flush();
+    })
+    .await?;
+    if printed {
+        println!();
+    } else if !response.is_empty() {
+        println!("{response}");
+    }
+    Ok(response)
 }
 
 fn read_multiline_prompt(stdin: &io::Stdin) -> Result<String> {
@@ -1057,6 +1167,16 @@ fn print_resources(kind: &str, resources: &[ResourceFile]) {
     }
     for resource in resources {
         println!("{}\t{}", resource.name, resource.path.display());
+    }
+}
+
+fn print_queue(runtime: &Runtime) {
+    if runtime.session().queued_messages.is_empty() {
+        println!("queue is empty");
+        return;
+    }
+    for (index, message) in runtime.session().queued_messages.iter().enumerate() {
+        println!("{}.\t{}", index + 1, message);
     }
 }
 
