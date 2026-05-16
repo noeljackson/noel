@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -19,6 +19,9 @@ import (
 	"github.com/noeljackson/pi/internal/agent"
 	anthropicprovider "github.com/noeljackson/pi/internal/anthropic"
 	authstore "github.com/noeljackson/pi/internal/auth"
+	"github.com/noeljackson/pi/internal/cli"
+	"github.com/noeljackson/pi/internal/cli/modes"
+	"github.com/noeljackson/pi/internal/cli/modes/rpc"
 	"github.com/noeljackson/pi/internal/config"
 	"github.com/noeljackson/pi/internal/diagnostics"
 	"github.com/noeljackson/pi/internal/exporter"
@@ -43,16 +46,24 @@ const (
 	defaultMaxTokens = 4096
 )
 
-type cliOptions struct {
-	headless     bool
-	resumeID     string
-	prompt       string
-	login        string
-	logout       string
-	listModels   bool
-	quietStartup bool
-	startupProbe bool
-}
+var (
+	pickAuthFn      = anthropicprovider.PickAuth
+	newAgentFn      = agent.NewAgent
+	runListModelsFn = runListModels
+	runLoginFn      = runLogin
+	runLogoutFn     = runLogout
+	runPrintModeFn  = func(ctx context.Context, opts cli.Options, runner *agent.Agent, out io.Writer) error {
+		return modes.RunPrintWithAgent(ctx, opts, runner, out)
+	}
+	runJSONModeFn = func(ctx context.Context, opts cli.Options, runner *agent.Agent, out io.Writer) error {
+		return modes.RunJSONWithAgent(ctx, opts, runner, out)
+	}
+	runRPCModeFn    = rpc.Run
+	runTUIModeFn    = runTUI
+	activeCollector *diagnostics.Collector
+	activeTimings   *timings.Timings
+	activeLogger    *slog.Logger
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -62,13 +73,29 @@ func main() {
 }
 
 func run() error {
-	opts, err := parseOptions(os.Args[1:])
+	return runWithArgs(os.Args[1:])
+}
+
+func runWithArgs(args []string) error {
+	opts, err := cli.Parse(args)
 	if err != nil {
 		return err
 	}
+	if opts.Help {
+		cli.PrintHelp(os.Stdout)
+		return nil
+	}
+	if opts.Version {
+		printVersion()
+		return nil
+	}
+
 	paths, err := config.ResolvePaths()
 	if err != nil {
 		return err
+	}
+	if opts.Session.SessionDir != "" {
+		paths.SessionDir = opts.Session.SessionDir
 	}
 	collector := diagnostics.New()
 	timingCollector := timings.New()
@@ -79,79 +106,121 @@ func run() error {
 	})
 	defer logger.Close()
 	slog.SetDefault(logger.Slog())
+	activeCollector = collector
+	activeTimings = timingCollector
+	activeLogger = logger.Slog()
+	defer func() {
+		activeCollector = nil
+		activeTimings = nil
+		activeLogger = nil
+	}()
 
-	quietStartup := opts.quietStartup || quietStartupFromSettings(paths)
+	quietStartup := opts.QuietStartup || quietStartupFromSettings(paths)
+	opts.QuietStartup = quietStartup
 	for _, diagnostic := range diagnostics.StartupDiagnostics(paths) {
 		collector.Add(diagnostic)
 	}
 	if !quietStartup {
 		printStartupDiagnostics(os.Stderr, collector.Recent(100))
 	}
-	if opts.startupProbe {
+	if opts.StartupProbe {
 		fmt.Fprintln(os.Stdout, "prompt-ready")
 		return nil
 	}
-	if opts.login != "" {
-		return runLogin(opts.login)
+	if opts.ListModels {
+		return runListModelsFn()
 	}
-	if opts.logout != "" {
-		return runLogout(opts.logout)
+	if opts.Login != "" {
+		return runLoginFn(opts.Login)
 	}
-	if opts.listModels {
-		return runListModels()
+	if opts.Logout != "" {
+		return runLogoutFn(opts.Logout)
 	}
-	if opts.headless {
-		return runHeadless(opts.prompt, paths, collector, timingCollector, logger.Slog())
+
+	if err := prependFilesToPrompt(&opts); err != nil {
+		return err
 	}
-	return runTUI(opts.resumeID, paths, collector, timingCollector, logger.Slog(), quietStartup)
+
+	auth, err := pickAuthFn()
+	if err != nil {
+		return err
+	}
+
+	sess, cfg, cleanup, err := newSessionConfig(opts, auth, paths)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	defer sess.Close()
+
+	runner := newAgentFn(cfg)
+	if err := modes.ApplyOptions(runner, opts); err != nil {
+		return err
+	}
+
+	switch opts.Mode {
+	case cli.ModePrint:
+		return runPrintModeFn(context.Background(), opts, runner, os.Stdout)
+	case cli.ModeJSON:
+		return runJSONModeFn(context.Background(), opts, runner, os.Stdout)
+	case cli.ModeRPC:
+		return runRPCModeFn(context.Background(), opts, runner, os.Stdin, os.Stdout)
+	case cli.ModeInteractive, "":
+		return runTUIModeFn(opts, runner, cfg, sess, paths)
+	default:
+		return fmt.Errorf("unknown mode: %s", opts.Mode)
+	}
 }
 
-func parseOptions(args []string) (cliOptions, error) {
-	flags := flag.NewFlagSet("pi", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
-	headless := flags.Bool("headless", false, "run one prompt without the TUI")
-	resumeID := flags.String("resume", "", "resume a session by id")
-	login := flags.String("login", "", "login to a provider")
-	logout := flags.String("logout", "", "logout from a provider")
-	listModels := flags.Bool("list-models", false, "list available models")
-	quietStartup := flags.Bool("quiet-startup", false, "suppress startup diagnostics")
-	startupProbe := flags.Bool("startup-probe", false, "print prompt-ready after startup checks")
-	if err := flags.Parse(args); err != nil {
-		return cliOptions{}, err
-	}
+func printVersion() {
+	fmt.Fprintln(os.Stdout, version.BuildVersion)
+}
 
-	remaining := flags.Args()
-	actionCount := 0
-	for _, active := range []bool{*login != "", *logout != "", *listModels} {
-		if active {
-			actionCount++
-		}
+func prependFilesToPrompt(opts *cli.Options) error {
+	if opts == nil || len(opts.Files) == 0 {
+		return nil
 	}
-	if actionCount > 0 {
-		if actionCount > 1 || *headless || *resumeID != "" || *startupProbe || len(remaining) != 0 {
-			return cliOptions{}, errors.New("usage: pi [--login <provider> | --logout <provider> | --list-models]")
+	var builder strings.Builder
+	for _, file := range opts.Files {
+		path, err := resolveInputFile(file)
+		if err != nil {
+			return err
 		}
-		return cliOptions{login: *login, logout: *logout, listModels: *listModels, quietStartup: *quietStartup}, nil
-	}
-	if *startupProbe {
-		if *headless || *resumeID != "" || len(remaining) != 0 {
-			return cliOptions{}, errors.New("usage: pi --startup-probe [--quiet-startup]")
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("file %s: %w", path, err)
 		}
-		return cliOptions{startupProbe: true, quietStartup: *quietStartup}, nil
-	}
-	if *headless {
-		if *resumeID != "" {
-			return cliOptions{}, errors.New("--headless cannot be combined with --resume")
+		if info.IsDir() {
+			return fmt.Errorf("file %s is a directory", path)
 		}
-		if len(remaining) == 0 {
-			return cliOptions{}, errors.New("usage: pi --headless \"prompt\"")
+		if info.Size() == 0 {
+			continue
 		}
-		return cliOptions{headless: true, prompt: strings.Join(remaining, " "), quietStartup: *quietStartup}, nil
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read file %s: %w", path, err)
+		}
+		fmt.Fprintf(&builder, "<file name=\"%s\">\n%s\n</file>\n", path, string(data))
 	}
-	if len(remaining) != 0 {
-		return cliOptions{}, errors.New("usage: pi [--resume <session-id>] or pi --headless \"prompt\"")
+	if builder.Len() == 0 {
+		return nil
 	}
-	return cliOptions{resumeID: *resumeID, quietStartup: *quietStartup}, nil
+	if opts.Prompt != "" {
+		builder.WriteString(opts.Prompt)
+	}
+	opts.Prompt = builder.String()
+	return nil
+}
+
+func resolveInputFile(path string) (string, error) {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(home, path[2:])
+	}
+	return filepath.Abs(path)
 }
 
 func runLogin(provider string) error {
@@ -228,68 +297,34 @@ func runListModels() error {
 	return nil
 }
 
-func runHeadless(prompt string, paths config.Paths, collector *diagnostics.Collector, timingCollector *timings.Timings, logger *slog.Logger) error {
-	auth, err := anthropicprovider.PickAuth()
-	if err != nil {
-		return err
-	}
-
-	sess, cfg, cleanup, err := newSessionConfig("", auth, paths, collector, timingCollector, logger)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-	defer sess.Close()
-
-	runner := agent.NewAgent(cfg)
-	runner.Subscribe(func(event agent.Event) {
-		if update, ok := event.(agent.MessageUpdateEvent); ok && update.Delta.TextDelta != "" {
-			fmt.Fprint(os.Stdout, update.Delta.TextDelta)
-		}
-	})
-	if err := runner.Prompt(context.Background(), prompt); err != nil {
-		return err
-	}
-	if err := runner.WaitForIdle(context.Background()); err != nil {
-		return err
-	}
-	if err := runner.LastError(); err != nil {
-		return err
-	}
-	fmt.Fprintln(os.Stdout)
-	return nil
-}
-
-func runTUI(resumeID string, paths config.Paths, collector *diagnostics.Collector, timingCollector *timings.Timings, logger *slog.Logger, quietStartup bool) error {
+func runTUI(opts cli.Options, runner *agent.Agent, cfg agent.LoopConfig, sess *session.Session, paths config.Paths) error {
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	auth, err := anthropicprovider.PickAuth()
-	if err != nil {
-		return err
-	}
-
-	sess, cfg, cleanup, err := newSessionConfig(resumeID, auth, paths, collector, timingCollector, logger)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-	defer sess.Close()
 
 	messages, err := sess.Messages()
 	if err != nil {
 		return err
 	}
 
+	collector := activeCollector
+	if collector == nil {
+		collector = diagnostics.New()
+	}
+	timingCollector := cfg.Timings
+	if timingCollector == nil {
+		timingCollector = activeTimings
+	}
+	if timingCollector == nil {
+		timingCollector = timings.New()
+	}
 	eventCh := make(chan agent.Event, 256)
 	submitCh := make(chan string, 32)
-	runner := agent.NewAgent(cfg)
 	runner.Subscribe(func(event agent.Event) {
 		sendEvent(rootCtx, eventCh, event)
 	})
 	commands := slash.New()
 	registerSlashCommands(commands, collector, timingCollector, sess, session.NewJSONLStore(paths.SessionDir))
-	if !quietStartup && telemetryEnabled(paths) {
+	if !opts.QuietStartup && telemetryEnabled(paths) {
 		go checkVersionNotice(rootCtx, eventCh)
 	}
 
@@ -480,35 +515,66 @@ func formatTimings(summary map[string]timings.Stats) string {
 	return strings.Join(lines, "\n")
 }
 
-func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource, paths config.Paths, collector *diagnostics.Collector, timingCollector *timings.Timings, logger *slog.Logger) (*session.Session, agent.LoopConfig, func(), error) {
+func newSessionConfig(opts cli.Options, auth anthropicprovider.AuthSource, paths config.Paths) (*session.Session, agent.LoopConfig, func(), error) {
 	store, err := newSessionStore(paths)
+	if err != nil {
+		return nil, agent.LoopConfig{}, nil, err
+	}
+	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, agent.LoopConfig{}, nil, err
 	}
 
 	var sess *session.Session
-	if resumeID == "" {
-		cwd, err := os.Getwd()
+	opened := false
+	switch {
+	case opts.Session.NoSession:
+		sess = session.NewInMemorySession(cwd)
+	case opts.Session.Continue:
+		info, ok, err := store.MostRecent()
 		if err != nil {
 			return nil, agent.LoopConfig{}, nil, err
 		}
+		if ok {
+			sess, err = store.Open(info.ID)
+			opened = err == nil
+		} else {
+			sess, err = store.Create(cwd)
+		}
+		if err != nil {
+			return nil, agent.LoopConfig{}, nil, err
+		}
+	case opts.Session.Resume != "":
+		sess, err = openSessionByIDOrPrefix(store, opts.Session.Resume)
+		if err != nil {
+			return nil, agent.LoopConfig{}, nil, err
+		}
+		opened = true
+	case opts.Session.SessionID != "":
+		sess, err = store.Open(opts.Session.SessionID)
+		if err != nil {
+			return nil, agent.LoopConfig{}, nil, err
+		}
+		opened = true
+	default:
 		sess, err = store.Create(cwd)
 		if err != nil {
 			return nil, agent.LoopConfig{}, nil, err
 		}
-	} else {
-		sess, err = store.Open(resumeID)
+	}
+	if opts.Session.Fork != "" {
+		if !opened {
+			_ = sess.Close()
+			return nil, agent.LoopConfig{}, nil, errors.New("--fork requires an existing session selected by --continue, --resume, or --session")
+		}
+		_, err := sess.ForkAt(opts.Session.Fork)
 		if err != nil {
+			_ = sess.Close()
 			return nil, agent.LoopConfig{}, nil, err
 		}
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		_ = sess.Close()
-		return nil, agent.LoopConfig{}, nil, err
-	}
-	cfg, cleanup, err := loopConfigForSession(sess, paths, store, auth, cwd, collector, timingCollector, logger)
+	cfg, cleanup, err := loopConfigForSession(sess, paths, store, auth, cwd, activeCollector, activeTimings, activeLogger, opts.Tools.NoBuiltins)
 	if err != nil {
 		cleanup()
 		_ = sess.Close()
@@ -517,7 +583,32 @@ func newSessionConfig(resumeID string, auth anthropicprovider.AuthSource, paths 
 	return sess, cfg, cleanup, nil
 }
 
-func loopConfigForSession(sess *session.Session, paths config.Paths, store *session.JSONLStore, auth anthropicprovider.AuthSource, cwd string, collector *diagnostics.Collector, timingCollector *timings.Timings, logger *slog.Logger) (agent.LoopConfig, func(), error) {
+func openSessionByIDOrPrefix(store *session.JSONLStore, id string) (*session.Session, error) {
+	sess, err := store.Open(id)
+	if err == nil {
+		return sess, nil
+	}
+	infos, listErr := store.List()
+	if listErr != nil {
+		return nil, listErr
+	}
+	matches := make([]session.SessionInfo, 0, 1)
+	for _, info := range infos {
+		if strings.HasPrefix(info.ID, id) {
+			matches = append(matches, info)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return nil, err
+	case 1:
+		return store.Open(matches[0].ID)
+	default:
+		return nil, fmt.Errorf("session id prefix %q is ambiguous", id)
+	}
+}
+
+func loopConfigForSession(sess *session.Session, paths config.Paths, store *session.JSONLStore, auth anthropicprovider.AuthSource, cwd string, collector *diagnostics.Collector, timingCollector *timings.Timings, logger *slog.Logger, noBuiltins bool) (agent.LoopConfig, func(), error) {
 	moreBuffer := more.NewDiskBuffer(toolOutputDir(paths, sess.ID()))
 	cleanup := func() {
 		_ = moreBuffer.Cleanup()
@@ -528,9 +619,13 @@ func loopConfigForSession(sess *session.Session, paths config.Paths, store *sess
 		auth:  auth,
 		cwd:   cwd,
 	}
-	registry, err := builtinRegistry(spawner, todo.NewSessionStore(sess), moreBuffer)
-	if err != nil {
-		return agent.LoopConfig{}, cleanup, err
+	registry := tools.NewRegistry()
+	if !noBuiltins {
+		var err error
+		registry, err = builtinRegistry(spawner, todo.NewSessionStore(sess), moreBuffer)
+		if err != nil {
+			return agent.LoopConfig{}, cleanup, err
+		}
 	}
 	resourceLoader := &resources.ResourceLoader{
 		Paths:       paths,
@@ -566,9 +661,7 @@ func loopConfigForSession(sess *session.Session, paths config.Paths, store *sess
 			storeToolOutput(moreBuffer, call, result)
 		},
 	}
-	if paths, err := config.ResolvePaths(); err == nil {
-		cfg.AuthStore = authstore.New(paths.AuthFile)
-	}
+	cfg.AuthStore = authstore.New(paths.AuthFile)
 	return cfg, cleanup, nil
 }
 
@@ -627,7 +720,7 @@ func (s *cliTaskSpawner) Spawn(ctx context.Context, req task.SpawnRequest) (task
 	}
 	defer sess.Close()
 
-	cfg, cleanup, err := loopConfigForSession(sess, s.paths, s.store, s.auth, cwd, nil, nil, nil)
+	cfg, cleanup, err := loopConfigForSession(sess, s.paths, s.store, s.auth, cwd, nil, nil, nil, false)
 	if err != nil {
 		cleanup()
 		return task.Result{SessionID: sess.ID()}, err

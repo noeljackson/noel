@@ -17,30 +17,8 @@ import (
 
 // Run starts the JSONL RPC server.
 func Run(ctx context.Context, opts cli.Options, runner *agent.Agent, in io.Reader, out io.Writer) error {
-	if opts.Model != "" {
-		if err := runner.SetModel(opts.Model); err != nil {
-			return err
-		}
-	}
-	if opts.Thinking != "" {
-		if err := runner.SetThinking(opts.Thinking); err != nil {
-			return err
-		}
-	}
-	if opts.Tools.NoTools {
-		if err := runner.ActivateTools(nil); err != nil {
-			return err
-		}
-	}
-	if len(opts.Tools.Allow) > 0 {
-		if err := runner.ActivateTools(opts.Tools.Allow); err != nil {
-			return err
-		}
-	}
-	if len(opts.Tools.Deny) > 0 {
-		if err := runner.DeactivateTools(opts.Tools.Deny); err != nil {
-			return err
-		}
+	if err := modes.ApplyOptions(runner, opts); err != nil {
+		return err
 	}
 
 	writer := &jsonlWriter{out: out}

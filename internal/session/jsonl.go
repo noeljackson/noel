@@ -13,10 +13,11 @@ import (
 
 // SessionInfo describes a persisted session found by JSONLStore.List.
 type SessionInfo struct {
-	ID        string
-	CreatedAt time.Time
-	Cwd       string
-	Path      string
+	ID           string
+	CreatedAt    time.Time
+	LastModified time.Time
+	Cwd          string
+	Path         string
 }
 
 // JSONLStore creates and opens append-only JSONL sessions.
@@ -151,6 +152,10 @@ func (s *JSONLStore) List() ([]SessionInfo, error) {
 			continue
 		}
 		path := filepath.Join(s.dir, entry.Name())
+		stat, err := entry.Info()
+		if err != nil {
+			continue
+		}
 		record, ok := loadHeaderRecord(path)
 		if !ok {
 			continue
@@ -164,16 +169,29 @@ func (s *JSONLStore) List() ([]SessionInfo, error) {
 			createdAt = record.Timestamp
 		}
 		infos = append(infos, SessionInfo{
-			ID:        header.ID,
-			CreatedAt: createdAt,
-			Cwd:       header.Cwd,
-			Path:      path,
+			ID:           header.ID,
+			CreatedAt:    createdAt,
+			LastModified: stat.ModTime(),
+			Cwd:          header.Cwd,
+			Path:         path,
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool {
-		return infos[i].CreatedAt.After(infos[j].CreatedAt)
+		return infos[i].LastModified.After(infos[j].LastModified)
 	})
 	return infos, nil
+}
+
+// MostRecent returns the most recently modified persisted session.
+func (s *JSONLStore) MostRecent() (SessionInfo, bool, error) {
+	infos, err := s.List()
+	if err != nil {
+		return SessionInfo{}, false, err
+	}
+	if len(infos) == 0 {
+		return SessionInfo{}, false, nil
+	}
+	return infos[0], true, nil
 }
 
 func (s *JSONLStore) sessionPath(id string) string {
