@@ -1985,7 +1985,11 @@ async fn run_prompt_with_queue_tui(
 }
 
 fn follow_up_mode(config: &LoadedConfig) -> &str {
-    config.settings.follow_up_mode.as_deref().unwrap_or("all")
+    config
+        .settings
+        .follow_up_mode
+        .as_deref()
+        .unwrap_or("one-at-a-time")
 }
 
 async fn run_prompt_once_tui(
