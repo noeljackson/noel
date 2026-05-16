@@ -30,7 +30,7 @@ printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${repo_root}' && PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -44,6 +44,18 @@ done
 if [ ! -f "${prompt_file}" ]; then
   tmux capture-pane -t "${session_name}" -p -S -2000 >&2
   echo "pi prompt did not appear" >&2
+  exit 1
+fi
+
+tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/live-pane.txt"
+if ! grep -Fq "conversation" "${work_dir}/live-pane.txt"; then
+  cat "${work_dir}/live-pane.txt" >&2
+  echo "TUI conversation pane did not appear" >&2
+  exit 1
+fi
+if ! grep -Fq "pi>" "${work_dir}/live-pane.txt"; then
+  cat "${work_dir}/live-pane.txt" >&2
+  echo "TUI input prompt did not appear" >&2
   exit 1
 fi
 
@@ -131,6 +143,8 @@ require_output() {
 }
 
 require_output "pi rust cli"
+require_output "assistant>"
+require_output "user>"
 require_output "[faux/echo] hello from tmux e2e"
 require_output "/model <provider/id>"
 require_output "status"
@@ -181,7 +195,7 @@ require_output "[faux/echo] multi one"
 require_output "multi two"
 require_output "deleted ${session_dir}/"
 
-mapfile -t session_lines < <(grep '^session: ' "${work_dir}/pane.txt")
+mapfile -t session_lines < <(grep -E '^(system> )?session: ' "${work_dir}/pane.txt" | sed -E 's/^system> //')
 if [ "${#session_lines[@]}" -lt 15 ]; then
   cat "${work_dir}/pane.txt" >&2
   echo "expected at least fifteen session lines" >&2
@@ -289,7 +303,7 @@ grep -Fq "[faux/echo] fix broken thing" "${work_dir}/clipboard.txt"
 disabled_session="pi-e2e-disabled-${$}"
 tmux new-session -d -s "${disabled_session}" -x 100 -y 20
 tmux send-keys -t "${disabled_session}" \
-  "cd '${repo_root}' && PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo --no-tools" \
+  "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo --no-tools" \
   Enter
 
 for _ in $(seq 1 80); do

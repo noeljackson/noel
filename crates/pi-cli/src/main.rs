@@ -3,10 +3,16 @@ use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use clap::{Parser, ValueEnum};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use pi_ai::{
     create_provider, MediaInput, ModelRef, ProviderApi as AiProviderApi, ProviderAuth,
     ProviderConfig,
@@ -23,6 +29,14 @@ use pi_core::{
 use pi_tui::{
     EditorState, Keybinding as TuiKeybinding, KeybindingMap, ModelView, Selector, SelectorItem,
     SessionView, SettingsView, TerminalRenderer, TerminalTheme,
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
+    Frame, Terminal,
 };
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -667,414 +681,654 @@ async fn run_interactive(
     mut config: LoadedConfig,
     offline: bool,
 ) -> Result<()> {
-    let renderer = terminal_renderer(&config);
-    println!("{}", renderer.banner());
-    println!("type /help for commands, /reload to reload config, /quit to exit");
-    let stdin = io::stdin();
-    let mut last_shell_command: Option<String> = None;
-    let mut editor_state = EditorState::default();
+    let mut app = TuiApp::new(&config, &runtime);
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    let _restore = TerminalRestore;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
     loop {
-        print!("{}", renderer.prompt());
-        io::stdout().flush()?;
-        let mut line = String::new();
-        let read = stdin.read_line(&mut line)?;
-        if read == 0 {
+        terminal.draw(|frame| draw_tui(frame, &app, &config, &runtime))?;
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if handle_tui_key(key, &mut app, &mut runtime, &mut config, offline).await? {
             break;
         }
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        if handle_bang_command(&mut runtime, &line, &mut last_shell_command).await? {
-            continue;
-        }
-        match line.as_str() {
-            "/quit" => break,
-            "/help" => {
-                println!("{}", renderer.help());
-                continue;
-            }
-            "/models" => {
-                for model in &config.models {
-                    println!("{}/{}", model.provider, model.id);
-                }
-                continue;
-            }
-            "/model" => {
-                print_scoped_models(&config, &runtime);
-                continue;
-            }
-            "/session" => {
-                print_session(&runtime);
-                continue;
-            }
-            "/reload" => {
-                config = load_config(config.paths.clone())?;
-                let next_generation = runtime.systems().config_generation + 1;
-                let report =
-                    runtime.reload(ReloadableSystems::from_config(&config, next_generation))?;
-                print_diagnostics(&config);
-                if !report.active_model_valid {
-                    println!("active model is no longer available; use /model <provider/model>");
-                }
-                if !report.removed_active_tools.is_empty() {
-                    println!(
-                        "removed active tools: {}",
-                        report.removed_active_tools.join(", ")
-                    );
-                }
-                println!("reloaded");
-                continue;
-            }
-            "/settings" => {
-                print_settings(&config, &runtime);
-                continue;
-            }
-            "/status" => {
-                print_status(&config, &runtime, &editor_state);
-                continue;
-            }
-            "/diagnostics" => {
-                print_diagnostics(&config);
-                continue;
-            }
-            "/hotkeys" => {
-                print_hotkeys(&config);
-                continue;
-            }
-            _ if line.starts_with("/complete ") => {
-                let prefix = line.trim_start_matches("/complete ").trim();
-                let completions = EditorState::command_completions(prefix);
-                if completions.is_empty() {
-                    println!("no completions");
-                } else {
-                    for completion in completions {
-                        println!("{completion}");
-                    }
-                }
-                continue;
-            }
-            "/history" => {
-                print_history(&editor_state);
-                continue;
-            }
-            _ if line.starts_with("/editor") => {
-                let initial = line.trim_start_matches("/editor").trim();
-                match read_external_editor_prompt(initial) {
-                    Ok(prompt) if !prompt.trim().is_empty() => {
-                        run_prompt_and_print(
-                            &mut runtime,
-                            &config,
-                            &mut editor_state,
-                            prompt,
-                            offline,
-                        )
-                        .await;
-                    }
-                    Ok(_) => println!("editor returned an empty prompt"),
-                    Err(error) => eprintln!("error: {error}"),
-                }
-                continue;
-            }
-            _ if line.starts_with("/image ") => {
-                let rest = line.trim_start_matches("/image ").trim();
-                let (path, prompt) = split_once_text(rest);
-                let media = load_media_input(&runtime.session().cwd, Path::new(path))?;
-                print_media_fallback(&media);
-                if !prompt.is_empty() {
-                    run_prompt_media_and_print(
-                        &mut runtime,
-                        &config,
-                        &mut editor_state,
-                        prompt.to_string(),
-                        vec![media],
-                        offline,
-                    )
-                    .await;
-                }
-                continue;
-            }
-            "/skills" => {
-                print_resources("skills", &config.skills);
-                continue;
-            }
-            "/prompts" => {
-                print_resources("prompts", &config.prompt_templates);
-                continue;
-            }
-            "/themes" => {
-                print_resources("themes", &config.themes);
-                continue;
-            }
-            "/queue" => {
-                print_queue(&runtime);
-                continue;
-            }
-            _ if line.starts_with("/queue ") => {
-                let message = line.trim_start_matches("/queue ").trim().to_string();
-                runtime.queue_message(message)?;
-                println!("queued: {}", runtime.session().queued_messages.len());
-                continue;
-            }
-            "/queue-clear" => {
-                let cleared = runtime.clear_queued_messages()?;
-                println!("cleared {cleared} queued message(s)");
-                continue;
-            }
-            "/interrupt" => {
-                let cleared = runtime.clear_queued_messages()?;
-                println!("interrupted; cleared {cleared} queued message(s)");
-                continue;
-            }
-            "/scoped-models" => {
-                print_scoped_models(&config, &runtime);
-                continue;
-            }
-            _ if line.starts_with("/selector ") => {
-                let kind = line.trim_start_matches("/selector ").trim();
-                print_selector(&config, &runtime, kind)?;
-                continue;
-            }
-            _ if line.starts_with("/select ") => {
-                select_from_selector(&mut config, &mut runtime, &line)?;
-                continue;
-            }
-            _ if line.starts_with("/model ") => {
-                let reference = line.trim_start_matches("/model ").trim();
-                let model = resolve_model_reference(&config, reference)
-                    .ok_or_else(|| anyhow!("model not found: {reference}"))?;
-                runtime.set_active_model(Some(model.clone()))?;
-                println!("model: {}/{}", model.provider, model.id);
-                continue;
-            }
-            _ if line.starts_with("/skill:") => {
-                let (name, input) = split_resource_command(&line, "/skill:");
-                let skill = find_resource(&config.skills, name)
-                    .ok_or_else(|| anyhow!("skill not found: {name}"))?;
-                let prompt = if input.is_empty() {
-                    skill.content.clone()
-                } else {
-                    format!("{}\n\n{}", skill.content, input)
-                };
-                run_prompt_and_print(&mut runtime, &config, &mut editor_state, prompt, offline)
-                    .await;
-                continue;
-            }
-            _ if line.starts_with("/prompt ") => {
-                let rest = line.trim_start_matches("/prompt ").trim();
-                let (name, input) = split_once_text(rest);
-                let template = find_resource(&config.prompt_templates, name)
-                    .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
-                let prompt = expand_prompt_template(&template.content, input);
-                run_prompt_and_print(&mut runtime, &config, &mut editor_state, prompt, offline)
-                    .await;
-                continue;
-            }
-            _ if line.starts_with("/theme ") => {
-                let name = line.trim_start_matches("/theme ").trim();
-                let theme = find_resource(&config.themes, name)
-                    .ok_or_else(|| anyhow!("theme not found: {name}"))?;
-                config.settings.theme = Some(theme.name.clone());
-                println!("theme: {}", theme.name);
-                continue;
-            }
-            "/multiline" => {
-                let prompt = read_multiline_prompt(&stdin)?;
-                run_prompt_and_print(&mut runtime, &config, &mut editor_state, prompt, offline)
-                    .await;
-                continue;
-            }
-            _ if line.starts_with("/new") => {
-                let (store, state) =
-                    SessionStore::create(&config.paths.session_dir, runtime.session().cwd.clone())?;
-                runtime.replace_session(state, Some(store));
-                print_session(&runtime);
-                continue;
-            }
-            _ if line.starts_with("/resume") => {
-                let reference = line.trim_start_matches("/resume").trim();
-                if reference.is_empty() {
-                    print_sessions(&config.paths.session_dir)?;
-                } else {
-                    let path = resolve_session_reference(&config.paths.session_dir, reference)?;
-                    let (store, state) = SessionStore::open(path)?;
-                    runtime.replace_session(state, Some(store));
-                    print_session(&runtime);
-                }
-                continue;
-            }
-            _ if line.starts_with("/fork") => {
-                let source =
-                    resolve_source_session(&config.paths.session_dir, &runtime, &line, "/fork")?;
-                let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, false)?;
-                runtime.replace_session(state, Some(store));
-                print_session(&runtime);
-                continue;
-            }
-            _ if line.starts_with("/clone") => {
-                let source =
-                    resolve_source_session(&config.paths.session_dir, &runtime, &line, "/clone")?;
-                let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, true)?;
-                runtime.replace_session(state, Some(store));
-                print_session(&runtime);
-                continue;
-            }
-            "/tree" => {
-                print_session_tree(&config.paths.session_dir)?;
-                continue;
-            }
-            "/summaries" => {
-                print_summaries(&runtime);
-                continue;
-            }
-            _ if line.starts_with("/delete") => {
-                let reference = line.trim_start_matches("/delete").trim();
-                let target = if reference.is_empty() {
-                    runtime
-                        .store()
-                        .map(|store| store.path().to_path_buf())
-                        .ok_or_else(|| anyhow!("ephemeral session cannot be deleted"))?
-                } else {
-                    resolve_session_reference(&config.paths.session_dir, reference)?
-                };
-                let deleting_current = runtime
-                    .store()
-                    .map(|store| store.path() == target)
-                    .unwrap_or(false);
-                fs::remove_file(&target)?;
-                println!("deleted {}", target.display());
-                if deleting_current {
-                    let (store, state) = SessionStore::create(
-                        &config.paths.session_dir,
-                        runtime.session().cwd.clone(),
-                    )?;
-                    runtime.replace_session(state, Some(store));
-                    print_session(&runtime);
-                }
-                continue;
-            }
-            _ if line.starts_with("/name") => {
-                let name = line.trim_start_matches("/name").trim();
-                runtime.rename_session((!name.is_empty()).then(|| name.to_string()))?;
-                print_session(&runtime);
-                continue;
-            }
-            _ if line.starts_with("/labels") => {
-                let labels = line
-                    .trim_start_matches("/labels")
-                    .split_whitespace()
-                    .map(ToString::to_string)
-                    .collect();
-                runtime.set_labels(labels)?;
-                print_session(&runtime);
-                continue;
-            }
-            _ if line.starts_with("/export ") => {
-                let path = PathBuf::from(line.trim_start_matches("/export ").trim());
-                export_session(&runtime, &path)?;
-                println!("exported {}", path.display());
-                continue;
-            }
-            _ if line.starts_with("/import ") => {
-                let path = PathBuf::from(line.trim_start_matches("/import ").trim());
-                let (store, state) = SessionStore::import_path(&config.paths.session_dir, &path)?;
-                runtime.replace_session(state, Some(store));
-                print_session(&runtime);
-                continue;
-            }
-            "/copy" => {
-                if let Some(message) = runtime
-                    .session()
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == MessageRole::Assistant)
-                {
-                    println!("{}", message.content);
-                    if let Some(command) = copy_to_clipboard(&message.content)? {
-                        println!("copied to clipboard via {command}");
-                    } else {
-                        println!("clipboard unavailable");
-                    }
-                } else {
-                    println!("no assistant message");
-                }
-                continue;
-            }
-            "/compact" => {
-                let record = runtime.compact_messages(CompactionKind::Manual)?;
-                println!(
-                    "compacted: omitted {} message(s), retained {} message(s)",
-                    record.omitted_messages, record.retained_messages
-                );
-                continue;
-            }
-            _ if line.starts_with("/login") => {
-                let provider = line.trim_start_matches("/login").trim();
-                print_login_status(&config, provider);
-                continue;
-            }
-            _ if line.starts_with("/logout") => {
-                let provider = line.trim_start_matches("/logout").trim();
-                if provider.is_empty() {
-                    println!("usage: /logout <provider>");
-                } else if config.auth.remove(provider).is_some() {
-                    write_auth_file(&config)?;
-                    println!("removed stored auth for {provider}");
-                } else {
-                    println!("no stored auth for {provider}");
-                }
-                continue;
-            }
-            _ if line.starts_with("/share") => {
-                let requested = line.trim_start_matches("/share").trim();
-                let path = if requested.is_empty() {
-                    config
-                        .paths
-                        .session_dir
-                        .join(format!("{}.html", runtime.session().session_id))
-                } else {
-                    PathBuf::from(requested)
-                };
-                export_session(&runtime, &path)?;
-                println!("share exported {}", path.display());
-                continue;
-            }
-            _ => {}
-        }
-
-        run_prompt_and_print(&mut runtime, &config, &mut editor_state, line, offline).await;
+    }
+    drop(terminal);
+    drop(_restore);
+    if std::env::var("PI_TUI_E2E_DUMP").ok().as_deref() == Some("1") {
+        println!("{}", app.transcript_text());
     }
     Ok(())
 }
 
-async fn handle_bang_command(
+struct TerminalRestore;
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TuiEntryKind {
+    System,
+    User,
+    Assistant,
+    Tool,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiEntry {
+    kind: TuiEntryKind,
+    text: String,
+}
+
+#[derive(Debug, Default)]
+struct TuiApp {
+    entries: Vec<TuiEntry>,
+    input: String,
+    editor_state: EditorState,
+    last_shell_command: Option<String>,
+    multiline: Option<Vec<String>>,
+    status: String,
+}
+
+impl TuiApp {
+    fn new(config: &LoadedConfig, runtime: &Runtime) -> Self {
+        let mut app = Self {
+            status: "Ready".to_string(),
+            ..Self::default()
+        };
+        app.push(
+            TuiEntryKind::System,
+            format!(
+                "{}\ntype /help for commands, /reload to reload config, /quit to exit",
+                terminal_renderer(config).banner()
+            ),
+        );
+        app.status = footer_status(config, runtime, &app.editor_state);
+        app
+    }
+
+    fn push(&mut self, kind: TuiEntryKind, text: impl Into<String>) {
+        let text = text.into();
+        if !text.trim().is_empty() {
+            self.entries.push(TuiEntry { kind, text });
+        }
+    }
+
+    fn transcript_text(&self) -> String {
+        self.entries
+            .iter()
+            .map(|entry| {
+                let label = match entry.kind {
+                    TuiEntryKind::System => "system",
+                    TuiEntryKind::User => "user",
+                    TuiEntryKind::Assistant => "assistant",
+                    TuiEntryKind::Tool => "tool",
+                    TuiEntryKind::Error => "error",
+                };
+                format!("{label}> {}", entry.text)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig, runtime: &Runtime) {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(4),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+    draw_header(frame, root[0], config, runtime);
+    draw_chat(frame, root[1], app);
+    draw_input(frame, root[2], app);
+    draw_footer(frame, root[3], app);
+}
+
+fn draw_header(frame: &mut Frame<'_>, area: Rect, config: &LoadedConfig, runtime: &Runtime) {
+    let model = runtime
+        .session()
+        .active_model
+        .as_ref()
+        .map(|model| format!("{}/{}", model.provider, model.id))
+        .unwrap_or_else(|| "no model".to_string());
+    let title = format!(
+        " pi  {}  {} ",
+        config
+            .settings
+            .theme
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        model
+    );
+    let session = runtime.session();
+    let line = format!(
+        "{}  {}  queue:{}",
+        session.cwd.display(),
+        session
+            .name
+            .clone()
+            .unwrap_or_else(|| session.session_id.chars().take(8).collect()),
+        session.queued_messages.len()
+    );
+    let paragraph = Paragraph::new(line)
+        .style(Style::default().fg(Color::Gray))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let mut lines = Vec::new();
+    for entry in &app.entries {
+        let (label, style) = match entry.kind {
+            TuiEntryKind::System => ("system", Style::default().fg(Color::DarkGray)),
+            TuiEntryKind::User => (
+                "you",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            TuiEntryKind::Assistant => (
+                "assistant",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            TuiEntryKind::Tool => ("tool", Style::default().fg(Color::Green)),
+            TuiEntryKind::Error => ("error", Style::default().fg(Color::Red)),
+        };
+        lines.push(Line::from(vec![Span::styled(format!("{label} "), style)]));
+        for line in entry.text.lines() {
+            lines.push(Line::from(Span::raw(format!("  {line}"))));
+        }
+        lines.push(Line::from(""));
+    }
+    let available = area.height.saturating_sub(2) as usize;
+    let start = lines.len().saturating_sub(available);
+    let paragraph = Paragraph::new(lines[start..].to_vec())
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" conversation "),
+        );
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = if app.multiline.is_some() {
+        " multiline: enter . to submit "
+    } else {
+        " pi> "
+    };
+    let paragraph = Paragraph::new(app.input.as_str())
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let footer = Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, area);
+}
+
+async fn handle_tui_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
     runtime: &mut Runtime,
-    line: &str,
-    last_shell_command: &mut Option<String>,
+    config: &mut LoadedConfig,
+    offline: bool,
 ) -> Result<bool> {
-    if line == "!!" && last_shell_command.is_none() {
-        println!("no previous shell command");
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
+        KeyCode::Esc => {
+            app.input.clear();
+            app.multiline = None;
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Enter => {
+            let line = app.input.trim().to_string();
+            app.input.clear();
+            if !line.is_empty() {
+                let quit = match handle_tui_submission(app, runtime, config, offline, line).await {
+                    Ok(quit) => quit,
+                    Err(error) => {
+                        app.push(TuiEntryKind::Error, format!("{error}"));
+                        false
+                    }
+                };
+                app.status = footer_status(config, runtime, &app.editor_state);
+                return Ok(quit);
+            }
+        }
+        KeyCode::Char(ch) => {
+            app.input.push(ch);
+        }
+        _ => {}
+    }
+    app.status = footer_status(config, runtime, &app.editor_state);
+    Ok(false)
+}
+
+async fn handle_tui_submission(
+    app: &mut TuiApp,
+    runtime: &mut Runtime,
+    config: &mut LoadedConfig,
+    offline: bool,
+    line: String,
+) -> Result<bool> {
+    if let Some(lines) = app.multiline.as_mut() {
+        if line == "." {
+            let prompt = lines.join("\n");
+            app.multiline = None;
+            submit_tui_prompt(app, runtime, config, prompt, Vec::new(), offline).await;
+        } else {
+            lines.push(line);
+        }
+        return Ok(false);
+    }
+    if line == "/quit" {
+        return Ok(true);
+    }
+    if handle_tui_bang(app, runtime, &line).await? {
+        return Ok(false);
+    }
+    match line.as_str() {
+        "/help" => app.push(TuiEntryKind::System, terminal_renderer(config).help()),
+        "/models" => app.push(
+            TuiEntryKind::System,
+            config
+                .models
+                .iter()
+                .map(|model| format!("{}/{}", model.provider, model.id))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        "/model" | "/scoped-models" => {
+            app.push(TuiEntryKind::System, format_scoped_models(config, runtime));
+        }
+        "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
+        "/settings" => app.push(TuiEntryKind::System, format_settings(config, runtime)),
+        "/status" => app.push(
+            TuiEntryKind::System,
+            format_status(config, runtime, &app.editor_state),
+        ),
+        "/diagnostics" => app.push(TuiEntryKind::System, format_diagnostics(config)),
+        "/hotkeys" => app.push(TuiEntryKind::System, format_hotkeys(config)),
+        "/history" => app.push(TuiEntryKind::System, format_history(&app.editor_state)),
+        "/skills" => app.push(
+            TuiEntryKind::System,
+            format_resources("skills", &config.skills),
+        ),
+        "/prompts" => app.push(
+            TuiEntryKind::System,
+            format_resources("prompts", &config.prompt_templates),
+        ),
+        "/themes" => app.push(
+            TuiEntryKind::System,
+            format_resources("themes", &config.themes),
+        ),
+        "/queue" => app.push(TuiEntryKind::System, format_queue(runtime)),
+        "/queue-clear" => {
+            let cleared = runtime.clear_queued_messages()?;
+            app.push(
+                TuiEntryKind::System,
+                format!("cleared {cleared} queued message(s)"),
+            );
+        }
+        "/interrupt" => {
+            let cleared = runtime.clear_queued_messages()?;
+            app.push(
+                TuiEntryKind::System,
+                format!("interrupted; cleared {cleared} queued message(s)"),
+            );
+        }
+        "/tree" => app.push(
+            TuiEntryKind::System,
+            format_session_tree(&config.paths.session_dir)?,
+        ),
+        "/summaries" => app.push(TuiEntryKind::System, format_summaries(runtime)),
+        "/compact" => {
+            let record = runtime.compact_messages(CompactionKind::Manual)?;
+            app.push(
+                TuiEntryKind::System,
+                format!(
+                    "compacted: omitted {} message(s), retained {} message(s)",
+                    record.omitted_messages, record.retained_messages
+                ),
+            );
+        }
+        "/copy" => app.push(TuiEntryKind::System, copy_last_assistant_message(runtime)?),
+        "/multiline" => {
+            app.multiline = Some(Vec::new());
+            app.push(
+                TuiEntryKind::System,
+                "enter multiline prompt; submit . on its own line",
+            );
+        }
+        "/reload" => {
+            *config = load_config(config.paths.clone())?;
+            let next_generation = runtime.systems().config_generation + 1;
+            let report = runtime.reload(ReloadableSystems::from_config(config, next_generation))?;
+            let mut output = format_diagnostics(config);
+            if !report.active_model_valid {
+                output
+                    .push_str("\nactive model is no longer available; use /model <provider/model>");
+            }
+            if !report.removed_active_tools.is_empty() {
+                output.push_str(&format!(
+                    "\nremoved active tools: {}",
+                    report.removed_active_tools.join(", ")
+                ));
+            }
+            output.push_str("\nreloaded");
+            app.push(TuiEntryKind::System, output);
+        }
+        _ if line.starts_with("/complete ") => {
+            let prefix = line.trim_start_matches("/complete ").trim();
+            let completions = EditorState::command_completions(prefix);
+            app.push(
+                TuiEntryKind::System,
+                if completions.is_empty() {
+                    "no completions".to_string()
+                } else {
+                    completions.join("\n")
+                },
+            );
+        }
+        _ if line.starts_with("/editor") => {
+            let initial = line.trim_start_matches("/editor").trim();
+            match read_external_editor_prompt(initial) {
+                Ok(prompt) if !prompt.trim().is_empty() => {
+                    submit_tui_prompt(app, runtime, config, prompt, Vec::new(), offline).await;
+                }
+                Ok(_) => app.push(TuiEntryKind::System, "editor returned an empty prompt"),
+                Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+            }
+        }
+        _ if line.starts_with("/image ") => {
+            let rest = line.trim_start_matches("/image ").trim();
+            let (path, prompt) = split_once_text(rest);
+            match load_media_input(&runtime.session().cwd, Path::new(path)) {
+                Ok(media) => {
+                    app.push(TuiEntryKind::System, format_media_fallback(&media));
+                    if !prompt.is_empty() {
+                        submit_tui_prompt(
+                            app,
+                            runtime,
+                            config,
+                            prompt.to_string(),
+                            vec![media],
+                            offline,
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+            }
+        }
+        _ if line.starts_with("/queue ") => {
+            let message = line.trim_start_matches("/queue ").trim().to_string();
+            runtime.queue_message(message)?;
+            app.push(
+                TuiEntryKind::System,
+                format!("queued: {}", runtime.session().queued_messages.len()),
+            );
+        }
+        _ if line.starts_with("/selector ") => {
+            let kind = line.trim_start_matches("/selector ").trim();
+            app.push(
+                TuiEntryKind::System,
+                terminal_renderer(config).selector(&selector_for_kind(config, runtime, kind)?),
+            );
+        }
+        _ if line.starts_with("/select ") => {
+            app.push(
+                TuiEntryKind::System,
+                select_from_selector_message(config, runtime, &line)?,
+            );
+        }
+        _ if line.starts_with("/model ") => {
+            let reference = line.trim_start_matches("/model ").trim();
+            let model = resolve_model_reference(config, reference)
+                .ok_or_else(|| anyhow!("model not found: {reference}"))?;
+            runtime.set_active_model(Some(model.clone()))?;
+            app.push(
+                TuiEntryKind::System,
+                format!("model: {}/{}", model.provider, model.id),
+            );
+        }
+        _ if line.starts_with("/skill:") => {
+            let (name, input) = split_resource_command(&line, "/skill:");
+            let skill = find_resource(&config.skills, name)
+                .ok_or_else(|| anyhow!("skill not found: {name}"))?;
+            let prompt = if input.is_empty() {
+                skill.content.clone()
+            } else {
+                format!("{}\n\n{}", skill.content, input)
+            };
+            submit_tui_prompt(app, runtime, config, prompt, Vec::new(), offline).await;
+        }
+        _ if line.starts_with("/prompt ") => {
+            let rest = line.trim_start_matches("/prompt ").trim();
+            let (name, input) = split_once_text(rest);
+            let template = find_resource(&config.prompt_templates, name)
+                .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
+            let prompt = expand_prompt_template(&template.content, input);
+            submit_tui_prompt(app, runtime, config, prompt, Vec::new(), offline).await;
+        }
+        _ if line.starts_with("/theme ") => {
+            let name = line.trim_start_matches("/theme ").trim();
+            let theme = find_resource(&config.themes, name)
+                .ok_or_else(|| anyhow!("theme not found: {name}"))?;
+            config.settings.theme = Some(theme.name.clone());
+            app.push(TuiEntryKind::System, format!("theme: {}", theme.name));
+        }
+        _ if line.starts_with("/new") => {
+            let (store, state) =
+                SessionStore::create(&config.paths.session_dir, runtime.session().cwd.clone())?;
+            runtime.replace_session(state, Some(store));
+            app.push(TuiEntryKind::System, format_session(runtime));
+        }
+        _ if line.starts_with("/resume") => {
+            let reference = line.trim_start_matches("/resume").trim();
+            if reference.is_empty() {
+                app.push(
+                    TuiEntryKind::System,
+                    format_sessions(&config.paths.session_dir)?,
+                );
+            } else {
+                let path = resolve_session_reference(&config.paths.session_dir, reference)?;
+                let (store, state) = SessionStore::open(path)?;
+                runtime.replace_session(state, Some(store));
+                app.push(TuiEntryKind::System, format_session(runtime));
+            }
+        }
+        _ if line.starts_with("/fork") => {
+            let source =
+                resolve_source_session(&config.paths.session_dir, runtime, &line, "/fork")?;
+            let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, false)?;
+            runtime.replace_session(state, Some(store));
+            app.push(TuiEntryKind::System, format_session(runtime));
+        }
+        _ if line.starts_with("/clone") => {
+            let source =
+                resolve_source_session(&config.paths.session_dir, runtime, &line, "/clone")?;
+            let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, true)?;
+            runtime.replace_session(state, Some(store));
+            app.push(TuiEntryKind::System, format_session(runtime));
+        }
+        _ if line.starts_with("/delete") => {
+            app.push(
+                TuiEntryKind::System,
+                delete_session_message(config, runtime, &line)?,
+            );
+        }
+        _ if line.starts_with("/name") => {
+            let name = line.trim_start_matches("/name").trim();
+            runtime.rename_session((!name.is_empty()).then(|| name.to_string()))?;
+            app.push(TuiEntryKind::System, format_session(runtime));
+        }
+        _ if line.starts_with("/labels") => {
+            let labels = line
+                .trim_start_matches("/labels")
+                .split_whitespace()
+                .map(ToString::to_string)
+                .collect();
+            runtime.set_labels(labels)?;
+            app.push(TuiEntryKind::System, format_session(runtime));
+        }
+        _ if line.starts_with("/export ") => {
+            let path = PathBuf::from(line.trim_start_matches("/export ").trim());
+            export_session(runtime, &path)?;
+            app.push(TuiEntryKind::System, format!("exported {}", path.display()));
+        }
+        _ if line.starts_with("/import ") => {
+            let path = PathBuf::from(line.trim_start_matches("/import ").trim());
+            let (store, state) = SessionStore::import_path(&config.paths.session_dir, &path)?;
+            runtime.replace_session(state, Some(store));
+            app.push(TuiEntryKind::System, format_session(runtime));
+        }
+        _ if line.starts_with("/login") => {
+            let provider = line.trim_start_matches("/login").trim();
+            app.push(TuiEntryKind::System, format_login_status(config, provider));
+        }
+        _ if line.starts_with("/logout") => {
+            let provider = line.trim_start_matches("/logout").trim();
+            if provider.is_empty() {
+                app.push(TuiEntryKind::System, "usage: /logout <provider>");
+            } else if config.auth.remove(provider).is_some() {
+                write_auth_file(config)?;
+                app.push(
+                    TuiEntryKind::System,
+                    format!("removed stored auth for {provider}"),
+                );
+            } else {
+                app.push(
+                    TuiEntryKind::System,
+                    format!("no stored auth for {provider}"),
+                );
+            }
+        }
+        _ if line.starts_with("/share") => {
+            let requested = line.trim_start_matches("/share").trim();
+            let path = if requested.is_empty() {
+                config
+                    .paths
+                    .session_dir
+                    .join(format!("{}.html", runtime.session().session_id))
+            } else {
+                PathBuf::from(requested)
+            };
+            export_session(runtime, &path)?;
+            app.push(
+                TuiEntryKind::System,
+                format!("share exported {}", path.display()),
+            );
+        }
+        _ => submit_tui_prompt(app, runtime, config, line, Vec::new(), offline).await,
+    }
+    Ok(false)
+}
+
+async fn handle_tui_bang(app: &mut TuiApp, runtime: &mut Runtime, line: &str) -> Result<bool> {
+    if line == "!!" && app.last_shell_command.is_none() {
+        app.push(TuiEntryKind::System, "no previous shell command");
         return Ok(true);
     }
     if line == "!" {
-        println!("usage: ! <command>");
+        app.push(TuiEntryKind::System, "usage: ! <command>");
         return Ok(true);
     }
-    let Some(command) = resolve_bang_command(line, last_shell_command) else {
+    let Some(command) = resolve_bang_command(line, &app.last_shell_command) else {
         return Ok(false);
     };
     match run_excluded_bash(runtime, command.clone()).await {
         Ok(output) => {
-            print!("{output}");
-            if !output.ends_with('\n') {
-                println!();
-            }
-            *last_shell_command = Some(command);
+            app.push(TuiEntryKind::Tool, output);
+            app.last_shell_command = Some(command);
         }
-        Err(error) => eprintln!("error: {error}"),
+        Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
     }
     Ok(true)
+}
+
+async fn submit_tui_prompt(
+    app: &mut TuiApp,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    prompt: String,
+    media: Vec<MediaInput>,
+    offline: bool,
+) {
+    app.editor_state.record_history(prompt.clone());
+    app.push(TuiEntryKind::User, prompt.clone());
+    if let Err(error) =
+        run_prompt_with_queue_tui(app, runtime, config, prompt, media, offline).await
+    {
+        app.push(TuiEntryKind::Error, format!("{error}"));
+    }
+}
+
+async fn run_prompt_with_queue_tui(
+    app: &mut TuiApp,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    prompt: String,
+    media: Vec<MediaInput>,
+    offline: bool,
+) -> Result<()> {
+    maybe_auto_compact(runtime, false)?;
+    let response = run_prompt_once(runtime, config, prompt.clone(), media, offline, false).await?;
+    app.push(response_kind_for_prompt(&prompt), response);
+    while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
+        let remaining = runtime
+            .session()
+            .queued_messages
+            .iter()
+            .skip(1)
+            .cloned()
+            .collect();
+        runtime.replace_queued_messages(remaining)?;
+        app.push(TuiEntryKind::System, format!("queued> {prompt}"));
+        let response =
+            run_prompt_once(runtime, config, prompt.clone(), Vec::new(), offline, false).await?;
+        app.push(response_kind_for_prompt(&prompt), response);
+    }
+    Ok(())
+}
+
+fn response_kind_for_prompt(prompt: &str) -> TuiEntryKind {
+    if matches!(
+        prompt.split_whitespace().next(),
+        Some("/read" | "/write" | "/edit" | "/grep" | "/find" | "/ls" | "/bash")
+    ) {
+        TuiEntryKind::Tool
+    } else {
+        TuiEntryKind::Assistant
+    }
 }
 
 fn resolve_bang_command(line: &str, last_shell_command: &Option<String>) -> Option<String> {
@@ -1102,63 +1356,6 @@ async fn run_prompt_media(
     offline: bool,
 ) -> Result<String> {
     run_prompt_once(runtime, config, prompt, media, offline, false).await
-}
-
-async fn run_prompt_and_print(
-    runtime: &mut Runtime,
-    config: &LoadedConfig,
-    editor_state: &mut EditorState,
-    prompt: String,
-    offline: bool,
-) {
-    editor_state.record_history(prompt.clone());
-    if let Err(error) =
-        run_prompt_with_queue(runtime, config, prompt, Vec::new(), offline, true).await
-    {
-        eprintln!("error: {error}");
-    }
-}
-
-async fn run_prompt_media_and_print(
-    runtime: &mut Runtime,
-    config: &LoadedConfig,
-    editor_state: &mut EditorState,
-    prompt: String,
-    media: Vec<MediaInput>,
-    offline: bool,
-) {
-    editor_state.record_history(prompt.clone());
-    if let Err(error) = run_prompt_with_queue(runtime, config, prompt, media, offline, true).await {
-        eprintln!("error: {error}");
-    }
-}
-
-async fn run_prompt_with_queue(
-    runtime: &mut Runtime,
-    config: &LoadedConfig,
-    prompt: String,
-    media: Vec<MediaInput>,
-    offline: bool,
-    stream_output: bool,
-) -> Result<String> {
-    maybe_auto_compact(runtime, stream_output)?;
-    let first_response =
-        run_prompt_once(runtime, config, prompt, media, offline, stream_output).await?;
-    while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
-        let remaining = runtime
-            .session()
-            .queued_messages
-            .iter()
-            .skip(1)
-            .cloned()
-            .collect();
-        runtime.replace_queued_messages(remaining)?;
-        if stream_output {
-            println!("queued> {prompt}");
-        }
-        run_prompt_once(runtime, config, prompt, Vec::new(), offline, stream_output).await?;
-    }
-    Ok(first_response)
 }
 
 fn maybe_auto_compact(runtime: &mut Runtime, stream_output: bool) -> Result<()> {
@@ -1223,26 +1420,6 @@ async fn run_prompt_once(
         println!("{response}");
     }
     Ok(response)
-}
-
-fn read_multiline_prompt(stdin: &io::Stdin) -> Result<String> {
-    println!("enter multiline prompt; finish with a single .");
-    let mut lines = Vec::new();
-    loop {
-        print!("...> ");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        let read = stdin.read_line(&mut line)?;
-        if read == 0 {
-            break;
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line == "." {
-            break;
-        }
-        lines.push(line.to_string());
-    }
-    Ok(lines.join("\n"))
 }
 
 fn provider_for_runtime(
@@ -1345,96 +1522,98 @@ fn keybinding_map(config: &LoadedConfig) -> KeybindingMap {
     )
 }
 
-fn print_session(runtime: &Runtime) {
-    println!(
-        "{}",
-        TerminalRenderer::default().session(&SessionView {
-            id: runtime.session().session_id.clone(),
-            cwd: runtime.session().cwd.display().to_string(),
-            name: runtime.session().name.clone(),
-            labels: runtime.session().labels.iter().cloned().collect(),
-            parent: runtime.session().parent_session_id.clone(),
-            file: runtime
-                .store()
-                .map(|store| store.path().display().to_string()),
-        })
-    );
+fn format_session(runtime: &Runtime) -> String {
+    TerminalRenderer::default().session(&SessionView {
+        id: runtime.session().session_id.clone(),
+        cwd: runtime.session().cwd.display().to_string(),
+        name: runtime.session().name.clone(),
+        labels: runtime.session().labels.iter().cloned().collect(),
+        parent: runtime.session().parent_session_id.clone(),
+        file: runtime
+            .store()
+            .map(|store| store.path().display().to_string()),
+    })
 }
 
-fn print_sessions(session_dir: &Path) -> Result<()> {
+fn format_sessions(session_dir: &Path) -> Result<String> {
+    let mut lines = Vec::new();
     for (index, session) in SessionStore::list(session_dir)?.into_iter().enumerate() {
         let name = session.name.unwrap_or_else(|| "-".to_string());
-        println!(
+        lines.push(format!(
             "{}.\t{}\t{}\t{}",
             index + 1,
             session.session_id,
             name,
             session.cwd.display()
-        );
+        ));
     }
-    Ok(())
+    Ok(if lines.is_empty() {
+        "no sessions".to_string()
+    } else {
+        lines.join("\n")
+    })
 }
 
-fn print_session_tree(session_dir: &Path) -> Result<()> {
+fn format_session_tree(session_dir: &Path) -> Result<String> {
+    let mut lines = Vec::new();
     for session in SessionStore::list(session_dir)? {
         let parent = session.parent_session_id.unwrap_or_else(|| "-".to_string());
         let summary = session.branch_summary.unwrap_or_else(|| "-".to_string());
-        println!(
+        lines.push(format!(
             "{}\tparent:{parent}\tsummary:{summary}\t{}",
             session.session_id,
             session.cwd.display()
-        );
+        ));
     }
-    Ok(())
+    Ok(if lines.is_empty() {
+        "no sessions".to_string()
+    } else {
+        lines.join("\n")
+    })
 }
 
-fn print_summaries(runtime: &Runtime) {
+fn format_summaries(runtime: &Runtime) -> String {
     if runtime.session().compactions.is_empty() && runtime.session().branch_summaries.is_empty() {
-        println!("no summaries");
-        return;
+        return "no summaries".to_string();
     }
+    let mut lines = Vec::new();
     for record in &runtime.session().compactions {
-        println!(
+        lines.push(format!(
             "compaction {:?}: omitted {}, retained {}",
             record.kind, record.omitted_messages, record.retained_messages
-        );
-        println!("{}", record.summary);
+        ));
+        lines.push(record.summary.clone());
     }
     for summary in &runtime.session().branch_summaries {
-        println!(
+        lines.push(format!(
             "branch {} -> {}",
             summary.from_session_id, summary.to_session_id
-        );
-        println!("{}", summary.summary);
+        ));
+        lines.push(summary.summary.clone());
     }
+    lines.join("\n")
 }
 
-fn print_settings(config: &LoadedConfig, runtime: &Runtime) {
-    println!(
-        "{}",
-        terminal_renderer(config).settings(&SettingsView {
-            agent_dir: config.paths.agent_dir.display().to_string(),
-            session_dir: config.paths.session_dir.display().to_string(),
-            config_generation: runtime.systems().config_generation,
-            active_model: runtime
-                .session()
-                .active_model
-                .as_ref()
-                .map(|model| format!("{}/{}", model.provider, model.id)),
-            theme: config.settings.theme.clone(),
-        })
-    );
+fn format_settings(config: &LoadedConfig, runtime: &Runtime) -> String {
+    terminal_renderer(config).settings(&SettingsView {
+        agent_dir: config.paths.agent_dir.display().to_string(),
+        session_dir: config.paths.session_dir.display().to_string(),
+        config_generation: runtime.systems().config_generation,
+        active_model: runtime
+            .session()
+            .active_model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider, model.id)),
+        theme: config.settings.theme.clone(),
+    })
 }
 
-fn print_hotkeys(config: &LoadedConfig) {
-    println!(
-        "{}",
-        terminal_renderer(config).keybindings(&keybinding_map(config))
-    );
+fn format_hotkeys(config: &LoadedConfig) -> String {
+    terminal_renderer(config).keybindings(&keybinding_map(config))
 }
 
-fn print_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) {
-    println!(
+fn format_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) -> String {
+    format!(
         "status\tmodel:{}\ttheme:{}\tqueue:{}\thistory:{}\tdiagnostics:{}",
         runtime
             .session()
@@ -1450,30 +1629,37 @@ fn print_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorS
         runtime.session().queued_messages.len(),
         editor_state.history().len(),
         config.diagnostics.len()
-    );
+    )
 }
 
-fn print_media_fallback(media: &MediaInput) {
+fn footer_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) -> String {
+    format_status(config, runtime, editor_state)
+}
+
+fn format_media_fallback(media: &MediaInput) -> String {
     let dimensions = match (media.width, media.height) {
         (Some(width), Some(height)) => format!("{width}x{height}"),
         _ => "unknown-size".to_string(),
     };
-    println!(
+    format!(
         "image: {}\t{}\t{}\tterminal display fallback: attached to provider message",
         media.path.as_deref().unwrap_or("-"),
         media.mime_type,
         dimensions
-    );
+    )
 }
 
-fn print_history(editor_state: &EditorState) {
+fn format_history(editor_state: &EditorState) -> String {
     if editor_state.history().is_empty() {
-        println!("history is empty");
-        return;
+        return "history is empty".to_string();
     }
-    for (index, entry) in editor_state.history().iter().enumerate() {
-        println!("{}.\t{}", index + 1, entry);
-    }
+    editor_state
+        .history()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| format!("{}.\t{}", index + 1, entry))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn read_external_editor_prompt(initial: &str) -> Result<String> {
@@ -1520,27 +1706,23 @@ fn unique_temp_suffix() -> u128 {
         .unwrap_or_default()
 }
 
-fn print_diagnostics(config: &LoadedConfig) {
+fn format_diagnostics(config: &LoadedConfig) -> String {
     if config.diagnostics.is_empty() {
-        println!("no diagnostics");
-        return;
+        return "no diagnostics".to_string();
     }
-    for diagnostic in &config.diagnostics {
-        println!("diagnostic: {diagnostic}");
-    }
+    config
+        .diagnostics
+        .iter()
+        .map(|diagnostic| format!("diagnostic: {diagnostic}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn print_selector(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Result<()> {
-    let selector = selector_for_kind(config, runtime, kind)?;
-    println!("{}", terminal_renderer(config).selector(&selector));
-    Ok(())
-}
-
-fn select_from_selector(
+fn select_from_selector_message(
     config: &mut LoadedConfig,
     runtime: &mut Runtime,
     line: &str,
-) -> Result<()> {
+) -> Result<String> {
     let rest = line.trim_start_matches("/select ").trim();
     let (kind, query) = split_once_text(rest);
     if query.is_empty() {
@@ -1555,24 +1737,21 @@ fn select_from_selector(
             let model = resolve_model_reference(config, &item.value)
                 .ok_or_else(|| anyhow!("model not found: {}", item.value))?;
             runtime.set_active_model(Some(model.clone()))?;
-            println!("model: {}/{}", model.provider, model.id);
+            Ok(format!("model: {}/{}", model.provider, model.id))
         }
         "theme" | "themes" => {
             config.settings.theme = Some(item.value.clone());
-            println!("theme: {}", item.value);
+            Ok(format!("theme: {}", item.value))
         }
         "session" | "sessions" => {
             let path = resolve_session_reference(&config.paths.session_dir, &item.value)?;
             let (store, state) = SessionStore::open(path)?;
             runtime.replace_session(state, Some(store));
-            print_session(runtime);
+            Ok(format_session(runtime))
         }
-        "auth" => {
-            println!("auth: {}", item.value);
-        }
-        _ => return Err(anyhow!("unknown selector: {kind}")),
+        "auth" => Ok(format!("auth: {}", item.value)),
+        _ => Err(anyhow!("unknown selector: {kind}")),
     }
-    Ok(())
 }
 
 fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Result<Selector> {
@@ -1645,24 +1824,29 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
     }
 }
 
-fn print_resources(kind: &str, resources: &[ResourceFile]) {
+fn format_resources(kind: &str, resources: &[ResourceFile]) -> String {
     if resources.is_empty() {
-        println!("no {kind}");
-        return;
+        return format!("no {kind}");
     }
-    for resource in resources {
-        println!("{}\t{}", resource.name, resource.path.display());
-    }
+    resources
+        .iter()
+        .map(|resource| format!("{}\t{}", resource.name, resource.path.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn print_queue(runtime: &Runtime) {
+fn format_queue(runtime: &Runtime) -> String {
     if runtime.session().queued_messages.is_empty() {
-        println!("queue is empty");
-        return;
+        return "queue is empty".to_string();
     }
-    for (index, message) in runtime.session().queued_messages.iter().enumerate() {
-        println!("{}.\t{}", index + 1, message);
-    }
+    runtime
+        .session()
+        .queued_messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| format!("{}.\t{}", index + 1, message))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn find_resource<'a>(resources: &'a [ResourceFile], name: &str) -> Option<&'a ResourceFile> {
@@ -1692,7 +1876,7 @@ fn expand_prompt_template(template: &str, input: &str) -> String {
     }
 }
 
-fn print_scoped_models(config: &LoadedConfig, runtime: &Runtime) {
+fn format_scoped_models(config: &LoadedConfig, runtime: &Runtime) -> String {
     let models = config
         .models
         .iter()
@@ -1707,10 +1891,10 @@ fn print_scoped_models(config: &LoadedConfig, runtime: &Runtime) {
                 .unwrap_or(false),
         })
         .collect::<Vec<_>>();
-    println!("{}", terminal_renderer(config).models(&models));
+    terminal_renderer(config).models(&models)
 }
 
-fn print_login_status(config: &LoadedConfig, provider: &str) {
+fn format_login_status(config: &LoadedConfig, provider: &str) -> String {
     let providers = if provider.is_empty() {
         config
             .models
@@ -1722,14 +1906,18 @@ fn print_login_status(config: &LoadedConfig, provider: &str) {
     } else {
         vec![provider.to_string()]
     };
-    for provider in providers {
-        let status = if auth_for_provider(&config.auth, &provider).is_some() {
-            "available"
-        } else {
-            "missing"
-        };
-        println!("{provider}: {status}");
-    }
+    providers
+        .into_iter()
+        .map(|provider| {
+            let status = if auth_for_provider(&config.auth, &provider).is_some() {
+                "available"
+            } else {
+                "missing"
+            };
+            format!("{provider}: {status}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn resolve_source_session(
@@ -1759,6 +1947,55 @@ fn export_session(runtime: &Runtime, path: &Path) -> Result<()> {
         write_session_export(runtime.session(), path)?;
     }
     Ok(())
+}
+
+fn delete_session_message(
+    config: &LoadedConfig,
+    runtime: &mut Runtime,
+    line: &str,
+) -> Result<String> {
+    let reference = line.trim_start_matches("/delete").trim();
+    let target = if reference.is_empty() {
+        runtime
+            .store()
+            .map(|store| store.path().to_path_buf())
+            .ok_or_else(|| anyhow!("ephemeral session cannot be deleted"))?
+    } else {
+        resolve_session_reference(&config.paths.session_dir, reference)?
+    };
+    let deleting_current = runtime
+        .store()
+        .map(|store| store.path() == target)
+        .unwrap_or(false);
+    fs::remove_file(&target)?;
+    let mut output = format!("deleted {}", target.display());
+    if deleting_current {
+        let (store, state) =
+            SessionStore::create(&config.paths.session_dir, runtime.session().cwd.clone())?;
+        runtime.replace_session(state, Some(store));
+        output.push('\n');
+        output.push_str(&format_session(runtime));
+    }
+    Ok(output)
+}
+
+fn copy_last_assistant_message(runtime: &Runtime) -> Result<String> {
+    let Some(message) = runtime
+        .session()
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Assistant)
+    else {
+        return Ok("no assistant message".to_string());
+    };
+    let mut output = message.content.clone();
+    if let Some(command) = copy_to_clipboard(&message.content)? {
+        output.push_str(&format!("\ncopied to clipboard via {command}"));
+    } else {
+        output.push_str("\nclipboard unavailable");
+    }
+    Ok(output)
 }
 
 fn copy_to_clipboard(text: &str) -> Result<Option<String>> {
