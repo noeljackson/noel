@@ -110,7 +110,11 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "/model <provider/id>",
-        description: "switch model",
+        description: "switch model by id or number",
+    },
+    CommandHelp {
+        command: "/multiline",
+        description: "enter a multiline prompt",
     },
     CommandHelp {
         command: "/session",
@@ -268,9 +272,10 @@ impl TerminalRenderer {
     pub fn models(&self, models: &[ModelView]) -> String {
         models
             .iter()
-            .map(|model| {
+            .enumerate()
+            .map(|(index, model)| {
                 let marker = if model.active { "*" } else { " " };
-                format!("{marker} {}/{}", model.provider, model.id)
+                format!("{:>2}. {marker} {}/{}", index + 1, model.provider, model.id)
             })
             .collect::<Vec<_>>()
             .join("\n")

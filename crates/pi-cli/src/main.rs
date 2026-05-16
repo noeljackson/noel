@@ -511,6 +511,14 @@ fn select_initial_model(runtime: &mut Runtime, config: &LoadedConfig, cli: &Cli)
 }
 
 fn resolve_model_reference(config: &LoadedConfig, reference: &str) -> Option<ModelRef> {
+    if let Ok(index) = reference.parse::<usize>() {
+        if index > 0 {
+            return config.models.get(index - 1).map(|model| ModelRef {
+                provider: model.provider.clone(),
+                id: model.id.clone(),
+            });
+        }
+    }
     if let Some((provider, id)) = reference.split_once('/') {
         return Some(ModelRef {
             provider: provider.to_string(),
@@ -560,6 +568,10 @@ async fn run_interactive(
                 }
                 continue;
             }
+            "/model" => {
+                print_scoped_models(&config, &runtime);
+                continue;
+            }
             "/session" => {
                 print_session(&runtime);
                 continue;
@@ -599,6 +611,14 @@ async fn run_interactive(
                     .ok_or_else(|| anyhow!("model not found: {reference}"))?;
                 runtime.set_active_model(Some(model.clone()))?;
                 println!("model: {}/{}", model.provider, model.id);
+                continue;
+            }
+            "/multiline" => {
+                let prompt = read_multiline_prompt(&stdin)?;
+                match run_prompt(&mut runtime, &config, prompt, offline).await {
+                    Ok(response) => println!("{response}"),
+                    Err(error) => eprintln!("error: {error}"),
+                }
                 continue;
             }
             _ if line.starts_with("/new") => {
@@ -760,6 +780,26 @@ async fn run_prompt(
         .map_err(Into::into)
 }
 
+fn read_multiline_prompt(stdin: &io::Stdin) -> Result<String> {
+    println!("enter multiline prompt; finish with a single .");
+    let mut lines = Vec::new();
+    loop {
+        print!("...> ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        let read = stdin.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line == "." {
+            break;
+        }
+        lines.push(line.to_string());
+    }
+    Ok(lines.join("\n"))
+}
+
 fn provider_for_runtime(
     runtime: &Runtime,
     config: &LoadedConfig,
@@ -871,10 +911,11 @@ fn print_session(runtime: &Runtime) {
 }
 
 fn print_sessions(session_dir: &Path) -> Result<()> {
-    for session in SessionStore::list(session_dir)? {
+    for (index, session) in SessionStore::list(session_dir)?.into_iter().enumerate() {
         let name = session.name.unwrap_or_else(|| "-".to_string());
         println!(
-            "{}\t{}\t{}",
+            "{}.\t{}\t{}\t{}",
+            index + 1,
             session.session_id,
             name,
             session.cwd.display()

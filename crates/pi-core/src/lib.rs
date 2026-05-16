@@ -443,7 +443,15 @@ impl SessionStore {
         if jsonl_candidate.exists() {
             return Ok(Some(jsonl_candidate));
         }
-        let matches = Self::list(session_dir)?
+        let summaries = Self::list(session_dir)?;
+        if let Ok(index) = reference.parse::<usize>() {
+            if index > 0 {
+                if let Some(summary) = summaries.get(index - 1) {
+                    return Ok(Some(summary.path.clone()));
+                }
+            }
+        }
+        let matches = summaries
             .into_iter()
             .filter(|summary| {
                 summary.session_id.starts_with(reference)
@@ -1091,6 +1099,10 @@ mod tests {
         );
         assert_eq!(
             SessionStore::resolve(&base, "named-session").expect("resolve name"),
+            Some(store.path().to_path_buf())
+        );
+        assert_eq!(
+            SessionStore::resolve(&base, "1").expect("resolve index"),
             Some(store.path().to_path_buf())
         );
 

@@ -175,6 +175,7 @@ or an object map:
 - `/models`
 - `/scoped-models`
 - `/model <provider/id>`
+- `/multiline`
 - `/session`
 - `/new`
 - `/resume [id|name|path]`
