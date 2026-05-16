@@ -1,0 +1,9 @@
+[package]
+name = "pi-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pi-ai = { path = "../pi-ai" }
+thiserror.workspace = true

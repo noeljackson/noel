@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/pi-ai",
+    "crates/pi-cli",
+    "crates/pi-config",
+    "crates/pi-core",
+    "crates/pi-tools",
+    "crates/pi-tui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.38", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.12"

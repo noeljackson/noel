@@ -1,0 +1,15 @@
+[package]
+name = "pi-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+pi-ai = { path = "../pi-ai" }
+pi-core = { path = "../pi-core" }
