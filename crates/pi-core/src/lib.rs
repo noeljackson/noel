@@ -15,6 +15,7 @@ use pi_tools::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationMessage {
@@ -164,6 +165,24 @@ pub struct ReloadableSystems {
     pub keybinding_generation: u64,
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
+    pub retry: RuntimeRetrySettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRetrySettings {
+    pub enabled: bool,
+    pub max_retries: u64,
+    pub base_delay_ms: u64,
+}
+
+impl Default for RuntimeRetrySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_retries: 3,
+            base_delay_ms: 2_000,
+        }
+    }
 }
 
 impl ReloadableSystems {
@@ -208,6 +227,26 @@ impl ReloadableSystems {
             keybinding_generation: generation,
             shell_path: config.settings.shell_path.clone(),
             shell_command_prefix: config.settings.shell_command_prefix.clone(),
+            retry: RuntimeRetrySettings {
+                enabled: config
+                    .settings
+                    .retry
+                    .as_ref()
+                    .and_then(|retry| retry.enabled)
+                    .unwrap_or(true),
+                max_retries: config
+                    .settings
+                    .retry
+                    .as_ref()
+                    .and_then(|retry| retry.max_retries)
+                    .unwrap_or(3),
+                base_delay_ms: config
+                    .settings
+                    .retry
+                    .as_ref()
+                    .and_then(|retry| retry.base_delay_ms)
+                    .unwrap_or(2_000),
+            },
         }
     }
 }
@@ -1232,7 +1271,7 @@ pub async fn run_user_turn_streaming_with_media(
             })
             .collect(),
     };
-    let events = provider.complete(request).await?;
+    let events = complete_with_retry(provider, request, &runtime.systems.retry).await?;
     let mut text = String::new();
     for event in events {
         if let StreamEvent::Text(delta) = event {
@@ -1246,6 +1285,39 @@ pub async fn run_user_turn_streaming_with_media(
         media: Vec::new(),
     })?;
     Ok(text)
+}
+
+async fn complete_with_retry(
+    provider: &dyn Provider,
+    request: ProviderRequest,
+    retry: &RuntimeRetrySettings,
+) -> Result<Vec<StreamEvent>, ProviderError> {
+    let max_attempts = if retry.enabled {
+        retry.max_retries.saturating_add(1)
+    } else {
+        1
+    };
+    let mut attempt = 0;
+    loop {
+        match provider.complete(request.clone()).await {
+            Ok(events) => return Ok(events),
+            Err(error) if attempt + 1 >= max_attempts => return Err(error),
+            Err(_) => {
+                let delay_ms = retry_delay_ms(retry.base_delay_ms, attempt);
+                if delay_ms > 0 {
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
+fn retry_delay_ms(base_delay_ms: u64, attempt: u64) -> u64 {
+    let multiplier = 1_u64
+        .checked_shl(attempt.min(16) as u32)
+        .unwrap_or(u64::MAX);
+    base_delay_ms.saturating_mul(multiplier)
 }
 
 pub async fn run_excluded_bash(runtime: &Runtime, command: String) -> Result<String, AgentError> {
@@ -1387,6 +1459,10 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc,
+    };
 
     use pi_ai::{create_provider, ProviderApi, ProviderAuth, ProviderConfig};
 
@@ -1750,6 +1826,68 @@ mod tests {
         assert_eq!(runtime.session().messages[1].content, response);
     }
 
+    #[tokio::test]
+    async fn provider_retry_does_not_duplicate_user_message() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems {
+                retry: RuntimeRetrySettings {
+                    enabled: true,
+                    max_retries: 2,
+                    base_delay_ms: 0,
+                },
+                ..ReloadableSystems::default()
+            },
+        );
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let provider = FlakyProvider {
+            attempts: Arc::clone(&attempts),
+            fail_before_success: 1,
+        };
+
+        let response = run_user_turn(&mut runtime, &provider, "hello".to_string())
+            .await
+            .expect("retry should recover");
+
+        assert_eq!(response, "retried");
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(runtime.session().messages.len(), 2);
+        assert_eq!(runtime.session().messages[0].role, MessageRole::User);
+        assert_eq!(runtime.session().messages[1].role, MessageRole::Assistant);
+    }
+
+    #[tokio::test]
+    async fn disabled_provider_retry_returns_first_attempt_failure() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems {
+                retry: RuntimeRetrySettings {
+                    enabled: false,
+                    max_retries: 2,
+                    base_delay_ms: 0,
+                },
+                ..ReloadableSystems::default()
+            },
+        );
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let provider = FlakyProvider {
+            attempts: Arc::clone(&attempts),
+            fail_before_success: 1,
+        };
+
+        let error = run_user_turn(&mut runtime, &provider, "hello".to_string())
+            .await
+            .expect_err("retry should be disabled");
+
+        assert!(matches!(
+            error,
+            AgentError::Provider(ProviderError::InvalidResponse(_))
+        ));
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(runtime.session().messages.len(), 1);
+        assert_eq!(runtime.session().messages[0].role, MessageRole::User);
+    }
+
     #[test]
     fn queued_messages_are_persisted_and_clearable() {
         let base = std::env::temp_dir().join(format!("pi-queue-test-{}", new_session_id()));
@@ -1828,5 +1966,29 @@ mod tests {
         let second = new_session_id();
 
         assert_ne!(first, second);
+    }
+
+    struct FlakyProvider {
+        attempts: Arc<AtomicUsize>,
+        fail_before_success: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FlakyProvider {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            if attempt < self.fail_before_success {
+                return Err(ProviderError::InvalidResponse("temporary".to_string()));
+            }
+            Ok(vec![
+                StreamEvent::Text("retried".to_string()),
+                StreamEvent::Stop {
+                    reason: "stop".to_string(),
+                },
+            ])
+        }
     }
 }
