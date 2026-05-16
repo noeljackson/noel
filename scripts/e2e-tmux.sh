@@ -17,6 +17,7 @@ prompt_file="${work_dir}/prompt-ready"
 
 cleanup() {
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+  tmux kill-session -t "pi-e2e-one-follow-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-disabled-${$}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -313,6 +314,50 @@ if [ ! -f "${work_dir}/clipboard.txt" ]; then
   exit 1
 fi
 grep -Fq "[faux/echo] fix broken thing" "${work_dir}/clipboard.txt"
+
+printf '{"followUpMode":"one-at-a-time"}\n' > "${agent_dir}/settings.json"
+one_follow_session="pi-e2e-one-follow-${$}"
+tmux new-session -d -s "${one_follow_session}" -x 100 -y 20
+tmux send-keys -t "${one_follow_session}" \
+  "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  Enter
+
+for _ in $(seq 1 80); do
+  if tmux capture-pane -t "${one_follow_session}" -p -S -2000 | grep -q "pi>"; then
+    break
+  fi
+  sleep 0.25
+done
+
+tmux send-keys -t "${one_follow_session}" "/queue first-one-at-a-time" Enter
+sleep 0.35
+tmux send-keys -t "${one_follow_session}" "/queue second-one-at-a-time" Enter
+sleep 0.35
+tmux send-keys -t "${one_follow_session}" "trigger one followup" Enter
+sleep 0.8
+tmux send-keys -t "${one_follow_session}" "/queue" Enter
+sleep 0.35
+tmux send-keys -t "${one_follow_session}" "/quit" Enter
+sleep 0.5
+one_follow_output="$(tmux capture-pane -t "${one_follow_session}" -p -S -2000 2>/dev/null || true)"
+printf '%s\n' "${one_follow_output}" > "${work_dir}/one-follow-pane.txt"
+tmux kill-session -t "${one_follow_session}" >/dev/null 2>&1 || true
+
+if ! grep -Fq "[faux/echo] first-one-at-a-time" "${work_dir}/one-follow-pane.txt"; then
+  cat "${work_dir}/one-follow-pane.txt" >&2
+  echo "one-at-a-time follow-up did not process the first queued message" >&2
+  exit 1
+fi
+if ! grep -Fq "second-one-at-a-time" "${work_dir}/one-follow-pane.txt"; then
+  cat "${work_dir}/one-follow-pane.txt" >&2
+  echo "one-at-a-time follow-up did not leave the second queued message visible" >&2
+  exit 1
+fi
+if grep -Fq "[faux/echo] second-one-at-a-time" "${work_dir}/one-follow-pane.txt"; then
+  cat "${work_dir}/one-follow-pane.txt" >&2
+  echo "one-at-a-time follow-up drained more than one queued message" >&2
+  exit 1
+fi
 
 disabled_session="pi-e2e-disabled-${$}"
 tmux new-session -d -s "${disabled_session}" -x 100 -y 20

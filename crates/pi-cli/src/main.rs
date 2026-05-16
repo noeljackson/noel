@@ -1964,8 +1964,15 @@ async fn run_prompt_with_queue_tui(
         runtime.replace_queued_messages(remaining)?;
         app.push(TuiEntryKind::System, format!("queued> {prompt}"));
         run_prompt_once_tui(app, terminal, runtime, config, prompt, Vec::new(), offline).await?;
+        if follow_up_mode(config) == "one-at-a-time" {
+            break;
+        }
     }
     Ok(())
+}
+
+fn follow_up_mode(config: &LoadedConfig) -> &str {
+    config.settings.follow_up_mode.as_deref().unwrap_or("all")
 }
 
 async fn run_prompt_once_tui(
