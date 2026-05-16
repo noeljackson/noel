@@ -10,7 +10,7 @@ use pi_ai::{
 };
 use pi_config::{
     auth_for_provider, has_auth_for_provider, load_config, AuthCredential, ConfigPaths,
-    LoadedConfig, ProviderApi as ConfigProviderApi, ResolvedAuth, ENV_SESSION_DIR,
+    LoadedConfig, ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, ENV_SESSION_DIR,
 };
 use pi_core::{
     run_user_turn, ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionExport,
@@ -350,7 +350,8 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
     if !cli.no_skills {
         for skill in &cli.skill {
             if skill.is_file() {
-                config.context_files.push(pi_config::ContextFile {
+                config.skills.push(ResourceFile {
+                    name: resource_name(skill),
                     path: skill.clone(),
                     content: fs::read_to_string(skill)?,
                 });
@@ -360,9 +361,11 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
     if !cli.no_prompt_templates {
         for prompt_template in &cli.prompt_template {
             if prompt_template.is_file() {
-                config
-                    .append_system_prompt
-                    .push(fs::read_to_string(prompt_template)?);
+                config.prompt_templates.push(ResourceFile {
+                    name: resource_name(prompt_template),
+                    path: prompt_template.clone(),
+                    content: fs::read_to_string(prompt_template)?,
+                });
             }
         }
     }
@@ -391,6 +394,13 @@ fn infer_cli_provider(cli: &Cli, config: &LoadedConfig) -> Option<String> {
             })
         })
         .or_else(|| config.settings.default_provider.clone())
+}
+
+fn resource_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("resource")
+        .to_string()
 }
 
 fn resolve_text_or_file(cwd: &Path, value: &str) -> Result<String> {
@@ -585,6 +595,7 @@ async fn run_interactive(
                 let next_generation = runtime.systems().config_generation + 1;
                 let report =
                     runtime.reload(ReloadableSystems::from_config(&config, next_generation))?;
+                print_diagnostics(&config);
                 if !report.active_model_valid {
                     println!("active model is no longer available; use /model <provider/model>");
                 }
@@ -601,8 +612,24 @@ async fn run_interactive(
                 print_settings(&config, &runtime);
                 continue;
             }
+            "/diagnostics" => {
+                print_diagnostics(&config);
+                continue;
+            }
             "/hotkeys" => {
                 print_hotkeys(&config);
+                continue;
+            }
+            "/skills" => {
+                print_resources("skills", &config.skills);
+                continue;
+            }
+            "/prompts" => {
+                print_resources("prompts", &config.prompt_templates);
+                continue;
+            }
+            "/themes" => {
+                print_resources("themes", &config.themes);
                 continue;
             }
             "/scoped-models" => {
@@ -615,6 +642,41 @@ async fn run_interactive(
                     .ok_or_else(|| anyhow!("model not found: {reference}"))?;
                 runtime.set_active_model(Some(model.clone()))?;
                 println!("model: {}/{}", model.provider, model.id);
+                continue;
+            }
+            _ if line.starts_with("/skill:") => {
+                let (name, input) = split_resource_command(&line, "/skill:");
+                let skill = find_resource(&config.skills, name)
+                    .ok_or_else(|| anyhow!("skill not found: {name}"))?;
+                let prompt = if input.is_empty() {
+                    skill.content.clone()
+                } else {
+                    format!("{}\n\n{}", skill.content, input)
+                };
+                match run_prompt(&mut runtime, &config, prompt, offline).await {
+                    Ok(response) => println!("{response}"),
+                    Err(error) => eprintln!("error: {error}"),
+                }
+                continue;
+            }
+            _ if line.starts_with("/prompt ") => {
+                let rest = line.trim_start_matches("/prompt ").trim();
+                let (name, input) = split_once_text(rest);
+                let template = find_resource(&config.prompt_templates, name)
+                    .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
+                let prompt = expand_prompt_template(&template.content, input);
+                match run_prompt(&mut runtime, &config, prompt, offline).await {
+                    Ok(response) => println!("{response}"),
+                    Err(error) => eprintln!("error: {error}"),
+                }
+                continue;
+            }
+            _ if line.starts_with("/theme ") => {
+                let name = line.trim_start_matches("/theme ").trim();
+                let theme = find_resource(&config.themes, name)
+                    .ok_or_else(|| anyhow!("theme not found: {name}"))?;
+                config.settings.theme = Some(theme.name.clone());
+                println!("theme: {}", theme.name);
                 continue;
             }
             "/multiline" => {
@@ -962,6 +1024,53 @@ fn print_hotkeys(config: &LoadedConfig) {
         "{}",
         terminal_renderer(config).keybindings(&keybinding_map(config))
     );
+}
+
+fn print_diagnostics(config: &LoadedConfig) {
+    if config.diagnostics.is_empty() {
+        println!("no diagnostics");
+        return;
+    }
+    for diagnostic in &config.diagnostics {
+        println!("diagnostic: {diagnostic}");
+    }
+}
+
+fn print_resources(kind: &str, resources: &[ResourceFile]) {
+    if resources.is_empty() {
+        println!("no {kind}");
+        return;
+    }
+    for resource in resources {
+        println!("{}\t{}", resource.name, resource.path.display());
+    }
+}
+
+fn find_resource<'a>(resources: &'a [ResourceFile], name: &str) -> Option<&'a ResourceFile> {
+    resources.iter().find(|resource| resource.name == name)
+}
+
+fn split_resource_command<'a>(line: &'a str, prefix: &str) -> (&'a str, &'a str) {
+    let rest = line.trim_start_matches(prefix).trim();
+    split_once_text(rest)
+}
+
+fn split_once_text(value: &str) -> (&str, &str) {
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default().trim();
+    (first, rest)
+}
+
+fn expand_prompt_template(template: &str, input: &str) -> String {
+    if template.contains("{{input}}") {
+        return template.replace("{{input}}", input);
+    }
+    if input.is_empty() {
+        template.to_string()
+    } else {
+        format!("{template}\n\n{input}")
+    }
 }
 
 fn print_scoped_models(config: &LoadedConfig, runtime: &Runtime) {

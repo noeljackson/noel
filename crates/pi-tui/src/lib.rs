@@ -97,8 +97,36 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "show active settings",
     },
     CommandHelp {
+        command: "/diagnostics",
+        description: "show resource reload diagnostics",
+    },
+    CommandHelp {
         command: "/hotkeys",
         description: "show keybindings",
+    },
+    CommandHelp {
+        command: "/skills",
+        description: "list loaded skills",
+    },
+    CommandHelp {
+        command: "/skill:<name> [input]",
+        description: "invoke a loaded skill",
+    },
+    CommandHelp {
+        command: "/prompts",
+        description: "list prompt templates",
+    },
+    CommandHelp {
+        command: "/prompt <name> [input]",
+        description: "invoke a prompt template",
+    },
+    CommandHelp {
+        command: "/themes",
+        description: "list themes",
+    },
+    CommandHelp {
+        command: "/theme <name>",
+        description: "switch theme",
     },
     CommandHelp {
         command: "/models",

@@ -12,6 +12,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 session_name="pi-e2e-${$}"
 session_dir="${repo_root}/target/e2e-tmux-sessions"
 work_dir="${repo_root}/target/e2e-tmux-work"
+agent_dir="${work_dir}/agent"
 prompt_file="${work_dir}/prompt-ready"
 
 cleanup() {
@@ -21,11 +22,14 @@ cleanup() {
 trap cleanup EXIT
 
 rm -rf "${session_dir}" "${work_dir}"
-mkdir -p "${session_dir}" "${work_dir}"
+mkdir -p "${session_dir}" "${work_dir}" "${agent_dir}/skills" "${agent_dir}/prompts" "${agent_dir}/themes"
+printf 'review this\n' > "${agent_dir}/skills/review.md"
+printf 'fix {{input}}\n' > "${agent_dir}/prompts/fix.md"
+printf '{"name":"dark"}\n' > "${agent_dir}/themes/dark.json"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${repo_root}' && '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${repo_root}' && PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -57,6 +61,13 @@ send_line "/session"
 send_line "/name tmux-session"
 send_line "/labels e2e tty"
 send_line "/settings"
+send_line "/diagnostics"
+send_line "/skills"
+send_line "/skill:review skill input"
+send_line "/prompts"
+send_line "/prompt fix broken thing"
+send_line "/themes"
+send_line "/theme dark"
 send_line "/scoped-models"
 send_line "/model"
 send_line "/model 1"
@@ -104,6 +115,13 @@ require_output "[faux/echo] after reload"
 require_output "name: tmux-session"
 require_output "labels: e2e, tty"
 require_output "agent dir:"
+require_output "no diagnostics"
+require_output "review"
+require_output "review this"
+require_output "skill input"
+require_output "fix"
+require_output "fix broken thing"
+require_output "theme: dark"
 require_output "* faux/echo"
 require_output "model: faux/echo"
 require_output "submit"
@@ -194,7 +212,7 @@ grep -Fq "${first_session}" "${work_dir}/session-export.json"
 disabled_session="pi-e2e-disabled-${$}"
 tmux new-session -d -s "${disabled_session}" -x 100 -y 20
 tmux send-keys -t "${disabled_session}" \
-  "cd '${repo_root}' && '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo --no-tools" \
+  "cd '${repo_root}' && PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo --no-tools" \
   Enter
 
 for _ in $(seq 1 80); do

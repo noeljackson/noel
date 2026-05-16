@@ -102,6 +102,9 @@ Supported files:
 - `auth.json`
 - `models.json`
 - `keybindings.json`
+- `skills/`
+- `prompts/`
+- `themes/`
 - `sessions/`
 
 Environment overrides:
@@ -171,7 +174,14 @@ or an object map:
 
 - `/help`
 - `/settings`
+- `/diagnostics`
 - `/hotkeys`
+- `/skills`
+- `/skill:<name> [input]`
+- `/prompts`
+- `/prompt <name> [input]`
+- `/themes`
+- `/theme <name>`
 - `/models`
 - `/scoped-models`
 - `/model <provider/id>`

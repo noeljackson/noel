@@ -212,12 +212,23 @@ pub struct LoadedConfig {
     pub models: Vec<ModelDefinition>,
     pub keybindings: Vec<KeybindingConfig>,
     pub context_files: Vec<ContextFile>,
+    pub skills: Vec<ResourceFile>,
+    pub prompt_templates: Vec<ResourceFile>,
+    pub themes: Vec<ResourceFile>,
+    pub diagnostics: Vec<String>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
+    pub path: PathBuf,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceFile {
+    pub name: String,
     pub path: PathBuf,
     pub content: String,
 }
@@ -237,7 +248,11 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
     let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
         .map(KeybindingsFile::into_keybindings)
         .unwrap_or_default();
+    let mut diagnostics = Vec::new();
     let context_files = load_context_files(&paths.cwd, &paths.agent_dir)?;
+    let skills = load_resource_files(&paths, "skills", &mut diagnostics);
+    let prompt_templates = load_resource_files(&paths, "prompts", &mut diagnostics);
+    let themes = load_resource_files(&paths, "themes", &mut diagnostics);
     let system_prompt = resolve_prompt_input(settings.system_prompt.as_deref())?;
     let append_system_prompt = settings
         .append_system_prompt
@@ -255,6 +270,10 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         models,
         keybindings,
         context_files,
+        skills,
+        prompt_templates,
+        themes,
+        diagnostics,
         system_prompt,
         append_system_prompt,
     })
@@ -501,6 +520,65 @@ fn load_context_file_from_dir(dir: &Path) -> Result<Option<ContextFile>, ConfigE
     Ok(None)
 }
 
+fn load_resource_files(
+    paths: &ConfigPaths,
+    resource_dir_name: &str,
+    diagnostics: &mut Vec<String>,
+) -> Vec<ResourceFile> {
+    let dirs = [
+        paths.agent_dir.join(resource_dir_name),
+        paths.cwd.join(CONFIG_DIR_NAME).join(resource_dir_name),
+    ];
+    let mut resources = BTreeMap::<String, ResourceFile>::new();
+    for dir in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                diagnostics.push(format!("failed to read {}: {error}", dir.display()));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    diagnostics.push(format!(
+                        "failed to read entry in {}: {error}",
+                        dir.display()
+                    ));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    resources.insert(
+                        stem.to_string(),
+                        ResourceFile {
+                            name: stem.to_string(),
+                            path,
+                            content,
+                        },
+                    );
+                }
+                Err(error) => {
+                    diagnostics.push(format!("failed to read {}: {error}", path.display()));
+                }
+            }
+        }
+    }
+    resources.into_values().collect()
+}
+
 fn default_models() -> Vec<ModelDefinition> {
     vec![
         ModelDefinition {
@@ -588,9 +666,15 @@ mod tests {
             r#"{"submit":["enter"],"cancel":["escape"]}"#,
         )
         .expect("write keybindings");
+        fs::create_dir_all(agent_dir.join("skills")).expect("create skills");
+        fs::create_dir_all(agent_dir.join("prompts")).expect("create prompts");
+        fs::create_dir_all(cwd.join(".pi/themes")).expect("create project themes");
+        fs::write(agent_dir.join("skills/review.md"), "review skill").expect("write skill");
+        fs::write(agent_dir.join("prompts/fix.md"), "fix {{input}}").expect("write prompt");
+        fs::write(cwd.join(".pi/themes/dark.json"), r#"{"name":"dark"}"#).expect("write theme");
 
         let config = load_config(ConfigPaths {
-            cwd,
+            cwd: cwd.clone(),
             agent_dir: agent_dir.clone(),
             session_dir: agent_dir.join("sessions"),
             settings_path: agent_dir.join("settings.json"),
@@ -615,6 +699,11 @@ mod tests {
             .keybindings
             .iter()
             .any(|binding| binding.action == "submit" && binding.keys == ["enter"]));
+        assert_eq!(config.skills[0].name, "review");
+        assert_eq!(config.skills[0].content, "review skill");
+        assert_eq!(config.prompt_templates[0].name, "fix");
+        assert_eq!(config.themes[0].name, "dark");
+        assert!(config.diagnostics.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
