@@ -197,6 +197,7 @@ or an object map:
 - `/fork [id|name|path]`
 - `/clone [id|name|path]`
 - `/tree`
+- `/summaries`
 - `/delete [id|name|path]`
 - `/name <name>`
 - `/labels <labels...>`
@@ -221,7 +222,7 @@ or an object map:
 
 `/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
 
-Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context.
+Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries.
 
 ## RPC Methods
 

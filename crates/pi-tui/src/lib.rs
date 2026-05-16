@@ -181,6 +181,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "list session tree",
     },
     CommandHelp {
+        command: "/summaries",
+        description: "show compaction and branch summaries",
+    },
+    CommandHelp {
         command: "/delete [id|name|path]",
         description: "delete a session",
     },
@@ -210,7 +214,7 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "/compact",
-        description: "compact older messages",
+        description: "compact older messages with a summary",
     },
     CommandHelp {
         command: "/login [provider]",

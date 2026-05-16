@@ -47,6 +47,10 @@ pub struct SessionState {
     pub messages: Vec<ConversationMessage>,
     pub tool_history: Vec<ToolEvent>,
     pub queued_messages: Vec<String>,
+    #[serde(default)]
+    pub compactions: Vec<CompactionRecord>,
+    #[serde(default)]
+    pub branch_summaries: Vec<BranchSummary>,
     pub active_model: Option<ModelRef>,
     pub active_tool_names: BTreeSet<String>,
 }
@@ -62,6 +66,8 @@ impl SessionState {
             messages: Vec::new(),
             tool_history: Vec::new(),
             queued_messages: Vec::new(),
+            compactions: Vec::new(),
+            branch_summaries: Vec::new(),
             active_model: None,
             active_tool_names: builtin_tool_definitions()
                 .into_iter()
@@ -79,6 +85,7 @@ pub struct SessionSummary {
     pub name: Option<String>,
     pub labels: BTreeSet<String>,
     pub parent_session_id: Option<String>,
+    pub branch_summary: Option<String>,
     pub modified: Option<SystemTime>,
 }
 
@@ -92,6 +99,10 @@ pub struct SessionExport {
     pub messages: Vec<ConversationMessage>,
     pub tool_history: Vec<ToolEvent>,
     pub queued_messages: Vec<String>,
+    #[serde(default)]
+    pub compactions: Vec<CompactionRecord>,
+    #[serde(default)]
+    pub branch_summaries: Vec<BranchSummary>,
     pub active_model: Option<ModelRef>,
     pub active_tool_names: BTreeSet<String>,
 }
@@ -107,10 +118,35 @@ impl From<&SessionState> for SessionExport {
             messages: state.messages.clone(),
             tool_history: state.tool_history.clone(),
             queued_messages: state.queued_messages.clone(),
+            compactions: state.compactions.clone(),
+            branch_summaries: state.branch_summaries.clone(),
             active_model: state.active_model.clone(),
             active_tool_names: state.active_tool_names.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionRecord {
+    pub kind: CompactionKind,
+    pub omitted_messages: usize,
+    pub retained_messages: usize,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionKind {
+    Manual,
+    Automatic,
+    Retry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchSummary {
+    pub from_session_id: String,
+    pub to_session_id: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -263,6 +299,12 @@ enum SessionRecord {
     QueuedMessagesSnapshot {
         messages: Vec<String>,
     },
+    Compaction {
+        record: CompactionRecord,
+    },
+    BranchSummary {
+        summary: BranchSummary,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +348,11 @@ impl SessionStore {
         } else {
             Some(source.session_id.clone())
         };
+        state.branch_summaries.push(BranchSummary {
+            from_session_id: source.session_id.clone(),
+            to_session_id: session_id,
+            summary: summarize_branch(source),
+        });
         store.write_full_state(&state)?;
         Ok((store, state))
     }
@@ -334,6 +381,8 @@ impl SessionStore {
             messages: export.messages,
             tool_history: export.tool_history,
             queued_messages: export.queued_messages,
+            compactions: export.compactions,
+            branch_summaries: export.branch_summaries,
             active_model: export.active_model,
             active_tool_names: export.active_tool_names,
         };
@@ -393,6 +442,14 @@ impl SessionStore {
         self.append(&SessionRecord::QueuedMessagesSnapshot { messages })
     }
 
+    pub fn record_compaction(&self, record: CompactionRecord) -> Result<(), SessionError> {
+        self.append(&SessionRecord::Compaction { record })
+    }
+
+    pub fn record_branch_summary(&self, summary: BranchSummary) -> Result<(), SessionError> {
+        self.append(&SessionRecord::BranchSummary { summary })
+    }
+
     pub fn export_state(&self, state: &SessionState, path: &Path) -> Result<(), SessionError> {
         write_session_export(state, path)
     }
@@ -442,6 +499,12 @@ impl SessionStore {
                 .and_then(|metadata| metadata.modified().ok());
             let store = Self { path: path.clone() };
             let state = store.load()?;
+            let branch_summary = state
+                .branch_summaries
+                .iter()
+                .rev()
+                .find(|summary| summary.to_session_id == state.session_id)
+                .map(|summary| summary.summary.clone());
             summaries.push(SessionSummary {
                 path,
                 session_id: state.session_id,
@@ -449,6 +512,7 @@ impl SessionStore {
                 name: state.name,
                 labels: state.labels,
                 parent_session_id: state.parent_session_id,
+                branch_summary,
                 modified,
             });
         }
@@ -562,6 +626,16 @@ impl SessionStore {
                         state.queued_messages = messages;
                     }
                 }
+                SessionRecord::Compaction { record } => {
+                    if let Some(state) = &mut state {
+                        state.compactions.push(record);
+                    }
+                }
+                SessionRecord::BranchSummary { summary } => {
+                    if let Some(state) = &mut state {
+                        state.branch_summaries.push(summary);
+                    }
+                }
             }
         }
         Ok(state.unwrap_or_else(|| SessionState::new("recovered", PathBuf::from("."))))
@@ -589,6 +663,12 @@ impl SessionStore {
             self.append(&SessionRecord::QueuedMessage {
                 message: message.clone(),
             })?;
+        }
+        for record in &state.compactions {
+            self.record_compaction(record.clone())?;
+        }
+        for summary in &state.branch_summaries {
+            self.record_branch_summary(summary.clone())?;
         }
         Ok(())
     }
@@ -676,6 +756,20 @@ fn write_jsonl_export(state: &SessionState, path: &Path) -> Result<(), SessionEr
             .cloned()
             .map(|message| SessionRecord::QueuedMessage { message }),
     );
+    records.extend(
+        state
+            .compactions
+            .iter()
+            .cloned()
+            .map(|record| SessionRecord::Compaction { record }),
+    );
+    records.extend(
+        state
+            .branch_summaries
+            .iter()
+            .cloned()
+            .map(|summary| SessionRecord::BranchSummary { summary }),
+    );
     for record in records {
         let line = serde_json::to_string(&record).map_err(|source| SessionError::Parse {
             path: path.to_path_buf(),
@@ -734,6 +828,31 @@ fn write_html_export(state: &SessionState, path: &Path) -> Result<(), SessionErr
             content.push_str("</section>");
         }
     }
+    if !state.compactions.is_empty() {
+        content.push_str("<h2>compactions</h2>");
+        for record in &state.compactions {
+            content.push_str("<section class=\"message\">");
+            content.push_str(&format!(
+                "<div class=\"role\">{:?}</div><pre>{}</pre>",
+                record.kind,
+                escape_html(&record.summary)
+            ));
+            content.push_str("</section>");
+        }
+    }
+    if !state.branch_summaries.is_empty() {
+        content.push_str("<h2>branch summaries</h2>");
+        for summary in &state.branch_summaries {
+            content.push_str("<section class=\"message\">");
+            content.push_str(&format!(
+                "<div class=\"role\">{} to {}</div><pre>{}</pre>",
+                escape_html(&summary.from_session_id),
+                escape_html(&summary.to_session_id),
+                escape_html(&summary.summary)
+            ));
+            content.push_str("</section>");
+        }
+    }
     content.push_str("</body></html>");
     fs::write(path, content).map_err(|source| SessionError::Write {
         path: path.to_path_buf(),
@@ -748,6 +867,62 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn summarize_messages(messages: &[ConversationMessage], omitted_messages: usize) -> String {
+    if omitted_messages == 0 {
+        return "No compaction was needed.".to_string();
+    }
+    let role_counts = messages
+        .iter()
+        .take(omitted_messages)
+        .fold(BTreeSet::new(), |mut roles, message| {
+            roles.insert(format!("{:?}", message.role).to_lowercase());
+            roles
+        })
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let first = messages
+        .first()
+        .map(|message| trim_summary_text(&message.content))
+        .unwrap_or_else(|| "-".to_string());
+    let last_omitted = messages
+        .get(omitted_messages.saturating_sub(1))
+        .map(|message| trim_summary_text(&message.content))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "Compacted {omitted_messages} earlier message(s). Omitted roles: {role_counts}. First omitted: {first}. Last omitted: {last_omitted}."
+    )
+}
+
+fn summarize_branch(source: &SessionState) -> String {
+    let name = source.name.as_deref().unwrap_or("-");
+    let labels = if source.labels.is_empty() {
+        "-".to_string()
+    } else {
+        source.labels.iter().cloned().collect::<Vec<_>>().join(", ")
+    };
+    let last_message = source
+        .messages
+        .last()
+        .map(|message| trim_summary_text(&message.content))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "Branched from {} with name {name}, labels {labels}, {} message(s), and last message: {last_message}.",
+        source.session_id,
+        source.messages.len()
+    )
+}
+
+fn trim_summary_text(value: &str) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= 160 {
+        return collapsed;
+    }
+    let mut trimmed = collapsed.chars().take(157).collect::<String>();
+    trimmed.push_str("...");
+    trimmed
 }
 
 #[derive(Debug, Clone)]
@@ -882,6 +1057,45 @@ impl Runtime {
         let count = self.session.queued_messages.len();
         self.replace_queued_messages(Vec::new())?;
         Ok(count)
+    }
+
+    pub fn compact_messages(
+        &mut self,
+        kind: CompactionKind,
+    ) -> Result<CompactionRecord, SessionError> {
+        let original_count = self.session.messages.len();
+        let retained_messages = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let omitted_messages = original_count.saturating_sub(retained_messages.len());
+        let summary = summarize_messages(&self.session.messages, omitted_messages);
+        let record = CompactionRecord {
+            kind,
+            omitted_messages,
+            retained_messages: retained_messages.len(),
+            summary: summary.clone(),
+        };
+        if omitted_messages > 0 {
+            let mut messages = vec![ConversationMessage {
+                role: MessageRole::System,
+                content: summary,
+            }];
+            messages.extend(retained_messages);
+            self.replace_messages(messages)?;
+        }
+        if let Some(store) = &self.store {
+            store.record_compaction(record.clone())?;
+        }
+        self.session.compactions.push(record.clone());
+        Ok(record)
     }
 
     pub fn reload(&mut self, next: ReloadableSystems) -> Result<ReloadReport, ReloadError> {
@@ -1352,10 +1566,46 @@ mod tests {
             SessionStore::open(fork_store.path().to_path_buf()).expect("open fork");
 
         assert_ne!(forked.session_id, state.session_id);
-        assert_eq!(opened.parent_session_id, Some(state.session_id));
+        assert_eq!(opened.parent_session_id, Some(state.session_id.clone()));
         assert_eq!(opened.name, Some("main".to_string()));
         assert_eq!(opened.labels, BTreeSet::from(["feature".to_string()]));
         assert_eq!(opened.messages[0].content, "parent prompt");
+        assert_eq!(opened.branch_summaries.len(), 1);
+        assert_eq!(opened.branch_summaries[0].from_session_id, state.session_id);
+        assert_eq!(opened.branch_summaries[0].to_session_id, forked.session_id);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn compact_messages_persists_summary_record_and_snapshot() {
+        let base = std::env::temp_dir().join(format!("pi-compact-test-{}", new_session_id()));
+        let (store, mut state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        for index in 0..8 {
+            state.messages.push(ConversationMessage {
+                role: MessageRole::User,
+                content: format!("message {index}"),
+            });
+            store
+                .record_message(state.messages[index].clone())
+                .expect("record message");
+        }
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store.clone());
+
+        let record = runtime
+            .compact_messages(CompactionKind::Manual)
+            .expect("compact messages");
+
+        assert_eq!(record.omitted_messages, 4);
+        assert_eq!(record.retained_messages, 4);
+        assert_eq!(runtime.session().messages.len(), 5);
+        assert_eq!(runtime.session().compactions, [record]);
+        let (_store, loaded) =
+            SessionStore::open(store.path().to_path_buf()).expect("open compacted");
+        assert_eq!(loaded.compactions.len(), 1);
+        assert_eq!(loaded.messages[0].role, MessageRole::System);
+        assert!(loaded.messages[0].content.contains("Compacted 4 earlier"));
 
         let _ = fs::remove_dir_all(base);
     }

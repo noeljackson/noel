@@ -15,7 +15,7 @@ use pi_config::{
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, write_session_export,
-    ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionState, SessionStore,
+    CompactionKind, MessageRole, ReloadableSystems, Runtime, SessionState, SessionStore,
 };
 use pi_tui::{
     Keybinding as TuiKeybinding, KeybindingMap, ModelView, SessionView, SettingsView,
@@ -742,6 +742,10 @@ async fn run_interactive(
                 print_session_tree(&config.paths.session_dir)?;
                 continue;
             }
+            "/summaries" => {
+                print_summaries(&runtime);
+                continue;
+            }
             _ if line.starts_with("/delete") => {
                 let reference = line.trim_start_matches("/delete").trim();
                 let target = if reference.is_empty() {
@@ -817,8 +821,11 @@ async fn run_interactive(
                 continue;
             }
             "/compact" => {
-                compact_session(&mut runtime)?;
-                println!("compacted");
+                let record = runtime.compact_messages(CompactionKind::Manual)?;
+                println!(
+                    "compacted: omitted {} message(s), retained {} message(s)",
+                    record.omitted_messages, record.retained_messages
+                );
                 continue;
             }
             _ if line.starts_with("/login") => {
@@ -924,6 +931,7 @@ async fn run_prompt_with_queue(
     offline: bool,
     stream_output: bool,
 ) -> Result<String> {
+    maybe_auto_compact(runtime, stream_output)?;
     let first_response = run_prompt_once(runtime, config, prompt, offline, stream_output).await?;
     while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
         let remaining = runtime
@@ -940,6 +948,21 @@ async fn run_prompt_with_queue(
         run_prompt_once(runtime, config, prompt, offline, stream_output).await?;
     }
     Ok(first_response)
+}
+
+fn maybe_auto_compact(runtime: &mut Runtime, stream_output: bool) -> Result<()> {
+    const AUTO_COMPACT_MESSAGE_LIMIT: usize = 24;
+    if runtime.session().messages.len() <= AUTO_COMPACT_MESSAGE_LIMIT {
+        return Ok(());
+    }
+    let record = runtime.compact_messages(CompactionKind::Automatic)?;
+    if stream_output && record.omitted_messages > 0 {
+        println!(
+            "auto-compacted: omitted {} message(s)",
+            record.omitted_messages
+        );
+    }
+    Ok(())
 }
 
 async fn run_prompt_once(
@@ -1117,13 +1140,35 @@ fn print_sessions(session_dir: &Path) -> Result<()> {
 fn print_session_tree(session_dir: &Path) -> Result<()> {
     for session in SessionStore::list(session_dir)? {
         let parent = session.parent_session_id.unwrap_or_else(|| "-".to_string());
+        let summary = session.branch_summary.unwrap_or_else(|| "-".to_string());
         println!(
-            "{}\tparent:{parent}\t{}",
+            "{}\tparent:{parent}\tsummary:{summary}\t{}",
             session.session_id,
             session.cwd.display()
         );
     }
     Ok(())
+}
+
+fn print_summaries(runtime: &Runtime) {
+    if runtime.session().compactions.is_empty() && runtime.session().branch_summaries.is_empty() {
+        println!("no summaries");
+        return;
+    }
+    for record in &runtime.session().compactions {
+        println!(
+            "compaction {:?}: omitted {}, retained {}",
+            record.kind, record.omitted_messages, record.retained_messages
+        );
+        println!("{}", record.summary);
+    }
+    for summary in &runtime.session().branch_summaries {
+        println!(
+            "branch {} -> {}",
+            summary.from_session_id, summary.to_session_id
+        );
+        println!("{}", summary.summary);
+    }
 }
 
 fn print_settings(config: &LoadedConfig, runtime: &Runtime) {
@@ -1323,29 +1368,6 @@ fn run_clipboard_command(command: &str, text: &str) -> Result<()> {
     } else {
         Err(anyhow!("clipboard command failed: {command}"))
     }
-}
-
-fn compact_session(runtime: &mut Runtime) -> Result<()> {
-    if runtime.session().messages.len() <= 6 {
-        return Ok(());
-    }
-    let omitted = runtime.session().messages.len().saturating_sub(4);
-    let mut messages = vec![ConversationMessage {
-        role: MessageRole::System,
-        content: format!("Compacted {omitted} earlier messages. Preserve established context from the session log when needed."),
-    }];
-    messages.extend(
-        runtime
-            .session()
-            .messages
-            .iter()
-            .rev()
-            .take(4)
-            .cloned()
-            .rev(),
-    );
-    runtime.replace_messages(messages)?;
-    Ok(())
 }
 
 fn write_auth_file(config: &LoadedConfig) -> Result<()> {
