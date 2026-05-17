@@ -323,10 +323,17 @@ Manual real-provider Opus smoke with Claude Code OAuth:
 make smoke-claude-opus-oauth
 ```
 
-This target is intentionally not part of `check` or `e2e`. It requires
-`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or
+Full manual smoke suite:
+
+```bash
+make test-smoke
+```
+
+The real-provider smoke is intentionally not part of `test`, `check`, or `e2e`.
+It requires `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or
 `~/.claude/.credentials.json`, sends one tiny prompt to
-`anthropic/claude-opus-4-7`, and defaults to `--thinking max`.
+`anthropic/claude-opus-4-7`, and defaults to `--thinking max`. `test-smoke`
+runs local tmux e2e first, then the real-provider Opus OAuth smoke.
 
 ## Development Notes
 
