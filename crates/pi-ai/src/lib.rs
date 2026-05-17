@@ -2010,6 +2010,73 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_ai_gateway_matches_ts_request_shape() {
+        std::env::set_var("CLOUDFLARE_ACCOUNT_ID", "acct_ts_parity");
+        std::env::set_var("CLOUDFLARE_GATEWAY_ID", "gateway_ts_parity");
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/cloudflare-ai-gateway-kimi.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "cloudflare-ai-gateway".to_string(),
+                id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
+            },
+            api: ProviderApi::OpenAi,
+            base_url: Some(
+                "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat"
+                    .to_string(),
+            ),
+            auth: ProviderAuth::ApiKey("cloudflare-key".to_string()),
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+        };
+        let fixture_request = &fixture["request"];
+        let provider = OpenAiProvider {
+            config: config.clone(),
+        };
+
+        assert_eq!(
+            format!(
+                "{}/chat/completions",
+                provider.chat_base_url().expect("base url")
+            ),
+            fixture_request["url"].as_str().expect("fixture url")
+        );
+        let headers = openai_compatible_headers(&config, "cloudflare-key", false).expect("headers");
+        for name in ["accept", "cf-aig-authorization", "content-type"] {
+            if name == "cf-aig-authorization" {
+                assert_eq!(
+                    headers
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.starts_with("Bearer ")),
+                    Some(true)
+                );
+            } else {
+                assert_eq!(
+                    headers.get(name).and_then(|value| value.to_str().ok()),
+                    fixture_request["headers"][name].as_str(),
+                    "header {name}"
+                );
+            }
+        }
+        assert!(headers.get(AUTHORIZATION).is_none());
+
+        let body = openai_chat_completions_body(&config, &request);
+        assert_eq!(body["model"], fixture_request["body"]["model"]);
+        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
+    }
+
+    #[test]
     fn codex_headers_accept_login_tokens_and_api_keys() {
         let login_headers = codex_headers(&ProviderAuth::ChatGptOAuth {
             access_token: "access-token".to_string(),

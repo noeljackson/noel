@@ -1,0 +1,46 @@
+{
+  "source": {
+    "branch": "ts-reference",
+    "script": "/ts-parity/cloudflare-fixture.ts"
+  },
+  "provider": "cloudflare-ai-gateway",
+  "auth": "api-key",
+  "request": {
+    "url": "https://gateway.ai.cloudflare.com/v1/acct_ts_parity/gateway_ts_parity/compat/chat/completions",
+    "method": "POST",
+    "headers": {
+      "accept": "application/json",
+      "cf-aig-authorization": "Bearer <redacted>",
+      "content-type": "application/json",
+      "session_id": "session_ts_parity",
+      "user-agent": "OpenAI/JS 6.26.0",
+      "x-client-request-id": "session_ts_parity",
+      "x-session-affinity": "session_ts_parity",
+      "x-stainless-arch": "x64",
+      "x-stainless-lang": "js",
+      "x-stainless-os": "Linux",
+      "x-stainless-package-version": "6.26.0",
+      "x-stainless-retry-count": "2",
+      "x-stainless-runtime": "node",
+      "x-stainless-runtime-version": "v22.22.3"
+    },
+    "body": {
+      "model": "workers-ai/@cf/moonshotai/kimi-k2.6",
+      "messages": [
+        {
+          "role": "system",
+          "content": "pi rust cli"
+        },
+        {
+          "role": "user",
+          "content": "hello"
+        }
+      ],
+      "stream": true,
+      "stream_options": {
+        "include_usage": true
+      },
+      "max_tokens": 32000
+    }
+  }
+}
