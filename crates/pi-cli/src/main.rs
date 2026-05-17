@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2859,6 +2861,13 @@ async fn handle_tui_submission(
             let (name, input) = split_resource_command(&line, "/extension:");
             let extension = find_resource(&config.extensions, name)
                 .ok_or_else(|| anyhow!("extension not found: {name}"))?;
+            if is_executable_extension(&extension.path) {
+                match run_executable_extension(extension, input, &runtime.session().cwd) {
+                    Ok(output) => app.push(TuiEntryKind::System, output),
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+                return Ok(false);
+            }
             let prompt = if input.is_empty() {
                 extension.content.clone()
             } else {
@@ -3891,6 +3900,66 @@ fn format_queue(runtime: &Runtime) -> String {
 
 fn find_resource<'a>(resources: &'a [ResourceFile], name: &str) -> Option<&'a ResourceFile> {
     resources.iter().find(|resource| resource.name == name)
+}
+
+fn is_executable_extension(path: &Path) -> bool {
+    path.is_file() && is_executable_file(path)
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("exe"))
+        .unwrap_or(false)
+}
+
+fn run_executable_extension(extension: &ResourceFile, input: &str, cwd: &Path) -> Result<String> {
+    let mut child = Command::new(&extension.path)
+        .current_dir(cwd)
+        .env("PI_EXTENSION_NAME", &extension.name)
+        .env("PI_EXTENSION_PATH", &extension.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if !input.is_empty() {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open extension stdin"))?;
+        stdin.write_all(input.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(anyhow!(
+            "extension {} failed:\n{}{}",
+            extension.name,
+            stdout,
+            stderr
+        ));
+    }
+    let mut text = stdout.trim_end().to_string();
+    if !stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(stderr.trim_end());
+    }
+    if text.is_empty() {
+        Ok(format!("extension {} completed", extension.name))
+    } else {
+        Ok(text)
+    }
 }
 
 fn split_resource_command<'a>(line: &'a str, prefix: &str) -> (&'a str, &'a str) {

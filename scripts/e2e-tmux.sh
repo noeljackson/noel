@@ -28,6 +28,12 @@ printf 'review this\n' > "${agent_dir}/skills/review.md"
 printf 'fix {{input}}\n' > "${agent_dir}/prompts/fix.md"
 printf '{"name":"dark"}\n' > "${agent_dir}/themes/dark.json"
 printf 'extension says {{input}}\n' > "${agent_dir}/extensions/assist.md"
+cat > "${agent_dir}/extensions/exec-ext" <<'SH'
+#!/bin/sh
+input="$(cat)"
+printf 'exec-ext saw %s\n' "${input}"
+SH
+chmod +x "${agent_dir}/extensions/exec-ext"
 printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=' | base64 -d > "${work_dir}/pixel.png"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
@@ -103,6 +109,7 @@ send_line "/skills"
 send_line "/skill:review skill input"
 send_line "/extensions"
 send_line "/extension:assist extension input"
+send_line "/extension:exec-ext executable input"
 send_line "/prompts"
 send_line "/prompt fix broken thing"
 send_line "/themes"
@@ -196,6 +203,7 @@ require_output "skill input"
 require_output "assist"
 require_output "extension says {{input}}"
 require_output "extension input"
+require_output "exec-ext saw executable input"
 require_output "fix"
 require_output "fix broken thing"
 require_output "theme: dark"
