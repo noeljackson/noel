@@ -345,6 +345,9 @@ fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> 
     if config.model.provider == "openai-codex" {
         return openai_codex_responses_body(config, request);
     }
+    if config.model.provider == "github-copilot" {
+        return github_copilot_responses_body(config, request);
+    }
     let mut body = json!({
         "model": config.model.id,
         "instructions": request.system_prompt.clone().unwrap_or_default(),
@@ -358,6 +361,23 @@ fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> 
     });
     if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
         body["reasoning"] = json!({ "effort": effort });
+    }
+    body
+}
+
+fn github_copilot_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let mut body = json!({
+        "model": config.model.id,
+        "input": openai_responses_input_with_developer_system(request),
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+    });
+    if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
+        body["reasoning"] = json!({
+            "effort": effort,
+            "summary": "auto",
+        });
     }
     body
 }
@@ -389,6 +409,20 @@ fn openai_codex_responses_body(config: &ProviderConfig, request: &ProviderReques
     body
 }
 
+fn openai_responses_input_with_developer_system(request: &ProviderRequest) -> Vec<Value> {
+    let mut input = Vec::new();
+    if let Some(system_prompt) = request.system_prompt.as_deref() {
+        if !system_prompt.trim().is_empty() {
+            input.push(json!({
+                "role": "developer",
+                "content": system_prompt,
+            }));
+        }
+    }
+    input.extend(openai_responses_input(request));
+    input
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiResponsesEndpoint {
     OpenAi,
@@ -404,7 +438,7 @@ struct OpenAiResponsesProvider {
 #[async_trait]
 impl Provider for OpenAiResponsesProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
-        let (url, headers, model) = self.request_parts()?;
+        let (url, headers, model) = self.request_parts(request_has_media(&request))?;
         let response = reqwest::Client::new()
             .post(url)
             .headers(headers)
@@ -433,7 +467,7 @@ impl Provider for OpenAiResponsesProvider {
 }
 
 impl OpenAiResponsesProvider {
-    fn request_parts(&self) -> Result<(String, HeaderMap, String), ProviderError> {
+    fn request_parts(&self, has_media: bool) -> Result<(String, HeaderMap, String), ProviderError> {
         match self.endpoint {
             OpenAiResponsesEndpoint::OpenAi => {
                 let api_key = self.api_key()?;
@@ -443,9 +477,14 @@ impl OpenAiResponsesProvider {
                         .as_deref()
                         .unwrap_or("https://api.openai.com/v1"),
                 )?;
+                let headers = if self.config.model.provider == "github-copilot" {
+                    openai_compatible_headers(&self.config, &api_key, has_media)?
+                } else {
+                    bearer_headers(&api_key)?
+                };
                 Ok((
                     format!("{}/responses", base_url.trim_end_matches('/')),
-                    bearer_headers(&api_key)?,
+                    headers,
                     self.config.model.id.clone(),
                 ))
             }
@@ -1907,6 +1946,66 @@ mod tests {
         let body = openai_chat_completions_body(&config, &request);
         assert_eq!(body["model"], fixture_request["body"]["model"]);
         assert_eq!(body["messages"], fixture_request["body"]["messages"]);
+        assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
+    }
+
+    #[test]
+    fn github_copilot_matches_ts_responses_request_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/github-copilot-gpt-5.4.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "github-copilot".to_string(),
+                id: "gpt-5.4".to_string(),
+            },
+            api: ProviderApi::OpenAiResponses,
+            base_url: Some("https://api.individual.githubcopilot.com".to_string()),
+            auth: ProviderAuth::ApiKey("copilot-key".to_string()),
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+        };
+        let fixture_request = &fixture["request"];
+        let provider = OpenAiResponsesProvider {
+            config: config.clone(),
+            endpoint: OpenAiResponsesEndpoint::OpenAi,
+        };
+        let (url, headers, _) = provider.request_parts(false).expect("request parts");
+
+        assert_eq!(url, fixture_request["url"].as_str().expect("fixture url"));
+        for name in [
+            "accept",
+            "content-type",
+            "copilot-integration-id",
+            "editor-plugin-version",
+            "editor-version",
+            "openai-intent",
+            "user-agent",
+            "x-initiator",
+        ] {
+            assert_eq!(
+                headers.get(name).and_then(|value| value.to_str().ok()),
+                fixture_request["headers"][name].as_str(),
+                "header {name}"
+            );
+        }
+        assert!(headers.get(AUTHORIZATION).is_some());
+
+        let body = openai_responses_body(&config, &request);
+        assert_eq!(body["model"], fixture_request["body"]["model"]);
+        assert_eq!(body["input"], fixture_request["body"]["input"]);
+        assert_eq!(body["store"], fixture_request["body"]["store"]);
+        assert_eq!(body["stream"], fixture_request["body"]["stream"]);
+        assert_eq!(body["include"], fixture_request["body"]["include"]);
         assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
     }
 

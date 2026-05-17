@@ -1361,7 +1361,7 @@ fn default_models() -> Vec<ModelDefinition> {
             provider: "github-copilot".to_string(),
             id: "gpt-5.4".to_string(),
             name: Some("GitHub Copilot GPT 5.4".to_string()),
-            api: ProviderApi::OpenAi,
+            api: ProviderApi::OpenAiResponses,
             base_url: Some("https://api.individual.githubcopilot.com".to_string()),
         },
         ModelDefinition {
