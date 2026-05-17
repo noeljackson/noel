@@ -1601,6 +1601,56 @@ mod tests {
         }
 
         let body = anthropic_body(&config, &request);
+        assert_eq!(body["model"], fixture_request["body"]["model"]);
+        assert_eq!(body["max_tokens"], fixture_request["body"]["max_tokens"]);
+        assert_eq!(body["system"], fixture_request["body"]["system"]);
+        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
+        assert_eq!(body["thinking"], fixture_request["body"]["thinking"]);
+    }
+
+    #[test]
+    fn anthropic_api_key_matches_ts_body_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/anthropic-api-key.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "anthropic".to_string(),
+                id: "claude-sonnet-4-6".to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("api-key".to_string()),
+            thinking_level: Some("off".to_string()),
+            thinking_budget_tokens: None,
+        };
+        let fixture_request = &fixture["request"];
+
+        let headers = anthropic_headers(&config).expect("anthropic headers");
+        for name in ["accept", "anthropic-version", "content-type"] {
+            assert_eq!(
+                headers.get(name).and_then(|value| value.to_str().ok()),
+                fixture_request["headers"][name].as_str(),
+                "header {name}"
+            );
+        }
+        assert!(headers.get("x-api-key").is_some());
+        assert!(headers.get(AUTHORIZATION).is_none());
+        assert!(headers.get("anthropic-beta").is_none());
+        assert!(headers.get("x-app").is_none());
+
+        let body = anthropic_body(&config, &request);
+        assert_eq!(body["model"], fixture_request["body"]["model"]);
+        assert_eq!(body["max_tokens"], fixture_request["body"]["max_tokens"]);
         assert_eq!(body["system"], fixture_request["body"]["system"]);
         assert_eq!(body["messages"], fixture_request["body"]["messages"]);
         assert_eq!(body["thinking"], fixture_request["body"]["thinking"]);

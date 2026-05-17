@@ -1,5 +1,5 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 type CapturedRequest = {
@@ -30,7 +30,7 @@ async function requestBody(input: RequestInfo | URL, init: RequestInit | undefin
 	return "";
 }
 
-async function captureAnthropicOAuthRequest(): Promise<CapturedRequest> {
+async function captureAnthropicRequest(apiKey: string): Promise<CapturedRequest> {
 	let captured: CapturedRequest | undefined;
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -47,7 +47,7 @@ async function captureAnthropicOAuthRequest(): Promise<CapturedRequest> {
 	};
 
 	try {
-		process.env.ANTHROPIC_API_KEY = "sk-ant-oat-ts-parity-token";
+		process.env.ANTHROPIC_API_KEY = apiKey;
 		const [{ getModel }, { streamSimple }] = await Promise.all([
 			import("/ts-reference/packages/ai/src/models.ts"),
 			import("/ts-reference/packages/ai/src/stream.ts"),
@@ -66,7 +66,7 @@ async function captureAnthropicOAuthRequest(): Promise<CapturedRequest> {
 				],
 			},
 			{
-				apiKey: "sk-ant-oat-ts-parity-token",
+				apiKey,
 				reasoning: undefined,
 				maxTokens: 4096,
 			},
@@ -94,21 +94,33 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 }
 
 async function main() {
-	const outputPath = process.argv[2];
-	if (!outputPath) {
-		throw new Error("usage: anthropic-oauth-fixture.ts <output-path>");
+	const outputDir = process.argv[2];
+	if (!outputDir) {
+		throw new Error("usage: anthropic-oauth-fixture.ts <output-dir>");
 	}
-	const fixture = {
+	await mkdir(outputDir, { recursive: true });
+	await writeFixture(outputDir, "anthropic-claude-code-oauth.json", {
 		source: {
 			branch: "ts-reference",
 			script: fileURLToPath(import.meta.url),
 		},
 		provider: "anthropic",
 		auth: "claude-code-oauth",
-		request: await captureAnthropicOAuthRequest(),
-	};
-	await mkdir(dirname(outputPath), { recursive: true });
-	await writeFile(outputPath, `${JSON.stringify(fixture, null, 2)}\n`);
+		request: await captureAnthropicRequest("sk-ant-oat-ts-parity-token"),
+	});
+	await writeFixture(outputDir, "anthropic-api-key.json", {
+		source: {
+			branch: "ts-reference",
+			script: fileURLToPath(import.meta.url),
+		},
+		provider: "anthropic",
+		auth: "api-key",
+		request: await captureAnthropicRequest("sk-ant-api03-ts-parity-token"),
+	});
+}
+
+async function writeFixture(outputDir: string, name: string, fixture: unknown) {
+	await writeFile(join(outputDir, name), `${JSON.stringify(fixture, null, 2)}\n`);
 }
 
 main().catch((error) => {
