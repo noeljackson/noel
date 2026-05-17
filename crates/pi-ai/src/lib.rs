@@ -286,6 +286,9 @@ impl OpenAiProvider {
 }
 
 fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    if config.model.provider == "openai-codex" {
+        return openai_codex_responses_body(config, request);
+    }
     let mut body = json!({
         "model": config.model.id,
         "instructions": request.system_prompt.clone().unwrap_or_default(),
@@ -299,6 +302,33 @@ fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> 
     });
     if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
         body["reasoning"] = json!({ "effort": effort });
+    }
+    body
+}
+
+fn openai_codex_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let mut body = json!({
+        "model": config.model.id,
+        "store": false,
+        "stream": true,
+        "instructions": request
+            .system_prompt
+            .clone()
+            .filter(|prompt| !prompt.trim().is_empty())
+            .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
+        "input": openai_responses_input(request),
+        "text": {
+            "verbosity": "low",
+        },
+        "include": ["reasoning.encrypted_content"],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+    });
+    if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
+        body["reasoning"] = json!({
+            "effort": effort,
+            "summary": "auto",
+        });
     }
     body
 }
@@ -1703,6 +1733,56 @@ mod tests {
             Some("Bearer token")
         );
         assert!(headers.get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn openai_codex_oauth_matches_ts_request_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/openai-codex-chatgpt-oauth.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "openai-codex".to_string(),
+                id: "gpt-5.5".to_string(),
+            },
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: None,
+            auth: ProviderAuth::ChatGptOAuth {
+                access_token: "access-token".to_string(),
+                account_id: Some("acct_ts_parity".to_string()),
+            },
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+        };
+        let fixture_request = &fixture["request"];
+
+        let headers = codex_headers(&config.auth).expect("codex headers");
+        for name in [
+            "accept",
+            "chatgpt-account-id",
+            "content-type",
+            "openai-beta",
+            "originator",
+        ] {
+            assert_eq!(
+                headers.get(name).and_then(|value| value.to_str().ok()),
+                fixture_request["headers"][name].as_str(),
+                "header {name}"
+            );
+        }
+        assert!(headers.get(AUTHORIZATION).is_some());
+
+        let body = openai_responses_body(&config, &request);
+        assert_eq!(body, fixture_request["body"]);
     }
 
     #[test]

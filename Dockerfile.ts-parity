@@ -16,4 +16,4 @@ RUN npm ci --ignore-scripts
 
 COPY scripts/ts-parity /ts-parity
 
-CMD ["npx", "tsx", "/ts-parity/anthropic-oauth-fixture.ts", "/fixtures"]
+CMD ["sh", "-c", "npx tsx /ts-parity/anthropic-oauth-fixture.ts /fixtures && npx tsx /ts-parity/codex-oauth-fixture.ts /fixtures"]
