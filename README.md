@@ -134,6 +134,7 @@ Environment overrides:
 {
   "defaultProvider": "faux",
   "defaultModel": "echo",
+  "defaultThinkingLevel": "xhigh",
   "enabledModels": ["faux/echo"],
   "enabledTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
   "sessionDir": "sessions",
@@ -210,6 +211,12 @@ Claude Code OAuth and ChatGPT/Codex OAuth refresh are best-effort against the
 same provider auth paths used for model requests. Refresh failures are ignored
 unless verbose logging is enabled.
 
+Thinking levels can be set with `--thinking <level>` or `/thinking <level>`.
+Supported levels are model-specific. Opus exposes `high`, `xhigh`, and `max`;
+OpenAI/Codex reasoning models expose `minimal` through `xhigh`. While the
+`/model` selector is open, left/right adjusts the pending thinking level and
+Enter applies both the model and thinking level to the session.
+
 `keybindings.json` may be either an array:
 
 ```json
@@ -247,6 +254,7 @@ or an object map:
 - `/selector <kind>`
 - `/select <kind> <query>`
 - `/model <provider/id>`
+- `/thinking <level>`
 - `/multiline`
 - `/session`
 - `/changelog`
@@ -308,6 +316,17 @@ Dockerized TTY e2e test:
 ```bash
 make docker-e2e
 ```
+
+Manual real-provider Opus smoke with Claude Code OAuth:
+
+```bash
+make smoke-claude-opus-oauth
+```
+
+This target is intentionally not part of `check` or `e2e`. It requires
+`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or
+`~/.claude/.credentials.json`, sends one tiny prompt to
+`anthropic/claude-opus-4-7`, and defaults to `--thinking max`.
 
 ## Development Notes
 

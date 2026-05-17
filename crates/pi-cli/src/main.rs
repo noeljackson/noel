@@ -1450,10 +1450,16 @@ struct TuiSelectorState {
     filtered_indices: Vec<usize>,
     selected: usize,
     query: String,
+    thinking_level: Option<String>,
 }
 
 impl TuiSelectorState {
-    fn new(kind: impl Into<String>, selector: Selector, query: impl Into<String>) -> Self {
+    fn new(
+        kind: impl Into<String>,
+        selector: Selector,
+        query: impl Into<String>,
+        thinking_level: Option<String>,
+    ) -> Self {
         let mut state = Self {
             kind: kind.into(),
             title: selector.title,
@@ -1461,6 +1467,7 @@ impl TuiSelectorState {
             filtered_indices: Vec::new(),
             selected: 0,
             query: query.into(),
+            thinking_level,
         };
         state.refresh_filter();
         state
@@ -1518,6 +1525,118 @@ impl TuiSelectorState {
         self.selected = 0;
         self.refresh_filter();
     }
+
+    fn cycle_thinking(&mut self, delta: isize) {
+        let Some(item) = self.selected_item() else {
+            return;
+        };
+        let Some(model) = model_ref_from_value(&item.value) else {
+            return;
+        };
+        let levels = model_thinking_levels(&model);
+        if levels.is_empty() {
+            return;
+        }
+        let current = self
+            .thinking_level
+            .as_deref()
+            .and_then(normalized_thinking_level)
+            .filter(|level| levels.contains(level))
+            .or_else(|| default_thinking_for_model(&model))
+            .unwrap_or("off");
+        let current_index = levels
+            .iter()
+            .position(|level| *level == current)
+            .unwrap_or(0);
+        let step = delta.unsigned_abs() % levels.len();
+        let next_index = if delta.is_negative() {
+            (current_index + levels.len() - step) % levels.len()
+        } else {
+            (current_index + step) % levels.len()
+        };
+        self.thinking_level = Some(levels[next_index].to_string());
+    }
+
+    fn selected_thinking_level(&self) -> Option<String> {
+        let item = self.selected_item()?;
+        let model = model_ref_from_value(&item.value)?;
+        let levels = model_thinking_levels(&model);
+        if levels.is_empty() {
+            return None;
+        }
+        let level = self
+            .thinking_level
+            .as_deref()
+            .and_then(normalized_thinking_level)
+            .filter(|level| levels.contains(level))
+            .or_else(|| default_thinking_for_model(&model))?;
+        Some(level.to_string())
+    }
+}
+
+fn model_ref_from_value(value: &str) -> Option<ModelRef> {
+    let (provider, id) = value.split_once('/')?;
+    Some(ModelRef {
+        provider: provider.to_string(),
+        id: id.to_string(),
+    })
+}
+
+fn model_thinking_levels(model: &ModelRef) -> &'static [&'static str] {
+    match model.provider.as_str() {
+        "anthropic" => {
+            if model.id.contains("opus") && supports_anthropic_adaptive_thinking(&model.id) {
+                &["off", "high", "xhigh", "max"]
+            } else if supports_anthropic_adaptive_thinking(&model.id) {
+                &["off", "low", "medium", "high", "xhigh"]
+            } else if model.id.contains("claude-") {
+                &["off", "minimal", "low", "medium", "high"]
+            } else {
+                &[]
+            }
+        }
+        "openai" | "openai-codex" | "azure-openai-responses" => {
+            if model.id.starts_with("gpt-5") || model.id.contains("codex") {
+                &["off", "minimal", "low", "medium", "high", "xhigh"]
+            } else {
+                &[]
+            }
+        }
+        _ => &[],
+    }
+}
+
+fn default_thinking_for_model(model: &ModelRef) -> Option<&'static str> {
+    let levels = model_thinking_levels(model);
+    if levels.contains(&"xhigh") {
+        Some("xhigh")
+    } else if levels.contains(&"high") {
+        Some("high")
+    } else {
+        None
+    }
+}
+
+fn normalized_thinking_level(level: &str) -> Option<&'static str> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" => Some("off"),
+        "minimal" | "min" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" | "med" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "extra-high" | "extra_high" => Some("xhigh"),
+        "max" => Some("max"),
+        _ => None,
+    }
+}
+
+fn supports_anthropic_adaptive_thinking(model_id: &str) -> bool {
+    model_id.contains("opus-4-6")
+        || model_id.contains("opus-4.6")
+        || model_id.contains("opus-4-7")
+        || model_id.contains("opus-4.7")
+        || model_id.contains("sonnet-4-6")
+        || model_id.contains("sonnet-4.6")
 }
 
 #[derive(Debug, Default)]
@@ -1765,6 +1884,17 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
             Style::default().fg(Color::DarkGray),
         )));
     }
+    if let Some(level) = selector.selected_thinking_level() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("thinking ", Style::default().fg(Color::DarkGray)),
+            Span::styled(level, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "  left/right to adjust",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
     let title = format!(" {} selector  enter select  esc cancel ", selector.title);
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -1871,6 +2001,16 @@ fn handle_tui_selector_key(
                 selector.move_selection(1);
             }
         }
+        KeyCode::Left => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.cycle_thinking(-1);
+            }
+        }
+        KeyCode::Right => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.cycle_thinking(1);
+            }
+        }
         KeyCode::Backspace => {
             if let Some(selector) = app.selector.as_mut() {
                 selector.pop_query_char();
@@ -1903,7 +2043,16 @@ fn open_tui_selector(
         app.push(TuiEntryKind::System, format!("no {kind}"));
         return Ok(());
     }
-    let state = TuiSelectorState::new(kind, selector, query);
+    let thinking_level = if matches!(kind, "model" | "models" | "scoped-models") {
+        runtime
+            .session()
+            .active_thinking_level
+            .clone()
+            .or_else(|| config.settings.default_thinking_level.clone())
+    } else {
+        None
+    };
+    let state = TuiSelectorState::new(kind, selector, query, thinking_level);
     app.push(TuiEntryKind::System, format!("{} selector", state.title));
     app.selector = Some(state);
     Ok(())
@@ -1923,10 +2072,12 @@ fn apply_tui_selector_selection(
         "model" | "models" | "scoped-models" => {
             let model = resolve_model_reference(config, &item.value)
                 .ok_or_else(|| anyhow!("model not found: {}", item.value))?;
+            let thinking = selector.selected_thinking_level();
             runtime.set_active_model(Some(model.clone()))?;
+            runtime.set_active_thinking_level(thinking.clone())?;
             app.push(
                 TuiEntryKind::System,
-                format!("model: {}/{}", model.provider, model.id),
+                format_model_selection(&model, thinking.as_deref()),
             );
         }
         "theme" | "themes" => {
@@ -2001,6 +2152,13 @@ async fn handle_tui_submission(
                 .map(|model| format!("{}/{}", model.provider, model.id))
                 .collect::<Vec<_>>()
                 .join("\n"),
+        ),
+        "/thinking" => app.push(
+            TuiEntryKind::System,
+            format!(
+                "thinking: {}",
+                active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string())
+            ),
         ),
         "/model" | "/scoped-models" => open_tui_selector(app, config, runtime, "model", "")?,
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
@@ -2158,11 +2316,33 @@ async fn handle_tui_submission(
             let reference = line.trim_start_matches("/model ").trim();
             let model = resolve_model_reference(config, reference)
                 .ok_or_else(|| anyhow!("model not found: {reference}"))?;
+            let thinking = active_thinking_level(runtime, config, &model);
             runtime.set_active_model(Some(model.clone()))?;
+            runtime.set_active_thinking_level(thinking.clone())?;
             app.push(
                 TuiEntryKind::System,
-                format!("model: {}/{}", model.provider, model.id),
+                format_model_selection(&model, thinking.as_deref()),
             );
+        }
+        _ if line.starts_with("/thinking ") => {
+            let level = line.trim_start_matches("/thinking ").trim();
+            let level = normalized_thinking_level(level)
+                .ok_or_else(|| anyhow!("unknown thinking level: {level}"))?;
+            if let Some(model) = runtime.session().active_model.clone() {
+                if !model_thinking_levels(&model).contains(&level) {
+                    return Err(anyhow!(
+                        "thinking level {level} is not supported by {}/{}",
+                        model.provider,
+                        model.id
+                    ));
+                }
+            }
+            runtime.set_active_thinking_level(if level == "off" {
+                None
+            } else {
+                Some(level.to_string())
+            })?;
+            app.push(TuiEntryKind::System, format!("thinking: {level}"));
         }
         _ if line.starts_with("/skill:") => {
             let (name, input) = split_resource_command(&line, "/skill:");
@@ -2566,12 +2746,57 @@ fn provider_for_runtime(
                 model.id
             )
         })?;
+    let thinking_level = active_thinking_level(runtime, config, &model);
     Ok(create_provider(ProviderConfig {
+        thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
+        thinking_level,
         model,
         api: map_provider_api(&definition.api),
         base_url: definition.base_url.clone(),
         auth: map_provider_auth(auth_for_provider(&config.auth, &definition.provider)),
     }))
+}
+
+fn active_thinking_level(
+    runtime: &Runtime,
+    config: &LoadedConfig,
+    model: &ModelRef,
+) -> Option<String> {
+    let level = runtime
+        .session()
+        .active_thinking_level
+        .as_deref()
+        .or(config.settings.default_thinking_level.as_deref())
+        .and_then(normalized_thinking_level)
+        .or_else(|| default_thinking_for_model(model))?;
+    if model_thinking_levels(model).contains(&level) && level != "off" {
+        Some(level.to_string())
+    } else {
+        None
+    }
+}
+
+fn active_thinking_label(runtime: &Runtime, config: &LoadedConfig) -> Option<String> {
+    let model = runtime.session().active_model.as_ref()?;
+    active_thinking_level(runtime, config, model)
+}
+
+fn thinking_budget_tokens(config: &LoadedConfig, level: Option<&str>) -> Option<u64> {
+    let budgets = config.settings.thinking_budgets.as_ref()?;
+    match level {
+        Some("minimal") => budgets.minimal,
+        Some("low") => budgets.low,
+        Some("medium") => budgets.medium,
+        Some("high") | Some("xhigh") | Some("max") => budgets.high,
+        _ => None,
+    }
+}
+
+fn format_model_selection(model: &ModelRef, thinking: Option<&str>) -> String {
+    match thinking {
+        Some(level) => format!("model: {}/{}\nthinking: {level}", model.provider, model.id),
+        None => format!("model: {}/{}", model.provider, model.id),
+    }
 }
 
 fn map_provider_auth(auth: Option<ResolvedAuth>) -> ProviderAuth {
@@ -2798,13 +3023,14 @@ fn format_hotkeys(config: &LoadedConfig) -> String {
 
 fn format_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) -> String {
     format!(
-        "status\tmodel:{}\ttheme:{}\tqueue:{}\thistory:{}\tdiagnostics:{}",
+        "status\tmodel:{}\tthinking:{}\ttheme:{}\tqueue:{}\thistory:{}\tdiagnostics:{}",
         runtime
             .session()
             .active_model
             .as_ref()
             .map(|model| format!("{}/{}", model.provider, model.id))
             .unwrap_or_else(|| "-".to_string()),
+        active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string()),
         config
             .settings
             .theme
@@ -2920,8 +3146,10 @@ fn select_from_selector_message(
         "model" | "models" | "scoped-models" => {
             let model = resolve_model_reference(config, &item.value)
                 .ok_or_else(|| anyhow!("model not found: {}", item.value))?;
+            let thinking = active_thinking_level(runtime, config, &model);
             runtime.set_active_model(Some(model.clone()))?;
-            Ok(format!("model: {}/{}", model.provider, model.id))
+            runtime.set_active_thinking_level(thinking.clone())?;
+            Ok(format_model_selection(&model, thinking.as_deref()))
         }
         "theme" | "themes" => {
             config.settings.theme = Some(item.value.clone());

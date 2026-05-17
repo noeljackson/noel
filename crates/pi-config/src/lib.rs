@@ -1331,6 +1331,13 @@ fn default_models() -> Vec<ModelDefinition> {
         },
         ModelDefinition {
             provider: "anthropic".to_string(),
+            id: "claude-opus-4-7".to_string(),
+            name: Some("Claude Opus 4.7".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: None,
+        },
+        ModelDefinition {
+            provider: "anthropic".to_string(),
             id: "claude-opus-4-20250514".to_string(),
             name: Some("Claude Opus 4".to_string()),
             api: ProviderApi::Anthropic,
@@ -1340,6 +1347,13 @@ fn default_models() -> Vec<ModelDefinition> {
             provider: "anthropic".to_string(),
             id: "claude-sonnet-4-5".to_string(),
             name: Some("Claude Sonnet".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: None,
+        },
+        ModelDefinition {
+            provider: "anthropic".to_string(),
+            id: "claude-sonnet-4-6".to_string(),
+            name: Some("Claude Sonnet 4.6".to_string()),
             api: ProviderApi::Anthropic,
             base_url: None,
         },
@@ -1841,6 +1855,8 @@ mod tests {
             .collect::<Vec<_>>();
         for model in [
             "anthropic/claude-opus-4-1-20250805",
+            "anthropic/claude-opus-4-7",
+            "anthropic/claude-sonnet-4-6",
             "openai-codex/gpt-5.4",
             "openai-codex/gpt-5.4-mini",
             "openai-codex/gpt-5.5",

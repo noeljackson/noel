@@ -56,6 +56,8 @@ pub struct SessionState {
     #[serde(default)]
     pub branch_summaries: Vec<BranchSummary>,
     pub active_model: Option<ModelRef>,
+    #[serde(default)]
+    pub active_thinking_level: Option<String>,
     pub active_tool_names: BTreeSet<String>,
 }
 
@@ -73,6 +75,7 @@ impl SessionState {
             compactions: Vec::new(),
             branch_summaries: Vec::new(),
             active_model: None,
+            active_thinking_level: None,
             active_tool_names: builtin_tool_definitions()
                 .into_iter()
                 .map(|definition| definition.name)
@@ -108,6 +111,8 @@ pub struct SessionExport {
     #[serde(default)]
     pub branch_summaries: Vec<BranchSummary>,
     pub active_model: Option<ModelRef>,
+    #[serde(default)]
+    pub active_thinking_level: Option<String>,
     pub active_tool_names: BTreeSet<String>,
 }
 
@@ -125,6 +130,7 @@ impl From<&SessionState> for SessionExport {
             compactions: state.compactions.clone(),
             branch_summaries: state.branch_summaries.clone(),
             active_model: state.active_model.clone(),
+            active_thinking_level: state.active_thinking_level.clone(),
             active_tool_names: state.active_tool_names.clone(),
         }
     }
@@ -332,6 +338,9 @@ enum SessionRecord {
     ActiveModel {
         model: Option<ModelRef>,
     },
+    ActiveThinkingLevel {
+        level: Option<String>,
+    },
     ActiveTools {
         tools: Vec<String>,
     },
@@ -426,6 +435,7 @@ impl SessionStore {
             compactions: export.compactions,
             branch_summaries: export.branch_summaries,
             active_model: export.active_model,
+            active_thinking_level: export.active_thinking_level,
             active_tool_names: export.active_tool_names,
         };
         store.write_full_state(&state)?;
@@ -459,6 +469,10 @@ impl SessionStore {
 
     pub fn record_active_model(&self, model: Option<ModelRef>) -> Result<(), SessionError> {
         self.append(&SessionRecord::ActiveModel { model })
+    }
+
+    pub fn record_active_thinking_level(&self, level: Option<String>) -> Result<(), SessionError> {
+        self.append(&SessionRecord::ActiveThinkingLevel { level })
     }
 
     pub fn record_active_tools(&self, tools: Vec<String>) -> Result<(), SessionError> {
@@ -653,6 +667,11 @@ impl SessionStore {
                         state.active_model = model;
                     }
                 }
+                SessionRecord::ActiveThinkingLevel { level } => {
+                    if let Some(state) = &mut state {
+                        state.active_thinking_level = level;
+                    }
+                }
                 SessionRecord::ActiveTools { tools } => {
                     if let Some(state) = &mut state {
                         state.active_tool_names = tools.into_iter().collect();
@@ -694,6 +713,7 @@ impl SessionStore {
         })?;
         self.record_metadata(state)?;
         self.record_active_model(state.active_model.clone())?;
+        self.record_active_thinking_level(state.active_thinking_level.clone())?;
         self.record_active_tools(state.active_tool_names.iter().cloned().collect())?;
         for message in &state.messages {
             self.record_message(message.clone())?;
@@ -1043,6 +1063,14 @@ impl Runtime {
             store.record_active_model(model.clone())?;
         }
         self.session.active_model = model;
+        Ok(())
+    }
+
+    pub fn set_active_thinking_level(&mut self, level: Option<String>) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_active_thinking_level(level.clone())?;
+        }
+        self.session.active_thinking_level = level;
         Ok(())
     }
 
@@ -1618,9 +1646,13 @@ mod tests {
             content: "hello".to_string(),
             media: Vec::new(),
         });
+        state.active_thinking_level = Some("xhigh".to_string());
         store
             .record_message(state.messages[0].clone())
             .expect("record message");
+        store
+            .record_active_thinking_level(state.active_thinking_level.clone())
+            .expect("record thinking");
 
         let (_store, loaded) =
             SessionStore::open(store.path().to_path_buf()).expect("open session");
@@ -1628,6 +1660,7 @@ mod tests {
         assert_eq!(loaded.cwd, PathBuf::from("/repo"));
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].content, "hello");
+        assert_eq!(loaded.active_thinking_level, Some("xhigh".to_string()));
 
         let _ = fs::remove_dir_all(base);
     }
@@ -1825,6 +1858,8 @@ mod tests {
             api: ProviderApi::Faux,
             base_url: None,
             auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
         });
 
         let response = run_user_turn(&mut runtime, provider.as_ref(), "hello".to_string())
@@ -1851,6 +1886,8 @@ mod tests {
             api: ProviderApi::Faux,
             base_url: None,
             auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
         });
         let mut deltas = Vec::new();
 
@@ -2018,6 +2055,8 @@ mod tests {
             api: ProviderApi::Faux,
             base_url: None,
             auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
         });
 
         let error = run_user_turn(

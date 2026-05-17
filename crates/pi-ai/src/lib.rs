@@ -50,6 +50,8 @@ pub struct ProviderConfig {
     pub api: ProviderApi,
     pub base_url: Option<String>,
     pub auth: ProviderAuth,
+    pub thinking_level: Option<String>,
+    pub thinking_budget_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -245,17 +247,7 @@ impl OpenAiProvider {
         let response = reqwest::Client::new()
             .post(url)
             .headers(chatgpt_headers(&self.config.auth)?)
-            .json(&json!({
-                "model": self.config.model.id,
-                "instructions": request.system_prompt.clone().unwrap_or_default(),
-                "input": openai_responses_input(&request),
-                "tools": [],
-                "tool_choice": "auto",
-                "parallel_tool_calls": false,
-                "store": false,
-                "stream": true,
-                "include": [],
-            }))
+            .json(&openai_responses_body(&self.config, &request))
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
@@ -293,6 +285,24 @@ impl OpenAiProvider {
     }
 }
 
+fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let mut body = json!({
+        "model": config.model.id,
+        "instructions": request.system_prompt.clone().unwrap_or_default(),
+        "input": openai_responses_input(request),
+        "tools": [],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "store": false,
+        "stream": true,
+        "include": [],
+    });
+    if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
+        body["reasoning"] = json!({ "effort": effort });
+    }
+    body
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiResponsesEndpoint {
     OpenAi,
@@ -312,17 +322,11 @@ impl Provider for OpenAiResponsesProvider {
         let response = reqwest::Client::new()
             .post(url)
             .headers(headers)
-            .json(&json!({
-                "model": model,
-                "instructions": request.system_prompt.clone().unwrap_or_default(),
-                "input": openai_responses_input(&request),
-                "tools": [],
-                "tool_choice": "auto",
-                "parallel_tool_calls": false,
-                "store": false,
-                "stream": true,
-                "include": [],
-            }))
+            .json(&{
+                let mut body = openai_responses_body(&self.config, &request);
+                body["model"] = json!(model);
+                body
+            })
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
@@ -438,12 +442,7 @@ impl Provider for AnthropicProvider {
         let response = reqwest::Client::new()
             .post(url)
             .headers(headers)
-            .json(&json!({
-                "model": self.config.model.id,
-                "max_tokens": 4096,
-                "system": request.system_prompt.unwrap_or_default(),
-                "messages": anthropic_messages(&request.messages),
-            }))
+            .json(&anthropic_body(&self.config, &request))
             .send()
             .await?;
         let response = error_for_status_with_body(response)
@@ -484,6 +483,89 @@ impl AnthropicProvider {
                 provider: self.config.model.provider.clone(),
             }),
         }
+    }
+}
+
+fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let mut body = json!({
+        "model": config.model.id,
+        "max_tokens": 4096,
+        "system": request.system_prompt.clone().unwrap_or_default(),
+        "messages": anthropic_messages(&request.messages),
+    });
+    apply_anthropic_thinking(&mut body, config);
+    body
+}
+
+fn apply_anthropic_thinking(body: &mut Value, config: &ProviderConfig) {
+    let Some(level) = normalized_thinking_level(config.thinking_level.as_deref()) else {
+        return;
+    };
+    if level == "off" {
+        body["thinking"] = json!({ "type": "disabled" });
+        return;
+    }
+    if supports_anthropic_adaptive_thinking(&config.model.id) {
+        body["thinking"] = json!({
+            "type": "adaptive",
+            "display": "summarized",
+        });
+        body["output_config"] = json!({
+            "effort": anthropic_adaptive_effort(&config.model.id, level),
+        });
+    } else {
+        body["thinking"] = json!({
+            "type": "enabled",
+            "budget_tokens": config.thinking_budget_tokens.unwrap_or(1024).max(1024),
+            "display": "summarized",
+        });
+    }
+}
+
+fn supports_anthropic_adaptive_thinking(model_id: &str) -> bool {
+    model_id.contains("opus-4-6")
+        || model_id.contains("opus-4.6")
+        || model_id.contains("opus-4-7")
+        || model_id.contains("opus-4.7")
+        || model_id.contains("sonnet-4-6")
+        || model_id.contains("sonnet-4.6")
+}
+
+fn anthropic_adaptive_effort(model_id: &str, level: &str) -> &'static str {
+    match level {
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" if model_id.contains("opus") => "max",
+        "max" => "xhigh",
+        _ => "high",
+    }
+}
+
+fn openai_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
+    match normalized_thinking_level(level)? {
+        "off" => Some("none"),
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" => Some("xhigh"),
+        "max" => Some("xhigh"),
+        _ => None,
+    }
+}
+
+fn normalized_thinking_level(level: Option<&str>) -> Option<&'static str> {
+    match level?.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" => Some("off"),
+        "minimal" | "min" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" | "med" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "extra-high" | "extra_high" => Some("xhigh"),
+        "max" => Some("max"),
+        _ => None,
     }
 }
 
@@ -1234,6 +1316,8 @@ mod tests {
             api: ProviderApi::Faux,
             base_url: None,
             auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
         });
 
         let events = provider
@@ -1367,6 +1451,46 @@ mod tests {
     }
 
     #[test]
+    fn thinking_levels_map_to_provider_payloads() {
+        let request = ProviderRequest {
+            system_prompt: Some("system".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let opus = ProviderConfig {
+            model: ModelRef {
+                provider: "anthropic".to_string(),
+                id: "claude-opus-4-7".to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: Some("max".to_string()),
+            thinking_budget_tokens: None,
+        };
+        let opus_body = anthropic_body(&opus, &request);
+        assert_eq!(opus_body["thinking"]["type"], "adaptive");
+        assert_eq!(opus_body["output_config"]["effort"], "max");
+
+        let codex = ProviderConfig {
+            model: ModelRef {
+                provider: "openai-codex".to_string(),
+                id: "gpt-5.5".to_string(),
+            },
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+        };
+        let codex_body = openai_responses_body(&codex, &request);
+        assert_eq!(codex_body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
     fn openai_compatible_headers_cover_copilot_and_cloudflare() {
         let copilot = ProviderConfig {
             model: ModelRef {
@@ -1376,6 +1500,8 @@ mod tests {
             api: ProviderApi::OpenAi,
             base_url: Some("https://api.individual.githubcopilot.com".to_string()),
             auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
         };
         let headers = openai_compatible_headers(&copilot, "token", true).expect("copilot headers");
         assert_eq!(
@@ -1399,6 +1525,8 @@ mod tests {
             api: ProviderApi::OpenAi,
             base_url: None,
             auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
         };
         let headers =
             openai_compatible_headers(&cloudflare, "token", false).expect("cloudflare headers");

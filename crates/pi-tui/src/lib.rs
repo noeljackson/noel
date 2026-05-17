@@ -189,6 +189,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "switch model by id or number",
     },
     CommandHelp {
+        command: "/thinking <level>",
+        description: "set model thinking effort",
+    },
+    CommandHelp {
         command: "/multiline",
         description: "enter a multiline prompt",
     },

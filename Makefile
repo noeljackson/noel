@@ -5,7 +5,7 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 
-.PHONY: help build release install run fmt lint test check ci e2e docker-build docker-e2e clean
+.PHONY: help build release install run fmt lint test check ci e2e docker-build docker-e2e smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -21,6 +21,7 @@ help:
 		'  ci           Run check and local tmux e2e' \
 		'  e2e          Run tmux TTY e2e' \
 		'  docker-e2e   Build and run Dockerized tmux TTY e2e' \
+		'  smoke-claude-opus-oauth  Run manual Claude Opus OAuth smoke' \
 		'  clean        Remove Cargo build output'
 
 build:
@@ -58,6 +59,9 @@ docker-build:
 
 docker-e2e: docker-build
 	$(DOCKER) run --rm $(E2E_IMAGE)
+
+smoke-claude-opus-oauth:
+	CARGO="$(CARGO)" scripts/smoke-claude-opus-oauth.sh
 
 clean:
 	$(CARGO) clean
