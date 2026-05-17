@@ -1,6 +1,7 @@
 use std::env;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -967,10 +968,29 @@ fn chatgpt_headers(auth: &ProviderAuth) -> Result<HeaderMap, ProviderError> {
     );
     if let Some(account_id) = account_id {
         headers.insert("ChatGPT-Account-ID", HeaderValue::from_str(account_id)?);
+    } else if let Some(account_id) = extract_chatgpt_account_id(access_token)? {
+        headers.insert("ChatGPT-Account-ID", HeaderValue::from_str(&account_id)?);
     }
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     Ok(headers)
+}
+
+fn extract_chatgpt_account_id(token: &str) -> Result<Option<String>, ProviderError> {
+    let parts = token.split('.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Ok(None);
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| ProviderError::Config("failed to extract ChatGPT account id".to_string()))?;
+    let payload = serde_json::from_slice::<Value>(&payload)
+        .map_err(|_| ProviderError::Config("failed to extract ChatGPT account id".to_string()))?;
+    Ok(payload
+        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string))
 }
 
 fn codex_headers(auth: &ProviderAuth) -> Result<HeaderMap, ProviderError> {
@@ -1808,6 +1828,27 @@ mod tests {
             Some("Bearer api-key")
         );
         assert!(api_key_headers.get("ChatGPT-Account-ID").is_none());
+    }
+
+    #[test]
+    fn codex_headers_extract_account_id_from_chatgpt_jwt() {
+        let token = concat!(
+            "eyJhbGciOiJub25lIn0.",
+            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9mcm9tX2p3dCJ9fQ.",
+            "signature"
+        );
+        let headers = codex_headers(&ProviderAuth::ChatGptOAuth {
+            access_token: token.to_string(),
+            account_id: None,
+        })
+        .expect("codex headers");
+
+        assert_eq!(
+            headers
+                .get("ChatGPT-Account-ID")
+                .and_then(|value| value.to_str().ok()),
+            Some("acct_from_jwt")
+        );
     }
 
     #[test]
