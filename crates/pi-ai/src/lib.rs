@@ -827,19 +827,22 @@ impl Provider for MistralProvider {
                 "{}/chat/completions",
                 base_url.trim_end_matches('/')
             ))
-            .headers(bearer_headers(&api_key)?)
-            .json(&json!({
-                "model": self.config.model.id,
-                "messages": openai_messages(&request),
-                "stream": false,
-            }))
+            .headers(mistral_headers(&api_key)?)
+            .json(&mistral_chat_body(&self.config, &request))
             .send()
             .await?;
+        let body = error_for_status_with_body(response).await?.text().await?;
+        if let Some(text) = parse_openai_chat_completions_sse_text(&body) {
+            return Ok(vec![
+                StreamEvent::Text(text),
+                StreamEvent::Stop {
+                    reason: "stop".to_string(),
+                },
+            ]);
+        }
         parse_openai_chat_response(
-            error_for_status_with_body(response)
-                .await?
-                .json::<Value>()
-                .await?,
+            serde_json::from_str::<Value>(&body)
+                .map_err(|_| ProviderError::InvalidResponse(body.clone()))?,
         )
     }
 }
@@ -853,6 +856,25 @@ impl MistralProvider {
             }),
         }
     }
+}
+
+fn mistral_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
+    let mut headers = bearer_headers(api_key)?;
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("mistral-client-typescript/2.2.1"),
+    );
+    Ok(headers)
+}
+
+fn mistral_chat_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    json!({
+        "model": config.model.id,
+        "max_tokens": 32000,
+        "stream": true,
+        "messages": openai_messages(request),
+    })
 }
 
 struct BedrockProvider {
@@ -1395,6 +1417,33 @@ fn parse_openai_responses_sse_text(body: &str) -> Option<String> {
     }
 }
 
+fn parse_openai_chat_completions_sse_text(body: &str) -> Option<String> {
+    let mut text = String::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let Some(delta) = event
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        text.push_str(delta);
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 fn parse_openai_responses_item_text(item: &Value) -> Option<String> {
     let text = item
         .get("content")
@@ -1601,6 +1650,20 @@ mod tests {
 
         assert_eq!(
             parse_openai_responses_sse_text(body),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_openai_chat_completions_sse_delta_text() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: [DONE]\n"
+        );
+
+        assert_eq!(
+            parse_openai_chat_completions_sse_text(body),
             Some("hello".to_string())
         );
     }
@@ -2073,6 +2136,50 @@ mod tests {
 
         let body = openai_chat_completions_body(&config, &request);
         assert_eq!(body["model"], fixture_request["body"]["model"]);
+        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
+    }
+
+    #[test]
+    fn mistral_devstral_matches_ts_request_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/mistral-devstral.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "mistral".to_string(),
+                id: "devstral-medium-latest".to_string(),
+            },
+            api: ProviderApi::Mistral,
+            base_url: Some("https://api.mistral.ai/v1".to_string()),
+            auth: ProviderAuth::ApiKey("mistral-key".to_string()),
+            thinking_level: Some("high".to_string()),
+            thinking_budget_tokens: None,
+        };
+        let fixture_request = &fixture["request"];
+        let headers = mistral_headers("mistral-key").expect("headers");
+
+        for name in ["accept", "content-type", "user-agent"] {
+            assert_eq!(
+                headers.get(name).and_then(|value| value.to_str().ok()),
+                fixture_request["headers"][name].as_str(),
+                "header {name}"
+            );
+        }
+        assert!(headers.get(AUTHORIZATION).is_some());
+
+        let body = mistral_chat_body(&config, &request);
+        assert_eq!(body["model"], fixture_request["body"]["model"]);
+        assert_eq!(body["max_tokens"], fixture_request["body"]["max_tokens"]);
+        assert_eq!(body["stream"], fixture_request["body"]["stream"]);
         assert_eq!(body["messages"], fixture_request["body"]["messages"]);
     }
 
