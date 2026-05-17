@@ -197,7 +197,6 @@ impl Provider for OpenAiProvider {
             "{}/chat/completions",
             self.chat_base_url()?.trim_end_matches('/')
         );
-        let messages = openai_messages(&request);
         let response = reqwest::Client::new()
             .post(url)
             .headers(openai_compatible_headers(
@@ -205,10 +204,7 @@ impl Provider for OpenAiProvider {
                 &api_key,
                 request_has_media(&request),
             )?)
-            .json(&json!({
-                "model": self.config.model.id,
-                "messages": messages,
-            }))
+            .json(&openai_chat_completions_body(&self.config, &request))
             .send()
             .await?;
         let response = error_for_status_with_body(response)
@@ -283,6 +279,65 @@ impl OpenAiProvider {
                 .as_deref()
                 .unwrap_or("https://api.openai.com/v1"),
         )
+    }
+}
+
+fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let mut body = json!({
+        "model": config.model.id,
+        "messages": openai_chat_messages(config, request),
+    });
+    if config.model.provider == "openrouter" {
+        if let Some(effort) = openrouter_reasoning_effort(config.thinking_level.as_deref()) {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+    }
+    body
+}
+
+fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> Vec<Value> {
+    let mut messages = Vec::new();
+    if let Some(system_prompt) = &request.system_prompt {
+        let role = if config.model.provider == "openrouter" {
+            "developer"
+        } else {
+            "system"
+        };
+        messages.push(json!({ "role": role, "content": system_prompt }));
+    }
+    messages.extend(request.messages.iter().map(|message| {
+        let content = if message.media.is_empty() {
+            json!(message.content)
+        } else {
+            let mut parts = vec![json!({
+                "type": "text",
+                "text": message.content,
+            })];
+            parts.extend(message.media.iter().map(|media| {
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": media_data_url(media),
+                    },
+                })
+            }));
+            Value::Array(parts)
+        };
+        json!({
+            "role": role_name(&message.role),
+            "content": content,
+        })
+    }));
+    messages
+}
+
+fn openrouter_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
+    match normalized_thinking_level(level)? {
+        "off" => Some("none"),
+        "minimal" | "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "xhigh" | "max" => Some("high"),
+        _ => None,
     }
 }
 
@@ -930,6 +985,7 @@ fn openai_compatible_headers(
         }
     }
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     Ok(headers)
 }
 
@@ -1803,6 +1859,55 @@ mod tests {
 
         let body = openai_responses_body(&config, &request);
         assert_eq!(body, fixture_request["body"]);
+    }
+
+    #[test]
+    fn openrouter_kimi_matches_ts_request_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/openrouter-kimi.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "openrouter".to_string(),
+                id: "moonshotai/kimi-k2.6".to_string(),
+            },
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            auth: ProviderAuth::ApiKey("openrouter-key".to_string()),
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+        };
+        let fixture_request = &fixture["request"];
+
+        let headers = openai_compatible_headers(&config, "openrouter-key", false).expect("headers");
+        for name in ["accept", "content-type"] {
+            assert_eq!(
+                headers.get(name).and_then(|value| value.to_str().ok()),
+                fixture_request["headers"][name].as_str(),
+                "header {name}"
+            );
+        }
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.starts_with("Bearer ")),
+            Some(true)
+        );
+
+        let body = openai_chat_completions_body(&config, &request);
+        assert_eq!(body["model"], fixture_request["body"]["model"]);
+        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
+        assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
     }
 
     #[test]
