@@ -1,0 +1,48 @@
+{
+  "source": {
+    "branch": "ts-reference",
+    "script": "/ts-parity/bedrock-fixture.ts"
+  },
+  "provider": "amazon-bedrock",
+  "auth": "payload-only",
+  "payload": {
+    "modelId": "us.anthropic.claude-opus-4-6-v1",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "text": "hello"
+          },
+          {
+            "cachePoint": {
+              "type": "default"
+            }
+          }
+        ]
+      }
+    ],
+    "system": [
+      {
+        "text": "pi rust cli"
+      },
+      {
+        "cachePoint": {
+          "type": "default"
+        }
+      }
+    ],
+    "inferenceConfig": {
+      "maxTokens": 32000
+    },
+    "additionalModelRequestFields": {
+      "thinking": {
+        "type": "adaptive",
+        "display": "summarized"
+      },
+      "output_config": {
+        "effort": "max"
+      }
+    }
+  }
+}

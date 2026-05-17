@@ -997,14 +997,7 @@ impl Provider for BedrockProvider {
                 encode_path_segment(&self.config.model.id)
             ))
             .headers(bearer_headers(&bearer_token)?)
-            .json(&json!({
-                "modelId": self.config.model.id,
-                "system": request.system_prompt.map(|text| vec![json!({ "text": text })]).unwrap_or_default(),
-                "messages": bedrock_messages(&request.messages),
-                "inferenceConfig": {
-                    "maxTokens": 4096,
-                },
-            }))
+            .json(&bedrock_body(&self.config, &request))
             .send()
             .await?;
         parse_bedrock_response(
@@ -1013,6 +1006,107 @@ impl Provider for BedrockProvider {
                 .json::<Value>()
                 .await?,
         )
+    }
+}
+
+fn bedrock_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let mut body = json!({
+        "modelId": config.model.id,
+        "messages": bedrock_messages_with_cache(config, &request.messages),
+        "inferenceConfig": {
+            "maxTokens": 32000,
+        },
+    });
+    if let Some(system) = bedrock_system(config, request.system_prompt.as_deref()) {
+        body["system"] = system;
+    }
+    if let Some(fields) = bedrock_additional_model_request_fields(config) {
+        body["additionalModelRequestFields"] = fields;
+    }
+    body
+}
+
+fn bedrock_system(config: &ProviderConfig, system_prompt: Option<&str>) -> Option<Value> {
+    let system_prompt = system_prompt?;
+    let mut blocks = vec![json!({ "text": system_prompt })];
+    if bedrock_supports_prompt_cache(&config.model.id) {
+        blocks.push(json!({ "cachePoint": { "type": "default" } }));
+    }
+    Some(Value::Array(blocks))
+}
+
+fn bedrock_messages_with_cache(config: &ProviderConfig, messages: &[ChatMessage]) -> Vec<Value> {
+    let mut messages = bedrock_messages(messages);
+    if bedrock_supports_prompt_cache(&config.model.id) {
+        if let Some(last_user) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        {
+            if let Some(content) = last_user.get_mut("content").and_then(Value::as_array_mut) {
+                content.push(json!({ "cachePoint": { "type": "default" } }));
+            }
+        }
+    }
+    messages
+}
+
+fn bedrock_additional_model_request_fields(config: &ProviderConfig) -> Option<Value> {
+    let level = normalized_thinking_level(config.thinking_level.as_deref())?;
+    if !bedrock_is_anthropic_claude(&config.model.id) || level == "off" {
+        return None;
+    }
+    if bedrock_supports_adaptive_thinking(&config.model.id) {
+        return Some(json!({
+            "thinking": {
+                "type": "adaptive",
+                "display": "summarized",
+            },
+            "output_config": {
+                "effort": bedrock_adaptive_effort(&config.model.id, level),
+            },
+        }));
+    }
+    Some(json!({
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": config.thinking_budget_tokens.unwrap_or(1024).max(1024),
+            "display": "summarized",
+        },
+        "anthropic_beta": ["interleaved-thinking-2025-05-14"],
+    }))
+}
+
+fn bedrock_is_anthropic_claude(model_id: &str) -> bool {
+    model_id.to_ascii_lowercase().contains("claude")
+}
+
+fn bedrock_supports_prompt_cache(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase();
+    normalized.contains("-4-")
+        || normalized.contains("claude-3-7-sonnet")
+        || normalized.contains("claude-3-5-haiku")
+}
+
+fn bedrock_supports_adaptive_thinking(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase().replace(['_', '.', ':'], "-");
+    normalized.contains("opus-4-6")
+        || normalized.contains("opus-4-7")
+        || normalized.contains("sonnet-4-6")
+}
+
+fn bedrock_adaptive_effort(model_id: &str, level: &str) -> &'static str {
+    let normalized = model_id.to_ascii_lowercase().replace(['_', '.', ':'], "-");
+    if level == "max" || (level == "xhigh" && normalized.contains("opus-4-6")) {
+        return "max";
+    }
+    if level == "xhigh" && normalized.contains("opus-4-7") {
+        return "xhigh";
+    }
+    match level {
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        _ => "high",
     }
 }
 
@@ -2282,6 +2376,36 @@ mod tests {
         assert!(headers.get("x-goog-api-key").is_some());
 
         assert_eq!(google_body(&config, &request), fixture_request["body"]);
+    }
+
+    #[test]
+    fn bedrock_claude_opus_matches_ts_payload_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/bedrock-claude-opus-4.6.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "amazon-bedrock".to_string(),
+                id: "us.anthropic.claude-opus-4-6-v1".to_string(),
+            },
+            api: ProviderApi::Bedrock,
+            base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
+            auth: ProviderAuth::ApiKey("bedrock-key".to_string()),
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        assert_eq!(bedrock_body(&config, &request), fixture["payload"]);
     }
 
     #[test]
