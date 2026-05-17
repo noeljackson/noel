@@ -233,6 +233,7 @@ or an object map:
 
 - `/help`
 - `/settings`
+- `/settings show`
 - `/status`
 - `/diagnostics`
 - `/hotkeys`

@@ -94,7 +94,7 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "/settings",
-        description: "show active settings",
+        description: "open settings selector",
     },
     CommandHelp {
         command: "/status",

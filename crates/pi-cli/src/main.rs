@@ -19,8 +19,9 @@ use pi_ai::{
 };
 use pi_config::{
     auth_for_provider, has_auth_for_provider, load_config, read_model_cache, write_model_cache,
-    AuthCredential, ConfigPaths, LoadedConfig, ModelCache, ModelDefinition,
-    ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, Settings, ENV_SESSION_DIR,
+    AuthCredential, CompactionSettings, ConfigPaths, ImageSettings, LoadedConfig, ModelCache,
+    ModelDefinition, ModelRefreshSettings, ProviderApi as ConfigProviderApi, ResolvedAuth,
+    ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings, ENV_SESSION_DIR,
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
@@ -1895,7 +1896,12 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
             ),
         ]));
     }
-    let title = format!(" {} selector  enter select  esc cancel ", selector.title);
+    let action = if selector.kind == "settings" {
+        "enter toggle"
+    } else {
+        "enter select"
+    };
+    let title = format!(" {} selector  {action}  esc cancel ", selector.title);
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -2017,7 +2023,14 @@ fn handle_tui_selector_key(
             }
         }
         KeyCode::Enter => {
-            if let Some(selector) = app.selector.take() {
+            let is_settings = app
+                .selector
+                .as_ref()
+                .map(|selector| selector.kind == "settings")
+                .unwrap_or(false);
+            if is_settings {
+                apply_tui_settings_selection(app, runtime, config)?;
+            } else if let Some(selector) = app.selector.take() {
                 apply_tui_selector_selection(app, runtime, config, selector)?;
             }
         }
@@ -2118,6 +2131,226 @@ fn apply_tui_selector_selection(
     Ok(())
 }
 
+fn apply_tui_settings_selection(
+    app: &mut TuiApp,
+    runtime: &mut Runtime,
+    config: &mut LoadedConfig,
+) -> Result<()> {
+    let Some(selector) = app.selector.take() else {
+        return Ok(());
+    };
+    let selected = selector.selected;
+    let query = selector.query.clone();
+    let Some(item) = selector.selected_item().cloned() else {
+        app.selector = Some(selector);
+        app.push(TuiEntryKind::System, "no selector match");
+        return Ok(());
+    };
+    let message = apply_settings_item(config, runtime, &item.value)?;
+    let mut next = TuiSelectorState::new(
+        "settings",
+        selector_for_kind(config, runtime, "settings")?,
+        query,
+        None,
+    );
+    if !next.filtered_indices.is_empty() {
+        next.selected = selected.min(next.filtered_indices.len() - 1);
+    }
+    app.selector = Some(next);
+    app.push(TuiEntryKind::System, message);
+    Ok(())
+}
+
+fn apply_settings_item(
+    config: &mut LoadedConfig,
+    runtime: &mut Runtime,
+    key: &str,
+) -> Result<String> {
+    let message = match key {
+        "compaction.enabled" => {
+            let next = !auto_compaction_enabled(config);
+            config
+                .settings
+                .compaction
+                .get_or_insert_with(CompactionSettings::default)
+                .enabled = Some(next);
+            write_user_setting(
+                &config.paths.settings_path,
+                &["compaction", "enabled"],
+                next.into(),
+            )?;
+            format!("setting compaction.enabled: {}", on_off(next))
+        }
+        "terminal.showImages" => {
+            let next = !config
+                .settings
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.show_images)
+                .unwrap_or(false);
+            config
+                .settings
+                .terminal
+                .get_or_insert_with(TerminalSettings::default)
+                .show_images = Some(next);
+            write_user_setting(
+                &config.paths.settings_path,
+                &["terminal", "showImages"],
+                next.into(),
+            )?;
+            format!("setting terminal.showImages: {}", on_off(next))
+        }
+        "images.autoResize" => {
+            let next = !config
+                .settings
+                .images
+                .as_ref()
+                .and_then(|images| images.auto_resize)
+                .unwrap_or(false);
+            config
+                .settings
+                .images
+                .get_or_insert_with(ImageSettings::default)
+                .auto_resize = Some(next);
+            write_user_setting(
+                &config.paths.settings_path,
+                &["images", "autoResize"],
+                next.into(),
+            )?;
+            format!("setting images.autoResize: {}", on_off(next))
+        }
+        "images.blockImages" => {
+            let next = !images_blocked(config);
+            config
+                .settings
+                .images
+                .get_or_insert_with(ImageSettings::default)
+                .block_images = Some(next);
+            write_user_setting(
+                &config.paths.settings_path,
+                &["images", "blockImages"],
+                next.into(),
+            )?;
+            format!("setting images.blockImages: {}", on_off(next))
+        }
+        "retry.enabled" => {
+            let next = !config
+                .settings
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.enabled)
+                .unwrap_or(true);
+            config
+                .settings
+                .retry
+                .get_or_insert_with(RetrySettings::default)
+                .enabled = Some(next);
+            write_user_setting(
+                &config.paths.settings_path,
+                &["retry", "enabled"],
+                next.into(),
+            )?;
+            format!("setting retry.enabled: {}", on_off(next))
+        }
+        "modelRefresh.enabled" => {
+            let next = !model_refresh_enabled(&config.settings);
+            config
+                .settings
+                .model_refresh
+                .get_or_insert_with(ModelRefreshSettings::default)
+                .enabled = Some(next);
+            write_user_setting(
+                &config.paths.settings_path,
+                &["modelRefresh", "enabled"],
+                next.into(),
+            )?;
+            format!("setting modelRefresh.enabled: {}", on_off(next))
+        }
+        "hideThinkingBlock" => {
+            let next = !config.settings.hide_thinking_block.unwrap_or(false);
+            config.settings.hide_thinking_block = Some(next);
+            write_user_setting(
+                &config.paths.settings_path,
+                &["hideThinkingBlock"],
+                next.into(),
+            )?;
+            format!("setting hideThinkingBlock: {}", on_off(next))
+        }
+        "warnings.anthropicExtraUsage" => {
+            let next = !config
+                .settings
+                .warnings
+                .as_ref()
+                .and_then(|warnings| warnings.anthropic_extra_usage)
+                .unwrap_or(true);
+            config
+                .settings
+                .warnings
+                .get_or_insert_with(WarningSettings::default)
+                .anthropic_extra_usage = Some(next);
+            write_user_setting(
+                &config.paths.settings_path,
+                &["warnings", "anthropicExtraUsage"],
+                next.into(),
+            )?;
+            format!("setting warnings.anthropicExtraUsage: {}", on_off(next))
+        }
+        "followUpMode" => {
+            let next = if follow_up_mode(config) == "one-at-a-time" {
+                "all"
+            } else {
+                "one-at-a-time"
+            };
+            config.settings.follow_up_mode = Some(next.to_string());
+            write_user_setting(&config.paths.settings_path, &["followUpMode"], next.into())?;
+            format!("setting followUpMode: {next}")
+        }
+        _ => return Err(anyhow!("unknown setting: {key}")),
+    };
+    let next_generation = runtime.systems().config_generation + 1;
+    runtime.reload(ReloadableSystems::from_config(config, next_generation))?;
+    Ok(message)
+}
+
+fn write_user_setting(path: &Path, keys: &[&str], value: serde_json::Value) -> Result<()> {
+    if keys.is_empty() {
+        return Err(anyhow!("settings key path is empty"));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut settings = if path.exists() {
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path)?)?
+    } else {
+        serde_json::json!({})
+    };
+    if !settings.is_object() {
+        return Err(anyhow!(
+            "settings file must contain a JSON object: {}",
+            path.display()
+        ));
+    }
+    let mut current = &mut settings;
+    for key in &keys[..keys.len() - 1] {
+        if !current
+            .get(*key)
+            .map(|value| value.is_object())
+            .unwrap_or(false)
+        {
+            current[*key] = serde_json::json!({});
+        }
+        current = current
+            .get_mut(*key)
+            .ok_or_else(|| anyhow!("failed to create settings object: {key}"))?;
+    }
+    current[keys[keys.len() - 1]] = value;
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?),
+    )?;
+    Ok(())
+}
+
 async fn handle_tui_submission(
     app: &mut TuiApp,
     terminal: &mut TuiTerminal,
@@ -2163,7 +2396,8 @@ async fn handle_tui_submission(
         "/model" | "/scoped-models" => open_tui_selector(app, config, runtime, "model", "")?,
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
         "/changelog" => app.push(TuiEntryKind::System, format_changelog()),
-        "/settings" => app.push(TuiEntryKind::System, format_settings(config, runtime)),
+        "/settings" => open_tui_selector(app, config, runtime, "settings", "")?,
+        "/settings show" => app.push(TuiEntryKind::System, format_settings(config, runtime)),
         "/status" => app.push(
             TuiEntryKind::System,
             format_status(config, runtime, &app.editor_state),
@@ -2541,7 +2775,7 @@ async fn run_prompt_with_queue_tui(
     media: Vec<MediaInput>,
     offline: bool,
 ) -> Result<()> {
-    maybe_auto_compact(runtime, false)?;
+    maybe_auto_compact(runtime, config, false)?;
     run_prompt_once_tui(app, terminal, runtime, config, prompt, media, offline).await?;
     while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
         let remaining = runtime
@@ -2654,8 +2888,15 @@ async fn run_prompt_media(
     run_prompt_once(runtime, config, prompt, media, offline, false).await
 }
 
-fn maybe_auto_compact(runtime: &mut Runtime, stream_output: bool) -> Result<()> {
+fn maybe_auto_compact(
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    stream_output: bool,
+) -> Result<()> {
     const AUTO_COMPACT_MESSAGE_LIMIT: usize = 24;
+    if !auto_compaction_enabled(config) {
+        return Ok(());
+    }
     if runtime.session().messages.len() <= AUTO_COMPACT_MESSAGE_LIMIT {
         return Ok(());
     }
@@ -2667,6 +2908,15 @@ fn maybe_auto_compact(runtime: &mut Runtime, stream_output: bool) -> Result<()> 
         );
     }
     Ok(())
+}
+
+fn auto_compaction_enabled(config: &LoadedConfig) -> bool {
+    config
+        .settings
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.enabled)
+        .unwrap_or(true)
 }
 
 async fn run_prompt_once(
@@ -3240,7 +3490,90 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
                 })
                 .collect(),
         )),
+        "settings" => Ok(Selector::new("settings", settings_selector_items(config))),
         _ => Err(anyhow!("unknown selector: {kind}")),
+    }
+}
+
+fn settings_selector_items(config: &LoadedConfig) -> Vec<SelectorItem> {
+    vec![
+        bool_setting_item(
+            "auto compact",
+            "compaction.enabled",
+            auto_compaction_enabled(config),
+        ),
+        bool_setting_item(
+            "show images",
+            "terminal.showImages",
+            config
+                .settings
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.show_images)
+                .unwrap_or(false),
+        ),
+        bool_setting_item(
+            "auto resize images",
+            "images.autoResize",
+            config
+                .settings
+                .images
+                .as_ref()
+                .and_then(|images| images.auto_resize)
+                .unwrap_or(false),
+        ),
+        bool_setting_item("block images", "images.blockImages", images_blocked(config)),
+        bool_setting_item(
+            "provider retry",
+            "retry.enabled",
+            config
+                .settings
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.enabled)
+                .unwrap_or(true),
+        ),
+        bool_setting_item(
+            "background model refresh",
+            "modelRefresh.enabled",
+            model_refresh_enabled(&config.settings),
+        ),
+        bool_setting_item(
+            "hide thinking block",
+            "hideThinkingBlock",
+            config.settings.hide_thinking_block.unwrap_or(false),
+        ),
+        bool_setting_item(
+            "Anthropic extra usage warning",
+            "warnings.anthropicExtraUsage",
+            config
+                .settings
+                .warnings
+                .as_ref()
+                .and_then(|warnings| warnings.anthropic_extra_usage)
+                .unwrap_or(true),
+        ),
+        SelectorItem {
+            label: format!("follow-up mode: {}", follow_up_mode(config)),
+            value: "followUpMode".to_string(),
+            active: follow_up_mode(config) == "one-at-a-time",
+        },
+    ]
+}
+
+fn bool_setting_item(label: &str, value: &str, active: bool) -> SelectorItem {
+    SelectorItem {
+        label: format!("{label}: {}", on_off(active)),
+        value: value.to_string(),
+        active,
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
     }
 }
 

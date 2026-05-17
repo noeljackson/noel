@@ -94,6 +94,10 @@ send_line "/changelog"
 send_line "/name tmux-session"
 send_line "/labels e2e tty"
 send_line "/settings"
+send_enter
+tmux send-keys -t "${session_name}" Escape
+sleep 0.35
+send_line "/settings show"
 send_line "/diagnostics"
 send_line "/skills"
 send_line "/skill:review skill input"
@@ -182,6 +186,8 @@ require_output "What's New"
 require_output "No changelog entries found."
 require_output "name: tmux-session"
 require_output "labels: e2e, tty"
+require_output "settings selector"
+require_output "setting compaction.enabled: off"
 require_output "agent dir:"
 require_output "no diagnostics"
 require_output "review"
@@ -317,6 +323,7 @@ if [ ! -f "${work_dir}/clipboard.txt" ]; then
   exit 1
 fi
 grep -Fq "[faux/echo] fix broken thing" "${work_dir}/clipboard.txt"
+grep -Fq '"enabled": false' "${agent_dir}/settings.json"
 
 printf '{"followUpMode":"one-at-a-time"}\n' > "${agent_dir}/settings.json"
 one_follow_session="pi-e2e-one-follow-${$}"
