@@ -19,9 +19,10 @@ use pi_ai::{
 };
 use pi_config::{
     auth_for_provider, has_auth_for_provider, load_config, read_model_cache, write_model_cache,
-    AuthCredential, CompactionSettings, ConfigPaths, ImageSettings, LoadedConfig, ModelCache,
-    ModelDefinition, ModelRefreshSettings, ProviderApi as ConfigProviderApi, ResolvedAuth,
-    ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings, ENV_SESSION_DIR,
+    AuthCredential, AuthData, CompactionSettings, ConfigPaths, ImageSettings, LoadedConfig,
+    ModelCache, ModelDefinition, ModelRefreshSettings, ProviderApi as ConfigProviderApi,
+    ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
+    ENV_SESSION_DIR,
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
@@ -34,7 +35,7 @@ use pi_tui::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -181,8 +182,97 @@ fn try_run_package_command() -> Result<bool> {
             run_package_config(&args[1..])?;
             Ok(true)
         }
+        "login" => {
+            run_auth_login(&args[1..])?;
+            Ok(true)
+        }
+        "logout" => {
+            run_auth_logout(&args[1..])?;
+            Ok(true)
+        }
         _ => Ok(false),
     }
+}
+
+fn run_auth_login(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_auth_help("login");
+        return Ok(());
+    }
+    let mut provider = None;
+    let mut api_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--api-key" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(anyhow!("--api-key requires a value"));
+                };
+                api_key = Some(value.clone());
+            }
+            value if value.starts_with('-') => {
+                return Err(anyhow!("unknown login option: {value}"))
+            }
+            value => {
+                if provider.replace(value.to_string()).is_some() {
+                    return Err(anyhow!("unexpected login argument: {value}"));
+                }
+            }
+        }
+        index += 1;
+    }
+    let provider =
+        provider.ok_or_else(|| anyhow!("usage: pi login <provider> --api-key <key|env:VAR|->"))?;
+    let key = match api_key {
+        Some(value) if value == "-" => {
+            let mut input = String::new();
+            io::stdin().read_to_string(&mut input)?;
+            input.trim().to_string()
+        }
+        Some(value) => value,
+        None => default_api_key_env(&provider)
+            .and_then(|name| {
+                std::env::var(name)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|_| format!("env:{name}"))
+            })
+            .ok_or_else(|| anyhow!("usage: pi login {provider} --api-key <key|env:VAR|->"))?,
+    };
+    if key.trim().is_empty() {
+        return Err(anyhow!("api key is empty"));
+    }
+    let cwd = std::env::current_dir()?;
+    let paths = ConfigPaths::discover(cwd, None)?;
+    let mut auth = read_auth_data(&paths.auth_path)?;
+    auth.insert(provider.clone(), AuthCredential::ApiKey { key });
+    write_auth_data(&paths.auth_path, &auth)?;
+    println!(
+        "stored API-key auth for {provider} in {}",
+        paths.auth_path.display()
+    );
+    Ok(())
+}
+
+fn run_auth_logout(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_auth_help("logout");
+        return Ok(());
+    }
+    let [provider] = args else {
+        return Err(anyhow!("usage: pi logout <provider>"));
+    };
+    let cwd = std::env::current_dir()?;
+    let paths = ConfigPaths::discover(cwd, None)?;
+    let mut auth = read_auth_data(&paths.auth_path)?;
+    if auth.remove(provider).is_some() {
+        write_auth_data(&paths.auth_path, &auth)?;
+        println!("removed stored auth for {provider}");
+    } else {
+        println!("no stored auth for {provider}");
+    }
+    Ok(())
 }
 
 fn run_package_install(args: &[String]) -> Result<()> {
@@ -388,6 +478,39 @@ fn read_settings_packages(path: &Path) -> Result<Vec<String>> {
     Ok(settings.packages)
 }
 
+fn read_auth_data(path: &Path) -> Result<AuthData> {
+    if !path.exists() {
+        return Ok(AuthData::default());
+    }
+    Ok(serde_json::from_str::<AuthData>(&fs::read_to_string(
+        path,
+    )?)?)
+}
+
+fn write_auth_data(path: &Path, auth: &AuthData) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{}\n", serde_json::to_string_pretty(auth)?))?;
+    Ok(())
+}
+
+fn default_api_key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "openai-codex" => Some("CODEX_API_KEY"),
+        "google" => Some("GEMINI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "mistral" => Some("MISTRAL_API_KEY"),
+        "github-copilot" => Some("COPILOT_GITHUB_TOKEN"),
+        "azure-openai-responses" => Some("AZURE_OPENAI_API_KEY"),
+        "cloudflare-ai-gateway" | "cloudflare-workers-ai" => Some("CLOUDFLARE_API_KEY"),
+        "amazon-bedrock" => Some("AWS_BEARER_TOKEN_BEDROCK"),
+        _ => None,
+    }
+}
+
 fn print_package_help(command: &str) {
     match command {
         "install" => println!("usage: pi install <source> [-l]\n\nRecord a package source in settings."),
@@ -395,6 +518,16 @@ fn print_package_help(command: &str) {
         "update" => println!("usage: pi update [source|self|pi]\n\nRust no-npm builds reload local resources at startup."),
         "list" => println!("usage: pi list\n\nList package sources from user and project settings."),
         "config" => println!("usage: pi config\n\nShow active resource configuration."),
+        _ => {}
+    }
+}
+
+fn print_auth_help(command: &str) {
+    match command {
+        "login" => println!(
+            "usage: pi login <provider> [--api-key <key|env:VAR|->]\n\nStore API-key auth in ~/.pi/agent/auth.json. Without --api-key, pi stores env:<provider default> when that environment variable is present."
+        ),
+        "logout" => println!("usage: pi logout <provider>\n\nRemove stored provider auth."),
         _ => {}
     }
 }
@@ -1651,6 +1784,7 @@ struct TuiApp {
     header_title: String,
     header_line: String,
     status: String,
+    show_hardware_cursor: bool,
 }
 
 impl TuiApp {
@@ -1698,6 +1832,7 @@ impl TuiApp {
             session.queued_messages.len()
         );
         self.status = footer_status(config, runtime, &self.editor_state);
+        self.show_hardware_cursor = config.settings.show_hardware_cursor.unwrap_or(true);
     }
 
     fn push(&mut self, kind: TuiEntryKind, text: impl Into<String>) {
@@ -1762,6 +1897,7 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
     draw_input(frame, root[2], app);
     draw_footer(frame, root[3], app);
     draw_selector_overlay(frame, app);
+    set_tui_cursor(frame, root[2], app);
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -1908,6 +2044,40 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
+fn set_tui_cursor(frame: &mut Frame<'_>, input_area: Rect, app: &TuiApp) {
+    if !app.show_hardware_cursor {
+        return;
+    }
+    if let Some(selector) = &app.selector {
+        let area = centered_rect(frame.area(), 82, 68);
+        let filter_prefix_width = 7;
+        let max_x = area.right().saturating_sub(2);
+        let x = area
+            .x
+            .saturating_add(1)
+            .saturating_add(filter_prefix_width)
+            .saturating_add(selector.query.chars().count() as u16)
+            .min(max_x);
+        let y = area
+            .y
+            .saturating_add(1)
+            .min(area.bottom().saturating_sub(2));
+        frame.set_cursor_position(Position::new(x, y));
+        return;
+    }
+    let max_x = input_area.right().saturating_sub(2);
+    let x = input_area
+        .x
+        .saturating_add(1)
+        .saturating_add(app.input.chars().count() as u16)
+        .min(max_x);
+    let y = input_area
+        .y
+        .saturating_add(1)
+        .min(input_area.bottom().saturating_sub(2));
+    frame.set_cursor_position(Position::new(x, y));
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let mut output = chars.by_ref().take(max_chars).collect::<String>();
@@ -1970,7 +2140,10 @@ async fn handle_tui_key(
                 {
                     Ok(quit) => quit,
                     Err(error) => {
-                        app.push(TuiEntryKind::Error, format!("{error}"));
+                        app.push(
+                            TuiEntryKind::Error,
+                            format_tui_error(&error, runtime, config),
+                        );
                         false
                     }
                 };
@@ -2762,8 +2935,28 @@ async fn submit_tui_prompt(
     if let Err(error) =
         run_prompt_with_queue_tui(app, terminal, runtime, config, prompt, media, offline).await
     {
-        app.push(TuiEntryKind::Error, format!("{error}"));
+        app.push(
+            TuiEntryKind::Error,
+            format_tui_error(&error, runtime, config),
+        );
     }
+}
+
+fn format_tui_error(error: &anyhow::Error, runtime: &Runtime, config: &LoadedConfig) -> String {
+    let message = error.to_string();
+    if !message.contains("429 Too Many Requests") {
+        return message;
+    }
+    let model = runtime
+        .session()
+        .active_model
+        .as_ref()
+        .map(|model| format!("{}/{}", model.provider, model.id))
+        .unwrap_or_else(|| "-".to_string());
+    let thinking = active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string());
+    format!(
+        "{message}\n\nAnthropic rate-limited this request for model {model} with thinking {thinking}. Try /thinking high, /thinking off, or /model anthropic/claude-sonnet-4-6. Claude Code may still work elsewhere if it is using a different model, thinking level, or quota pool."
+    )
 }
 
 async fn run_prompt_with_queue_tui(

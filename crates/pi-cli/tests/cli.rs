@@ -202,6 +202,51 @@ fn package_commands_manage_settings_sources() {
 }
 
 #[test]
+fn login_commands_manage_api_key_auth() {
+    let root = test_dir("pi-cli-login-commands");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+
+    let login = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["login", "anthropic", "--api-key", "env:ANTHROPIC_API_KEY"])
+        .output()
+        .expect("login anthropic");
+    assert!(
+        login.status.success(),
+        "{}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+
+    let auth = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(agent.join("auth.json")).expect("auth settings"),
+    )
+    .expect("parse auth settings");
+    assert_eq!(auth["anthropic"]["type"], "api_key");
+    assert_eq!(auth["anthropic"]["key"], "env:ANTHROPIC_API_KEY");
+
+    let logout = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["logout", "anthropic"])
+        .output()
+        .expect("logout anthropic");
+    assert!(
+        logout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&logout.stderr)
+    );
+    let auth = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(agent.join("auth.json")).expect("auth after logout"),
+    )
+    .expect("parse auth after logout");
+    assert!(auth.as_object().expect("auth object").is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn continue_reopens_most_recent_session() {
     let root = test_dir("pi-cli-continue");
     let sessions = root.join("sessions");

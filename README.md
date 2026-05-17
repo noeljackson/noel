@@ -164,6 +164,14 @@ Provider API keys can be stored in `auth.json`:
 }
 ```
 
+Or use the CLI helper:
+
+```bash
+pi login anthropic --api-key env:ANTHROPIC_API_KEY
+printf '%s' "$ANTHROPIC_API_KEY" | pi login anthropic --api-key -
+pi logout anthropic
+```
+
 When no explicit API key is configured, `pi` can reuse existing CLI login credentials:
 
 - Claude Code: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or `~/.claude/.credentials.json`
