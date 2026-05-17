@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
@@ -18,9 +18,9 @@ use pi_ai::{
     ProviderConfig,
 };
 use pi_config::{
-    auth_for_provider, has_auth_for_provider, load_config, AuthCredential, ConfigPaths,
-    LoadedConfig, ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, Settings,
-    ENV_SESSION_DIR,
+    auth_for_provider, has_auth_for_provider, load_config, read_model_cache, write_model_cache,
+    AuthCredential, ConfigPaths, LoadedConfig, ModelCache, ModelDefinition,
+    ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, Settings, ENV_SESSION_DIR,
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
@@ -39,6 +39,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
+use serde::Deserialize;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum OutputMode {
@@ -415,6 +416,8 @@ async fn main() -> Result<()> {
         eprintln!("agent dir: {}", config.paths.agent_dir.display());
         eprintln!("session dir: {}", config.paths.session_dir.display());
     }
+    let offline = offline_enabled(cli.offline);
+    start_model_refresh(&config, offline, cli.verbose);
 
     if let Some(search) = &cli.list_models {
         let search = search.as_deref().map(str::to_lowercase);
@@ -451,7 +454,7 @@ async fn main() -> Result<()> {
         && !cli.print
         && cli.messages.is_empty()
     {
-        return run_rpc(runtime, config, cli.offline).await;
+        return run_rpc(runtime, config, offline).await;
     }
 
     let mut initial_prompt = expand_message_inputs(&cwd, &cli.messages)?;
@@ -475,7 +478,7 @@ async fn main() -> Result<()> {
             &config,
             initial_prompt,
             initial_media,
-            cli.offline,
+            offline,
         )
         .await?;
         if let Some(path) = &cli.export {
@@ -485,7 +488,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_interactive(runtime, config, cli.offline).await
+    run_interactive(runtime, config, offline).await
 }
 
 async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) -> Result<()> {
@@ -705,6 +708,145 @@ fn normalized_cli_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
             _ => arg,
         })
         .collect()
+}
+
+fn offline_enabled(cli_offline: bool) -> bool {
+    cli_offline
+        || std::env::var("PI_OFFLINE")
+            .ok()
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+}
+
+fn start_model_refresh(config: &LoadedConfig, offline: bool, verbose: bool) {
+    if offline || !model_refresh_enabled(&config.settings) {
+        return;
+    }
+    let ttl_hours = model_refresh_ttl_hours(&config.settings);
+    if !model_cache_needs_refresh(&config.paths.model_cache_path, ttl_hours) {
+        return;
+    }
+    let paths = config.paths.clone();
+    let auth = config.auth.clone();
+    tokio::spawn(async move {
+        if let Err(error) = refresh_model_cache(paths, auth).await {
+            if verbose {
+                eprintln!("model refresh failed: {error}");
+            }
+        }
+    });
+}
+
+fn model_refresh_enabled(settings: &Settings) -> bool {
+    settings
+        .model_refresh
+        .as_ref()
+        .and_then(|refresh| refresh.enabled)
+        .unwrap_or(true)
+}
+
+fn model_refresh_ttl_hours(settings: &Settings) -> u64 {
+    settings
+        .model_refresh
+        .as_ref()
+        .and_then(|refresh| refresh.ttl_hours)
+        .unwrap_or(24)
+}
+
+fn model_cache_needs_refresh(path: &Path, ttl_hours: u64) -> bool {
+    let Ok(Some(cache)) = read_model_cache(path) else {
+        return true;
+    };
+    let Some(now) = unix_seconds() else {
+        return true;
+    };
+    let ttl_seconds = ttl_hours.saturating_mul(60 * 60);
+    now.saturating_sub(cache.refreshed_at) >= ttl_seconds
+}
+
+async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> Result<()> {
+    let mut refreshed_providers = BTreeSet::new();
+    let mut refreshed_models = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    if let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, "anthropic") {
+        match fetch_anthropic_models(&api_key).await {
+            Ok(models) => {
+                refreshed_providers.insert("anthropic".to_string());
+                refreshed_models.extend(models);
+            }
+            Err(error) => diagnostics.push(format!("anthropic model refresh failed: {error}")),
+        }
+    }
+
+    if refreshed_providers.is_empty() && diagnostics.is_empty() {
+        return Ok(());
+    }
+
+    let existing = read_model_cache(&paths.model_cache_path)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let existing_refreshed_at = existing.refreshed_at;
+    let mut models = existing
+        .models
+        .into_iter()
+        .filter(|model| !refreshed_providers.contains(&model.provider))
+        .collect::<Vec<_>>();
+    models.extend(refreshed_models);
+    write_model_cache(
+        &paths.model_cache_path,
+        &ModelCache {
+            refreshed_at: unix_seconds().unwrap_or(existing_refreshed_at),
+            models,
+            diagnostics,
+        },
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModelsResponse {
+    data: Vec<AnthropicModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModel {
+    id: String,
+    display_name: String,
+}
+
+async fn fetch_anthropic_models(api_key: &str) -> Result<Vec<ModelDefinition>> {
+    let response = reqwest::Client::new()
+        .get("https://api.anthropic.com/v1/models")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("status {status}: {body}"));
+    }
+    let response = response.json::<AnthropicModelsResponse>().await?;
+    Ok(response
+        .data
+        .into_iter()
+        .map(|model| ModelDefinition {
+            provider: "anthropic".to_string(),
+            id: model.id,
+            name: Some(model.display_name),
+            api: ConfigProviderApi::Anthropic,
+            base_url: None,
+        })
+        .collect())
+}
+
+fn unix_seconds() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 fn infer_cli_provider(cli: &Cli, config: &LoadedConfig) -> Option<String> {

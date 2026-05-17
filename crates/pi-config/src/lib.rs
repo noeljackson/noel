@@ -18,6 +18,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to parse {path}: {source}")]
     Parse {
         path: PathBuf,
@@ -36,6 +41,7 @@ pub struct ConfigPaths {
     pub project_settings_path: PathBuf,
     pub auth_path: PathBuf,
     pub models_path: PathBuf,
+    pub model_cache_path: PathBuf,
     pub keybindings_path: PathBuf,
 }
 
@@ -63,6 +69,7 @@ impl ConfigPaths {
             project_settings_path: cwd.join(CONFIG_DIR_NAME).join("settings.json"),
             auth_path: agent_dir.join("auth.json"),
             models_path: agent_dir.join("models.json"),
+            model_cache_path: agent_dir.join("model-cache.json"),
             keybindings_path: agent_dir.join("keybindings.json"),
             agent_dir,
             session_dir,
@@ -136,6 +143,8 @@ pub struct Settings {
     pub markdown: Option<MarkdownSettings>,
     #[serde(default)]
     pub warnings: Option<WarningSettings>,
+    #[serde(default)]
+    pub model_refresh: Option<ModelRefreshSettings>,
 }
 
 impl Settings {
@@ -206,6 +215,7 @@ impl Settings {
             show_hardware_cursor: overrides.show_hardware_cursor.or(self.show_hardware_cursor),
             markdown: merge_optional_settings(self.markdown, overrides.markdown),
             warnings: merge_optional_settings(self.warnings, overrides.warnings),
+            model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
         }
     }
 }
@@ -383,6 +393,22 @@ impl MergeSettings for WarningSettings {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRefreshSettings {
+    pub enabled: Option<bool>,
+    pub ttl_hours: Option<u64>,
+}
+
+impl MergeSettings for ModelRefreshSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            enabled: overrides.enabled.or(self.enabled),
+            ttl_hours: overrides.ttl_hours.or(self.ttl_hours),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum AuthCredential {
@@ -422,6 +448,16 @@ pub struct ModelDefinition {
     pub api: ProviderApi,
     #[serde(default)]
     pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCache {
+    pub refreshed_at: u64,
+    #[serde(default)]
+    pub models: Vec<ModelDefinition>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,15 +547,36 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
     let project_settings = project_settings.unwrap_or_default();
     let settings = global_settings.clone().merge(project_settings.clone());
     let auth = read_optional_json::<AuthData>(&paths.auth_path)?.unwrap_or_default();
+    let mut diagnostics = Vec::new();
+    let explicit_models =
+        read_optional_json::<Vec<ModelDefinition>>(&paths.models_path)?.unwrap_or_default();
+    let cache = match read_model_cache(&paths.model_cache_path) {
+        Ok(cache) => cache,
+        Err(error) => {
+            diagnostics.push(format!(
+                "failed to read model cache {}: {error}",
+                paths.model_cache_path.display()
+            ));
+            None
+        }
+    };
+    if let Some(cache) = &cache {
+        diagnostics.extend(cache.diagnostics.iter().cloned());
+    }
     let models = filter_enabled_models(
-        read_optional_json::<Vec<ModelDefinition>>(&paths.models_path)?
-            .unwrap_or_else(default_models),
+        merge_model_definitions(
+            default_models(),
+            cache
+                .as_ref()
+                .map(|cache| cache.models.clone())
+                .unwrap_or_default(),
+            explicit_models,
+        ),
         settings.enabled_models.as_deref(),
     );
     let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
         .map(KeybindingsFile::into_keybindings)
         .unwrap_or_default();
-    let mut diagnostics = Vec::new();
     let context_files = load_context_files(&paths.cwd, &paths.agent_dir)?;
     let mut extensions = load_resource_files(&paths, "extensions", &mut diagnostics);
     let mut skills = load_resource_files(&paths, "skills", &mut diagnostics);
@@ -656,6 +713,45 @@ pub fn auth_for_provider(auth: &AuthData, provider: &str) -> Option<ResolvedAuth
 
 pub fn has_auth_for_provider(auth: &AuthData, provider: &str) -> bool {
     auth_for_provider(auth, provider).is_some()
+}
+
+pub fn read_model_cache(path: &Path) -> Result<Option<ModelCache>, ConfigError> {
+    read_optional_json::<ModelCache>(path)
+}
+
+pub fn write_model_cache(path: &Path, cache: &ModelCache) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let content = serde_json::to_string_pretty(cache).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    fs::write(path, format!("{content}\n")).map_err(|source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn merge_model_definitions(
+    base: Vec<ModelDefinition>,
+    cache: Vec<ModelDefinition>,
+    explicit: Vec<ModelDefinition>,
+) -> Vec<ModelDefinition> {
+    let mut models = Vec::new();
+    for model in base.into_iter().chain(cache).chain(explicit) {
+        if let Some(index) = models.iter().position(|existing: &ModelDefinition| {
+            existing.provider == model.provider && existing.id == model.id
+        }) {
+            models[index] = model;
+        } else {
+            models.push(model);
+        }
+    }
+    models
 }
 
 fn env_api_key(provider: &str) -> Option<String> {
@@ -1302,6 +1398,7 @@ mod tests {
             project_settings_path: root.join("missing-project-settings.json"),
             auth_path: root.join("missing-auth.json"),
             models_path: agent_dir.join("models.json"),
+            model_cache_path: agent_dir.join("model-cache.json"),
             keybindings_path: agent_dir.join("keybindings.json"),
         })
         .expect("load config");
@@ -1375,6 +1472,7 @@ mod tests {
             project_settings_path: cwd.join(".pi/settings.json"),
             auth_path: root.join("missing-auth.json"),
             models_path: root.join("missing-models.json"),
+            model_cache_path: root.join("missing-model-cache.json"),
             keybindings_path: root.join("missing-keybindings.json"),
         })
         .expect("load config");
@@ -1401,6 +1499,62 @@ mod tests {
     }
 
     #[test]
+    fn model_cache_extends_builtin_and_explicit_models() {
+        let root = test_dir("pi-config-model-cache");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        fs::write(
+            agent_dir.join("models.json"),
+            r#"[
+                {"provider":"anthropic","id":"claude-custom","name":"Custom Claude","api":"anthropic"}
+            ]"#,
+        )
+        .expect("write explicit models");
+        write_model_cache(
+            &agent_dir.join("model-cache.json"),
+            &ModelCache {
+                refreshed_at: 123,
+                models: vec![ModelDefinition {
+                    provider: "anthropic".to_string(),
+                    id: "claude-opus-4-1-20250805".to_string(),
+                    name: Some("Claude Opus 4.1".to_string()),
+                    api: ProviderApi::Anthropic,
+                    base_url: None,
+                }],
+                diagnostics: vec!["model refresh warning".to_string()],
+            },
+        )
+        .expect("write model cache");
+
+        let config = load_config(ConfigPaths {
+            cwd,
+            agent_dir: agent_dir.clone(),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: root.join("missing-settings.json"),
+            project_settings_path: root.join("missing-project-settings.json"),
+            auth_path: root.join("missing-auth.json"),
+            models_path: agent_dir.join("models.json"),
+            model_cache_path: agent_dir.join("model-cache.json"),
+            keybindings_path: root.join("missing-keybindings.json"),
+        })
+        .expect("load config");
+
+        let model_ids = config
+            .models
+            .iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect::<Vec<_>>();
+        assert!(model_ids.contains(&"faux/echo".to_string()));
+        assert!(model_ids.contains(&"anthropic/claude-opus-4-1-20250805".to_string()));
+        assert!(model_ids.contains(&"anthropic/claude-custom".to_string()));
+        assert_eq!(config.diagnostics, ["model refresh warning"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn with_session_dir_expands_relative_paths_from_cwd() {
         let cwd = test_dir("pi-config-session-dir");
         let paths = ConfigPaths {
@@ -1411,6 +1565,7 @@ mod tests {
             project_settings_path: cwd.join(".pi/settings.json"),
             auth_path: cwd.join("agent/auth.json"),
             models_path: cwd.join("agent/models.json"),
+            model_cache_path: cwd.join("agent/model-cache.json"),
             keybindings_path: cwd.join("agent/keybindings.json"),
         };
 
@@ -1440,7 +1595,8 @@ mod tests {
                 "images":{"autoResize":true},
                 "thinkingBudgets":{"minimal":1000},
                 "markdown":{"codeBlockIndent":"  "},
-                "warnings":{"anthropicExtraUsage":true}
+                "warnings":{"anthropicExtraUsage":true},
+                "modelRefresh":{"enabled":true,"ttlHours":24}
             }"#,
         )
         .expect("write user settings");
@@ -1453,7 +1609,8 @@ mod tests {
                 "terminal":{"imageWidthCells":40},
                 "images":{"blockImages":true},
                 "thinkingBudgets":{"high":4000},
-                "warnings":{"anthropicExtraUsage":false}
+                "warnings":{"anthropicExtraUsage":false},
+                "modelRefresh":{"ttlHours":12}
             }"#,
         )
         .expect("write project settings");
@@ -1466,6 +1623,7 @@ mod tests {
             project_settings_path: cwd.join(".pi/settings.json"),
             auth_path: root.join("missing-auth.json"),
             models_path: root.join("missing-models.json"),
+            model_cache_path: root.join("missing-model-cache.json"),
             keybindings_path: root.join("missing-keybindings.json"),
         })
         .expect("load config");
@@ -1510,6 +1668,9 @@ mod tests {
                 .anthropic_extra_usage,
             Some(false)
         );
+        let model_refresh = config.settings.model_refresh.expect("model refresh");
+        assert_eq!(model_refresh.enabled, Some(true));
+        assert_eq!(model_refresh.ttl_hours, Some(12));
 
         let _ = fs::remove_dir_all(root);
     }

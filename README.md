@@ -116,6 +116,7 @@ Supported files:
 - `settings.json`
 - `auth.json`
 - `models.json`
+- `model-cache.json`
 - `keybindings.json`
 - `skills/`
 - `prompts/`
@@ -135,7 +136,11 @@ Environment overrides:
   "defaultModel": "echo",
   "enabledModels": ["faux/echo"],
   "enabledTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
-  "sessionDir": "sessions"
+  "sessionDir": "sessions",
+  "modelRefresh": {
+    "enabled": true,
+    "ttlHours": 24
+  }
 }
 ```
 
@@ -194,6 +199,13 @@ Provider-specific environment:
   }
 ]
 ```
+
+`model-cache.json` is managed by `pi`. On startup, `pi` uses built-in models,
+cached models, and explicit `models.json` entries immediately, then starts a
+non-blocking background refresh when `modelRefresh.enabled` is not false,
+`PI_OFFLINE`/`--offline` is not set, the cache is older than `ttlHours`, and a
+provider has supported API-key auth. Refreshed models are available after
+`/reload` or the next startup. Anthropic refresh uses the official Models API.
 
 `keybindings.json` may be either an array:
 
