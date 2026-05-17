@@ -1,7 +1,7 @@
 use std::env;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -406,7 +406,6 @@ struct AnthropicProvider {
 #[async_trait]
 impl Provider for AnthropicProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
-        let api_key = self.api_key()?;
         let url = format!(
             "{}/messages",
             self.config
@@ -415,33 +414,10 @@ impl Provider for AnthropicProvider {
                 .unwrap_or("https://api.anthropic.com/v1")
                 .trim_end_matches('/')
         );
-        let mut headers = HeaderMap::new();
-        match &self.config.auth {
-            ProviderAuth::ApiKey(_) => {
-                headers.insert("x-api-key", HeaderValue::from_str(&api_key)?);
-            }
-            ProviderAuth::ClaudeCodeOAuth { access_token } => {
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {access_token}"))?,
-                );
-                headers.insert(
-                    "anthropic-beta",
-                    HeaderValue::from_static("oauth-2025-04-20"),
-                );
-            }
-            _ => {
-                return Err(ProviderError::MissingApiKey {
-                    provider: self.config.model.provider.clone(),
-                });
-            }
-        }
-        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let response = reqwest::Client::new()
             .post(url)
-            .headers(headers)
+            .headers(anthropic_headers(&self.config)?)
             .json(&anthropic_body(&self.config, &request))
             .send()
             .await?;
@@ -474,27 +450,69 @@ impl Provider for AnthropicProvider {
     }
 }
 
-impl AnthropicProvider {
-    fn api_key(&self) -> Result<String, ProviderError> {
-        match &self.config.auth {
-            ProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
-            ProviderAuth::ClaudeCodeOAuth { .. } => Ok(String::new()),
-            _ => Err(ProviderError::MissingApiKey {
-                provider: self.config.model.provider.clone(),
-            }),
-        }
-    }
-}
-
 fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     let mut body = json!({
         "model": config.model.id,
         "max_tokens": 4096,
-        "system": request.system_prompt.clone().unwrap_or_default(),
+        "system": anthropic_system(config, request),
         "messages": anthropic_messages(&request.messages),
     });
     apply_anthropic_thinking(&mut body, config);
     body
+}
+
+fn anthropic_headers(config: &ProviderConfig) -> Result<HeaderMap, ProviderError> {
+    let mut headers = HeaderMap::new();
+    match &config.auth {
+        ProviderAuth::ApiKey(api_key) => {
+            headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
+        }
+        ProviderAuth::ClaudeCodeOAuth { access_token } => {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {access_token}"))?,
+            );
+            headers.insert(
+                "anthropic-beta",
+                HeaderValue::from_static("claude-code-20250219,oauth-2025-04-20"),
+            );
+            headers.insert(
+                "anthropic-dangerous-direct-browser-access",
+                HeaderValue::from_static("true"),
+            );
+            headers.insert(USER_AGENT, HeaderValue::from_static("claude-cli/2.1.75"));
+            headers.insert("x-app", HeaderValue::from_static("cli"));
+        }
+        _ => {
+            return Err(ProviderError::MissingApiKey {
+                provider: config.model.provider.clone(),
+            });
+        }
+    }
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(headers)
+}
+
+fn anthropic_system(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    if matches!(&config.auth, ProviderAuth::ClaudeCodeOAuth { .. }) {
+        let mut blocks = vec![json!({
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        })];
+        if let Some(system_prompt) = request.system_prompt.as_deref() {
+            if !system_prompt.trim().is_empty() {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": system_prompt,
+                }));
+            }
+        }
+        Value::Array(blocks)
+    } else {
+        Value::String(request.system_prompt.clone().unwrap_or_default())
+    }
 }
 
 fn apply_anthropic_thinking(body: &mut Value, config: &ProviderConfig) {
@@ -1488,6 +1506,57 @@ mod tests {
         };
         let codex_body = openai_responses_body(&codex, &request);
         assert_eq!(codex_body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn anthropic_claude_code_oauth_matches_ts_identity_shape() {
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "anthropic".to_string(),
+                id: "claude-sonnet-4-6".to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: None,
+            auth: ProviderAuth::ClaudeCodeOAuth {
+                access_token: "access-token".to_string(),
+            },
+            thinking_level: Some("off".to_string()),
+            thinking_budget_tokens: None,
+        };
+
+        let headers = anthropic_headers(&config).expect("anthropic headers");
+        assert_eq!(
+            headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some("claude-code-20250219,oauth-2025-04-20")
+        );
+        assert_eq!(
+            headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("claude-cli/2.1.75")
+        );
+        assert_eq!(
+            headers.get("x-app").and_then(|value| value.to_str().ok()),
+            Some("cli")
+        );
+
+        let body = anthropic_body(&config, &request);
+        assert_eq!(
+            body["system"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(body["system"][1]["text"], "pi rust cli");
+        assert_eq!(body["thinking"]["type"], "disabled");
     }
 
     #[test]
