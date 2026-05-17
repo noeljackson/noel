@@ -204,8 +204,11 @@ Provider-specific environment:
 cached models, and explicit `models.json` entries immediately, then starts a
 non-blocking background refresh when `modelRefresh.enabled` is not false,
 `PI_OFFLINE`/`--offline` is not set, the cache is older than `ttlHours`, and a
-provider has supported API-key auth. Refreshed models are available after
-`/reload` or the next startup. Anthropic refresh uses the official Models API.
+provider has supported auth. Refreshed models are available after `/reload` or
+the next startup. Anthropic API-key refresh uses the official Models API;
+Claude Code OAuth and ChatGPT/Codex OAuth refresh are best-effort against the
+same provider auth paths used for model requests. Refresh failures are ignored
+unless verbose logging is enabled.
 
 `keybindings.json` may be either an array:
 

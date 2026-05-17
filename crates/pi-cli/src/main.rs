@@ -39,6 +39,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -769,13 +770,35 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
     let mut refreshed_models = Vec::new();
     let mut diagnostics = Vec::new();
 
-    if let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, "anthropic") {
-        match fetch_anthropic_models(&api_key).await {
+    if let Some(auth) = auth_for_provider(&auth, "anthropic") {
+        match fetch_anthropic_models(auth).await {
             Ok(models) => {
                 refreshed_providers.insert("anthropic".to_string());
                 refreshed_models.extend(models);
             }
             Err(error) => diagnostics.push(format!("anthropic model refresh failed: {error}")),
+        }
+    }
+
+    if let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, "openai") {
+        match fetch_openai_api_models("openai", ConfigProviderApi::OpenAiResponses, None, &api_key)
+            .await
+        {
+            Ok(models) => {
+                refreshed_providers.insert("openai".to_string());
+                refreshed_models.extend(models);
+            }
+            Err(error) => diagnostics.push(format!("openai model refresh failed: {error}")),
+        }
+    }
+
+    if let Some(auth) = auth_for_provider(&auth, "openai-codex") {
+        match fetch_codex_models(auth).await {
+            Ok(models) => {
+                refreshed_providers.insert("openai-codex".to_string());
+                refreshed_models.extend(models);
+            }
+            Err(error) => diagnostics.push(format!("openai-codex model refresh failed: {error}")),
         }
     }
 
@@ -799,9 +822,12 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
         &ModelCache {
             refreshed_at: unix_seconds().unwrap_or(existing_refreshed_at),
             models,
-            diagnostics,
+            diagnostics: Vec::new(),
         },
     )?;
+    if !diagnostics.is_empty() {
+        return Err(anyhow!(diagnostics.join("; ")));
+    }
     Ok(())
 }
 
@@ -816,11 +842,10 @@ struct AnthropicModel {
     display_name: String,
 }
 
-async fn fetch_anthropic_models(api_key: &str) -> Result<Vec<ModelDefinition>> {
+async fn fetch_anthropic_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinition>> {
     let response = reqwest::Client::new()
         .get("https://api.anthropic.com/v1/models")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
+        .headers(anthropic_model_headers(&auth)?)
         .send()
         .await?;
     let status = response.status();
@@ -840,6 +865,224 @@ async fn fetch_anthropic_models(api_key: &str) -> Result<Vec<ModelDefinition>> {
             base_url: None,
         })
         .collect())
+}
+
+fn anthropic_model_headers(auth: &ResolvedAuth) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    match auth {
+        ResolvedAuth::ApiKey(api_key) => {
+            headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
+        }
+        ResolvedAuth::ClaudeCodeOAuth { access_token } => {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {access_token}"))?,
+            );
+            headers.insert(
+                "anthropic-beta",
+                HeaderValue::from_static("oauth-2025-04-20"),
+            );
+        }
+        ResolvedAuth::ChatGptOAuth { .. } => {
+            return Err(anyhow!("unsupported Anthropic auth type"));
+        }
+    }
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    Ok(headers)
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelsResponse {
+    data: Vec<OpenAiModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModel {
+    id: String,
+}
+
+async fn fetch_openai_api_models(
+    provider: &str,
+    api: ConfigProviderApi,
+    base_url: Option<String>,
+    api_key: &str,
+) -> Result<Vec<ModelDefinition>> {
+    let response = reqwest::Client::new()
+        .get("https://api.openai.com/v1/models")
+        .header(AUTHORIZATION, format!("Bearer {api_key}"))
+        .header(ACCEPT, "application/json")
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("status {status}: {body}"));
+    }
+    let response = response.json::<OpenAiModelsResponse>().await?;
+    Ok(response
+        .data
+        .into_iter()
+        .filter(|model| model_supported_for_provider(provider, &model.id))
+        .map(|model| ModelDefinition {
+            provider: provider.to_string(),
+            id: model.id.clone(),
+            name: Some(model_display_name(&model.id)),
+            api: api.clone(),
+            base_url: base_url.clone(),
+        })
+        .collect())
+}
+
+async fn fetch_codex_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinition>> {
+    match auth {
+        ResolvedAuth::ApiKey(api_key) => {
+            fetch_openai_api_models(
+                "openai-codex",
+                ConfigProviderApi::OpenAiCodexResponses,
+                Some("https://chatgpt.com/backend-api".to_string()),
+                &api_key,
+            )
+            .await
+        }
+        ResolvedAuth::ChatGptOAuth {
+            access_token,
+            account_id,
+        } => fetch_chatgpt_codex_models(&access_token, account_id.as_deref()).await,
+        ResolvedAuth::ClaudeCodeOAuth { .. } => Err(anyhow!("unsupported Codex auth type")),
+    }
+}
+
+async fn fetch_chatgpt_codex_models(
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<Vec<ModelDefinition>> {
+    let client = reqwest::Client::new();
+    let mut last_error = None;
+    for endpoint in [
+        "https://chatgpt.com/backend-api/codex/models",
+        "https://chatgpt.com/backend-api/models",
+    ] {
+        let response = client
+            .get(endpoint)
+            .headers(chatgpt_model_headers(access_token, account_id)?)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            last_error = Some(anyhow!("status {status} from {endpoint}: {body}"));
+            continue;
+        }
+        let value = response.json::<serde_json::Value>().await?;
+        let ids = collect_codex_model_ids(&value);
+        if ids.is_empty() {
+            last_error = Some(anyhow!("no Codex model IDs in response from {endpoint}"));
+            continue;
+        }
+        return Ok(ids
+            .into_iter()
+            .map(|id| ModelDefinition {
+                provider: "openai-codex".to_string(),
+                name: Some(model_display_name(&id)),
+                id,
+                api: ConfigProviderApi::OpenAiCodexResponses,
+                base_url: Some("https://chatgpt.com/backend-api".to_string()),
+            })
+            .collect());
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("no Codex model refresh endpoint succeeded")))
+}
+
+fn chatgpt_model_headers(access_token: &str, account_id: Option<&str>) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {access_token}"))?,
+    );
+    if let Some(account_id) = account_id {
+        headers.insert("chatgpt-account-id", HeaderValue::from_str(account_id)?);
+    }
+    headers.insert("originator", HeaderValue::from_static("pi"));
+    headers.insert("User-Agent", HeaderValue::from_static("pi"));
+    headers.insert(
+        "OpenAI-Beta",
+        HeaderValue::from_static("responses=experimental"),
+    );
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(headers)
+}
+
+fn collect_codex_model_ids(value: &serde_json::Value) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    collect_codex_model_ids_from_value(value, &mut ids);
+    ids
+}
+
+fn collect_codex_model_ids_from_value(value: &serde_json::Value, ids: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_codex_model_ids_from_value(item, ids);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for key in ["id", "slug", "model", "name"] {
+                if let Some(id) = object
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| model_supported_for_provider("openai-codex", id))
+                {
+                    ids.insert(id.to_string());
+                }
+            }
+            for nested in object.values() {
+                collect_codex_model_ids_from_value(nested, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn model_supported_for_provider(provider: &str, id: &str) -> bool {
+    match provider {
+        "openai" => {
+            (id.starts_with("gpt-")
+                || id.starts_with("o1")
+                || id.starts_with("o3")
+                || id.starts_with("o4"))
+                && !id.contains("audio")
+                && !id.contains("realtime")
+                && !id.contains("transcribe")
+                && !id.contains("tts")
+                && !id.contains("image")
+                && !id.contains("moderation")
+        }
+        "openai-codex" => id.starts_with("gpt-5.") || id.contains("codex"),
+        _ => false,
+    }
+}
+
+fn model_display_name(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) if part.chars().all(|ch| ch.is_ascii_digit() || ch == '.') => {
+                    format!("{first}{}", chars.collect::<String>())
+                }
+                Some(first) => format!(
+                    "{}{}",
+                    first.to_ascii_uppercase(),
+                    chars.collect::<String>()
+                ),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn unix_seconds() -> Option<u64> {
@@ -1506,13 +1749,13 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
         } else {
             Style::default()
         };
+        let prefix = format!("{:>2}. {marker}{active} ", position + 1);
+        let text_width = area
+            .width
+            .saturating_sub(4)
+            .saturating_sub(prefix.chars().count() as u16) as usize;
         lines.push(Line::from(Span::styled(
-            format!(
-                "{:>2}. {marker}{active} {}\t{}",
-                position + 1,
-                item.label,
-                item.value
-            ),
+            format!("{prefix}{}", truncate_chars(&item.label, text_width)),
             style,
         )));
     }
@@ -1527,6 +1770,16 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(paragraph, area);
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut output = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() && max_chars > 0 {
+        output.pop();
+        output.push('~');
+    }
+    output
 }
 
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {

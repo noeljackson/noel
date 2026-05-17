@@ -1247,8 +1247,71 @@ fn default_models() -> Vec<ModelDefinition> {
         },
         ModelDefinition {
             provider: "openai-codex".to_string(),
+            id: "gpt-5.1".to_string(),
+            name: Some("GPT 5.1".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.1-codex-max".to_string(),
+            name: Some("GPT 5.1 Codex Max".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.1-codex-mini".to_string(),
+            name: Some("GPT 5.1 Codex Mini".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.2".to_string(),
+            name: Some("GPT 5.2".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "openai-codex".to_string(),
             id: "gpt-5.2-codex".to_string(),
-            name: Some("OpenAI Codex GPT 5.2".to_string()),
+            name: Some("GPT 5.2 Codex".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.3-codex".to_string(),
+            name: Some("GPT 5.3 Codex".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.3-codex-spark".to_string(),
+            name: Some("GPT 5.3 Codex Spark".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.4".to_string(),
+            name: Some("GPT 5.4".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.4-mini".to_string(),
+            name: Some("GPT 5.4 Mini".to_string()),
+            api: ProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        },
+        ModelDefinition {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.5".to_string(),
+            name: Some("GPT 5.5".to_string()),
             api: ProviderApi::OpenAiCodexResponses,
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
@@ -1257,6 +1320,20 @@ fn default_models() -> Vec<ModelDefinition> {
             id: "gpt-5.2".to_string(),
             name: Some("Azure OpenAI GPT 5.2".to_string()),
             api: ProviderApi::AzureOpenAiResponses,
+            base_url: None,
+        },
+        ModelDefinition {
+            provider: "anthropic".to_string(),
+            id: "claude-opus-4-1-20250805".to_string(),
+            name: Some("Claude Opus 4.1".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: None,
+        },
+        ModelDefinition {
+            provider: "anthropic".to_string(),
+            id: "claude-opus-4-20250514".to_string(),
+            name: Some("Claude Opus 4".to_string()),
+            api: ProviderApi::Anthropic,
             base_url: None,
         },
         ModelDefinition {
@@ -1756,6 +1833,19 @@ mod tests {
             "cloudflare-ai-gateway",
         ] {
             assert!(providers.iter().any(|candidate| candidate == provider));
+        }
+
+        let models = default_models()
+            .into_iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect::<Vec<_>>();
+        for model in [
+            "anthropic/claude-opus-4-1-20250805",
+            "openai-codex/gpt-5.4",
+            "openai-codex/gpt-5.4-mini",
+            "openai-codex/gpt-5.5",
+        ] {
+            assert!(models.iter().any(|candidate| candidate == model));
         }
     }
 

@@ -532,12 +532,16 @@ impl TerminalRenderer {
         lines.extend(selector.items.iter().enumerate().map(|(index, item)| {
             let selected = if index == selector.selected { ">" } else { " " };
             let active = if item.active { "*" } else { " " };
-            format!(
-                "{:>2}. {selected}{active} {}\t{}",
-                index + 1,
-                item.label,
-                item.value
-            )
+            if item.label == item.value {
+                format!("{:>2}. {selected}{active} {}", index + 1, item.label)
+            } else {
+                format!(
+                    "{:>2}. {selected}{active} {} ({})",
+                    index + 1,
+                    item.label,
+                    item.value
+                )
+            }
         }));
         lines.join("\n")
     }
@@ -646,5 +650,8 @@ mod tests {
         assert!(TerminalRenderer::default()
             .selector(&selector)
             .contains("model selector"));
+        assert!(!TerminalRenderer::default()
+            .selector(&selector)
+            .contains("faux/echo\tfaux/echo"));
     }
 }
