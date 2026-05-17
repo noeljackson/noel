@@ -999,24 +999,7 @@ fn load_resource_files(
             if !path.is_file() {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            match fs::read_to_string(&path) {
-                Ok(content) => {
-                    resources.insert(
-                        stem.to_string(),
-                        ResourceFile {
-                            name: stem.to_string(),
-                            path,
-                            content,
-                        },
-                    );
-                }
-                Err(error) => {
-                    diagnostics.push(format!("failed to read {}: {error}", path.display()));
-                }
-            }
+            push_resource_file(&mut resources, &path, diagnostics);
         }
     }
     resources.into_values().collect()
@@ -1209,7 +1192,7 @@ fn push_resource_file(
     };
     match fs::read_to_string(path) {
         Ok(content) => {
-            resources.insert(
+            let previous = resources.insert(
                 stem.to_string(),
                 ResourceFile {
                     name: stem.to_string(),
@@ -1217,6 +1200,13 @@ fn push_resource_file(
                     content,
                 },
             );
+            if let Some(previous) = previous {
+                diagnostics.push(format!(
+                    "resource name collision for {stem}: {} replaced by {}",
+                    previous.path.display(),
+                    path.display()
+                ));
+            }
         }
         Err(error) => diagnostics.push(format!("failed to read {}: {error}", path.display())),
     }
@@ -1585,6 +1575,47 @@ mod tests {
             .iter()
             .any(|resource| resource.name == "local" && resource.content == "local prompt"));
         assert!(config.diagnostics.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resource_name_collisions_emit_diagnostics() {
+        let root = test_dir("pi-config-resource-collisions");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        fs::create_dir_all(agent_dir.join("extensions")).expect("create user extensions");
+        fs::create_dir_all(cwd.join(".pi/extensions")).expect("create project extensions");
+        fs::write(agent_dir.join("extensions/dup.md"), "user extension")
+            .expect("write user extension");
+        fs::write(cwd.join(".pi/extensions/dup.md"), "project extension")
+            .expect("write project extension");
+
+        let config = load_config(ConfigPaths {
+            cwd,
+            agent_dir: agent_dir.clone(),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: root.join("repo/.pi/settings.json"),
+            auth_path: root.join("missing-auth.json"),
+            models_path: root.join("missing-models.json"),
+            model_cache_path: root.join("missing-model-cache.json"),
+            keybindings_path: root.join("missing-keybindings.json"),
+        })
+        .expect("load config");
+
+        assert!(config
+            .extensions
+            .iter()
+            .any(|resource| { resource.name == "dup" && resource.content == "project extension" }));
+        assert!(
+            config
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("resource name collision for dup")),
+            "{:?}",
+            config.diagnostics
+        );
 
         let _ = fs::remove_dir_all(root);
     }
