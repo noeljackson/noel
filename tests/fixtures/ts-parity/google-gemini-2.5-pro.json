@@ -1,0 +1,45 @@
+{
+  "source": {
+    "branch": "ts-reference",
+    "script": "/ts-parity/google-fixture.ts"
+  },
+  "provider": "google",
+  "auth": "api-key",
+  "request": {
+    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+    "method": "POST",
+    "headers": {
+      "content-type": "application/json",
+      "user-agent": "google-genai-sdk/1.52.0 gl-node/v22.22.3",
+      "x-goog-api-client": "google-genai-sdk/1.52.0 gl-node/v22.22.3",
+      "x-goog-api-key": "<redacted>"
+    },
+    "body": {
+      "contents": [
+        {
+          "parts": [
+            {
+              "text": "hello"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "systemInstruction": {
+        "parts": [
+          {
+            "text": "pi rust cli"
+          }
+        ],
+        "role": "user"
+      },
+      "generationConfig": {
+        "maxOutputTokens": 32000,
+        "thinkingConfig": {
+          "includeThoughts": true,
+          "thinkingBudget": 32768
+        }
+      }
+    }
+  }
+}

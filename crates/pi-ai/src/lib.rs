@@ -751,30 +751,24 @@ struct GoogleProvider {
 impl Provider for GoogleProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
         let api_key = self.api_key()?;
-        let base_url = self
-            .config
-            .base_url
-            .as_deref()
-            .unwrap_or("https://generativelanguage.googleapis.com/v1beta");
-        let url = format!(
-            "{}/models/{}:generateContent?key={}",
-            base_url.trim_end_matches('/'),
-            self.config.model.id,
-            api_key
-        );
         let response = reqwest::Client::new()
-            .post(url)
-            .json(&json!({
-                "systemInstruction": request.system_prompt.map(|text| json!({ "parts": [{ "text": text }] })),
-                "contents": google_messages(&request.messages),
-            }))
+            .post(google_url(&self.config)?)
+            .headers(google_headers(&api_key)?)
+            .json(&google_body(&self.config, &request))
             .send()
             .await?;
+        let body = error_for_status_with_body(response).await?.text().await?;
+        if let Some(text) = parse_google_sse_text(&body) {
+            return Ok(vec![
+                StreamEvent::Text(text),
+                StreamEvent::Stop {
+                    reason: "STOP".to_string(),
+                },
+            ]);
+        }
         parse_google_response(
-            error_for_status_with_body(response)
-                .await?
-                .json::<Value>()
-                .await?,
+            serde_json::from_str::<Value>(&body)
+                .map_err(|_| ProviderError::InvalidResponse(body.clone()))?,
         )
     }
 }
@@ -788,6 +782,89 @@ impl GoogleProvider {
             }),
         }
     }
+}
+
+fn google_url(config: &ProviderConfig) -> Result<String, ProviderError> {
+    let base_url = resolve_env_placeholders(
+        config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://generativelanguage.googleapis.com/v1beta"),
+    )?;
+    Ok(format!(
+        "{}/models/{}:streamGenerateContent?alt=sse",
+        base_url.trim_end_matches('/'),
+        encode_path_segment(&config.model.id)
+    ))
+}
+
+fn google_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-goog-api-key", HeaderValue::from_str(api_key)?);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(headers)
+}
+
+fn google_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let mut generation_config = json!({
+        "maxOutputTokens": 32000,
+    });
+    if let Some(thinking_config) = google_thinking_config(config) {
+        generation_config["thinkingConfig"] = thinking_config;
+    }
+    json!({
+        "contents": google_messages(&request.messages),
+        "systemInstruction": request.system_prompt.as_ref().map(|text| {
+            json!({
+                "parts": [{ "text": text }],
+                "role": "user",
+            })
+        }),
+        "generationConfig": generation_config,
+    })
+}
+
+fn google_thinking_config(config: &ProviderConfig) -> Option<Value> {
+    let level = normalized_thinking_level(config.thinking_level.as_deref())?;
+    if level == "off" {
+        return Some(json!({ "thinkingBudget": 0 }));
+    }
+    let budget = config
+        .thinking_budget_tokens
+        .map(|budget| budget as i64)
+        .unwrap_or_else(|| google_default_thinking_budget(&config.model.id, level));
+    Some(json!({
+        "includeThoughts": true,
+        "thinkingBudget": budget,
+    }))
+}
+
+fn google_default_thinking_budget(model_id: &str, level: &str) -> i64 {
+    if model_id.contains("2.5-pro") {
+        return match level {
+            "minimal" => 128,
+            "low" => 2048,
+            "medium" => 8192,
+            _ => 32768,
+        };
+    }
+    if model_id.contains("2.5-flash-lite") {
+        return match level {
+            "minimal" => 512,
+            "low" => 2048,
+            "medium" => 8192,
+            _ => 24576,
+        };
+    }
+    if model_id.contains("2.5-flash") {
+        return match level {
+            "minimal" => 128,
+            "low" => 2048,
+            "medium" => 8192,
+            _ => 24576,
+        };
+    }
+    -1
 }
 
 struct GoogleVertexProvider {
@@ -990,6 +1067,37 @@ fn parse_google_response(response: Value) -> Result<Vec<StreamEvent>, ProviderEr
                 .to_string(),
         },
     ])
+}
+
+fn parse_google_sse_text(body: &str) -> Option<String> {
+    let mut text = String::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let Some(parts) = event
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for part in parts {
+            if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            if let Some(delta) = part.get("text").and_then(Value::as_str) {
+                text.push_str(delta);
+            }
+        }
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn parse_bedrock_response(response: Value) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -1560,8 +1668,8 @@ fn google_messages(messages: &[ChatMessage]) -> Vec<Value> {
             let mut parts = vec![json!({ "text": message.content })];
             parts.extend(message.media.iter().map(|media| {
                 json!({
-                    "inline_data": {
-                        "mime_type": media.mime_type,
+                    "inlineData": {
+                        "mimeType": media.mime_type,
                         "data": media.data_base64,
                     },
                 })
@@ -1697,6 +1805,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_google_sse_text_deltas() {
+        let body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hel\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"skip\"},{\"text\":\"lo\"}]}}]}\n\n",
+        );
+
+        assert_eq!(parse_google_sse_text(body), Some("hello".to_string()));
+    }
+
+    #[test]
     fn provider_message_converters_include_image_parts() {
         let request = ProviderRequest {
             system_prompt: None,
@@ -1724,10 +1842,7 @@ mod tests {
             "image/png"
         );
         let google = google_messages(&request.messages);
-        assert_eq!(
-            google[0]["parts"][1]["inline_data"]["mime_type"],
-            "image/png"
-        );
+        assert_eq!(google[0]["parts"][1]["inlineData"]["mimeType"], "image/png");
     }
 
     #[test]
@@ -2123,6 +2238,50 @@ mod tests {
         assert_eq!(body["stream"], fixture_request["body"]["stream"]);
         assert_eq!(body["include"], fixture_request["body"]["include"]);
         assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
+    }
+
+    #[test]
+    fn google_gemini_matches_ts_request_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/google-gemini-2.5-pro.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "google".to_string(),
+                id: "gemini-2.5-pro".to_string(),
+            },
+            api: ProviderApi::Google,
+            base_url: Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            auth: ProviderAuth::ApiKey("google-key".to_string()),
+            thinking_level: Some("high".to_string()),
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        let fixture_request = &fixture["request"];
+        let headers = google_headers("google-key").expect("headers");
+
+        assert_eq!(
+            google_url(&config).expect("url"),
+            fixture_request["url"].as_str().expect("fixture url")
+        );
+        assert_eq!(
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            fixture_request["headers"]["content-type"].as_str()
+        );
+        assert!(headers.get("x-goog-api-key").is_some());
+
+        assert_eq!(google_body(&config, &request), fixture_request["body"]);
     }
 
     #[test]
