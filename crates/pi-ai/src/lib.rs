@@ -53,6 +53,7 @@ pub struct ProviderConfig {
     pub auth: ProviderAuth,
     pub thinking_level: Option<String>,
     pub thinking_budget_tokens: Option<u64>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -207,10 +208,17 @@ impl Provider for OpenAiProvider {
             .json(&openai_chat_completions_body(&self.config, &request))
             .send()
             .await?;
-        let response = error_for_status_with_body(response)
-            .await?
-            .json::<Value>()
-            .await?;
+        let body = error_for_status_with_body(response).await?.text().await?;
+        if let Some(text) = parse_openai_chat_completions_sse_text(&body) {
+            return Ok(vec![
+                StreamEvent::Text(text),
+                StreamEvent::Stop {
+                    reason: "stop".to_string(),
+                },
+            ]);
+        }
+        let response = serde_json::from_str::<Value>(&body)
+            .map_err(|_| ProviderError::InvalidResponse(body.clone()))?;
         let text = response
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -288,9 +296,20 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
         "messages": openai_chat_messages(config, request),
     });
     if config.model.provider == "openrouter" {
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({ "include_usage": true });
+        body["store"] = json!(false);
+        body["max_completion_tokens"] = json!(16384);
         if let Some(effort) = openrouter_reasoning_effort(config.thinking_level.as_deref()) {
             body["reasoning"] = json!({ "effort": effort });
         }
+    } else if matches!(
+        config.model.provider.as_str(),
+        "cloudflare-ai-gateway" | "cloudflare-workers-ai"
+    ) {
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({ "include_usage": true });
+        body["max_tokens"] = json!(32000);
     }
     body
 }
@@ -827,7 +846,7 @@ impl Provider for MistralProvider {
                 "{}/chat/completions",
                 base_url.trim_end_matches('/')
             ))
-            .headers(mistral_headers(&api_key)?)
+            .headers(mistral_headers(&self.config, &api_key)?)
             .json(&mistral_chat_body(&self.config, &request))
             .send()
             .await?;
@@ -858,13 +877,16 @@ impl MistralProvider {
     }
 }
 
-fn mistral_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
+fn mistral_headers(config: &ProviderConfig, api_key: &str) -> Result<HeaderMap, ProviderError> {
     let mut headers = bearer_headers(api_key)?;
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert(
         USER_AGENT,
         HeaderValue::from_static("mistral-client-typescript/2.2.1"),
     );
+    if let Some(session_id) = &config.session_id {
+        headers.insert("x-affinity", HeaderValue::from_str(session_id)?);
+    }
     Ok(headers)
 }
 
@@ -1016,6 +1038,11 @@ fn openai_compatible_headers(
             "cf-aig-authorization",
             HeaderValue::from_str(&format!("Bearer {api_key}"))?,
         );
+        if let Some(session_id) = &config.session_id {
+            headers.insert("session_id", HeaderValue::from_str(session_id)?);
+            headers.insert("x-client-request-id", HeaderValue::from_str(session_id)?);
+            headers.insert("x-session-affinity", HeaderValue::from_str(session_id)?);
+        }
     } else {
         headers.insert(
             AUTHORIZATION,
@@ -1576,6 +1603,7 @@ mod tests {
             auth: ProviderAuth::None,
             thinking_level: None,
             thinking_budget_tokens: None,
+            session_id: None,
         });
 
         let events = provider
@@ -1742,6 +1770,7 @@ mod tests {
             auth: ProviderAuth::ApiKey("token".to_string()),
             thinking_level: Some("max".to_string()),
             thinking_budget_tokens: None,
+            session_id: None,
         };
         let opus_body = anthropic_body(&opus, &request);
         assert_eq!(opus_body["thinking"]["type"], "adaptive");
@@ -1757,6 +1786,7 @@ mod tests {
             auth: ProviderAuth::ApiKey("token".to_string()),
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
+            session_id: None,
         };
         let codex_body = openai_responses_body(&codex, &request);
         assert_eq!(codex_body["reasoning"]["effort"], "xhigh");
@@ -1788,6 +1818,7 @@ mod tests {
             },
             thinking_level: Some("off".to_string()),
             thinking_budget_tokens: None,
+            session_id: None,
         };
         let fixture_request = &fixture["request"];
 
@@ -1840,6 +1871,7 @@ mod tests {
             auth: ProviderAuth::ApiKey("api-key".to_string()),
             thinking_level: Some("off".to_string()),
             thinking_budget_tokens: None,
+            session_id: None,
         };
         let fixture_request = &fixture["request"];
 
@@ -1876,6 +1908,7 @@ mod tests {
             auth: ProviderAuth::ApiKey("token".to_string()),
             thinking_level: None,
             thinking_budget_tokens: None,
+            session_id: None,
         };
         let headers = openai_compatible_headers(&copilot, "token", true).expect("copilot headers");
         assert_eq!(
@@ -1901,6 +1934,7 @@ mod tests {
             auth: ProviderAuth::ApiKey("token".to_string()),
             thinking_level: None,
             thinking_budget_tokens: None,
+            session_id: Some("session-test".to_string()),
         };
         let headers =
             openai_compatible_headers(&cloudflare, "token", false).expect("cloudflare headers");
@@ -1909,6 +1943,12 @@ mod tests {
                 .get("cf-aig-authorization")
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer token")
+        );
+        assert_eq!(
+            headers
+                .get("x-session-affinity")
+                .and_then(|value| value.to_str().ok()),
+            Some("session-test")
         );
         assert!(headers.get(AUTHORIZATION).is_none());
     }
@@ -1940,6 +1980,7 @@ mod tests {
             },
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
+            session_id: None,
         };
         let fixture_request = &fixture["request"];
 
@@ -1987,6 +2028,7 @@ mod tests {
             auth: ProviderAuth::ApiKey("openrouter-key".to_string()),
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
+            session_id: None,
         };
         let fixture_request = &fixture["request"];
 
@@ -2009,6 +2051,16 @@ mod tests {
         let body = openai_chat_completions_body(&config, &request);
         assert_eq!(body["model"], fixture_request["body"]["model"]);
         assert_eq!(body["messages"], fixture_request["body"]["messages"]);
+        assert_eq!(body["stream"], fixture_request["body"]["stream"]);
+        assert_eq!(
+            body["stream_options"],
+            fixture_request["body"]["stream_options"]
+        );
+        assert_eq!(body["store"], fixture_request["body"]["store"]);
+        assert_eq!(
+            body["max_completion_tokens"],
+            fixture_request["body"]["max_completion_tokens"]
+        );
         assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
     }
 
@@ -2036,6 +2088,7 @@ mod tests {
             auth: ProviderAuth::ApiKey("copilot-key".to_string()),
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
+            session_id: None,
         };
         let fixture_request = &fixture["request"];
         let provider = OpenAiResponsesProvider {
@@ -2101,6 +2154,7 @@ mod tests {
             auth: ProviderAuth::ApiKey("cloudflare-key".to_string()),
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
+            session_id: Some("session_ts_parity".to_string()),
         };
         let fixture_request = &fixture["request"];
         let provider = OpenAiProvider {
@@ -2115,7 +2169,14 @@ mod tests {
             fixture_request["url"].as_str().expect("fixture url")
         );
         let headers = openai_compatible_headers(&config, "cloudflare-key", false).expect("headers");
-        for name in ["accept", "cf-aig-authorization", "content-type"] {
+        for name in [
+            "accept",
+            "cf-aig-authorization",
+            "content-type",
+            "session_id",
+            "x-client-request-id",
+            "x-session-affinity",
+        ] {
             if name == "cf-aig-authorization" {
                 assert_eq!(
                     headers
@@ -2137,6 +2198,12 @@ mod tests {
         let body = openai_chat_completions_body(&config, &request);
         assert_eq!(body["model"], fixture_request["body"]["model"]);
         assert_eq!(body["messages"], fixture_request["body"]["messages"]);
+        assert_eq!(body["stream"], fixture_request["body"]["stream"]);
+        assert_eq!(
+            body["stream_options"],
+            fixture_request["body"]["stream_options"]
+        );
+        assert_eq!(body["max_tokens"], fixture_request["body"]["max_tokens"]);
     }
 
     #[test]
@@ -2163,11 +2230,12 @@ mod tests {
             auth: ProviderAuth::ApiKey("mistral-key".to_string()),
             thinking_level: Some("high".to_string()),
             thinking_budget_tokens: None,
+            session_id: Some("session_ts_parity".to_string()),
         };
         let fixture_request = &fixture["request"];
-        let headers = mistral_headers("mistral-key").expect("headers");
+        let headers = mistral_headers(&config, "mistral-key").expect("headers");
 
-        for name in ["accept", "content-type", "user-agent"] {
+        for name in ["accept", "content-type", "user-agent", "x-affinity"] {
             assert_eq!(
                 headers.get(name).and_then(|value| value.to_str().ok()),
                 fixture_request["headers"][name].as_str(),

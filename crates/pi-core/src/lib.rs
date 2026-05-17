@@ -1860,6 +1860,7 @@ mod tests {
             auth: ProviderAuth::None,
             thinking_level: None,
             thinking_budget_tokens: None,
+            session_id: None,
         });
 
         let response = run_user_turn(&mut runtime, provider.as_ref(), "hello".to_string())
@@ -1888,6 +1889,7 @@ mod tests {
             auth: ProviderAuth::None,
             thinking_level: None,
             thinking_budget_tokens: None,
+            session_id: None,
         });
         let mut deltas = Vec::new();
 
@@ -2057,6 +2059,7 @@ mod tests {
             auth: ProviderAuth::None,
             thinking_level: None,
             thinking_budget_tokens: None,
+            session_id: None,
         });
 
         let error = run_user_turn(

@@ -3197,6 +3197,7 @@ fn provider_for_runtime(
         api: map_provider_api(&definition.api),
         base_url: definition.base_url.clone(),
         auth: map_provider_auth(auth_for_provider(&config.auth, &definition.provider)),
+        session_id: Some(runtime.session().session_id.clone()),
     }))
 }
 
