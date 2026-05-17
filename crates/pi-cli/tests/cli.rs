@@ -202,6 +202,80 @@ fn package_commands_manage_settings_sources() {
 }
 
 #[test]
+fn update_pulls_local_git_package_source() {
+    let root = test_dir("pi-cli-package-update");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("create source repo");
+    git(&source, ["init"]);
+    git(&source, ["config", "commit.gpgsign", "false"]);
+    git(&source, ["config", "user.email", "pi@example.test"]);
+    git(&source, ["config", "user.name", "pi test"]);
+    fs::write(source.join("plugin.txt"), "v1").expect("write initial plugin");
+    git(&source, ["add", "plugin.txt"]);
+    git(&source, ["commit", "-m", "initial"]);
+    git(
+        &root,
+        [
+            "clone",
+            source.to_str().expect("source path"),
+            "package-plugin",
+        ],
+    );
+
+    let install = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["install", "./package-plugin"])
+        .output()
+        .expect("install package");
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    fs::write(source.join("plugin.txt"), "v2").expect("write updated plugin");
+    git(&source, ["add", "plugin.txt"]);
+    git(&source, ["commit", "-m", "update"]);
+
+    let update = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["update", "./package-plugin"])
+        .output()
+        .expect("update package");
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&update.stdout);
+    assert!(stdout.contains("updated package"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(root.join("package-plugin/plugin.txt")).expect("updated plugin"),
+        "v2"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+fn git<const N: usize>(cwd: &Path, args: [&str; N]) {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn login_commands_manage_api_key_auth() {
     let root = test_dir("pi-cli-login-commands");
     let agent = root.join("agent");

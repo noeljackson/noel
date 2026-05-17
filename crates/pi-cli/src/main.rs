@@ -331,9 +331,94 @@ fn run_package_update(args: &[String]) -> Result<()> {
     if let Some(invalid) = args.iter().find(|arg| arg.starts_with('-')) {
         return Err(anyhow!("unknown update option: {invalid}"));
     }
+    if args.len() > 1 {
+        return Err(anyhow!("usage: pi update [source|self|pi]"));
+    }
+    let cwd = std::env::current_dir()?;
+    let paths = ConfigPaths::discover(cwd.clone(), None)?;
     let target = args.first().map(String::as_str).unwrap_or("all");
-    println!("update target '{target}' is recorded; Rust no-npm builds reload local resources at startup");
+    let sources = if target == "all" {
+        configured_package_sources(&paths)?
+    } else if matches!(target, "self" | "pi") {
+        println!("self update is not managed by the Rust no-npm package updater");
+        return Ok(());
+    } else {
+        vec![target.to_string()]
+    };
+    if sources.is_empty() {
+        println!("no package sources configured");
+        return Ok(());
+    }
+    for source in sources {
+        update_package_source(&cwd, &source)?;
+    }
     Ok(())
+}
+
+fn configured_package_sources(paths: &ConfigPaths) -> Result<Vec<String>> {
+    let mut sources = BTreeSet::new();
+    for source in read_settings_packages(&paths.settings_path)? {
+        sources.insert(source);
+    }
+    for source in read_settings_packages(&paths.project_settings_path)? {
+        sources.insert(source);
+    }
+    Ok(sources.into_iter().collect())
+}
+
+fn update_package_source(cwd: &Path, source: &str) -> Result<()> {
+    if source.contains("://") || source.starts_with("git@") {
+        println!("git source is recorded but not installed locally: {source}");
+        return Ok(());
+    }
+    let path = resolve_package_source_path(cwd, source)?;
+    if !path.exists() {
+        return Err(anyhow!("package path not found: {}", path.display()));
+    }
+    if path.join(".git").is_dir() {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["pull", "--ff-only"])
+            .output()?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "failed to update package {}:\n{}{}",
+                path.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let details = String::from_utf8_lossy(&output.stdout);
+        let details = details.trim();
+        if details.is_empty() {
+            println!("updated package {} from git", path.display());
+        } else {
+            println!("updated package {} from git: {details}", path.display());
+        }
+    } else {
+        println!(
+            "local package {} is not a git repository; resources reload at startup",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn resolve_package_source_path(cwd: &Path, source: &str) -> Result<PathBuf> {
+    let path = if let Some(rest) = source.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("home directory is not available"))?
+            .join(rest)
+    } else {
+        PathBuf::from(source)
+    };
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    })
 }
 
 fn run_package_list(args: &[String]) -> Result<()> {
@@ -513,10 +598,18 @@ fn default_api_key_env(provider: &str) -> Option<&'static str> {
 
 fn print_package_help(command: &str) {
     match command {
-        "install" => println!("usage: pi install <source> [-l]\n\nRecord a package source in settings."),
-        "remove" => println!("usage: pi remove <source> [-l]\n\nRemove a package source from settings."),
-        "update" => println!("usage: pi update [source|self|pi]\n\nRust no-npm builds reload local resources at startup."),
-        "list" => println!("usage: pi list\n\nList package sources from user and project settings."),
+        "install" => {
+            println!("usage: pi install <source> [-l]\n\nRecord a package source in settings.")
+        }
+        "remove" => {
+            println!("usage: pi remove <source> [-l]\n\nRemove a package source from settings.")
+        }
+        "update" => println!(
+            "usage: pi update [source|self|pi]\n\nUpdate local git package sources without npm."
+        ),
+        "list" => {
+            println!("usage: pi list\n\nList package sources from user and project settings.")
+        }
         "config" => println!("usage: pi config\n\nShow active resource configuration."),
         _ => {}
     }
