@@ -1,0 +1,19 @@
+FROM node:22-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TS_REFERENCE_REPO=https://github.com/noeljackson/pi.git
+ARG TS_REFERENCE_REF=ts-reference
+
+RUN git clone --filter=blob:none "${TS_REFERENCE_REPO}" /ts-reference \
+    && cd /ts-reference \
+    && git checkout "${TS_REFERENCE_REF}"
+
+WORKDIR /ts-reference
+RUN npm ci --ignore-scripts
+
+COPY scripts/ts-parity /ts-parity
+
+CMD ["npx", "tsx", "/ts-parity/anthropic-oauth-fixture.ts", "/fixtures/anthropic-claude-code-oauth.json"]

@@ -1,11 +1,15 @@
 CARGO ?= cargo
 DOCKER ?= docker
 E2E_IMAGE ?= pi-e2e
+TS_PARITY_IMAGE ?= pi-ts-parity
+TS_REFERENCE_REPO ?= https://github.com/noeljackson/pi.git
+TS_REFERENCE_REF ?= $(shell git rev-parse ts-reference)
+TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 
-.PHONY: help build release install run fmt lint test check ci e2e test-smoke docker-build docker-e2e smoke-claude-opus-oauth clean
+.PHONY: help build release install run fmt lint test check ci e2e test-smoke docker-build docker-e2e ts-parity-build ts-parity-fixtures smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -22,6 +26,7 @@ help:
 		'  e2e          Run tmux TTY e2e' \
 		'  test-smoke   Run local TTY smoke plus manual real-provider smoke' \
 		'  docker-e2e   Build and run Dockerized tmux TTY e2e' \
+		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
 		'  smoke-claude-opus-oauth  Run manual Claude Opus OAuth smoke' \
 		'  clean        Remove Cargo build output'
 
@@ -62,6 +67,16 @@ docker-build:
 
 docker-e2e: docker-build
 	$(DOCKER) run --rm $(E2E_IMAGE)
+
+ts-parity-build:
+	$(DOCKER) build -f Dockerfile.ts-parity \
+		--build-arg TS_REFERENCE_REPO="$(TS_REFERENCE_REPO)" \
+		--build-arg TS_REFERENCE_REF="$(TS_REFERENCE_REF)" \
+		-t $(TS_PARITY_IMAGE) .
+
+ts-parity-fixtures: ts-parity-build
+	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
+	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE)
 
 smoke-claude-opus-oauth:
 	CARGO="$(CARGO)" scripts/smoke-claude-opus-oauth.sh

@@ -455,7 +455,7 @@ fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
         "model": config.model.id,
         "max_tokens": 4096,
         "system": anthropic_system(config, request),
-        "messages": anthropic_messages(&request.messages),
+        "messages": anthropic_messages_with_cache_control(&request.messages, true),
     });
     apply_anthropic_thinking(&mut body, config);
     body
@@ -497,22 +497,34 @@ fn anthropic_headers(config: &ProviderConfig) -> Result<HeaderMap, ProviderError
 
 fn anthropic_system(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     if matches!(&config.auth, ProviderAuth::ClaudeCodeOAuth { .. }) {
-        let mut blocks = vec![json!({
-            "type": "text",
-            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-        })];
+        let mut blocks = vec![anthropic_cached_text_block(
+            "You are Claude Code, Anthropic's official CLI for Claude.",
+        )];
         if let Some(system_prompt) = request.system_prompt.as_deref() {
             if !system_prompt.trim().is_empty() {
-                blocks.push(json!({
-                    "type": "text",
-                    "text": system_prompt,
-                }));
+                blocks.push(anthropic_cached_text_block(system_prompt));
             }
         }
         Value::Array(blocks)
+    } else if let Some(system_prompt) = request.system_prompt.as_deref() {
+        if system_prompt.trim().is_empty() {
+            Value::String(String::new())
+        } else {
+            Value::Array(vec![anthropic_cached_text_block(system_prompt)])
+        }
     } else {
-        Value::String(request.system_prompt.clone().unwrap_or_default())
+        Value::String(String::new())
     }
+}
+
+fn anthropic_cached_text_block(text: &str) -> Value {
+    json!({
+        "type": "text",
+        "text": text,
+        "cache_control": {
+            "type": "ephemeral",
+        },
+    })
 }
 
 fn apply_anthropic_thinking(body: &mut Value, config: &ProviderConfig) {
@@ -1253,8 +1265,16 @@ fn parse_openai_responses_item_text(item: &Value) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
+    anthropic_messages_with_cache_control(messages, false)
+}
+
+fn anthropic_messages_with_cache_control(
+    messages: &[ChatMessage],
+    cache_last_user_message: bool,
+) -> Vec<Value> {
+    let mut output: Vec<Value> = messages
         .iter()
         .filter(|message| message.role != ChatRole::System)
         .map(|message| {
@@ -1282,7 +1302,33 @@ fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
                 "content": content,
             })
         })
-        .collect()
+        .collect();
+    if cache_last_user_message {
+        apply_anthropic_cache_control_to_last_user_message(&mut output);
+    }
+    output
+}
+
+fn apply_anthropic_cache_control_to_last_user_message(messages: &mut [Value]) {
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message["role"] == "user")
+    else {
+        return;
+    };
+    if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(block) = content.last_mut() {
+            if block["type"] == "text" || block["type"] == "image" {
+                block["cache_control"] = json!({ "type": "ephemeral" });
+            }
+        }
+        return;
+    }
+    let Some(text) = message.get("content").and_then(Value::as_str) else {
+        return;
+    };
+    message["content"] = json!([anthropic_cached_text_block(text)]);
 }
 
 fn google_messages(messages: &[ChatMessage]) -> Vec<Value> {
@@ -1510,6 +1556,10 @@ mod tests {
 
     #[test]
     fn anthropic_claude_code_oauth_matches_ts_identity_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/anthropic-claude-code-oauth.json"
+        ))
+        .expect("parse TS parity fixture");
         let request = ProviderRequest {
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
@@ -1531,32 +1581,29 @@ mod tests {
             thinking_level: Some("off".to_string()),
             thinking_budget_tokens: None,
         };
+        let fixture_request = &fixture["request"];
 
         let headers = anthropic_headers(&config).expect("anthropic headers");
-        assert_eq!(
-            headers
-                .get("anthropic-beta")
-                .and_then(|value| value.to_str().ok()),
-            Some("claude-code-20250219,oauth-2025-04-20")
-        );
-        assert_eq!(
-            headers
-                .get(USER_AGENT)
-                .and_then(|value| value.to_str().ok()),
-            Some("claude-cli/2.1.75")
-        );
-        assert_eq!(
-            headers.get("x-app").and_then(|value| value.to_str().ok()),
-            Some("cli")
-        );
+        for name in [
+            "accept",
+            "anthropic-beta",
+            "anthropic-dangerous-direct-browser-access",
+            "anthropic-version",
+            "content-type",
+            "user-agent",
+            "x-app",
+        ] {
+            assert_eq!(
+                headers.get(name).and_then(|value| value.to_str().ok()),
+                fixture_request["headers"][name].as_str(),
+                "header {name}"
+            );
+        }
 
         let body = anthropic_body(&config, &request);
-        assert_eq!(
-            body["system"][0]["text"],
-            "You are Claude Code, Anthropic's official CLI for Claude."
-        );
-        assert_eq!(body["system"][1]["text"], "pi rust cli");
-        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["system"], fixture_request["body"]["system"]);
+        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
+        assert_eq!(body["thinking"], fixture_request["body"]["thinking"]);
     }
 
     #[test]

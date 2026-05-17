@@ -326,6 +326,16 @@ Dockerized TTY e2e test:
 make docker-e2e
 ```
 
+Docker-only TS reference fixture generation:
+
+```bash
+make ts-parity-fixtures
+```
+
+This is the only supported path for executing TypeScript reference code. It
+clones `ts-reference` inside Docker, runs npm inside Docker, and writes
+sanitized fixtures under `tests/fixtures/ts-parity/`.
+
 Manual real-provider Opus smoke with Claude Code OAuth:
 
 ```bash
