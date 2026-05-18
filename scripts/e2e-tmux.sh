@@ -34,6 +34,14 @@ input="$(cat)"
 printf 'exec-ext saw %s\n' "${input}"
 SH
 chmod +x "${agent_dir}/extensions/exec-ext"
+cat > "${agent_dir}/extensions/json-ext" <<'SH'
+#!/bin/sh
+request="$(cat)"
+input="$(printf '%s' "${request}" | sed -n 's/.*"input":"\([^"]*\)".*/\1/p')"
+printf '{"output":"json-ext saw %s"}\n' "${input}"
+SH
+chmod +x "${agent_dir}/extensions/json-ext"
+printf '{"protocol":"json"}\n' > "${agent_dir}/extensions/json-ext.pi-extension.json"
 printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=' | base64 -d > "${work_dir}/pixel.png"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
@@ -110,6 +118,7 @@ send_line "/skill:review skill input"
 send_line "/extensions"
 send_line "/extension:assist extension input"
 send_line "/extension:exec-ext executable input"
+send_line "/extension:json-ext protocol input"
 send_line "/prompts"
 send_line "/prompt fix broken thing"
 send_line "/themes"
@@ -204,6 +213,7 @@ require_output "assist"
 require_output "extension says {{input}}"
 require_output "extension input"
 require_output "exec-ext saw executable input"
+require_output "json-ext saw protocol input"
 require_output "fix"
 require_output "fix broken thing"
 require_output "theme: dark"

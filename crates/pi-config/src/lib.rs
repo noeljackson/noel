@@ -999,6 +999,9 @@ fn load_resource_files(
             if !path.is_file() {
                 continue;
             }
+            if is_resource_metadata_file(&path) {
+                continue;
+            }
             push_resource_file(&mut resources, &path, diagnostics);
         }
     }
@@ -1174,12 +1177,22 @@ fn collect_resource_path(
             }
         };
         let child = entry.path();
+        if is_resource_metadata_file(&child) {
+            continue;
+        }
         if child.is_dir() {
             collect_resource_path(resources, &child, diagnostics);
         } else if child.is_file() {
             push_resource_file(resources, &child, diagnostics);
         }
     }
+}
+
+fn is_resource_metadata_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| name.ends_with(".pi-extension.json"))
+        .unwrap_or(false)
 }
 
 fn push_resource_file(

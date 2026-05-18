@@ -44,7 +44,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum OutputMode {
@@ -3921,21 +3921,60 @@ fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionManifest {
+    protocol: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionCommandRequest<'a> {
+    protocol_version: u8,
+    kind: &'static str,
+    command: &'a str,
+    input: &'a str,
+    cwd: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionCommandResponse {
+    output: Option<String>,
+    error: Option<String>,
+}
+
 fn run_executable_extension(extension: &ResourceFile, input: &str, cwd: &Path) -> Result<String> {
+    let protocol = extension_protocol(extension)?;
     let mut child = Command::new(&extension.path)
         .current_dir(cwd)
         .env("PI_EXTENSION_NAME", &extension.name)
         .env("PI_EXTENSION_PATH", &extension.path)
+        .env(
+            "PI_EXTENSION_PROTOCOL",
+            protocol.as_deref().unwrap_or("stdio"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    if !input.is_empty() {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("failed to open extension stdin"))?;
-        stdin.write_all(input.as_bytes())?;
+    if let Some(mut stdin) = child.stdin.take() {
+        match protocol.as_deref() {
+            Some("json") => {
+                let cwd_string = cwd.display().to_string();
+                let request = ExtensionCommandRequest {
+                    protocol_version: 1,
+                    kind: "command",
+                    command: &extension.name,
+                    input,
+                    cwd: &cwd_string,
+                };
+                serde_json::to_writer(&mut stdin, &request)?;
+                stdin.write_all(b"\n")?;
+            }
+            _ if !input.is_empty() => stdin.write_all(input.as_bytes())?,
+            _ => {}
+        }
     }
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3948,7 +3987,10 @@ fn run_executable_extension(extension: &ResourceFile, input: &str, cwd: &Path) -
             stderr
         ));
     }
-    let mut text = stdout.trim_end().to_string();
+    let mut text = match protocol.as_deref() {
+        Some("json") => parse_extension_json_response(&stdout, &extension.name)?,
+        _ => stdout.trim_end().to_string(),
+    };
     if !stderr.trim().is_empty() {
         if !text.is_empty() {
             text.push('\n');
@@ -3960,6 +4002,45 @@ fn run_executable_extension(extension: &ResourceFile, input: &str, cwd: &Path) -
     } else {
         Ok(text)
     }
+}
+
+fn extension_protocol(extension: &ResourceFile) -> Result<Option<String>> {
+    for manifest_path in extension_manifest_paths(&extension.path) {
+        if !manifest_path.exists() {
+            continue;
+        }
+        let manifest =
+            serde_json::from_str::<ExtensionManifest>(&fs::read_to_string(&manifest_path)?)?;
+        return Ok(manifest.protocol);
+    }
+    Ok(None)
+}
+
+fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(file_name) = path.file_name() {
+        paths.push(
+            path.with_file_name(format!("{}.pi-extension.json", file_name.to_string_lossy())),
+        );
+        paths.push(path.with_file_name(format!("{}.json", file_name.to_string_lossy())));
+    }
+    if path.extension().is_some() {
+        paths.push(path.with_extension("json"));
+    }
+    paths
+}
+
+fn parse_extension_json_response(stdout: &str, name: &str) -> Result<String> {
+    let response =
+        serde_json::from_str::<ExtensionCommandResponse>(stdout.trim()).map_err(|error| {
+            anyhow!("extension {name} returned invalid JSON protocol response: {error}")
+        })?;
+    if let Some(error) = response.error {
+        return Err(anyhow!("extension {name} failed: {error}"));
+    }
+    Ok(response
+        .output
+        .unwrap_or_else(|| format!("extension {name} completed")))
 }
 
 fn split_resource_command<'a>(line: &'a str, prefix: &str) -> (&'a str, &'a str) {
