@@ -500,10 +500,12 @@ pub enum AuthCredential {
     ApiKey {
         key: String,
     },
+    #[serde(rename = "oauth", alias = "o_auth")]
     OAuth {
+        #[serde(alias = "access")]
         access_token: String,
         expires: u64,
-        #[serde(default)]
+        #[serde(default, alias = "accountId")]
         account_id: Option<String>,
     },
 }
@@ -923,15 +925,15 @@ fn env_api_key(provider: &str) -> Option<String> {
 }
 
 fn env_auth(provider: &str) -> Option<ResolvedAuth> {
-    if let Some(api_key) = env_api_key(provider) {
-        return Some(ResolvedAuth::ApiKey(api_key));
-    }
     match provider {
-        "anthropic" => read_non_empty_env("ANTHROPIC_AUTH_TOKEN")
+        "anthropic" => read_non_empty_env("ANTHROPIC_OAUTH_TOKEN")
+            .or_else(|| read_non_empty_env("ANTHROPIC_AUTH_TOKEN"))
             .or_else(|| read_non_empty_env("CLAUDE_CODE_OAUTH_TOKEN"))
-            .map(|access_token| ResolvedAuth::ClaudeCodeOAuth { access_token }),
-        "openai" => read_non_empty_env("CODEX_API_KEY")
+            .map(|access_token| ResolvedAuth::ClaudeCodeOAuth { access_token })
+            .or_else(|| env_api_key(provider).map(ResolvedAuth::ApiKey)),
+        "openai" => env_api_key(provider)
             .map(ResolvedAuth::ApiKey)
+            .or_else(|| read_non_empty_env("CODEX_API_KEY").map(ResolvedAuth::ApiKey))
             .or_else(|| {
                 read_non_empty_env("CODEX_ACCESS_TOKEN").map(|access_token| {
                     ResolvedAuth::ChatGptOAuth {
@@ -946,7 +948,7 @@ fn env_auth(provider: &str) -> Option<ResolvedAuth> {
                 account_id: read_non_empty_env("CHATGPT_ACCOUNT_ID"),
             }
         }),
-        _ => None,
+        _ => env_api_key(provider).map(ResolvedAuth::ApiKey),
     }
 }
 
@@ -3077,6 +3079,119 @@ mod tests {
                 account_id: Some("account-id".to_string())
             })
         );
+    }
+
+    #[test]
+    fn auth_discovery_matches_upstream_ts_fixture() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/auth-discovery.json"
+        ))
+        .expect("parse fixture");
+        assert_eq!(fixture["fakeTokensOnly"], true);
+        assert_eq!(
+            fixture["redaction"]["fixturesUseOnlyFakeTokens"],
+            serde_json::Value::Bool(true)
+        );
+
+        let api_key_credential = serde_json::from_value::<AuthCredential>(
+            fixture["authJson"]["apiKeyCredential"].clone(),
+        )
+        .expect("parse api key credential");
+        let oauth_credential = serde_json::from_value::<AuthCredential>(
+            fixture["authJson"]["oauthCredential"].clone(),
+        )
+        .expect("parse oauth credential");
+        let auth = BTreeMap::from([
+            ("anthropic".to_string(), api_key_credential),
+            ("openai-codex".to_string(), oauth_credential),
+        ]);
+        assert_eq!(
+            auth_for_provider(&auth, "anthropic"),
+            Some(ResolvedAuth::ApiKey("stored-anthropic-api-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&auth, "openai-codex"),
+            Some(ResolvedAuth::ChatGptOAuth {
+                access_token: "stored-codex-access-token".to_string(),
+                account_id: Some("account-id".to_string())
+            })
+        );
+
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let saved = [
+            save_env("ANTHROPIC_OAUTH_TOKEN"),
+            save_env("ANTHROPIC_AUTH_TOKEN"),
+            save_env("CLAUDE_CODE_OAUTH_TOKEN"),
+            save_env("ANTHROPIC_API_KEY"),
+            save_env("OPENAI_API_KEY"),
+            save_env("AZURE_OPENAI_API_KEY"),
+            save_env("CODEX_API_KEY"),
+            save_env("CODEX_ACCESS_TOKEN"),
+            save_env("CHATGPT_ACCOUNT_ID"),
+        ];
+        for (name, _) in saved.iter() {
+            env::remove_var(name);
+        }
+
+        env::set_var("ANTHROPIC_OAUTH_TOKEN", "claude-oauth-env-token");
+        env::set_var("ANTHROPIC_API_KEY", "anthropic-api-key");
+        assert_eq!(
+            auth_for_provider(&BTreeMap::new(), "anthropic"),
+            Some(ResolvedAuth::ClaudeCodeOAuth {
+                access_token: "claude-oauth-env-token".to_string()
+            })
+        );
+        assert_eq!(
+            auth_for_provider(&auth, "anthropic"),
+            Some(ResolvedAuth::ApiKey("stored-anthropic-api-key".to_string()))
+        );
+
+        env::remove_var("ANTHROPIC_OAUTH_TOKEN");
+        env::remove_var("ANTHROPIC_API_KEY");
+        env::set_var("OPENAI_API_KEY", "openai-api-key");
+        env::set_var("AZURE_OPENAI_API_KEY", "azure-api-key");
+        assert_eq!(
+            auth_for_provider(&BTreeMap::new(), "openai"),
+            Some(ResolvedAuth::ApiKey("openai-api-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&BTreeMap::new(), "azure-openai-responses"),
+            Some(ResolvedAuth::ApiKey("azure-api-key".to_string()))
+        );
+
+        for (name, value) in saved {
+            restore_env(name, value);
+        }
+
+        let root = test_dir("pi-config-auth-discovery");
+        fs::create_dir_all(root.join(".claude")).expect("create claude dir");
+        fs::create_dir_all(root.join(".codex")).expect("create codex dir");
+        fs::write(
+            root.join(".claude").join(".credentials.json"),
+            serde_json::to_string(&fixture["interopLoginFiles"]["claudeCode"]["sample"])
+                .expect("encode claude sample"),
+        )
+        .expect("write claude credentials");
+        fs::write(
+            root.join(".codex").join("auth.json"),
+            serde_json::to_string(&fixture["interopLoginFiles"]["codex"]["sample"])
+                .expect("encode codex sample"),
+        )
+        .expect("write codex auth");
+        assert_eq!(
+            read_claude_code_oauth_from_path(&root.join(".claude").join(".credentials.json")),
+            Some(ResolvedAuth::ClaudeCodeOAuth {
+                access_token: "claude-access".to_string()
+            })
+        );
+        assert_eq!(
+            read_codex_chatgpt_oauth_from_path(&root.join(".codex").join("auth.json")),
+            Some(ResolvedAuth::ChatGptOAuth {
+                access_token: "codex-access".to_string(),
+                account_id: Some("account-id".to_string())
+            })
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
