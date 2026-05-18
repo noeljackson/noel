@@ -12,6 +12,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 session_name="pi-e2e-${$}"
 session_dir="${repo_root}/target/e2e-tmux-sessions"
 work_dir="${repo_root}/target/e2e-tmux-work"
+cwd_dir="${work_dir}/cwd"
 agent_dir="${work_dir}/agent"
 prompt_file="${work_dir}/prompt-ready"
 
@@ -23,7 +24,7 @@ cleanup() {
 trap cleanup EXIT
 
 rm -rf "${session_dir}" "${work_dir}"
-mkdir -p "${session_dir}" "${work_dir}" "${agent_dir}/skills" "${agent_dir}/prompts" "${agent_dir}/themes" "${agent_dir}/extensions"
+mkdir -p "${session_dir}" "${cwd_dir}" "${agent_dir}/skills" "${agent_dir}/prompts" "${agent_dir}/themes" "${agent_dir}/extensions"
 printf 'review this\n' > "${agent_dir}/skills/review.md"
 printf 'fix {{input}}\n' > "${agent_dir}/prompts/fix.md"
 printf '{"name":"dark"}\n' > "${agent_dir}/themes/dark.json"
@@ -48,16 +49,16 @@ chmod +x "${agent_dir}/extensions/json-ext"
 printf '{"protocol":"json"}\n' > "${agent_dir}/extensions/json-ext.pi-extension.json"
 printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=' | base64 -d > "${work_dir}/pixel.png"
 
-(cd "${repo_root}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q -p pi-cli -- config disable extension assist) > "${work_dir}/config-disable.txt"
-(cd "${repo_root}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q -p pi-cli -- config show) > "${work_dir}/config-disabled.txt"
+(cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config disable extension assist) > "${work_dir}/config-disable.txt"
+(cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config show) > "${work_dir}/config-disabled.txt"
 grep -Fq "disabled extensions: assist" "${work_dir}/config-disabled.txt"
-(cd "${repo_root}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q -p pi-cli -- config enable extension assist) > "${work_dir}/config-enable.txt"
-(cd "${repo_root}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q -p pi-cli -- config show) > "${work_dir}/config-enabled.txt"
+(cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config enable extension assist) > "${work_dir}/config-enable.txt"
+(cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config show) > "${work_dir}/config-enabled.txt"
 grep -Fq "disabled extensions: -" "${work_dir}/config-enabled.txt"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -103,9 +104,9 @@ send_line "/complete /extension:j"
 send_line "/status"
 send_line "/editor draft"
 send_line "/history"
-send_line "/image target/e2e-tmux-work/pixel.png describe image"
-send_line "/write target/e2e-tmux-work/file.txt e2e-ok"
-send_line "/read target/e2e-tmux-work/file.txt"
+send_line "/image ${work_dir}/pixel.png describe image"
+send_line "/write ${cwd_dir}/file.txt e2e-ok"
+send_line "/read ${cwd_dir}/file.txt"
 send_line "/reload"
 send_line "/queue queued followup"
 send_line "after reload"
@@ -157,17 +158,17 @@ send_enter
 send_line "/model 1"
 send_line "/hotkeys"
 send_line "/copy"
-send_line "/export target/e2e-tmux-work/session-export.json"
-send_line "/export target/e2e-tmux-work/session-export.jsonl"
-send_line "/export target/e2e-tmux-work/session-export.html"
-send_line "/share target/e2e-tmux-work/session-share.html"
+send_line "/export ${work_dir}/session-export.json"
+send_line "/export ${work_dir}/session-export.jsonl"
+send_line "/export ${work_dir}/session-export.html"
+send_line "/share ${work_dir}/session-share.html"
 send_line "/clone"
 send_line "/session"
 send_line "/resume 1"
 send_line "/session"
-send_line "/import target/e2e-tmux-work/session-export.json"
+send_line "/import ${work_dir}/session-export.json"
 send_line "/session"
-send_line "/import target/e2e-tmux-work/session-export.jsonl"
+send_line "/import ${work_dir}/session-export.jsonl"
 send_line "/session"
 send_line "/fork"
 send_line "/session"
@@ -209,7 +210,7 @@ require_output "hello from tmux e2e"
 require_output "image/png"
 require_output "1x1"
 require_output "[faux/echo] describe image [media:1]"
-require_output "wrote ${repo_root}/target/e2e-tmux-work/file.txt"
+require_output "wrote ${cwd_dir}/file.txt"
 require_output "e2e-ok"
 require_output "reloaded"
 require_output "queued: 1"
@@ -248,10 +249,10 @@ require_output "submit"
 require_output "reload"
 require_output "[faux/echo] after reload"
 require_output "copied to clipboard via cat > ${work_dir}/clipboard.txt"
-require_output "exported target/e2e-tmux-work/session-export.json"
-require_output "exported target/e2e-tmux-work/session-export.jsonl"
-require_output "exported target/e2e-tmux-work/session-export.html"
-require_output "share exported target/e2e-tmux-work/session-share.html"
+require_output "exported ${work_dir}/session-export.json"
+require_output "exported ${work_dir}/session-export.jsonl"
+require_output "exported ${work_dir}/session-export.html"
+require_output "share exported ${work_dir}/session-share.html"
 require_output "parent:"
 require_output "Branched from"
 require_output "compacted:"
@@ -377,7 +378,7 @@ printf '{"followUpMode":"one-at-a-time"}\n' > "${agent_dir}/settings.json"
 one_follow_session="pi-e2e-one-follow-${$}"
 tmux new-session -d -s "${one_follow_session}" -x 100 -y 20
 tmux send-keys -t "${one_follow_session}" \
-  "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -420,7 +421,7 @@ fi
 disabled_session="pi-e2e-disabled-${$}"
 tmux new-session -d -s "${disabled_session}" -x 100 -y 20
 tmux send-keys -t "${disabled_session}" \
-  "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo --no-tools" \
+  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo --no-tools" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -430,7 +431,7 @@ for _ in $(seq 1 80); do
   sleep 0.25
 done
 
-tmux send-keys -t "${disabled_session}" "/write target/e2e-tmux-work/blocked.txt blocked" Enter
+tmux send-keys -t "${disabled_session}" "/write ${cwd_dir}/blocked.txt blocked" Enter
 sleep 0.5
 tmux send-keys -t "${disabled_session}" "/quit" Enter
 sleep 0.5
@@ -443,7 +444,7 @@ if ! grep -Fq "tool is disabled: write" "${work_dir}/disabled-pane.txt"; then
   echo "disabled tool smoke did not fail as expected" >&2
   exit 1
 fi
-if [ -f "${work_dir}/blocked.txt" ]; then
+if [ -f "${cwd_dir}/blocked.txt" ]; then
   echo "disabled tool unexpectedly wrote blocked.txt" >&2
   exit 1
 fi

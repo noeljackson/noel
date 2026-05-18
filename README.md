@@ -509,7 +509,19 @@ make test-smoke
 `make dogfood` builds `target/release/pi` and runs the binary in tmux with an
 isolated agent/session directory under `target/`. It uses the faux provider, so
 it does not require provider credentials or network access. `make dogfood-real`
-is an opt-in alias for the live Claude Opus OAuth smoke.
+is opt-in and runs real Claude and Codex TTY smoke tests when local credentials
+are available. It asks each provider for a tiny Rust program and checks that a
+real assistant message contains the expected marker and `fn main`.
+
+The real TTY dogfood target can be narrowed with `PI_DOGFOOD_REAL_PROVIDERS`:
+
+```bash
+PI_DOGFOOD_REAL_PROVIDERS=claude make dogfood-real
+PI_DOGFOOD_REAL_PROVIDERS=codex make dogfood-real
+```
+
+The default models can be overridden with `PI_DOGFOOD_CLAUDE_MODEL` and
+`PI_DOGFOOD_CODEX_MODEL`.
 
 The real-provider smoke is intentionally not part of `test`, `check`, or `e2e`.
 It requires `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or

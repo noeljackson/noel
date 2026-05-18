@@ -18,6 +18,7 @@ fi
 session_name="pi-dogfood-${$}"
 session_dir="${repo_root}/target/dogfood-release-sessions"
 work_dir="${repo_root}/target/dogfood-release-work"
+cwd_dir="${work_dir}/cwd"
 agent_dir="${work_dir}/agent"
 prompt_file="${work_dir}/prompt-ready"
 
@@ -27,7 +28,7 @@ cleanup() {
 trap cleanup EXIT
 
 rm -rf "${session_dir}" "${work_dir}"
-mkdir -p "${session_dir}" "${work_dir}" "${agent_dir}"
+mkdir -p "${session_dir}" "${cwd_dir}" "${agent_dir}"
 
 cat > "${agent_dir}/settings.json" <<'JSON'
 {
@@ -43,7 +44,7 @@ grep -Eq '^pi [0-9]+' "${work_dir}/version.txt"
 
 tmux new-session -d -s "${session_name}" -x 110 -y 34
 tmux send-keys -t "${session_name}" \
-  "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' '${pi_bin}' --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' '${pi_bin}' --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -78,8 +79,8 @@ send_key() {
 
 send_line "/session"
 send_line "dogfood release prompt"
-send_line "/write target/dogfood-release-work/note.txt dogfood-ok"
-send_line "/read target/dogfood-release-work/note.txt"
+send_line "/write ${cwd_dir}/note.txt dogfood-ok"
+send_line "/read ${cwd_dir}/note.txt"
 send_line "/reload"
 send_line "/session"
 send_line "dogfood after reload"
@@ -100,8 +101,8 @@ sleep 0.35
 send_line "/thinking"
 send_line "/model faux/echo"
 send_line "dogfood back on faux"
-send_line "/export target/dogfood-release-work/session-export.json"
-send_line "/export target/dogfood-release-work/session-export.jsonl"
+send_line "/export ${work_dir}/session-export.json"
+send_line "/export ${work_dir}/session-export.jsonl"
 send_line "/clone"
 send_line "/session"
 send_line "/resume 1"
@@ -125,7 +126,7 @@ require_output() {
 require_output "pi rust cli"
 require_output "assistant>"
 require_output "[faux/echo] dogfood release prompt"
-require_output "wrote ${repo_root}/target/dogfood-release-work/note.txt"
+require_output "wrote ${cwd_dir}/note.txt"
 require_output "dogfood-ok"
 require_output "reloaded"
 require_output "[faux/echo] dogfood after reload"
@@ -137,8 +138,8 @@ require_output "model: anthropic/claude-opus-4-7"
 require_output "thinking: max"
 require_output "model: faux/echo"
 require_output "[faux/echo] dogfood back on faux"
-require_output "exported target/dogfood-release-work/session-export.json"
-require_output "exported target/dogfood-release-work/session-export.jsonl"
+require_output "exported ${work_dir}/session-export.json"
+require_output "exported ${work_dir}/session-export.jsonl"
 require_output "copied to clipboard via cat > ${work_dir}/clipboard.txt"
 
 mapfile -t session_lines < <(grep -E '^(system> )?session: ' "${work_dir}/pane.txt" | sed -E 's/^system> //')
