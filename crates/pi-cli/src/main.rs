@@ -2538,12 +2538,7 @@ fn apply_settings_item(
             format!("setting terminal.showImages: {}", on_off(next))
         }
         "images.autoResize" => {
-            let next = !config
-                .settings
-                .images
-                .as_ref()
-                .and_then(|images| images.auto_resize)
-                .unwrap_or(false);
+            let next = !images_auto_resize(config);
             config
                 .settings
                 .images
@@ -3732,15 +3727,28 @@ fn unique_temp_suffix() -> u128 {
 }
 
 fn format_diagnostics(config: &LoadedConfig) -> String {
-    if config.diagnostics.is_empty() {
+    let mut diagnostics = config.diagnostics.clone();
+    diagnostics.extend(extension_manifest_diagnostics(&config.extensions));
+    if diagnostics.is_empty() {
         return "no diagnostics".to_string();
     }
-    config
-        .diagnostics
+    diagnostics
         .iter()
         .map(|diagnostic| format!("diagnostic: {diagnostic}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn extension_manifest_diagnostics(extensions: &[ResourceFile]) -> Vec<String> {
+    extensions
+        .iter()
+        .filter(|extension| is_executable_extension(&extension.path))
+        .filter_map(|extension| {
+            extension_protocol(extension)
+                .err()
+                .map(|error| format!("extension {}: {error}", extension.name))
+        })
+        .collect()
 }
 
 fn select_from_selector_message(
@@ -3880,12 +3888,7 @@ fn settings_selector_items(config: &LoadedConfig) -> Vec<SelectorItem> {
         bool_setting_item(
             "auto resize images",
             "images.autoResize",
-            config
-                .settings
-                .images
-                .as_ref()
-                .and_then(|images| images.auto_resize)
-                .unwrap_or(false),
+            images_auto_resize(config),
         ),
         bool_setting_item("block images", "images.blockImages", images_blocked(config)),
         bool_setting_item(
@@ -3948,9 +3951,26 @@ fn format_resources(kind: &str, resources: &[ResourceFile]) -> String {
     }
     resources
         .iter()
-        .map(|resource| format!("{}\t{}", resource.name, resource.path.display()))
+        .map(|resource| format_resource_line(kind, resource))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_resource_line(kind: &str, resource: &ResourceFile) -> String {
+    if kind != "extensions" || !is_executable_extension(&resource.path) {
+        return format!("{}\t{}", resource.name, resource.path.display());
+    }
+    let protocol = match extension_protocol(resource) {
+        Ok(Some(protocol)) => protocol,
+        Ok(None) => "stdio".to_string(),
+        Err(error) => format!("invalid: {error}"),
+    };
+    format!(
+        "{}\t{}\tprotocol:{}",
+        resource.name,
+        resource.path.display(),
+        protocol
+    )
 }
 
 fn format_queue(runtime: &Runtime) -> String {
@@ -4078,8 +4098,21 @@ fn extension_protocol(extension: &ResourceFile) -> Result<Option<String>> {
         if !manifest_path.exists() {
             continue;
         }
-        let manifest =
-            serde_json::from_str::<ExtensionManifest>(&fs::read_to_string(&manifest_path)?)?;
+        let content = fs::read_to_string(&manifest_path)?;
+        let manifest = serde_json::from_str::<ExtensionManifest>(&content).map_err(|error| {
+            anyhow!(
+                "failed to parse extension manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+        if let Some(protocol) = manifest.protocol.as_deref() {
+            if !matches!(protocol, "json" | "stdio") {
+                return Err(anyhow!(
+                    "unsupported protocol {protocol} in {}",
+                    manifest_path.display()
+                ));
+            }
+        }
         return Ok(manifest.protocol);
     }
     Ok(None)
@@ -4331,6 +4364,32 @@ mod tests {
             resize_image_if_needed(invalid_png_header, "image/png").expect("resize image");
 
         assert!(resized.is_none());
+    }
+
+    #[test]
+    fn extension_protocol_rejects_unknown_manifest_protocol() {
+        let root = std::env::temp_dir().join(format!(
+            "pi-cli-extension-protocol-{}",
+            unique_temp_suffix()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("bad-ext");
+        fs::write(&path, "").expect("write extension");
+        fs::write(
+            root.join("bad-ext.pi-extension.json"),
+            r#"{"protocol":"bogus"}"#,
+        )
+        .expect("write manifest");
+        let extension = ResourceFile {
+            name: "bad-ext".to_string(),
+            path,
+            content: String::new(),
+        };
+
+        let error = extension_protocol(&extension).expect_err("reject protocol");
+
+        assert!(error.to_string().contains("unsupported protocol bogus"));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
