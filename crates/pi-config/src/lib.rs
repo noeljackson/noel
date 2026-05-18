@@ -3183,6 +3183,44 @@ mod tests {
     }
 
     #[test]
+    fn default_models_cover_upstream_ts_catalog_targets() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/model-catalog.json"
+        ))
+        .expect("parse model catalog fixture");
+        assert!(
+            fixture["providerCount"].as_u64().expect("provider count") >= 1,
+            "upstream model catalog should expose providers"
+        );
+        let rust_models = default_models()
+            .into_iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect::<BTreeSet<_>>();
+        for target in fixture["targets"].as_array().expect("catalog targets") {
+            assert_eq!(target["found"], true, "upstream target missing: {target}");
+            let provider = target["provider"].as_str().expect("provider");
+            let id = target["id"].as_str().expect("id");
+            let model_ref = format!("{provider}/{id}");
+            assert!(
+                rust_models.contains(&model_ref),
+                "missing upstream model catalog target {model_ref}"
+            );
+        }
+
+        let opus = fixture["targets"]
+            .as_array()
+            .expect("catalog targets")
+            .iter()
+            .find(|target| target["provider"] == "anthropic" && target["id"] == "claude-opus-4-7")
+            .expect("opus target");
+        assert!(opus["thinkingLevels"]
+            .as_array()
+            .expect("opus thinking levels")
+            .iter()
+            .any(|level| level == "xhigh"));
+    }
+
+    #[test]
     fn default_image_models_include_openrouter_targets() {
         let models = default_image_models()
             .into_iter()
