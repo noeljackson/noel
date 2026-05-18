@@ -793,6 +793,9 @@ fn write_jsonl_export(state: &SessionState, path: &Path) -> Result<(), SessionEr
         SessionRecord::ActiveModel {
             model: state.active_model.clone(),
         },
+        SessionRecord::ActiveThinkingLevel {
+            level: state.active_thinking_level.clone(),
+        },
         SessionRecord::ActiveTools {
             tools: state.active_tool_names.iter().cloned().collect(),
         },
@@ -1674,6 +1677,15 @@ mod tests {
         let (store, mut state) =
             SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
         state.name = Some("exported".to_string());
+        state.labels = BTreeSet::from(["important".to_string()]);
+        state.parent_session_id = Some("parent-session".to_string());
+        state.active_model = Some(ModelRef {
+            provider: "anthropic".to_string(),
+            id: "claude".to_string(),
+        });
+        state.active_thinking_level = Some("xhigh".to_string());
+        state.active_tool_names = BTreeSet::from(["read".to_string()]);
+        state.queued_messages = vec!["next prompt".to_string()];
         state.messages.push(ConversationMessage {
             role: MessageRole::User,
             content: "hello <world>".to_string(),
@@ -1689,7 +1701,27 @@ mod tests {
             name: "read".to_string(),
             result: "content".to_string(),
         });
+        state.compactions.push(CompactionRecord {
+            kind: CompactionKind::Manual,
+            omitted_messages: 1,
+            retained_messages: 1,
+            summary: "compacted".to_string(),
+        });
+        state.branch_summaries.push(BranchSummary {
+            from_session_id: state.session_id.clone(),
+            to_session_id: "branch-session".to_string(),
+            summary: "branched".to_string(),
+        });
         store.record_metadata(&state).expect("record metadata");
+        store
+            .record_active_model(state.active_model.clone())
+            .expect("record model");
+        store
+            .record_active_thinking_level(state.active_thinking_level.clone())
+            .expect("record thinking");
+        store
+            .record_active_tools(state.active_tool_names.iter().cloned().collect())
+            .expect("record tools");
         store
             .record_message(state.messages[0].clone())
             .expect("record user");
@@ -1699,15 +1731,61 @@ mod tests {
         store
             .record_tool(state.tool_history[0].clone())
             .expect("record tool");
+        store
+            .record_queued_message(state.queued_messages[0].clone())
+            .expect("record queued");
+        store
+            .record_compaction(state.compactions[0].clone())
+            .expect("record compaction");
+        store
+            .record_branch_summary(state.branch_summaries[0].clone())
+            .expect("record branch summary");
 
+        let json = export_dir.join("session.json");
         let jsonl = export_dir.join("session.jsonl");
         let html = export_dir.join("session.html");
+        store.export_state(&state, &json).expect("export json");
         store.export_state(&state, &jsonl).expect("export jsonl");
         store.export_state(&state, &html).expect("export html");
 
+        let json_content = fs::read_to_string(&json).expect("read json");
+        let exported =
+            serde_json::from_str::<serde_json::Value>(&json_content).expect("parse json export");
+        assert_eq!(exported["name"], "exported");
+        assert_eq!(exported["parent_session_id"], "parent-session");
+        assert_eq!(exported["active_thinking_level"], "xhigh");
+        assert_eq!(exported["active_model"]["provider"], "anthropic");
+        assert_eq!(exported["queued_messages"][0], "next prompt");
+
         let jsonl_content = fs::read_to_string(&jsonl).expect("read jsonl");
         assert!(jsonl_content.contains("\"type\":\"message\""));
+        let jsonl_records = jsonl_content
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse jsonl line"))
+            .collect::<Vec<_>>();
+        let jsonl_types = jsonl_records
+            .iter()
+            .map(|record| record["type"].as_str().expect("record type"))
+            .collect::<Vec<_>>();
+        assert_eq!(jsonl_types.first(), Some(&"started"));
+        for expected_type in [
+            "metadata",
+            "active_model",
+            "active_thinking_level",
+            "active_tools",
+            "message",
+            "tool",
+            "queued_message",
+            "compaction",
+            "branch_summary",
+        ] {
+            assert!(
+                jsonl_types.contains(&expected_type),
+                "missing jsonl record type {expected_type}"
+            );
+        }
         let html_content = fs::read_to_string(&html).expect("read html");
+        assert!(html_content.contains("<!doctype html>"));
         assert!(html_content.contains("hello &lt;world&gt;"));
         assert!(html_content.contains("tool history"));
 
@@ -1717,8 +1795,49 @@ mod tests {
         assert_eq!(imported.session_id, state.session_id);
         assert_eq!(imported.messages, state.messages);
         assert_eq!(imported.tool_history, state.tool_history);
+        assert_eq!(imported.active_thinking_level, state.active_thinking_level);
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn upstream_session_export_fixture_documents_ts_session_surface() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/session-export.json"
+        ))
+        .expect("parse session export fixture");
+
+        assert_eq!(fixture["header"]["type"], "session");
+        assert_eq!(fixture["header"]["version"], 3);
+        assert_eq!(fixture["treeRootCount"], 1);
+        assert_eq!(fixture["sessionName"], "demo session");
+        assert_eq!(fixture["labelForFirstMessage"], "important");
+        let entry_types = fixture["entryTypes"]
+            .as_array()
+            .expect("entry types")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<BTreeSet<_>>();
+        for expected_type in [
+            "message",
+            "session_info",
+            "model_change",
+            "thinking_level_change",
+            "custom",
+            "compaction",
+            "label",
+        ] {
+            assert!(
+                entry_types.contains(expected_type),
+                "missing upstream session entry type {expected_type}"
+            );
+        }
+        assert_eq!(fixture["jsonlBranchExport"]["recordTypes"][0], "session");
+        assert_eq!(fixture["jsonlBranchExport"]["firstRecordVersion"], 3);
+        assert_eq!(
+            fixture["jsonlBranchExport"]["parentChain"],
+            serde_json::json!([null, "set", "set"])
+        );
     }
 
     #[test]

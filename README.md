@@ -428,12 +428,13 @@ Rust parity is tracked against the upstream TypeScript implementation at
 npm or TypeScript on the host. All TypeScript reference execution happens inside
 `Dockerfile.ts-parity`.
 
-The parity harness captures sanitized provider request fixtures from upstream
-TypeScript code under `tests/fixtures/ts-parity/`. These fixtures record request
-shape for provider integrations: URL, method, selected headers, request body, or
-payload. Secrets are redacted. The Rust tests in `pi-ai` compare Rust request
-builders against those fixtures, so changes in upstream provider behavior become
-visible as fixture diffs and test failures.
+The parity harness captures sanitized fixtures from upstream TypeScript code
+under `tests/fixtures/ts-parity/`. Provider fixtures record request shape:
+URL, method, selected headers, request body, or payload. Contract fixtures cover
+CLI flags, slash commands, settings normalization, and session/export shape
+where Rust intentionally supports compatibility or analogous behavior. Secrets
+are redacted. Rust tests compare covered behavior against those fixtures, so
+upstream changes become visible as fixture diffs and test failures.
 
 Generate fixtures from the configured reference:
 
@@ -482,10 +483,10 @@ make check
 make ts-parity-drift
 ```
 
-Parity fixtures prove request-shape compatibility for covered provider paths.
-They do not prove full product parity, live provider success, or TUI behavior;
-those are covered by Rust unit tests, tmux e2e tests, and manual real-provider
-smoke tests.
+Parity fixtures prove compatibility only for covered provider paths and product
+contracts. They do not prove full product parity, live provider success, or TUI
+behavior; those are covered by Rust unit tests, tmux e2e tests, and manual
+real-provider smoke tests.
 
 Manual real-provider Opus smoke with Claude Code OAuth:
 
