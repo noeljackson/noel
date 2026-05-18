@@ -37,7 +37,11 @@ chmod +x "${agent_dir}/extensions/exec-ext"
 cat > "${agent_dir}/extensions/json-ext" <<'SH'
 #!/bin/sh
 request="$(cat)"
+kind="$(printf '%s' "${request}" | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')"
 input="$(printf '%s' "${request}" | sed -n 's/.*"input":"\([^"]*\)".*/\1/p')"
+if [ "${kind}" != "command" ] && [ -n "${PI_EXTENSION_EVENTS_LOG:-}" ]; then
+  printf '%s\n' "${kind}" >> "${PI_EXTENSION_EVENTS_LOG}"
+fi
 printf '{"output":"json-ext saw %s"}\n' "${input}"
 SH
 chmod +x "${agent_dir}/extensions/json-ext"
@@ -53,7 +57,7 @@ grep -Fq "disabled extensions: -" "${work_dir}/config-enabled.txt"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -361,6 +365,12 @@ if [ ! -f "${work_dir}/clipboard.txt" ]; then
   exit 1
 fi
 grep -Fq "[faux/echo] fix broken thing" "${work_dir}/clipboard.txt"
+if [ ! -f "${work_dir}/extension-events.txt" ]; then
+  echo "missing extension lifecycle events" >&2
+  exit 1
+fi
+grep -Fxq "reload" "${work_dir}/extension-events.txt"
+grep -Fxq "shutdown" "${work_dir}/extension-events.txt"
 grep -Fq '"enabled": false' "${agent_dir}/settings.json"
 
 printf '{"followUpMode":"one-at-a-time"}\n' > "${agent_dir}/settings.json"

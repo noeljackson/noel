@@ -2839,6 +2839,11 @@ async fn handle_tui_submission(
         return Ok(false);
     }
     if line == "/quit" {
+        for diagnostic in
+            notify_extension_lifecycle(&config.extensions, "shutdown", &runtime.session().cwd)
+        {
+            app.push(TuiEntryKind::Error, diagnostic);
+        }
         return Ok(true);
     }
     if handle_tui_bang(app, terminal, runtime, config, &line).await? {
@@ -2930,10 +2935,15 @@ async fn handle_tui_submission(
             );
         }
         "/reload" => {
+            let lifecycle_diagnostics =
+                notify_extension_lifecycle(&config.extensions, "reload", &runtime.session().cwd);
             *config = load_config(config.paths.clone())?;
             let next_generation = runtime.systems().config_generation + 1;
             let report = runtime.reload(ReloadableSystems::from_config(config, next_generation))?;
             let mut output = format_diagnostics(config);
+            for diagnostic in lifecycle_diagnostics {
+                output.push_str(&format!("\n{diagnostic}"));
+            }
             if !report.active_model_valid {
                 output
                     .push_str("\nactive model is no longer available; use /model <provider/model>");
@@ -4256,7 +4266,7 @@ struct ExtensionManifest {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ExtensionCommandRequest<'a> {
+struct ExtensionProtocolRequest<'a> {
     protocol_version: u8,
     kind: &'static str,
     command: &'a str,
@@ -4273,25 +4283,55 @@ struct ExtensionCommandResponse {
 
 fn run_executable_extension(extension: &ResourceFile, input: &str, cwd: &Path) -> Result<String> {
     let protocol = extension_protocol(extension)?;
+    run_extension_process(extension, protocol.as_deref(), "command", input, cwd)
+}
+
+fn notify_extension_lifecycle(
+    extensions: &[ResourceFile],
+    kind: &'static str,
+    cwd: &Path,
+) -> Vec<String> {
+    extensions
+        .iter()
+        .filter(|extension| is_executable_extension(&extension.path))
+        .filter_map(|extension| match extension_protocol(extension) {
+            Ok(Some(protocol)) if protocol == "json" => {
+                run_extension_process(extension, Some("json"), kind, "", cwd)
+                    .err()
+                    .map(|error| format!("extension {} {kind} failed: {error}", extension.name))
+            }
+            Ok(_) => None,
+            Err(error) => Some(format!(
+                "extension {} {kind} failed: {error}",
+                extension.name
+            )),
+        })
+        .collect()
+}
+
+fn run_extension_process(
+    extension: &ResourceFile,
+    protocol: Option<&str>,
+    kind: &'static str,
+    input: &str,
+    cwd: &Path,
+) -> Result<String> {
     let mut child = Command::new(&extension.path)
         .current_dir(cwd)
         .env("PI_EXTENSION_NAME", &extension.name)
         .env("PI_EXTENSION_PATH", &extension.path)
-        .env(
-            "PI_EXTENSION_PROTOCOL",
-            protocol.as_deref().unwrap_or("stdio"),
-        )
+        .env("PI_EXTENSION_PROTOCOL", protocol.unwrap_or("stdio"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
-        match protocol.as_deref() {
+        match protocol {
             Some("json") => {
                 let cwd_string = cwd.display().to_string();
-                let request = ExtensionCommandRequest {
+                let request = ExtensionProtocolRequest {
                     protocol_version: 1,
-                    kind: "command",
+                    kind,
                     command: &extension.name,
                     input,
                     cwd: &cwd_string,
@@ -4314,7 +4354,7 @@ fn run_executable_extension(extension: &ResourceFile, input: &str, cwd: &Path) -
             stderr
         ));
     }
-    let mut text = match protocol.as_deref() {
+    let mut text = match protocol {
         Some("json") => parse_extension_json_response(&stdout, &extension.name)?,
         _ => stdout.trim_end().to_string(),
     };
