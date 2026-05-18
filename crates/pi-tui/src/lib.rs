@@ -593,6 +593,7 @@ pub fn default_keybindings() -> KeybindingMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn keybinding_overrides_replace_defaults() {
@@ -621,6 +622,28 @@ mod tests {
         assert!(session.contains("session: s1"));
         assert!(session.contains("labels: a, b"));
         assert!(renderer.help().contains("/reload"));
+    }
+
+    #[test]
+    fn slash_commands_cover_upstream_ts_builtins() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/slash-commands.json"
+        ))
+        .expect("parse slash command fixture");
+        let rust_commands = COMMAND_HELP
+            .iter()
+            .filter_map(|entry| entry.command.strip_prefix('/'))
+            .map(|command| command.split_whitespace().next().unwrap_or(command))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+
+        for command in fixture["commands"].as_array().expect("commands array") {
+            let name = command["name"].as_str().expect("command name");
+            assert!(
+                rust_commands.contains(name),
+                "missing upstream slash command /{name}"
+            );
+        }
     }
 
     #[test]

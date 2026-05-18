@@ -1,0 +1,93 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/slash-command-fixture.ts"
+  },
+  "commands": [
+    {
+      "name": "changelog",
+      "description": "Show changelog entries"
+    },
+    {
+      "name": "clone",
+      "description": "Duplicate the current session at the current position"
+    },
+    {
+      "name": "compact",
+      "description": "Manually compact the session context"
+    },
+    {
+      "name": "copy",
+      "description": "Copy last agent message to clipboard"
+    },
+    {
+      "name": "export",
+      "description": "Export session (HTML default, or specify path: .html/.jsonl)"
+    },
+    {
+      "name": "fork",
+      "description": "Create a new fork from a previous user message"
+    },
+    {
+      "name": "hotkeys",
+      "description": "Show all keyboard shortcuts"
+    },
+    {
+      "name": "import",
+      "description": "Import and resume a session from a JSONL file"
+    },
+    {
+      "name": "login",
+      "description": "Configure provider authentication"
+    },
+    {
+      "name": "logout",
+      "description": "Remove provider authentication"
+    },
+    {
+      "name": "model",
+      "description": "Select model (opens selector UI)"
+    },
+    {
+      "name": "name",
+      "description": "Set session display name"
+    },
+    {
+      "name": "new",
+      "description": "Start a new session"
+    },
+    {
+      "name": "quit",
+      "description": "Quit pi"
+    },
+    {
+      "name": "reload",
+      "description": "Reload keybindings, extensions, skills, prompts, and themes"
+    },
+    {
+      "name": "resume",
+      "description": "Resume a different session"
+    },
+    {
+      "name": "scoped-models",
+      "description": "Enable/disable models for Ctrl+P cycling"
+    },
+    {
+      "name": "session",
+      "description": "Show session info and stats"
+    },
+    {
+      "name": "settings",
+      "description": "Open settings menu"
+    },
+    {
+      "name": "share",
+      "description": "Share session as a secret GitHub gist"
+    },
+    {
+      "name": "tree",
+      "description": "Navigate session tree (switch branches)"
+    }
+  ]
+}
