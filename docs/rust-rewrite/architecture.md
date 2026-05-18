@@ -241,6 +241,7 @@ Implemented providers:
 - Together.
 - Moonshot AI.
 - OpenCode.
+- Vercel AI Gateway.
 - Fireworks.
 - MiniMax.
 - Kimi Coding.

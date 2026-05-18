@@ -883,6 +883,7 @@ fn env_api_key(provider: &str) -> Option<String> {
         "openrouter" => &["OPENROUTER_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
         "together" => &["TOGETHER_API_KEY"][..],
+        "vercel-ai-gateway" => &["AI_GATEWAY_API_KEY"][..],
         "xai" => &["XAI_API_KEY"][..],
         "xiaomi" => &["XIAOMI_API_KEY"][..],
         "xiaomi-token-plan-ams" => &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"][..],
@@ -2080,6 +2081,13 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://token-plan-sgp.xiaomimimo.com/anthropic".to_string()),
         },
         ModelDefinition {
+            provider: "vercel-ai-gateway".to_string(),
+            id: "alibaba/qwen3-coder".to_string(),
+            name: Some("Vercel AI Gateway Qwen3 Coder".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://ai-gateway.vercel.sh".to_string()),
+        },
+        ModelDefinition {
             provider: "google".to_string(),
             id: "gemini-2.5-pro".to_string(),
             name: Some("Gemini Pro".to_string()),
@@ -2850,6 +2858,7 @@ mod tests {
             "xiaomi-token-plan-cn",
             "xiaomi-token-plan-ams",
             "xiaomi-token-plan-sgp",
+            "vercel-ai-gateway",
             "google-vertex",
             "amazon-bedrock",
             "mistral",
@@ -2889,6 +2898,7 @@ mod tests {
             "xiaomi-token-plan-cn/mimo-v2.5-pro",
             "xiaomi-token-plan-ams/mimo-v2.5-pro",
             "xiaomi-token-plan-sgp/mimo-v2.5-pro",
+            "vercel-ai-gateway/alibaba/qwen3-coder",
         ] {
             assert!(models.iter().any(|candidate| candidate == model));
         }
@@ -2917,6 +2927,7 @@ mod tests {
             save_env("MISTRAL_API_KEY"),
             save_env("CLOUDFLARE_API_KEY"),
             save_env("TOGETHER_API_KEY"),
+            save_env("AI_GATEWAY_API_KEY"),
             save_env("XAI_API_KEY"),
             save_env("XIAOMI_API_KEY"),
             save_env("XIAOMI_TOKEN_PLAN_AMS_API_KEY"),
@@ -2945,6 +2956,7 @@ mod tests {
         env::set_var("MISTRAL_API_KEY", "mistral-key");
         env::set_var("CLOUDFLARE_API_KEY", "cloudflare-key");
         env::set_var("TOGETHER_API_KEY", "together-key");
+        env::set_var("AI_GATEWAY_API_KEY", "vercel-key");
         env::set_var("XAI_API_KEY", "xai-key");
         env::set_var("XIAOMI_API_KEY", "xiaomi-key");
         env::set_var("XIAOMI_TOKEN_PLAN_AMS_API_KEY", "xiaomi-ams-key");
@@ -3041,6 +3053,10 @@ mod tests {
         assert_eq!(
             auth_for_provider(&empty_auth, "xiaomi-token-plan-sgp"),
             Some(ResolvedAuth::ApiKey("xiaomi-sgp-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "vercel-ai-gateway"),
+            Some(ResolvedAuth::ApiKey("vercel-key".to_string()))
         );
         assert_eq!(
             auth_for_provider(&empty_auth, "google-vertex"),

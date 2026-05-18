@@ -16,7 +16,7 @@ Current Rust implementation:
 - Config/auth/model loading from `~/.pi/agent`
 - `AGENTS.md` and `CLAUDE.md` context discovery
 - Built-in local tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
-- Providers: faux test provider, OpenAI chat/responses/Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini/Vertex, OpenRouter, GitHub Copilot, Amazon Bedrock bearer-token Converse, Mistral, Cloudflare Workers AI/AI Gateway, OpenAI-compatible aliases for DeepSeek, Groq, Cerebras, xAI, Z.AI, Hugging Face, Together, Moonshot AI, and OpenCode, plus Anthropic-compatible aliases for Fireworks, MiniMax, Kimi Coding, and Xiaomi MiMo
+- Providers: faux test provider, OpenAI chat/responses/Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini/Vertex, OpenRouter, GitHub Copilot, Amazon Bedrock bearer-token Converse, Mistral, Cloudflare Workers AI/AI Gateway, OpenAI-compatible aliases for DeepSeek, Groq, Cerebras, xAI, Z.AI, Hugging Face, Together, Moonshot AI, and OpenCode, plus Anthropic-compatible aliases for Vercel AI Gateway, Fireworks, MiniMax, Kimi Coding, and Xiaomi MiMo
 
 Intentionally removed:
 
@@ -173,6 +173,7 @@ Provider API keys can be stored in `auth.json`:
   "moonshotai-cn": { "type": "api_key", "key": "env:MOONSHOT_API_KEY" },
   "opencode": { "type": "api_key", "key": "env:OPENCODE_API_KEY" },
   "opencode-go": { "type": "api_key", "key": "env:OPENCODE_API_KEY" },
+  "vercel-ai-gateway": { "type": "api_key", "key": "env:AI_GATEWAY_API_KEY" },
   "fireworks": { "type": "api_key", "key": "env:FIREWORKS_API_KEY" },
   "minimax": { "type": "api_key", "key": "env:MINIMAX_API_KEY" },
   "minimax-cn": { "type": "api_key", "key": "env:MINIMAX_CN_API_KEY" },

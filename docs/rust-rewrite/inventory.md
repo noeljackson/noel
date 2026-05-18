@@ -335,6 +335,7 @@ Implemented provider/auth scope includes:
 - Together.
 - Moonshot AI.
 - OpenCode.
+- Vercel AI Gateway.
 - Fireworks.
 - MiniMax.
 - Kimi Coding.
@@ -414,5 +415,4 @@ Deferred until explicitly approved:
 
 - Browser HTML export polish beyond local session export.
 - Automatic legacy TypeScript session migration.
-- Full provider parity for every provider from the old TypeScript branch.
 - Image generation APIs.
