@@ -421,40 +421,71 @@ Dockerized TTY e2e test:
 make docker-e2e
 ```
 
-Docker-only TS reference fixture generation:
+## Upstream TypeScript Parity
+
+Rust parity is tracked against the upstream TypeScript implementation at
+`https://github.com/earendil-works/pi` on `main`. The Rust repo does not run
+npm or TypeScript on the host. All TypeScript reference execution happens inside
+`Dockerfile.ts-parity`.
+
+The parity harness captures sanitized provider request fixtures from upstream
+TypeScript code under `tests/fixtures/ts-parity/`. These fixtures record request
+shape for provider integrations: URL, method, selected headers, request body, or
+payload. Secrets are redacted. The Rust tests in `pi-ai` compare Rust request
+builders against those fixtures, so changes in upstream provider behavior become
+visible as fixture diffs and test failures.
+
+Generate fixtures from the configured reference:
 
 ```bash
 make ts-parity-fixtures
 ```
 
-This is the only supported path for executing TypeScript reference code. It
-clones the upstream TypeScript repo `https://github.com/earendil-works/pi`
-inside Docker, runs npm inside Docker, and writes sanitized fixtures under
-`tests/fixtures/ts-parity/`.
-
-Update committed parity fixtures from the moving TypeScript reference:
+Refresh committed fixtures from upstream:
 
 ```bash
 make ts-parity-update
 ```
 
-Check for drift against the moving reference and write an agent brief:
+Check for drift without accepting it:
 
 ```bash
 make ts-parity-drift
 ```
 
-Dispatch the drift brief to an external CLI agent:
+`make ts-parity-drift` regenerates fixtures in Docker, compares them with the
+committed fixtures, and fails if they differ. On drift it writes:
+
+- `target/ts-parity-drift/fixture.diff`
+- `target/ts-parity-drift/brief.md`
+
+The brief is designed for a coding agent. It includes the upstream reference,
+constraints, suggested workflow, and the fixture diff. To dispatch that brief to
+an external CLI agent:
 
 ```bash
 PI_PARITY_AGENT_COMMAND='cw exec --name ts-parity-agent -- claude' make ts-parity-agent
 ```
 
-The agent command receives `target/ts-parity-drift/brief.md` on stdin. Scheduled
-GitHub Actions runs the same Docker-only drift harness and opens or updates a
-`TS parity drift detected` issue when the TypeScript reference changes.
-Override `TS_REFERENCE_REPO` or `TS_PARITY_TRACKING_REF` to compare against a
-different TypeScript repository or ref.
+`PI_PARITY_AGENT_COMMAND` receives `brief.md` on stdin. Scheduled GitHub Actions
+runs the same drift harness and opens or updates a `TS parity drift detected`
+issue when upstream changes. Override `TS_REFERENCE_REPO` or
+`TS_PARITY_TRACKING_REF` to compare against a different TypeScript repository or
+ref.
+
+When drift is intentional, update Rust behavior and committed fixtures together:
+
+```bash
+make ts-parity-update
+cargo test -p pi-ai --lib matches_ts
+make check
+make ts-parity-drift
+```
+
+Parity fixtures prove request-shape compatibility for covered provider paths.
+They do not prove full product parity, live provider success, or TUI behavior;
+those are covered by Rust unit tests, tmux e2e tests, and manual real-provider
+smoke tests.
 
 Manual real-provider Opus smoke with Claude Code OAuth:
 

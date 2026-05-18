@@ -413,6 +413,16 @@ refreshes fixtures from the moving TypeScript reference. `make ts-parity-drift` 
 ts-parity-agent` can dispatch that brief through `PI_PARITY_AGENT_COMMAND`,
 including a Codewire command such as `cw exec --name ts-parity-agent -- claude`.
 
+Parity fixtures are sanitized upstream provider request captures. They document
+URL, method, selected headers, body, and payload shape for covered providers.
+Rust tests compare local provider request builders against those captures. Drift
+is handled by updating Rust behavior and committed fixtures together, then
+running `cargo test -p pi-ai --lib matches_ts`, `make check`, and
+`make ts-parity-drift`.
+
+This harness tracks provider request-shape parity. It does not replace Rust unit
+coverage, tmux TTY e2e, or manual live-provider smoke tests.
+
 ## Intentionally Dropped or Deferred
 
 Dropped for Rust-only product path:

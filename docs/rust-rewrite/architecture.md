@@ -383,6 +383,17 @@ regenerates those fixtures, fails if committed fixtures would change, writes
 present. `make ts-parity-agent` uses the same harness and pipes the brief to
 `PI_PARITY_AGENT_COMMAND` when that environment variable is set.
 
+The parity fixtures are sanitized provider request captures. They cover request
+shape for URLs, selected headers, request bodies, and provider payloads. The
+Rust `pi-ai` tests compare local builders against those captures. When upstream
+changes, the drift harness produces both a raw diff and an agent-oriented brief
+that states the constraints: no host npm, TypeScript only in Docker, keep Rust
+changes scoped to parity behavior, and rerun Rust validation before committing.
+
+This is request-shape parity, not a live-provider guarantee. Full product
+coverage still relies on Rust unit tests, tmux TTY e2e, and manual real-provider
+smoke tests.
+
 ## Current Cutover Status
 
 The Rust cutover is complete for the CLI/TUI product path. Remaining gaps should
