@@ -484,7 +484,7 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
         body["stream"] = json!(true);
         body["stream_options"] = json!({ "include_usage": true });
         body["store"] = json!(false);
-        body["max_completion_tokens"] = json!(16384);
+        body["max_completion_tokens"] = json!(32000);
         if let Some(effort) = openrouter_reasoning_effort(config.thinking_level.as_deref()) {
             body["reasoning"] = json!({ "effort": effort });
         }
@@ -575,6 +575,7 @@ fn github_copilot_responses_body(config: &ProviderConfig, request: &ProviderRequ
         "input": openai_responses_input_with_developer_system(request),
         "stream": true,
         "store": false,
+        "max_output_tokens": 128000,
         "include": ["reasoning.encrypted_content"],
     });
     if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
@@ -1009,7 +1010,7 @@ fn google_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
 
 fn google_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     let mut generation_config = json!({
-        "maxOutputTokens": 32000,
+        "maxOutputTokens": 65536,
     });
     if let Some(thinking_config) = google_thinking_config(config) {
         generation_config["thinkingConfig"] = thinking_config;
@@ -1216,7 +1217,7 @@ fn bedrock_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
         "modelId": config.model.id,
         "messages": bedrock_messages_with_cache(config, &request.messages),
         "inferenceConfig": {
-            "maxTokens": 32000,
+            "maxTokens": 128000,
         },
     });
     if let Some(system) = bedrock_system(config, request.system_prompt.as_deref()) {
@@ -2657,6 +2658,10 @@ mod tests {
         assert_eq!(body["input"], fixture_request["body"]["input"]);
         assert_eq!(body["store"], fixture_request["body"]["store"]);
         assert_eq!(body["stream"], fixture_request["body"]["stream"]);
+        assert_eq!(
+            body["max_output_tokens"],
+            fixture_request["body"]["max_output_tokens"]
+        );
         assert_eq!(body["include"], fixture_request["body"]["include"]);
         assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
     }

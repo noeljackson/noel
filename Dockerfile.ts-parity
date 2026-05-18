@@ -4,8 +4,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ARG TS_REFERENCE_REPO=https://github.com/noeljackson/pi.git
-ARG TS_REFERENCE_REF=ts-reference
+ARG TS_REFERENCE_REPO=https://github.com/earendil-works/pi.git
+ARG TS_REFERENCE_REF=main
 
 RUN git clone --filter=blob:none "${TS_REFERENCE_REPO}" /ts-reference \
     && cd /ts-reference \

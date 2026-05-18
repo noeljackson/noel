@@ -33,7 +33,7 @@
       }
     ],
     "inferenceConfig": {
-      "maxTokens": 32000
+      "maxTokens": 128000
     },
     "additionalModelRequestFields": {
       "thinking": {

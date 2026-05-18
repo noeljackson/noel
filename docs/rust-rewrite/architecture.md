@@ -375,8 +375,9 @@ Manual validation:
 - `make ts-parity-agent`
 
 `make ts-parity-fixtures` is the only supported path for executing TypeScript
-reference code. It runs npm inside Docker only. `make ts-parity-update`
-refreshes fixtures from the moving reference ref. `make ts-parity-drift`
+reference code. It runs npm inside Docker only and defaults to the upstream
+TypeScript repository `https://github.com/earendil-works/pi` on `main`. `make
+ts-parity-update` refreshes fixtures from the moving reference ref. `make ts-parity-drift`
 regenerates those fixtures, fails if committed fixtures would change, writes
 `target/ts-parity-drift/brief.md`, and runs Rust TS-shape tests when no drift is
 present. `make ts-parity-agent` uses the same harness and pipes the brief to

@@ -406,8 +406,9 @@ Additional manual validation:
 - `make ts-parity-agent`
 
 `make ts-parity-fixtures` is the only supported TypeScript execution path and
-runs npm inside Docker only. `make ts-parity-update` refreshes fixtures from
-the moving TypeScript reference. `make ts-parity-drift` writes
+runs npm inside Docker only. It defaults to the upstream TypeScript repository
+`https://github.com/earendil-works/pi` on `main`. `make ts-parity-update`
+refreshes fixtures from the moving TypeScript reference. `make ts-parity-drift` writes
 `target/ts-parity-drift/brief.md` and fails on fixture drift. `make
 ts-parity-agent` can dispatch that brief through `PI_PARITY_AGENT_COMMAND`,
 including a Codewire command such as `cw exec --name ts-parity-agent -- claude`.
