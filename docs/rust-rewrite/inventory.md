@@ -67,6 +67,8 @@ Implemented CLI flags include:
 - `--no-themes`
 - `--no-context-files`, `-nc`
 - `--image <path>`
+- `images [search]`
+- `generate-image --output <file> [--model <provider/model>] [--image <file>] <prompt>`
 - `--export <file>`
 - `--list-models [search]`
 - `--verbose`
@@ -231,6 +233,8 @@ Implemented built-in slash commands include:
 - `/history`
 - `/editor [text]`
 - `/image <path> [prompt]`
+- `/image-models [search]`
+- `/generate-image <output> <prompt>`
 - `/skills`
 - `/skill:<name> [input]`
 - `/prompts`
@@ -415,4 +419,3 @@ Deferred until explicitly approved:
 
 - Browser HTML export polish beyond local session export.
 - Automatic legacy TypeScript session migration.
-- Image generation APIs.

@@ -77,6 +77,19 @@ List models:
 cargo run -p pi-cli -- --list-models
 ```
 
+List image-generation models:
+
+```bash
+cargo run -p pi-cli -- images
+```
+
+Generate an image through a configured OpenRouter API key:
+
+```bash
+cargo run -p pi-cli -- generate-image --output image.png \
+  --model openrouter/google/gemini-3.1-flash-image-preview "a compact rust cli logo"
+```
+
 Resume or fork sessions:
 
 ```bash
@@ -323,6 +336,8 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/history`
 - `/editor [text]`
 - `/image <path> [prompt]`
+- `/image-models [search]`
+- `/generate-image <output> <prompt>`
 - `/skills`
 - `/skill:<name> [input]`
 - `/prompts`

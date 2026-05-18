@@ -84,6 +84,31 @@ fn list_models_accepts_optional_search() {
 }
 
 #[test]
+fn list_image_models_accepts_optional_search() {
+    let root = test_dir("pi-cli-image-models");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+
+    let output = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["images", "gemini"])
+        .output()
+        .expect("run pi images");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("openrouter/google/gemini-3.1-flash-image-preview"));
+    assert!(!stdout.contains("black-forest-labs/flux.2-pro"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn ts_style_multi_letter_cli_aliases_are_accepted() {
     let output = pi_command()
         .args([

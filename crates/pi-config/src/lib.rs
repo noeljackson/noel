@@ -570,6 +570,30 @@ pub enum ProviderApi {
     Faux,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageProviderApi {
+    #[serde(rename = "openrouter-images")]
+    #[default]
+    OpenRouterImages,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageModelDefinition {
+    pub provider: String,
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub api: ImageProviderApi,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub input: Vec<String>,
+    #[serde(default)]
+    pub output: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeybindingConfig {
     pub action: String,
@@ -601,6 +625,7 @@ pub struct LoadedConfig {
     pub settings: Settings,
     pub auth: AuthData,
     pub models: Vec<ModelDefinition>,
+    pub image_models: Vec<ImageModelDefinition>,
     pub keybindings: Vec<KeybindingConfig>,
     pub context_files: Vec<ContextFile>,
     pub extensions: Vec<ResourceFile>,
@@ -659,6 +684,7 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         ),
         settings.enabled_models.as_deref(),
     );
+    let image_models = default_image_models();
     let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
         .map(KeybindingsFile::into_keybindings)
         .unwrap_or_default();
@@ -760,6 +786,7 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         settings,
         auth,
         models,
+        image_models,
         keybindings,
         context_files,
         extensions,
@@ -2138,6 +2165,47 @@ fn default_models() -> Vec<ModelDefinition> {
     ]
 }
 
+fn default_image_models() -> Vec<ImageModelDefinition> {
+    vec![
+        ImageModelDefinition {
+            provider: "openrouter".to_string(),
+            id: "google/gemini-3.1-flash-image-preview".to_string(),
+            name: Some("Google Nano Banana 2".to_string()),
+            api: ImageProviderApi::OpenRouterImages,
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            input: vec!["image".to_string(), "text".to_string()],
+            output: vec!["image".to_string(), "text".to_string()],
+        },
+        ImageModelDefinition {
+            provider: "openrouter".to_string(),
+            id: "openai/gpt-5-image".to_string(),
+            name: Some("OpenAI GPT-5 Image".to_string()),
+            api: ImageProviderApi::OpenRouterImages,
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            input: vec!["image".to_string(), "text".to_string()],
+            output: vec!["image".to_string(), "text".to_string()],
+        },
+        ImageModelDefinition {
+            provider: "openrouter".to_string(),
+            id: "black-forest-labs/flux.2-pro".to_string(),
+            name: Some("FLUX.2 Pro".to_string()),
+            api: ImageProviderApi::OpenRouterImages,
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            input: vec!["text".to_string(), "image".to_string()],
+            output: vec!["image".to_string()],
+        },
+        ImageModelDefinition {
+            provider: "openrouter".to_string(),
+            id: "openrouter/auto".to_string(),
+            name: Some("OpenRouter Auto Image".to_string()),
+            api: ImageProviderApi::OpenRouterImages,
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            input: vec!["text".to_string(), "image".to_string()],
+            output: vec!["text".to_string(), "image".to_string()],
+        },
+    ]
+}
+
 fn expand_tilde(path: PathBuf) -> Result<PathBuf, ConfigError> {
     let value = path.to_string_lossy();
     if value == "~" {
@@ -2899,6 +2967,23 @@ mod tests {
             "xiaomi-token-plan-ams/mimo-v2.5-pro",
             "xiaomi-token-plan-sgp/mimo-v2.5-pro",
             "vercel-ai-gateway/alibaba/qwen3-coder",
+        ] {
+            assert!(models.iter().any(|candidate| candidate == model));
+        }
+    }
+
+    #[test]
+    fn default_image_models_include_openrouter_targets() {
+        let models = default_image_models()
+            .into_iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect::<Vec<_>>();
+
+        for model in [
+            "openrouter/google/gemini-3.1-flash-image-preview",
+            "openrouter/openai/gpt-5-image",
+            "openrouter/black-forest-labs/flux.2-pro",
+            "openrouter/openrouter/auto",
         ] {
             assert!(models.iter().any(|candidate| candidate == model));
         }

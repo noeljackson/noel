@@ -92,6 +92,7 @@ Reloadable runtime state owns replaceable wiring:
 - Settings.
 - Auth resolver inputs.
 - Model registry and model cache.
+- Image model registry.
 - Provider availability.
 - Tool definitions.
 - Prompt templates.
@@ -316,6 +317,7 @@ Implemented TUI concepts:
 - Diagnostics/status display.
 - Reload status/error display.
 - Theme application.
+- Image model listing and local image generation output commands.
 
 Keybindings:
 

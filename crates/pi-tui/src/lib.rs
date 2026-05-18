@@ -125,6 +125,14 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "attach an image to a prompt",
     },
     CommandHelp {
+        command: "/image-models [search]",
+        description: "list image-generation models",
+    },
+    CommandHelp {
+        command: "/generate-image <output> <prompt>",
+        description: "generate an image",
+    },
+    CommandHelp {
         command: "/skills",
         description: "list loaded skills",
     },

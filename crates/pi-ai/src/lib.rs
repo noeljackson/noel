@@ -45,6 +45,11 @@ pub enum ProviderApi {
     Mistral,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageProviderApi {
+    OpenRouterImages,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
     pub model: ModelRef,
@@ -54,6 +59,15 @@ pub struct ProviderConfig {
     pub thinking_level: Option<String>,
     pub thinking_budget_tokens: Option<u64>,
     pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageProviderConfig {
+    pub model: ModelRef,
+    pub api: ImageProviderApi,
+    pub base_url: Option<String>,
+    pub auth: ProviderAuth,
+    pub output_modalities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,6 +99,30 @@ pub struct MediaInput {
     pub path: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ImageGenerationInput {
+    Text { text: String },
+    Image { media: MediaInput },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageGenerationOutput {
+    Text(String),
+    Image {
+        mime_type: String,
+        data_base64: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationResult {
+    pub response_id: Option<String>,
+    pub output: Vec<ImageGenerationOutput>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,8 +188,155 @@ pub fn create_provider(config: ProviderConfig) -> Box<dyn Provider> {
     }
 }
 
+pub async fn generate_images(
+    config: ImageProviderConfig,
+    input: Vec<ImageGenerationInput>,
+) -> Result<ImageGenerationResult, ProviderError> {
+    match config.api {
+        ImageProviderApi::OpenRouterImages => generate_openrouter_images(config, input).await,
+    }
+}
+
 struct FauxProvider {
     config: ProviderConfig,
+}
+
+async fn generate_openrouter_images(
+    config: ImageProviderConfig,
+    input: Vec<ImageGenerationInput>,
+) -> Result<ImageGenerationResult, ProviderError> {
+    let api_key = match &config.auth {
+        ProviderAuth::ApiKey(api_key) => api_key.clone(),
+        _ => {
+            return Err(ProviderError::MissingApiKey {
+                provider: config.model.provider.clone(),
+            });
+        }
+    };
+    let base_url = resolve_env_placeholders(
+        config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://openrouter.ai/api/v1"),
+    )?;
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/chat/completions",
+            base_url.trim_end_matches('/')
+        ))
+        .headers(bearer_headers(&api_key)?)
+        .json(&openrouter_images_body(&config, &input))
+        .send()
+        .await?;
+    parse_openrouter_images_response(
+        error_for_status_with_body(response)
+            .await?
+            .json::<Value>()
+            .await?,
+    )
+}
+
+fn openrouter_images_body(config: &ImageProviderConfig, input: &[ImageGenerationInput]) -> Value {
+    let modalities = if config.output_modalities.is_empty() {
+        vec!["image".to_string(), "text".to_string()]
+    } else {
+        config.output_modalities.clone()
+    };
+    let content = input
+        .iter()
+        .map(|item| match item {
+            ImageGenerationInput::Text { text } => json!({
+                "type": "text",
+                "text": sanitize_surrogates(text),
+            }),
+            ImageGenerationInput::Image { media } => json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": media_data_url(media),
+                },
+            }),
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "model": config.model.id,
+        "messages": [{
+            "role": "user",
+            "content": content,
+        }],
+        "stream": false,
+        "modalities": modalities,
+    })
+}
+
+fn parse_openrouter_images_response(
+    response: Value,
+) -> Result<ImageGenerationResult, ProviderError> {
+    let mut output = Vec::new();
+    if let Some(text) = response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        output.push(ImageGenerationOutput::Text(text.to_string()));
+    }
+    if let Some(images) = response
+        .pointer("/choices/0/message/images")
+        .and_then(Value::as_array)
+    {
+        for image in images {
+            let image_url = image
+                .get("image_url")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .or_else(|| value.get("url").and_then(Value::as_str))
+                })
+                .unwrap_or_default();
+            let Some((mime_type, data_base64)) = parse_data_url(image_url) else {
+                continue;
+            };
+            output.push(ImageGenerationOutput::Image {
+                mime_type,
+                data_base64,
+            });
+        }
+    }
+    if output.is_empty() {
+        return Err(ProviderError::InvalidResponse(response.to_string()));
+    }
+    let input_tokens = response
+        .pointer("/usage/prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = response
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Ok(ImageGenerationResult {
+        response_id: response
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        output,
+        input_tokens,
+        output_tokens,
+    })
+}
+
+fn parse_data_url(value: &str) -> Option<(String, String)> {
+    let rest = value.strip_prefix("data:")?;
+    let (mime_type, data) = rest.split_once(";base64,")?;
+    if mime_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((mime_type.to_string(), data.to_string()))
+}
+
+fn sanitize_surrogates(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| *character != '\u{FFFD}')
+        .collect()
 }
 
 #[async_trait]
@@ -1954,6 +2139,91 @@ mod tests {
         );
         let google = google_messages(&request.messages);
         assert_eq!(google[0]["parts"][1]["inlineData"]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn openrouter_images_body_matches_ts_shape() {
+        let media = MediaInput {
+            mime_type: "image/png".to_string(),
+            data_base64: "aW1hZ2U=".to_string(),
+            path: Some("fixture.png".to_string()),
+            width: Some(1),
+            height: Some(1),
+        };
+        let config = ImageProviderConfig {
+            model: ModelRef {
+                provider: "openrouter".to_string(),
+                id: "google/gemini-3.1-flash-image-preview".to_string(),
+            },
+            api: ImageProviderApi::OpenRouterImages,
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            output_modalities: vec!["image".to_string(), "text".to_string()],
+        };
+        let body = openrouter_images_body(
+            &config,
+            &[
+                ImageGenerationInput::Text {
+                    text: "Generate a dog".to_string(),
+                },
+                ImageGenerationInput::Image { media },
+            ],
+        );
+
+        assert_eq!(body["model"], "google/gemini-3.1-flash-image-preview");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["modalities"], json!(["image", "text"]));
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "Generate a dog");
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+    }
+
+    #[test]
+    fn parses_openrouter_images_response() {
+        let response = json!({
+            "id": "img-1",
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 34
+            },
+            "choices": [{
+                "message": {
+                    "content": "Here is your image.",
+                    "images": [
+                        { "image_url": "data:image/png;base64,ZmFrZS1wbmc=" },
+                        { "image_url": { "url": "data:image/jpeg;base64,ZmFrZS1qcGc=" } }
+                    ]
+                }
+            }]
+        });
+
+        let parsed = parse_openrouter_images_response(response).expect("parse image response");
+        assert_eq!(parsed.response_id.as_deref(), Some("img-1"));
+        assert_eq!(parsed.input_tokens, 12);
+        assert_eq!(parsed.output_tokens, 34);
+        assert_eq!(
+            parsed.output[0],
+            ImageGenerationOutput::Text("Here is your image.".to_string())
+        );
+        assert_eq!(
+            parsed.output[1],
+            ImageGenerationOutput::Image {
+                mime_type: "image/png".to_string(),
+                data_base64: "ZmFrZS1wbmc=".to_string(),
+            }
+        );
+        assert_eq!(
+            parsed.output[2],
+            ImageGenerationOutput::Image {
+                mime_type: "image/jpeg".to_string(),
+                data_base64: "ZmFrZS1qcGc=".to_string(),
+            }
+        );
     }
 
     #[test]

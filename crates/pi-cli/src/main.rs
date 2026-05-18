@@ -16,15 +16,17 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use pi_ai::{
-    create_provider, MediaInput, ModelRef, ProviderApi as AiProviderApi, ProviderAuth,
-    ProviderConfig,
+    create_provider, generate_images, ImageGenerationInput, ImageGenerationOutput,
+    ImageProviderApi as AiImageProviderApi, ImageProviderConfig, MediaInput, ModelRef,
+    ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig,
 };
 use pi_config::{
     auth_for_provider, has_auth_for_provider, load_config, read_model_cache, write_model_cache,
-    AuthCredential, AuthData, CompactionSettings, ConfigPaths, ImageSettings, LoadedConfig,
-    ModelCache, ModelDefinition, ModelRefreshSettings, PackageSource,
-    ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, RetrySettings, Settings,
-    TerminalSettings, WarningSettings, ENV_SESSION_DIR,
+    AuthCredential, AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
+    ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig, ModelCache,
+    ModelDefinition, ModelRefreshSettings, PackageSource, ProviderApi as ConfigProviderApi,
+    ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
+    ENV_SESSION_DIR,
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
@@ -156,6 +158,250 @@ struct Cli {
 
     #[arg()]
     messages: Vec<String>,
+}
+
+async fn try_run_image_command() -> Result<bool> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(false);
+    };
+    match command {
+        "images" | "image-models" => {
+            run_image_model_list(&args[1..])?;
+            Ok(true)
+        }
+        "generate-image" | "image-generate" => {
+            run_image_generate(&args[1..]).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn run_image_model_list(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        println!("usage: pi images [search]\n\nList image-generation models.");
+        return Ok(());
+    }
+    let cwd = std::env::current_dir()?;
+    let config = load_config(ConfigPaths::discover(cwd, None)?)?;
+    let search = args.first().map(|value| value.to_ascii_lowercase());
+    for model in &config.image_models {
+        if let Some(search) = &search {
+            let display = format!(
+                "{}/{} {} {:?}",
+                model.provider,
+                model.id,
+                model.name.as_deref().unwrap_or_default(),
+                model.api
+            )
+            .to_ascii_lowercase();
+            if !display.contains(search) {
+                continue;
+            }
+        }
+        println!("{}/{}\t{:?}", model.provider, model.id, model.api);
+    }
+    Ok(())
+}
+
+async fn run_image_generate(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_image_generate_help();
+        return Ok(());
+    }
+    let cwd = std::env::current_dir()?;
+    let mut model_ref = "openrouter/google/gemini-3.1-flash-image-preview".to_string();
+    let mut output_path = None::<PathBuf>;
+    let mut image_paths = Vec::<PathBuf>::new();
+    let mut prompt_parts = Vec::<String>::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" | "-m" => {
+                index += 1;
+                model_ref = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("--model requires a value"))?
+                    .clone();
+            }
+            "--output" | "-o" => {
+                index += 1;
+                output_path = Some(PathBuf::from(
+                    args.get(index)
+                        .ok_or_else(|| anyhow!("--output requires a value"))?,
+                ));
+            }
+            "--image" | "-i" => {
+                index += 1;
+                image_paths.push(PathBuf::from(
+                    args.get(index)
+                        .ok_or_else(|| anyhow!("--image requires a value"))?,
+                ));
+            }
+            value => prompt_parts.push(value.to_string()),
+        }
+        index += 1;
+    }
+    let output_path = output_path.ok_or_else(|| anyhow!("--output is required"))?;
+    let prompt = prompt_parts.join(" ");
+    if prompt.trim().is_empty() {
+        return Err(anyhow!("image generation requires a prompt"));
+    }
+    let config = load_config(ConfigPaths::discover(cwd.clone(), None)?)?;
+    println!(
+        "{}",
+        generate_image_to_path(
+            &config,
+            &cwd,
+            &model_ref,
+            &output_path,
+            &prompt,
+            &image_paths
+        )
+        .await?
+    );
+    Ok(())
+}
+
+fn print_image_generate_help() {
+    println!(
+        "usage: pi generate-image --output <file> [--model <provider/model>] [--image <file>] <prompt>\n\nGenerate images through a configured image model and write output files locally."
+    );
+}
+
+fn resolve_image_model_reference(
+    config: &LoadedConfig,
+    reference: &str,
+) -> Option<ImageModelDefinition> {
+    let reference = reference.trim();
+    config
+        .image_models
+        .iter()
+        .find(|model| {
+            reference == model.id
+                || reference == format!("{}/{}", model.provider, model.id)
+                || model.name.as_deref() == Some(reference)
+        })
+        .cloned()
+}
+
+fn map_image_provider_api(api: &ConfigImageProviderApi) -> AiImageProviderApi {
+    match api {
+        ConfigImageProviderApi::OpenRouterImages => AiImageProviderApi::OpenRouterImages,
+    }
+}
+
+async fn generate_image_to_path(
+    config: &LoadedConfig,
+    cwd: &Path,
+    model_ref: &str,
+    output_path: &Path,
+    prompt: &str,
+    image_paths: &[PathBuf],
+) -> Result<String> {
+    if images_blocked(config) {
+        return Err(anyhow!("images are blocked by settings"));
+    }
+    let model = resolve_image_model_reference(config, model_ref)
+        .ok_or_else(|| anyhow!("image model not found: {model_ref}"))?;
+    let auth = auth_for_provider(&config.auth, &model.provider).ok_or_else(|| {
+        anyhow!(
+            "provider {} requires auth; set auth.json or {}",
+            model.provider,
+            default_api_key_env(&model.provider).unwrap_or("provider API key env")
+        )
+    })?;
+    let mut input = vec![ImageGenerationInput::Text {
+        text: prompt.to_string(),
+    }];
+    for media in load_media_inputs(cwd, image_paths, config)? {
+        input.push(ImageGenerationInput::Image { media });
+    }
+    let result = generate_images(
+        ImageProviderConfig {
+            model: ModelRef {
+                provider: model.provider.clone(),
+                id: model.id.clone(),
+            },
+            api: map_image_provider_api(&model.api),
+            base_url: model.base_url.clone(),
+            auth: map_provider_auth(Some(auth)),
+            output_modalities: model.output.clone(),
+        },
+        input,
+    )
+    .await?;
+    let mut lines = write_generated_image_outputs(output_path, &result.output)?;
+    if let Some(response_id) = result.response_id {
+        lines.push(format!("response: {response_id}"));
+    }
+    lines.push(format!(
+        "usage: input_tokens={} output_tokens={}",
+        result.input_tokens, result.output_tokens
+    ));
+    Ok(lines.join("\n"))
+}
+
+fn write_generated_image_outputs(
+    path: &Path,
+    output: &[ImageGenerationOutput],
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let mut image_index = 0usize;
+    for item in output {
+        match item {
+            ImageGenerationOutput::Text(text) => {
+                if !text.trim().is_empty() {
+                    lines.push(text.to_string());
+                }
+            }
+            ImageGenerationOutput::Image {
+                mime_type,
+                data_base64,
+            } => {
+                image_index += 1;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(data_base64)?;
+                let target = generated_image_output_path(path, image_index, mime_type);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&target, bytes)?;
+                lines.push(format!("image: {}", target.display()));
+            }
+        }
+    }
+    if image_index == 0 {
+        return Err(anyhow!("image provider returned no image output"));
+    }
+    Ok(lines)
+}
+
+fn generated_image_output_path(path: &Path, image_index: usize, mime_type: &str) -> PathBuf {
+    if image_index == 1 {
+        return path.to_path_buf();
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(ToString::to_string)
+        .or_else(|| image_extension_for_mime_type(mime_type).map(ToString::to_string))
+        .unwrap_or_else(|| "img".to_string());
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    path.with_file_name(format!("{stem}-{image_index}.{extension}"))
+}
+
+fn image_extension_for_mime_type(mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        _ => None,
+    }
 }
 
 fn try_run_package_command() -> Result<bool> {
@@ -769,6 +1015,9 @@ fn print_auth_help(command: &str) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if try_run_image_command().await? {
+        return Ok(());
+    }
     if try_run_package_command()? {
         return Ok(());
     }
@@ -2874,6 +3123,7 @@ async fn handle_tui_submission(
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
+        "/image-models" => app.push(TuiEntryKind::System, format_image_models(config, "")),
         "/thinking" => app.push(
             TuiEntryKind::System,
             format!(
@@ -3019,6 +3269,34 @@ async fn handle_tui_submission(
                     }
                 }
                 Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+            }
+        }
+        _ if line.starts_with("/image-models ") => {
+            let search = line.trim_start_matches("/image-models ").trim();
+            app.push(TuiEntryKind::System, format_image_models(config, search));
+        }
+        _ if line.starts_with("/generate-image ") => {
+            let rest = line.trim_start_matches("/generate-image ").trim();
+            let (path, prompt) = split_once_text(rest);
+            if path.is_empty() || prompt.is_empty() {
+                app.push(
+                    TuiEntryKind::Error,
+                    "usage: /generate-image <output> <prompt>",
+                );
+            } else {
+                match generate_image_to_path(
+                    config,
+                    &runtime.session().cwd,
+                    "openrouter/google/gemini-3.1-flash-image-preview",
+                    Path::new(path),
+                    prompt,
+                    &[],
+                )
+                .await
+                {
+                    Ok(output) => app.push(TuiEntryKind::System, output),
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
             }
         }
         _ if line.starts_with("/queue ") => {
@@ -3902,6 +4180,34 @@ fn format_history(editor_state: &EditorState) -> String {
         .join("\n")
 }
 
+fn format_image_models(config: &LoadedConfig, search: &str) -> String {
+    let search = search.to_ascii_lowercase();
+    let models = config
+        .image_models
+        .iter()
+        .filter(|model| {
+            if search.is_empty() {
+                return true;
+            }
+            format!(
+                "{}/{} {} {:?}",
+                model.provider,
+                model.id,
+                model.name.as_deref().unwrap_or_default(),
+                model.api
+            )
+            .to_ascii_lowercase()
+            .contains(&search)
+        })
+        .map(|model| format!("{}/{}", model.provider, model.id))
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        "no image models".to_string()
+    } else {
+        models.join("\n")
+    }
+}
+
 fn command_completions(config: &LoadedConfig, prefix: &str) -> Vec<String> {
     let mut completions = EditorState::command_completions(prefix)
         .into_iter()
@@ -4737,6 +5043,7 @@ mod tests {
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
+            image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
             extensions: vec![test_resource("json-ext")],
