@@ -16,7 +16,7 @@ Current Rust implementation:
 - Config/auth/model loading from `~/.pi/agent`
 - `AGENTS.md` and `CLAUDE.md` context discovery
 - Built-in local tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
-- Providers: faux test provider, OpenAI chat/responses/Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini/Vertex, OpenRouter, GitHub Copilot, Amazon Bedrock bearer-token Converse, Mistral, and Cloudflare Workers AI/AI Gateway
+- Providers: faux test provider, OpenAI chat/responses/Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini/Vertex, OpenRouter, GitHub Copilot, Amazon Bedrock bearer-token Converse, Mistral, Cloudflare Workers AI/AI Gateway, and OpenAI-compatible aliases for DeepSeek, Groq, Cerebras, xAI, Z.AI, Hugging Face, Together, Moonshot AI, and OpenCode
 
 Intentionally removed:
 
@@ -162,6 +162,17 @@ Provider API keys can be stored in `auth.json`:
   "google-vertex": { "type": "api_key", "key": "env:GOOGLE_CLOUD_API_KEY" },
   "github-copilot": { "type": "api_key", "key": "env:COPILOT_GITHUB_TOKEN" },
   "openrouter": { "type": "api_key", "key": "env:OPENROUTER_API_KEY" },
+  "deepseek": { "type": "api_key", "key": "env:DEEPSEEK_API_KEY" },
+  "groq": { "type": "api_key", "key": "env:GROQ_API_KEY" },
+  "cerebras": { "type": "api_key", "key": "env:CEREBRAS_API_KEY" },
+  "xai": { "type": "api_key", "key": "env:XAI_API_KEY" },
+  "zai": { "type": "api_key", "key": "env:ZAI_API_KEY" },
+  "huggingface": { "type": "api_key", "key": "env:HF_TOKEN" },
+  "together": { "type": "api_key", "key": "env:TOGETHER_API_KEY" },
+  "moonshotai": { "type": "api_key", "key": "env:MOONSHOT_API_KEY" },
+  "moonshotai-cn": { "type": "api_key", "key": "env:MOONSHOT_API_KEY" },
+  "opencode": { "type": "api_key", "key": "env:OPENCODE_API_KEY" },
+  "opencode-go": { "type": "api_key", "key": "env:OPENCODE_API_KEY" },
   "amazon-bedrock": { "type": "api_key", "key": "env:AWS_BEARER_TOKEN_BEDROCK" },
   "mistral": { "type": "api_key", "key": "env:MISTRAL_API_KEY" },
   "cloudflare-workers-ai": { "type": "api_key", "key": "env:CLOUDFLARE_API_KEY" },

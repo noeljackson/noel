@@ -865,13 +865,22 @@ fn env_api_key(provider: &str) -> Option<String> {
         "amazon-bedrock" => &["AWS_BEARER_TOKEN_BEDROCK"][..],
         "azure-openai-responses" => &["AZURE_OPENAI_API_KEY"][..],
         "cloudflare-ai-gateway" | "cloudflare-workers-ai" => &["CLOUDFLARE_API_KEY"][..],
+        "cerebras" => &["CEREBRAS_API_KEY"][..],
+        "deepseek" => &["DEEPSEEK_API_KEY"][..],
         "github-copilot" => &["COPILOT_GITHUB_TOKEN"][..],
         "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "google-vertex" => &["GOOGLE_CLOUD_API_KEY"][..],
+        "groq" => &["GROQ_API_KEY"][..],
+        "huggingface" => &["HF_TOKEN"][..],
+        "moonshotai" | "moonshotai-cn" => &["MOONSHOT_API_KEY"][..],
         "openai" => &["OPENAI_API_KEY"],
         "openai-codex" => &["CODEX_API_KEY"][..],
+        "opencode" | "opencode-go" => &["OPENCODE_API_KEY"][..],
         "openrouter" => &["OPENROUTER_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
+        "together" => &["TOGETHER_API_KEY"][..],
+        "xai" => &["XAI_API_KEY"][..],
+        "zai" => &["ZAI_API_KEY"][..],
         _ => &[],
     };
     names.iter().find_map(|name| env::var(name).ok())
@@ -1930,6 +1939,83 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://openrouter.ai/api/v1".to_string()),
         },
         ModelDefinition {
+            provider: "deepseek".to_string(),
+            id: "deepseek-v4-flash".to_string(),
+            name: Some("DeepSeek V4 Flash".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.deepseek.com".to_string()),
+        },
+        ModelDefinition {
+            provider: "groq".to_string(),
+            id: "openai/gpt-oss-120b".to_string(),
+            name: Some("Groq GPT OSS 120B".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.groq.com/openai/v1".to_string()),
+        },
+        ModelDefinition {
+            provider: "cerebras".to_string(),
+            id: "gpt-oss-120b".to_string(),
+            name: Some("Cerebras GPT OSS 120B".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.cerebras.ai/v1".to_string()),
+        },
+        ModelDefinition {
+            provider: "xai".to_string(),
+            id: "grok-code-fast-1".to_string(),
+            name: Some("Grok Code Fast 1".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.x.ai/v1".to_string()),
+        },
+        ModelDefinition {
+            provider: "zai".to_string(),
+            id: "glm-5.1".to_string(),
+            name: Some("GLM 5.1".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+        },
+        ModelDefinition {
+            provider: "huggingface".to_string(),
+            id: "MiniMaxAI/MiniMax-M2.7".to_string(),
+            name: Some("Hugging Face MiniMax M2.7".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://router.huggingface.co/v1".to_string()),
+        },
+        ModelDefinition {
+            provider: "together".to_string(),
+            id: "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8".to_string(),
+            name: Some("Together Qwen3 Coder 480B".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.together.ai/v1".to_string()),
+        },
+        ModelDefinition {
+            provider: "moonshotai".to_string(),
+            id: "kimi-k2-thinking".to_string(),
+            name: Some("Kimi K2 Thinking".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.moonshot.ai/v1".to_string()),
+        },
+        ModelDefinition {
+            provider: "moonshotai-cn".to_string(),
+            id: "kimi-k2-thinking".to_string(),
+            name: Some("Kimi K2 Thinking CN".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://api.moonshot.cn/v1".to_string()),
+        },
+        ModelDefinition {
+            provider: "opencode".to_string(),
+            id: "big-pickle".to_string(),
+            name: Some("OpenCode Big Pickle".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://opencode.ai/zen/v1".to_string()),
+        },
+        ModelDefinition {
+            provider: "opencode-go".to_string(),
+            id: "deepseek-v4-flash".to_string(),
+            name: Some("OpenCode Go DeepSeek V4 Flash".to_string()),
+            api: ProviderApi::OpenAi,
+            base_url: Some("https://opencode.ai/zen/go/v1".to_string()),
+        },
+        ModelDefinition {
             provider: "google".to_string(),
             id: "gemini-2.5-pro".to_string(),
             name: Some("Gemini Pro".to_string()),
@@ -2681,6 +2767,17 @@ mod tests {
             "azure-openai-responses",
             "github-copilot",
             "openrouter",
+            "deepseek",
+            "groq",
+            "cerebras",
+            "xai",
+            "zai",
+            "huggingface",
+            "together",
+            "moonshotai",
+            "moonshotai-cn",
+            "opencode",
+            "opencode-go",
             "google-vertex",
             "amazon-bedrock",
             "mistral",
@@ -2701,6 +2798,17 @@ mod tests {
             "openai-codex/gpt-5.4",
             "openai-codex/gpt-5.4-mini",
             "openai-codex/gpt-5.5",
+            "deepseek/deepseek-v4-flash",
+            "groq/openai/gpt-oss-120b",
+            "cerebras/gpt-oss-120b",
+            "xai/grok-code-fast-1",
+            "zai/glm-5.1",
+            "huggingface/MiniMaxAI/MiniMax-M2.7",
+            "together/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+            "moonshotai/kimi-k2-thinking",
+            "moonshotai-cn/kimi-k2-thinking",
+            "opencode/big-pickle",
+            "opencode-go/deepseek-v4-flash",
         ] {
             assert!(models.iter().any(|candidate| candidate == model));
         }
@@ -2712,23 +2820,41 @@ mod tests {
         let empty_auth = BTreeMap::new();
         let saved = [
             save_env("AZURE_OPENAI_API_KEY"),
+            save_env("CEREBRAS_API_KEY"),
             save_env("COPILOT_GITHUB_TOKEN"),
+            save_env("DEEPSEEK_API_KEY"),
+            save_env("GROQ_API_KEY"),
+            save_env("HF_TOKEN"),
+            save_env("MOONSHOT_API_KEY"),
+            save_env("OPENCODE_API_KEY"),
             save_env("OPENROUTER_API_KEY"),
             save_env("GOOGLE_CLOUD_API_KEY"),
             save_env("AWS_BEARER_TOKEN_BEDROCK"),
             save_env("MISTRAL_API_KEY"),
             save_env("CLOUDFLARE_API_KEY"),
+            save_env("TOGETHER_API_KEY"),
+            save_env("XAI_API_KEY"),
+            save_env("ZAI_API_KEY"),
             save_env("CODEX_ACCESS_TOKEN"),
             save_env("CHATGPT_ACCOUNT_ID"),
         ];
 
         env::set_var("AZURE_OPENAI_API_KEY", "azure-key");
+        env::set_var("CEREBRAS_API_KEY", "cerebras-key");
         env::set_var("COPILOT_GITHUB_TOKEN", "copilot-key");
+        env::set_var("DEEPSEEK_API_KEY", "deepseek-key");
+        env::set_var("GROQ_API_KEY", "groq-key");
+        env::set_var("HF_TOKEN", "hf-key");
+        env::set_var("MOONSHOT_API_KEY", "moonshot-key");
+        env::set_var("OPENCODE_API_KEY", "opencode-key");
         env::set_var("OPENROUTER_API_KEY", "openrouter-key");
         env::set_var("GOOGLE_CLOUD_API_KEY", "vertex-key");
         env::set_var("AWS_BEARER_TOKEN_BEDROCK", "bedrock-token");
         env::set_var("MISTRAL_API_KEY", "mistral-key");
         env::set_var("CLOUDFLARE_API_KEY", "cloudflare-key");
+        env::set_var("TOGETHER_API_KEY", "together-key");
+        env::set_var("XAI_API_KEY", "xai-key");
+        env::set_var("ZAI_API_KEY", "zai-key");
         env::set_var("CODEX_ACCESS_TOKEN", "codex-token");
         env::set_var("CHATGPT_ACCOUNT_ID", "account-id");
 
@@ -2743,6 +2869,50 @@ mod tests {
         assert_eq!(
             auth_for_provider(&empty_auth, "openrouter"),
             Some(ResolvedAuth::ApiKey("openrouter-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "deepseek"),
+            Some(ResolvedAuth::ApiKey("deepseek-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "groq"),
+            Some(ResolvedAuth::ApiKey("groq-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "cerebras"),
+            Some(ResolvedAuth::ApiKey("cerebras-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "xai"),
+            Some(ResolvedAuth::ApiKey("xai-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "zai"),
+            Some(ResolvedAuth::ApiKey("zai-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "huggingface"),
+            Some(ResolvedAuth::ApiKey("hf-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "together"),
+            Some(ResolvedAuth::ApiKey("together-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "moonshotai"),
+            Some(ResolvedAuth::ApiKey("moonshot-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "moonshotai-cn"),
+            Some(ResolvedAuth::ApiKey("moonshot-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "opencode"),
+            Some(ResolvedAuth::ApiKey("opencode-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "opencode-go"),
+            Some(ResolvedAuth::ApiKey("opencode-key".to_string()))
         );
         assert_eq!(
             auth_for_provider(&empty_auth, "google-vertex"),

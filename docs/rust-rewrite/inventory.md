@@ -326,6 +326,15 @@ Implemented provider/auth scope includes:
 - Mistral.
 - Cloudflare Workers AI.
 - Cloudflare AI Gateway.
+- DeepSeek.
+- Groq.
+- Cerebras.
+- xAI.
+- Z.AI.
+- Hugging Face.
+- Together.
+- Moonshot AI.
+- OpenCode.
 
 Current auth sources:
 

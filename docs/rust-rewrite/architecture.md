@@ -232,6 +232,15 @@ Implemented providers:
 - Mistral.
 - Cloudflare Workers AI.
 - Cloudflare AI Gateway.
+- DeepSeek.
+- Groq.
+- Cerebras.
+- xAI.
+- Z.AI.
+- Hugging Face.
+- Together.
+- Moonshot AI.
+- OpenCode.
 
 Credential resolution supports runtime API keys, `auth.json`, environment
 variables, Claude Code login token fallback, Codex/ChatGPT login token fallback,
