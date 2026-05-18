@@ -22,9 +22,9 @@ use pi_ai::{
 use pi_config::{
     auth_for_provider, has_auth_for_provider, load_config, read_model_cache, write_model_cache,
     AuthCredential, AuthData, CompactionSettings, ConfigPaths, ImageSettings, LoadedConfig,
-    ModelCache, ModelDefinition, ModelRefreshSettings, ProviderApi as ConfigProviderApi,
-    ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
-    ENV_SESSION_DIR,
+    ModelCache, ModelDefinition, ModelRefreshSettings, PackageSource,
+    ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, RetrySettings, Settings,
+    TerminalSettings, WarningSettings, ENV_SESSION_DIR,
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
@@ -286,8 +286,8 @@ fn run_package_install(args: &[String]) -> Result<()> {
     let source = single_package_source("install", &rest)?;
     let path = package_settings_path(local)?;
     mutate_settings_packages(&path, |packages| {
-        if !packages.iter().any(|package| package == &source) {
-            packages.push(source.clone());
+        if !packages.iter().any(|package| package.source() == source) {
+            packages.push(PackageSource::Simple(source.clone()));
         }
     })?;
     println!(
@@ -308,7 +308,7 @@ fn run_package_remove(args: &[String]) -> Result<()> {
     let mut removed = false;
     mutate_settings_packages(&path, |packages| {
         let before = packages.len();
-        packages.retain(|package| package != &source);
+        packages.retain(|package| package.source() != source);
         removed = packages.len() != before;
     })?;
     if removed {
@@ -360,10 +360,10 @@ fn run_package_update(args: &[String]) -> Result<()> {
 fn configured_package_sources(paths: &ConfigPaths) -> Result<Vec<String>> {
     let mut sources = BTreeSet::new();
     for source in read_settings_packages(&paths.settings_path)? {
-        sources.insert(source);
+        sources.insert(source.source().to_string());
     }
     for source in read_settings_packages(&paths.project_settings_path)? {
-        sources.insert(source);
+        sources.insert(source.source().to_string());
     }
     Ok(sources.into_iter().collect())
 }
@@ -460,7 +460,13 @@ fn run_package_config(args: &[String]) -> Result<()> {
         if config.settings.packages.is_empty() {
             "-".to_string()
         } else {
-            config.settings.packages.join(", ")
+            config
+                .settings
+                .packages
+                .iter()
+                .map(|package| package.source())
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     );
     println!("skills: {}", config.skills.len());
@@ -503,7 +509,10 @@ fn package_settings_path(local: bool) -> Result<PathBuf> {
     })
 }
 
-fn mutate_settings_packages(path: &Path, mutate: impl FnOnce(&mut Vec<String>)) -> Result<()> {
+fn mutate_settings_packages(
+    path: &Path,
+    mutate: impl FnOnce(&mut Vec<PackageSource>),
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -524,20 +533,14 @@ fn mutate_settings_packages(path: &Path, mutate: impl FnOnce(&mut Vec<String>)) 
         .map(|values| {
             values
                 .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToString::to_string)
+                .filter_map(|value| serde_json::from_value::<PackageSource>(value.clone()).ok())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     let mut packages = current;
     mutate(&mut packages);
-    packages.sort();
-    settings["packages"] = serde_json::Value::Array(
-        packages
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect(),
-    );
+    packages.sort_by(|left, right| left.source().cmp(right.source()));
+    settings["packages"] = serde_json::to_value(packages)?;
     fs::write(
         path,
         format!("{}\n", serde_json::to_string_pretty(&settings)?),
@@ -551,13 +554,13 @@ fn print_package_sources(scope: &str, path: &Path) -> Result<()> {
         println!("{scope}: no packages");
     } else {
         for package in packages {
-            println!("{scope}: {package}");
+            println!("{scope}: {}", package.source());
         }
     }
     Ok(())
 }
 
-fn read_settings_packages(path: &Path) -> Result<Vec<String>> {
+fn read_settings_packages(path: &Path) -> Result<Vec<PackageSource>> {
     if !path.exists() {
         return Ok(Vec::new());
     }

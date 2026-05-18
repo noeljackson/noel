@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -113,7 +114,7 @@ pub struct Settings {
     #[serde(default)]
     pub session_dir: Option<String>,
     #[serde(default)]
-    pub packages: Vec<String>,
+    pub packages: Vec<PackageSource>,
     #[serde(default)]
     pub extensions: Vec<String>,
     #[serde(default)]
@@ -218,6 +219,48 @@ impl Settings {
             model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PackageSource {
+    Simple(String),
+    Filtered(PackageSourceConfig),
+}
+
+impl PackageSource {
+    pub fn source(&self) -> &str {
+        match self {
+            PackageSource::Simple(source) => source,
+            PackageSource::Filtered(config) => &config.source,
+        }
+    }
+
+    fn filters(&self, resource_type: PackageResourceType) -> Option<&[String]> {
+        let PackageSource::Filtered(config) = self else {
+            return None;
+        };
+        match resource_type {
+            PackageResourceType::Extensions => config.extensions.as_deref(),
+            PackageResourceType::Skills => config.skills.as_deref(),
+            PackageResourceType::Prompts => config.prompts.as_deref(),
+            PackageResourceType::Themes => config.themes.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageSourceConfig {
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub themes: Option<Vec<String>>,
 }
 
 trait MergeSettings {
@@ -1033,7 +1076,7 @@ fn extend_resource_files(
 
 fn load_package_resources(
     cwd: &Path,
-    packages: &[String],
+    packages: &[PackageSource],
     extensions: &mut Vec<ResourceFile>,
     skills: &mut Vec<ResourceFile>,
     prompts: &mut Vec<ResourceFile>,
@@ -1041,15 +1084,23 @@ fn load_package_resources(
     diagnostics: &mut Vec<String>,
 ) {
     for package in packages {
-        let package_root = match resolve_resource_path(cwd, package) {
+        let package_root = match resolve_resource_path(cwd, package.source()) {
             Ok(path) => path,
             Err(error) => {
-                diagnostics.push(format!("failed to resolve package {package}: {error}"));
+                diagnostics.push(format!(
+                    "failed to resolve package {}: {error}",
+                    package.source()
+                ));
                 continue;
             }
         };
         if package_root.is_file() {
-            extend_resource_files(extensions, cwd, std::slice::from_ref(package), diagnostics);
+            extend_resource_files(
+                extensions,
+                cwd,
+                &[package.source().to_string()],
+                diagnostics,
+            );
             continue;
         }
         if !package_root.is_dir() {
@@ -1059,46 +1110,79 @@ fn load_package_resources(
             ));
             continue;
         }
-        if load_manifest_package_resources(
+        load_package_root_resources(
             &package_root,
+            package,
             extensions,
             skills,
             prompts,
             themes,
             diagnostics,
-        ) {
-            continue;
-        }
-        extend_resource_files(
-            extensions,
-            &package_root,
-            &["extensions".to_string()],
-            diagnostics,
         );
-        extend_resource_files(skills, &package_root, &["skills".to_string()], diagnostics);
-        extend_resource_files(
-            prompts,
-            &package_root,
-            &["prompts".to_string()],
-            diagnostics,
-        );
-        extend_resource_files(themes, &package_root, &["themes".to_string()], diagnostics);
     }
 }
 
-fn load_manifest_package_resources(
+fn load_package_root_resources(
     package_root: &Path,
+    package: &PackageSource,
     extensions: &mut Vec<ResourceFile>,
     skills: &mut Vec<ResourceFile>,
     prompts: &mut Vec<ResourceFile>,
     themes: &mut Vec<ResourceFile>,
     diagnostics: &mut Vec<String>,
-) -> bool {
+) {
+    let manifest = read_package_manifest(package_root, diagnostics);
+    let extension_entries = package_resource_entries(
+        manifest.as_ref().map(|manifest| &manifest.extensions),
+        "extensions",
+    );
+    let skill_entries =
+        package_resource_entries(manifest.as_ref().map(|manifest| &manifest.skills), "skills");
+    let prompt_entries = package_resource_entries(
+        manifest.as_ref().map(|manifest| &manifest.prompts),
+        "prompts",
+    );
+    let theme_entries =
+        package_resource_entries(manifest.as_ref().map(|manifest| &manifest.themes), "themes");
+    extend_package_resource_files(
+        extensions,
+        package_root,
+        &extension_entries,
+        package.filters(PackageResourceType::Extensions),
+        diagnostics,
+    );
+    extend_package_resource_files(
+        skills,
+        package_root,
+        &skill_entries,
+        package.filters(PackageResourceType::Skills),
+        diagnostics,
+    );
+    extend_package_resource_files(
+        prompts,
+        package_root,
+        &prompt_entries,
+        package.filters(PackageResourceType::Prompts),
+        diagnostics,
+    );
+    extend_package_resource_files(
+        themes,
+        package_root,
+        &theme_entries,
+        package.filters(PackageResourceType::Themes),
+        diagnostics,
+    );
+}
+
+fn read_package_manifest(
+    package_root: &Path,
+    diagnostics: &mut Vec<String>,
+) -> Option<PackageManifest> {
     let path = package_root.join("package.json");
     if !path.exists() {
-        return false;
+        return None;
     }
-    let manifest = match read_optional_json::<PackageJson>(&path) {
+    match read_optional_json::<PackageJson>(&path) {
         Ok(Some(package_json)) => package_json.pi,
         Ok(None) => None,
         Err(error) => {
@@ -1108,15 +1192,66 @@ fn load_manifest_package_resources(
             ));
             None
         }
+    }
+}
+
+fn package_resource_entries(
+    manifest_entries: Option<&Vec<String>>,
+    default_dir: &str,
+) -> Vec<String> {
+    manifest_entries
+        .cloned()
+        .unwrap_or_else(|| vec![default_dir.to_string()])
+}
+
+fn extend_package_resource_files(
+    resources: &mut Vec<ResourceFile>,
+    base_dir: &Path,
+    entries: &[String],
+    filters: Option<&[String]>,
+    diagnostics: &mut Vec<String>,
+) {
+    let Some(filtered_paths) =
+        collect_filtered_package_paths(base_dir, entries, filters, diagnostics)
+    else {
+        return;
     };
-    let Some(manifest) = manifest else {
-        return false;
-    };
-    extend_resource_files(extensions, package_root, &manifest.extensions, diagnostics);
-    extend_resource_files(skills, package_root, &manifest.skills, diagnostics);
-    extend_resource_files(prompts, package_root, &manifest.prompts, diagnostics);
-    extend_resource_files(themes, package_root, &manifest.themes, diagnostics);
-    true
+    let mut map = resources
+        .drain(..)
+        .map(|resource| (resource.name.clone(), resource))
+        .collect::<BTreeMap<_, _>>();
+    for path in filtered_paths {
+        push_resource_file(&mut map, &path, diagnostics);
+    }
+    resources.extend(map.into_values());
+}
+
+fn collect_filtered_package_paths(
+    base_dir: &Path,
+    entries: &[String],
+    filters: Option<&[String]>,
+    diagnostics: &mut Vec<String>,
+) -> Option<Vec<PathBuf>> {
+    if matches!(filters, Some(filters) if filters.is_empty()) {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = match resolve_resource_path(base_dir, entry) {
+            Ok(path) => path,
+            Err(error) => {
+                diagnostics.push(format!("failed to resolve resource path {entry}: {error}"));
+                continue;
+            }
+        };
+        collect_resource_paths(&mut paths, &path, diagnostics);
+    }
+    paths.sort();
+    paths.dedup();
+    Some(match filters {
+        Some(filters) => apply_resource_patterns(&paths, filters, base_dir),
+        None => paths,
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1136,6 +1271,14 @@ struct PackageManifest {
     themes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PackageResourceType {
+    Extensions,
+    Skills,
+    Prompts,
+    Themes,
+}
+
 fn resolve_resource_path(base_dir: &Path, entry: &str) -> Result<PathBuf, ConfigError> {
     let path = expand_tilde(PathBuf::from(entry))?;
     Ok(if path.is_absolute() {
@@ -1150,8 +1293,19 @@ fn collect_resource_path(
     path: &Path,
     diagnostics: &mut Vec<String>,
 ) {
+    let mut paths = Vec::new();
+    collect_resource_paths(&mut paths, path, diagnostics);
+    for path in paths {
+        push_resource_file(resources, &path, diagnostics);
+    }
+}
+
+fn collect_resource_paths(paths: &mut Vec<PathBuf>, path: &Path, diagnostics: &mut Vec<String>) {
+    if is_resource_metadata_file(path) {
+        return;
+    }
     if path.is_file() {
-        push_resource_file(resources, path, diagnostics);
+        paths.push(path.to_path_buf());
         return;
     }
     if !path.is_dir() {
@@ -1181,11 +1335,127 @@ fn collect_resource_path(
             continue;
         }
         if child.is_dir() {
-            collect_resource_path(resources, &child, diagnostics);
+            collect_resource_paths(paths, &child, diagnostics);
         } else if child.is_file() {
-            push_resource_file(resources, &child, diagnostics);
+            paths.push(child);
         }
     }
+}
+
+fn apply_resource_patterns(
+    paths: &[PathBuf],
+    patterns: &[String],
+    base_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    let mut force_includes = Vec::new();
+    let mut force_excludes = Vec::new();
+    for pattern in patterns {
+        if let Some(pattern) = pattern.strip_prefix('+') {
+            force_includes.push(pattern);
+        } else if let Some(pattern) = pattern.strip_prefix('-') {
+            force_excludes.push(pattern);
+        } else if let Some(pattern) = pattern.strip_prefix('!') {
+            excludes.push(pattern);
+        } else {
+            includes.push(pattern.as_str());
+        }
+    }
+
+    let mut selected = paths
+        .iter()
+        .filter(|path| {
+            includes.is_empty()
+                || includes
+                    .iter()
+                    .any(|pattern| resource_pattern_matches(path, pattern, base_dir))
+        })
+        .filter(|path| {
+            !excludes
+                .iter()
+                .any(|pattern| resource_pattern_matches(path, pattern, base_dir))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for path in paths {
+        if !selected.contains(path)
+            && force_includes
+                .iter()
+                .any(|pattern| exact_resource_pattern_matches(path, pattern, base_dir))
+        {
+            selected.push(path.clone());
+        }
+    }
+    selected.retain(|path| {
+        !force_excludes
+            .iter()
+            .any(|pattern| exact_resource_pattern_matches(path, pattern, base_dir))
+    });
+    selected
+}
+
+fn resource_pattern_matches(path: &Path, pattern: &str, base_dir: &Path) -> bool {
+    let pattern = normalize_pattern(pattern);
+    let rel = normalize_resource_path(path.strip_prefix(base_dir).unwrap_or(path));
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_string();
+    let full = normalize_resource_path(path);
+    wildcard_matches(&pattern, &rel)
+        || wildcard_matches(&pattern, &name)
+        || wildcard_matches(&pattern, &full)
+}
+
+fn exact_resource_pattern_matches(path: &Path, pattern: &str, base_dir: &Path) -> bool {
+    let pattern = normalize_pattern(pattern);
+    let rel = normalize_resource_path(path.strip_prefix(base_dir).unwrap_or(path));
+    let full = normalize_resource_path(path);
+    pattern == rel || pattern == full
+}
+
+fn normalize_pattern(pattern: &str) -> String {
+    pattern
+        .strip_prefix("./")
+        .unwrap_or(pattern)
+        .replace('\\', "/")
+}
+
+fn normalize_resource_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let mut matched = vec![vec![false; value.len() + 1]; pattern.len() + 1];
+    matched[0][0] = true;
+    for index in 1..=pattern.len() {
+        if pattern[index - 1] == b'*' {
+            matched[index][0] = matched[index - 1][0];
+        }
+    }
+    for pattern_index in 1..=pattern.len() {
+        for value_index in 1..=value.len() {
+            matched[pattern_index][value_index] = match pattern[pattern_index - 1] {
+                b'*' => {
+                    matched[pattern_index - 1][value_index]
+                        || matched[pattern_index][value_index - 1]
+                }
+                b'?' => matched[pattern_index - 1][value_index - 1],
+                byte => {
+                    matched[pattern_index - 1][value_index - 1] && byte == value[value_index - 1]
+                }
+            };
+        }
+    }
+    matched[pattern.len()][value.len()]
 }
 
 fn is_resource_metadata_file(path: &Path) -> bool {
@@ -1587,6 +1857,92 @@ mod tests {
             .prompt_templates
             .iter()
             .any(|resource| resource.name == "local" && resource.content == "local prompt"));
+        assert!(config.diagnostics.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn package_object_filters_resource_paths() {
+        let root = test_dir("pi-config-package-filters");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        let package_dir = cwd.join("package");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(package_dir.join("extensions")).expect("create package extensions");
+        fs::create_dir_all(package_dir.join("skills")).expect("create package skills");
+        fs::create_dir_all(package_dir.join("prompts")).expect("create package prompts");
+        fs::create_dir_all(package_dir.join("themes")).expect("create package themes");
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{
+                "packages":[{
+                    "source":"package",
+                    "extensions":[
+                        "extensions/*.md",
+                        "!extensions/skip.md",
+                        "+extensions/force.txt",
+                        "-extensions/drop.md"
+                    ],
+                    "skills":[],
+                    "prompts":["prompts/review.md"],
+                    "themes":[]
+                }]
+            }"#,
+        )
+        .expect("write settings");
+        fs::write(package_dir.join("extensions/keep.md"), "keep extension")
+            .expect("write keep extension");
+        fs::write(package_dir.join("extensions/skip.md"), "skip extension")
+            .expect("write skip extension");
+        fs::write(package_dir.join("extensions/drop.md"), "drop extension")
+            .expect("write drop extension");
+        fs::write(package_dir.join("extensions/force.txt"), "force extension")
+            .expect("write force extension");
+        fs::write(package_dir.join("extensions/other.txt"), "other extension")
+            .expect("write other extension");
+        fs::write(package_dir.join("skills/pkg.md"), "package skill").expect("write skill");
+        fs::write(package_dir.join("prompts/review.md"), "review prompt").expect("write prompt");
+        fs::write(package_dir.join("prompts/other.md"), "other prompt").expect("write prompt");
+        fs::write(package_dir.join("themes/dark.json"), r#"{"name":"dark"}"#).expect("write theme");
+
+        let config = load_config(ConfigPaths {
+            cwd: cwd.clone(),
+            agent_dir: agent_dir.clone(),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: cwd.join(".pi/settings.json"),
+            auth_path: root.join("missing-auth.json"),
+            models_path: root.join("missing-models.json"),
+            model_cache_path: root.join("missing-model-cache.json"),
+            keybindings_path: root.join("missing-keybindings.json"),
+        })
+        .expect("load config");
+
+        assert!(config
+            .extensions
+            .iter()
+            .any(|resource| resource.name == "keep" && resource.content == "keep extension"));
+        assert!(config
+            .extensions
+            .iter()
+            .any(|resource| resource.name == "force" && resource.content == "force extension"));
+        assert!(!config
+            .extensions
+            .iter()
+            .any(|resource| resource.name == "skip"));
+        assert!(!config
+            .extensions
+            .iter()
+            .any(|resource| resource.name == "drop"));
+        assert!(!config
+            .extensions
+            .iter()
+            .any(|resource| resource.name == "other"));
+        assert!(config.skills.is_empty());
+        assert_eq!(config.prompt_templates.len(), 1);
+        assert_eq!(config.prompt_templates[0].name, "review");
+        assert!(config.themes.is_empty());
         assert!(config.diagnostics.is_empty());
 
         let _ = fs::remove_dir_all(root);

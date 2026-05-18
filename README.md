@@ -118,6 +118,7 @@ Supported files:
 - `models.json`
 - `model-cache.json`
 - `keybindings.json`
+- `extensions/`
 - `skills/`
 - `prompts/`
 - `themes/`
@@ -236,6 +237,40 @@ or an object map:
 ```json
 { "submit": ["enter"], "cancel": ["escape"] }
 ```
+
+Local Rust-path packages are configured with `packages`. A package may expose
+resources by convention through `extensions/`, `skills/`, `prompts/`, and
+`themes/`, or with `package.json` under the `pi` key:
+
+```json
+{
+  "pi": {
+    "extensions": ["extensions/assist"],
+    "skills": ["skills/review.md"],
+    "prompts": ["prompts/fix.md"],
+    "themes": ["themes/dark.json"]
+  }
+}
+```
+
+Object package entries filter package resources without npm:
+
+```json
+{
+  "packages": [
+    {
+      "source": "vendor/pi-package",
+      "extensions": ["extensions/*.md", "!extensions/legacy.md", "+extensions/force.txt"],
+      "skills": [],
+      "prompts": ["prompts/review.md"]
+    }
+  ]
+}
+```
+
+Omitting a resource key loads all resources of that type. `[]` loads none.
+`!pattern` excludes wildcard matches, `+path` force-includes an exact path, and
+`-path` force-excludes an exact path.
 
 ## Interactive Commands
 
