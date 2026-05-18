@@ -401,9 +401,16 @@ Additional manual validation:
 - `make smoke-claude-opus-oauth`
 - `make test-smoke`
 - `make ts-parity-fixtures`
+- `make ts-parity-update`
+- `make ts-parity-drift`
+- `make ts-parity-agent`
 
 `make ts-parity-fixtures` is the only supported TypeScript execution path and
-runs npm inside Docker only.
+runs npm inside Docker only. `make ts-parity-update` refreshes fixtures from
+the moving TypeScript reference. `make ts-parity-drift` writes
+`target/ts-parity-drift/brief.md` and fails on fixture drift. `make
+ts-parity-agent` can dispatch that brief through `PI_PARITY_AGENT_COMMAND`,
+including a Codewire command such as `cw exec --name ts-parity-agent -- claude`.
 
 ## Intentionally Dropped or Deferred
 

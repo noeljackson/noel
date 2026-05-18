@@ -4,12 +4,13 @@ E2E_IMAGE ?= pi-e2e
 TS_PARITY_IMAGE ?= pi-ts-parity
 TS_REFERENCE_REPO ?= https://github.com/noeljackson/pi.git
 TS_REFERENCE_REF ?= $(shell git rev-parse ts-reference)
+TS_PARITY_TRACKING_REF ?= ts-reference
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 
-.PHONY: help build release install run fmt lint test check ci e2e test-smoke docker-build docker-e2e ts-parity-build ts-parity-fixtures smoke-claude-opus-oauth clean
+.PHONY: help build release install run fmt lint test check ci e2e test-smoke docker-build docker-e2e ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -27,6 +28,9 @@ help:
 		'  test-smoke   Run local TTY smoke plus manual real-provider smoke' \
 		'  docker-e2e   Build and run Dockerized tmux TTY e2e' \
 		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
+		'  ts-parity-update    Refresh fixtures from moving TS reference inside Docker' \
+		'  ts-parity-drift     Check moving TS reference for fixture drift' \
+		'  ts-parity-agent     Check drift and optionally dispatch PI_PARITY_AGENT_COMMAND' \
 		'  smoke-claude-opus-oauth  Run manual Claude Opus OAuth smoke' \
 		'  clean        Remove Cargo build output'
 
@@ -77,6 +81,15 @@ ts-parity-build:
 ts-parity-fixtures: ts-parity-build
 	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
 	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE)
+
+ts-parity-update:
+	$(MAKE) ts-parity-fixtures TS_REFERENCE_REF="$(TS_PARITY_TRACKING_REF)"
+
+ts-parity-drift:
+	scripts/ts-parity-drift.sh
+
+ts-parity-agent:
+	scripts/ts-parity-drift.sh
 
 smoke-claude-opus-oauth:
 	CARGO="$(CARGO)" scripts/smoke-claude-opus-oauth.sh

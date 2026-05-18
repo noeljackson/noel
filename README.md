@@ -431,6 +431,28 @@ This is the only supported path for executing TypeScript reference code. It
 clones `ts-reference` inside Docker, runs npm inside Docker, and writes
 sanitized fixtures under `tests/fixtures/ts-parity/`.
 
+Update committed parity fixtures from the moving TypeScript reference:
+
+```bash
+make ts-parity-update
+```
+
+Check for drift against the moving reference and write an agent brief:
+
+```bash
+make ts-parity-drift
+```
+
+Dispatch the drift brief to an external CLI agent:
+
+```bash
+PI_PARITY_AGENT_COMMAND='cw exec --name ts-parity-agent -- claude' make ts-parity-agent
+```
+
+The agent command receives `target/ts-parity-drift/brief.md` on stdin. Scheduled
+GitHub Actions runs the same Docker-only drift harness and opens or updates a
+`TS parity drift detected` issue when the TypeScript reference changes.
+
 Manual real-provider Opus smoke with Claude Code OAuth:
 
 ```bash

@@ -370,9 +370,17 @@ Manual validation:
 - `make smoke-claude-opus-oauth`
 - `make test-smoke`
 - `make ts-parity-fixtures`
+- `make ts-parity-update`
+- `make ts-parity-drift`
+- `make ts-parity-agent`
 
 `make ts-parity-fixtures` is the only supported path for executing TypeScript
-reference code. It runs npm inside Docker only.
+reference code. It runs npm inside Docker only. `make ts-parity-update`
+refreshes fixtures from the moving reference ref. `make ts-parity-drift`
+regenerates those fixtures, fails if committed fixtures would change, writes
+`target/ts-parity-drift/brief.md`, and runs Rust TS-shape tests when no drift is
+present. `make ts-parity-agent` uses the same harness and pipes the brief to
+`PI_PARITY_AGENT_COMMAND` when that environment variable is set.
 
 ## Current Cutover Status
 
