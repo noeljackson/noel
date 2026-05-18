@@ -241,6 +241,10 @@ Implemented providers:
 - Together.
 - Moonshot AI.
 - OpenCode.
+- Fireworks.
+- MiniMax.
+- Kimi Coding.
+- Xiaomi MiMo.
 
 Credential resolution supports runtime API keys, `auth.json`, environment
 variables, Claude Code login token fallback, Codex/ChatGPT login token fallback,

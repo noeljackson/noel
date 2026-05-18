@@ -335,6 +335,10 @@ Implemented provider/auth scope includes:
 - Together.
 - Moonshot AI.
 - OpenCode.
+- Fireworks.
+- MiniMax.
+- Kimi Coding.
+- Xiaomi MiMo.
 
 Current auth sources:
 

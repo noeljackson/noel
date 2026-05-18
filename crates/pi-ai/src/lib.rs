@@ -550,14 +550,7 @@ struct AnthropicProvider {
 #[async_trait]
 impl Provider for AnthropicProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
-        let url = format!(
-            "{}/messages",
-            self.config
-                .base_url
-                .as_deref()
-                .unwrap_or("https://api.anthropic.com/v1")
-                .trim_end_matches('/')
-        );
+        let url = anthropic_messages_url(&self.config)?;
 
         let response = reqwest::Client::new()
             .post(url)
@@ -591,6 +584,27 @@ impl Provider for AnthropicProvider {
                     .to_string(),
             },
         ])
+    }
+}
+
+fn anthropic_messages_url(config: &ProviderConfig) -> Result<String, ProviderError> {
+    let base_url = resolve_env_placeholders(
+        config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://api.anthropic.com/v1"),
+    )?;
+    let normalized = base_url.trim_end_matches('/');
+    if normalized.ends_with("/messages") {
+        return Ok(normalized.to_string());
+    }
+    if normalized.ends_with("/v1") {
+        return Ok(format!("{normalized}/messages"));
+    }
+    if config.model.provider == "anthropic" {
+        Ok(format!("{normalized}/messages"))
+    } else {
+        Ok(format!("{normalized}/v1/messages"))
     }
 }
 
@@ -632,6 +646,9 @@ fn anthropic_headers(config: &ProviderConfig) -> Result<HeaderMap, ProviderError
                 provider: config.model.provider.clone(),
             });
         }
+    }
+    if config.model.provider == "kimi-coding" {
+        headers.insert(USER_AGENT, HeaderValue::from_static("KimiCLI/1.5"));
     }
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -1946,6 +1963,22 @@ mod tests {
             "https://chatgpt.com/backend-api/codex/responses"
         );
         assert_eq!(
+            anthropic_messages_url(&ProviderConfig {
+                model: ModelRef {
+                    provider: "fireworks".to_string(),
+                    id: "accounts/fireworks/models/deepseek-v4-pro".to_string(),
+                },
+                api: ProviderApi::Anthropic,
+                base_url: Some("https://api.fireworks.ai/inference".to_string()),
+                auth: ProviderAuth::ApiKey("token".to_string()),
+                thinking_level: None,
+                thinking_budget_tokens: None,
+                session_id: None,
+            })
+            .expect("anthropic compatible url"),
+            "https://api.fireworks.ai/inference/v1/messages"
+        );
+        assert_eq!(
             azure_openai_responses_url("https://example.openai.azure.com/openai/v1"),
             "https://example.openai.azure.com/openai/v1/responses?api-version=v1"
         );
@@ -1956,6 +1989,30 @@ mod tests {
         assert_eq!(
             encode_path_segment("workers-ai/@cf/model"),
             "workers-ai%2F%40cf%2Fmodel"
+        );
+    }
+
+    #[test]
+    fn anthropic_compatible_headers_cover_kimi_static_headers() {
+        let headers = anthropic_headers(&ProviderConfig {
+            model: ModelRef {
+                provider: "kimi-coding".to_string(),
+                id: "kimi-for-coding".to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://api.kimi.com/coding".to_string()),
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        })
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("KimiCLI/1.5")
         );
     }
 

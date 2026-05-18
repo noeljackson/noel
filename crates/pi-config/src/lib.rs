@@ -867,11 +867,15 @@ fn env_api_key(provider: &str) -> Option<String> {
         "cloudflare-ai-gateway" | "cloudflare-workers-ai" => &["CLOUDFLARE_API_KEY"][..],
         "cerebras" => &["CEREBRAS_API_KEY"][..],
         "deepseek" => &["DEEPSEEK_API_KEY"][..],
+        "fireworks" => &["FIREWORKS_API_KEY"][..],
         "github-copilot" => &["COPILOT_GITHUB_TOKEN"][..],
         "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "google-vertex" => &["GOOGLE_CLOUD_API_KEY"][..],
         "groq" => &["GROQ_API_KEY"][..],
         "huggingface" => &["HF_TOKEN"][..],
+        "kimi-coding" => &["KIMI_API_KEY"][..],
+        "minimax" => &["MINIMAX_API_KEY"][..],
+        "minimax-cn" => &["MINIMAX_CN_API_KEY"][..],
         "moonshotai" | "moonshotai-cn" => &["MOONSHOT_API_KEY"][..],
         "openai" => &["OPENAI_API_KEY"],
         "openai-codex" => &["CODEX_API_KEY"][..],
@@ -880,6 +884,10 @@ fn env_api_key(provider: &str) -> Option<String> {
         "mistral" => &["MISTRAL_API_KEY"],
         "together" => &["TOGETHER_API_KEY"][..],
         "xai" => &["XAI_API_KEY"][..],
+        "xiaomi" => &["XIAOMI_API_KEY"][..],
+        "xiaomi-token-plan-ams" => &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"][..],
+        "xiaomi-token-plan-cn" => &["XIAOMI_TOKEN_PLAN_CN_API_KEY"][..],
+        "xiaomi-token-plan-sgp" => &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"][..],
         "zai" => &["ZAI_API_KEY"][..],
         _ => &[],
     };
@@ -2016,6 +2024,62 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://opencode.ai/zen/go/v1".to_string()),
         },
         ModelDefinition {
+            provider: "fireworks".to_string(),
+            id: "accounts/fireworks/models/deepseek-v4-pro".to_string(),
+            name: Some("Fireworks DeepSeek V4 Pro".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://api.fireworks.ai/inference".to_string()),
+        },
+        ModelDefinition {
+            provider: "minimax".to_string(),
+            id: "MiniMax-M2.7".to_string(),
+            name: Some("MiniMax M2.7".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://api.minimax.io/anthropic".to_string()),
+        },
+        ModelDefinition {
+            provider: "minimax-cn".to_string(),
+            id: "MiniMax-M2.7".to_string(),
+            name: Some("MiniMax M2.7 CN".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://api.minimaxi.com/anthropic".to_string()),
+        },
+        ModelDefinition {
+            provider: "kimi-coding".to_string(),
+            id: "kimi-for-coding".to_string(),
+            name: Some("Kimi For Coding".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://api.kimi.com/coding".to_string()),
+        },
+        ModelDefinition {
+            provider: "xiaomi".to_string(),
+            id: "mimo-v2.5-pro".to_string(),
+            name: Some("MiMo V2.5 Pro".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://api.xiaomimimo.com/anthropic".to_string()),
+        },
+        ModelDefinition {
+            provider: "xiaomi-token-plan-cn".to_string(),
+            id: "mimo-v2.5-pro".to_string(),
+            name: Some("MiMo V2.5 Pro Token Plan CN".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://token-plan-cn.xiaomimimo.com/anthropic".to_string()),
+        },
+        ModelDefinition {
+            provider: "xiaomi-token-plan-ams".to_string(),
+            id: "mimo-v2.5-pro".to_string(),
+            name: Some("MiMo V2.5 Pro Token Plan AMS".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://token-plan-ams.xiaomimimo.com/anthropic".to_string()),
+        },
+        ModelDefinition {
+            provider: "xiaomi-token-plan-sgp".to_string(),
+            id: "mimo-v2.5-pro".to_string(),
+            name: Some("MiMo V2.5 Pro Token Plan SGP".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: Some("https://token-plan-sgp.xiaomimimo.com/anthropic".to_string()),
+        },
+        ModelDefinition {
             provider: "google".to_string(),
             id: "gemini-2.5-pro".to_string(),
             name: Some("Gemini Pro".to_string()),
@@ -2778,6 +2842,14 @@ mod tests {
             "moonshotai-cn",
             "opencode",
             "opencode-go",
+            "fireworks",
+            "minimax",
+            "minimax-cn",
+            "kimi-coding",
+            "xiaomi",
+            "xiaomi-token-plan-cn",
+            "xiaomi-token-plan-ams",
+            "xiaomi-token-plan-sgp",
             "google-vertex",
             "amazon-bedrock",
             "mistral",
@@ -2809,6 +2881,14 @@ mod tests {
             "moonshotai-cn/kimi-k2-thinking",
             "opencode/big-pickle",
             "opencode-go/deepseek-v4-flash",
+            "fireworks/accounts/fireworks/models/deepseek-v4-pro",
+            "minimax/MiniMax-M2.7",
+            "minimax-cn/MiniMax-M2.7",
+            "kimi-coding/kimi-for-coding",
+            "xiaomi/mimo-v2.5-pro",
+            "xiaomi-token-plan-cn/mimo-v2.5-pro",
+            "xiaomi-token-plan-ams/mimo-v2.5-pro",
+            "xiaomi-token-plan-sgp/mimo-v2.5-pro",
         ] {
             assert!(models.iter().any(|candidate| candidate == model));
         }
@@ -2823,8 +2903,12 @@ mod tests {
             save_env("CEREBRAS_API_KEY"),
             save_env("COPILOT_GITHUB_TOKEN"),
             save_env("DEEPSEEK_API_KEY"),
+            save_env("FIREWORKS_API_KEY"),
             save_env("GROQ_API_KEY"),
             save_env("HF_TOKEN"),
+            save_env("KIMI_API_KEY"),
+            save_env("MINIMAX_API_KEY"),
+            save_env("MINIMAX_CN_API_KEY"),
             save_env("MOONSHOT_API_KEY"),
             save_env("OPENCODE_API_KEY"),
             save_env("OPENROUTER_API_KEY"),
@@ -2834,6 +2918,10 @@ mod tests {
             save_env("CLOUDFLARE_API_KEY"),
             save_env("TOGETHER_API_KEY"),
             save_env("XAI_API_KEY"),
+            save_env("XIAOMI_API_KEY"),
+            save_env("XIAOMI_TOKEN_PLAN_AMS_API_KEY"),
+            save_env("XIAOMI_TOKEN_PLAN_CN_API_KEY"),
+            save_env("XIAOMI_TOKEN_PLAN_SGP_API_KEY"),
             save_env("ZAI_API_KEY"),
             save_env("CODEX_ACCESS_TOKEN"),
             save_env("CHATGPT_ACCOUNT_ID"),
@@ -2843,8 +2931,12 @@ mod tests {
         env::set_var("CEREBRAS_API_KEY", "cerebras-key");
         env::set_var("COPILOT_GITHUB_TOKEN", "copilot-key");
         env::set_var("DEEPSEEK_API_KEY", "deepseek-key");
+        env::set_var("FIREWORKS_API_KEY", "fireworks-key");
         env::set_var("GROQ_API_KEY", "groq-key");
         env::set_var("HF_TOKEN", "hf-key");
+        env::set_var("KIMI_API_KEY", "kimi-key");
+        env::set_var("MINIMAX_API_KEY", "minimax-key");
+        env::set_var("MINIMAX_CN_API_KEY", "minimax-cn-key");
         env::set_var("MOONSHOT_API_KEY", "moonshot-key");
         env::set_var("OPENCODE_API_KEY", "opencode-key");
         env::set_var("OPENROUTER_API_KEY", "openrouter-key");
@@ -2854,6 +2946,10 @@ mod tests {
         env::set_var("CLOUDFLARE_API_KEY", "cloudflare-key");
         env::set_var("TOGETHER_API_KEY", "together-key");
         env::set_var("XAI_API_KEY", "xai-key");
+        env::set_var("XIAOMI_API_KEY", "xiaomi-key");
+        env::set_var("XIAOMI_TOKEN_PLAN_AMS_API_KEY", "xiaomi-ams-key");
+        env::set_var("XIAOMI_TOKEN_PLAN_CN_API_KEY", "xiaomi-cn-key");
+        env::set_var("XIAOMI_TOKEN_PLAN_SGP_API_KEY", "xiaomi-sgp-key");
         env::set_var("ZAI_API_KEY", "zai-key");
         env::set_var("CODEX_ACCESS_TOKEN", "codex-token");
         env::set_var("CHATGPT_ACCOUNT_ID", "account-id");
@@ -2913,6 +3009,38 @@ mod tests {
         assert_eq!(
             auth_for_provider(&empty_auth, "opencode-go"),
             Some(ResolvedAuth::ApiKey("opencode-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "fireworks"),
+            Some(ResolvedAuth::ApiKey("fireworks-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "minimax"),
+            Some(ResolvedAuth::ApiKey("minimax-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "minimax-cn"),
+            Some(ResolvedAuth::ApiKey("minimax-cn-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "kimi-coding"),
+            Some(ResolvedAuth::ApiKey("kimi-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "xiaomi"),
+            Some(ResolvedAuth::ApiKey("xiaomi-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "xiaomi-token-plan-cn"),
+            Some(ResolvedAuth::ApiKey("xiaomi-cn-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "xiaomi-token-plan-ams"),
+            Some(ResolvedAuth::ApiKey("xiaomi-ams-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&empty_auth, "xiaomi-token-plan-sgp"),
+            Some(ResolvedAuth::ApiKey("xiaomi-sgp-key".to_string()))
         );
         assert_eq!(
             auth_for_provider(&empty_auth, "google-vertex"),
