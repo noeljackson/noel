@@ -622,7 +622,7 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         .unwrap_or_default();
     let context_files = load_context_files(&paths.cwd, &paths.agent_dir)?;
     let mut extensions = load_resource_files(&paths, "extensions", &mut diagnostics);
-    let mut skills = load_resource_files(&paths, "skills", &mut diagnostics);
+    let mut skills = load_skill_resource_files(&paths, &mut diagnostics);
     let mut prompt_templates = load_resource_files(&paths, "prompts", &mut diagnostics);
     let mut themes = load_resource_files(&paths, "themes", &mut diagnostics);
     extend_resource_files(
@@ -1051,6 +1051,91 @@ fn load_resource_files(
     resources.into_values().collect()
 }
 
+fn load_skill_resource_files(
+    paths: &ConfigPaths,
+    diagnostics: &mut Vec<String>,
+) -> Vec<ResourceFile> {
+    let resources = load_resource_files(paths, "skills", diagnostics);
+    let mut map = resources
+        .into_iter()
+        .map(|resource| (resource.name.clone(), resource))
+        .collect::<BTreeMap<_, _>>();
+    for dir in ancestor_agents_skill_dirs(&paths.cwd) {
+        collect_agent_skill_path(&mut map, &dir, diagnostics);
+    }
+    map.into_values().collect()
+}
+
+fn ancestor_agents_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let git_root = find_git_root(cwd);
+    let mut dirs = Vec::new();
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        dirs.push(dir.join(".agents").join("skills"));
+        if git_root.as_deref() == Some(dir) {
+            break;
+        }
+        current = dir.parent();
+    }
+    dirs.reverse();
+    dirs
+}
+
+fn find_git_root(cwd: &Path) -> Option<PathBuf> {
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn collect_agent_skill_path(
+    resources: &mut BTreeMap<String, ResourceFile>,
+    path: &Path,
+    diagnostics: &mut Vec<String>,
+) {
+    if !path.exists() {
+        return;
+    }
+    if path.is_file() {
+        if path.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
+            push_resource_file(resources, path, diagnostics);
+        }
+        return;
+    }
+    if !path.is_dir() {
+        return;
+    }
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            diagnostics.push(format!("failed to read {}: {error}", path.display()));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "failed to read entry in {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let child = entry.path();
+        if child.is_dir() {
+            collect_agent_skill_path(resources, &child, diagnostics);
+        } else if child.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
+            push_resource_file(resources, &child, diagnostics);
+        }
+    }
+}
+
 fn extend_resource_files(
     resources: &mut Vec<ResourceFile>,
     base_dir: &Path,
@@ -1470,22 +1555,22 @@ fn push_resource_file(
     path: &Path,
     diagnostics: &mut Vec<String>,
 ) {
-    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+    let Some(name) = resource_name(path) else {
         return;
     };
     match fs::read_to_string(path) {
         Ok(content) => {
             let previous = resources.insert(
-                stem.to_string(),
+                name.clone(),
                 ResourceFile {
-                    name: stem.to_string(),
+                    name: name.clone(),
                     path: path.to_path_buf(),
                     content,
                 },
             );
             if let Some(previous) = previous {
                 diagnostics.push(format!(
-                    "resource name collision for {stem}: {} replaced by {}",
+                    "resource name collision for {name}: {} replaced by {}",
                     previous.path.display(),
                     path.display()
                 ));
@@ -1493,6 +1578,19 @@ fn push_resource_file(
         }
         Err(error) => diagnostics.push(format!("failed to read {}: {error}", path.display())),
     }
+}
+
+fn resource_name(path: &Path) -> Option<String> {
+    if path.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
+        return path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .map(ToString::to_string);
+    }
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .map(ToString::to_string)
 }
 
 fn default_models() -> Vec<ModelDefinition> {
@@ -1943,6 +2041,59 @@ mod tests {
         assert_eq!(config.prompt_templates.len(), 1);
         assert_eq!(config.prompt_templates[0].name, "review");
         assert!(config.themes.is_empty());
+        assert!(config.diagnostics.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agents_skill_dirs_load_skill_md_by_directory_name() {
+        let root = test_dir("pi-config-agents-skills");
+        let agent_dir = root.join("agent");
+        let repo = root.join("repo");
+        let cwd = repo.join("nested");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(cwd.join(".agents/skills/local")).expect("create local skill");
+        fs::create_dir_all(repo.join(".agents/skills/repo")).expect("create repo skill");
+        fs::write(repo.join(".git"), "").expect("mark git root");
+        fs::write(
+            cwd.join(".agents/skills/local/SKILL.md"),
+            "local skill body",
+        )
+        .expect("write local skill");
+        fs::write(repo.join(".agents/skills/repo/SKILL.md"), "repo skill body")
+            .expect("write repo skill");
+        fs::write(
+            cwd.join(".agents/skills/ignored.md"),
+            "ignored root markdown",
+        )
+        .expect("write ignored root markdown");
+
+        let config = load_config(ConfigPaths {
+            cwd: cwd.clone(),
+            agent_dir: agent_dir.clone(),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: cwd.join(".pi/settings.json"),
+            auth_path: root.join("missing-auth.json"),
+            models_path: root.join("missing-models.json"),
+            model_cache_path: root.join("missing-model-cache.json"),
+            keybindings_path: root.join("missing-keybindings.json"),
+        })
+        .expect("load config");
+
+        assert!(config
+            .skills
+            .iter()
+            .any(|resource| resource.name == "repo" && resource.content == "repo skill body"));
+        assert!(config
+            .skills
+            .iter()
+            .any(|resource| resource.name == "local" && resource.content == "local skill body"));
+        assert!(!config
+            .skills
+            .iter()
+            .any(|resource| resource.name == "ignored"));
         assert!(config.diagnostics.is_empty());
 
         let _ = fs::remove_dir_all(root);

@@ -124,6 +124,10 @@ Supported files:
 - `themes/`
 - `sessions/`
 
+Project skills are also discovered from `.agents/skills` directories from the
+current working directory up to the git root. `SKILL.md` files are named by
+their containing directory.
+
 Environment overrides:
 
 - `PI_CODING_AGENT_DIR`
