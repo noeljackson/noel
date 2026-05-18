@@ -415,6 +415,12 @@ TTY e2e test:
 make e2e
 ```
 
+Release-binary dogfood smoke:
+
+```bash
+make dogfood
+```
+
 Dockerized TTY e2e test:
 
 ```bash
@@ -499,6 +505,11 @@ Full manual smoke suite:
 ```bash
 make test-smoke
 ```
+
+`make dogfood` builds `target/release/pi` and runs the binary in tmux with an
+isolated agent/session directory under `target/`. It uses the faux provider, so
+it does not require provider credentials or network access. `make dogfood-real`
+is an opt-in alias for the live Claude Opus OAuth smoke.
 
 The real-provider smoke is intentionally not part of `test`, `check`, or `e2e`.
 It requires `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or

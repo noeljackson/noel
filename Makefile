@@ -10,7 +10,7 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 
-.PHONY: help build release install run fmt lint test check ci e2e test-smoke docker-build docker-e2e ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-claude-opus-oauth clean
+.PHONY: help build release install run fmt lint test check ci e2e dogfood dogfood-real test-smoke docker-build docker-e2e ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -25,6 +25,8 @@ help:
 		'  check        Run fmt, lint, and test' \
 		'  ci           Run check and local tmux e2e' \
 		'  e2e          Run tmux TTY e2e' \
+		'  dogfood      Run release-binary tmux dogfood smoke' \
+		'  dogfood-real Run optional real-provider dogfood smoke' \
 		'  test-smoke   Run local TTY smoke plus manual real-provider smoke' \
 		'  docker-e2e   Build and run Dockerized tmux TTY e2e' \
 		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
@@ -63,6 +65,11 @@ ci: check e2e
 
 e2e:
 	scripts/e2e-tmux.sh
+
+dogfood: release
+	scripts/dogfood-release.sh
+
+dogfood-real: smoke-claude-opus-oauth
 
 test-smoke: e2e smoke-claude-opus-oauth
 
