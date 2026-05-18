@@ -354,6 +354,51 @@ fn display_relative(cwd: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn builtin_tools_cover_upstream_ts_names() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/local-tools.json"
+        ))
+        .expect("parse local tools fixture");
+        let upstream_names = fixture["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name").to_string())
+            .collect::<Vec<_>>();
+        let rust_tools = builtin_tool_definitions();
+        let rust_names = rust_tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(rust_names, upstream_names);
+
+        let read_only = rust_tools
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool.read_only))
+            .collect::<BTreeMap<_, _>>();
+        assert!(read_only["read"]);
+        assert!(read_only["grep"]);
+        assert!(read_only["find"]);
+        assert!(read_only["ls"]);
+        assert!(!read_only["bash"]);
+        assert!(!read_only["edit"]);
+        assert!(!read_only["write"]);
+
+        let grep = fixture["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == "grep")
+            .expect("grep fixture");
+        assert!(grep["parameters"]["properties"]
+            .as_array()
+            .expect("grep properties")
+            .iter()
+            .any(|property| property == "glob"));
+    }
 
     #[tokio::test]
     async fn read_write_and_edit_tool_round_trip() {
@@ -392,6 +437,62 @@ mod tests {
         .expect("read");
 
         assert_eq!(result.output, "hello rust");
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn grep_find_ls_and_bash_return_text_outputs() {
+        let cwd = std::env::temp_dir().join(format!("pi-tools-search-test-{}", std::process::id()));
+        fs::create_dir_all(cwd.join("src")).expect("create temp dir");
+        fs::write(cwd.join("src/a.txt"), "alpha\nbeta\n").expect("write a");
+        fs::write(cwd.join("src/b.txt"), "gamma\n").expect("write b");
+
+        let grep = execute_tool(
+            &cwd,
+            ToolRequest::Grep {
+                path: Some("src".to_string()),
+                pattern: "alpha".to_string(),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("grep");
+        assert!(grep.output.contains("src/a.txt:1:alpha"));
+
+        let find = execute_tool(
+            &cwd,
+            ToolRequest::Find {
+                pattern: "a.txt".to_string(),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("find");
+        assert_eq!(find.output, "src/a.txt");
+
+        let ls = execute_tool(
+            &cwd,
+            ToolRequest::Ls {
+                path: Some("src".to_string()),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("ls");
+        assert_eq!(ls.output, "a.txt\nb.txt");
+
+        let bash = execute_tool(
+            &cwd,
+            ToolRequest::Bash {
+                command: "printf tool-ok".to_string(),
+                timeout_ms: Some(1000),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("bash");
+        assert_eq!(bash.output, "tool-ok");
+
         let _ = fs::remove_dir_all(cwd);
     }
 
@@ -436,6 +537,26 @@ mod tests {
         )
         .await
         .expect_err("outside write should fail");
+
+        assert!(matches!(error, ToolError::PathEscapesCwd(_)));
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_paths_outside_cwd() {
+        let cwd =
+            std::env::temp_dir().join(format!("pi-tools-outside-read-test-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+
+        let error = execute_tool(
+            &cwd,
+            ToolRequest::Read {
+                path: "../outside.txt".to_string(),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect_err("outside read should fail");
 
         assert!(matches!(error, ToolError::PathEscapesCwd(_)));
         let _ = fs::remove_dir_all(cwd);
