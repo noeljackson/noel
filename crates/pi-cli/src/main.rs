@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, BufRead, Cursor, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1379,8 +1379,17 @@ fn load_media_inputs(
     }
     paths
         .iter()
-        .map(|path| load_media_input(cwd, path))
+        .map(|path| load_media_input(cwd, path, config))
         .collect()
+}
+
+fn images_auto_resize(config: &LoadedConfig) -> bool {
+    config
+        .settings
+        .images
+        .as_ref()
+        .and_then(|images| images.auto_resize)
+        .unwrap_or(true)
 }
 
 fn images_blocked(config: &LoadedConfig) -> bool {
@@ -1392,14 +1401,20 @@ fn images_blocked(config: &LoadedConfig) -> bool {
         .unwrap_or(false)
 }
 
-fn load_media_input(cwd: &Path, path: &Path) -> Result<MediaInput> {
+fn load_media_input(cwd: &Path, path: &Path, config: &LoadedConfig) -> Result<MediaInput> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
     };
-    let bytes = fs::read(&path)?;
-    let mime_type = media_mime_type(&path)?;
+    let mut bytes = fs::read(&path)?;
+    let mut mime_type = media_mime_type(&path)?;
+    if images_auto_resize(config) {
+        if let Some(resized) = resize_image_if_needed(&bytes, &mime_type)? {
+            bytes = resized.bytes;
+            mime_type = resized.mime_type;
+        }
+    }
     let (width, height) = image_dimensions(&bytes, &mime_type).unwrap_or((None, None));
     Ok(MediaInput {
         mime_type,
@@ -1408,6 +1423,57 @@ fn load_media_input(cwd: &Path, path: &Path) -> Result<MediaInput> {
         width,
         height,
     })
+}
+
+const MAX_AUTO_RESIZE_IMAGE_DIMENSION: u32 = 2000;
+
+struct ResizedImage {
+    bytes: Vec<u8>,
+    mime_type: String,
+}
+
+fn resize_image_if_needed(bytes: &[u8], mime_type: &str) -> Result<Option<ResizedImage>> {
+    let Some(input_format) = image_format_for_mime_type(mime_type) else {
+        return Ok(None);
+    };
+    let image = match image::load_from_memory_with_format(bytes, input_format) {
+        Ok(image) => image,
+        Err(_) => return Ok(None),
+    };
+    if image.width() <= MAX_AUTO_RESIZE_IMAGE_DIMENSION
+        && image.height() <= MAX_AUTO_RESIZE_IMAGE_DIMENSION
+    {
+        return Ok(None);
+    }
+    let resized = image.thumbnail(
+        MAX_AUTO_RESIZE_IMAGE_DIMENSION,
+        MAX_AUTO_RESIZE_IMAGE_DIMENSION,
+    );
+    let output_format = if mime_type == "image/jpeg" {
+        image::ImageFormat::Jpeg
+    } else {
+        image::ImageFormat::Png
+    };
+    let mut output = Cursor::new(Vec::new());
+    resized.write_to(&mut output, output_format)?;
+    Ok(Some(ResizedImage {
+        bytes: output.into_inner(),
+        mime_type: if output_format == image::ImageFormat::Jpeg {
+            "image/jpeg".to_string()
+        } else {
+            "image/png".to_string()
+        },
+    }))
+}
+
+fn image_format_for_mime_type(mime_type: &str) -> Option<image::ImageFormat> {
+    match mime_type {
+        "image/png" => Some(image::ImageFormat::Png),
+        "image/jpeg" => Some(image::ImageFormat::Jpeg),
+        "image/gif" => Some(image::ImageFormat::Gif),
+        "image/webp" => Some(image::ImageFormat::WebP),
+        _ => None,
+    }
 }
 
 fn media_mime_type(path: &Path) -> Result<String> {
@@ -2778,7 +2844,7 @@ async fn handle_tui_submission(
             let media_result = if images_blocked(config) {
                 Err(anyhow!("images are blocked by settings"))
             } else {
-                load_media_input(&runtime.session().cwd, Path::new(path))
+                load_media_input(&runtime.session().cwd, Path::new(path), config)
             };
             match media_result {
                 Ok(media) => {
@@ -4231,4 +4297,48 @@ fn write_auth_file(config: &LoadedConfig) -> Result<()> {
         serde_json::to_string_pretty(&config.auth)?,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_resize_downscales_large_png() {
+        let original = png_bytes(3000, 1000);
+        let resized = resize_image_if_needed(&original, "image/png")
+            .expect("resize image")
+            .expect("resized");
+
+        assert_eq!(resized.mime_type, "image/png");
+        let (width, height) = png_dimensions(&resized.bytes).expect("png dimensions");
+        assert_eq!((width, height), (2000, 667));
+        assert!(resized.bytes.len() < original.len());
+    }
+
+    #[test]
+    fn auto_resize_leaves_small_png_unchanged() {
+        let original = png_bytes(10, 10);
+        let resized = resize_image_if_needed(&original, "image/png").expect("resize image");
+
+        assert!(resized.is_none());
+    }
+
+    #[test]
+    fn auto_resize_ignores_decode_failures() {
+        let invalid_png_header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x04\0\0\0";
+        let resized =
+            resize_image_if_needed(invalid_png_header, "image/png").expect("resize image");
+
+        assert!(resized.is_none());
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height));
+        let mut output = Cursor::new(Vec::new());
+        image
+            .write_to(&mut output, image::ImageFormat::Png)
+            .expect("encode png");
+        output.into_inner()
+    }
 }
