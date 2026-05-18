@@ -421,6 +421,12 @@ Release-binary dogfood smoke:
 make dogfood
 ```
 
+Long TTY paint and scroll dogfood:
+
+```bash
+make dogfood-long
+```
+
 Dockerized TTY e2e test:
 
 ```bash
@@ -508,7 +514,10 @@ make test-smoke
 
 `make dogfood` builds `target/release/pi` and runs the binary in tmux with an
 isolated agent/session directory under `target/`. It uses the faux provider, so
-it does not require provider credentials or network access. `make dogfood-real`
+it does not require provider credentials or network access. `make dogfood-long`
+uses the same release binary and faux provider, but creates a long transcript,
+checks PageUp/Home and End scroll behavior, resizes the tmux pane, and verifies
+the exported session still contains the full transcript. `make dogfood-real`
 is opt-in and runs real Claude and Codex TTY smoke tests when local credentials
 are available. It asks each provider for a tiny Rust program and checks that a
 real assistant message contains the expected marker and `fn main`.

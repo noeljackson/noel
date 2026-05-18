@@ -2337,6 +2337,7 @@ struct TuiApp {
     header_line: String,
     status: String,
     show_hardware_cursor: bool,
+    chat_scroll: usize,
 }
 
 impl TuiApp {
@@ -2390,11 +2391,13 @@ impl TuiApp {
     fn push(&mut self, kind: TuiEntryKind, text: impl Into<String>) {
         let text = text.into();
         if !text.trim().is_empty() {
+            self.chat_scroll = 0;
             self.entries.push(TuiEntry { kind, text });
         }
     }
 
     fn push_placeholder(&mut self, kind: TuiEntryKind, text: impl Into<String>) -> usize {
+        self.chat_scroll = 0;
         self.entries.push(TuiEntry {
             kind,
             text: text.into(),
@@ -2490,7 +2493,8 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         lines.push(Line::from(""));
     }
     let available = area.height.saturating_sub(2) as usize;
-    let start = lines.len().saturating_sub(available);
+    let max_start = lines.len().saturating_sub(available);
+    let start = max_start.saturating_sub(app.chat_scroll.min(max_start));
     let paragraph = Paragraph::new(lines[start..].to_vec())
         .wrap(Wrap { trim: false })
         .block(
@@ -2680,6 +2684,18 @@ async fn handle_tui_key(
         }
         KeyCode::Backspace => {
             app.input.pop();
+        }
+        KeyCode::PageUp => {
+            app.chat_scroll = app.chat_scroll.saturating_add(10);
+        }
+        KeyCode::PageDown => {
+            app.chat_scroll = app.chat_scroll.saturating_sub(10);
+        }
+        KeyCode::Home => {
+            app.chat_scroll = usize::MAX;
+        }
+        KeyCode::End => {
+            app.chat_scroll = 0;
         }
         KeyCode::Enter => {
             let line = app.input.trim().to_string();
@@ -4128,7 +4144,12 @@ fn format_settings(config: &LoadedConfig, runtime: &Runtime) -> String {
 }
 
 fn format_hotkeys(config: &LoadedConfig) -> String {
-    terminal_renderer(config).keybindings(&keybinding_map(config))
+    let mut output = terminal_renderer(config).keybindings(&keybinding_map(config));
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str("scroll-up\tpageup, home\nscroll-down\tpagedown, end");
+    output
 }
 
 fn format_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) -> String {
