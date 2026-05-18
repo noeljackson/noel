@@ -2841,7 +2841,7 @@ async fn handle_tui_submission(
     if line == "/quit" {
         return Ok(true);
     }
-    if handle_tui_bang(app, runtime, &line).await? {
+    if handle_tui_bang(app, terminal, runtime, config, &line).await? {
         return Ok(false);
     }
     match line.as_str() {
@@ -3202,7 +3202,13 @@ async fn handle_tui_submission(
     Ok(false)
 }
 
-async fn handle_tui_bang(app: &mut TuiApp, runtime: &mut Runtime, line: &str) -> Result<bool> {
+async fn handle_tui_bang(
+    app: &mut TuiApp,
+    terminal: &mut TuiTerminal,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    line: &str,
+) -> Result<bool> {
     if line == "!!" && app.last_shell_command.is_none() {
         app.push(TuiEntryKind::System, "no previous shell command");
         return Ok(true);
@@ -3214,12 +3220,29 @@ async fn handle_tui_bang(app: &mut TuiApp, runtime: &mut Runtime, line: &str) ->
     let Some(command) = resolve_bang_command(line, &app.last_shell_command) else {
         return Ok(false);
     };
+    let entry_index = if terminal_progress_enabled(config) {
+        let index = app.push_placeholder(TuiEntryKind::Tool, format_bash_running(&command));
+        terminal.draw(|frame| draw_tui(frame, app))?;
+        Some(index)
+    } else {
+        None
+    };
     match run_excluded_bash(runtime, command.clone()).await {
         Ok(output) => {
-            app.push(TuiEntryKind::Tool, output);
+            if let Some(index) = entry_index {
+                app.replace_entry(index, format_bash_completed(&command, &output));
+            } else {
+                app.push(TuiEntryKind::Tool, output);
+            }
             app.last_shell_command = Some(command);
         }
-        Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+        Err(error) => {
+            if let Some(index) = entry_index {
+                app.replace_entry(index, format!("failed bash\n{error}"));
+            } else {
+                app.push(TuiEntryKind::Error, format!("{error}"));
+            }
+        }
     }
     Ok(true)
 }
@@ -3309,12 +3332,15 @@ async fn run_prompt_once_tui(
     offline: bool,
 ) -> Result<()> {
     let kind = response_kind_for_prompt(&prompt);
+    let progress_enabled = terminal_progress_enabled(config);
     let entry_index = app.push_placeholder(
         kind.clone(),
-        if kind == TuiEntryKind::Tool {
-            "running..."
+        if kind == TuiEntryKind::Tool && progress_enabled {
+            format_tool_running(&prompt)
+        } else if kind == TuiEntryKind::Tool {
+            "running...".to_string()
         } else {
-            "Working..."
+            "Working...".to_string()
         },
     );
     terminal.draw(|frame| draw_tui(frame, app))?;
@@ -3323,7 +3349,11 @@ async fn run_prompt_once_tui(
         let response =
             run_user_turn_streaming_with_media(runtime, provider.as_ref(), prompt, media, |_| {})
                 .await?;
-        app.replace_entry(entry_index, response);
+        if progress_enabled {
+            app.replace_entry(entry_index, format_tool_completed(&response));
+        } else {
+            app.replace_entry(entry_index, response);
+        }
         terminal.draw(|frame| draw_tui(frame, app))?;
         return Ok(());
     }
@@ -3355,6 +3385,35 @@ fn response_kind_for_prompt(prompt: &str) -> TuiEntryKind {
     } else {
         TuiEntryKind::Assistant
     }
+}
+
+fn terminal_progress_enabled(config: &LoadedConfig) -> bool {
+    config
+        .settings
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.show_terminal_progress)
+        .unwrap_or(true)
+}
+
+fn format_tool_running(prompt: &str) -> String {
+    let (command, detail) = split_once_text(prompt.trim());
+    if detail.is_empty() {
+        return format!("running {command}");
+    }
+    format!("running {command}\n{detail}")
+}
+
+fn format_tool_completed(output: &str) -> String {
+    format!("completed\n{output}")
+}
+
+fn format_bash_running(command: &str) -> String {
+    format!("running bash\n$ {command}")
+}
+
+fn format_bash_completed(command: &str, output: &str) -> String {
+    format!("completed bash\n$ {command}\n{output}")
 }
 
 fn resolve_bang_command(line: &str, last_shell_command: &Option<String>) -> Option<String> {

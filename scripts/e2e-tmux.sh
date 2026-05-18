@@ -110,6 +110,15 @@ send_line "/queue"
 send_line "/interrupt"
 send_line "! printf shell-ok"
 send_line "!!"
+tmux send-keys -t "${session_name}" "! sleep 1; printf delayed-shell-ok" Enter
+sleep 0.25
+tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/progress-pane.txt"
+if ! grep -Fq "running bash" "${work_dir}/progress-pane.txt"; then
+  cat "${work_dir}/progress-pane.txt" >&2
+  echo "shell progress was not visible while command was running" >&2
+  exit 1
+fi
+sleep 1.1
 send_line "/session"
 send_line "/changelog"
 send_line "/name tmux-session"
@@ -205,6 +214,8 @@ require_output "queue is empty"
 require_output "queued cancel"
 require_output "interrupted; cleared 1 queued message(s)"
 require_output "shell-ok"
+require_output "completed bash"
+require_output "delayed-shell-ok"
 require_output "What's New"
 require_output "No changelog entries found."
 require_output "name: tmux-session"
