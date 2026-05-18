@@ -385,7 +385,7 @@ impl MergeSettings for RetrySettings {
             enabled: overrides.enabled.or(self.enabled),
             max_retries: overrides.max_retries.or(self.max_retries),
             base_delay_ms: overrides.base_delay_ms.or(self.base_delay_ms),
-            provider: merge_optional_settings(self.provider, overrides.provider),
+            provider: overrides.provider.or(self.provider),
         }
     }
 }
@@ -651,8 +651,8 @@ pub struct ResourceFile {
 }
 
 pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
-    let global_settings = read_optional_json::<Settings>(&paths.settings_path)?;
-    let project_settings = read_optional_json::<Settings>(&paths.project_settings_path)?;
+    let global_settings = read_optional_settings(&paths.settings_path)?;
+    let project_settings = read_optional_settings(&paths.project_settings_path)?;
     let global_settings = global_settings.unwrap_or_default();
     let project_settings = project_settings.unwrap_or_default();
     let settings = global_settings.clone().merge(project_settings.clone());
@@ -1043,6 +1043,70 @@ fn read_codex_chatgpt_oauth_from_path(path: &Path) -> Option<ResolvedAuth> {
         access_token: tokens.access_token,
         account_id: tokens.account_id,
     })
+}
+
+fn read_optional_settings(path: &Path) -> Result<Option<Settings>, ConfigError> {
+    let Some(mut value) = read_optional_json::<serde_json::Value>(path)? else {
+        return Ok(None);
+    };
+    migrate_settings_value(&mut value);
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn migrate_settings_value(value: &mut serde_json::Value) {
+    let Some(settings) = value.as_object_mut() else {
+        return;
+    };
+
+    if !settings.contains_key("steeringMode") {
+        if let Some(queue_mode) = settings.remove("queueMode") {
+            settings.insert("steeringMode".to_string(), queue_mode);
+        }
+    }
+
+    if !settings.contains_key("transport") {
+        if let Some(websockets) = settings
+            .get("websockets")
+            .and_then(serde_json::Value::as_bool)
+        {
+            settings.insert(
+                "transport".to_string(),
+                serde_json::Value::String(if websockets { "websocket" } else { "sse" }.to_string()),
+            );
+            settings.remove("websockets");
+        }
+    }
+
+    let Some(retry) = settings
+        .get_mut("retry")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if let Some(max_delay) = retry
+        .get("maxDelayMs")
+        .filter(|value| value.is_number())
+        .cloned()
+    {
+        let provider = retry
+            .entry("provider".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(provider) = provider.as_object_mut() {
+            let should_set = match provider.get("maxRetryDelayMs") {
+                Some(existing) => existing.is_null(),
+                None => true,
+            };
+            if should_set {
+                provider.insert("maxRetryDelayMs".to_string(), max_delay);
+            }
+        }
+    }
+    retry.remove("maxDelayMs");
 }
 
 fn read_optional_json<T>(path: &Path) -> Result<Option<T>, ConfigError>
@@ -2230,6 +2294,91 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn optional_u64_object(fields: &[(&str, Option<u64>)]) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        for (key, value) in fields {
+            if let Some(value) = value {
+                object.insert((*key).to_string(), serde_json::json!(value));
+            }
+        }
+        serde_json::Value::Object(object)
+    }
+
+    fn provider_retry_summary(settings: &Settings) -> serde_json::Value {
+        let provider = settings
+            .retry
+            .as_ref()
+            .and_then(|retry| retry.provider.as_ref());
+        let mut object = serde_json::Map::new();
+        if let Some(timeout_ms) = provider.and_then(|provider| provider.timeout_ms) {
+            object.insert("timeoutMs".to_string(), serde_json::json!(timeout_ms));
+        }
+        if let Some(max_retries) = provider.and_then(|provider| provider.max_retries) {
+            object.insert("maxRetries".to_string(), serde_json::json!(max_retries));
+        }
+        object.insert(
+            "maxRetryDelayMs".to_string(),
+            serde_json::json!(provider
+                .and_then(|provider| provider.max_retry_delay_ms)
+                .unwrap_or(60000)),
+        );
+        serde_json::Value::Object(object)
+    }
+
+    fn thinking_budgets_summary(settings: &Settings) -> serde_json::Value {
+        let Some(thinking) = settings.thinking_budgets.as_ref() else {
+            return serde_json::Value::Null;
+        };
+        optional_u64_object(&[
+            ("minimal", thinking.minimal),
+            ("low", thinking.low),
+            ("medium", thinking.medium),
+            ("high", thinking.high),
+        ])
+    }
+
+    fn settings_summary(settings: &Settings) -> serde_json::Value {
+        let compaction = settings.compaction.as_ref();
+        let retry = settings.retry.as_ref();
+        let terminal = settings.terminal.as_ref();
+        let images = settings.images.as_ref();
+        serde_json::json!({
+            "defaultProvider": settings.default_provider.as_deref(),
+            "defaultModel": settings.default_model.as_deref(),
+            "defaultThinkingLevel": settings.default_thinking_level.as_deref(),
+            "transport": settings.transport.as_deref().unwrap_or("auto"),
+            "steeringMode": settings.steering_mode.as_deref().unwrap_or("one-at-a-time"),
+            "followUpMode": settings.follow_up_mode.as_deref().unwrap_or("one-at-a-time"),
+            "enabledModels": settings.enabled_models.as_ref(),
+            "compaction": {
+                "enabled": compaction.and_then(|compaction| compaction.enabled).unwrap_or(true),
+                "reserveTokens": compaction.and_then(|compaction| compaction.reserve_tokens).unwrap_or(16384),
+                "keepRecentTokens": compaction.and_then(|compaction| compaction.keep_recent_tokens).unwrap_or(20000),
+            },
+            "retry": {
+                "enabled": retry.and_then(|retry| retry.enabled).unwrap_or(true),
+                "maxRetries": retry.and_then(|retry| retry.max_retries).unwrap_or(3),
+                "baseDelayMs": retry.and_then(|retry| retry.base_delay_ms).unwrap_or(2000),
+            },
+            "providerRetry": provider_retry_summary(settings),
+            "terminal": {
+                "showImages": terminal.and_then(|terminal| terminal.show_images).unwrap_or(true),
+                "imageWidthCells": terminal.and_then(|terminal| terminal.image_width_cells).unwrap_or(60),
+                "clearOnShrink": terminal.and_then(|terminal| terminal.clear_on_shrink).unwrap_or(false),
+                "showTerminalProgress": terminal.and_then(|terminal| terminal.show_terminal_progress).unwrap_or(false),
+            },
+            "images": {
+                "autoResize": images.and_then(|images| images.auto_resize).unwrap_or(true),
+                "blockImages": images.and_then(|images| images.block_images).unwrap_or(false),
+            },
+            "thinkingBudgets": thinking_budgets_summary(settings),
+            "doubleEscapeAction": settings.double_escape_action.as_deref().unwrap_or("tree"),
+            "treeFilterMode": settings.tree_filter_mode.as_deref().unwrap_or("default"),
+            "quietStartup": settings.quiet_startup.unwrap_or(false),
+            "hideThinkingBlock": settings.hide_thinking_block.unwrap_or(false),
+        })
+    }
+
     #[test]
     fn load_config_accepts_keybinding_map_and_filters_enabled_models() {
         let root = test_dir("pi-config-load");
@@ -2736,6 +2885,67 @@ mod tests {
     }
 
     #[test]
+    fn settings_behavior_matches_upstream_ts_fixture() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/settings.json"
+        ))
+        .expect("parse settings fixture");
+
+        for case in fixture["cases"].as_array().expect("settings cases") {
+            let name = case["name"].as_str().expect("case name");
+            let root = test_dir(&format!("pi-config-settings-parity-{name}"));
+            let agent_dir = root.join("agent");
+            let cwd = root.join("repo");
+            fs::create_dir_all(&agent_dir).expect("create agent dir");
+            fs::create_dir_all(cwd.join(".pi")).expect("create project settings dir");
+
+            let global = &case["globalSettings"];
+            if !global.as_object().expect("global settings").is_empty() {
+                fs::write(
+                    agent_dir.join("settings.json"),
+                    format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(global).expect("serialize global")
+                    ),
+                )
+                .expect("write global settings");
+            }
+            let project = &case["projectSettings"];
+            if !project.as_object().expect("project settings").is_empty() {
+                fs::write(
+                    cwd.join(".pi/settings.json"),
+                    format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(project).expect("serialize project")
+                    ),
+                )
+                .expect("write project settings");
+            }
+
+            let config = load_config(ConfigPaths {
+                cwd: cwd.clone(),
+                agent_dir: agent_dir.clone(),
+                session_dir: agent_dir.join("sessions"),
+                settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".pi/settings.json"),
+                auth_path: root.join("missing-auth.json"),
+                models_path: root.join("missing-models.json"),
+                model_cache_path: root.join("missing-model-cache.json"),
+                keybindings_path: root.join("missing-keybindings.json"),
+            })
+            .unwrap_or_else(|error| panic!("load config for {name}: {error}"));
+
+            assert_eq!(
+                settings_summary(&config.settings),
+                case["expected"],
+                "settings parity case {name}"
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn nested_settings_deep_merge_like_ts_reference() {
         let root = test_dir("pi-config-nested-settings");
         let agent_dir = root.join("agent");
@@ -2798,7 +3008,7 @@ mod tests {
         assert_eq!(compaction.keep_recent_tokens, Some(200));
         let retry = config.settings.retry.expect("retry");
         let provider = retry.provider.expect("provider retry");
-        assert_eq!(provider.timeout_ms, Some(1000));
+        assert_eq!(provider.timeout_ms, None);
         assert_eq!(provider.max_retries, Some(2));
         let terminal = config.settings.terminal.expect("terminal");
         assert_eq!(terminal.show_images, Some(true));

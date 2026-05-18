@@ -1,0 +1,205 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/settings-fixture.ts"
+  },
+  "cases": [
+    {
+      "name": "deep-merge-project-overrides",
+      "globalSettings": {
+        "defaultProvider": "anthropic",
+        "defaultModel": "claude-global",
+        "defaultThinkingLevel": "high",
+        "transport": "auto",
+        "steeringMode": "all",
+        "followUpMode": "all",
+        "enabledModels": [
+          "anthropic/*",
+          "openai/*"
+        ],
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 100
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 4,
+          "provider": {
+            "timeoutMs": 1000
+          }
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 80
+        },
+        "images": {
+          "autoResize": true
+        },
+        "thinkingBudgets": {
+          "minimal": 1000,
+          "high": 4000
+        }
+      },
+      "projectSettings": {
+        "defaultModel": "claude-project",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": [
+          "anthropic/claude-*"
+        ],
+        "compaction": {
+          "keepRecentTokens": 200
+        },
+        "retry": {
+          "provider": {
+            "maxRetries": 2
+          }
+        },
+        "terminal": {
+          "imageWidthCells": 40,
+          "clearOnShrink": true
+        },
+        "images": {
+          "blockImages": true
+        },
+        "thinkingBudgets": {
+          "medium": 2500
+        }
+      },
+      "expected": {
+        "defaultProvider": "anthropic",
+        "defaultModel": "claude-project",
+        "defaultThinkingLevel": "high",
+        "transport": "auto",
+        "steeringMode": "all",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": [
+          "anthropic/claude-*"
+        ],
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 100,
+          "keepRecentTokens": 200
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 4,
+          "baseDelayMs": 2000
+        },
+        "providerRetry": {
+          "maxRetries": 2,
+          "maxRetryDelayMs": 60000
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 40,
+          "clearOnShrink": true,
+          "showTerminalProgress": false
+        },
+        "images": {
+          "autoResize": true,
+          "blockImages": true
+        },
+        "thinkingBudgets": {
+          "minimal": 1000,
+          "high": 4000,
+          "medium": 2500
+        },
+        "doubleEscapeAction": "tree",
+        "treeFilterMode": "default",
+        "quietStartup": false,
+        "hideThinkingBlock": false
+      }
+    },
+    {
+      "name": "legacy-migrations",
+      "globalSettings": {
+        "queueMode": "all",
+        "websockets": false,
+        "retry": {
+          "maxDelayMs": 12345
+        }
+      },
+      "projectSettings": {},
+      "expected": {
+        "defaultProvider": null,
+        "defaultModel": null,
+        "defaultThinkingLevel": null,
+        "transport": "sse",
+        "steeringMode": "all",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": null,
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000
+        },
+        "providerRetry": {
+          "maxRetryDelayMs": 12345
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 60,
+          "clearOnShrink": false,
+          "showTerminalProgress": false
+        },
+        "images": {
+          "autoResize": true,
+          "blockImages": false
+        },
+        "thinkingBudgets": null,
+        "doubleEscapeAction": "tree",
+        "treeFilterMode": "default",
+        "quietStartup": false,
+        "hideThinkingBlock": false
+      }
+    },
+    {
+      "name": "empty-defaults",
+      "globalSettings": {},
+      "projectSettings": {},
+      "expected": {
+        "defaultProvider": null,
+        "defaultModel": null,
+        "defaultThinkingLevel": null,
+        "transport": "auto",
+        "steeringMode": "one-at-a-time",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": null,
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000
+        },
+        "providerRetry": {
+          "maxRetryDelayMs": 60000
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 60,
+          "clearOnShrink": false,
+          "showTerminalProgress": false
+        },
+        "images": {
+          "autoResize": true,
+          "blockImages": false
+        },
+        "thinkingBudgets": null,
+        "doubleEscapeAction": "tree",
+        "treeFilterMode": "default",
+        "quietStartup": false,
+        "hideThinkingBlock": false
+      }
+    }
+  ]
+}
