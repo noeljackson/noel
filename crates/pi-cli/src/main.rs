@@ -439,13 +439,34 @@ fn run_package_list(args: &[String]) -> Result<()> {
 }
 
 fn run_package_config(args: &[String]) -> Result<()> {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    let (local, rest) = parse_package_scope_args(args)?;
+    if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
         print_package_help("config");
         return Ok(());
     }
-    if let Some(invalid) = args.first() {
-        return Err(anyhow!("unknown config argument: {invalid}"));
+    match rest.as_slice() {
+        [] => print_package_config_summary(),
+        [summary] if summary == "show" || summary == "list" => print_package_config_summary(),
+        [action, kind, name] if action == "disable" || action == "enable" => {
+            let kind = normalize_resource_kind(kind)?;
+            let path = package_settings_path(local)?;
+            let disabled = action == "disable";
+            mutate_settings_resource_state(&path, kind, name, disabled)?;
+            println!(
+                "{} {kind} resource in {} settings: {name}",
+                if disabled { "disabled" } else { "enabled" },
+                if local { "project" } else { "user" }
+            );
+            Ok(())
+        }
+        [action, ..] if action == "disable" || action == "enable" => Err(anyhow!(
+            "usage: pi config {action} <extension|skill|prompt|theme> <name> [-l]"
+        )),
+        [invalid, ..] => Err(anyhow!("unknown config argument: {invalid}")),
     }
+}
+
+fn print_package_config_summary() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd, None)?;
     let config = load_config(paths)?;
@@ -473,7 +494,54 @@ fn run_package_config(args: &[String]) -> Result<()> {
     println!("prompts: {}", config.prompt_templates.len());
     println!("themes: {}", config.themes.len());
     println!("extensions: {}", config.extensions.len());
+    println!(
+        "disabled extensions: {}",
+        format_disabled_resource_patterns(
+            config
+                .settings
+                .disabled_resources
+                .as_ref()
+                .map(|resources| resources.extensions.as_slice())
+        )
+    );
+    println!(
+        "disabled skills: {}",
+        format_disabled_resource_patterns(
+            config
+                .settings
+                .disabled_resources
+                .as_ref()
+                .map(|resources| resources.skills.as_slice())
+        )
+    );
+    println!(
+        "disabled prompts: {}",
+        format_disabled_resource_patterns(
+            config
+                .settings
+                .disabled_resources
+                .as_ref()
+                .map(|resources| resources.prompts.as_slice())
+        )
+    );
+    println!(
+        "disabled themes: {}",
+        format_disabled_resource_patterns(
+            config
+                .settings
+                .disabled_resources
+                .as_ref()
+                .map(|resources| resources.themes.as_slice())
+        )
+    );
     Ok(())
+}
+
+fn format_disabled_resource_patterns(patterns: Option<&[String]>) -> String {
+    patterns
+        .filter(|patterns| !patterns.is_empty())
+        .map(|patterns| patterns.join(", "))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn parse_package_scope_args(args: &[String]) -> Result<(bool, Vec<String>)> {
@@ -548,6 +616,73 @@ fn mutate_settings_packages(
     Ok(())
 }
 
+fn mutate_settings_resource_state(
+    path: &Path,
+    kind: &str,
+    name: &str,
+    disabled: bool,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut settings = if path.exists() {
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path)?)?
+    } else {
+        serde_json::json!({})
+    };
+    if !settings.is_object() {
+        return Err(anyhow!(
+            "settings file must contain a JSON object: {}",
+            path.display()
+        ));
+    }
+    if !settings
+        .get("disabledResources")
+        .map(|value| value.is_object())
+        .unwrap_or(false)
+    {
+        settings["disabledResources"] = serde_json::json!({});
+    }
+    let mut values = settings["disabledResources"]
+        .get(kind)
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if disabled {
+        if !values.iter().any(|value| value == name) {
+            values.push(name.to_string());
+        }
+    } else {
+        values.retain(|value| value != name);
+    }
+    values.sort();
+    values.dedup();
+    settings["disabledResources"][kind] = serde_json::to_value(values)?;
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?),
+    )?;
+    Ok(())
+}
+
+fn normalize_resource_kind(kind: &str) -> Result<&'static str> {
+    match kind {
+        "extension" | "extensions" => Ok("extensions"),
+        "skill" | "skills" => Ok("skills"),
+        "prompt" | "prompts" => Ok("prompts"),
+        "theme" | "themes" => Ok("themes"),
+        _ => Err(anyhow!(
+            "unknown resource kind: {kind}; expected extension, skill, prompt, or theme"
+        )),
+    }
+}
+
 fn print_package_sources(scope: &str, path: &Path) -> Result<()> {
     let packages = read_settings_packages(path)?;
     if packages.is_empty() {
@@ -615,7 +750,9 @@ fn print_package_help(command: &str) {
         "list" => {
             println!("usage: pi list\n\nList package sources from user and project settings.")
         }
-        "config" => println!("usage: pi config\n\nShow active resource configuration."),
+        "config" => println!(
+            "usage: pi config [show|list|disable <kind> <name>|enable <kind> <name>] [-l]\n\nShow active resource configuration or enable/disable resources."
+        ),
         _ => {}
     }
 }
@@ -4389,6 +4526,37 @@ mod tests {
         let error = extension_protocol(&extension).expect_err("reject protocol");
 
         assert!(error.to_string().contains("unsupported protocol bogus"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_resource_state_enable_disable_updates_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "pi-cli-config-resource-state-{}",
+            unique_temp_suffix()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("settings.json");
+
+        mutate_settings_resource_state(&path, "extensions", "assist", true)
+            .expect("disable resource");
+        mutate_settings_resource_state(&path, "extensions", "assist", false)
+            .expect("enable resource");
+        mutate_settings_resource_state(&path, "prompts", "fix", true).expect("disable prompt");
+
+        let settings = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&path).expect("read settings"),
+        )
+        .expect("parse settings");
+
+        assert_eq!(
+            settings["disabledResources"]["extensions"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            settings["disabledResources"]["prompts"],
+            serde_json::json!(["fix"])
+        );
         let _ = fs::remove_dir_all(root);
     }
 

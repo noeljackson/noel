@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -125,6 +125,8 @@ pub struct Settings {
     #[serde(default)]
     pub themes: Vec<String>,
     #[serde(default)]
+    pub disabled_resources: Option<ResourceStateSettings>,
+    #[serde(default)]
     pub compaction: Option<CompactionSettings>,
     #[serde(default)]
     pub branch_summary: Option<BranchSummarySettings>,
@@ -199,6 +201,10 @@ impl Settings {
             } else {
                 overrides.themes
             },
+            disabled_resources: merge_optional_settings(
+                self.disabled_resources,
+                overrides.disabled_resources,
+            ),
             compaction: merge_optional_settings(self.compaction, overrides.compaction),
             branch_summary: merge_optional_settings(self.branch_summary, overrides.branch_summary),
             retry: merge_optional_settings(self.retry, overrides.retry),
@@ -220,6 +226,41 @@ impl Settings {
             model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceStateSettings {
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub prompts: Vec<String>,
+    #[serde(default)]
+    pub themes: Vec<String>,
+}
+
+impl MergeSettings for ResourceStateSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            extensions: merge_resource_state_patterns(self.extensions, overrides.extensions),
+            skills: merge_resource_state_patterns(self.skills, overrides.skills),
+            prompts: merge_resource_state_patterns(self.prompts, overrides.prompts),
+            themes: merge_resource_state_patterns(self.themes, overrides.themes),
+        }
+    }
+}
+
+fn merge_resource_state_patterns(base: Vec<String>, overrides: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut merged = Vec::new();
+    for pattern in base.into_iter().chain(overrides) {
+        if seen.insert(pattern.clone()) {
+            merged.push(pattern);
+        }
+    }
+    merged
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -683,6 +724,26 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         &mut prompt_templates,
         &mut themes,
         &mut diagnostics,
+    );
+    filter_disabled_resource_files(
+        &mut extensions,
+        PackageResourceType::Extensions,
+        settings.disabled_resources.as_ref(),
+    );
+    filter_disabled_resource_files(
+        &mut skills,
+        PackageResourceType::Skills,
+        settings.disabled_resources.as_ref(),
+    );
+    filter_disabled_resource_files(
+        &mut prompt_templates,
+        PackageResourceType::Prompts,
+        settings.disabled_resources.as_ref(),
+    );
+    filter_disabled_resource_files(
+        &mut themes,
+        PackageResourceType::Themes,
+        settings.disabled_resources.as_ref(),
     );
     let system_prompt = resolve_prompt_input(settings.system_prompt.as_deref())?;
     let append_system_prompt = settings
@@ -1367,6 +1428,65 @@ enum PackageResourceType {
     Skills,
     Prompts,
     Themes,
+}
+
+impl PackageResourceType {
+    fn key(self) -> &'static str {
+        match self {
+            PackageResourceType::Extensions => "extensions",
+            PackageResourceType::Skills => "skills",
+            PackageResourceType::Prompts => "prompts",
+            PackageResourceType::Themes => "themes",
+        }
+    }
+
+    fn singular(self) -> &'static str {
+        match self {
+            PackageResourceType::Extensions => "extension",
+            PackageResourceType::Skills => "skill",
+            PackageResourceType::Prompts => "prompt",
+            PackageResourceType::Themes => "theme",
+        }
+    }
+}
+
+fn filter_disabled_resource_files(
+    resources: &mut Vec<ResourceFile>,
+    resource_type: PackageResourceType,
+    disabled_resources: Option<&ResourceStateSettings>,
+) {
+    let Some(disabled_resources) = disabled_resources else {
+        return;
+    };
+    let patterns = match resource_type {
+        PackageResourceType::Extensions => &disabled_resources.extensions,
+        PackageResourceType::Skills => &disabled_resources.skills,
+        PackageResourceType::Prompts => &disabled_resources.prompts,
+        PackageResourceType::Themes => &disabled_resources.themes,
+    };
+    if patterns.is_empty() {
+        return;
+    }
+    resources.retain(|resource| {
+        !patterns
+            .iter()
+            .any(|pattern| resource_state_pattern_matches(resource, resource_type, pattern))
+    });
+}
+
+fn resource_state_pattern_matches(
+    resource: &ResourceFile,
+    resource_type: PackageResourceType,
+    pattern: &str,
+) -> bool {
+    let pattern = normalize_pattern(pattern);
+    let path = normalize_resource_path(&resource.path);
+    let key = resource_type.key();
+    let singular = resource_type.singular();
+    wildcard_matches(&pattern, &resource.name)
+        || wildcard_matches(&pattern, &format!("{key}/{}", resource.name))
+        || wildcard_matches(&pattern, &format!("{singular}:{}", resource.name))
+        || wildcard_matches(&pattern, &path)
 }
 
 fn resolve_resource_path(base_dir: &Path, entry: &str) -> Result<PathBuf, ConfigError> {
@@ -2220,6 +2340,50 @@ mod tests {
             .prompt_templates
             .iter()
             .any(|resource| resource.name == "nested"));
+        assert!(config.diagnostics.is_empty(), "{:?}", config.diagnostics);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabled_resources_are_filtered_from_loaded_config() {
+        let root = test_dir("pi-config-disabled-resources");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        fs::create_dir_all(agent_dir.join("extensions")).expect("create extensions");
+        fs::create_dir_all(agent_dir.join("prompts")).expect("create prompts");
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"disabledResources":{"extensions":["assist"],"prompts":["prompt:fix"]}}"#,
+        )
+        .expect("write settings");
+        fs::write(agent_dir.join("extensions/assist.md"), "assist extension")
+            .expect("write assist");
+        fs::write(agent_dir.join("extensions/keep.md"), "keep extension").expect("write keep");
+        fs::write(agent_dir.join("prompts/fix.md"), "fix prompt").expect("write prompt");
+
+        let config = load_config(ConfigPaths {
+            cwd: cwd.clone(),
+            agent_dir: agent_dir.clone(),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: cwd.join(".pi/settings.json"),
+            auth_path: root.join("missing-auth.json"),
+            models_path: root.join("missing-models.json"),
+            model_cache_path: root.join("missing-model-cache.json"),
+            keybindings_path: root.join("missing-keybindings.json"),
+        })
+        .expect("load config");
+
+        assert!(!config
+            .extensions
+            .iter()
+            .any(|resource| resource.name == "assist"));
+        assert!(config
+            .extensions
+            .iter()
+            .any(|resource| resource.name == "keep"));
+        assert!(config.prompt_templates.is_empty());
         assert!(config.diagnostics.is_empty(), "{:?}", config.diagnostics);
 
         let _ = fs::remove_dir_all(root);

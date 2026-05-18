@@ -44,6 +44,13 @@ chmod +x "${agent_dir}/extensions/json-ext"
 printf '{"protocol":"json"}\n' > "${agent_dir}/extensions/json-ext.pi-extension.json"
 printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=' | base64 -d > "${work_dir}/pixel.png"
 
+(cd "${repo_root}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q -p pi-cli -- config disable extension assist) > "${work_dir}/config-disable.txt"
+(cd "${repo_root}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q -p pi-cli -- config show) > "${work_dir}/config-disabled.txt"
+grep -Fq "disabled extensions: assist" "${work_dir}/config-disabled.txt"
+(cd "${repo_root}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q -p pi-cli -- config enable extension assist) > "${work_dir}/config-enable.txt"
+(cd "${repo_root}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q -p pi-cli -- config show) > "${work_dir}/config-enabled.txt"
+grep -Fq "disabled extensions: -" "${work_dir}/config-enabled.txt"
+
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
   "cd '${repo_root}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \

@@ -278,6 +278,19 @@ Omitting a resource key loads all resources of that type. `[]` loads none.
 Resource discovery honors `.gitignore`, `.ignore`, and `.fdignore` files in
 scanned resource directories.
 
+Resources can be disabled by name or wildcard through `disabledResources`, or
+managed with `pi config disable <extension|skill|prompt|theme> <name>` and
+`pi config enable <extension|skill|prompt|theme> <name>`:
+
+```json
+{
+  "disabledResources": {
+    "extensions": ["legacy"],
+    "prompts": ["prompt:old-*"]
+  }
+}
+```
+
 ## Interactive Commands
 
 - `/help`
