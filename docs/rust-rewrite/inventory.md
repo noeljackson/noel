@@ -1,38 +1,43 @@
 # Rust Rewrite Inventory
 
-Tracking issue: https://github.com/noeljackson/pi/issues/3
+Original tracking issue: https://github.com/noeljackson/pi/issues/3
 
-This document records the TypeScript behavior that the Rust rewrite must either preserve or intentionally drop. The reference branch is `ts-reference`; Rust work happens on separate branches.
+Current doc refresh: https://github.com/noeljackson/pi/issues/38
+
+This document records the TypeScript reference behavior that the Rust rewrite
+preserved, replaced, or intentionally dropped. The reference branch is
+`ts-reference`; active implementation is Rust-only.
 
 ## Product Scope
 
-Required target:
+Current target:
 
 - Native Rust CLI/TUI application named `pi`.
 - No web UI.
-- No npm, Node.js, TypeScript, Vite, React, or browser runtime in the final product path.
-- Context-safe reload of runtime systems without clearing the active conversation.
+- No npm, Node.js, TypeScript, Vite, React, or browser runtime in the product path.
+- Normal explicit reload of runtime systems without clearing the active conversation.
+- Docker-only execution path for TypeScript reference fixture generation.
 
-Reference packages:
+Reference packages from `ts-reference`:
 
 - `packages/coding-agent`: CLI entrypoint, TUI mode, sessions, tools, settings, extensions, auth, slash commands.
 - `packages/agent`: generic agent loop, message/session helpers, compaction.
 - `packages/ai`: provider registry, model metadata, streaming adapters, OAuth/env auth.
 - `packages/tui`: terminal renderer, editor, keybinding engine, selectable lists, markdown rendering.
-- `packages/web-ui`: intentionally dropped unless a later issue explicitly restores web functionality.
+- `packages/web-ui`: intentionally dropped from the Rust product path.
 
 ## CLI Surface
 
-The current executable is `pi` from `packages/coding-agent/src/cli.ts`, with main dispatch in `packages/coding-agent/src/main.ts`.
+The Rust executable is `pi` from `crates/pi-cli`.
 
 Primary modes:
 
 - Interactive TUI by default when stdin is a TTY.
 - Print mode via `--print`/`-p` or piped stdin.
 - JSON output via `--mode json`.
-- RPC mode via `--mode rpc`.
+- JSON-line RPC mode via `--mode rpc`.
 
-Required CLI flags for Rust parity:
+Implemented CLI flags include:
 
 - `--help`, `-h`
 - `--version`, `-v`
@@ -40,15 +45,15 @@ Required CLI flags for Rust parity:
 - `--print`, `-p`
 - `--continue`, `-c`
 - `--resume`, `-r`
-- `--session <path|id>`
-- `--fork <path|id>`
+- `--session <path|id|name>`
+- `--fork <path|id|name>`
 - `--session-dir <dir>`
 - `--no-session`
 - `--provider <name>`
-- `--model <pattern>`
+- `--model <provider/id-or-pattern>`
 - `--api-key <key>`
 - `--models <patterns>`
-- `--thinking off|minimal|low|medium|high|xhigh`
+- `--thinking off|minimal|low|medium|high|xhigh|max`
 - `--system-prompt <text-or-path>`
 - `--append-system-prompt <text-or-path>`
 - `--no-tools`, `-nt`
@@ -61,206 +66,223 @@ Required CLI flags for Rust parity:
 - `--theme <path>`
 - `--no-themes`
 - `--no-context-files`, `-nc`
+- `--image <path>`
 - `--export <file>`
 - `--list-models [search]`
 - `--verbose`
 - `--offline`
 - `@file` initial-message inputs
 
-Package-management commands currently exist but are npm-centric:
+Rust package/config commands:
 
-- `install`
-- `remove`
-- `uninstall`
-- `update`
-- `list`
-- `config`
+- `pi install <path-or-git-url>`
+- `pi remove|uninstall <source-or-name>`
+- `pi update [source|self|pi]`
+- `pi list`
+- `pi config show`
+- `pi config disable <extension|skill|prompt|theme> <name>`
+- `pi config enable <extension|skill|prompt|theme> <name>`
 
-Rust target:
-
-- Keep `config` as a local resource/configuration TUI if still useful.
-- Drop npm/package-manager install/update/list behavior from the Rust-only product path.
-- Do not carry extension package installation forward unless a later Rust-native extension story is approved.
+Package commands are Rust-path only. They do not run npm, install npm packages,
+or load a Node runtime. `pi update` fast-forwards local git package sources and
+does not self-update the Rust binary.
 
 ## Config, Auth, and Data Paths
 
-Current default config root:
+Default config root:
 
 - `~/.pi/agent`
 
-Current environment overrides:
+Environment overrides:
 
 - `PI_CODING_AGENT_DIR`
 - `PI_CODING_AGENT_SESSION_DIR`
-- `PI_PACKAGE_DIR`
 - `PI_OFFLINE`
-- `PI_TELEMETRY`
-- `PI_SHARE_VIEWER_URL`
 
 Current user files:
 
 - `settings.json`
 - `auth.json`
 - `models.json`
+- `model-cache.json`
 - `keybindings.json`
-- `tools/`
+- `extensions/`
+- `skills/`
 - `prompts/`
 - `themes/`
 - `sessions/`
 - `pi-debug.log`
 
-Current project-local files:
+Project-local files:
 
 - `.pi/settings.json`
+- `.pi/extensions`
 - `.pi/skills`
 - `.pi/prompts`
 - `.pi/themes`
-- `.pi/extensions`
+- `.agents/skills`
 - `AGENTS.md` or `CLAUDE.md` discovered from the global agent dir and cwd ancestors.
 
-Rust target:
+Rust behavior:
 
-- Preserve the config root and key file names initially to reduce user disruption.
-- Do not promise TypeScript session/config backward compatibility until the session format is specified in the Rust architecture.
-- Preserve `AGENTS.md` discovery because it is core CLI context behavior.
+- Preserve the config root and key file names where useful.
 - Keep `auth.json` permissions strict where the platform supports it.
+- Reuse Claude Code OAuth and Codex/ChatGPT login credentials when available.
+- Do not automatically migrate legacy TypeScript sessions.
 
 ## Settings Surface
 
-Current settings include:
+Current settings cover:
 
 - Default provider/model/thinking level.
-- Transport preference.
-- Steering and follow-up queue modes.
-- Theme.
-- Compaction and branch-summary settings.
-- Retry settings.
-- Thinking block visibility.
+- Enabled model scopes and active tools.
+- Model refresh settings and cache TTL.
+- Theme, keybindings, markdown, and terminal behavior.
 - Shell path and shell command prefix.
-- Quiet startup.
-- Changelog display.
-- Install telemetry.
-- Package resource paths.
-- Extension, skill, prompt, and theme paths.
-- Skill command registration.
+- Thinking block visibility and thinking budgets.
 - Terminal image/progress settings.
 - Image resize/block settings.
-- Enabled model scope.
-- Double-escape behavior.
-- Tree filter mode.
-- Thinking budgets.
-- Editor padding.
-- Autocomplete max visible rows.
-- Hardware cursor visibility.
-- Markdown formatting.
-- Warning toggles.
+- Prompt, skill, extension, theme, and package resource paths.
+- Package resource filters.
+- Disabled resources by name or wildcard.
 - Custom session directory.
 
-Rust target:
+Rust behavior:
 
-- Preserve settings needed by CLI/TUI, sessions, providers, tools, prompts, skills, keybindings, terminal behavior, image handling if images remain supported, and reload.
-- Drop npm-specific package settings unless a Rust-native package system replaces them.
-- Treat settings reload as a validated replacement, not partial mutation of active session state.
+- Settings reload is validated before replacing runtime systems.
+- Invalid reloads preserve the old runtime systems and active conversation.
+- `terminal.showTerminalProgress` controls visible running/completed tool and shell entries.
+- `disabledResources` and `pi config enable|disable` filter loaded extensions, skills, prompts, and themes.
+- npm-specific package settings are not preserved.
 
 ## Session Behavior
 
-Current session behavior:
+Rust sessions:
 
-- Sessions are JSONL-backed.
-- Sessions are associated with a cwd.
-- `--continue` resumes the recent cwd session.
-- `--resume` opens a selector.
-- `--session` accepts a path or UUID prefix.
-- `--fork` creates a new session from an existing one.
-- Missing cwd for a restored session prompts interactively or fails in non-interactive mode.
-- Session tree operations include new, fork, clone, resume, delete, rename, labels, branch navigation, and filters.
-- Session state includes conversation messages, tool calls/results, model info, queues, metadata, and extension state.
+- Are append-only JSONL-backed.
+- Are associated with a cwd.
+- Support `--continue`, `--resume`, `--session`, and `--fork`.
+- Support new, fork, clone, resume, delete, rename, labels, summaries, branch navigation, and filters.
+- Persist active model and thinking level.
+- Export/import JSON, JSONL, and local HTML where applicable.
 
-Rust target:
+Rust behavior:
 
-- Preserve active conversation context, cwd identity, tool history, and queues across reload.
-- Preserve fork/resume/new-session workflows before cutover.
-- Specify a Rust session schema before implementation.
-- Add a migration decision for old JSONL sessions before final cutover.
+- Preserve active conversation context, cwd identity, tool history, queues, active model state, and session tree state across reload.
+- Do not automatically read or migrate old TypeScript session logs.
+- `/share` writes a local HTML export; web or gist sharing is intentionally unsupported.
 
 ## Reload Behavior
 
-Current reload command:
+`/reload` reloads:
 
-- `/reload` reloads keybindings, extensions, skills, prompts, themes, settings, resource loader output, provider registrations, and tool registry.
-- Reload is rejected while an assistant response is in progress.
-- Reload is rejected while compaction is in progress.
-- Extension runtime receives shutdown/start events around reload.
-- Current active tool names are preserved and new extension tools are included.
-- Keybindings reload separately through `KeybindingsManager.reload()`.
+- Settings.
+- Auth metadata.
+- Model metadata and cached model data.
+- Provider availability.
+- Keybindings.
+- Extensions.
+- Skills.
+- Prompts.
+- Themes.
+- Context files.
+- Tool definitions.
+- Slash command completions for loaded resources.
 
-Rust target:
+Reload behavior:
 
-- Keep explicit `/reload`.
 - No hot module reload.
-- Reload must not clear messages, cwd, session identity, tool call history, queues, active model state, or accumulated context.
-- If the reloaded model/provider becomes invalid, report it and require user action instead of clearing the session.
+- Reject reload while an assistant response is in progress.
+- Preserve messages, cwd, session id/file, tool history, queued messages, branch state, active model, and active thinking level.
+- Surface diagnostics for invalid resources instead of clearing context.
+- Notify JSON executable extensions with `reload`; notify them with `shutdown` on quit.
 
 ## TUI and Keybindings
 
-Current keybinding model:
+Rust TUI parity includes:
 
-- TUI defaults come from `packages/tui`.
-- App bindings extend TUI bindings.
-- User bindings load from `~/.pi/agent/keybindings.json`.
-- Legacy keybinding names migrate to namespaced keys.
+- Claude Code-style framed layout.
+- Streaming assistant output.
+- Visible hardware cursor in prompt input.
+- Tool and shell progress display.
+- Model selector with left/right thinking adjustment.
+- Settings selector.
+- Session selectors and tree operations.
+- Dynamic slash completion.
+- Editor history, undo, kill-ring, multiline mode, and external editor handoff.
 
-App bindings include:
+Keybinding behavior:
 
-- Interrupt, clear, exit, suspend.
-- Cycle/select model.
-- Cycle/toggle thinking.
-- Expand tool output.
-- Toggle session filters and tree filters.
-- External editor.
-- Queue/dequeue follow-up messages.
-- Paste image.
-- New/tree/fork/resume session operations.
-- Rename/delete session.
-- Model scope selector actions.
-
-Rust target:
-
-- Keybindings must remain configurable.
-- No hardcoded key checks in feature logic; resolve through a keybinding manager.
-- Reload must refresh keybindings without resetting the active session.
+- Defaults live in Rust.
+- User overrides load from `~/.pi/agent/keybindings.json`.
+- Reload refreshes keybindings without resetting `SessionState`.
 
 ## Slash Commands
 
-Built-in slash commands:
+Implemented built-in slash commands include:
 
+- `/help`
 - `/settings`
-- `/model`
+- `/settings show`
+- `/status`
+- `/diagnostics`
+- `/hotkeys`
+- `/complete <prefix>`
+- `/history`
+- `/editor [text]`
+- `/image <path> [prompt]`
+- `/skills`
+- `/skill:<name> [input]`
+- `/prompts`
+- `/prompt <name> [input]`
+- `/themes`
+- `/theme <name>`
+- `/queue [prompt]`
+- `/queue-clear`
+- `/interrupt`
+- `/models`
 - `/scoped-models`
-- `/export`
-- `/import`
-- `/share`
-- `/copy`
-- `/name`
+- `/selector <kind>`
+- `/select <kind> <query>`
+- `/model <provider/id>`
+- `/thinking <level>`
+- `/multiline`
 - `/session`
 - `/changelog`
-- `/hotkeys`
-- `/fork`
-- `/clone`
-- `/tree`
-- `/login`
-- `/logout`
 - `/new`
+- `/resume [id|name|path]`
+- `/fork [id|name|path]`
+- `/clone [id|name|path]`
+- `/tree`
+- `/summaries`
+- `/delete [id|name|path]`
+- `/name <name>`
+- `/labels <labels...>`
+- `/export <file>`
+- `/import <file>`
+- `/copy`
+- `/share [file]`
 - `/compact`
-- `/resume`
+- `/login [provider]`
+- `/logout <provider>`
 - `/reload`
+- `/read <path>`
+- `/write <path> <text>`
+- `/edit <path> <find> <replace>`
+- `/grep <text> [path]`
+- `/find <text>`
+- `/ls [path]`
+- `/bash <command>`
+- `! <command>`
+- `!!`
 - `/quit`
 
-Rust target:
+Loaded resources add dynamic commands:
 
-- Preserve core CLI/TUI slash commands needed for coding-agent operation.
-- Defer `/share` if it depends on GitHub/web presentation not yet defined.
-- Drop or replace extension-driven slash commands until Rust extension scope is approved.
+- `/extension:<name>`
+- `/skill:<name>`
+- `/prompt <name>`
+- `/theme <name>`
 
 ## Tool Surface
 
@@ -277,46 +299,33 @@ Built-in tools:
 Current defaults:
 
 - Coding tool set defaults to `read`, `bash`, `edit`, `write`.
-- Read-only tool set includes `read`, `grep`, `find`, `ls`.
-- `grep`, `find`, and `ls` are read-only but off by default in the normal coding tool set.
+- Read-only tools include `grep`, `find`, and `ls`.
 - CLI flags can disable all tools, disable built-in tools, or allowlist tools.
 
-Rust target:
+Rust behavior:
 
 - Preserve tool names and user-facing semantics.
-- Preserve dirty-worktree awareness and the rule that unrelated user changes must not be wiped.
-- Implement tests for command execution, file reads/writes, edits/patches, search/listing, and git status handling.
+- Preserve dirty-worktree awareness and avoid wiping unrelated user changes.
+- Execute shell commands with configured shell settings.
+- Show visible TUI progress when terminal progress is enabled.
 
 ## Provider and Model Surface
 
-Current provider/auth scope is broad. Known provider defaults include:
+Implemented provider/auth scope includes:
 
-- Amazon Bedrock
-- Anthropic
-- OpenAI
-- Azure OpenAI Responses
-- OpenAI Codex
-- DeepSeek
-- Google
-- Google Vertex
-- GitHub Copilot
-- OpenRouter
-- Vercel AI Gateway
-- xAI
-- Groq
-- Cerebras
-- ZAI
-- Mistral
-- MiniMax
-- Moonshot
-- Hugging Face
-- Fireworks
-- Together
-- OpenCode
-- Kimi Coding
-- Cloudflare Workers AI
-- Cloudflare AI Gateway
-- Xiaomi
+- Faux test provider.
+- OpenAI chat/responses.
+- OpenAI Codex.
+- Azure OpenAI Responses.
+- Anthropic Messages.
+- Google Gemini.
+- Google Vertex.
+- OpenRouter.
+- GitHub Copilot.
+- Amazon Bedrock bearer-token Converse.
+- Mistral.
+- Cloudflare Workers AI.
+- Cloudflare AI Gateway.
 
 Current auth sources:
 
@@ -324,28 +333,73 @@ Current auth sources:
 - Stored `auth.json` API keys.
 - Stored OAuth credentials.
 - Environment variables.
+- Claude Code login token fallback.
+- Codex/ChatGPT login token fallback.
 - Custom provider fallback from model config.
 
-Rust target:
+Model refresh:
 
-- Implement `faux` first for tests.
-- Implement the initial production provider set as OpenAI Responses-compatible, Anthropic, and Google because those cover the main provider shapes in current use.
-- Add additional providers issue-by-issue after the streaming event model is stable.
-- Provider tests must not require paid APIs or real credentials.
+- Uses built-in models, cached models, and explicit `models.json` immediately.
+- Starts a non-blocking refresh when enabled, online, stale, and authenticated.
+- Surfaces refreshed data after `/reload` or the next startup.
+
+Provider tests do not require paid APIs or real credentials. Real-provider smoke
+tests are manual and excluded from `make check`, `make e2e`, and `make docker-e2e`.
+
+## Extension and Package Resource Surface
+
+Rust supports:
+
+- Local package sources by path.
+- Git package sources.
+- Package resource discovery by convention.
+- Package resource discovery through `package.json` under the `pi` key.
+- Resource include/exclude filters.
+- `.gitignore`, `.ignore`, and `.fdignore` handling in resource directories.
+- Resource enable/disable state.
+- Raw executable extensions.
+- JSON stdio executable extensions.
+- JSON extension lifecycle notifications for reload and shutdown.
+
+Rust intentionally does not support:
+
+- Embedded TypeScript or JavaScript extension execution.
+- npm extension installation/update workflows.
+- In-process TypeScript UI primitive/custom renderer APIs.
+
+Future Rust extension work can build on the JSON executable protocol with a
+Rust SDK, tool registration helpers, or provider registration helpers.
+
+## Validation
+
+Primary validation:
+
+- `make check`
+- `make e2e`
+- `make docker-e2e`
+
+Additional manual validation:
+
+- `make smoke-claude-opus-oauth`
+- `make test-smoke`
+- `make ts-parity-fixtures`
+
+`make ts-parity-fixtures` is the only supported TypeScript execution path and
+runs npm inside Docker only.
 
 ## Intentionally Dropped or Deferred
 
-Dropped for Rust-only cutover:
+Dropped for Rust-only product path:
 
 - Web UI package and browser UI product path.
 - npm workspaces, npm scripts, npm publishing, Node runtime, TypeScript build tooling.
 - Hot module reload.
 - npm package installation/update workflows.
+- Embedded TypeScript/JavaScript extension runtime compatibility.
 
 Deferred until explicitly approved:
 
-- TypeScript extension runtime compatibility.
-- Browser HTML export polish beyond session data export.
-- Full legacy session migration.
-- Full provider parity for every current provider.
+- Browser HTML export polish beyond local session export.
+- Automatic legacy TypeScript session migration.
+- Full provider parity for every provider from the old TypeScript branch.
 - Image generation APIs.

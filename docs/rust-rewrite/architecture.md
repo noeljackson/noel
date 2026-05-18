@@ -1,70 +1,77 @@
 # Rust Rewrite Architecture
 
-Tracking issue: https://github.com/noeljackson/pi/issues/4
+Original tracking issue: https://github.com/noeljackson/pi/issues/4
 
-This document defines the Rust architecture target before implementation. The design is CLI/TUI-only and keeps `ts-reference` as the behavior reference.
+Current doc refresh: https://github.com/noeljackson/pi/issues/38
+
+This document records the implemented Rust architecture. The product path is
+CLI/TUI-only, Rust-only, and keeps `ts-reference` only as a behavioral reference.
 
 ## Goals
 
-- Build a native Rust `pi` binary.
-- Remove npm, Node.js, TypeScript, web UI, and browser runtime dependencies from the final product path.
-- Preserve required CLI/TUI coding-agent workflows.
-- Preserve active conversation context during normal reload.
+- Build and ship a native Rust `pi` binary.
+- Remove npm, Node.js, TypeScript, web UI, and browser runtime dependencies from the product path.
+- Preserve CLI/TUI coding-agent workflows from the TypeScript reference.
+- Preserve active conversation context during explicit reload.
 - Keep behavior testable without real provider credentials.
+- Keep TypeScript reference fixture generation isolated to Docker.
 
 ## Non-Goals
 
 - No web UI.
 - No hot module reload.
-- No TypeScript extension runtime compatibility in the first Rust cutover.
 - No npm package manager workflows.
-- No automatic compatibility promise for old JSONL sessions until the Rust session schema is finalized.
+- No embedded TypeScript or JavaScript extension runtime.
+- No automatic compatibility promise for old TypeScript JSONL sessions.
 
 ## Workspace Shape
 
-Use a Cargo workspace with small crates and explicit boundaries:
+The Rust implementation uses a Cargo workspace with explicit crate boundaries:
 
 - `crates/pi-cli`
   - Binary entrypoint.
   - Argument parsing.
   - Mode dispatch.
-  - Process-level setup.
+  - Interactive TUI loop.
+  - Slash command dispatch.
+  - Package/config CLI commands.
 - `crates/pi-core`
   - Agent loop.
   - Session state.
   - Conversation orchestration.
-  - Reload coordinator.
-  - Slash command dispatch.
+  - Session persistence and export/import.
+  - Runtime reload state.
 - `crates/pi-config`
   - Config paths.
   - Settings loading.
   - Auth loading.
   - Keybindings config.
-  - System/context prompt loading.
+  - Resource/package discovery.
+  - Model cache loading.
 - `crates/pi-ai`
-  - Provider traits.
-  - Normalized stream events.
-  - Model registry.
+  - Provider request/response normalization.
+  - Model registry data.
   - Credential resolution.
   - Faux provider for tests.
+  - Production provider adapters.
 - `crates/pi-tools`
   - Shell execution.
   - Filesystem reads/writes.
   - Search/list operations.
   - Patch/edit operations.
-  - Git helpers.
 - `crates/pi-tui`
-  - Terminal renderer and layout.
-  - Editor/input.
+  - Terminal renderer and layout primitives.
+  - Editor/input helpers.
   - Selectors.
   - Key event normalization.
-  - Markdown/text rendering.
+  - Markdown/text rendering metadata.
 
-The crate split can be adjusted during implementation, but dependencies should flow inward: CLI/TUI depend on core, core depends on config/AI/tools, and config/AI/tools do not depend on TUI.
+Dependencies flow inward: CLI/TUI depend on core, core depends on config/AI/tools,
+and config/AI/tools do not depend on TUI.
 
 ## Runtime State Split
 
-The Rust implementation must separate durable session state from reloadable systems.
+The Rust implementation separates durable session state from reloadable systems.
 
 `SessionState` owns user work:
 
@@ -72,62 +79,54 @@ The Rust implementation must separate durable session state from reloadable syst
 - Session cwd.
 - Conversation messages.
 - Tool calls and tool results.
-- Queued steering/follow-up messages.
+- Queued follow-up messages.
 - Active model selection.
 - Active thinking level.
 - Active tool names.
 - Session tree metadata.
 - Current compaction/retry metadata.
-- User-visible session name/labels.
+- User-visible session name and labels.
 
-`ReloadableSystems` owns replaceable runtime wiring:
+Reloadable runtime state owns replaceable wiring:
 
 - Settings.
-- Auth resolver.
-- Model registry.
-- Provider registry.
+- Auth resolver inputs.
+- Model registry and model cache.
+- Provider availability.
 - Tool definitions.
 - Prompt templates.
 - Skills.
 - Context files.
-- System prompt and appended system prompt.
+- Extensions.
 - Keybinding map.
 - Theme.
-- Slash command registry.
+- Dynamic slash completions.
 
-`Runtime` owns the current pair:
-
-- `Arc<RwLock<SessionState>>`
-- `ArcSwap<ReloadableSystems>` or equivalent atomic replacement mechanism
-- Event bus
-- Cancellation handles
-- Persistence handle
-
-The exact synchronization primitive can change, but readers must see either the old valid systems or the new valid systems. They must not observe a partially reloaded state.
+`Runtime` coordinates the current session plus reloadable systems. Reload builds
+and validates replacement systems before swapping them into the active runtime.
+The active session is never rebuilt as part of a normal reload.
 
 ## Reload Semantics
 
-Rust reload is explicit through `/reload` first. File-watch reload can be added later, but is not required.
+Rust reload is explicit through `/reload`.
 
-Reload algorithm:
+Reload behavior:
 
-1. Reject reload if an assistant turn or compaction is actively mutating the session.
-2. Snapshot reload-stable session choices:
+1. Reject reload if an assistant turn is in progress.
+2. Preserve reload-stable session choices:
    - active model
    - active thinking level
    - active tool names
    - cwd
    - queues
-3. Load settings, auth metadata, prompts, context files, keybindings, themes, providers, model metadata, and tool definitions into a new builder-owned value.
-4. Validate the new value completely.
-5. If validation fails, keep the old `ReloadableSystems`, append or display diagnostics, and leave `SessionState` unchanged.
-6. If validation succeeds, atomically swap `ReloadableSystems`.
-7. Reconcile active model/tool choices:
-   - preserve still-valid model and tool selections;
-   - preserve removed model in `SessionState` but mark it invalid for the next send;
-   - ask the user to select a valid model instead of clearing context;
-   - drop unavailable active tool names from the next request only after surfacing diagnostics.
-8. Re-render TUI using the new keybindings/theme/systems.
+   - session tree state
+3. Load settings, auth metadata, prompts, context files, keybindings, themes, provider availability, model metadata, package resources, and tool definitions.
+4. Validate the replacement systems.
+5. If validation fails, keep the old systems and surface diagnostics.
+6. If validation succeeds, swap the reloadable systems.
+7. Reconcile active model/tool choices and report invalid selections without clearing context.
+8. Re-render the TUI using the new keybindings/theme/systems.
+9. Notify JSON executable extensions with a `reload` event.
 
 Reload must not clear:
 
@@ -139,6 +138,8 @@ Reload must not clear:
 - branch/session tree state
 - accumulated context
 
+There is no file-watch hot module reload.
+
 ## CLI Mode Behavior
 
 `pi-cli` dispatches:
@@ -146,29 +147,34 @@ Reload must not clear:
 - `interactive`: default when stdin is a TTY.
 - `print`: `--print` or piped stdin.
 - `json`: `--mode json`.
-- `rpc`: `--mode rpc`, if retained after inventory validation.
+- `rpc`: `--mode rpc`.
 
-The first implementation phase should support `--help`, `--version`, `--print`, model selection flags, session flags, tool flags, and prompt/file inputs. Advanced selectors can land in later issues.
+All modes use the same config, model resolution, auth, session, and provider
+machinery where applicable.
 
 ## Config Model
 
-Keep the current default root:
+Default root:
 
 - `~/.pi/agent`
 
-Initial file names:
+File names:
 
 - `settings.json`
 - `auth.json`
 - `models.json`
+- `model-cache.json`
 - `keybindings.json`
+- `extensions/`
+- `skills/`
 - `prompts/`
 - `themes/`
 - `sessions/`
 
-Project-local root:
+Project-local roots:
 
 - `.pi/`
+- `.agents/skills`
 
 Context discovery:
 
@@ -179,38 +185,30 @@ Validation rules:
 
 - Invalid settings do not replace active settings.
 - Invalid keybindings do not replace active keybindings.
-- Missing optional resource paths become diagnostics.
+- Invalid resources produce diagnostics.
+- Missing optional resource paths produce diagnostics.
 - Missing required session cwd blocks session resume outside interactive recovery.
 
 ## Session Model
 
-Use an append-only session log unless implementation proves a structured snapshot is simpler and safer.
+Rust sessions use an append-only JSONL log.
 
 Required properties:
 
 - Durable across process restarts.
-- Supports session tree/fork operations.
+- Supports session tree/fork/clone operations.
 - Can recover partial sessions after process interruption.
 - Can be tested with in-memory and temp-dir storage.
+- Persists active model and active thinking level.
+- Supports JSON, JSONL, and local HTML export/import where applicable.
 
-Before cutover, decide whether to:
-
-- migrate old JSONL sessions;
-- read old JSONL sessions without writing them;
-- or intentionally abandon old session compatibility.
-
-That decision must be documented in the cutover issue.
+Legacy TypeScript sessions are intentionally not migrated automatically. Keep
+the `ts-reference` branch for reading old behavior.
 
 ## Provider Architecture
 
-Provider trait:
-
-- accepts normalized request input built from `SessionState` and `ReloadableSystems`;
-- returns an async stream of normalized events;
-- supports cancellation;
-- never exposes provider-specific partial state above `pi-ai`.
-
-Normalized events:
+Provider requests are normalized from session state and reloadable systems.
+Provider responses stream normalized events back into the runtime:
 
 - text delta
 - thinking delta
@@ -219,20 +217,52 @@ Normalized events:
 - stop
 - error
 
-Initial providers:
+Implemented providers:
 
 - `faux` for tests.
-- OpenAI Responses-compatible adapter.
-- Anthropic adapter.
-- Google Gemini adapter.
+- OpenAI chat/responses.
+- OpenAI Codex.
+- Azure OpenAI Responses.
+- Anthropic Messages.
+- Google Gemini.
+- Google Vertex.
+- OpenRouter.
+- GitHub Copilot.
+- Amazon Bedrock bearer-token Converse.
+- Mistral.
+- Cloudflare Workers AI.
+- Cloudflare AI Gateway.
 
-Additional providers are follow-up issues after stream normalization and tests are stable.
+Credential resolution supports runtime API keys, `auth.json`, environment
+variables, Claude Code login token fallback, Codex/ChatGPT login token fallback,
+and provider-specific environment settings.
+
+Model refresh runs in the background when enabled, online, stale, and
+authenticated. It does not block startup. Refreshed models become visible after
+`/reload` or the next startup.
+
+## Thinking Architecture
+
+Thinking level is session state and can be set with `--thinking`, `/thinking`,
+or left/right while the `/model` selector is open.
+
+Model-specific levels:
+
+- Anthropic Opus adaptive models: `high`, `xhigh`, `max`.
+- Other Anthropic adaptive models: `high`, `xhigh`.
+- OpenAI/Codex reasoning models: `minimal`, `low`, `medium`, `high`, `xhigh`.
+- Google thinking models: mapped to provider thinking budgets.
+- Non-thinking models: no active thinking level.
+
+Provider adapters translate normalized thinking levels into provider-specific
+payloads.
 
 ## Tool Architecture
 
-Tool definitions live in `pi-tools`; active tool selection lives in `SessionState`.
+Tool definitions live in `pi-tools`; active tool selection lives in session
+state.
 
-Required built-ins:
+Built-ins:
 
 - `read`
 - `bash`
@@ -247,77 +277,89 @@ Rules:
 - Tools receive an explicit cwd.
 - File mutation tools must protect unrelated user changes.
 - Search/list tools are read-only.
-- Tool tests must not call providers.
-- Shell execution must support configurable shell path and command prefix if retained in settings.
+- Tool tests do not call providers.
+- Shell execution supports configured shell path and command prefix.
+- TUI progress rendering is controlled by `terminal.showTerminalProgress`.
 
-Patch/edit behavior should prefer structured diff/patch application instead of ad hoc string replacement where possible.
+Patch/edit behavior uses structured local logic rather than provider-specific
+side effects.
 
 ## TUI Architecture
 
-`pi-tui` should own terminal mechanics and reusable widgets. `pi-core` should own product state and commands.
+`pi-tui` owns terminal mechanics and reusable rendering metadata. `pi-cli` owns
+the product event loop and command interactions.
 
-Required TUI concepts:
+Implemented TUI concepts:
 
-- Editor input.
+- Editor input with visible cursor.
 - Streaming assistant output.
 - Tool call/result display.
+- Shell command progress display.
 - Model selector.
 - Settings selector.
 - Session selector/tree.
-- Keybinding hint display.
+- Dynamic slash completion.
 - Diagnostics/status display.
 - Reload status/error display.
+- Theme application.
 
 Keybindings:
 
-- Resolve all action checks through a keybinding manager.
 - Load defaults plus user overrides.
 - Support reload without recreating `SessionState`.
+- Keep action checks routed through the keybinding layer where user-configurable behavior is required.
 
-## Extension and Package Resource Scope
+## Extension and Package Resource Architecture
 
-The TypeScript extension runtime is not part of the first Rust cutover.
+Rust package/resource support is local and git based.
 
-Initial Rust behavior:
+Package discovery supports:
 
-- Load built-in tools and commands.
-- Load local prompts and skills from configured paths.
-- Do not execute TypeScript/JavaScript extensions.
-- Do not install npm extension packages.
+- Resource directories by convention: `extensions/`, `skills/`, `prompts/`, `themes/`.
+- `package.json` with a `pi` key.
+- Object package entries with include/exclude filters.
+- `.gitignore`, `.ignore`, and `.fdignore` handling.
+- Disabled resource state from settings and `pi config enable|disable`.
 
-A later Rust-native extension design can add:
+Extension execution supports:
 
-- static plugin manifests;
-- subprocess-based extensions;
-- WASM extensions;
-- or a Rust dynamic plugin story.
+- Raw executable extensions.
+- JSON stdio executable extensions.
+- JSON lifecycle events for `reload` and `shutdown`.
+- Diagnostics for manifest and lifecycle failures.
+
+Intentionally unsupported:
+
+- Running TypeScript/JavaScript extensions in-process.
+- Installing npm extension packages.
+- Loading npm package-manager metadata as executable code.
+- TypeScript UI primitive/custom renderer APIs.
+
+Future Rust extension work should build on the JSON executable protocol with a
+Rust SDK, tool registration helpers, or provider registration helpers.
 
 ## Validation
 
-During the Rust implementation phase:
+Primary validation:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all`
+- `make check`
+- `make e2e`
+- `make docker-e2e`
 
-When TypeScript files are still changed, also run the repository-required TypeScript check. Documentation-only changes do not require `npm run check`.
+Manual validation:
 
-Issue-specific tests:
+- `make smoke-claude-opus-oauth`
+- `make test-smoke`
+- `make ts-parity-fixtures`
 
-- Config reload preserving context.
-- Invalid reload preserving old systems.
-- Session persistence and recovery.
-- Provider stream normalization with faux providers.
-- Tool execution and file mutation behavior.
-- Keybinding reload.
-- TUI smoke tests where feasible.
+`make ts-parity-fixtures` is the only supported path for executing TypeScript
+reference code. It runs npm inside Docker only.
 
-## Milestone Order
+## Current Cutover Status
 
-1. Discovery and architecture.
-2. Core CLI runtime.
-3. Agent, providers, and tools.
-4. TUI parity and persistence.
-5. Rust-only cutover.
-
-Do not remove npm/Node/web artifacts until CLI/TUI parity and Rust validation are complete.
+The Rust cutover is complete for the CLI/TUI product path. Remaining gaps should
+be tracked as normal GitHub issues and must preserve the Rust-only, no-npm, no-web
+scope unless the user explicitly changes that product direction.
