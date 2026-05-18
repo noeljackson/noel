@@ -2674,6 +2674,20 @@ fn apply_settings_item(
             )?;
             format!("setting terminal.showImages: {}", on_off(next))
         }
+        "terminal.showTerminalProgress" => {
+            let next = !terminal_progress_enabled(config);
+            config
+                .settings
+                .terminal
+                .get_or_insert_with(TerminalSettings::default)
+                .show_terminal_progress = Some(next);
+            write_user_setting(
+                &config.paths.settings_path,
+                &["terminal", "showTerminalProgress"],
+                next.into(),
+            )?;
+            format!("setting terminal.showTerminalProgress: {}", on_off(next))
+        }
         "images.autoResize" => {
             let next = !images_auto_resize(config);
             config
@@ -4132,6 +4146,11 @@ fn settings_selector_items(config: &LoadedConfig) -> Vec<SelectorItem> {
                 .as_ref()
                 .and_then(|terminal| terminal.show_images)
                 .unwrap_or(false),
+        ),
+        bool_setting_item(
+            "terminal progress",
+            "terminal.showTerminalProgress",
+            terminal_progress_enabled(config),
         ),
         bool_setting_item(
             "auto resize images",
