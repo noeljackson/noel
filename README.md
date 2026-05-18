@@ -275,6 +275,8 @@ Object package entries filter package resources without npm:
 Omitting a resource key loads all resources of that type. `[]` loads none.
 `!pattern` excludes wildcard matches, `+path` force-includes an exact path, and
 `-path` force-excludes an exact path.
+Resource discovery honors `.gitignore`, `.ignore`, and `.fdignore` files in
+scanned resource directories.
 
 ## Interactive Commands
 

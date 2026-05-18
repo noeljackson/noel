@@ -11,6 +11,7 @@ pub const APP_NAME: &str = "pi";
 pub const CONFIG_DIR_NAME: &str = ".pi";
 pub const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 pub const ENV_SESSION_DIR: &str = "PI_CODING_AGENT_SESSION_DIR";
+const RESOURCE_IGNORE_FILES: [&str; 3] = [".gitignore", ".ignore", ".fdignore"];
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -1116,6 +1117,7 @@ fn collect_agent_skill_path(
             return;
         }
     };
+    let ignore_patterns = read_resource_ignore_patterns(path, diagnostics);
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -1128,6 +1130,9 @@ fn collect_agent_skill_path(
             }
         };
         let child = entry.path();
+        if resource_path_ignored(&child, path, &ignore_patterns) {
+            continue;
+        }
         if child.is_dir() {
             collect_agent_skill_path(resources, &child, diagnostics);
         } else if child.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
@@ -1404,6 +1409,7 @@ fn collect_resource_paths(paths: &mut Vec<PathBuf>, path: &Path, diagnostics: &m
             return;
         }
     };
+    let ignore_patterns = read_resource_ignore_patterns(path, diagnostics);
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -1416,6 +1422,9 @@ fn collect_resource_paths(paths: &mut Vec<PathBuf>, path: &Path, diagnostics: &m
             }
         };
         let child = entry.path();
+        if resource_path_ignored(&child, path, &ignore_patterns) {
+            continue;
+        }
         if is_resource_metadata_file(&child) {
             continue;
         }
@@ -1546,8 +1555,66 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 fn is_resource_metadata_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|value| value.to_str())
-        .map(|name| name.ends_with(".pi-extension.json"))
+        .map(|name| name.ends_with(".pi-extension.json") || RESOURCE_IGNORE_FILES.contains(&name))
         .unwrap_or(false)
+}
+
+fn read_resource_ignore_patterns(dir: &Path, diagnostics: &mut Vec<String>) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for filename in RESOURCE_IGNORE_FILES {
+        let path = dir.join(filename);
+        if !path.exists() {
+            continue;
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => patterns.extend(content.lines().filter_map(parse_ignore_line)),
+            Err(error) => diagnostics.push(format!("failed to read {}: {error}", path.display())),
+        }
+    }
+    patterns
+}
+
+fn parse_ignore_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    Some(line.to_string())
+}
+
+fn resource_path_ignored(path: &Path, base_dir: &Path, patterns: &[String]) -> bool {
+    let mut ignored = false;
+    for pattern in patterns {
+        let (negated, pattern) = pattern
+            .strip_prefix('!')
+            .map(|pattern| (true, pattern))
+            .unwrap_or((false, pattern.as_str()));
+        if resource_ignore_pattern_matches(path, base_dir, pattern) {
+            ignored = !negated;
+        }
+    }
+    ignored
+}
+
+fn resource_ignore_pattern_matches(path: &Path, base_dir: &Path, pattern: &str) -> bool {
+    let is_dir = path.is_dir();
+    let pattern = normalize_pattern(pattern);
+    let directory_only = pattern.ends_with('/');
+    if directory_only && !is_dir {
+        return false;
+    }
+    let pattern = pattern.trim_end_matches('/');
+    let rel = normalize_resource_path(path.strip_prefix(base_dir).unwrap_or(path));
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_string();
+    if pattern.contains('/') {
+        wildcard_matches(pattern, &rel)
+    } else {
+        wildcard_matches(pattern, &name)
+    }
 }
 
 fn push_resource_file(
@@ -1885,7 +1952,7 @@ mod tests {
         assert_eq!(config.skills[0].content, "review skill");
         assert_eq!(config.prompt_templates[0].name, "fix");
         assert_eq!(config.themes[0].name, "dark");
-        assert!(config.diagnostics.is_empty());
+        assert!(config.diagnostics.is_empty(), "{:?}", config.diagnostics);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1955,7 +2022,7 @@ mod tests {
             .prompt_templates
             .iter()
             .any(|resource| resource.name == "local" && resource.content == "local prompt"));
-        assert!(config.diagnostics.is_empty());
+        assert!(config.diagnostics.is_empty(), "{:?}", config.diagnostics);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2095,6 +2162,65 @@ mod tests {
             .iter()
             .any(|resource| resource.name == "ignored"));
         assert!(config.diagnostics.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resource_discovery_honors_ignore_files() {
+        let root = test_dir("pi-config-resource-ignore");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        let package_dir = cwd.join("package");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(package_dir.join("extensions")).expect("create extensions");
+        fs::create_dir_all(package_dir.join("skills")).expect("create skills");
+        fs::create_dir_all(package_dir.join("prompts/ignored-dir")).expect("create prompts");
+        fs::create_dir_all(package_dir.join("themes")).expect("create themes");
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"packages":["package"]}"#,
+        )
+        .expect("write settings");
+        fs::write(
+            package_dir.join("prompts/.ignore"),
+            "skip.md\nignored-dir/\n!keep.md\n",
+        )
+        .expect("write ignore");
+        fs::write(package_dir.join("prompts/keep.md"), "keep prompt").expect("write keep prompt");
+        fs::write(package_dir.join("prompts/skip.md"), "skip prompt").expect("write skip prompt");
+        fs::write(
+            package_dir.join("prompts/ignored-dir/nested.md"),
+            "nested prompt",
+        )
+        .expect("write nested prompt");
+
+        let config = load_config(ConfigPaths {
+            cwd: cwd.clone(),
+            agent_dir: agent_dir.clone(),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: cwd.join(".pi/settings.json"),
+            auth_path: root.join("missing-auth.json"),
+            models_path: root.join("missing-models.json"),
+            model_cache_path: root.join("missing-model-cache.json"),
+            keybindings_path: root.join("missing-keybindings.json"),
+        })
+        .expect("load config");
+
+        assert!(config
+            .prompt_templates
+            .iter()
+            .any(|resource| resource.name == "keep"));
+        assert!(!config
+            .prompt_templates
+            .iter()
+            .any(|resource| resource.name == "skip"));
+        assert!(!config
+            .prompt_templates
+            .iter()
+            .any(|resource| resource.name == "nested"));
+        assert!(config.diagnostics.is_empty(), "{:?}", config.diagnostics);
 
         let _ = fs::remove_dir_all(root);
     }
