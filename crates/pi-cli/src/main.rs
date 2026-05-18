@@ -2949,7 +2949,7 @@ async fn handle_tui_submission(
         }
         _ if line.starts_with("/complete ") => {
             let prefix = line.trim_start_matches("/complete ").trim();
-            let completions = EditorState::command_completions(prefix);
+            let completions = command_completions(config, prefix);
             app.push(
                 TuiEntryKind::System,
                 if completions.is_empty() {
@@ -3878,6 +3878,48 @@ fn format_history(editor_state: &EditorState) -> String {
         .join("\n")
 }
 
+fn command_completions(config: &LoadedConfig, prefix: &str) -> Vec<String> {
+    let mut completions = EditorState::command_completions(prefix)
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    completions.extend(resource_command_completions(
+        prefix,
+        "/extension:",
+        &config.extensions,
+    ));
+    completions.extend(resource_command_completions(
+        prefix,
+        "/skill:",
+        &config.skills,
+    ));
+    completions.extend(resource_command_completions(
+        prefix,
+        "/prompt ",
+        &config.prompt_templates,
+    ));
+    completions.extend(resource_command_completions(
+        prefix,
+        "/theme ",
+        &config.themes,
+    ));
+    completions.sort();
+    completions.dedup();
+    completions
+}
+
+fn resource_command_completions(
+    prefix: &str,
+    command_prefix: &str,
+    resources: &[ResourceFile],
+) -> Vec<String> {
+    resources
+        .iter()
+        .map(|resource| format!("{command_prefix}{}", resource.name))
+        .filter(|command| command.starts_with(prefix))
+        .collect()
+}
+
 fn read_external_editor_prompt(initial: &str) -> Result<String> {
     let path = std::env::temp_dir().join(format!(
         "pi-editor-{}-{}.txt",
@@ -4617,6 +4659,51 @@ mod tests {
             serde_json::json!(["fix"])
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_completions_include_loaded_resources() {
+        let config = LoadedConfig {
+            paths: ConfigPaths {
+                cwd: PathBuf::from("."),
+                agent_dir: PathBuf::from(".pi/agent"),
+                session_dir: PathBuf::from(".pi/agent/sessions"),
+                settings_path: PathBuf::from(".pi/agent/settings.json"),
+                project_settings_path: PathBuf::from(".pi/settings.json"),
+                auth_path: PathBuf::from(".pi/agent/auth.json"),
+                models_path: PathBuf::from(".pi/agent/models.json"),
+                model_cache_path: PathBuf::from(".pi/agent/model-cache.json"),
+                keybindings_path: PathBuf::from(".pi/agent/keybindings.json"),
+            },
+            settings: Settings::default(),
+            auth: AuthData::default(),
+            models: Vec::new(),
+            keybindings: Vec::new(),
+            context_files: Vec::new(),
+            extensions: vec![test_resource("json-ext")],
+            skills: vec![test_resource("review")],
+            prompt_templates: vec![test_resource("fix")],
+            themes: vec![test_resource("dark")],
+            diagnostics: Vec::new(),
+            system_prompt: None,
+            append_system_prompt: Vec::new(),
+        };
+
+        assert_eq!(
+            command_completions(&config, "/extension:j"),
+            ["/extension:json-ext"]
+        );
+        assert!(command_completions(&config, "/skill:r").contains(&"/skill:review".to_string()));
+        assert!(command_completions(&config, "/prompt f").contains(&"/prompt fix".to_string()));
+        assert!(command_completions(&config, "/theme d").contains(&"/theme dark".to_string()));
+    }
+
+    fn test_resource(name: &str) -> ResourceFile {
+        ResourceFile {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            content: String::new(),
+        }
     }
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
