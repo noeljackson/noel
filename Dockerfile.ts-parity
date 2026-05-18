@@ -16,4 +16,4 @@ RUN npm ci --ignore-scripts
 
 COPY scripts/ts-parity /ts-parity
 
-CMD ["sh", "-c", "npx tsx /ts-parity/anthropic-oauth-fixture.ts /fixtures && npx tsx /ts-parity/codex-oauth-fixture.ts /fixtures && npx tsx /ts-parity/openrouter-fixture.ts /fixtures && npx tsx /ts-parity/copilot-fixture.ts /fixtures && npx tsx /ts-parity/cloudflare-fixture.ts /fixtures && npx tsx /ts-parity/mistral-fixture.ts /fixtures && npx tsx /ts-parity/google-fixture.ts /fixtures && npx tsx /ts-parity/bedrock-fixture.ts /fixtures"]
+CMD ["sh", "-c", "npx tsx /ts-parity/anthropic-oauth-fixture.ts /fixtures && npx tsx /ts-parity/codex-oauth-fixture.ts /fixtures && npx tsx /ts-parity/openrouter-fixture.ts /fixtures && npx tsx /ts-parity/copilot-fixture.ts /fixtures && npx tsx /ts-parity/cloudflare-fixture.ts /fixtures && npx tsx /ts-parity/mistral-fixture.ts /fixtures && npx tsx /ts-parity/google-fixture.ts /fixtures && npx tsx /ts-parity/bedrock-fixture.ts /fixtures && npx tsx /ts-parity/cli-contract-fixture.ts /fixtures"]

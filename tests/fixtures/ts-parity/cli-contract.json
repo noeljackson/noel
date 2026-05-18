@@ -1,0 +1,130 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/cli-contract-fixture.ts"
+  },
+  "about": "pi - AI coding assistant with read, bash, edit, write tools",
+  "options": [
+    {
+      "long": "api-key"
+    },
+    {
+      "long": "append-system-prompt"
+    },
+    {
+      "long": "continue",
+      "short": "c"
+    },
+    {
+      "long": "export"
+    },
+    {
+      "long": "extension",
+      "short": "e"
+    },
+    {
+      "long": "fork"
+    },
+    {
+      "long": "help",
+      "short": "h"
+    },
+    {
+      "long": "list-models"
+    },
+    {
+      "long": "mode"
+    },
+    {
+      "long": "model"
+    },
+    {
+      "long": "models"
+    },
+    {
+      "long": "no-builtin-tools",
+      "short": "nbt"
+    },
+    {
+      "long": "no-context-files",
+      "short": "nc"
+    },
+    {
+      "long": "no-extensions",
+      "short": "ne"
+    },
+    {
+      "long": "no-prompt-templates",
+      "short": "np"
+    },
+    {
+      "long": "no-session"
+    },
+    {
+      "long": "no-skills",
+      "short": "ns"
+    },
+    {
+      "long": "no-themes"
+    },
+    {
+      "long": "no-tools",
+      "short": "nt"
+    },
+    {
+      "long": "offline"
+    },
+    {
+      "long": "print",
+      "short": "p"
+    },
+    {
+      "long": "prompt-template"
+    },
+    {
+      "long": "provider"
+    },
+    {
+      "long": "resume",
+      "short": "r"
+    },
+    {
+      "long": "session"
+    },
+    {
+      "long": "session-dir"
+    },
+    {
+      "long": "skill"
+    },
+    {
+      "long": "system-prompt"
+    },
+    {
+      "long": "theme"
+    },
+    {
+      "long": "thinking"
+    },
+    {
+      "long": "tools",
+      "short": "t"
+    },
+    {
+      "long": "verbose"
+    },
+    {
+      "long": "version",
+      "short": "v"
+    }
+  ],
+  "commands": [
+    "config",
+    "install",
+    "list",
+    "remove",
+    "uninstall",
+    "update"
+  ]
+}

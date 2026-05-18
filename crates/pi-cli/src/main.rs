@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
+#[cfg(test)]
+use clap::CommandFactory;
 use clap::{Parser, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -5062,6 +5064,63 @@ mod tests {
         assert!(command_completions(&config, "/skill:r").contains(&"/skill:review".to_string()));
         assert!(command_completions(&config, "/prompt f").contains(&"/prompt fix".to_string()));
         assert!(command_completions(&config, "/theme d").contains(&"/theme dark".to_string()));
+    }
+
+    #[test]
+    fn cli_contract_covers_upstream_ts_options_and_commands() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/cli-contract.json"
+        ))
+        .expect("parse cli contract fixture");
+        let rust_options = rust_cli_option_contract();
+        let rust_commands = rust_cli_command_contract();
+
+        for option in fixture["options"].as_array().expect("fixture options") {
+            let long = option["long"].as_str().expect("option long");
+            assert!(
+                rust_options.contains(long),
+                "missing upstream CLI option --{long}"
+            );
+            if let Some(short) = option["short"].as_str() {
+                assert!(
+                    rust_options.contains(short),
+                    "missing upstream CLI option -{short}"
+                );
+            }
+        }
+
+        for command in fixture["commands"].as_array().expect("fixture commands") {
+            let command = command.as_str().expect("command");
+            assert!(
+                rust_commands.contains(command),
+                "missing upstream CLI command {command}"
+            );
+        }
+    }
+
+    fn rust_cli_option_contract() -> BTreeSet<String> {
+        let mut options = BTreeSet::new();
+        for argument in Cli::command().get_arguments() {
+            if let Some(long) = argument.get_long() {
+                options.insert(long.to_string());
+            }
+            if let Some(short) = argument.get_short() {
+                options.insert(short.to_string());
+            }
+        }
+        for option in [
+            "help", "h", "version", "v", "nt", "nbt", "ne", "ns", "np", "nc",
+        ] {
+            options.insert(option.to_string());
+        }
+        options
+    }
+
+    fn rust_cli_command_contract() -> BTreeSet<String> {
+        ["config", "install", "list", "remove", "uninstall", "update"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     fn test_resource(name: &str) -> ResourceFile {
