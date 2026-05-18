@@ -5,7 +5,7 @@ TS_PARITY_IMAGE ?= pi-ts-parity
 TS_REFERENCE_REPO ?= https://github.com/noeljackson/pi.git
 TS_REFERENCE_REF ?= $(shell git rev-parse ts-reference)
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
-PREFIX ?= /usr/local
+PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 

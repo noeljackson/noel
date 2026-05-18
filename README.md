@@ -38,7 +38,7 @@ The binary is:
 target/release/pi
 ```
 
-Install system-wide:
+Install for the current user:
 
 ```bash
 make install
@@ -47,7 +47,13 @@ make install
 Install under a different prefix:
 
 ```bash
-make install PREFIX="$HOME/.local"
+make install PREFIX="/opt/pi"
+```
+
+Install system-wide:
+
+```bash
+sudo make install PREFIX="/usr/local"
 ```
 
 ## Run
