@@ -540,7 +540,11 @@ impl TerminalRenderer {
     }
 
     pub fn selector(&self, selector: &Selector) -> String {
-        let mut lines = vec![format!("{} selector", selector.title)];
+        let mut lines = vec![
+            format!("{} selector", selector.title),
+            "filter".to_string(),
+            "enter select  esc cancel".to_string(),
+        ];
         lines.extend(selector.items.iter().enumerate().map(|(index, item)| {
             let selected = if index == selector.selected { ">" } else { " " };
             let active = if item.active { "*" } else { " " };
@@ -642,6 +646,60 @@ mod tests {
             assert!(
                 rust_commands.contains(name),
                 "missing upstream slash command /{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_outputs_cover_upstream_tui_transcript_markers() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/tui-transcripts.json"
+        ))
+        .expect("parse tui transcript fixture");
+        let markers = |name: &str| {
+            fixture["transcripts"]
+                .as_array()
+                .expect("transcripts")
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap_or_else(|| panic!("missing transcript {name}"))["requiredMarkers"]
+                .as_array()
+                .expect("markers")
+                .iter()
+                .map(|marker| marker.as_str().expect("marker").to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let renderer = TerminalRenderer::default();
+        let help = renderer.help();
+        for marker in markers("help") {
+            assert!(help.contains(&marker), "missing help marker {marker}");
+        }
+
+        let session = renderer.session(&SessionView {
+            id: "s1".to_string(),
+            cwd: "/repo".to_string(),
+            name: Some("work".to_string()),
+            labels: vec!["feature".to_string()],
+            parent: Some("root".to_string()),
+            file: Some("/sessions/s1.jsonl".to_string()),
+        });
+        for marker in markers("session") {
+            assert!(session.contains(&marker), "missing session marker {marker}");
+        }
+
+        let selector = renderer.selector(&Selector::new(
+            "model",
+            vec![SelectorItem {
+                label: "anthropic/claude".to_string(),
+                value: "anthropic/claude".to_string(),
+                active: true,
+            }],
+        ));
+        for marker in markers("selector") {
+            assert!(
+                selector.contains(&marker),
+                "missing selector marker {marker}"
             );
         }
     }
