@@ -1,0 +1,50 @@
+{
+  "source": {
+    "branch": "ts-reference",
+    "script": "/ts-parity/codex-oauth-fixture.ts"
+  },
+  "provider": "openai-codex",
+  "auth": "chatgpt-oauth",
+  "request": {
+    "url": "https://chatgpt.com/backend-api/codex/responses",
+    "method": "POST",
+    "headers": {
+      "accept": "text/event-stream",
+      "authorization": "Bearer <redacted>",
+      "chatgpt-account-id": "acct_ts_parity",
+      "content-type": "application/json",
+      "openai-beta": "responses=experimental",
+      "originator": "pi",
+      "user-agent": "pi (browser)"
+    },
+    "body": {
+      "model": "gpt-5.5",
+      "store": false,
+      "stream": true,
+      "instructions": "pi rust cli",
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "hello"
+            }
+          ]
+        }
+      ],
+      "text": {
+        "verbosity": "low"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "tool_choice": "auto",
+      "parallel_tool_calls": true,
+      "reasoning": {
+        "effort": "xhigh",
+        "summary": "auto"
+      }
+    }
+  }
+}

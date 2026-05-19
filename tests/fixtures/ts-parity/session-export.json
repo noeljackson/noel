@@ -1,0 +1,57 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/session-export-fixture.ts"
+  },
+  "header": {
+    "type": "session",
+    "version": 3,
+    "hasCwd": true
+  },
+  "entryTypes": [
+    "message",
+    "message",
+    "session_info",
+    "model_change",
+    "thinking_level_change",
+    "custom",
+    "compaction",
+    "message",
+    "label"
+  ],
+  "treeRootCount": 1,
+  "sessionName": "demo session",
+  "labelForFirstMessage": "important",
+  "branch": [
+    {
+      "type": "message",
+      "parent": null,
+      "role": "user"
+    },
+    {
+      "type": "message",
+      "parent": "set",
+      "role": "user"
+    },
+    {
+      "type": "label",
+      "parent": "set"
+    }
+  ],
+  "jsonlBranchExport": {
+    "recordTypes": [
+      "session",
+      "message",
+      "message",
+      "label"
+    ],
+    "parentChain": [
+      null,
+      "set",
+      "set"
+    ],
+    "firstRecordVersion": 3,
+    "firstRecordHasCwd": true
+  }
+}

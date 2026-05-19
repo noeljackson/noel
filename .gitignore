@@ -1,5 +1,6 @@
 node_modules/
 dist/
+target/
 *.log
 .DS_Store
 *.tsbuildinfo
@@ -39,7 +40,3 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
-
-# Go binaries built at repo root
-/pi
-/pi-tui-demo

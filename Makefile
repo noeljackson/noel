@@ -1,37 +1,113 @@
-.PHONY: help build test vet bench check run demo clean tidy install sessions
+CARGO ?= cargo
+DOCKER ?= docker
+E2E_IMAGE ?= pi-e2e
+TS_PARITY_IMAGE ?= pi-ts-parity
+TS_REFERENCE_REPO ?= https://github.com/earendil-works/pi.git
+TS_REFERENCE_REF ?= main
+TS_PARITY_TRACKING_REF ?= main
+TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
+PREFIX ?= $(HOME)/.local
+BINDIR ?= $(PREFIX)/bin
+INSTALL_BUILD_SCRIPT := scripts/install-build.sh
+
+.PHONY: help build release install run fmt lint test check ci e2e dogfood dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-claude-opus-oauth clean
 
 help:
-	@awk 'BEGIN{FS=":.*##"; printf "Targets:\n"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@printf '%s\n' \
+		'Targets:' \
+		'  build        Build the workspace' \
+		'  release      Build the pi CLI release binary' \
+		'  install      Install the pi CLI release binary to $$(PREFIX)/bin' \
+		'  run          Run the pi CLI' \
+		'  fmt          Check Rust formatting' \
+		'  lint         Run clippy with warnings denied' \
+		'  test         Run all Rust tests' \
+		'  check        Run fmt, lint, and test' \
+		'  ci           Run check and local tmux e2e' \
+		'  e2e          Run tmux TTY e2e' \
+		'  dogfood      Run release-binary tmux dogfood smoke' \
+		'  dogfood-long Run long release-binary TTY paint/scroll smoke' \
+		'  dogfood-real Run optional real-provider TTY dogfood smoke' \
+		'  dogfood-real-print Run optional real-provider print smoke' \
+		'  test-smoke   Run local TTY smoke plus manual real-provider smoke' \
+		'  docker-e2e   Build and run Dockerized tmux TTY e2e' \
+		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
+		'  ts-parity-update    Refresh fixtures from moving TS reference inside Docker' \
+		'  ts-parity-drift     Check moving TS reference for fixture drift' \
+		'  ts-parity-agent     Check drift and optionally dispatch PI_PARITY_AGENT_COMMAND' \
+		'  smoke-claude-opus-oauth  Run manual Claude Opus OAuth smoke' \
+		'  clean        Remove Cargo build output'
 
-build: ## Build pi and pi-tui-demo binaries at repo root
-	go build -o pi ./cmd/pi
-	go build -o pi-tui-demo ./cmd/pi-tui-demo
+build:
+	$(CARGO) build --all
 
-test: ## Run the full test suite
-	go test ./...
+release:
+	$(CARGO) build --release -p pi-cli
 
-vet: ## go vet ./...
-	go vet ./...
+install:
+	CARGO="$(CARGO)" $(INSTALL_BUILD_SCRIPT)
+	install -d "$(BINDIR)"
+	install -m 0755 target/release/pi "$(BINDIR)/pi"
 
-bench: ## Run performance benchmarks
-	./scripts/check-perf.sh
+run:
+	$(CARGO) run -p pi-cli
 
-check: vet test bench ## Vet + test + performance benchmarks (CI-shaped local check)
+fmt:
+	$(CARGO) fmt --all -- --check
 
-run: ## Launch the interactive TUI against a fresh session
-	go run ./cmd/pi
+lint:
+	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
-demo: ## Run the TUI against scripted mock events (no API call)
-	go run ./cmd/pi-tui-demo
+test:
+	$(CARGO) test --all
 
-clean: ## Remove built binaries
-	rm -f pi pi-tui-demo
+check: fmt lint test
 
-tidy: ## go mod tidy
-	go mod tidy
+ci: check e2e
 
-install: ## Install pi to $GOBIN (or $GOPATH/bin)
-	go install ./cmd/pi
+e2e:
+	scripts/e2e-tmux.sh
 
-sessions: ## List existing session files
-	@ls -lt ~/.pi/sessions/ 2>/dev/null | head -20 || echo "no sessions yet"
+dogfood: release
+	scripts/dogfood-release.sh
+
+dogfood-long: release
+	scripts/dogfood-long-tty.sh
+
+dogfood-real: release
+	scripts/dogfood-real-tty.sh
+
+dogfood-real-print: smoke-claude-opus-oauth
+
+test-smoke: e2e smoke-claude-opus-oauth
+
+docker-build:
+	$(DOCKER) build -f Dockerfile.e2e -t $(E2E_IMAGE) .
+
+docker-e2e: docker-build
+	$(DOCKER) run --rm $(E2E_IMAGE)
+
+ts-parity-build:
+	$(DOCKER) build -f Dockerfile.ts-parity \
+		--build-arg TS_REFERENCE_REPO="$(TS_REFERENCE_REPO)" \
+		--build-arg TS_REFERENCE_REF="$(TS_REFERENCE_REF)" \
+		-t $(TS_PARITY_IMAGE) .
+
+ts-parity-fixtures: ts-parity-build
+	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
+	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE)
+
+ts-parity-update:
+	$(MAKE) ts-parity-fixtures TS_REFERENCE_REF="$(TS_PARITY_TRACKING_REF)"
+
+ts-parity-drift:
+	scripts/ts-parity-drift.sh
+
+ts-parity-agent:
+	scripts/ts-parity-drift.sh
+
+smoke-claude-opus-oauth:
+	CARGO="$(CARGO)" scripts/smoke-claude-opus-oauth.sh
+
+clean:
+	$(CARGO) clean

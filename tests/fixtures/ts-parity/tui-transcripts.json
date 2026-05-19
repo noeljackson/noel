@@ -1,0 +1,73 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/tui-transcript-fixture.ts"
+  },
+  "transcripts": [
+    {
+      "name": "help",
+      "requiredMarkers": [
+        "/changelog",
+        "/clone",
+        "/compact",
+        "/copy",
+        "/export",
+        "/fork",
+        "/hotkeys",
+        "/import",
+        "/login",
+        "/logout",
+        "/model",
+        "/name",
+        "/new",
+        "/quit",
+        "/reload",
+        "/resume",
+        "/scoped-models",
+        "/session",
+        "/settings",
+        "/share",
+        "/tree"
+      ]
+    },
+    {
+      "name": "session",
+      "requiredMarkers": [
+        "session:",
+        "cwd:",
+        "name:",
+        "labels:",
+        "parent:",
+        "file:"
+      ]
+    },
+    {
+      "name": "status",
+      "requiredMarkers": [
+        "status",
+        "model:",
+        "thinking:",
+        "theme:",
+        "queue:",
+        "history:",
+        "diagnostics:"
+      ]
+    },
+    {
+      "name": "selector",
+      "requiredMarkers": [
+        "selector",
+        "filter",
+        "enter select",
+        "esc cancel"
+      ]
+    },
+    {
+      "name": "reload",
+      "requiredMarkers": [
+        "Reloaded keybindings, extensions, skills, prompts, themes"
+      ]
+    }
+  ]
+}

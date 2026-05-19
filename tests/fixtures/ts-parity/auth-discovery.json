@@ -1,0 +1,129 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/auth-discovery-fixture.ts"
+  },
+  "fakeTokensOnly": true,
+  "authJson": {
+    "pathSuffix": ".pi/agent/auth.json",
+    "credentialTypes": [
+      "api_key",
+      "oauth"
+    ],
+    "apiKeyCredential": {
+      "type": "api_key",
+      "key": "stored-anthropic-api-key"
+    },
+    "oauthCredential": {
+      "type": "oauth",
+      "access": "stored-codex-access-token",
+      "refresh": "stored-codex-refresh-token",
+      "expires": 4102444800000,
+      "accountId": "account-id"
+    },
+    "providers": [
+      "anthropic",
+      "openai-codex"
+    ],
+    "status": {
+      "anthropic": {
+        "configured": true,
+        "source": "stored"
+      },
+      "openaiCodex": {
+        "configured": true,
+        "source": "stored"
+      }
+    }
+  },
+  "precedence": {
+    "order": [
+      "runtime",
+      "stored_api_key",
+      "stored_oauth",
+      "environment",
+      "fallback"
+    ],
+    "runtimeOverride": "runtime-anthropic-api-key",
+    "fallback": "fallback-custom-provider-key"
+  },
+  "env": [
+    {
+      "provider": "anthropic",
+      "env": {
+        "ANTHROPIC_OAUTH_TOKEN": "claude-oauth-env-token",
+        "ANTHROPIC_API_KEY": "anthropic-api-key"
+      },
+      "statusLabel": "ANTHROPIC_OAUTH_TOKEN",
+      "expectedApiKey": "claude-oauth-env-token",
+      "expectedSource": "environment",
+      "status": {
+        "configured": false,
+        "source": "environment",
+        "label": "ANTHROPIC_OAUTH_TOKEN"
+      },
+      "apiKey": "claude-oauth-env-token"
+    },
+    {
+      "provider": "openai",
+      "env": {
+        "OPENAI_API_KEY": "openai-api-key"
+      },
+      "statusLabel": "OPENAI_API_KEY",
+      "expectedApiKey": "openai-api-key",
+      "expectedSource": "environment",
+      "status": {
+        "configured": false,
+        "source": "environment",
+        "label": "OPENAI_API_KEY"
+      },
+      "apiKey": "openai-api-key"
+    },
+    {
+      "provider": "azure-openai-responses",
+      "env": {
+        "AZURE_OPENAI_API_KEY": "azure-api-key"
+      },
+      "statusLabel": "AZURE_OPENAI_API_KEY",
+      "expectedApiKey": "azure-api-key",
+      "expectedSource": "environment",
+      "status": {
+        "configured": false,
+        "source": "environment",
+        "label": "AZURE_OPENAI_API_KEY"
+      },
+      "apiKey": "azure-api-key"
+    }
+  ],
+  "interopLoginFiles": {
+    "claudeCode": {
+      "pathSuffix": ".claude/.credentials.json",
+      "tokenPointer": "/claudeAiOauth/accessToken",
+      "sample": {
+        "claudeAiOauth": {
+          "accessToken": "claude-access",
+          "refreshToken": "redacted",
+          "expiresAt": 1
+        }
+      }
+    },
+    "codex": {
+      "pathSuffix": ".codex/auth.json",
+      "tokenPointer": "/tokens/access_token",
+      "accountPointer": "/tokens/account_id",
+      "sample": {
+        "auth_mode": "chatgpt",
+        "tokens": {
+          "access_token": "codex-access",
+          "refresh_token": "redacted",
+          "account_id": "account-id"
+        }
+      }
+    }
+  },
+  "redaction": {
+    "persistLiveCredentials": false,
+    "fixturesUseOnlyFakeTokens": true
+  }
+}

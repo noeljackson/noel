@@ -1,0 +1,19 @@
+FROM node:22-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TS_REFERENCE_REPO=https://github.com/earendil-works/pi.git
+ARG TS_REFERENCE_REF=main
+
+RUN git clone --filter=blob:none "${TS_REFERENCE_REPO}" /ts-reference \
+    && cd /ts-reference \
+    && git checkout "${TS_REFERENCE_REF}"
+
+WORKDIR /ts-reference
+RUN npm ci --ignore-scripts
+
+COPY scripts/ts-parity /ts-parity
+
+CMD ["sh", "-c", "npx tsx /ts-parity/anthropic-oauth-fixture.ts /fixtures && npx tsx /ts-parity/codex-oauth-fixture.ts /fixtures && npx tsx /ts-parity/openrouter-fixture.ts /fixtures && npx tsx /ts-parity/copilot-fixture.ts /fixtures && npx tsx /ts-parity/cloudflare-fixture.ts /fixtures && npx tsx /ts-parity/mistral-fixture.ts /fixtures && npx tsx /ts-parity/google-fixture.ts /fixtures && npx tsx /ts-parity/bedrock-fixture.ts /fixtures && npx tsx /ts-parity/cli-contract-fixture.ts /fixtures && npx tsx /ts-parity/slash-command-fixture.ts /fixtures && npx tsx /ts-parity/settings-fixture.ts /fixtures && npx tsx /ts-parity/session-export-fixture.ts /fixtures && npx tsx /ts-parity/local-tools-fixture.ts /fixtures && npx tsx /ts-parity/tui-transcript-fixture.ts /fixtures && npx tsx /ts-parity/model-catalog-fixture.ts /fixtures && npx tsx /ts-parity/auth-discovery-fixture.ts /fixtures"]
