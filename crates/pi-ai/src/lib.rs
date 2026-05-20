@@ -484,7 +484,6 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
         body["stream"] = json!(true);
         body["stream_options"] = json!({ "include_usage": true });
         body["store"] = json!(false);
-        body["max_completion_tokens"] = json!(32000);
         if let Some(effort) = openrouter_reasoning_effort(config.thinking_level.as_deref()) {
             body["reasoning"] = json!({ "effort": effort });
         }
@@ -494,7 +493,6 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
     ) {
         body["stream"] = json!(true);
         body["stream_options"] = json!({ "include_usage": true });
-        body["max_tokens"] = json!(32000);
     }
     body
 }
@@ -575,7 +573,6 @@ fn github_copilot_responses_body(config: &ProviderConfig, request: &ProviderRequ
         "input": openai_responses_input_with_developer_system(request),
         "stream": true,
         "store": false,
-        "max_output_tokens": 128000,
         "include": ["reasoning.encrypted_content"],
     });
     if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
@@ -1009,9 +1006,7 @@ fn google_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
 }
 
 fn google_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
-    let mut generation_config = json!({
-        "maxOutputTokens": 65536,
-    });
+    let mut generation_config = json!({});
     if let Some(thinking_config) = google_thinking_config(config) {
         generation_config["thinkingConfig"] = thinking_config;
     }
@@ -1173,7 +1168,6 @@ fn mistral_headers(config: &ProviderConfig, api_key: &str) -> Result<HeaderMap, 
 fn mistral_chat_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     json!({
         "model": config.model.id,
-        "max_tokens": 32000,
         "stream": true,
         "messages": openai_messages(request),
     })
@@ -1216,9 +1210,7 @@ fn bedrock_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     let mut body = json!({
         "modelId": config.model.id,
         "messages": bedrock_messages_with_cache(config, &request.messages),
-        "inferenceConfig": {
-            "maxTokens": 128000,
-        },
+        "inferenceConfig": {},
     });
     if let Some(system) = bedrock_system(config, request.system_prompt.as_deref()) {
         body["system"] = system;
@@ -2594,10 +2586,6 @@ mod tests {
             fixture_request["body"]["stream_options"]
         );
         assert_eq!(body["store"], fixture_request["body"]["store"]);
-        assert_eq!(
-            body["max_completion_tokens"],
-            fixture_request["body"]["max_completion_tokens"]
-        );
         assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
     }
 
@@ -2658,10 +2646,6 @@ mod tests {
         assert_eq!(body["input"], fixture_request["body"]["input"]);
         assert_eq!(body["store"], fixture_request["body"]["store"]);
         assert_eq!(body["stream"], fixture_request["body"]["stream"]);
-        assert_eq!(
-            body["max_output_tokens"],
-            fixture_request["body"]["max_output_tokens"]
-        );
         assert_eq!(body["include"], fixture_request["body"]["include"]);
         assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
     }
@@ -2818,7 +2802,6 @@ mod tests {
             body["stream_options"],
             fixture_request["body"]["stream_options"]
         );
-        assert_eq!(body["max_tokens"], fixture_request["body"]["max_tokens"]);
     }
 
     #[test]
@@ -2861,7 +2844,6 @@ mod tests {
 
         let body = mistral_chat_body(&config, &request);
         assert_eq!(body["model"], fixture_request["body"]["model"]);
-        assert_eq!(body["max_tokens"], fixture_request["body"]["max_tokens"]);
         assert_eq!(body["stream"], fixture_request["body"]["stream"]);
         assert_eq!(body["messages"], fixture_request["body"]["messages"]);
     }

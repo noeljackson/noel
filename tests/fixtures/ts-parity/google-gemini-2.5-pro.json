@@ -34,7 +34,6 @@
         "role": "user"
       },
       "generationConfig": {
-        "maxOutputTokens": 65536,
         "thinkingConfig": {
           "includeThoughts": true,
           "thinkingBudget": 32768

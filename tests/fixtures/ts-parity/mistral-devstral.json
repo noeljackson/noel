@@ -18,7 +18,6 @@
     },
     "body": {
       "model": "devstral-medium-latest",
-      "max_tokens": 32000,
       "stream": true,
       "messages": [
         {

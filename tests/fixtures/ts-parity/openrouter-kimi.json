@@ -38,7 +38,6 @@
         "include_usage": true
       },
       "store": false,
-      "max_completion_tokens": 32000,
       "reasoning": {
         "effort": "high"
       }

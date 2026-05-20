@@ -45,7 +45,6 @@
       ],
       "stream": true,
       "store": false,
-      "max_output_tokens": 128000,
       "reasoning": {
         "effort": "xhigh",
         "summary": "auto"
