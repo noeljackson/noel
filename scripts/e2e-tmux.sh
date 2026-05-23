@@ -76,9 +76,9 @@ if [ ! -f "${prompt_file}" ]; then
 fi
 
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/live-pane.txt"
-if ! grep -Fq "conversation" "${work_dir}/live-pane.txt"; then
+if ! grep -Fq "pi rust cli" "${work_dir}/live-pane.txt"; then
   cat "${work_dir}/live-pane.txt" >&2
-  echo "TUI conversation pane did not appear" >&2
+  echo "TUI transcript did not appear" >&2
   exit 1
 fi
 if ! grep -Fq "pi>" "${work_dir}/live-pane.txt"; then
@@ -104,6 +104,12 @@ send_line "/complete /extension:j"
 send_line "/status"
 send_line "/editor draft"
 send_line "/history"
+tmux send-keys -t "${session_name}" "wheel draft"
+sleep 0.1
+tmux send-keys -t "${session_name}" Escape "[<64;5;10M"
+sleep 0.1
+tmux send-keys -t "${session_name}" Enter
+sleep 0.35
 send_line "/image ${work_dir}/pixel.png describe image"
 send_line "/write ${cwd_dir}/file.txt e2e-ok"
 send_line "/read ${cwd_dir}/file.txt"
@@ -119,7 +125,7 @@ send_line "!!"
 tmux send-keys -t "${session_name}" "! sleep 1; printf delayed-shell-ok" Enter
 sleep 0.25
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/progress-pane.txt"
-if ! grep -Fq "running bash" "${work_dir}/progress-pane.txt"; then
+if ! grep -Fq "Running bash" "${work_dir}/progress-pane.txt"; then
   cat "${work_dir}/progress-pane.txt" >&2
   echo "shell progress was not visible while command was running" >&2
   exit 1
@@ -207,6 +213,7 @@ require_output "/extension:json-ext"
 require_output "status"
 require_output "[faux/echo] editor-prompt"
 require_output "hello from tmux e2e"
+require_output "[faux/echo] wheel draft"
 require_output "image/png"
 require_output "1x1"
 require_output "[faux/echo] describe image [media:1]"

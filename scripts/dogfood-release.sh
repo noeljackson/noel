@@ -62,7 +62,7 @@ if [ ! -f "${prompt_file}" ]; then
 fi
 
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/initial-pane.txt"
-grep -Fq "conversation" "${work_dir}/initial-pane.txt"
+grep -Fq "pi rust cli" "${work_dir}/initial-pane.txt"
 grep -Fq "pi>" "${work_dir}/initial-pane.txt"
 grep -Fq "faux/echo" "${work_dir}/initial-pane.txt"
 

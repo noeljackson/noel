@@ -10,7 +10,10 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 
-.PHONY: help build release install run fmt lint test check ci e2e dogfood dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-claude-opus-oauth clean
+RUN_ARGS ?=
+DOGFOOD_ARGS ?= --continue --model faux/echo
+
+.PHONY: help build release install run dogfood dogfood-release fmt lint test check ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -18,19 +21,21 @@ help:
 		'  build        Build the workspace' \
 		'  release      Build the pi CLI release binary' \
 		'  install      Install the pi CLI release binary to $$(PREFIX)/bin' \
-		'  run          Run the pi CLI' \
+		'  run          Run the pi CLI; pass RUN_ARGS="..." for CLI args' \
+		'  dogfood     Run dev TUI with rebuild/restart watcher' \
 		'  fmt          Check Rust formatting' \
 		'  lint         Run clippy with warnings denied' \
 		'  test         Run all Rust tests' \
 		'  check        Run fmt, lint, and test' \
 		'  ci           Run check and local tmux e2e' \
 		'  e2e          Run tmux TTY e2e' \
-		'  dogfood      Run release-binary tmux dogfood smoke' \
+		'  dogfood-release Run release-binary tmux dogfood smoke' \
 		'  dogfood-long Run long release-binary TTY paint/scroll smoke' \
 		'  dogfood-real Run optional real-provider TTY dogfood smoke' \
 		'  dogfood-real-print Run optional real-provider print smoke' \
 		'  test-smoke   Run local TTY smoke plus manual real-provider smoke' \
 		'  docker-e2e   Build and run Dockerized tmux TTY e2e' \
+		'  parity-check Run committed TS parity checks and drift detection' \
 		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
 		'  ts-parity-update    Refresh fixtures from moving TS reference inside Docker' \
 		'  ts-parity-drift     Check moving TS reference for fixture drift' \
@@ -50,7 +55,10 @@ install:
 	install -m 0755 target/release/pi "$(BINDIR)/pi"
 
 run:
-	$(CARGO) run -p pi-cli
+	$(CARGO) run -p pi-cli -- $(RUN_ARGS)
+
+dogfood:
+	CARGO="$(CARGO)" scripts/dogfood-dev.sh $(DOGFOOD_ARGS)
 
 fmt:
 	$(CARGO) fmt --all -- --check
@@ -68,7 +76,7 @@ ci: check e2e
 e2e:
 	scripts/e2e-tmux.sh
 
-dogfood: release
+dogfood-release: release
 	scripts/dogfood-release.sh
 
 dogfood-long: release
@@ -86,6 +94,12 @@ docker-build:
 
 docker-e2e: docker-build
 	$(DOCKER) run --rm $(E2E_IMAGE)
+
+parity-check:
+	$(CARGO) test -p pi-parity
+	$(CARGO) test -p pi-ai --lib matches_ts
+	$(CARGO) test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
+	$(MAKE) ts-parity-drift
 
 ts-parity-build:
 	$(DOCKER) build -f Dockerfile.ts-parity \
