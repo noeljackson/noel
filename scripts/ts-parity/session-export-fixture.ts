@@ -8,12 +8,25 @@ import {
 	type SessionHeader,
 } from "/ts-reference/packages/coding-agent/src/core/session-manager.ts";
 
+const FIXTURE_TIMESTAMP = "2024-01-01T00:00:00.000Z";
+
 function summarizeEntry(entry: SessionEntry) {
 	return {
 		type: entry.type,
 		parent: entry.parentId === null ? null : "set",
 		role: entry.type === "message" ? entry.message.role : undefined,
 	};
+}
+
+function messageText(entry: SessionEntry) {
+	if (entry.type !== "message") {
+		return "";
+	}
+	const content = entry.message.content;
+	if (typeof content === "string") {
+		return content;
+	}
+	return content.map((part) => "text" in part ? part.text : "").join("");
 }
 
 function linearizedBranchExport(session: SessionManager) {
@@ -31,6 +44,45 @@ function linearizedBranchExport(session: SessionManager) {
 		previousId = entry.id;
 	}
 	return lines.map((entry) => JSON.parse(JSON.stringify(entry)));
+}
+
+function fullTreeJsonlExport(session: SessionManager) {
+	const header: SessionHeader = {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id: session.getSessionId(),
+		timestamp: new Date().toISOString(),
+		cwd: session.getCwd(),
+	};
+	return [header, ...session.getEntries()].map((entry) => JSON.parse(JSON.stringify(entry)));
+}
+
+function normalizeFullTreeRecords(records: Record<string, unknown>[]) {
+	const idMap = new Map<string, string>();
+	for (const [index, record] of records.slice(1).entries()) {
+		const id = record.id;
+		if (typeof id === "string") {
+			idMap.set(id, `e${index + 1}`);
+		}
+	}
+	return records.map((record, index) => {
+		const normalized = { ...record };
+		normalized.timestamp = FIXTURE_TIMESTAMP;
+		if (index === 0) {
+			normalized.id = "session_ts_parity";
+			return normalized;
+		}
+		if (typeof record.id === "string") {
+			normalized.id = idMap.get(record.id) ?? record.id;
+		}
+		for (const key of ["parentId", "targetId", "firstKeptEntryId"]) {
+			const value = normalized[key];
+			if (typeof value === "string") {
+				normalized[key] = idMap.get(value) ?? value;
+			}
+		}
+		return normalized;
+	});
 }
 
 async function main() {
@@ -74,6 +126,7 @@ async function main() {
 	const entries = session.getEntries();
 	const branch = session.getBranch();
 	const exported = linearizedBranchExport(session);
+	const fullTreeExport = fullTreeJsonlExport(session);
 	const fixture = {
 		source: {
 			repository: "https://github.com/earendil-works/pi",
@@ -95,6 +148,15 @@ async function main() {
 			parentChain: exported.slice(1).map((entry) => entry.parentId === null ? null : "set"),
 			firstRecordVersion: exported[0]?.version,
 			firstRecordHasCwd: Boolean(exported[0]?.cwd),
+		},
+		fullTreeJsonlExport: {
+			records: normalizeFullTreeRecords(fullTreeExport),
+			activeMessageTexts: session.getBranch()
+				.filter((entry) => entry.type === "message")
+				.map(messageText),
+			abandonedMessageTexts: session.getEntries()
+				.filter((entry) => entry.type === "message" && !session.getBranch().includes(entry))
+				.map(messageText),
 		},
 	};
 

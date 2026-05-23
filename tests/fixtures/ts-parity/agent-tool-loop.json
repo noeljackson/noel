@@ -1,0 +1,77 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/agent-tool-loop-fixture.ts"
+  },
+  "toolLoop": {
+    "streamCalls": [
+      {
+        "roles": [
+          "user"
+        ],
+        "toolNames": [
+          "fixture_echo"
+        ],
+        "lastRole": "user"
+      },
+      {
+        "roles": [
+          "user",
+          "assistant",
+          "toolResult"
+        ],
+        "toolNames": [
+          "fixture_echo"
+        ],
+        "lastRole": "toolResult"
+      }
+    ],
+    "events": [
+      "agent_start",
+      "turn_start",
+      "message_start",
+      "message_end",
+      "message_start",
+      "message_end",
+      "tool_execution_start",
+      "tool_execution_end",
+      "message_start",
+      "message_end",
+      "turn_end",
+      "turn_start",
+      "message_start",
+      "message_end",
+      "turn_end",
+      "agent_end"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "text": "use the fixture tool",
+        "toolCallNames": [],
+        "toolResultFor": null
+      },
+      {
+        "role": "assistant",
+        "text": "",
+        "toolCallNames": [
+          "fixture_echo"
+        ],
+        "toolResultFor": null
+      },
+      {
+        "role": "toolResult",
+        "text": "echo:hello",
+        "toolCallNames": [],
+        "toolResultFor": "fixture_echo"
+      },
+      {
+        "role": "assistant",
+        "text": "final",
+        "toolCallNames": [],
+        "toolResultFor": null
+      }
+    ]
+  }
+}

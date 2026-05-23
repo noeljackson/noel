@@ -86,7 +86,6 @@ tmux send-keys -t "${session_name}" Escape
 sleep 0.3
 
 capture "${work_dir}/tail-pane.txt"
-grep -Fq "conversation" "${work_dir}/tail-pane.txt"
 grep -Fq "pi>" "${work_dir}/tail-pane.txt"
 grep -Fq "paint-tool-output" "${work_dir}/tail-pane.txt"
 if grep -Fq "paint-line-01" "${work_dir}/tail-pane.txt"; then
@@ -99,7 +98,7 @@ tmux send-keys -t "${session_name}" Home
 sleep 0.4
 capture "${work_dir}/top-pane.txt"
 grep -Fq "paint-line-01" "${work_dir}/top-pane.txt"
-grep -Fq "conversation" "${work_dir}/top-pane.txt"
+grep -Fq "pi rust cli" "${work_dir}/top-pane.txt"
 grep -Fq "pi>" "${work_dir}/top-pane.txt"
 
 tmux send-keys -t "${session_name}" End
@@ -115,14 +114,12 @@ fi
 tmux resize-window -t "${session_name}" -x 72 -y 18
 sleep 0.4
 capture "${work_dir}/small-pane.txt"
-grep -Fq "conversation" "${work_dir}/small-pane.txt"
 grep -Fq "pi>" "${work_dir}/small-pane.txt"
-grep -Fq "status" "${work_dir}/small-pane.txt"
+grep -Fq "model:" "${work_dir}/small-pane.txt"
 
 tmux resize-window -t "${session_name}" -x 132 -y 38
 sleep 0.4
 capture "${work_dir}/large-pane.txt"
-grep -Fq "conversation" "${work_dir}/large-pane.txt"
 grep -Fq "paint-tool-output" "${work_dir}/large-pane.txt"
 
 send_line "/export ${work_dir}/long-session.json"

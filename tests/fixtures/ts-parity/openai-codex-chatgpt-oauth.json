@@ -1,6 +1,7 @@
 {
   "source": {
-    "branch": "ts-reference",
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
     "script": "/ts-parity/codex-oauth-fixture.ts"
   },
   "provider": "openai-codex",

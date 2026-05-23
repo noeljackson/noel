@@ -26,6 +26,48 @@ Intentionally removed:
 - hot module reload
 - npm extension package management
 
+## Why Rust
+
+The active product is a terminal-first coding agent. Rust keeps the shipped path
+to one native binary with no Node.js runtime, no npm install step, and no browser
+UI dependency. That matters for dogfooding on remote shells, Raspberry Pi class
+machines, tmux sessions, and locked-down environments where a small predictable
+binary is easier to install, restart, and debug.
+
+The rewrite also makes terminal behavior a first-class part of the product. TTY
+input, mouse handling, scrollback, session replay, tool execution, provider
+streaming, and reload behavior live in one Cargo workspace instead of being split
+between a web UI, Node process, and package runtime.
+
+## How Development Works
+
+Use Cargo and Make targets only. The main binary is `crates/pi-cli`; shared
+behavior lives in `pi-core`, provider adapters in `pi-ai`, configuration in
+`pi-config`, local tools in `pi-tools`, terminal rendering helpers in `pi-tui`,
+and TypeScript parity checks in `pi-parity`.
+
+For normal local work:
+
+```bash
+make dogfood
+make check
+make e2e
+```
+
+`make dogfood` starts the development TUI with the faux provider and a Rust
+rebuild/restart watcher. Durable state stays in the session store, so a rebuild
+should not clear conversation messages, cwd, session identity, tool history,
+queued messages, or active context. `make check` runs formatting, clippy, and
+Rust tests. `make e2e` runs tmux-based terminal behavior checks.
+
+TypeScript is reference material, not a runtime dependency. Parity fixtures are
+generated only through Docker:
+
+```bash
+make parity-check
+make ts-parity-update
+```
+
 ## Build
 
 ```bash
@@ -62,6 +104,13 @@ Interactive mode:
 
 ```bash
 cargo run -p pi-cli
+```
+
+Local dogfood mode with session resume, the faux provider, and automatic
+rebuild/restart on Rust source changes:
+
+```bash
+make dogfood
 ```
 
 Print mode:
@@ -317,6 +366,28 @@ Omitting a resource key loads all resources of that type. `[]` loads none.
 Resource discovery honors `.gitignore`, `.ignore`, and `.fdignore` files in
 scanned resource directories.
 
+Executable extensions can opt into the JSON protocol with an adjacent
+`.pi-extension.json` manifest. A manifest `tools` array registers model-callable
+tools; Pi sends `kind: "tool"` JSON requests on stdin and expects a JSON
+response with `output` or `error`:
+
+```json
+{
+  "protocol": "json",
+  "tools": [
+    {
+      "name": "fixture_echo",
+      "description": "Echo text.",
+      "parameters": {
+        "type": "object",
+        "properties": { "text": { "type": "string" } },
+        "required": ["text"]
+      }
+    }
+  ]
+}
+```
+
 Resources can be disabled by name or wildcard through `disabledResources`, or
 managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 `pi config enable <extension|skill|prompt|theme> <name>`:
@@ -392,7 +463,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 
 `/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
 
-Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; `/editor` uses `PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`. Image inputs are encoded as provider attachments with terminal text fallback.
+Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history. `/editor` uses `PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`. Mouse wheel scrolls the transcript, terminal selection remains available through the terminal selection modifier, and bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 
 ## RPC Methods
 
@@ -418,7 +489,7 @@ make e2e
 Release-binary dogfood smoke:
 
 ```bash
-make dogfood
+make dogfood-release
 ```
 
 Long TTY paint and scroll dogfood:
@@ -466,6 +537,13 @@ Check for drift without accepting it:
 make ts-parity-drift
 ```
 
+Run the committed fixture inventory checks, Rust fixture assertions, and Docker
+drift check together:
+
+```bash
+make parity-check
+```
+
 `make ts-parity-drift` regenerates fixtures in Docker, compares them with the
 committed fixtures, and fails if they differ. On drift it writes:
 
@@ -490,9 +568,8 @@ When drift is intentional, update Rust behavior and committed fixtures together:
 
 ```bash
 make ts-parity-update
-cargo test -p pi-ai --lib matches_ts
+make parity-check
 make check
-make ts-parity-drift
 ```
 
 Parity fixtures prove compatibility only for covered provider paths and product
@@ -500,10 +577,32 @@ contracts. They do not prove full product parity, live provider success, or TUI
 behavior; those are covered by Rust unit tests, tmux e2e tests, and manual
 real-provider smoke tests.
 
+The parity inventory and deliberate non-parity decisions are tracked in
+`docs/rust-rewrite/parity-status.md` and
+`docs/rust-rewrite/non-parity-register.md`. The `pi-parity` crate keeps fixture
+inventory, fixture source metadata, redaction checks, and parity documentation
+in sync.
+
 Manual real-provider Opus smoke with Claude Code OAuth:
 
 ```bash
 make smoke-claude-opus-oauth
+```
+
+Generic opt-in real-provider print smoke:
+
+```bash
+PI_SMOKE_REAL=1 PI_SMOKE_REAL_MODEL=provider/model make smoke-real
+```
+
+Provider profile smokes:
+
+```bash
+PI_SMOKE_REAL=1 make smoke-real-openai
+PI_SMOKE_REAL=1 make smoke-real-anthropic
+PI_SMOKE_REAL=1 make smoke-real-gemini
+PI_SMOKE_REAL=1 make smoke-real-mistral
+PI_SMOKE_REAL=1 make smoke-real-openrouter
 ```
 
 Full manual smoke suite:
@@ -512,15 +611,24 @@ Full manual smoke suite:
 make test-smoke
 ```
 
-`make dogfood` builds `target/release/pi` and runs the binary in tmux with an
-isolated agent/session directory under `target/`. It uses the faux provider, so
-it does not require provider credentials or network access. `make dogfood-long`
-uses the same release binary and faux provider, but creates a long transcript,
-checks PageUp/Home and End scroll behavior, resizes the tmux pane, and verifies
-the exported session still contains the full transcript. `make dogfood-real`
-is opt-in and runs real Claude and Codex TTY smoke tests when local credentials
-are available. It asks each provider for a tiny Rust program and checks that a
-real assistant message contains the expected marker and `fn main`.
+`make dogfood` runs the development TUI with `--continue --model faux/echo`.
+It also starts a quiet background `cargo build -p pi-cli` watcher; successful
+rebuilds restart the running TUI process, and the continued session restores
+conversation messages from disk. Watcher output is written to
+`target/dogfood-dev/watch.log`. `make dogfood-release` builds
+`target/release/pi` and runs the binary in tmux with an isolated agent/session
+directory under `target/`. It uses the faux provider, so it does not require
+provider credentials or network access. `make dogfood-long` uses the same
+release binary and faux provider, but creates a long transcript, checks
+PageUp/Home and End scroll behavior, resizes the tmux pane, and verifies the
+exported session still contains the full transcript. `make dogfood-real` is
+opt-in and runs real Claude and Codex TTY smoke tests when local credentials are
+available. It asks each provider for a tiny Rust program and checks that a real
+assistant message contains the expected marker and `fn main`. `make smoke-real`
+is a generic print-mode live-provider smoke; it exits without network access
+unless `PI_SMOKE_REAL=1` and `PI_SMOKE_REAL_MODEL=provider/model` are set.
+The profile targets preselect default models for OpenAI, Anthropic, Gemini,
+Mistral, and OpenRouter while still using the normal auth resolver.
 
 The real TTY dogfood target can be narrowed with `PI_DOGFOOD_REAL_PROVIDERS`:
 
@@ -535,11 +643,18 @@ The default models can be overridden with `PI_DOGFOOD_CLAUDE_MODEL` and
 The real-provider smoke is intentionally not part of `test`, `check`, or `e2e`.
 It requires `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or
 `~/.claude/.credentials.json`, sends one tiny prompt to
-`anthropic/claude-opus-4-7`, and defaults to `--thinking max`. `test-smoke`
-runs local tmux e2e first, then the real-provider Opus OAuth smoke.
+`anthropic/claude-opus-4-7`, and defaults to `--thinking max`. The generic
+`smoke-real` target uses the normal auth resolver for the selected model and
+defaults to `--thinking off` unless `PI_SMOKE_REAL_THINKING` is set.
+Provider profile defaults can be overridden with `PI_SMOKE_OPENAI_MODEL`,
+`PI_SMOKE_ANTHROPIC_MODEL`, `PI_SMOKE_GEMINI_MODEL`, `PI_SMOKE_MISTRAL_MODEL`,
+or `PI_SMOKE_OPENROUTER_MODEL`. `PI_SMOKE_REAL_EXPECTED` changes the expected
+marker for all real-provider print smokes.
+`test-smoke` runs local tmux e2e first, then the opt-in generic real-provider
+smoke and the real-provider Opus OAuth smoke.
 
 ## Development Notes
 
 The old TypeScript implementation is preserved on the `ts-reference` branch for behavioral reference. Active development on `main` is Rust-only.
 
-Rust sessions use a new append-only JSONL schema plus JSON, JSONL, and HTML export/import where applicable. Legacy TypeScript session logs are not migrated automatically; keep `ts-reference` for reading old session behavior and export/import only through the Rust schema. `/share` writes a local HTML export; web or gist sharing is intentionally unsupported in the Rust-only CLI.
+Rust live sessions use an append-only replay JSONL log. JSONL export/import and direct session open support the TypeScript v3 session-tree shape where applicable, including a `type:"session"` header and entry `id`/`parentId` chain. Full in-place active-leaf tree editing is still tracked as parity work. Legacy TypeScript session logs are not migrated automatically; keep `ts-reference` for reading old session behavior. `/share` writes a local HTML export; web or gist sharing is intentionally unsupported in the Rust-only CLI.

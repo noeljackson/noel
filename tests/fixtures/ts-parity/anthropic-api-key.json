@@ -1,6 +1,7 @@
 {
   "source": {
-    "branch": "ts-reference",
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
     "script": "/ts-parity/anthropic-oauth-fixture.ts"
   },
   "provider": "anthropic",

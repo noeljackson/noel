@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Type } from "/ts-reference/packages/ai/src/index.ts";
 
 type CapturedRequest = {
 	url: string;
@@ -30,7 +31,79 @@ async function requestBody(input: RequestInfo | URL, init: RequestInit | undefin
 	return "";
 }
 
-async function captureMistralRequest(): Promise<CapturedRequest> {
+async function captureMistralRequest(withTools = false): Promise<CapturedRequest> {
+	return captureMistralRequestForContext({
+		systemPrompt: "pi rust cli",
+		messages: [
+			{
+				role: "user",
+				content: "hello",
+				timestamp: 0,
+			},
+		],
+		tools: withTools
+			? [
+					{
+						name: "fixture_echo",
+						description: "Echo text for the parity fixture.",
+						parameters: Type.Object({
+							text: Type.String(),
+						}),
+					},
+				]
+			: undefined,
+	});
+}
+
+async function captureMistralToolIdRequest(): Promise<CapturedRequest> {
+	return captureMistralRequestForContext({
+		messages: [
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "call_1",
+						name: "read",
+						arguments: { path: "a.txt" },
+					},
+				],
+				api: "openai-completions",
+				provider: "openai",
+				model: "gpt-4o-mini",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: 0,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call_1",
+				toolName: "read",
+				content: [{ type: "text", text: "file contents" }],
+				isError: false,
+				timestamp: 1,
+			},
+		],
+		tools: [
+			{
+				name: "read",
+				description: "Read a file",
+				parameters: Type.Object({
+					path: Type.String(),
+				}),
+			},
+		],
+	});
+}
+
+async function captureMistralRequestForContext(context: Record<string, unknown>): Promise<CapturedRequest> {
 	let captured: CapturedRequest | undefined;
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -54,16 +127,7 @@ async function captureMistralRequest(): Promise<CapturedRequest> {
 		const model = getModel("mistral", "devstral-medium-latest");
 		const stream = streamSimple(
 			model,
-			{
-				systemPrompt: "pi rust cli",
-				messages: [
-					{
-						role: "user",
-						content: "hello",
-						timestamp: 0,
-					},
-				],
-			},
+			context as never,
 			{
 				apiKey: "mistral_ts_parity_token",
 				reasoning: "high",
@@ -100,12 +164,47 @@ async function main() {
 		`${JSON.stringify(
 			{
 				source: {
-					branch: "ts-reference",
+					repository: "https://github.com/earendil-works/pi",
+					ref: "main",
 					script: fileURLToPath(import.meta.url),
 				},
 				provider: "mistral",
 				auth: "api-key",
 				request: await captureMistralRequest(),
+			},
+			null,
+			2,
+		)}\n`,
+	);
+	await writeFile(
+		join(outputDir, "mistral-tools.json"),
+		`${JSON.stringify(
+			{
+				source: {
+					repository: "https://github.com/earendil-works/pi",
+					ref: "main",
+					script: fileURLToPath(import.meta.url),
+				},
+				provider: "mistral",
+				auth: "api-key",
+				request: await captureMistralRequest(true),
+			},
+			null,
+			2,
+		)}\n`,
+	);
+	await writeFile(
+		join(outputDir, "mistral-tool-id.json"),
+		`${JSON.stringify(
+			{
+				source: {
+					repository: "https://github.com/earendil-works/pi",
+					ref: "main",
+					script: fileURLToPath(import.meta.url),
+				},
+				provider: "mistral",
+				auth: "api-key",
+				request: await captureMistralToolIdRequest(),
 			},
 			null,
 			2,

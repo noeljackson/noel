@@ -600,7 +600,8 @@ fn print_mode_exports_html_and_jsonl_sessions() {
     assert!(html_content.contains("<!doctype html>"));
     assert!(html_content.contains("html export"));
     let jsonl_content = fs::read_to_string(jsonl).expect("read jsonl export");
-    assert!(jsonl_content.contains("\"type\":\"started\""));
+    assert!(jsonl_content.contains("\"type\":\"session\""));
+    assert!(jsonl_content.contains("\"version\":3"));
     assert!(jsonl_content.contains("jsonl export"));
 
     let _ = fs::remove_dir_all(root);

@@ -1,0 +1,56 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/mistral-fixture.ts"
+  },
+  "provider": "mistral",
+  "auth": "api-key",
+  "request": {
+    "url": "https://api.mistral.ai/v1/chat/completions",
+    "method": "POST",
+    "headers": {
+      "accept": "text/event-stream",
+      "authorization": "Bearer <redacted>",
+      "content-type": "application/json",
+      "cookie": "",
+      "user-agent": "mistral-client-typescript/2.2.1",
+      "x-affinity": "session_ts_parity"
+    },
+    "body": {
+      "model": "devstral-medium-latest",
+      "stream": true,
+      "messages": [
+        {
+          "role": "system",
+          "content": "pi rust cli"
+        },
+        {
+          "role": "user",
+          "content": "hello"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "fixture_echo",
+            "description": "Echo text for the parity fixture.",
+            "strict": false,
+            "parameters": {
+              "type": "object",
+              "required": [
+                "text"
+              ],
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

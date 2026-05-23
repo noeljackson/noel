@@ -373,9 +373,16 @@ impl EditorState {
     }
 
     pub fn record_history(&mut self, value: impl Into<String>) {
-        let value = value.into();
-        if !value.trim().is_empty() {
-            self.history.push(value);
+        let value = value.into().trim().to_string();
+        if value.is_empty() {
+            return;
+        }
+        if self.history.last() == Some(&value) {
+            return;
+        }
+        self.history.push(value);
+        if self.history.len() > 100 {
+            self.history.remove(0);
         }
     }
 
@@ -709,7 +716,21 @@ mod tests {
         let mut editor = EditorState::default();
         editor.insert("hello");
         editor.record_history(editor.draft().to_string());
+        editor.record_history("hello");
+        editor.record_history("  ");
         assert_eq!(editor.history(), ["hello"]);
+        for index in 0..105 {
+            editor.record_history(format!("prompt {index}"));
+        }
+        assert_eq!(editor.history().len(), 100);
+        assert_eq!(
+            editor.history().first().map(String::as_str),
+            Some("prompt 5")
+        );
+        assert_eq!(
+            editor.history().last().map(String::as_str),
+            Some("prompt 104")
+        );
         assert_eq!(editor.kill_line(), Some("hello".to_string()));
         assert_eq!(editor.kill_ring(), ["hello"]);
         assert!(editor.undo());

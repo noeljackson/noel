@@ -71,7 +71,7 @@ jobs:
               '',
               '```bash',
               'make ts-parity-update',
-              'make ts-parity-drift',
+              'make parity-check',
               '```',
               '',
               'Agent brief is uploaded as the `ts-parity-drift` workflow artifact.',

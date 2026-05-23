@@ -105,7 +105,8 @@ async function main() {
 		`${JSON.stringify(
 			{
 				source: {
-					branch: "ts-reference",
+					repository: "https://github.com/earendil-works/pi",
+					ref: "main",
 					script: fileURLToPath(import.meta.url),
 				},
 				provider: "cloudflare-ai-gateway",

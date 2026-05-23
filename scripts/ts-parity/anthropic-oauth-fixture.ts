@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Type } from "/ts-reference/packages/ai/src/index.ts";
 
 type CapturedRequest = {
 	url: string;
@@ -30,7 +31,7 @@ async function requestBody(input: RequestInfo | URL, init: RequestInit | undefin
 	return "";
 }
 
-async function captureAnthropicRequest(apiKey: string): Promise<CapturedRequest> {
+async function captureAnthropicRequest(apiKey: string, withTools = false): Promise<CapturedRequest> {
 	let captured: CapturedRequest | undefined;
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -64,6 +65,17 @@ async function captureAnthropicRequest(apiKey: string): Promise<CapturedRequest>
 						timestamp: 0,
 					},
 				],
+				tools: withTools
+					? [
+							{
+								name: "fixture_echo",
+								description: "Echo text for the parity fixture.",
+								parameters: Type.Object({
+									text: Type.String(),
+								}),
+							},
+						]
+					: undefined,
 			},
 			{
 				apiKey,
@@ -101,7 +113,8 @@ async function main() {
 	await mkdir(outputDir, { recursive: true });
 	await writeFixture(outputDir, "anthropic-claude-code-oauth.json", {
 		source: {
-			branch: "ts-reference",
+			repository: "https://github.com/earendil-works/pi",
+			ref: "main",
 			script: fileURLToPath(import.meta.url),
 		},
 		provider: "anthropic",
@@ -110,12 +123,23 @@ async function main() {
 	});
 	await writeFixture(outputDir, "anthropic-api-key.json", {
 		source: {
-			branch: "ts-reference",
+			repository: "https://github.com/earendil-works/pi",
+			ref: "main",
 			script: fileURLToPath(import.meta.url),
 		},
 		provider: "anthropic",
 		auth: "api-key",
 		request: await captureAnthropicRequest("sk-ant-api03-ts-parity-token"),
+	});
+	await writeFixture(outputDir, "anthropic-tools.json", {
+		source: {
+			repository: "https://github.com/earendil-works/pi",
+			ref: "main",
+			script: fileURLToPath(import.meta.url),
+		},
+		provider: "anthropic",
+		auth: "api-key",
+		request: await captureAnthropicRequest("sk-ant-api03-ts-parity-token", true),
 	});
 }
 

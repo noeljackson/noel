@@ -1,8 +1,11 @@
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, Cursor, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +16,10 @@ use base64::Engine;
 use clap::CommandFactory;
 use clap::{Parser, ValueEnum};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -32,8 +38,8 @@ use pi_config::{
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
-    write_session_export, CompactionKind, MessageRole, ReloadableSystems, Runtime, SessionState,
-    SessionStore,
+    write_session_export, CompactionKind, ConversationMessage, MessageRole, ReloadableSystems,
+    Runtime, SessionState, SessionStore,
 };
 use pi_tui::{
     EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector, SelectorItem, SessionView,
@@ -2064,35 +2070,55 @@ async fn run_interactive(
     offline: bool,
 ) -> Result<()> {
     let mut app = TuiApp::new(&config, &runtime);
+    let auto_restart = AutoRestart::from_env();
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseWheelCapture
+    )?;
     let _restore = TerminalRestore;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    let mut restart = false;
     loop {
         app.refresh_chrome(&config, &runtime);
         terminal.draw(|frame| draw_tui(frame, &app))?;
+        if auto_restart.should_restart()? {
+            app.push(TuiEntryKind::System, "rebuilt; restarting");
+            terminal.draw(|frame| draw_tui(frame, &app))?;
+            restart = true;
+            break;
+        }
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let quit = match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                handle_tui_key(
+                    key,
+                    &mut terminal,
+                    &mut app,
+                    &mut runtime,
+                    &mut config,
+                    offline,
+                )
+                .await?
+            }
+            Event::Mouse(mouse) => {
+                handle_tui_mouse(mouse, &mut app, terminal.size()?.height);
+                false
+            }
+            Event::Paste(text) => {
+                app.paste_text(&text);
+                false
+            }
+            _ => false,
         };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        if handle_tui_key(
-            key,
-            &mut terminal,
-            &mut app,
-            &mut runtime,
-            &mut config,
-            offline,
-        )
-        .await?
-        {
+        if quit {
             break;
         }
     }
@@ -2101,7 +2127,89 @@ async fn run_interactive(
     if std::env::var("PI_TUI_E2E_DUMP").ok().as_deref() == Some("1") {
         println!("{}", app.transcript_text());
     }
+    if restart {
+        restart_current_process()?;
+    }
     Ok(())
+}
+
+struct AutoRestart {
+    executable: PathBuf,
+    modified: Option<SystemTime>,
+}
+
+impl AutoRestart {
+    fn from_env() -> Self {
+        let enabled = std::env::var("PI_DOGFOOD_AUTO_RESTART").ok().as_deref() == Some("1");
+        if !enabled {
+            return Self {
+                executable: PathBuf::new(),
+                modified: None,
+            };
+        }
+        let executable = std::env::var_os("PI_DOGFOOD_RESTART_EXE")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_default();
+        let modified = executable
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        Self {
+            executable,
+            modified,
+        }
+    }
+
+    fn should_restart(&self) -> Result<bool> {
+        let Some(modified) = self.modified else {
+            return Ok(false);
+        };
+        let current = self
+            .executable
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        Ok(current.map(|current| current != modified).unwrap_or(false))
+    }
+}
+
+#[cfg(unix)]
+fn restart_current_process() -> Result<()> {
+    let executable = std::env::var_os("PI_DOGFOOD_RESTART_EXE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+        .ok_or_else(|| anyhow!("failed to resolve restart executable"))?;
+    let error = Command::new(executable)
+        .args(restart_args_preserving_session_model())
+        .exec();
+    Err(error.into())
+}
+
+#[cfg(not(unix))]
+fn restart_current_process() -> Result<()> {
+    Err(anyhow!("dogfood auto-restart is only supported on Unix"))
+}
+
+fn restart_args_preserving_session_model() -> Vec<OsString> {
+    strip_restart_model_args(std::env::args_os().skip(1))
+}
+
+fn strip_restart_model_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut output = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--model" || arg == "--provider" {
+            let _ = args.next();
+            continue;
+        }
+        let text = arg.to_string_lossy();
+        if text.starts_with("--model=") || text.starts_with("--provider=") {
+            continue;
+        }
+        output.push(arg);
+    }
+    output
 }
 
 struct TerminalRestore;
@@ -2109,7 +2217,43 @@ struct TerminalRestore;
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseWheelCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableMouseWheelCapture;
+
+impl crossterm::Command for EnableMouseWheelCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        std::fmt::Write::write_str(f, "\x1b[?1000h\x1b[?1006h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mouse wheel capture is only supported through ANSI escape sequences",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableMouseWheelCapture;
+
+impl crossterm::Command for DisableMouseWheelCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        std::fmt::Write::write_str(f, "\x1b[?1006l\x1b[?1000l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -2338,6 +2482,8 @@ struct TuiApp {
     status: String,
     show_hardware_cursor: bool,
     chat_scroll: usize,
+    history_cursor: Option<usize>,
+    history_draft: Option<String>,
 }
 
 impl TuiApp {
@@ -2354,6 +2500,7 @@ impl TuiApp {
                 terminal_renderer(config).banner()
             ),
         );
+        app.restore_session_messages(runtime);
         app.status = footer_status(config, runtime, &app.editor_state);
         app
     }
@@ -2396,6 +2543,91 @@ impl TuiApp {
         }
     }
 
+    fn restore_session_messages(&mut self, runtime: &Runtime) {
+        for message in &runtime.session().messages {
+            let kind = match message.role {
+                MessageRole::User => TuiEntryKind::User,
+                MessageRole::Assistant => TuiEntryKind::Assistant,
+                MessageRole::Tool => TuiEntryKind::Tool,
+                MessageRole::System => TuiEntryKind::System,
+            };
+            let text = if message.role == MessageRole::Tool {
+                format_model_tool_message(message)
+            } else {
+                message.content.clone()
+            };
+            self.push(kind, text);
+            if message.role == MessageRole::User {
+                self.editor_state.record_history(message.content.clone());
+            }
+        }
+    }
+
+    fn history_previous(&mut self) {
+        let history = self.editor_state.history();
+        if history.is_empty() {
+            return;
+        }
+        let next = match self.history_cursor {
+            Some(cursor) => cursor.saturating_sub(1),
+            None => {
+                self.history_draft = Some(self.input.clone());
+                history.len().saturating_sub(1)
+            }
+        };
+        self.history_cursor = Some(next);
+        self.input = history[next].clone();
+    }
+
+    fn history_next(&mut self) {
+        let Some(cursor) = self.history_cursor else {
+            return;
+        };
+        let history = self.editor_state.history();
+        if cursor + 1 < history.len() {
+            let next = cursor + 1;
+            self.history_cursor = Some(next);
+            self.input = history[next].clone();
+        } else {
+            self.history_cursor = None;
+            self.input = self.history_draft.take().unwrap_or_default();
+        }
+    }
+
+    fn reset_history_navigation(&mut self) {
+        self.history_cursor = None;
+        self.history_draft = None;
+    }
+
+    fn paste_text(&mut self, text: &str) {
+        self.input.push_str(text);
+        self.reset_history_navigation();
+    }
+
+    fn scroll_chat_up(&mut self, amount: usize, max_scroll: usize) {
+        self.chat_scroll = self.chat_scroll.saturating_add(amount).min(max_scroll);
+    }
+
+    fn scroll_chat_down(&mut self, amount: usize, max_scroll: usize) {
+        self.chat_scroll = self.chat_scroll.min(max_scroll).saturating_sub(amount);
+    }
+
+    fn scroll_chat_top(&mut self, max_scroll: usize) {
+        self.chat_scroll = max_scroll;
+    }
+
+    fn chat_line_count(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| 2 + entry.text.lines().count())
+            .sum::<usize>()
+    }
+
+    fn max_chat_scroll(&self, terminal_height: u16) -> usize {
+        self.chat_line_count()
+            .saturating_sub(chat_available_lines(terminal_height))
+    }
+
     fn push_placeholder(&mut self, kind: TuiEntryKind, text: impl Into<String>) -> usize {
         self.chat_scroll = 0;
         self.entries.push(TuiEntry {
@@ -2415,6 +2647,16 @@ impl TuiApp {
         if let Some(entry) = self.entries.get_mut(index) {
             entry.text.push_str(text);
         }
+    }
+
+    fn insert_entry(&mut self, index: usize, kind: TuiEntryKind, text: impl Into<String>) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.chat_scroll = 0;
+        let index = index.min(self.entries.len());
+        self.entries.insert(index, TuiEntry { kind, text });
     }
 
     fn transcript_text(&self) -> String {
@@ -2441,80 +2683,189 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(4),
             Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(frame.area());
     draw_header(frame, root[0], app);
     draw_chat(frame, root[1], app);
-    draw_input(frame, root[2], app);
-    draw_footer(frame, root[3], app);
+    draw_input(frame, root[3], app);
+    draw_footer(frame, root[4], app);
     draw_selector_overlay(frame, app);
-    set_tui_cursor(frame, root[2], app);
+    set_tui_cursor(frame, root[3], app);
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph = Paragraph::new(app.header_line.as_str())
-        .style(Style::default().fg(Color::Gray))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.header_title.as_str()),
-        );
+    let paragraph = Paragraph::new(vec![
+        Line::from(Span::styled(
+            app.header_title.trim().to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            app.header_line.as_str(),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
     frame.render_widget(paragraph, area);
 }
 
 fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let mut lines = Vec::new();
     for entry in &app.entries {
-        let (label, style) = match entry.kind {
-            TuiEntryKind::System => ("system", Style::default().fg(Color::DarkGray)),
-            TuiEntryKind::User => (
-                "you",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+        match entry.kind {
+            TuiEntryKind::Tool => push_tool_lines(&mut lines, &entry.text),
+            TuiEntryKind::Error => push_marked_lines(
+                &mut lines,
+                "error",
+                &entry.text,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Red),
             ),
-            TuiEntryKind::Assistant => (
-                "assistant",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+            TuiEntryKind::System => push_marked_lines(
+                &mut lines,
+                "",
+                &entry.text,
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ),
-            TuiEntryKind::Tool => ("tool", Style::default().fg(Color::Green)),
-            TuiEntryKind::Error => ("error", Style::default().fg(Color::Red)),
-        };
-        lines.push(Line::from(vec![Span::styled(format!("{label} "), style)]));
-        for line in entry.text.lines() {
-            lines.push(Line::from(Span::raw(format!("  {line}"))));
+            TuiEntryKind::User | TuiEntryKind::Assistant => {
+                push_marked_lines(
+                    &mut lines,
+                    "",
+                    &entry.text,
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::White),
+                );
+            }
         }
         lines.push(Line::from(""));
     }
-    let available = area.height.saturating_sub(2) as usize;
+    let available = area.height as usize;
     let max_start = lines.len().saturating_sub(available);
     let start = max_start.saturating_sub(app.chat_scroll.min(max_start));
     let paragraph = Paragraph::new(lines[start..].to_vec())
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" conversation "),
-        );
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let title = if app.multiline.is_some() {
-        " multiline: enter . to submit "
+fn push_marked_lines(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    text: &str,
+    marker_style: Style,
+    text_style: Style,
+) {
+    let mut text_lines = text.lines();
+    let first = text_lines.next().unwrap_or_default();
+    let prefix = if label.is_empty() {
+        "• ".to_string()
     } else {
-        " pi> "
+        format!("• {label} ")
     };
-    let paragraph = Paragraph::new(app.input.as_str())
-        .style(Style::default().fg(Color::White))
+    lines.push(Line::from(vec![
+        Span::styled(prefix, marker_style),
+        Span::styled(first.to_string(), text_style),
+    ]));
+    for line in text_lines {
+        lines.push(Line::from(Span::styled(format!("  {line}"), text_style)));
+    }
+}
+
+fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str) {
+    let mut parts = text.lines();
+    let state = parts.next().unwrap_or_default();
+    let detail = parts.next().unwrap_or_default();
+    let title = match state {
+        "running bash" => "Running bash".to_string(),
+        "completed bash" => "Ran bash".to_string(),
+        "failed bash" => "Failed bash".to_string(),
+        "running" => format!("Running {detail}"),
+        "completed" => format!("Ran {detail}"),
+        "failed" => format!("Failed {detail}"),
+        _ if state.starts_with("running ") => {
+            format!("Running {}", state.trim_start_matches("running "))
+        }
+        _ if state.starts_with("completed ") => {
+            format!("Ran {}", state.trim_start_matches("completed "))
+        }
+        _ => "Ran tool".to_string(),
+    };
+    lines.push(Line::from(vec![
+        Span::styled("• ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if !detail.is_empty() && !matches!(state, "running" | "completed" | "failed") {
+        lines.push(Line::from(Span::styled(
+            format!("  {detail}"),
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    let output = parts.collect::<Vec<_>>().join("\n");
+    if !output.is_empty() {
+        for line in output.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    } else if state.starts_with("completed") {
+        lines.push(Line::from(Span::styled(
+            "  (no output)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+}
+
+fn chat_available_lines(terminal_height: u16) -> usize {
+    terminal_height
+        .saturating_sub(2)
+        .saturating_sub(1)
+        .saturating_sub(3)
+        .saturating_sub(1) as usize
+}
+
+fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let prompt = if app.multiline.is_some() {
+        "multi> "
+    } else {
+        "pi> "
+    };
+    let input_bg = Color::Rgb(48, 48, 48);
+    let input_style = Style::default().bg(input_bg);
+    let muted_style = Style::default().bg(input_bg);
+    let mut lines = vec![
+        Line::from(Span::styled("", input_style)),
+        Line::from(vec![
+            Span::styled(prompt, muted_style),
+            Span::styled(app.input.as_str(), input_style),
+        ]),
+    ];
+    if app.multiline.is_some() {
+        lines.push(Line::from(Span::styled(
+            "submit with . on its own line",
+            muted_style,
+        )));
+    } else {
+        lines.push(Line::from(Span::styled("", input_style)));
+    }
+    frame.render_widget(Block::default().style(Style::default().bg(input_bg)), area);
+    let paragraph = Paragraph::new(lines)
+        .style(input_style)
         .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(Block::default().style(input_style));
     frame.render_widget(paragraph, area);
 }
 
@@ -2624,13 +2975,13 @@ fn set_tui_cursor(frame: &mut Frame<'_>, input_area: Rect, app: &TuiApp) {
     let max_x = input_area.right().saturating_sub(2);
     let x = input_area
         .x
-        .saturating_add(1)
+        .saturating_add(if app.multiline.is_some() { 7 } else { 4 })
         .saturating_add(app.input.chars().count() as u16)
         .min(max_x);
     let y = input_area
         .y
         .saturating_add(1)
-        .min(input_area.bottom().saturating_sub(2));
+        .min(input_area.bottom().saturating_sub(1));
     frame.set_cursor_position(Position::new(x, y));
 }
 
@@ -2681,18 +3032,29 @@ async fn handle_tui_key(
         KeyCode::Esc => {
             app.input.clear();
             app.multiline = None;
+            app.reset_history_navigation();
         }
         KeyCode::Backspace => {
             app.input.pop();
+            app.reset_history_navigation();
+        }
+        KeyCode::Up if app.multiline.is_none() => {
+            app.history_previous();
+        }
+        KeyCode::Down if app.multiline.is_none() => {
+            app.history_next();
         }
         KeyCode::PageUp => {
-            app.chat_scroll = app.chat_scroll.saturating_add(10);
+            let max_scroll = app.max_chat_scroll(terminal.size()?.height);
+            app.scroll_chat_up(10, max_scroll);
         }
         KeyCode::PageDown => {
-            app.chat_scroll = app.chat_scroll.saturating_sub(10);
+            let max_scroll = app.max_chat_scroll(terminal.size()?.height);
+            app.scroll_chat_down(10, max_scroll);
         }
         KeyCode::Home => {
-            app.chat_scroll = usize::MAX;
+            let max_scroll = app.max_chat_scroll(terminal.size()?.height);
+            app.scroll_chat_top(max_scroll);
         }
         KeyCode::End => {
             app.chat_scroll = 0;
@@ -2700,6 +3062,7 @@ async fn handle_tui_key(
         KeyCode::Enter => {
             let line = app.input.trim().to_string();
             app.input.clear();
+            app.reset_history_navigation();
             if !line.is_empty() {
                 let quit = match handle_tui_submission(
                     app, terminal, runtime, config, offline, line,
@@ -2721,11 +3084,21 @@ async fn handle_tui_key(
         }
         KeyCode::Char(ch) => {
             app.input.push(ch);
+            app.reset_history_navigation();
         }
         _ => {}
     }
     app.refresh_chrome(config, runtime);
     Ok(false)
+}
+
+fn handle_tui_mouse(mouse: MouseEvent, app: &mut TuiApp, terminal_height: u16) {
+    let max_scroll = app.max_chat_scroll(terminal_height);
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_chat_up(3, max_scroll),
+        MouseEventKind::ScrollDown => app.scroll_chat_down(3, max_scroll),
+        _ => {}
+    }
 }
 
 fn handle_tui_selector_key(
@@ -3665,12 +4038,14 @@ async fn run_prompt_once_tui(
     );
     terminal.draw(|frame| draw_tui(frame, app))?;
     let provider = provider_for_runtime(runtime, config, offline)?;
+    let message_start = runtime.session().messages.len();
     if kind == TuiEntryKind::Tool {
+        let tool_prompt = prompt.clone();
         let response =
             run_user_turn_streaming_with_media(runtime, provider.as_ref(), prompt, media, |_| {})
                 .await?;
         if progress_enabled {
-            app.replace_entry(entry_index, format_tool_completed(&response));
+            app.replace_entry(entry_index, format_tool_completed(&tool_prompt, &response));
         } else {
             app.replace_entry(entry_index, response);
         }
@@ -3692,8 +4067,36 @@ async fn run_prompt_once_tui(
     if !saw_delta {
         app.replace_entry(entry_index, response);
     }
+    insert_new_tool_messages(app, runtime, message_start, entry_index);
     terminal.draw(|frame| draw_tui(frame, app))?;
     Ok(())
+}
+
+fn insert_new_tool_messages(
+    app: &mut TuiApp,
+    runtime: &Runtime,
+    message_start: usize,
+    assistant_entry_index: usize,
+) {
+    let tool_messages = runtime
+        .session()
+        .messages
+        .iter()
+        .skip(message_start)
+        .filter(|message| message.role == MessageRole::Tool)
+        .map(format_model_tool_message)
+        .collect::<Vec<_>>();
+    for (offset, text) in tool_messages.into_iter().enumerate() {
+        app.insert_entry(assistant_entry_index + offset, TuiEntryKind::Tool, text);
+    }
+}
+
+fn format_model_tool_message(message: &ConversationMessage) -> String {
+    let tool_name = message.tool_name.as_deref().unwrap_or("tool");
+    if message.content.trim().is_empty() {
+        return format!("completed {tool_name}");
+    }
+    format!("completed {tool_name}\n{}", message.content)
 }
 
 fn response_kind_for_prompt(prompt: &str) -> TuiEntryKind {
@@ -3724,8 +4127,12 @@ fn format_tool_running(prompt: &str) -> String {
     format!("running {command}\n{detail}")
 }
 
-fn format_tool_completed(output: &str) -> String {
-    format!("completed\n{output}")
+fn format_tool_completed(prompt: &str, output: &str) -> String {
+    let (command, detail) = split_once_text(prompt.trim());
+    if detail.is_empty() {
+        return format!("completed {command}\n{output}");
+    }
+    format!("completed {command}\n{detail}\n{output}")
 }
 
 fn format_bash_running(command: &str) -> String {
@@ -4174,7 +4581,24 @@ fn format_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &Editor
 }
 
 fn footer_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) -> String {
-    format_status(config, runtime, editor_state)
+    format!(
+        "model: {}  thinking: {}  theme: {}  queue: {}  history: {}  diagnostics: {}",
+        runtime
+            .session()
+            .active_model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .unwrap_or_else(|| "-".to_string()),
+        active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string()),
+        config
+            .settings
+            .theme
+            .clone()
+            .unwrap_or_else(|| "-".to_string()),
+        runtime.session().queued_messages.len(),
+        editor_state.history().len(),
+        config.diagnostics.len()
+    )
 }
 
 fn format_media_fallback(media: &MediaInput) -> String {
@@ -5085,6 +5509,185 @@ mod tests {
         assert!(command_completions(&config, "/skill:r").contains(&"/skill:review".to_string()));
         assert!(command_completions(&config, "/prompt f").contains(&"/prompt fix".to_string()));
         assert!(command_completions(&config, "/theme d").contains(&"/theme dark".to_string()));
+    }
+
+    #[test]
+    fn chat_scroll_can_page_down_after_jumping_to_top() {
+        let mut app = TuiApp::default();
+        for index in 0..40 {
+            app.entries.push(TuiEntry {
+                kind: TuiEntryKind::User,
+                text: format!("message {index}"),
+            });
+        }
+        let max_scroll = app.max_chat_scroll(24);
+
+        app.scroll_chat_top(max_scroll);
+        assert_eq!(app.chat_scroll, max_scroll);
+
+        app.scroll_chat_down(10, max_scroll);
+        assert_eq!(app.chat_scroll, max_scroll.saturating_sub(10));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_chat_without_prompt_history() {
+        let mut app = TuiApp::default();
+        app.editor_state.record_history("previous prompt");
+        app.input = "draft".to_string();
+        for index in 0..40 {
+            app.entries.push(TuiEntry {
+                kind: TuiEntryKind::User,
+                text: format!("message {index}"),
+            });
+        }
+
+        handle_tui_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            },
+            &mut app,
+            24,
+        );
+
+        assert!(app.chat_scroll > 0);
+        assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn prompt_history_navigates_with_draft_restore() {
+        let mut app = TuiApp::default();
+        app.editor_state.record_history("first");
+        app.editor_state.record_history("second");
+        app.input = "draft".to_string();
+
+        app.history_previous();
+        assert_eq!(app.input, "second");
+        app.history_previous();
+        assert_eq!(app.input, "first");
+        app.history_previous();
+        assert_eq!(app.input, "first");
+
+        app.history_next();
+        assert_eq!(app.input, "second");
+        app.history_next();
+        assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn restored_session_user_messages_populate_prompt_history() {
+        let mut session = SessionState::new("session-1", PathBuf::from("."));
+        session.messages.push(ConversationMessage {
+            role: MessageRole::User,
+            content: "first prompt".to_string(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        });
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            content: "first response".to_string(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        });
+        session.messages.push(ConversationMessage {
+            role: MessageRole::User,
+            content: "second prompt".to_string(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        });
+        let runtime = Runtime::new(session, ReloadableSystems::default());
+        let mut app = TuiApp::default();
+
+        app.restore_session_messages(&runtime);
+        app.history_previous();
+        assert_eq!(app.input, "second prompt");
+        app.history_previous();
+        assert_eq!(app.input, "first prompt");
+    }
+
+    #[test]
+    fn bracketed_paste_appends_to_input_and_exits_history_navigation() {
+        let mut app = TuiApp::default();
+        app.editor_state.record_history("old prompt");
+        app.history_previous();
+        assert_eq!(app.input, "old prompt");
+
+        app.paste_text(" pasted");
+        assert_eq!(app.input, "old prompt pasted");
+        app.history_next();
+        assert_eq!(app.input, "old prompt pasted");
+    }
+
+    #[test]
+    fn model_tool_messages_render_before_final_assistant_entry() {
+        let mut app = TuiApp::default();
+        app.push(TuiEntryKind::User, "read a file");
+        let assistant_index = app.push_placeholder(TuiEntryKind::Assistant, "done");
+        let mut session = SessionState::new("session-1", PathBuf::from("."));
+        session.messages.push(ConversationMessage {
+            role: MessageRole::User,
+            content: "read a file".to_string(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        });
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Tool,
+            content: "file contents".to_string(),
+            media: Vec::new(),
+            tool_call_id: Some("call_1".to_string()),
+            tool_name: Some("read".to_string()),
+            tool_calls: Vec::new(),
+        });
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            content: "done".to_string(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        });
+        let runtime = Runtime::new(session, ReloadableSystems::default());
+
+        insert_new_tool_messages(&mut app, &runtime, 1, assistant_index);
+
+        assert_eq!(app.entries[1].kind, TuiEntryKind::Tool);
+        assert_eq!(app.entries[1].text, "completed read\nfile contents");
+        assert_eq!(app.entries[2].kind, TuiEntryKind::Assistant);
+        assert_eq!(app.entries[2].text, "done");
+    }
+
+    #[test]
+    fn dogfood_restart_drops_model_cli_overrides() {
+        let args = [
+            "--continue",
+            "--model",
+            "faux/echo",
+            "--provider=openai",
+            "--theme",
+            "dark",
+        ]
+        .into_iter()
+        .map(OsString::from);
+
+        let filtered = strip_restart_model_args(args);
+
+        assert_eq!(
+            filtered,
+            ["--continue", "--theme", "dark"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

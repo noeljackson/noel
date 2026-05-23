@@ -1,10 +1,11 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Type } from "/ts-reference/packages/ai/src/index.ts";
 import { getModel } from "/ts-reference/packages/ai/src/models.ts";
 import { streamSimple } from "/ts-reference/packages/ai/src/stream.ts";
 
-async function captureBedrockPayload(): Promise<unknown> {
+async function captureBedrockPayload(withTools = false): Promise<unknown> {
 	let captured: unknown;
 	const model = getModel("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1");
 	const stream = streamSimple(
@@ -18,6 +19,17 @@ async function captureBedrockPayload(): Promise<unknown> {
 					timestamp: 0,
 				},
 			],
+			tools: withTools
+				? [
+						{
+							name: "fixture_echo",
+							description: "Echo text for the parity fixture.",
+							parameters: Type.Object({
+								text: Type.String(),
+							}),
+						},
+					]
+				: undefined,
 		},
 		{
 			reasoning: "xhigh",
@@ -45,12 +57,30 @@ async function main() {
 		`${JSON.stringify(
 			{
 				source: {
-					branch: "ts-reference",
+					repository: "https://github.com/earendil-works/pi",
+					ref: "main",
 					script: fileURLToPath(import.meta.url),
 				},
 				provider: "amazon-bedrock",
 				auth: "payload-only",
 				payload: await captureBedrockPayload(),
+			},
+			null,
+			2,
+		)}\n`,
+	);
+	await writeFile(
+		join(outputDir, "bedrock-tools.json"),
+		`${JSON.stringify(
+			{
+				source: {
+					repository: "https://github.com/earendil-works/pi",
+					ref: "main",
+					script: fileURLToPath(import.meta.url),
+				},
+				provider: "amazon-bedrock",
+				auth: "payload-only",
+				payload: await captureBedrockPayload(true),
 			},
 			null,
 			2,

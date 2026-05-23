@@ -192,12 +192,15 @@ Validation rules:
 
 ## Session Model
 
-Rust sessions use an append-only JSONL log.
+Rust live sessions use an append-only replay JSONL log. JSONL export/import and
+direct session open support the TypeScript v3 session-tree shape where
+applicable, with a `session` header and entry `id`/`parentId` chain.
 
 Required properties:
 
 - Durable across process restarts.
-- Supports session tree/fork/clone operations.
+- Supports fork/clone operations and TS-shaped JSONL open/export/import.
+- Full in-place active-leaf session-tree editing remains parity work.
 - Can recover partial sessions after process interruption.
 - Can be tested with in-memory and temp-dir storage.
 - Persists active model and active thinking level.
@@ -342,6 +345,9 @@ Extension execution supports:
 - Raw executable extensions.
 - JSON stdio executable extensions.
 - JSON lifecycle events for `reload` and `shutdown`.
+- JSON model-tool registration from adjacent `.pi-extension.json` manifests.
+  Registered tools receive `kind: "tool"` protocol requests and return JSON
+  command responses.
 - Diagnostics for manifest and lifecycle failures.
 
 Intentionally unsupported:
@@ -352,7 +358,7 @@ Intentionally unsupported:
 - TypeScript UI primitive/custom renderer APIs.
 
 Future Rust extension work should build on the JSON executable protocol with a
-Rust SDK, tool registration helpers, or provider registration helpers.
+Rust SDK or provider registration helpers.
 
 ## Validation
 
@@ -364,6 +370,7 @@ Primary validation:
 - `make check`
 - `make e2e`
 - `make docker-e2e`
+- `make parity-check`
 
 Manual validation:
 
@@ -374,7 +381,9 @@ Manual validation:
 - `make ts-parity-drift`
 - `make ts-parity-agent`
 
-`make ts-parity-fixtures` is the only supported path for executing TypeScript
+`make parity-check` runs the committed fixture inventory checks, Rust
+fixture-backed assertions, and Docker drift detection. `make
+ts-parity-fixtures` is the only supported path for executing TypeScript
 reference code. It runs npm inside Docker only and defaults to the upstream
 TypeScript repository `https://github.com/earendil-works/pi` on `main`. `make
 ts-parity-update` refreshes fixtures from the moving reference ref. `make ts-parity-drift`
@@ -389,6 +398,8 @@ Rust `pi-ai` tests compare local builders against those captures. When upstream
 changes, the drift harness produces both a raw diff and an agent-oriented brief
 that states the constraints: no host npm, TypeScript only in Docker, keep Rust
 changes scoped to parity behavior, and rerun Rust validation before committing.
+The `pi-parity` crate owns fixture inventory, source metadata, script-output
+mapping, redaction checks, and parity documentation coverage.
 
 This is request-shape parity, not a live-provider guarantee. Full product
 coverage still relies on Rust unit tests, tmux TTY e2e, and manual real-provider
