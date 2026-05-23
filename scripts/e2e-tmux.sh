@@ -97,6 +97,18 @@ send_enter() {
   sleep 0.35
 }
 
+tmux send-keys -t "${session_name}" Escape "[<0;1;3M"
+sleep 0.1
+tmux send-keys -t "${session_name}" Escape "[<32;1;4M"
+sleep 0.1
+tmux send-keys -t "${session_name}" Escape "[<0;1;4m"
+sleep 0.35
+if ! grep -Fq "pi rust cli" "${work_dir}/clipboard.txt"; then
+  cat "${work_dir}/clipboard.txt" >&2 || true
+  echo "mouse selection did not copy transcript text" >&2
+  exit 1
+fi
+
 send_line "/session"
 send_line "hello from tmux e2e"
 send_line "/complete /mo"
