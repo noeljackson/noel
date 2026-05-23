@@ -463,7 +463,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 
 `/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
 
-Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history. `/editor` uses `PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`. Mouse wheel, `PageUp`, `PageDown`, `Home`, and `End` scroll the transcript. Mouse drag selects visible transcript rows and copies the selection on release through the normal clipboard path. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
+Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history. `/editor` uses `PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`. The TUI runs in an inline terminal viewport: finalized transcript rows are written to normal terminal scrollback, so native mouse selection and mouse-wheel scrollback remain terminal-owned while Up/Down navigate prompt history. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 
 ## RPC Methods
 
@@ -620,7 +620,7 @@ conversation messages from disk. Watcher output is written to
 directory under `target/`. It uses the faux provider, so it does not require
 provider credentials or network access. `make dogfood-long` uses the same
 release binary and faux provider, but creates a long transcript, checks
-PageUp/Home and End scroll behavior, resizes the tmux pane, and verifies the
+terminal scrollback output, resizes the tmux pane, and verifies the
 exported session still contains the full transcript. `make dogfood-real` is
 opt-in and runs real Claude and Codex TTY smoke tests when local credentials are
 available. It asks each provider for a tiny Rust program and checks that a real

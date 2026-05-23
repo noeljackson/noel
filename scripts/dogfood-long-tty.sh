@@ -65,6 +65,10 @@ send_line() {
 }
 
 capture() {
+  tmux capture-pane -t "${session_name}" -p > "$1"
+}
+
+capture_scrollback() {
   tmux capture-pane -t "${session_name}" -p -S -2000 > "$1"
 }
 
@@ -94,22 +98,10 @@ if grep -Fq "paint-line-01" "${work_dir}/tail-pane.txt"; then
   exit 1
 fi
 
-tmux send-keys -t "${session_name}" Home
-sleep 0.4
-capture "${work_dir}/top-pane.txt"
-grep -Fq "paint-line-01" "${work_dir}/top-pane.txt"
-grep -Fq "pi rust cli" "${work_dir}/top-pane.txt"
-grep -Fq "pi>" "${work_dir}/top-pane.txt"
-
-tmux send-keys -t "${session_name}" End
-sleep 0.4
-capture "${work_dir}/end-pane.txt"
-grep -Fq "paint-tool-output" "${work_dir}/end-pane.txt"
-if grep -Fq "paint-line-01" "${work_dir}/end-pane.txt"; then
-  cat "${work_dir}/end-pane.txt" >&2
-  echo "end key did not return the viewport to the tail" >&2
-  exit 1
-fi
+capture_scrollback "${work_dir}/scrollback-pane.txt"
+grep -Fq "paint-line-01" "${work_dir}/scrollback-pane.txt"
+grep -Fq "pi rust cli" "${work_dir}/scrollback-pane.txt"
+grep -Fq "pi>" "${work_dir}/scrollback-pane.txt"
 
 tmux resize-window -t "${session_name}" -x 72 -y 18
 sleep 0.4
@@ -125,7 +117,7 @@ grep -Fq "paint-tool-output" "${work_dir}/large-pane.txt"
 send_line "/export ${work_dir}/long-session.json"
 send_line "/quit"
 sleep 0.5
-capture "${work_dir}/transcript.txt"
+capture_scrollback "${work_dir}/transcript.txt"
 
 grep -Fq "paint-line-01" "${work_dir}/transcript.txt"
 grep -Fq "paint-line-36" "${work_dir}/transcript.txt"

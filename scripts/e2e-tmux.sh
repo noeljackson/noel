@@ -97,18 +97,6 @@ send_enter() {
   sleep 0.35
 }
 
-tmux send-keys -t "${session_name}" Escape "[<0;1;3M"
-sleep 0.1
-tmux send-keys -t "${session_name}" Escape "[<32;1;4M"
-sleep 0.1
-tmux send-keys -t "${session_name}" Escape "[<0;1;4m"
-sleep 0.35
-if ! grep -Fq "pi rust cli" "${work_dir}/clipboard.txt"; then
-  cat "${work_dir}/clipboard.txt" >&2 || true
-  echo "mouse selection did not copy transcript text" >&2
-  exit 1
-fi
-
 send_line "/session"
 send_line "hello from tmux e2e"
 send_line "/complete /mo"
@@ -116,6 +104,9 @@ send_line "/complete /extension:j"
 send_line "/status"
 send_line "/editor draft"
 send_line "/history"
+send_line "history seed"
+tmux send-keys -t "${session_name}" "history draft" Up Down Enter
+sleep 0.35
 tmux send-keys -t "${session_name}" "wheel draft"
 sleep 0.1
 tmux send-keys -t "${session_name}" Escape "[<64;5;10M"
@@ -225,6 +216,7 @@ require_output "/extension:json-ext"
 require_output "status"
 require_output "[faux/echo] editor-prompt"
 require_output "hello from tmux e2e"
+require_output "[faux/echo] history draft"
 require_output "[faux/echo] wheel draft"
 require_output "image/png"
 require_output "1x1"
