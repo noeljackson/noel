@@ -547,6 +547,12 @@ Manual real-provider Opus smoke with Claude Code OAuth:
 make smoke-claude-opus-oauth
 ```
 
+Generic opt-in real-provider print smoke:
+
+```bash
+PI_SMOKE_REAL=1 PI_SMOKE_REAL_MODEL=provider/model make smoke-real
+```
+
 Full manual smoke suite:
 
 ```bash
@@ -566,7 +572,9 @@ PageUp/Home and End scroll behavior, resizes the tmux pane, and verifies the
 exported session still contains the full transcript. `make dogfood-real` is
 opt-in and runs real Claude and Codex TTY smoke tests when local credentials are
 available. It asks each provider for a tiny Rust program and checks that a real
-assistant message contains the expected marker and `fn main`.
+assistant message contains the expected marker and `fn main`. `make smoke-real`
+is a generic print-mode live-provider smoke; it exits without network access
+unless `PI_SMOKE_REAL=1` and `PI_SMOKE_REAL_MODEL=provider/model` are set.
 
 The real TTY dogfood target can be narrowed with `PI_DOGFOOD_REAL_PROVIDERS`:
 
@@ -581,8 +589,11 @@ The default models can be overridden with `PI_DOGFOOD_CLAUDE_MODEL` and
 The real-provider smoke is intentionally not part of `test`, `check`, or `e2e`.
 It requires `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or
 `~/.claude/.credentials.json`, sends one tiny prompt to
-`anthropic/claude-opus-4-7`, and defaults to `--thinking max`. `test-smoke`
-runs local tmux e2e first, then the real-provider Opus OAuth smoke.
+`anthropic/claude-opus-4-7`, and defaults to `--thinking max`. The generic
+`smoke-real` target uses the normal auth resolver for the selected model and
+defaults to `--thinking off` unless `PI_SMOKE_REAL_THINKING` is set.
+`test-smoke` runs local tmux e2e first, then the opt-in generic real-provider
+smoke and the real-provider Opus OAuth smoke.
 
 ## Development Notes
 

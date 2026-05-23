@@ -13,7 +13,7 @@ INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install run dogfood dogfood-release fmt lint test check ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-claude-opus-oauth clean
+.PHONY: help build release install run dogfood dogfood-release fmt lint test check ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-real smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -34,6 +34,7 @@ help:
 		'  dogfood-real Run optional real-provider TTY dogfood smoke' \
 		'  dogfood-real-print Run optional real-provider print smoke' \
 		'  test-smoke   Run local TTY smoke plus manual real-provider smoke' \
+		'  smoke-real   Run opt-in generic real-provider print smoke' \
 		'  docker-e2e   Build and run Dockerized tmux TTY e2e' \
 		'  parity-check Run committed TS parity checks and drift detection' \
 		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
@@ -87,7 +88,7 @@ dogfood-real: release
 
 dogfood-real-print: smoke-claude-opus-oauth
 
-test-smoke: e2e smoke-claude-opus-oauth
+test-smoke: e2e smoke-real smoke-claude-opus-oauth
 
 docker-build:
 	$(DOCKER) build -f Dockerfile.e2e -t $(E2E_IMAGE) .
@@ -119,6 +120,9 @@ ts-parity-drift:
 
 ts-parity-agent:
 	scripts/ts-parity-drift.sh
+
+smoke-real:
+	CARGO="$(CARGO)" scripts/smoke-real-provider.sh
 
 smoke-claude-opus-oauth:
 	CARGO="$(CARGO)" scripts/smoke-claude-opus-oauth.sh
