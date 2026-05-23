@@ -345,6 +345,9 @@ Extension execution supports:
 - Raw executable extensions.
 - JSON stdio executable extensions.
 - JSON lifecycle events for `reload` and `shutdown`.
+- JSON model-tool registration from adjacent `.pi-extension.json` manifests.
+  Registered tools receive `kind: "tool"` protocol requests and return JSON
+  command responses.
 - Diagnostics for manifest and lifecycle failures.
 
 Intentionally unsupported:
@@ -355,7 +358,7 @@ Intentionally unsupported:
 - TypeScript UI primitive/custom renderer APIs.
 
 Future Rust extension work should build on the JSON executable protocol with a
-Rust SDK, tool registration helpers, or provider registration helpers.
+Rust SDK or provider registration helpers.
 
 ## Validation
 

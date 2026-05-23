@@ -54,12 +54,3 @@ Reason: provider sampling, shell timing, terminal dimensions, and network state
 make full transcripts brittle. The harness instead captures deterministic
 contracts for request shape, normalized messages, tool dispatch, storage,
 settings, and TUI markers.
-
-### Plugin Runtime Surface Is Not Fully Ported Yet
-
-Rust currently loads resource metadata and JSON executable extension lifecycle
-hooks, but it does not clone the full TypeScript plugin runtime.
-
-Reason: model-callable tools and provider/session parity are higher-priority
-cutover blockers. A Rust plugin hook surface should be designed explicitly
-instead of inheriting arbitrary TypeScript execution semantics.

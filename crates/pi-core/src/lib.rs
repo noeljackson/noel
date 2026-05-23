@@ -1,7 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,13 +10,15 @@ use pi_ai::{
     ChatMessage, ChatRole, ChatToolCall, MediaInput, ModelRef, Provider, ProviderError,
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
 };
-use pi_config::{has_auth_for_provider, LoadedConfig};
+use pi_config::{has_auth_for_provider, LoadedConfig, ResourceFile};
 use pi_tools::{
     builtin_tool_definitions, execute_tool, ToolError, ToolRequest, ToolRuntimeOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,10 +196,21 @@ pub struct ReloadableSystems {
     pub available_models: Vec<ModelRef>,
     pub configured_providers: BTreeSet<String>,
     pub available_tool_names: BTreeSet<String>,
+    pub extension_tools: BTreeMap<String, ExtensionTool>,
     pub keybinding_generation: u64,
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
     pub retry: RuntimeRetrySettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+    pub extension_name: String,
+    pub extension_path: PathBuf,
+    pub protocol: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,11 +248,13 @@ impl ReloadableSystems {
             })
             .map(|model| model.provider.clone())
             .collect();
+        let extension_tools = extension_tools_from_resources(&config.extensions);
         let available_tool_names = match &config.settings.enabled_tools {
             Some(enabled_tools) => enabled_tools.iter().cloned().collect(),
             None => builtin_tool_definitions()
                 .into_iter()
                 .map(|definition| definition.name)
+                .chain(extension_tools.keys().cloned())
                 .collect(),
         };
         let context_messages = config
@@ -255,6 +271,7 @@ impl ReloadableSystems {
             available_models,
             configured_providers,
             available_tool_names,
+            extension_tools,
             keybinding_generation: generation,
             shell_path: config.settings.shell_path.clone(),
             shell_command_prefix: config.settings.shell_command_prefix.clone(),
@@ -1767,15 +1784,29 @@ async fn complete_with_retry(
 }
 
 fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
-    builtin_tool_definitions()
+    let mut definitions = builtin_tool_definitions()
         .into_iter()
         .filter(|tool| model_tool_enabled(runtime, &tool.name))
         .filter_map(|tool| model_tool_definition(&tool.name))
-        .collect()
+        .collect::<Vec<_>>();
+    definitions.extend(
+        runtime
+            .systems
+            .extension_tools
+            .values()
+            .filter(|tool| model_tool_enabled(runtime, &tool.name))
+            .map(|tool| AiToolDefinition {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            }),
+    );
+    definitions
 }
 
 fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
-    runtime.session.active_tool_names.contains(name)
+    (runtime.session.active_tool_names.contains(name)
+        || runtime.systems.extension_tools.contains_key(name))
         && (runtime.systems.available_tool_names.is_empty()
             || runtime.systems.available_tool_names.contains(name))
 }
@@ -1888,29 +1919,135 @@ fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
     Some(definition)
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionManifest {
+    protocol: Option<String>,
+    #[serde(default)]
+    tools: Vec<ExtensionToolManifest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionToolManifest {
+    name: String,
+    description: Option<String>,
+    parameters: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionProtocolRequest<'a> {
+    protocol_version: u8,
+    kind: &'static str,
+    command: &'a str,
+    input: &'a str,
+    cwd: &'a str,
+    tool_call_id: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionCommandResponse {
+    output: Option<String>,
+    error: Option<String>,
+}
+
+fn extension_tools_from_resources(extensions: &[ResourceFile]) -> BTreeMap<String, ExtensionTool> {
+    let mut tools = BTreeMap::new();
+    for extension in extensions {
+        let Some(manifest) = read_extension_manifest(&extension.path) else {
+            continue;
+        };
+        let protocol = manifest.protocol.unwrap_or_else(|| "json".to_string());
+        if protocol != "json" {
+            continue;
+        }
+        for tool in manifest.tools {
+            let name = tool.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            tools.insert(
+                name.to_string(),
+                ExtensionTool {
+                    name: name.to_string(),
+                    description: tool
+                        .description
+                        .unwrap_or_else(|| format!("Run extension tool {name}.")),
+                    parameters: tool.parameters.unwrap_or_else(|| {
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        })
+                    }),
+                    extension_name: extension.name.clone(),
+                    extension_path: extension.path.clone(),
+                    protocol: protocol.clone(),
+                },
+            );
+        }
+    }
+    tools
+}
+
+fn read_extension_manifest(path: &Path) -> Option<ExtensionManifest> {
+    extension_manifest_paths(path).into_iter().find_map(|path| {
+        let content = fs::read_to_string(path).ok()?;
+        serde_json::from_str::<ExtensionManifest>(&content).ok()
+    })
+}
+
+fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(file_name) = path.file_name() {
+        paths.push(
+            path.with_file_name(format!("{}.pi-extension.json", file_name.to_string_lossy())),
+        );
+        paths.push(path.with_file_name(format!("{}.json", file_name.to_string_lossy())));
+    }
+    if path.extension().is_some() {
+        paths.push(path.with_extension("json"));
+    }
+    paths
+}
+
 async fn execute_model_tool_call(
     runtime: &mut Runtime,
     tool_call: &ChatToolCall,
 ) -> Result<(), AgentError> {
-    let outputs = match model_tool_requests(tool_call) {
-        Ok(requests) if model_tool_enabled(runtime, &tool_call.name) => {
-            let mut outputs = Vec::new();
-            for request in requests {
-                let result = execute_tool(
-                    &runtime.session.cwd,
-                    request,
-                    &ToolRuntimeOptions {
-                        shell_path: runtime.systems.shell_path.clone(),
-                        shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
-                    },
-                )
-                .await?;
-                outputs.push(result.output);
-            }
-            outputs
+    let extension_tool = runtime
+        .systems
+        .extension_tools
+        .get(&tool_call.name)
+        .cloned();
+    let outputs = if let Some(extension_tool) = extension_tool {
+        match execute_extension_tool(&runtime.session.cwd, &extension_tool, tool_call).await {
+            Ok(output) => vec![output],
+            Err(error) => vec![error.to_string()],
         }
-        Ok(_) => vec![format!("Tool {} not found", tool_call.name)],
-        Err(error) => vec![error.to_string()],
+    } else {
+        match model_tool_requests(tool_call) {
+            Ok(requests) if model_tool_enabled(runtime, &tool_call.name) => {
+                let mut outputs = Vec::new();
+                for request in requests {
+                    let result = execute_tool(
+                        &runtime.session.cwd,
+                        request,
+                        &ToolRuntimeOptions {
+                            shell_path: runtime.systems.shell_path.clone(),
+                            shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
+                        },
+                    )
+                    .await?;
+                    outputs.push(result.output);
+                }
+                outputs
+            }
+            Ok(_) => vec![format!("Tool {} not found", tool_call.name)],
+            Err(error) => vec![error.to_string()],
+        }
     };
     let output = outputs.join("\n");
     runtime.push_tool_event(ToolEvent {
@@ -1927,6 +2064,89 @@ async fn execute_model_tool_call(
         tool_calls: Vec::new(),
     })?;
     Ok(())
+}
+
+async fn execute_extension_tool(
+    cwd: &Path,
+    extension: &ExtensionTool,
+    tool_call: &ChatToolCall,
+) -> Result<String, AgentError> {
+    let cwd_string = cwd.display().to_string();
+    let request = ExtensionProtocolRequest {
+        protocol_version: 1,
+        kind: "tool",
+        command: &tool_call.name,
+        input: &tool_call.arguments,
+        cwd: &cwd_string,
+        tool_call_id: Some(&tool_call.id),
+    };
+    let mut child = Command::new(&extension.extension_path)
+        .current_dir(cwd)
+        .env("PI_EXTENSION_NAME", &extension.extension_name)
+        .env("PI_EXTENSION_PATH", &extension.extension_path)
+        .env("PI_EXTENSION_PROTOCOL", &extension.protocol)
+        .env("PI_EXTENSION_TOOL", &extension.name)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|source| {
+            AgentError::Tool(ToolError::Io {
+                path: extension.extension_path.clone(),
+                source,
+            })
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let input = format!(
+            "{}\n",
+            serde_json::to_string(&request).map_err(|source| AgentError::Session(
+                SessionError::Parse {
+                    path: extension.extension_path.clone(),
+                    source,
+                }
+            ))?
+        );
+        stdin.write_all(input.as_bytes()).await.map_err(|source| {
+            AgentError::Tool(ToolError::Io {
+                path: extension.extension_path.clone(),
+                source,
+            })
+        })?;
+    }
+    let output = child.wait_with_output().await.map_err(|source| {
+        AgentError::Tool(ToolError::Io {
+            path: extension.extension_path.clone(),
+            source,
+        })
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Ok(format!(
+            "extension {} failed:\n{}{}",
+            extension.extension_name, stdout, stderr
+        ));
+    }
+    let response =
+        serde_json::from_str::<ExtensionCommandResponse>(stdout.trim()).map_err(|source| {
+            AgentError::Session(SessionError::Parse {
+                path: extension.extension_path.clone(),
+                source,
+            })
+        })?;
+    if let Some(error) = response.error {
+        return Ok(format!(
+            "extension {} failed: {error}",
+            extension.extension_name
+        ));
+    }
+    Ok(response.output.unwrap_or_else(|| {
+        format!(
+            "extension {} tool {} completed",
+            extension.extension_name, extension.name
+        )
+    }))
 }
 
 fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, AgentError> {
@@ -2977,6 +3197,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_user_turn_executes_json_extension_model_tools() {
+        let cwd = std::env::current_dir()
+            .expect("current dir")
+            .join("target")
+            .join(format!("pi-extension-tool-loop-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let extension_path = cwd.join("ext-tool.sh");
+        fs::write(
+            &extension_path,
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"output\":\"extension output\"}\\n'\n",
+        )
+        .expect("write extension");
+        make_executable(&extension_path);
+        fs::write(
+            cwd.join("ext-tool.sh.pi-extension.json"),
+            serde_json::json!({
+                "protocol": "json",
+                "tools": [{
+                    "name": "ext_echo",
+                    "description": "Echo through an extension.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } },
+                        "required": ["text"]
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let extensions = vec![ResourceFile {
+            name: "ext-tool".to_string(),
+            path: extension_path,
+            content: String::new(),
+        }];
+        let extension_tools = extension_tools_from_resources(&extensions);
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems {
+                available_tool_names: BTreeSet::from(["ext_echo".to_string()]),
+                extension_tools,
+                ..ReloadableSystems::default()
+            },
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ExtensionToolLoopProvider {
+            requests: Arc::clone(&requests),
+        };
+
+        let response = run_user_turn(&mut runtime, &provider, "use extension".to_string())
+            .await
+            .expect("run extension tool loop");
+
+        assert_eq!(response, "done");
+        assert_eq!(runtime.session().tool_history[0].name, "ext_echo");
+        assert_eq!(runtime.session().tool_history[0].result, "extension output");
+        assert_eq!(runtime.session().messages[2].content, "extension output");
+        let captured = requests.lock().expect("requests");
+        assert!(captured[0].tools.iter().any(|tool| tool.name == "ext_echo"));
+        assert_eq!(
+            captured[1].messages[2].tool_name.as_deref(),
+            Some("ext_echo")
+        );
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
     async fn provider_retry_does_not_duplicate_user_message() {
         let mut runtime = Runtime::new(
             SessionState::new("session-1", PathBuf::from(".")),
@@ -3161,6 +3449,10 @@ mod tests {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
     }
 
+    struct ExtensionToolLoopProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
     #[async_trait::async_trait]
     impl Provider for ToolLoopProvider {
         async fn complete(
@@ -3190,6 +3482,48 @@ mod tests {
             ])
         }
     }
+
+    #[async_trait::async_trait]
+    impl Provider for ExtensionToolLoopProvider {
+        async fn complete(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            let mut requests = self.requests.lock().expect("requests");
+            let call_index = requests.len();
+            requests.push(request);
+            if call_index == 0 {
+                return Ok(vec![
+                    StreamEvent::ToolCall {
+                        id: "call_ext_1".to_string(),
+                        name: "ext_echo".to_string(),
+                        arguments: r#"{"text":"hello"}"#.to_string(),
+                    },
+                    StreamEvent::Stop {
+                        reason: "toolUse".to_string(),
+                    },
+                ]);
+            }
+            Ok(vec![
+                StreamEvent::Text("done".to_string()),
+                StreamEvent::Stop {
+                    reason: "stop".to_string(),
+                },
+            ])
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod extension");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {}
 
     #[async_trait::async_trait]
     impl Provider for FlakyProvider {

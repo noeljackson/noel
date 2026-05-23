@@ -324,6 +324,28 @@ Omitting a resource key loads all resources of that type. `[]` loads none.
 Resource discovery honors `.gitignore`, `.ignore`, and `.fdignore` files in
 scanned resource directories.
 
+Executable extensions can opt into the JSON protocol with an adjacent
+`.pi-extension.json` manifest. A manifest `tools` array registers model-callable
+tools; Pi sends `kind: "tool"` JSON requests on stdin and expects a JSON
+response with `output` or `error`:
+
+```json
+{
+  "protocol": "json",
+  "tools": [
+    {
+      "name": "fixture_echo",
+      "description": "Echo text.",
+      "parameters": {
+        "type": "object",
+        "properties": { "text": { "type": "string" } },
+        "required": ["text"]
+      }
+    }
+  ]
+}
+```
+
 Resources can be disabled by name or wildcard through `disabledResources`, or
 managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 `pi config enable <extension|skill|prompt|theme> <name>`:

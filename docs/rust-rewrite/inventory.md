@@ -378,6 +378,10 @@ Rust supports:
 - Raw executable extensions.
 - JSON stdio executable extensions.
 - JSON extension lifecycle notifications for reload and shutdown.
+- JSON executable extension model tools. An executable extension can declare
+  `protocol: "json"` and a `tools` array in its adjacent
+  `.pi-extension.json`; those tools are exposed to providers and receive
+  `kind: "tool"` JSON requests on stdin.
 
 Rust intentionally does not support:
 
@@ -386,7 +390,7 @@ Rust intentionally does not support:
 - In-process TypeScript UI primitive/custom renderer APIs.
 
 Future Rust extension work can build on the JSON executable protocol with a
-Rust SDK, tool registration helpers, or provider registration helpers.
+Rust SDK or provider registration helpers.
 
 ## Validation
 
