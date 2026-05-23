@@ -2071,14 +2071,15 @@ async fn run_interactive(
 ) -> Result<()> {
     let mut app = TuiApp::new(&config, &runtime);
     let auto_restart = AutoRestart::from_env();
+    let mouse_mode = TuiMouseMode::from_env();
     enable_raw_mode()?;
     execute!(
         io::stdout(),
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseWheelCapture
+        EnableTuiMouseMode(mouse_mode)
     )?;
-    let _restore = TerminalRestore;
+    let _restore = TerminalRestore { mouse_mode };
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -2212,14 +2213,16 @@ fn strip_restart_model_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsS
     output
 }
 
-struct TerminalRestore;
+struct TerminalRestore {
+    mouse_mode: TuiMouseMode,
+}
 
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
-            DisableMouseWheelCapture,
+            DisableTuiMouseMode(self.mouse_mode),
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
@@ -2227,28 +2230,51 @@ impl Drop for TerminalRestore {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EnableMouseWheelCapture;
+enum TuiMouseMode {
+    SelectionFriendly,
+    AppCapture,
+}
 
-impl crossterm::Command for EnableMouseWheelCapture {
+impl TuiMouseMode {
+    fn from_env() -> Self {
+        match std::env::var("PI_TUI_MOUSE_CAPTURE").ok().as_deref() {
+            Some("1") | Some("true") | Some("yes") => Self::AppCapture,
+            _ => Self::SelectionFriendly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableTuiMouseMode(TuiMouseMode);
+
+impl crossterm::Command for EnableTuiMouseMode {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        std::fmt::Write::write_str(f, "\x1b[?1000h\x1b[?1006h")
+        match self.0 {
+            TuiMouseMode::SelectionFriendly => {
+                std::fmt::Write::write_str(f, "\x1b[?1007s\x1b[?1007l")
+            }
+            TuiMouseMode::AppCapture => std::fmt::Write::write_str(f, "\x1b[?1000h\x1b[?1006h"),
+        }
     }
 
     #[cfg(windows)]
     fn execute_winapi(&self) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "mouse wheel capture is only supported through ANSI escape sequences",
+            "TUI mouse mode is only supported through ANSI escape sequences",
         ))
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DisableMouseWheelCapture;
+struct DisableTuiMouseMode(TuiMouseMode);
 
-impl crossterm::Command for DisableMouseWheelCapture {
+impl crossterm::Command for DisableTuiMouseMode {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        std::fmt::Write::write_str(f, "\x1b[?1006l\x1b[?1000l")
+        match self.0 {
+            TuiMouseMode::SelectionFriendly => std::fmt::Write::write_str(f, "\x1b[?1007r"),
+            TuiMouseMode::AppCapture => std::fmt::Write::write_str(f, "\x1b[?1006l\x1b[?1000l"),
+        }
     }
 
     #[cfg(windows)]
@@ -5554,6 +5580,45 @@ mod tests {
 
         assert!(app.chat_scroll > 0);
         assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn default_tui_mouse_mode_preserves_terminal_selection() {
+        let mut enable = String::new();
+        crossterm::Command::write_ansi(
+            &EnableTuiMouseMode(TuiMouseMode::SelectionFriendly),
+            &mut enable,
+        )
+        .unwrap();
+        assert!(!enable.contains("?1000h"));
+        assert!(!enable.contains("?1006h"));
+        assert!(enable.contains("?1007l"));
+
+        let mut disable = String::new();
+        crossterm::Command::write_ansi(
+            &DisableTuiMouseMode(TuiMouseMode::SelectionFriendly),
+            &mut disable,
+        )
+        .unwrap();
+        assert!(disable.contains("?1007r"));
+    }
+
+    #[test]
+    fn app_capture_mouse_mode_is_explicit() {
+        let mut enable = String::new();
+        crossterm::Command::write_ansi(&EnableTuiMouseMode(TuiMouseMode::AppCapture), &mut enable)
+            .unwrap();
+        assert!(enable.contains("?1000h"));
+        assert!(enable.contains("?1006h"));
+
+        let mut disable = String::new();
+        crossterm::Command::write_ansi(
+            &DisableTuiMouseMode(TuiMouseMode::AppCapture),
+            &mut disable,
+        )
+        .unwrap();
+        assert!(disable.contains("?1006l"));
+        assert!(disable.contains("?1000l"));
     }
 
     #[test]
