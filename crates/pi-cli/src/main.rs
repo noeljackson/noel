@@ -18,10 +18,10 @@ use clap::{Parser, ValueEnum};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        KeyModifiers,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
 use pi_ai::{
     create_provider, generate_images, ImageGenerationInput, ImageGenerationOutput,
@@ -50,8 +50,8 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
-    Frame, Terminal,
+    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
+    Frame, Terminal, TerminalOptions, Viewport,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -2072,24 +2072,24 @@ async fn run_interactive(
     let mut app = TuiApp::new(&config, &runtime);
     let auto_restart = AutoRestart::from_env();
     enable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableAlternateScroll
-    )?;
+    execute!(io::stdout(), EnableBracketedPaste)?;
     let _restore = TerminalRestore;
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(TUI_VIEWPORT_HEIGHT),
+        },
+    )?;
     terminal.clear()?;
 
     let mut restart = false;
     loop {
         app.refresh_chrome(&config, &runtime);
-        terminal.draw(|frame| draw_tui(frame, &app))?;
+        redraw_tui(&mut terminal, &mut app)?;
         if auto_restart.should_restart()? {
             app.push(TuiEntryKind::System, "rebuilt; restarting");
-            terminal.draw(|frame| draw_tui(frame, &app))?;
+            redraw_tui(&mut terminal, &mut app)?;
             restart = true;
             break;
         }
@@ -2109,7 +2109,7 @@ async fn run_interactive(
                 .await?
             }
             Event::Mouse(mouse) => {
-                handle_tui_mouse(mouse, &mut app, terminal.size()?.height);
+                let _ = mouse;
                 false
             }
             Event::Paste(text) => {
@@ -2122,9 +2122,14 @@ async fn run_interactive(
             break;
         }
     }
+    let dump_transcript = std::env::var("PI_TUI_E2E_DUMP").ok().as_deref() == Some("1");
+    if dump_transcript {
+        terminal.clear()?;
+    }
     drop(terminal);
     drop(_restore);
-    if std::env::var("PI_TUI_E2E_DUMP").ok().as_deref() == Some("1") {
+    if dump_transcript {
+        println!();
         println!("{}", app.transcript_text());
     }
     if restart {
@@ -2217,43 +2222,7 @@ struct TerminalRestore;
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableAlternateScroll,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EnableAlternateScroll;
-
-impl crossterm::Command for EnableAlternateScroll {
-    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        std::fmt::Write::write_str(f, "\x1b[?1007h")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "alternate scroll is only supported through ANSI escape sequences",
-        ))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DisableAlternateScroll;
-
-impl crossterm::Command for DisableAlternateScroll {
-    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        std::fmt::Write::write_str(f, "\x1b[?1007l")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> io::Result<()> {
-        Ok(())
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
 
@@ -2481,7 +2450,8 @@ struct TuiApp {
     header_line: String,
     status: String,
     show_hardware_cursor: bool,
-    chat_scroll: usize,
+    history_emitted_entries: usize,
+    live_entry_index: Option<usize>,
     history_cursor: Option<usize>,
     history_draft: Option<String>,
 }
@@ -2538,7 +2508,6 @@ impl TuiApp {
     fn push(&mut self, kind: TuiEntryKind, text: impl Into<String>) {
         let text = text.into();
         if !text.trim().is_empty() {
-            self.chat_scroll = 0;
             self.entries.push(TuiEntry { kind, text });
         }
     }
@@ -2604,37 +2573,14 @@ impl TuiApp {
         self.reset_history_navigation();
     }
 
-    fn scroll_chat_up(&mut self, amount: usize, max_scroll: usize) {
-        self.chat_scroll = self.chat_scroll.saturating_add(amount).min(max_scroll);
-    }
-
-    fn scroll_chat_down(&mut self, amount: usize, max_scroll: usize) {
-        self.chat_scroll = self.chat_scroll.min(max_scroll).saturating_sub(amount);
-    }
-
-    fn scroll_chat_top(&mut self, max_scroll: usize) {
-        self.chat_scroll = max_scroll;
-    }
-
-    fn chat_line_count(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|entry| 2 + entry.text.lines().count())
-            .sum::<usize>()
-    }
-
-    fn max_chat_scroll(&self, terminal_height: u16) -> usize {
-        self.chat_line_count()
-            .saturating_sub(chat_available_lines(terminal_height))
-    }
-
     fn push_placeholder(&mut self, kind: TuiEntryKind, text: impl Into<String>) -> usize {
-        self.chat_scroll = 0;
         self.entries.push(TuiEntry {
             kind,
             text: text.into(),
         });
-        self.entries.len() - 1
+        let index = self.entries.len() - 1;
+        self.live_entry_index = Some(index);
+        index
     }
 
     fn replace_entry(&mut self, index: usize, text: impl Into<String>) {
@@ -2654,9 +2600,30 @@ impl TuiApp {
         if text.trim().is_empty() {
             return;
         }
-        self.chat_scroll = 0;
         let index = index.min(self.entries.len());
         self.entries.insert(index, TuiEntry { kind, text });
+        if let Some(live_index) = self.live_entry_index.as_mut() {
+            if index <= *live_index {
+                *live_index += 1;
+            }
+        }
+    }
+
+    fn finish_live_entry(&mut self) {
+        self.live_entry_index = None;
+    }
+
+    fn drop_live_entry(&mut self) {
+        let Some(index) = self.live_entry_index.take() else {
+            return;
+        };
+        if index >= self.history_emitted_entries && index < self.entries.len() {
+            self.entries.remove(index);
+        }
+    }
+
+    fn finalized_entry_count(&self) -> usize {
+        self.live_entry_index.unwrap_or(self.entries.len())
     }
 
     fn transcript_text(&self) -> String {
@@ -2678,45 +2645,78 @@ impl TuiApp {
 }
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+const TUI_VIEWPORT_HEIGHT: u16 = 12;
+
+fn redraw_tui(terminal: &mut TuiTerminal, app: &mut TuiApp) -> Result<()> {
+    emit_finalized_history(terminal, app)?;
+    terminal.draw(|frame| draw_tui(frame, app))?;
+    Ok(())
+}
+
+fn emit_finalized_history(terminal: &mut TuiTerminal, app: &mut TuiApp) -> Result<()> {
+    let emit_until = app.finalized_entry_count();
+    if emit_until <= app.history_emitted_entries {
+        return Ok(());
+    }
+    let lines = render_entry_lines(&app.entries[app.history_emitted_entries..emit_until]);
+    if lines.is_empty() {
+        app.history_emitted_entries = emit_until;
+        return Ok(());
+    }
+    let width = terminal.size()?.width.max(1) as usize;
+    let height = rendered_lines_height(&lines, width);
+    let render_lines = lines.clone();
+    terminal.insert_before(height, move |buffer| {
+        Paragraph::new(render_lines)
+            .wrap(Wrap { trim: false })
+            .render(buffer.area, buffer);
+    })?;
+    app.history_emitted_entries = emit_until;
+    Ok(())
+}
+
+fn rendered_lines_height(lines: &[Line<'_>], width: usize) -> u16 {
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16
+}
 
 fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
-            Constraint::Min(5),
-            Constraint::Length(1),
+            Constraint::Min(0),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(frame.area());
-    draw_header(frame, root[0], app);
-    draw_chat(frame, root[1], app);
-    draw_input(frame, root[3], app);
-    draw_footer(frame, root[4], app);
+    draw_live_history(frame, root[0], app);
+    draw_input(frame, root[1], app);
+    draw_footer(frame, root[2], app);
     draw_selector_overlay(frame, app);
-    set_tui_cursor(frame, root[3], app);
+    set_tui_cursor(frame, root[1], app);
 }
 
-fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph = Paragraph::new(vec![
-        Line::from(Span::styled(
-            app.header_title.trim().to_string(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            app.header_line.as_str(),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]);
+fn draw_live_history(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(live_index) = app.live_entry_index else {
+        return;
+    };
+    let mut lines = render_entry_lines(&app.entries[live_index..]);
+    let available = area.height as usize;
+    if lines.len() > available {
+        lines = lines[lines.len() - available..].to_vec();
+    }
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+fn render_entry_lines(entries: &[TuiEntry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for entry in &app.entries {
+    for entry in entries {
         match entry.kind {
             TuiEntryKind::Tool => push_tool_lines(&mut lines, &entry.text),
             TuiEntryKind::Error => push_marked_lines(
@@ -2745,13 +2745,7 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         }
         lines.push(Line::from(""));
     }
-    let available = area.height as usize;
-    let max_start = lines.len().saturating_sub(available);
-    let start = max_start.saturating_sub(app.chat_scroll.min(max_start));
-    let paragraph = Paragraph::new(lines[start..].to_vec())
-        .style(Style::default().fg(Color::White))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    lines
 }
 
 fn push_marked_lines(
@@ -2827,14 +2821,6 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str) {
             Style::default().fg(Color::DarkGray),
         )));
     }
-}
-
-fn chat_available_lines(terminal_height: u16) -> usize {
-    terminal_height
-        .saturating_sub(2)
-        .saturating_sub(1)
-        .saturating_sub(3)
-        .saturating_sub(1) as usize
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -3044,21 +3030,6 @@ async fn handle_tui_key(
         KeyCode::Down if app.multiline.is_none() => {
             app.history_next();
         }
-        KeyCode::PageUp => {
-            let max_scroll = app.max_chat_scroll(terminal.size()?.height);
-            app.scroll_chat_up(10, max_scroll);
-        }
-        KeyCode::PageDown => {
-            let max_scroll = app.max_chat_scroll(terminal.size()?.height);
-            app.scroll_chat_down(10, max_scroll);
-        }
-        KeyCode::Home => {
-            let max_scroll = app.max_chat_scroll(terminal.size()?.height);
-            app.scroll_chat_top(max_scroll);
-        }
-        KeyCode::End => {
-            app.chat_scroll = 0;
-        }
         KeyCode::Enter => {
             let line = app.input.trim().to_string();
             app.input.clear();
@@ -3090,15 +3061,6 @@ async fn handle_tui_key(
     }
     app.refresh_chrome(config, runtime);
     Ok(false)
-}
-
-fn handle_tui_mouse(mouse: MouseEvent, app: &mut TuiApp, terminal_height: u16) {
-    let max_scroll = app.max_chat_scroll(terminal_height);
-    match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_chat_up(3, max_scroll),
-        MouseEventKind::ScrollDown => app.scroll_chat_down(3, max_scroll),
-        _ => {}
-    }
 }
 
 fn handle_tui_selector_key(
@@ -3915,7 +3877,7 @@ async fn handle_tui_bang(
     };
     let entry_index = if terminal_progress_enabled(config) {
         let index = app.push_placeholder(TuiEntryKind::Tool, format_bash_running(&command));
-        terminal.draw(|frame| draw_tui(frame, app))?;
+        redraw_tui(terminal, app)?;
         Some(index)
     } else {
         None
@@ -3924,6 +3886,7 @@ async fn handle_tui_bang(
         Ok(output) => {
             if let Some(index) = entry_index {
                 app.replace_entry(index, format_bash_completed(&command, &output));
+                app.finish_live_entry();
             } else {
                 app.push(TuiEntryKind::Tool, output);
             }
@@ -3932,6 +3895,7 @@ async fn handle_tui_bang(
         Err(error) => {
             if let Some(index) = entry_index {
                 app.replace_entry(index, format!("failed bash\n{error}"));
+                app.finish_live_entry();
             } else {
                 app.push(TuiEntryKind::Error, format!("{error}"));
             }
@@ -3954,6 +3918,7 @@ async fn submit_tui_prompt(
     if let Err(error) =
         run_prompt_with_queue_tui(app, terminal, runtime, config, prompt, media, offline).await
     {
+        app.drop_live_entry();
         app.push(
             TuiEntryKind::Error,
             format_tui_error(&error, runtime, config),
@@ -4036,7 +4001,7 @@ async fn run_prompt_once_tui(
             "Working...".to_string()
         },
     );
-    terminal.draw(|frame| draw_tui(frame, app))?;
+    redraw_tui(terminal, app)?;
     let provider = provider_for_runtime(runtime, config, offline)?;
     let message_start = runtime.session().messages.len();
     if kind == TuiEntryKind::Tool {
@@ -4049,7 +4014,8 @@ async fn run_prompt_once_tui(
         } else {
             app.replace_entry(entry_index, response);
         }
-        terminal.draw(|frame| draw_tui(frame, app))?;
+        app.finish_live_entry();
+        redraw_tui(terminal, app)?;
         return Ok(());
     }
 
@@ -4061,14 +4027,15 @@ async fn run_prompt_once_tui(
                 saw_delta = true;
             }
             app.append_entry(entry_index, delta);
-            let _ = terminal.draw(|frame| draw_tui(frame, app));
+            let _ = redraw_tui(terminal, app);
         })
         .await?;
     if !saw_delta {
         app.replace_entry(entry_index, response);
     }
     insert_new_tool_messages(app, runtime, message_start, entry_index);
-    terminal.draw(|frame| draw_tui(frame, app))?;
+    app.finish_live_entry();
+    redraw_tui(terminal, app)?;
     Ok(())
 }
 
@@ -4555,7 +4522,7 @@ fn format_hotkeys(config: &LoadedConfig) -> String {
     if !output.is_empty() {
         output.push('\n');
     }
-    output.push_str("scroll-up\tpageup, home\nscroll-down\tpagedown, end");
+    output.push_str("scrollback\tmouse wheel, terminal selection");
     output
 }
 
@@ -5512,61 +5479,16 @@ mod tests {
     }
 
     #[test]
-    fn chat_scroll_can_page_down_after_jumping_to_top() {
+    fn live_entries_are_not_finalized_until_complete() {
         let mut app = TuiApp::default();
-        for index in 0..40 {
-            app.entries.push(TuiEntry {
-                kind: TuiEntryKind::User,
-                text: format!("message {index}"),
-            });
-        }
-        let max_scroll = app.max_chat_scroll(24);
+        app.push(TuiEntryKind::User, "hello");
+        let live = app.push_placeholder(TuiEntryKind::Assistant, "Working...");
+        assert_eq!(live, 1);
+        assert_eq!(app.finalized_entry_count(), 1);
 
-        app.scroll_chat_top(max_scroll);
-        assert_eq!(app.chat_scroll, max_scroll);
-
-        app.scroll_chat_down(10, max_scroll);
-        assert_eq!(app.chat_scroll, max_scroll.saturating_sub(10));
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_chat_without_prompt_history() {
-        let mut app = TuiApp::default();
-        app.editor_state.record_history("previous prompt");
-        app.input = "draft".to_string();
-        for index in 0..40 {
-            app.entries.push(TuiEntry {
-                kind: TuiEntryKind::User,
-                text: format!("message {index}"),
-            });
-        }
-
-        handle_tui_mouse(
-            MouseEvent {
-                kind: MouseEventKind::ScrollUp,
-                column: 0,
-                row: 0,
-                modifiers: KeyModifiers::empty(),
-            },
-            &mut app,
-            24,
-        );
-
-        assert!(app.chat_scroll > 0);
-        assert_eq!(app.input, "draft");
-    }
-
-    #[test]
-    fn alternate_scroll_preserves_terminal_selection() {
-        let mut enable = String::new();
-        crossterm::Command::write_ansi(&EnableAlternateScroll, &mut enable).unwrap();
-        assert!(!enable.contains("?1000h"));
-        assert!(!enable.contains("?1006h"));
-        assert!(enable.contains("?1007h"));
-
-        let mut disable = String::new();
-        crossterm::Command::write_ansi(&DisableAlternateScroll, &mut disable).unwrap();
-        assert!(disable.contains("?1007l"));
+        app.replace_entry(live, "done");
+        app.finish_live_entry();
+        assert_eq!(app.finalized_entry_count(), 2);
     }
 
     #[test]

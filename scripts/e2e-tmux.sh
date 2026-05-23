@@ -104,6 +104,9 @@ send_line "/complete /extension:j"
 send_line "/status"
 send_line "/editor draft"
 send_line "/history"
+send_line "history seed"
+tmux send-keys -t "${session_name}" "history draft" Up Down Enter
+sleep 0.35
 tmux send-keys -t "${session_name}" "wheel draft"
 sleep 0.1
 tmux send-keys -t "${session_name}" Escape "[<64;5;10M"
@@ -213,6 +216,7 @@ require_output "/extension:json-ext"
 require_output "status"
 require_output "[faux/echo] editor-prompt"
 require_output "hello from tmux e2e"
+require_output "[faux/echo] history draft"
 require_output "[faux/echo] wheel draft"
 require_output "image/png"
 require_output "1x1"
