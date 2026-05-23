@@ -18,7 +18,7 @@ use clap::{Parser, ValueEnum};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -2076,7 +2076,7 @@ async fn run_interactive(
         io::stdout(),
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableTuiMouseCapture
+        EnableAlternateScroll
     )?;
     let _restore = TerminalRestore;
     let backend = CrosstermBackend::new(io::stdout());
@@ -2109,7 +2109,7 @@ async fn run_interactive(
                 .await?
             }
             Event::Mouse(mouse) => {
-                handle_tui_mouse(mouse, &mut app, terminal.size()?.height)?;
+                handle_tui_mouse(mouse, &mut app, terminal.size()?.height);
                 false
             }
             Event::Paste(text) => {
@@ -2219,7 +2219,7 @@ impl Drop for TerminalRestore {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
-            DisableTuiMouseCapture,
+            DisableAlternateScroll,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
@@ -2227,28 +2227,28 @@ impl Drop for TerminalRestore {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EnableTuiMouseCapture;
+struct EnableAlternateScroll;
 
-impl crossterm::Command for EnableTuiMouseCapture {
+impl crossterm::Command for EnableAlternateScroll {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        std::fmt::Write::write_str(f, "\x1b[?1000h\x1b[?1006h")
+        std::fmt::Write::write_str(f, "\x1b[?1007h")
     }
 
     #[cfg(windows)]
     fn execute_winapi(&self) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "TUI mouse capture is only supported through ANSI escape sequences",
+            "alternate scroll is only supported through ANSI escape sequences",
         ))
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DisableTuiMouseCapture;
+struct DisableAlternateScroll;
 
-impl crossterm::Command for DisableTuiMouseCapture {
+impl crossterm::Command for DisableAlternateScroll {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        std::fmt::Write::write_str(f, "\x1b[?1006l\x1b[?1000l")
+        std::fmt::Write::write_str(f, "\x1b[?1007l")
     }
 
     #[cfg(windows)]
@@ -2269,42 +2269,6 @@ enum TuiEntryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TuiEntry {
     kind: TuiEntryKind,
-    text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TuiSelection {
-    anchor_row: usize,
-    focus_row: usize,
-    active: bool,
-}
-
-impl TuiSelection {
-    fn new(row: usize) -> Self {
-        Self {
-            anchor_row: row,
-            focus_row: row,
-            active: true,
-        }
-    }
-
-    fn row_range(&self) -> (usize, usize) {
-        if self.anchor_row <= self.focus_row {
-            (self.anchor_row, self.focus_row)
-        } else {
-            (self.focus_row, self.anchor_row)
-        }
-    }
-
-    fn contains_row(&self, row: usize) -> bool {
-        let (start, end) = self.row_range();
-        (start..=end).contains(&row)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ChatLine {
-    line: Line<'static>,
     text: String,
 }
 
@@ -2520,7 +2484,6 @@ struct TuiApp {
     chat_scroll: usize,
     history_cursor: Option<usize>,
     history_draft: Option<String>,
-    selection: Option<TuiSelection>,
 }
 
 impl TuiApp {
@@ -2576,7 +2539,6 @@ impl TuiApp {
         let text = text.into();
         if !text.trim().is_empty() {
             self.chat_scroll = 0;
-            self.clear_selection();
             self.entries.push(TuiEntry { kind, text });
         }
     }
@@ -2655,7 +2617,10 @@ impl TuiApp {
     }
 
     fn chat_line_count(&self) -> usize {
-        self.chat_lines().len()
+        self.entries
+            .iter()
+            .map(|entry| 2 + entry.text.lines().count())
+            .sum::<usize>()
     }
 
     fn max_chat_scroll(&self, terminal_height: u16) -> usize {
@@ -2663,157 +2628,8 @@ impl TuiApp {
             .saturating_sub(chat_available_lines(terminal_height))
     }
 
-    fn clear_selection(&mut self) {
-        self.selection = None;
-    }
-
-    fn visible_chat_start(&self, terminal_height: u16) -> usize {
-        let line_count = self.chat_lines().len();
-        let available = chat_available_lines(terminal_height);
-        let max_start = line_count.saturating_sub(available);
-        max_start.saturating_sub(self.chat_scroll.min(max_start))
-    }
-
-    fn chat_row_at_mouse(
-        &self,
-        mouse: MouseEvent,
-        terminal_height: u16,
-        clamp: bool,
-    ) -> Option<usize> {
-        let line_count = self.chat_lines().len();
-        if line_count == 0 {
-            return None;
-        }
-        let chat_top = 2u16;
-        let available = chat_available_lines(terminal_height) as u16;
-        let chat_bottom = chat_top.saturating_add(available);
-        if !clamp && (mouse.row < chat_top || mouse.row >= chat_bottom) {
-            return None;
-        }
-        let row = mouse
-            .row
-            .saturating_sub(chat_top)
-            .min(available.saturating_sub(1));
-        if mouse.row < chat_top {
-            return Some(self.visible_chat_start(terminal_height));
-        }
-        if mouse.row >= chat_top.saturating_add(available) {
-            return Some(
-                self.visible_chat_start(terminal_height)
-                    .saturating_add(available.saturating_sub(1) as usize)
-                    .min(line_count.saturating_sub(1)),
-            );
-        }
-        Some(
-            self.visible_chat_start(terminal_height)
-                .saturating_add(row as usize)
-                .min(line_count.saturating_sub(1)),
-        )
-    }
-
-    fn begin_selection(&mut self, mouse: MouseEvent, terminal_height: u16) {
-        if let Some(row) = self.chat_row_at_mouse(mouse, terminal_height, false) {
-            self.selection = Some(TuiSelection::new(row));
-            self.status = "selecting transcript".to_string();
-        }
-    }
-
-    fn update_selection(&mut self, mouse: MouseEvent, terminal_height: u16) {
-        let Some(row) = self.chat_row_at_mouse(mouse, terminal_height, true) else {
-            return;
-        };
-        if let Some(selection) = &mut self.selection {
-            selection.focus_row = row;
-            selection.active = true;
-            self.status = "selecting transcript".to_string();
-        }
-    }
-
-    fn finish_selection(&mut self, mouse: MouseEvent, terminal_height: u16) -> Result<()> {
-        self.update_selection(mouse, terminal_height);
-        if let Some(selection) = &mut self.selection {
-            selection.active = false;
-        }
-        let Some(text) = self.selected_chat_text() else {
-            self.status = "selection is empty".to_string();
-            return Ok(());
-        };
-        match copy_to_clipboard(&text)? {
-            Some(command) => {
-                self.status = format!("copied selection via {command}");
-            }
-            None => {
-                self.status = "selection copied unavailable".to_string();
-            }
-        }
-        Ok(())
-    }
-
-    fn selected_chat_text(&self) -> Option<String> {
-        let selection = self.selection?;
-        let lines = self.chat_lines();
-        let (start, end) = selection.row_range();
-        let text = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| {
-                if (start..=end).contains(&index) {
-                    Some(line.text.trim_end().to_string())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    }
-
-    fn chat_lines(&self) -> Vec<ChatLine> {
-        let mut lines = Vec::new();
-        for entry in &self.entries {
-            match entry.kind {
-                TuiEntryKind::Tool => push_tool_chat_lines(&mut lines, &entry.text),
-                TuiEntryKind::Error => push_marked_chat_lines(
-                    &mut lines,
-                    "error",
-                    &entry.text,
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    Style::default().fg(Color::Red),
-                ),
-                TuiEntryKind::System => push_marked_chat_lines(
-                    &mut lines,
-                    "",
-                    &entry.text,
-                    Style::default().fg(Color::DarkGray),
-                    Style::default().fg(Color::Gray),
-                ),
-                TuiEntryKind::User | TuiEntryKind::Assistant => {
-                    push_marked_chat_lines(
-                        &mut lines,
-                        "",
-                        &entry.text,
-                        Style::default().fg(Color::DarkGray),
-                        Style::default().fg(Color::White),
-                    );
-                }
-            }
-            lines.push(ChatLine {
-                line: Line::from(""),
-                text: String::new(),
-            });
-        }
-        lines
-    }
-
     fn push_placeholder(&mut self, kind: TuiEntryKind, text: impl Into<String>) -> usize {
         self.chat_scroll = 0;
-        self.clear_selection();
         self.entries.push(TuiEntry {
             kind,
             text: text.into(),
@@ -2839,7 +2655,6 @@ impl TuiApp {
             return;
         }
         self.chat_scroll = 0;
-        self.clear_selection();
         let index = index.min(self.entries.len());
         self.entries.insert(index, TuiEntry { kind, text });
     }
@@ -2900,38 +2715,47 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let chat_lines = app.chat_lines();
-    let available = area.height as usize;
-    let max_start = chat_lines.len().saturating_sub(available);
-    let start = max_start.saturating_sub(app.chat_scroll.min(max_start));
-    let lines = chat_lines
-        .iter()
-        .enumerate()
-        .skip(start)
-        .map(|(index, line)| {
-            if app
-                .selection
-                .as_ref()
-                .map(|selection| selection.contains_row(index))
-                .unwrap_or(false)
-            {
-                Line::from(Span::styled(
-                    line.text.clone(),
-                    Style::default().fg(Color::Black).bg(Color::White),
-                ))
-            } else {
-                line.line.clone()
+    let mut lines = Vec::new();
+    for entry in &app.entries {
+        match entry.kind {
+            TuiEntryKind::Tool => push_tool_lines(&mut lines, &entry.text),
+            TuiEntryKind::Error => push_marked_lines(
+                &mut lines,
+                "error",
+                &entry.text,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Red),
+            ),
+            TuiEntryKind::System => push_marked_lines(
+                &mut lines,
+                "",
+                &entry.text,
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
+            ),
+            TuiEntryKind::User | TuiEntryKind::Assistant => {
+                push_marked_lines(
+                    &mut lines,
+                    "",
+                    &entry.text,
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::White),
+                );
             }
-        })
-        .collect::<Vec<_>>();
-    let paragraph = Paragraph::new(lines)
+        }
+        lines.push(Line::from(""));
+    }
+    let available = area.height as usize;
+    let max_start = lines.len().saturating_sub(available);
+    let start = max_start.saturating_sub(app.chat_scroll.min(max_start));
+    let paragraph = Paragraph::new(lines[start..].to_vec())
         .style(Style::default().fg(Color::White))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn push_marked_chat_lines(
-    lines: &mut Vec<ChatLine>,
+fn push_marked_lines(
+    lines: &mut Vec<Line<'static>>,
     label: &str,
     text: &str,
     marker_style: Style,
@@ -2944,23 +2768,16 @@ fn push_marked_chat_lines(
     } else {
         format!("• {label} ")
     };
-    lines.push(ChatLine {
-        text: format!("{prefix}{first}"),
-        line: Line::from(vec![
-            Span::styled(prefix, marker_style),
-            Span::styled(first.to_string(), text_style),
-        ]),
-    });
+    lines.push(Line::from(vec![
+        Span::styled(prefix, marker_style),
+        Span::styled(first.to_string(), text_style),
+    ]));
     for line in text_lines {
-        let text = format!("  {line}");
-        lines.push(ChatLine {
-            line: Line::from(Span::styled(text.clone(), text_style)),
-            text,
-        });
+        lines.push(Line::from(Span::styled(format!("  {line}"), text_style)));
     }
 }
 
-fn push_tool_chat_lines(lines: &mut Vec<ChatLine>, text: &str) {
+fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str) {
     let mut parts = text.lines();
     let state = parts.next().unwrap_or_default();
     let detail = parts.next().unwrap_or_default();
@@ -2979,51 +2796,36 @@ fn push_tool_chat_lines(lines: &mut Vec<ChatLine>, text: &str) {
         }
         _ => "Ran tool".to_string(),
     };
-    let title_text = format!("• {title}");
-    lines.push(ChatLine {
-        text: title_text,
-        line: Line::from(vec![
-            Span::styled("• ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                title,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-    });
+    lines.push(Line::from(vec![
+        Span::styled("• ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
     if !detail.is_empty() && !matches!(state, "running" | "completed" | "failed") {
-        let text = format!("  {detail}");
-        lines.push(ChatLine {
-            line: Line::from(Span::styled(
-                text.clone(),
-                Style::default()
-                    .fg(Color::Gray)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            text,
-        });
+        lines.push(Line::from(Span::styled(
+            format!("  {detail}"),
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        )));
     }
     let output = parts.collect::<Vec<_>>().join("\n");
     if !output.is_empty() {
         for line in output.lines() {
-            let text = format!("  {line}");
-            lines.push(ChatLine {
-                line: Line::from(Span::styled(
-                    text.clone(),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                text,
-            });
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     } else if state.starts_with("completed") {
-        lines.push(ChatLine {
-            line: Line::from(Span::styled(
-                "  (no output)",
-                Style::default().fg(Color::DarkGray),
-            )),
-            text: "  (no output)".to_string(),
-        });
+        lines.push(Line::from(Span::styled(
+            "  (no output)",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 }
 
@@ -3231,7 +3033,6 @@ async fn handle_tui_key(
             app.input.clear();
             app.multiline = None;
             app.reset_history_navigation();
-            app.clear_selection();
         }
         KeyCode::Backspace => {
             app.input.pop();
@@ -3284,7 +3085,6 @@ async fn handle_tui_key(
         KeyCode::Char(ch) => {
             app.input.push(ch);
             app.reset_history_navigation();
-            app.clear_selection();
         }
         _ => {}
     }
@@ -3292,17 +3092,13 @@ async fn handle_tui_key(
     Ok(false)
 }
 
-fn handle_tui_mouse(mouse: MouseEvent, app: &mut TuiApp, terminal_height: u16) -> Result<()> {
+fn handle_tui_mouse(mouse: MouseEvent, app: &mut TuiApp, terminal_height: u16) {
     let max_scroll = app.max_chat_scroll(terminal_height);
     match mouse.kind {
         MouseEventKind::ScrollUp => app.scroll_chat_up(3, max_scroll),
         MouseEventKind::ScrollDown => app.scroll_chat_down(3, max_scroll),
-        MouseEventKind::Down(MouseButton::Left) => app.begin_selection(mouse, terminal_height),
-        MouseEventKind::Drag(MouseButton::Left) => app.update_selection(mouse, terminal_height),
-        MouseEventKind::Up(MouseButton::Left) => app.finish_selection(mouse, terminal_height)?,
         _ => {}
     }
-    Ok(())
 }
 
 fn handle_tui_selector_key(
@@ -5536,19 +5332,7 @@ fn copy_to_clipboard(text: &str) -> Result<Option<String>> {
             return Ok(Some(command));
         }
     }
-    if io::stdout().is_terminal() {
-        write_osc52_clipboard(text)?;
-        return Ok(Some("OSC 52".to_string()));
-    }
     Ok(None)
-}
-
-fn write_osc52_clipboard(text: &str) -> Result<()> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let mut stdout = io::stdout();
-    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
-    stdout.flush()?;
-    Ok(())
 }
 
 fn clipboard_commands() -> Vec<String> {
@@ -5766,57 +5550,23 @@ mod tests {
             },
             &mut app,
             24,
-        )
-        .unwrap();
+        );
 
         assert!(app.chat_scroll > 0);
         assert_eq!(app.input, "draft");
     }
 
     #[test]
-    fn tui_mouse_capture_enables_wheel_and_sgr_coordinates() {
+    fn alternate_scroll_preserves_terminal_selection() {
         let mut enable = String::new();
-        crossterm::Command::write_ansi(&EnableTuiMouseCapture, &mut enable).unwrap();
-        assert!(enable.contains("?1000h"));
-        assert!(enable.contains("?1006h"));
+        crossterm::Command::write_ansi(&EnableAlternateScroll, &mut enable).unwrap();
+        assert!(!enable.contains("?1000h"));
+        assert!(!enable.contains("?1006h"));
+        assert!(enable.contains("?1007h"));
 
         let mut disable = String::new();
-        crossterm::Command::write_ansi(&DisableTuiMouseCapture, &mut disable).unwrap();
-        assert!(disable.contains("?1006l"));
-        assert!(disable.contains("?1000l"));
-    }
-
-    #[test]
-    fn mouse_drag_selects_visible_transcript_rows() {
-        let mut app = TuiApp::default();
-        app.entries.push(TuiEntry {
-            kind: TuiEntryKind::User,
-            text: "first\nsecond\nthird".to_string(),
-        });
-
-        app.begin_selection(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 0,
-                row: 2,
-                modifiers: KeyModifiers::empty(),
-            },
-            24,
-        );
-        app.update_selection(
-            MouseEvent {
-                kind: MouseEventKind::Drag(MouseButton::Left),
-                column: 0,
-                row: 3,
-                modifiers: KeyModifiers::empty(),
-            },
-            24,
-        );
-
-        assert_eq!(
-            app.selected_chat_text().as_deref(),
-            Some("• first\n  second")
-        );
+        crossterm::Command::write_ansi(&DisableAlternateScroll, &mut disable).unwrap();
+        assert!(disable.contains("?1007l"));
     }
 
     #[test]
