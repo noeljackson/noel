@@ -53,5 +53,133 @@
     ],
     "firstRecordVersion": 3,
     "firstRecordHasCwd": true
+  },
+  "fullTreeJsonlExport": {
+    "records": [
+      {
+        "type": "session",
+        "version": 3,
+        "id": "session_ts_parity",
+        "timestamp": "2024-01-01T00:00:00.000Z",
+        "cwd": "/repo"
+      },
+      {
+        "type": "message",
+        "id": "e1",
+        "parentId": null,
+        "timestamp": "2024-01-01T00:00:00.000Z",
+        "message": {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "hello <world>"
+            }
+          ],
+          "timestamp": 1
+        }
+      },
+      {
+        "type": "message",
+        "id": "e2",
+        "parentId": "e1",
+        "timestamp": "2024-01-01T00:00:00.000Z",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "done"
+            }
+          ],
+          "api": "anthropic-messages",
+          "provider": "anthropic",
+          "model": "claude",
+          "usage": {
+            "input": 1,
+            "output": 1,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 2,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 2
+        }
+      },
+      {
+        "type": "session_info",
+        "id": "e3",
+        "parentId": "e2",
+        "timestamp": "2024-01-01T00:00:00.000Z",
+        "name": "demo session"
+      },
+      {
+        "type": "model_change",
+        "id": "e4",
+        "parentId": "e3",
+        "timestamp": "2024-01-01T00:00:00.000Z",
+        "provider": "anthropic",
+        "modelId": "claude"
+      },
+      {
+        "type": "thinking_level_change",
+        "id": "e5",
+        "parentId": "e4",
+        "timestamp": "2024-01-01T00:00:00.000Z",
+        "thinkingLevel": "xhigh"
+      },
+      {
+        "type": "custom",
+        "customType": "fixture_state",
+        "data": {
+          "value": 1
+        },
+        "id": "e6",
+        "parentId": "e5",
+        "timestamp": "2024-01-01T00:00:00.000Z"
+      },
+      {
+        "type": "compaction",
+        "id": "e7",
+        "parentId": "e6",
+        "timestamp": "2024-01-01T00:00:00.000Z",
+        "summary": "summary",
+        "firstKeptEntryId": "e1",
+        "tokensBefore": 100
+      },
+      {
+        "type": "message",
+        "id": "e8",
+        "parentId": "e1",
+        "timestamp": "2024-01-01T00:00:00.000Z",
+        "message": {
+          "role": "user",
+          "content": "branch",
+          "timestamp": 3
+        }
+      },
+      {
+        "type": "label",
+        "id": "e9",
+        "parentId": "e8",
+        "timestamp": "2024-01-01T00:00:00.000Z",
+        "targetId": "e1",
+        "label": "important"
+      }
+    ],
+    "activeMessageTexts": [
+      "hello <world>",
+      "branch"
+    ],
+    "abandonedMessageTexts": [
+      "done"
+    ]
   }
 }

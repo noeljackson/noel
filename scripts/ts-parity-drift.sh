@@ -6,23 +6,27 @@ cd "${repo_root}"
 
 make_bin="${MAKE:-make}"
 cargo_bin="${CARGO:-cargo}"
+docker_bin="${DOCKER:-docker}"
 reference_repo="${TS_REFERENCE_REPO:-https://github.com/earendil-works/pi.git}"
 tracking_ref="${TS_PARITY_TRACKING_REF:-main}"
 fixtures_dir="${TS_PARITY_FIXTURES_DIR:-tests/fixtures/ts-parity}"
 out_dir="${TS_PARITY_DRIFT_DIR:-target/ts-parity-drift}"
+fresh_fixtures_dir="${out_dir}/fixtures"
 diff_file="${out_dir}/fixture.diff"
 brief_file="${out_dir}/brief.md"
 
-mkdir -p "${out_dir}" "${fixtures_dir}"
+rm -rf "${out_dir}"
+mkdir -p "${fresh_fixtures_dir}" "${fixtures_dir}"
 
-"${make_bin}" ts-parity-fixtures \
+"${make_bin}" ts-parity-build \
   TS_REFERENCE_REPO="${reference_repo}" \
-  TS_REFERENCE_REF="${tracking_ref}" \
-  TS_PARITY_FIXTURES_DIR="${fixtures_dir}"
+  TS_REFERENCE_REF="${tracking_ref}"
 
-git diff -- "${fixtures_dir}" > "${diff_file}"
+"${docker_bin}" run --rm \
+  -v "${repo_root}/${fresh_fixtures_dir}:/fixtures" \
+  "${TS_PARITY_IMAGE:-pi-ts-parity}"
 
-if [ -s "${diff_file}" ]; then
+if ! diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}"; then
   {
     printf '# TS Parity Drift Brief\n\n'
     printf 'The TypeScript reference fixtures changed against the tracked reference.\n\n'
@@ -35,7 +39,7 @@ if [ -s "${diff_file}" ]; then
     printf -- '- Do not run npm on the host.\n'
     printf -- '- Execute TypeScript only through Docker targets such as `make ts-parity-fixtures`, `make ts-parity-update`, or `make ts-parity-drift`.\n'
     printf -- '- Keep changes scoped to Rust parity code, fixtures, tests, and docs required by the drift.\n'
-    printf -- '- Run `cargo test -p pi-ai --lib matches_ts` and `make check` before committing.\n'
+    printf -- '- Run `cargo test -p pi-parity`, `cargo test -p pi-ai --lib matches_ts`, `cargo test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools`, and `make check` before committing.\n'
     printf -- '- If a GitHub issue is provided, include `closes #<number>` in the commit message.\n\n'
     printf '## Suggested Workflow\n\n'
     printf '1. Inspect `tests/fixtures/ts-parity` and the diff below.\n'
@@ -68,6 +72,8 @@ fi
 } > "${brief_file}"
 
 "${cargo_bin}" test -p pi-ai --lib matches_ts
+"${cargo_bin}" test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
+"${cargo_bin}" test -p pi-parity
 
 printf 'No TS parity drift detected.\n'
 printf 'Brief: %s\n' "${brief_file}"

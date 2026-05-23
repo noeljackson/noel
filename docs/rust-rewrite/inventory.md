@@ -161,12 +161,12 @@ Rust behavior:
 
 Rust sessions:
 
-- Are append-only JSONL-backed.
+- Are append-only JSONL-backed for live Rust sessions.
 - Are associated with a cwd.
 - Support `--continue`, `--resume`, `--session`, and `--fork`.
 - Support new, fork, clone, resume, delete, rename, labels, summaries, branch navigation, and filters.
 - Persist active model and thinking level.
-- Export/import JSON, JSONL, and local HTML where applicable.
+- Open/export/import JSON, TypeScript v3-shaped JSONL, and local HTML where applicable.
 
 Rust behavior:
 
@@ -395,6 +395,7 @@ Primary validation:
 - `make check`
 - `make e2e`
 - `make docker-e2e`
+- `make parity-check`
 
 Additional manual validation:
 
@@ -405,7 +406,9 @@ Additional manual validation:
 - `make ts-parity-drift`
 - `make ts-parity-agent`
 
-`make ts-parity-fixtures` is the only supported TypeScript execution path and
+`make parity-check` runs the committed fixture inventory checks, Rust
+fixture-backed assertions, and Docker drift detection. `make
+ts-parity-fixtures` is the only supported TypeScript execution path and
 runs npm inside Docker only. It defaults to the upstream TypeScript repository
 `https://github.com/earendil-works/pi` on `main`. `make ts-parity-update`
 refreshes fixtures from the moving TypeScript reference. `make ts-parity-drift` writes
@@ -417,8 +420,11 @@ Parity fixtures are sanitized upstream provider request captures. They document
 URL, method, selected headers, body, and payload shape for covered providers.
 Rust tests compare local provider request builders against those captures. Drift
 is handled by updating Rust behavior and committed fixtures together, then
-running `cargo test -p pi-ai --lib matches_ts`, `make check`, and
-`make ts-parity-drift`.
+running `make parity-check` and `make check`.
+
+The `pi-parity` crate keeps the fixture inventory, source metadata,
+script-output mapping, redaction checks, and parity documentation coverage in
+sync.
 
 This harness tracks provider request-shape parity. It does not replace Rust unit
 coverage, tmux TTY e2e, or manual live-provider smoke tests.

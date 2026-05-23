@@ -1,0 +1,62 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/google-fixture.ts"
+  },
+  "provider": "google",
+  "routing": {
+    "gemini2": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "response": {
+                "output": "alpha text"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Tool result image:"
+          },
+          {
+            "inlineData": {
+              "mimeType": "image/png",
+              "data": "YWJj"
+            }
+          }
+        ]
+      }
+    ],
+    "gemini3": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "read",
+              "response": {
+                "output": "alpha text"
+              },
+              "parts": [
+                {
+                  "inlineData": {
+                    "mimeType": "image/png",
+                    "data": "YWJj"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

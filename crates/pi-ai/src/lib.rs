@@ -1,4 +1,4 @@
-use std::env;
+use std::{collections::BTreeMap, env};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -90,6 +90,19 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(default)]
     pub media: Vec<MediaInput>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ChatToolCall>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +151,14 @@ pub enum ChatRole {
 pub struct ProviderRequest {
     pub system_prompt: Option<String>,
     pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ToolDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
 }
 
 #[derive(Debug, Error)]
@@ -394,30 +415,24 @@ impl Provider for OpenAiProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        if let Some(text) = parse_openai_chat_completions_sse_text(&body) {
-            return Ok(vec![
-                StreamEvent::Text(text),
-                StreamEvent::Stop {
-                    reason: "stop".to_string(),
-                },
-            ]);
+        if let Some(mut events) = parse_openai_chat_completions_sse_events(&body) {
+            events.push(StreamEvent::Stop {
+                reason: "stop".to_string(),
+            });
+            return Ok(events);
         }
         let response = serde_json::from_str::<Value>(&body)
             .map_err(|_| ProviderError::InvalidResponse(body.clone()))?;
-        let text = response
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
+        let mut events = parse_openai_chat_completions_events(&response)
             .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
-        Ok(vec![
-            StreamEvent::Text(text.to_string()),
-            StreamEvent::Stop {
-                reason: response
-                    .pointer("/choices/0/finish_reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("stop")
-                    .to_string(),
-            },
-        ])
+        events.push(StreamEvent::Stop {
+            reason: response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_string(),
+        });
+        Ok(events)
     }
 }
 
@@ -441,19 +456,17 @@ impl OpenAiProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        let text = parse_openai_responses_sse_text(&body)
+        let mut events = parse_openai_responses_sse_events(&body)
             .or_else(|| {
                 serde_json::from_str::<Value>(&body)
                     .ok()
-                    .and_then(|response| parse_openai_responses_text(&response))
+                    .and_then(|response| parse_openai_responses_events(&response))
             })
             .ok_or_else(|| ProviderError::InvalidResponse(body.clone()))?;
-        Ok(vec![
-            StreamEvent::Text(text),
-            StreamEvent::Stop {
-                reason: "completed".to_string(),
-            },
-        ])
+        events.push(StreamEvent::Stop {
+            reason: "completed".to_string(),
+        });
+        Ok(events)
     }
 
     fn api_key(&self) -> Result<String, ProviderError> {
@@ -480,6 +493,10 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
         "model": config.model.id,
         "messages": openai_chat_messages(config, request),
     });
+    if !request.tools.is_empty() {
+        body["tools"] = json!(openai_chat_tools(&request.tools));
+        body["tool_choice"] = json!("auto");
+    }
     if config.model.provider == "openrouter" {
         body["stream"] = json!(true);
         body["stream_options"] = json!({ "include_usage": true });
@@ -497,6 +514,23 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
     body
 }
 
+fn openai_chat_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "strict": false,
+                    "parameters": tool.parameters,
+                },
+            })
+        })
+        .collect()
+}
+
 fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> Vec<Value> {
     let mut messages = Vec::new();
     if let Some(system_prompt) = &request.system_prompt {
@@ -508,6 +542,29 @@ fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> V
         messages.push(json!({ "role": role, "content": system_prompt }));
     }
     messages.extend(request.messages.iter().map(|message| {
+        if message.role == ChatRole::Tool {
+            return json!({
+                "role": "tool",
+                "tool_call_id": message.tool_call_id.as_deref().map(|id| normalize_openai_chat_tool_call_id(config, id)),
+                "content": message.content,
+            });
+        }
+        if message.role == ChatRole::Assistant && !message.tool_calls.is_empty() {
+            return json!({
+                "role": "assistant",
+                "content": if message.content.is_empty() { Value::Null } else { json!(message.content) },
+                "tool_calls": message.tool_calls.iter().map(|tool_call| {
+                    json!({
+                        "id": normalize_openai_chat_tool_call_id(config, &tool_call.id),
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        },
+                    })
+                }).collect::<Vec<_>>(),
+            });
+        }
         let content = if message.media.is_empty() {
             json!(message.content)
         } else {
@@ -533,6 +590,51 @@ fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> V
     messages
 }
 
+fn normalize_openai_chat_tool_call_id(config: &ProviderConfig, id: &str) -> String {
+    if config.api == ProviderApi::Mistral {
+        return derive_mistral_tool_call_id(id);
+    }
+    if let Some((call_id, _item_id)) = id.split_once('|') {
+        return call_id
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .take(40)
+            .collect();
+    }
+    if config.model.provider == "openai" && id.len() > 40 {
+        id.chars().take(40).collect()
+    } else {
+        id.to_string()
+    }
+}
+
+fn derive_mistral_tool_call_id(id: &str) -> String {
+    const MISTRAL_TOOL_CALL_ID_LENGTH: usize = 9;
+    let normalized = id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    if normalized.len() == MISTRAL_TOOL_CALL_ID_LENGTH {
+        return normalized;
+    }
+    let seed = if normalized.is_empty() {
+        id
+    } else {
+        normalized.as_str()
+    };
+    short_hash(seed)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(MISTRAL_TOOL_CALL_ID_LENGTH)
+        .collect()
+}
+
 fn openrouter_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
     match normalized_thinking_level(level)? {
         "off" => Some("none"),
@@ -552,17 +654,19 @@ fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> 
     }
     let mut body = json!({
         "model": config.model.id,
-        "instructions": request.system_prompt.clone().unwrap_or_default(),
-        "input": openai_responses_input(request),
-        "tools": [],
-        "tool_choice": "auto",
-        "parallel_tool_calls": false,
-        "store": false,
+        "input": openai_responses_input_with_developer_system(request),
         "stream": true,
-        "include": [],
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
     });
+    if !request.tools.is_empty() {
+        body["tools"] = json!(openai_responses_tools(&request.tools, json!(false)));
+    }
     if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
-        body["reasoning"] = json!({ "effort": effort });
+        body["reasoning"] = json!({
+            "effort": effort,
+            "summary": "auto",
+        });
     }
     body
 }
@@ -608,7 +712,25 @@ fn openai_codex_responses_body(config: &ProviderConfig, request: &ProviderReques
             "summary": "auto",
         });
     }
+    if !request.tools.is_empty() {
+        body["tools"] = json!(openai_responses_tools(&request.tools, Value::Null));
+    }
     body
+}
+
+fn openai_responses_tools(tools: &[ToolDefinition], strict: Value) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters.clone(),
+                "strict": strict.clone(),
+            })
+        })
+        .collect()
 }
 
 fn openai_responses_input_with_developer_system(request: &ProviderRequest) -> Vec<Value> {
@@ -652,19 +774,17 @@ impl Provider for OpenAiResponsesProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        let text = parse_openai_responses_sse_text(&body)
+        let mut events = parse_openai_responses_sse_events(&body)
             .or_else(|| {
                 serde_json::from_str::<Value>(&body)
                     .ok()
-                    .and_then(|response| parse_openai_responses_text(&response))
+                    .and_then(|response| parse_openai_responses_events(&response))
             })
             .ok_or_else(|| ProviderError::InvalidResponse(body.clone()))?;
-        Ok(vec![
-            StreamEvent::Text(text),
-            StreamEvent::Stop {
-                reason: "completed".to_string(),
-            },
-        ])
+        events.push(StreamEvent::Stop {
+            reason: "completed".to_string(),
+        });
+        Ok(events)
     }
 }
 
@@ -741,32 +861,25 @@ impl Provider for AnthropicProvider {
             .json(&anthropic_body(&self.config, &request))
             .send()
             .await?;
-        let response = error_for_status_with_body(response)
-            .await?
-            .json::<Value>()
-            .await?;
-        let text = response
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .filter(|text| !text.is_empty())
+        let body = error_for_status_with_body(response).await?.text().await?;
+        if let Some(mut events) = parse_anthropic_sse_events(&body) {
+            events.push(StreamEvent::Stop {
+                reason: "stop".to_string(),
+            });
+            return Ok(events);
+        }
+        let response = serde_json::from_str::<Value>(&body)
+            .map_err(|_| ProviderError::InvalidResponse(body.clone()))?;
+        let mut events = parse_anthropic_response_events(&response)
             .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
-        Ok(vec![
-            StreamEvent::Text(text),
-            StreamEvent::Stop {
-                reason: response
-                    .get("stop_reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("stop")
-                    .to_string(),
-            },
-        ])
+        events.push(StreamEvent::Stop {
+            reason: response
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_string(),
+        });
+        Ok(events)
     }
 }
 
@@ -795,11 +908,32 @@ fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     let mut body = json!({
         "model": config.model.id,
         "max_tokens": 4096,
+        "stream": true,
         "system": anthropic_system(config, request),
         "messages": anthropic_messages_with_cache_control(&request.messages, true),
     });
+    if !request.tools.is_empty() {
+        body["tools"] = json!(anthropic_tools(&request.tools));
+    }
     apply_anthropic_thinking(&mut body, config);
     body
+}
+
+fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "eager_input_streaming": true,
+                "input_schema": tool.parameters,
+                "cache_control": {
+                    "type": "ephemeral",
+                },
+            })
+        })
+        .collect()
 }
 
 fn anthropic_headers(config: &ProviderConfig) -> Result<HeaderMap, ProviderError> {
@@ -958,13 +1092,11 @@ impl Provider for GoogleProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        if let Some(text) = parse_google_sse_text(&body) {
-            return Ok(vec![
-                StreamEvent::Text(text),
-                StreamEvent::Stop {
-                    reason: "STOP".to_string(),
-                },
-            ]);
+        if let Some(mut events) = parse_google_sse_events(&body) {
+            events.push(StreamEvent::Stop {
+                reason: "STOP".to_string(),
+            });
+            return Ok(events);
         }
         parse_google_response(
             serde_json::from_str::<Value>(&body)
@@ -1010,8 +1142,8 @@ fn google_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     if let Some(thinking_config) = google_thinking_config(config) {
         generation_config["thinkingConfig"] = thinking_config;
     }
-    json!({
-        "contents": google_messages(&request.messages),
+    let mut body = json!({
+        "contents": google_messages(config, &request.messages),
         "systemInstruction": request.system_prompt.as_ref().map(|text| {
             json!({
                 "parts": [{ "text": text }],
@@ -1019,7 +1151,23 @@ fn google_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
             })
         }),
         "generationConfig": generation_config,
-    })
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = json!(google_tools(&request.tools));
+    }
+    body
+}
+
+fn google_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+    vec![json!({
+        "functionDeclarations": tools.iter().map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parametersJsonSchema": tool.parameters,
+            })
+        }).collect::<Vec<_>>(),
+    })]
 }
 
 fn google_thinking_config(config: &ProviderConfig) -> Option<Value> {
@@ -1076,10 +1224,7 @@ impl Provider for GoogleVertexProvider {
         let url = google_vertex_url(&self.config)?;
         let response = reqwest::Client::new()
             .post(format!("{url}?key={api_key}"))
-            .json(&json!({
-                "systemInstruction": request.system_prompt.map(|text| json!({ "parts": [{ "text": text }] })),
-                "contents": google_messages(&request.messages),
-            }))
+            .json(&google_body(&self.config, &request))
             .send()
             .await?;
         parse_google_response(
@@ -1126,18 +1271,25 @@ impl Provider for MistralProvider {
             .send()
             .await?;
         let body = error_for_status_with_body(response).await?.text().await?;
-        if let Some(text) = parse_openai_chat_completions_sse_text(&body) {
-            return Ok(vec![
-                StreamEvent::Text(text),
-                StreamEvent::Stop {
-                    reason: "stop".to_string(),
-                },
-            ]);
+        if let Some(mut events) = parse_openai_chat_completions_sse_events(&body) {
+            events.push(StreamEvent::Stop {
+                reason: "stop".to_string(),
+            });
+            return Ok(events);
         }
-        parse_openai_chat_response(
-            serde_json::from_str::<Value>(&body)
-                .map_err(|_| ProviderError::InvalidResponse(body.clone()))?,
-        )
+        let response = serde_json::from_str::<Value>(&body)
+            .map_err(|_| ProviderError::InvalidResponse(body.clone()))?;
+        if let Some(mut events) = parse_openai_chat_completions_events(&response) {
+            events.push(StreamEvent::Stop {
+                reason: response
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stop")
+                    .to_string(),
+            });
+            return Ok(events);
+        }
+        Err(ProviderError::InvalidResponse(response.to_string()))
     }
 }
 
@@ -1166,11 +1318,57 @@ fn mistral_headers(config: &ProviderConfig, api_key: &str) -> Result<HeaderMap, 
 }
 
 fn mistral_chat_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
-    json!({
+    let mut body = json!({
         "model": config.model.id,
         "stream": true,
-        "messages": openai_messages(request),
-    })
+        "messages": mistral_messages(config, request),
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = json!(openai_chat_tools(&request.tools));
+    }
+    body
+}
+
+fn mistral_messages(config: &ProviderConfig, request: &ProviderRequest) -> Vec<Value> {
+    let mut messages = Vec::new();
+    if let Some(system_prompt) = &request.system_prompt {
+        messages.push(json!({ "role": "system", "content": system_prompt }));
+    }
+    messages.extend(request.messages.iter().map(|message| {
+        if message.role == ChatRole::Tool {
+            return json!({
+                "role": "tool",
+                "content": [{
+                    "type": "text",
+                    "text": message.content,
+                }],
+                "tool_call_id": message.tool_call_id.as_deref().map(|id| normalize_openai_chat_tool_call_id(config, id)),
+                "name": message.tool_name,
+            });
+        }
+        if message.role == ChatRole::Assistant && !message.tool_calls.is_empty() {
+            return json!({
+                "role": "assistant",
+                "tool_calls": message.tool_calls.iter().enumerate().map(|(index, tool_call)| {
+                    json!({
+                        "id": normalize_openai_chat_tool_call_id(config, &tool_call.id),
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        },
+                        "index": index,
+                    })
+                }).collect::<Vec<_>>(),
+                "prefix": false,
+            });
+        }
+        json!({
+            "role": role_name(&message.role),
+            "content": message.content,
+        })
+    }));
+    messages
 }
 
 struct BedrockProvider {
@@ -1212,6 +1410,11 @@ fn bedrock_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
         "messages": bedrock_messages_with_cache(config, &request.messages),
         "inferenceConfig": {},
     });
+    if !request.tools.is_empty() {
+        body["toolConfig"] = json!({
+            "tools": bedrock_tools(&request.tools),
+        });
+    }
     if let Some(system) = bedrock_system(config, request.system_prompt.as_deref()) {
         body["system"] = system;
     }
@@ -1219,6 +1422,23 @@ fn bedrock_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
         body["additionalModelRequestFields"] = fields;
     }
     body
+}
+
+fn bedrock_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "toolSpec": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": {
+                        "json": tool.parameters,
+                    },
+                },
+            })
+        })
+        .collect()
 }
 
 fn bedrock_system(config: &ProviderConfig, system_prompt: Option<&str>) -> Option<Value> {
@@ -1316,50 +1536,46 @@ impl BedrockProvider {
     }
 }
 
-fn parse_openai_chat_response(response: Value) -> Result<Vec<StreamEvent>, ProviderError> {
-    let text = response
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
-    Ok(vec![
-        StreamEvent::Text(text.to_string()),
-        StreamEvent::Stop {
-            reason: response
-                .pointer("/choices/0/finish_reason")
-                .and_then(Value::as_str)
-                .unwrap_or("stop")
-                .to_string(),
-        },
-    ])
-}
-
 fn parse_google_response(response: Value) -> Result<Vec<StreamEvent>, ProviderError> {
-    let text = response
-        .pointer("/candidates/0/content/parts")
-        .and_then(Value::as_array)
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .filter(|text| !text.is_empty())
+    let mut events = parse_google_response_events(&response)
         .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
-    Ok(vec![
-        StreamEvent::Text(text),
-        StreamEvent::Stop {
-            reason: response
-                .pointer("/candidates/0/finishReason")
-                .and_then(Value::as_str)
-                .unwrap_or("STOP")
-                .to_string(),
-        },
-    ])
+    events.push(StreamEvent::Stop {
+        reason: response
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+            .unwrap_or("STOP")
+            .to_string(),
+    });
+    Ok(events)
 }
 
+fn parse_google_response_events(response: &Value) -> Option<Vec<StreamEvent>> {
+    let parts = response
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)?;
+    google_part_events(parts)
+}
+
+#[cfg(test)]
 fn parse_google_sse_text(body: &str) -> Option<String> {
-    let mut text = String::new();
+    let events = parse_google_sse_events(body)?;
+    let text = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn parse_google_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
+    let mut events = Vec::new();
     for line in body.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
@@ -1373,45 +1589,242 @@ fn parse_google_sse_text(body: &str) -> Option<String> {
         else {
             continue;
         };
-        for part in parts {
-            if part.get("thought").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            if let Some(delta) = part.get("text").and_then(Value::as_str) {
-                text.push_str(delta);
-            }
+        if let Some(mut part_events) = google_part_events(parts) {
+            events.append(&mut part_events);
         }
     }
-    if text.is_empty() {
+    if events.is_empty() {
         None
     } else {
-        Some(text)
+        Some(events)
+    }
+}
+
+fn google_part_events(parts: &[Value]) -> Option<Vec<StreamEvent>> {
+    let mut events = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            if !text.is_empty() {
+                events.push(StreamEvent::Text(text.to_string()));
+            }
+        }
+        if let Some(function_call) = part.get("functionCall") {
+            let Some(name) = function_call.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            events.push(StreamEvent::ToolCall {
+                id: function_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("{name}_{index}")),
+                name: name.to_string(),
+                arguments: function_call
+                    .get("args")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "{}".to_string()),
+            });
+        }
+    }
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
     }
 }
 
 fn parse_bedrock_response(response: Value) -> Result<Vec<StreamEvent>, ProviderError> {
-    let text = response
-        .pointer("/output/message/content")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .filter(|text| !text.is_empty())
+    let mut events = parse_bedrock_response_events(&response)
         .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
-    Ok(vec![
-        StreamEvent::Text(text),
-        StreamEvent::Stop {
-            reason: response
-                .get("stopReason")
-                .and_then(Value::as_str)
-                .unwrap_or("stop")
-                .to_string(),
-        },
-    ])
+    events.push(StreamEvent::Stop {
+        reason: response
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .unwrap_or("stop")
+            .to_string(),
+    });
+    Ok(events)
+}
+
+fn parse_bedrock_response_events(response: &Value) -> Option<Vec<StreamEvent>> {
+    let content = response
+        .pointer("/output/message/content")
+        .and_then(Value::as_array)?;
+    let mut events = Vec::new();
+    for item in content {
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            if !text.is_empty() {
+                events.push(StreamEvent::Text(text.to_string()));
+            }
+        }
+        if let Some(tool_use) = item.get("toolUse") {
+            let Some(id) = tool_use.get("toolUseId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(name) = tool_use.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            events.push(StreamEvent::ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: tool_use
+                    .get("input")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "{}".to_string()),
+            });
+        }
+    }
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
+}
+
+fn parse_anthropic_response_events(response: &Value) -> Option<Vec<StreamEvent>> {
+    let mut events = Vec::new();
+    let content = response.get("content").and_then(Value::as_array)?;
+    for item in content {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        events.push(StreamEvent::Text(text.to_string()));
+                    }
+                }
+            }
+            Some("tool_use") => {
+                let Some(id) = item.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let arguments = item
+                    .get("input")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "{}".to_string());
+                events.push(StreamEvent::ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments,
+                });
+            }
+            _ => {}
+        }
+    }
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
+}
+
+#[derive(Debug)]
+struct PendingAnthropicToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+fn parse_anthropic_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
+    let mut events = Vec::new();
+    let mut pending_tool_calls: BTreeMap<u64, PendingAnthropicToolCall> = BTreeMap::new();
+
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(block) = event.get("content_block") else {
+                    continue;
+                };
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    let Some(id) = block.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(name) = block.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let arguments = block
+                        .get("input")
+                        .filter(|input| !input.is_null())
+                        .filter(|input| input.as_object().is_none_or(|object| !object.is_empty()))
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    pending_tool_calls.insert(
+                        index,
+                        PendingAnthropicToolCall {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            arguments,
+                        },
+                    );
+                }
+            }
+            Some("content_block_delta") => {
+                let Some(delta) = event.get("delta") else {
+                    continue;
+                };
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                events.push(StreamEvent::Text(text.to_string()));
+                            }
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                            continue;
+                        };
+                        let Some(partial_json) = delta.get("partial_json").and_then(Value::as_str)
+                        else {
+                            continue;
+                        };
+                        if let Some(tool_call) = pending_tool_calls.get_mut(&index) {
+                            tool_call.arguments.push_str(partial_json);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_stop") => {
+                let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(tool_call) = pending_tool_calls.remove(&index) else {
+                    continue;
+                };
+                events.push(StreamEvent::ToolCall {
+                    id: tool_call.id,
+                    name: tool_call.name,
+                    arguments: if tool_call.arguments.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        tool_call.arguments
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
 }
 
 fn bearer_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
@@ -1698,6 +2111,37 @@ fn bedrock_messages(messages: &[ChatMessage]) -> Vec<Value> {
         .iter()
         .filter(|message| message.role != ChatRole::System)
         .map(|message| {
+            if message.role == ChatRole::Tool {
+                return json!({
+                    "role": "user",
+                    "content": [{
+                        "toolResult": {
+                            "toolUseId": message.tool_call_id,
+                            "content": [{ "text": message.content }],
+                        },
+                    }],
+                });
+            }
+            if message.role == ChatRole::Assistant && !message.tool_calls.is_empty() {
+                let mut content = Vec::new();
+                if !message.content.is_empty() {
+                    content.push(json!({ "text": message.content }));
+                }
+                content.extend(message.tool_calls.iter().filter_map(|tool_call| {
+                    let input = serde_json::from_str::<Value>(&tool_call.arguments).ok()?;
+                    Some(json!({
+                        "toolUse": {
+                            "toolUseId": tool_call.id,
+                            "name": tool_call.name,
+                            "input": input,
+                        },
+                    }))
+                }));
+                return json!({
+                    "role": "assistant",
+                    "content": content,
+                });
+            }
             let mut content = vec![json!({ "text": message.content })];
             content.extend(message.media.iter().filter_map(|media| {
                 let format = media.mime_type.strip_prefix("image/")?;
@@ -1730,6 +2174,7 @@ fn encode_path_segment(value: &str) -> String {
     encoded
 }
 
+#[cfg(test)]
 fn openai_messages(request: &ProviderRequest) -> Vec<Value> {
     let mut messages = Vec::new();
     if let Some(system_prompt) = &request.system_prompt {
@@ -1762,10 +2207,49 @@ fn openai_messages(request: &ProviderRequest) -> Vec<Value> {
 }
 
 fn openai_responses_input(request: &ProviderRequest) -> Vec<Value> {
-    request
-        .messages
-        .iter()
-        .map(|message| {
+    let mut input = Vec::new();
+    for message in &request.messages {
+        if message.role == ChatRole::Tool {
+            let Some(call_id) = message.tool_call_id.as_deref() else {
+                continue;
+            };
+            let (call_id, _item_id) = openai_responses_tool_call_ids(call_id);
+            let output = openai_responses_tool_output(message);
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }));
+            continue;
+        }
+
+        if message.role == ChatRole::Assistant && !message.tool_calls.is_empty() {
+            if !message.content.is_empty() {
+                input.push(json!({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": message.content,
+                    }],
+                }));
+            }
+            input.extend(message.tool_calls.iter().map(|tool_call| {
+                let (call_id, item_id) = openai_responses_tool_call_ids(&tool_call.id);
+                let mut item = json!({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": tool_call.name,
+                    "arguments": tool_call.arguments,
+                });
+                if let Some(item_id) = item_id {
+                    item["id"] = json!(item_id);
+                }
+                item
+            }));
+            continue;
+        }
+
+        input.push({
             let mut content = vec![json!({
                 "type": if message.role == ChatRole::Assistant { "output_text" } else { "input_text" },
                 "text": message.content,
@@ -1780,10 +2264,107 @@ fn openai_responses_input(request: &ProviderRequest) -> Vec<Value> {
                 "role": role_name(&message.role),
                 "content": content,
             })
-        })
-        .collect()
+        });
+    }
+    input
 }
 
+fn openai_responses_tool_output(message: &ChatMessage) -> Value {
+    if message.media.is_empty() {
+        return json!(message.content);
+    }
+    let mut output = Vec::new();
+    if !message.content.is_empty() {
+        output.push(json!({
+            "type": "input_text",
+            "text": message.content,
+        }));
+    }
+    output.extend(message.media.iter().map(|media| {
+        json!({
+            "type": "input_image",
+            "detail": "auto",
+            "image_url": media_data_url(media),
+        })
+    }));
+    Value::Array(output)
+}
+
+fn openai_responses_tool_call_ids(id: &str) -> (String, Option<String>) {
+    let Some((call_id, item_id)) = id.split_once('|') else {
+        return (normalize_openai_responses_id_part(id), None);
+    };
+    (
+        normalize_openai_responses_id_part(call_id),
+        Some(normalize_openai_responses_item_id(item_id)),
+    )
+}
+
+fn normalize_openai_responses_item_id(id: &str) -> String {
+    let normalized = normalize_openai_responses_id_part(id);
+    if normalized.starts_with("fc_") && normalized.len() <= 64 && normalized.len() == id.len() {
+        return normalized;
+    }
+    let hashed = format!("fc_{}", short_hash(id));
+    if hashed.len() > 64 {
+        hashed.chars().take(64).collect()
+    } else {
+        hashed
+    }
+}
+
+fn normalize_openai_responses_id_part(id: &str) -> String {
+    let mut normalized = id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect::<String>();
+    while normalized.ends_with('_') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn short_hash(value: &str) -> String {
+    let mut h1 = 0xdead_beefu32;
+    let mut h2 = 0x41c6_ce57u32;
+    for unit in value.encode_utf16() {
+        let ch = u32::from(unit);
+        h1 = (h1 ^ ch).wrapping_mul(2_654_435_761);
+        h2 = (h2 ^ ch).wrapping_mul(1_597_334_677);
+    }
+    h1 = (h1 ^ (h1 >> 16)).wrapping_mul(2_246_822_507)
+        ^ (h2 ^ (h2 >> 13)).wrapping_mul(3_266_489_909);
+    h2 = (h2 ^ (h2 >> 16)).wrapping_mul(2_246_822_507)
+        ^ (h1 ^ (h1 >> 13)).wrapping_mul(3_266_489_909);
+    format!("{}{}", to_base36(h2), to_base36(h1))
+}
+
+fn to_base36(mut value: u32) -> String {
+    if value == 0 {
+        return "0".to_string();
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        let digit = (value % 36) as u8;
+        let ch = if digit < 10 {
+            char::from(b'0' + digit)
+        } else {
+            char::from(b'a' + digit - 10)
+        };
+        digits.push(ch);
+        value /= 36;
+    }
+    digits.iter().rev().collect()
+}
+
+#[cfg(test)]
 fn parse_openai_responses_text(response: &Value) -> Option<String> {
     if let Some(text) = response.get("output_text").and_then(Value::as_str) {
         if !text.is_empty() {
@@ -1806,6 +2387,73 @@ fn parse_openai_responses_text(response: &Value) -> Option<String> {
     }
 }
 
+fn parse_openai_responses_events(response: &Value) -> Option<Vec<StreamEvent>> {
+    let mut events = Vec::new();
+    let has_output_text = response
+        .get("output_text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+    if let Some(text) = has_output_text {
+        events.push(StreamEvent::Text(text.to_string()));
+    }
+    if let Some(output) = response.get("output").and_then(Value::as_array) {
+        for item in output {
+            if has_output_text.is_none() {
+                if let Some(text) = parse_openai_responses_item_text(item) {
+                    events.push(StreamEvent::Text(text));
+                }
+            }
+            if let Some(tool_call) = parse_openai_responses_function_call(item) {
+                events.push(tool_call);
+            }
+        }
+    }
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
+}
+
+fn parse_openai_responses_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
+    let mut events = Vec::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") | Some("output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    events.push(StreamEvent::Text(delta.to_string()));
+                }
+            }
+            Some("response.output_item.done") | Some("output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    if let Some(text) = parse_openai_responses_item_text(item) {
+                        events.push(StreamEvent::Text(text));
+                    }
+                    if let Some(tool_call) = parse_openai_responses_function_call(item) {
+                        events.push(tool_call);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
+}
+
+#[cfg(test)]
 fn parse_openai_responses_sse_text(body: &str) -> Option<String> {
     let mut text = String::new();
     for line in body.lines() {
@@ -1841,6 +2489,26 @@ fn parse_openai_responses_sse_text(body: &str) -> Option<String> {
     }
 }
 
+fn parse_openai_responses_function_call(item: &Value) -> Option<StreamEvent> {
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+    Some(StreamEvent::ToolCall {
+        id: item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)?
+            .to_string(),
+        name: item.get("name").and_then(Value::as_str)?.to_string(),
+        arguments: item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}")
+            .to_string(),
+    })
+}
+
+#[cfg(test)]
 fn parse_openai_chat_completions_sse_text(body: &str) -> Option<String> {
     let mut text = String::new();
     for line in body.lines() {
@@ -1865,6 +2533,95 @@ fn parse_openai_chat_completions_sse_text(body: &str) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+fn parse_openai_chat_completions_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
+    let mut events = Vec::new();
+    let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let Some(delta) = event.pointer("/choices/0/delta") else {
+            continue;
+        };
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            events.push(StreamEvent::Text(text.to_string()));
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                while tool_calls.len() <= index {
+                    tool_calls.push((String::new(), String::new(), String::new()));
+                }
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    tool_calls[index].0.push_str(id);
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    tool_calls[index].1.push_str(name);
+                }
+                if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
+                {
+                    tool_calls[index].2.push_str(arguments);
+                }
+            }
+        }
+    }
+    events.extend(tool_calls.into_iter().filter_map(|(id, name, arguments)| {
+        if id.is_empty() || name.is_empty() {
+            return None;
+        }
+        Some(StreamEvent::ToolCall {
+            id,
+            name,
+            arguments,
+        })
+    }));
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
+}
+
+fn parse_openai_chat_completions_events(response: &Value) -> Option<Vec<StreamEvent>> {
+    let message = response.pointer("/choices/0/message")?;
+    let mut events = Vec::new();
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            events.push(StreamEvent::Text(text.to_string()));
+        }
+    }
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            let Some(id) = call.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(name) = call.pointer("/function/name").and_then(Value::as_str) else {
+                continue;
+            };
+            events.push(StreamEvent::ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: call
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}")
+                    .to_string(),
+            });
+        }
+    }
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
     }
 }
 
@@ -1896,6 +2653,40 @@ fn anthropic_messages_with_cache_control(
         .iter()
         .filter(|message| message.role != ChatRole::System)
         .map(|message| {
+            if message.role == ChatRole::Tool {
+                if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+                    return json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": message.content,
+                        }],
+                    });
+                }
+            }
+            if message.role == ChatRole::Assistant && !message.tool_calls.is_empty() {
+                let mut content = Vec::new();
+                if !message.content.is_empty() {
+                    content.push(json!({
+                        "type": "text",
+                        "text": message.content,
+                    }));
+                }
+                content.extend(message.tool_calls.iter().filter_map(|tool_call| {
+                    let input = serde_json::from_str::<Value>(&tool_call.arguments).ok()?;
+                    Some(json!({
+                        "type": "tool_use",
+                        "id": tool_call.id,
+                        "name": tool_call.name,
+                        "input": input,
+                    }))
+                }));
+                return json!({
+                    "role": "assistant",
+                    "content": content,
+                });
+            }
             let content = if message.media.is_empty() {
                 json!(message.content)
             } else {
@@ -1949,26 +2740,139 @@ fn apply_anthropic_cache_control_to_last_user_message(messages: &mut [Value]) {
     message["content"] = json!([anthropic_cached_text_block(text)]);
 }
 
-fn google_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
+fn google_messages(config: &ProviderConfig, messages: &[ChatMessage]) -> Vec<Value> {
+    let mut contents = Vec::new();
+    for message in messages
         .iter()
         .filter(|message| message.role != ChatRole::System)
-        .map(|message| {
-            let mut parts = vec![json!({ "text": message.content })];
-            parts.extend(message.media.iter().map(|media| {
-                json!({
-                    "inlineData": {
-                        "mimeType": media.mime_type,
-                        "data": media.data_base64,
-                    },
-                })
+    {
+        if message.role == ChatRole::Tool {
+            let mut image_parts = message
+                .media
+                .iter()
+                .map(google_inline_data_part)
+                .collect::<Vec<_>>();
+            let has_images = !image_parts.is_empty();
+            let response_value = if !message.content.is_empty() {
+                message.content.clone()
+            } else if has_images {
+                "(see attached image)".to_string()
+            } else {
+                String::new()
+            };
+            let mut function_response = json!({
+                "name": message.tool_name.as_deref().unwrap_or("tool"),
+                "response": {
+                    "output": response_value,
+                },
+            });
+            if has_images && google_supports_multimodal_function_response(&config.model.id) {
+                function_response["parts"] = Value::Array(image_parts.clone());
+            }
+            if google_requires_tool_call_id(&config.model.id) {
+                if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+                    function_response["id"] = json!(tool_call_id);
+                }
+            }
+            let function_response_part = json!({ "functionResponse": function_response });
+            let should_merge = contents
+                .last()
+                .and_then(|content: &Value| content.get("role"))
+                .and_then(Value::as_str)
+                == Some("user")
+                && contents
+                    .last()
+                    .and_then(|content| content.get("parts"))
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .any(|part| part.get("functionResponse").is_some())
+                    })
+                    .unwrap_or(false);
+            if should_merge {
+                if let Some(parts) = contents
+                    .last_mut()
+                    .and_then(|content| content.get_mut("parts"))
+                    .and_then(Value::as_array_mut)
+                {
+                    parts.push(function_response_part);
+                }
+            } else {
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [function_response_part],
+                }));
+            }
+            if has_images && !google_supports_multimodal_function_response(&config.model.id) {
+                let mut parts = vec![json!({ "text": "Tool result image:" })];
+                parts.append(&mut image_parts);
+                contents.push(json!({
+                    "role": "user",
+                    "parts": parts,
+                }));
+            }
+            continue;
+        }
+        if message.role == ChatRole::Assistant && !message.tool_calls.is_empty() {
+            let mut parts = Vec::new();
+            if !message.content.is_empty() {
+                parts.push(json!({ "text": message.content }));
+            }
+            parts.extend(message.tool_calls.iter().filter_map(|tool_call| {
+                let args = serde_json::from_str::<Value>(&tool_call.arguments).ok()?;
+                let mut function_call = json!({
+                    "name": tool_call.name,
+                    "args": args,
+                });
+                if google_requires_tool_call_id(&config.model.id) {
+                    function_call["id"] = json!(tool_call.id);
+                }
+                Some(json!({ "functionCall": function_call }))
             }));
-            json!({
-                "role": if message.role == ChatRole::Assistant { "model" } else { "user" },
+            contents.push(json!({
+                "role": "model",
                 "parts": parts,
-            })
-        })
-        .collect()
+            }));
+            continue;
+        }
+        let mut parts = vec![json!({ "text": message.content })];
+        parts.extend(message.media.iter().map(google_inline_data_part));
+        contents.push(json!({
+            "role": if message.role == ChatRole::Assistant { "model" } else { "user" },
+            "parts": parts,
+        }));
+    }
+    contents
+}
+
+fn google_inline_data_part(media: &MediaInput) -> Value {
+    json!({
+        "inlineData": {
+            "mimeType": media.mime_type,
+            "data": media.data_base64,
+        },
+    })
+}
+
+fn google_requires_tool_call_id(model_id: &str) -> bool {
+    model_id.starts_with("claude-") || model_id.starts_with("gpt-oss-")
+}
+
+fn google_supports_multimodal_function_response(model_id: &str) -> bool {
+    google_gemini_major_version(model_id)
+        .map(|major| major >= 3)
+        .unwrap_or(true)
+}
+
+fn google_gemini_major_version(model_id: &str) -> Option<u64> {
+    let lower = model_id.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("gemini-live-")
+        .or_else(|| lower.strip_prefix("gemini-"))?;
+    let version = rest.split('-').next()?;
+    let major = version.split('.').next()?;
+    major.parse().ok()
 }
 
 fn media_data_url(media: &MediaInput) -> String {
@@ -2010,7 +2914,11 @@ mod tests {
                     role: ChatRole::User,
                     content: "hello".to_string(),
                     media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
                 }],
+                tools: Vec::new(),
             })
             .await
             .expect("faux provider should complete");
@@ -2080,6 +2988,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_openai_responses_function_call_events() {
+        let body = r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#;
+        let events = parse_openai_responses_sse_events(body).expect("events");
+
+        assert_eq!(
+            events,
+            vec![StreamEvent::ToolCall {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path":"a.txt"}"#.to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn parses_openai_chat_completions_sse_delta_text() {
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
@@ -2090,6 +3013,24 @@ mod tests {
         assert_eq!(
             parse_openai_chat_completions_sse_text(body),
             Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_openai_chat_completions_tool_call_events() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.txt\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n"
+        );
+
+        assert_eq!(
+            parse_openai_chat_completions_sse_events(body),
+            Some(vec![StreamEvent::ToolCall {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path":"a.txt"}"#.to_string(),
+            }])
         );
     }
 
@@ -2117,7 +3058,11 @@ mod tests {
                     width: Some(1),
                     height: Some(1),
                 }],
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
 
         let openai = openai_messages(&request);
@@ -2130,8 +3075,652 @@ mod tests {
             anthropic[0]["content"][1]["source"]["media_type"],
             "image/png"
         );
-        let google = google_messages(&request.messages);
+        let google_config = ProviderConfig {
+            model: ModelRef {
+                provider: "google".to_string(),
+                id: "gemini-2.5-pro".to_string(),
+            },
+            api: ProviderApi::Google,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("key".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        let google = google_messages(&google_config, &request.messages);
         assert_eq!(google[0]["parts"][1]["inlineData"]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn openai_responses_input_preserves_tool_calls_and_results() {
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "use a tool".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "file contents".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_name: Some("read".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            tools: Vec::new(),
+        };
+
+        let input = openai_responses_input(&request);
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["name"], "read");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[2]["output"], "file contents");
+    }
+
+    #[test]
+    fn openai_responses_input_normalizes_pipe_separated_tool_call_ids() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/openai-responses-tool-id.json"
+        ))
+        .expect("parse TS parity fixture");
+        let raw_id = fixture["conversion"]["rawToolCallId"]
+            .as_str()
+            .expect("raw tool call id");
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: raw_id.to_string(),
+                        name: "edit".to_string(),
+                        arguments: r#"{"path":"src/styles/app.css"}"#.to_string(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "ok".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: Some(raw_id.to_string()),
+                    tool_name: Some("edit".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            tools: Vec::new(),
+        };
+
+        let input = openai_responses_input(&request);
+
+        assert_eq!(input[0], fixture["conversion"]["functionCall"]);
+        assert!(input[0]["id"].as_str().expect("id").len() <= 64);
+        assert_eq!(input[1], fixture["conversion"]["toolOutput"]);
+    }
+
+    #[test]
+    fn openai_responses_tool_result_keeps_images_inside_function_output() {
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::Tool,
+                content: "A red circle".to_string(),
+                media: vec![MediaInput {
+                    mime_type: "image/png".to_string(),
+                    data_base64: "cmVkLWNpcmNsZQ==".to_string(),
+                    path: Some("circle.png".to_string()),
+                    width: Some(100),
+                    height: Some(100),
+                }],
+                tool_call_id: Some("call_1".to_string()),
+                tool_name: Some("get_image".to_string()),
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+        };
+
+        let input = openai_responses_input(&request);
+
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["output"][0]["type"], "input_text");
+        assert_eq!(input[0]["output"][0]["text"], "A red circle");
+        assert_eq!(input[0]["output"][1]["type"], "input_image");
+        assert_eq!(input[0]["output"][1]["detail"], "auto");
+        assert_eq!(
+            input[0]["output"][1]["image_url"],
+            "data:image/png;base64,cmVkLWNpcmNsZQ=="
+        );
+    }
+
+    #[test]
+    fn openai_chat_body_preserves_tools_calls_and_results() {
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "file contents".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_name: Some("read".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                }),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "openrouter".to_string(),
+                id: "model".to_string(),
+            },
+            api: ProviderApi::OpenAi,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        let body = openai_chat_completions_body(&config, &request);
+        assert_eq!(body["tools"][0]["function"]["name"], "read");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][1]["role"], "tool");
+        assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn openai_chat_body_normalizes_responses_tool_call_ids() {
+        let raw_id = "call_1234567890abcdefghijklmnopqrstuvwxyzEXTRA|fc_foreign_item";
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: raw_id.to_string(),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "file contents".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: Some(raw_id.to_string()),
+                    tool_name: Some("read".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            tools: Vec::new(),
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "openai".to_string(),
+                id: "gpt-4o-mini".to_string(),
+            },
+            api: ProviderApi::OpenAi,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("sk".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        let body = openai_chat_completions_body(&config, &request);
+
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["id"],
+            "call_1234567890abcdefghijklmnopqrstuvwxy"
+        );
+        assert_eq!(
+            body["messages"][1]["tool_call_id"],
+            "call_1234567890abcdefghijklmnopqrstuvwxy"
+        );
+    }
+
+    #[test]
+    fn anthropic_body_preserves_tools_calls_and_results() {
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: "toolu_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "file contents".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: Some("toolu_1".to_string()),
+                    tool_name: Some("read".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                }),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "anthropic".to_string(),
+                id: "claude-sonnet-4-6".to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        let body = anthropic_body(&config, &request);
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(
+            body["tools"][0]["input_schema"],
+            request.tools[0].parameters
+        );
+        assert_eq!(body["messages"][0]["content"][0]["type"], "tool_use");
+        assert_eq!(body["messages"][0]["content"][0]["id"], "toolu_1");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "tool_result");
+        assert_eq!(body["messages"][1]["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn parses_anthropic_tool_use_events() {
+        let response = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "read",
+                "input": { "path": "a.txt" }
+            }],
+            "stop_reason": "tool_use"
+        });
+
+        assert_eq!(
+            parse_anthropic_response_events(&response),
+            Some(vec![StreamEvent::ToolCall {
+                id: "toolu_1".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path":"a.txt"}"#.to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn parses_anthropic_sse_tool_use_events() {
+        let body = concat!(
+            r#"event: message_start"#,
+            "\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_1"}}"#,
+            "\n\n",
+            r#"event: content_block_start"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"event: content_block_delta"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"reading "}}"#,
+            "\n\n",
+            r#"event: content_block_start"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}"#,
+            "\n\n",
+            r#"event: content_block_delta"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\""}}"#,
+            "\n\n",
+            r#"event: content_block_delta"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":":\"a.txt\"}"}}"#,
+            "\n\n",
+            r#"event: content_block_stop"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n\n",
+        );
+
+        assert_eq!(
+            parse_anthropic_sse_events(body),
+            Some(vec![
+                StreamEvent::Text("reading ".to_string()),
+                StreamEvent::ToolCall {
+                    id: "toolu_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: r#"{"path":"a.txt"}"#.to_string(),
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn google_body_preserves_tools_calls_and_results() {
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: "read_0".to_string(),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "file contents".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: Some("read_0".to_string()),
+                    tool_name: Some("read".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                }),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "google".to_string(),
+                id: "gemini-2.5-pro".to_string(),
+            },
+            api: ProviderApi::Google,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        let body = google_body(&config, &request);
+        assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read");
+        assert_eq!(
+            body["contents"][0]["parts"][0]["functionCall"]["name"],
+            "read"
+        );
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["name"],
+            "read"
+        );
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["response"]["output"],
+            "file contents"
+        );
+    }
+
+    #[test]
+    fn google_tool_result_images_follow_gemini_version_routing() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/google-tool-image-routing.json"
+        ))
+        .expect("parse TS parity fixture");
+        let messages = vec![ChatMessage {
+            role: ChatRole::Tool,
+            content: "alpha text".to_string(),
+            media: vec![MediaInput {
+                mime_type: "image/png".to_string(),
+                data_base64: "YWJj".to_string(),
+                path: Some("image.png".to_string()),
+                width: Some(1),
+                height: Some(1),
+            }],
+            tool_call_id: Some("call_img".to_string()),
+            tool_name: Some("read".to_string()),
+            tool_calls: Vec::new(),
+        }];
+        let mut config = ProviderConfig {
+            model: ModelRef {
+                provider: "google".to_string(),
+                id: "gemini-2.5-flash".to_string(),
+            },
+            api: ProviderApi::Google,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        let gemini_2 = google_messages(&config, &messages);
+        assert_eq!(json!(gemini_2), fixture["routing"]["gemini2"]);
+
+        config.model.id = "gemini-3-pro-preview".to_string();
+        let gemini_3 = google_messages(&config, &messages);
+        assert_eq!(json!(gemini_3), fixture["routing"]["gemini3"]);
+    }
+
+    #[test]
+    fn parses_google_function_call_events() {
+        let body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[",
+            "{\"functionCall\":{\"name\":\"read\",\"args\":{\"path\":\"a.txt\"}}}",
+            "]}}]}\n\n"
+        );
+
+        assert_eq!(
+            parse_google_sse_events(body),
+            Some(vec![StreamEvent::ToolCall {
+                id: "read_0".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path":"a.txt"}"#.to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn mistral_body_preserves_tools_calls_and_results() {
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "file contents".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_name: Some("read".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                }),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "mistral".to_string(),
+                id: "devstral-medium-latest".to_string(),
+            },
+            api: ProviderApi::Mistral,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        let body = mistral_chat_body(&config, &request);
+        assert_eq!(body["tools"][0]["function"]["name"], "read");
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/mistral-tool-id.json"
+        ))
+        .expect("parse TS parity fixture");
+        assert_eq!(body["messages"], fixture["request"]["body"]["messages"]);
+    }
+
+    #[test]
+    fn bedrock_body_preserves_tools_calls_and_results() {
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: "tooluse_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "file contents".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: Some("tooluse_1".to_string()),
+                    tool_name: Some("read".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                }),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "amazon-bedrock".to_string(),
+                id: "us.anthropic.claude-opus-4-6-20260112-v1:0".to_string(),
+            },
+            api: ProviderApi::Bedrock,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        let body = bedrock_body(&config, &request);
+        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "read");
+        assert_eq!(
+            body["messages"][0]["content"][0]["toolUse"]["toolUseId"],
+            "tooluse_1"
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["toolResult"]["toolUseId"],
+            "tooluse_1"
+        );
+    }
+
+    #[test]
+    fn parses_bedrock_tool_use_events() {
+        let response = json!({
+            "output": {
+                "message": {
+                    "content": [{
+                        "toolUse": {
+                            "toolUseId": "tooluse_1",
+                            "name": "read",
+                            "input": { "path": "a.txt" }
+                        }
+                    }]
+                }
+            },
+            "stopReason": "tool_use"
+        });
+
+        assert_eq!(
+            parse_bedrock_response_events(&response),
+            Some(vec![StreamEvent::ToolCall {
+                id: "tooluse_1".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path":"a.txt"}"#.to_string(),
+            }])
+        );
     }
 
     #[test]
@@ -2287,7 +3876,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let opus = ProviderConfig {
             model: ModelRef {
@@ -2333,7 +3926,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let config = ProviderConfig {
             model: ModelRef {
@@ -2369,11 +3966,7 @@ mod tests {
         }
 
         let body = anthropic_body(&config, &request);
-        assert_eq!(body["model"], fixture_request["body"]["model"]);
-        assert_eq!(body["max_tokens"], fixture_request["body"]["max_tokens"]);
-        assert_eq!(body["system"], fixture_request["body"]["system"]);
-        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
-        assert_eq!(body["thinking"], fixture_request["body"]["thinking"]);
+        assert_eq!(body, fixture_request["body"]);
     }
 
     #[test]
@@ -2388,7 +3981,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let config = ProviderConfig {
             model: ModelRef {
@@ -2418,11 +4015,7 @@ mod tests {
         assert!(headers.get("x-app").is_none());
 
         let body = anthropic_body(&config, &request);
-        assert_eq!(body["model"], fixture_request["body"]["model"]);
-        assert_eq!(body["max_tokens"], fixture_request["body"]["max_tokens"]);
-        assert_eq!(body["system"], fixture_request["body"]["system"]);
-        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
-        assert_eq!(body["thinking"], fixture_request["body"]["thinking"]);
+        assert_eq!(body, fixture_request["body"]);
     }
 
     #[test]
@@ -2494,7 +4087,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let config = ProviderConfig {
             model: ModelRef {
@@ -2534,6 +4131,208 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_tools_matches_ts_request_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/openai-responses-tools.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: vec![ToolDefinition {
+                name: "fixture_echo".to_string(),
+                description: "Echo text for the parity fixture.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                        },
+                    },
+                    "required": ["text"],
+                }),
+            }],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "openai".to_string(),
+                id: "gpt-5.4".to_string(),
+            },
+            api: ProviderApi::OpenAiResponses,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("sk-ts-parity-token".to_string()),
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        let body = openai_responses_body(&config, &request);
+        assert_eq!(body, fixture["request"]["body"]);
+    }
+
+    #[test]
+    fn anthropic_tools_matches_ts_request_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/anthropic-tools.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: vec![fixture_echo_tool()],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "anthropic".to_string(),
+                id: "claude-sonnet-4-6".to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("api-key".to_string()),
+            thinking_level: Some("off".to_string()),
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        let body = anthropic_body(&config, &request);
+
+        assert_eq!(body, fixture["request"]["body"]);
+    }
+
+    #[test]
+    fn google_tools_matches_ts_request_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/google-tools.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: vec![fixture_echo_tool()],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "google".to_string(),
+                id: "gemini-2.5-pro".to_string(),
+            },
+            api: ProviderApi::Google,
+            base_url: Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+            auth: ProviderAuth::ApiKey("google-key".to_string()),
+            thinking_level: Some("high".to_string()),
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        assert_eq!(google_body(&config, &request), fixture["request"]["body"]);
+    }
+
+    #[test]
+    fn mistral_tools_matches_ts_request_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/mistral-tools.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: vec![fixture_echo_tool()],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "mistral".to_string(),
+                id: "devstral-medium-latest".to_string(),
+            },
+            api: ProviderApi::Mistral,
+            base_url: Some("https://api.mistral.ai/v1".to_string()),
+            auth: ProviderAuth::ApiKey("mistral-key".to_string()),
+            thinking_level: Some("high".to_string()),
+            thinking_budget_tokens: None,
+            session_id: Some("session_ts_parity".to_string()),
+        };
+
+        assert_eq!(
+            mistral_chat_body(&config, &request),
+            fixture["request"]["body"]
+        );
+    }
+
+    #[test]
+    fn bedrock_tools_matches_ts_payload_shape() {
+        let fixture = serde_json::from_str::<Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/bedrock-tools.json"
+        ))
+        .expect("parse TS parity fixture");
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: vec![fixture_echo_tool()],
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "amazon-bedrock".to_string(),
+                id: "us.anthropic.claude-opus-4-6-v1".to_string(),
+            },
+            api: ProviderApi::Bedrock,
+            base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
+            auth: ProviderAuth::ApiKey("bedrock-key".to_string()),
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+
+        assert_eq!(bedrock_body(&config, &request), fixture["payload"]);
+    }
+
+    fn fixture_echo_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "fixture_echo".to_string(),
+            description: "Echo text for the parity fixture.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                    },
+                },
+                "required": ["text"],
+            }),
+        }
+    }
+
+    #[test]
     fn openrouter_kimi_matches_ts_request_shape() {
         let fixture = serde_json::from_str::<Value>(include_str!(
             "../../../tests/fixtures/ts-parity/openrouter-kimi.json"
@@ -2545,7 +4344,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let config = ProviderConfig {
             model: ModelRef {
@@ -2578,15 +4381,7 @@ mod tests {
         );
 
         let body = openai_chat_completions_body(&config, &request);
-        assert_eq!(body["model"], fixture_request["body"]["model"]);
-        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
-        assert_eq!(body["stream"], fixture_request["body"]["stream"]);
-        assert_eq!(
-            body["stream_options"],
-            fixture_request["body"]["stream_options"]
-        );
-        assert_eq!(body["store"], fixture_request["body"]["store"]);
-        assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
+        assert_eq!(body, fixture_request["body"]);
     }
 
     #[test]
@@ -2601,7 +4396,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let config = ProviderConfig {
             model: ModelRef {
@@ -2642,12 +4441,7 @@ mod tests {
         assert!(headers.get(AUTHORIZATION).is_some());
 
         let body = openai_responses_body(&config, &request);
-        assert_eq!(body["model"], fixture_request["body"]["model"]);
-        assert_eq!(body["input"], fixture_request["body"]["input"]);
-        assert_eq!(body["store"], fixture_request["body"]["store"]);
-        assert_eq!(body["stream"], fixture_request["body"]["stream"]);
-        assert_eq!(body["include"], fixture_request["body"]["include"]);
-        assert_eq!(body["reasoning"], fixture_request["body"]["reasoning"]);
+        assert_eq!(body, fixture_request["body"]);
     }
 
     #[test]
@@ -2662,7 +4456,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let config = ProviderConfig {
             model: ModelRef {
@@ -2706,7 +4504,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let config = ProviderConfig {
             model: ModelRef {
@@ -2738,7 +4540,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let config = ProviderConfig {
             model: ModelRef {
@@ -2795,13 +4601,7 @@ mod tests {
         assert!(headers.get(AUTHORIZATION).is_none());
 
         let body = openai_chat_completions_body(&config, &request);
-        assert_eq!(body["model"], fixture_request["body"]["model"]);
-        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
-        assert_eq!(body["stream"], fixture_request["body"]["stream"]);
-        assert_eq!(
-            body["stream_options"],
-            fixture_request["body"]["stream_options"]
-        );
+        assert_eq!(body, fixture_request["body"]);
     }
 
     #[test]
@@ -2816,7 +4616,11 @@ mod tests {
                 role: ChatRole::User,
                 content: "hello".to_string(),
                 media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
             }],
+            tools: Vec::new(),
         };
         let config = ProviderConfig {
             model: ModelRef {
@@ -2843,9 +4647,7 @@ mod tests {
         assert!(headers.get(AUTHORIZATION).is_some());
 
         let body = mistral_chat_body(&config, &request);
-        assert_eq!(body["model"], fixture_request["body"]["model"]);
-        assert_eq!(body["stream"], fixture_request["body"]["stream"]);
-        assert_eq!(body["messages"], fixture_request["body"]["messages"]);
+        assert_eq!(body, fixture_request["body"]);
     }
 
     #[test]
@@ -2906,6 +4708,9 @@ mod tests {
                 width: None,
                 height: None,
             }],
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
         }]);
 
         assert_eq!(messages[0]["role"], "user");

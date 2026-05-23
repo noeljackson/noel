@@ -1,7 +1,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Type } from "/ts-reference/packages/ai/src/index.ts";
 import { getModel } from "/ts-reference/packages/ai/src/models.ts";
+import { convertMessages } from "/ts-reference/packages/ai/src/providers/google-shared.ts";
 import { streamSimple } from "/ts-reference/packages/ai/src/stream.ts";
 
 type CapturedRequest = {
@@ -32,7 +34,7 @@ async function requestBody(input: RequestInfo | URL, init: RequestInit | undefin
 	return "";
 }
 
-async function captureGoogleRequest(): Promise<CapturedRequest> {
+async function captureGoogleRequest(withTools = false): Promise<CapturedRequest> {
 	let captured: CapturedRequest | undefined;
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -62,6 +64,17 @@ async function captureGoogleRequest(): Promise<CapturedRequest> {
 						timestamp: 0,
 					},
 				],
+				tools: withTools
+					? [
+							{
+								name: "fixture_echo",
+								description: "Echo text for the parity fixture.",
+								parameters: Type.Object({
+									text: Type.String(),
+								}),
+							},
+						]
+					: undefined,
 			},
 			{
 				apiKey: "google_ts_parity_token",
@@ -91,6 +104,30 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 	return sanitized;
 }
 
+function captureGoogleToolImageRouting() {
+	const context = {
+		messages: [
+			{
+				role: "toolResult",
+				toolCallId: "call_img",
+				toolName: "read",
+				content: [
+					{ type: "text", text: "alpha text" },
+					{ type: "image", data: "YWJj", mimeType: "image/png" },
+				],
+				isError: false,
+				timestamp: 0,
+			},
+		],
+	};
+	const gemini2 = getModel("google", "gemini-2.5-flash");
+	const gemini3 = { ...getModel("google", "gemini-2.5-flash"), id: "gemini-3-pro-preview" };
+	return {
+		gemini2: convertMessages(gemini2, context as never),
+		gemini3: convertMessages(gemini3, context as never),
+	};
+}
+
 async function main() {
 	const outputDir = process.argv[2];
 	if (!outputDir) {
@@ -102,12 +139,46 @@ async function main() {
 		`${JSON.stringify(
 			{
 				source: {
-					branch: "ts-reference",
+					repository: "https://github.com/earendil-works/pi",
+					ref: "main",
 					script: fileURLToPath(import.meta.url),
 				},
 				provider: "google",
 				auth: "api-key",
 				request: await captureGoogleRequest(),
+			},
+			null,
+			2,
+		)}\n`,
+	);
+	await writeFile(
+		join(outputDir, "google-tools.json"),
+		`${JSON.stringify(
+			{
+				source: {
+					repository: "https://github.com/earendil-works/pi",
+					ref: "main",
+					script: fileURLToPath(import.meta.url),
+				},
+				provider: "google",
+				auth: "api-key",
+				request: await captureGoogleRequest(true),
+			},
+			null,
+			2,
+		)}\n`,
+	);
+	await writeFile(
+		join(outputDir, "google-tool-image-routing.json"),
+		`${JSON.stringify(
+			{
+				source: {
+					repository: "https://github.com/earendil-works/pi",
+					ref: "main",
+					script: fileURLToPath(import.meta.url),
+				},
+				provider: "google",
+				routing: captureGoogleToolImageRouting(),
 			},
 			null,
 			2,
