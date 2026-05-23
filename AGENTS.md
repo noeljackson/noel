@@ -32,6 +32,12 @@ make e2e
 - Provider tests must use faux/local providers, not paid APIs or real credentials.
 - File tools must not wipe unrelated user changes.
 
+## Persistence
+
+When given an implementation, parity, debugging, or cleanup task, keep working until the task is genuinely complete, blocked by missing information, or explicitly paused by the user. Do not stop at a validated checkpoint if there is still known relevant work to do; move to the next highest-value item and keep validating as you go.
+
+If a task is broad, break it into concrete slices internally and continue through them autonomously. Only return a final answer when there is no reasonable next step left, validation fails in a way that needs user input, or the user asks for status or stop.
+
 ## Git
 
 - Never use `git add -A` or `git add .`.
