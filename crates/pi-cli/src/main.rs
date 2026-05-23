@@ -2690,11 +2690,12 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
             Constraint::Min(0),
             Constraint::Length(3),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(frame.area());
     draw_live_history(frame, root[0], app);
     draw_input(frame, root[1], app);
-    draw_footer(frame, root[2], app);
+    draw_footer(frame, root[2], root[3], app);
     draw_selector_overlay(frame, app);
     set_tui_cursor(frame, root[1], app);
 }
@@ -2855,9 +2856,12 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+fn draw_footer(frame: &mut Frame<'_>, primary: Rect, secondary: Rect, app: &TuiApp) {
     let footer = Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(footer, area);
+    frame.render_widget(footer, primary);
+    let details =
+        Paragraph::new(app.header_line.as_str()).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(details, secondary);
 }
 
 fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
