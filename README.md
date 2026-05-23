@@ -26,6 +26,48 @@ Intentionally removed:
 - hot module reload
 - npm extension package management
 
+## Why Rust
+
+The active product is a terminal-first coding agent. Rust keeps the shipped path
+to one native binary with no Node.js runtime, no npm install step, and no browser
+UI dependency. That matters for dogfooding on remote shells, Raspberry Pi class
+machines, tmux sessions, and locked-down environments where a small predictable
+binary is easier to install, restart, and debug.
+
+The rewrite also makes terminal behavior a first-class part of the product. TTY
+input, mouse handling, scrollback, session replay, tool execution, provider
+streaming, and reload behavior live in one Cargo workspace instead of being split
+between a web UI, Node process, and package runtime.
+
+## How Development Works
+
+Use Cargo and Make targets only. The main binary is `crates/pi-cli`; shared
+behavior lives in `pi-core`, provider adapters in `pi-ai`, configuration in
+`pi-config`, local tools in `pi-tools`, terminal rendering helpers in `pi-tui`,
+and TypeScript parity checks in `pi-parity`.
+
+For normal local work:
+
+```bash
+make dogfood
+make check
+make e2e
+```
+
+`make dogfood` starts the development TUI with the faux provider and a Rust
+rebuild/restart watcher. Durable state stays in the session store, so a rebuild
+should not clear conversation messages, cwd, session identity, tool history,
+queued messages, or active context. `make check` runs formatting, clippy, and
+Rust tests. `make e2e` runs tmux-based terminal behavior checks.
+
+TypeScript is reference material, not a runtime dependency. Parity fixtures are
+generated only through Docker:
+
+```bash
+make parity-check
+make ts-parity-update
+```
+
 ## Build
 
 ```bash
@@ -553,6 +595,16 @@ Generic opt-in real-provider print smoke:
 PI_SMOKE_REAL=1 PI_SMOKE_REAL_MODEL=provider/model make smoke-real
 ```
 
+Provider profile smokes:
+
+```bash
+PI_SMOKE_REAL=1 make smoke-real-openai
+PI_SMOKE_REAL=1 make smoke-real-anthropic
+PI_SMOKE_REAL=1 make smoke-real-gemini
+PI_SMOKE_REAL=1 make smoke-real-mistral
+PI_SMOKE_REAL=1 make smoke-real-openrouter
+```
+
 Full manual smoke suite:
 
 ```bash
@@ -575,6 +627,8 @@ available. It asks each provider for a tiny Rust program and checks that a real
 assistant message contains the expected marker and `fn main`. `make smoke-real`
 is a generic print-mode live-provider smoke; it exits without network access
 unless `PI_SMOKE_REAL=1` and `PI_SMOKE_REAL_MODEL=provider/model` are set.
+The profile targets preselect default models for OpenAI, Anthropic, Gemini,
+Mistral, and OpenRouter while still using the normal auth resolver.
 
 The real TTY dogfood target can be narrowed with `PI_DOGFOOD_REAL_PROVIDERS`:
 
@@ -592,6 +646,10 @@ It requires `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or
 `anthropic/claude-opus-4-7`, and defaults to `--thinking max`. The generic
 `smoke-real` target uses the normal auth resolver for the selected model and
 defaults to `--thinking off` unless `PI_SMOKE_REAL_THINKING` is set.
+Provider profile defaults can be overridden with `PI_SMOKE_OPENAI_MODEL`,
+`PI_SMOKE_ANTHROPIC_MODEL`, `PI_SMOKE_GEMINI_MODEL`, `PI_SMOKE_MISTRAL_MODEL`,
+or `PI_SMOKE_OPENROUTER_MODEL`. `PI_SMOKE_REAL_EXPECTED` changes the expected
+marker for all real-provider print smokes.
 `test-smoke` runs local tmux e2e first, then the opt-in generic real-provider
 smoke and the real-provider Opus OAuth smoke.
 

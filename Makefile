@@ -13,7 +13,7 @@ INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install run dogfood dogfood-release fmt lint test check ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-real smoke-claude-opus-oauth clean
+.PHONY: help build release install run dogfood dogfood-release fmt lint test check ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -35,6 +35,7 @@ help:
 		'  dogfood-real-print Run optional real-provider print smoke' \
 		'  test-smoke   Run local TTY smoke plus manual real-provider smoke' \
 		'  smoke-real   Run opt-in generic real-provider print smoke' \
+		'  smoke-real-profiles Run opt-in OpenAI/Anthropic/Gemini/Mistral/OpenRouter smokes' \
 		'  docker-e2e   Build and run Dockerized tmux TTY e2e' \
 		'  parity-check Run committed TS parity checks and drift detection' \
 		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
@@ -123,6 +124,23 @@ ts-parity-agent:
 
 smoke-real:
 	CARGO="$(CARGO)" scripts/smoke-real-provider.sh
+
+smoke-real-openai:
+	CARGO="$(CARGO)" scripts/smoke-real-provider.sh openai
+
+smoke-real-anthropic:
+	CARGO="$(CARGO)" scripts/smoke-real-provider.sh anthropic
+
+smoke-real-gemini:
+	CARGO="$(CARGO)" scripts/smoke-real-provider.sh gemini
+
+smoke-real-mistral:
+	CARGO="$(CARGO)" scripts/smoke-real-provider.sh mistral
+
+smoke-real-openrouter:
+	CARGO="$(CARGO)" scripts/smoke-real-provider.sh openrouter
+
+smoke-real-profiles: smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter
 
 smoke-claude-opus-oauth:
 	CARGO="$(CARGO)" scripts/smoke-claude-opus-oauth.sh
