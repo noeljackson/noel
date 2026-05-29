@@ -1730,13 +1730,58 @@ fn runtime_system_prompt(runtime: &Runtime) -> Option<String> {
 fn provider_request(runtime: &Runtime, system_prompt: Option<String>) -> ProviderRequest {
     ProviderRequest {
         system_prompt,
-        messages: runtime
-            .session
-            .messages
-            .iter()
-            .map(conversation_to_chat_message)
-            .collect(),
+        messages: provider_messages(&runtime.session.messages),
         tools: active_tool_definitions(runtime),
+    }
+}
+
+fn provider_messages(messages: &[ConversationMessage]) -> Vec<ChatMessage> {
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        if message.role == MessageRole::Assistant && !message.tool_calls.is_empty() {
+            output.push(conversation_to_chat_message(message));
+            index += 1;
+
+            let mut tool_outputs = BTreeMap::new();
+            while index < messages.len() && messages[index].role == MessageRole::Tool {
+                let tool_message = conversation_to_chat_message(&messages[index]);
+                if let Some(tool_call_id) = tool_message.tool_call_id.clone() {
+                    tool_outputs.entry(tool_call_id).or_insert(tool_message);
+                }
+                index += 1;
+            }
+
+            for tool_call in &message.tool_calls {
+                output.push(
+                    tool_outputs
+                        .remove(&tool_call.id)
+                        .unwrap_or_else(|| missing_tool_output(tool_call)),
+                );
+            }
+            continue;
+        }
+
+        if message.role != MessageRole::Tool {
+            output.push(conversation_to_chat_message(message));
+        }
+        index += 1;
+    }
+    output
+}
+
+fn missing_tool_output(tool_call: &ChatToolCall) -> ChatMessage {
+    ChatMessage {
+        role: ChatRole::Tool,
+        content: format!(
+            "tool call {} did not complete before the session continued",
+            tool_call.name
+        ),
+        media: Vec::new(),
+        tool_call_id: Some(tool_call.id.clone()),
+        tool_name: Some(tool_call.name.clone()),
+        tool_calls: Vec::new(),
     }
 }
 
@@ -2032,7 +2077,7 @@ async fn execute_model_tool_call(
             Ok(requests) if model_tool_enabled(runtime, &tool_call.name) => {
                 let mut outputs = Vec::new();
                 for request in requests {
-                    let result = execute_tool(
+                    let output = match execute_tool(
                         &runtime.session.cwd,
                         request,
                         &ToolRuntimeOptions {
@@ -2040,8 +2085,12 @@ async fn execute_model_tool_call(
                             shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
                         },
                     )
-                    .await?;
-                    outputs.push(result.output);
+                    .await
+                    {
+                        Ok(result) => result.output,
+                        Err(error) => error.to_string(),
+                    };
+                    outputs.push(output);
                 }
                 outputs
             }
@@ -3197,6 +3246,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failing_model_tool_call_is_recorded_as_tool_output() {
+        let cwd =
+            std::env::temp_dir().join(format!("pi-failing-model-tool-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = FailingToolLoopProvider {
+            requests: requests.clone(),
+        };
+
+        let response = run_user_turn(&mut runtime, &provider, "read outside".to_string())
+            .await
+            .expect("run tool loop");
+
+        assert_eq!(response, "done");
+        assert_eq!(runtime.session().tool_history.len(), 1);
+        assert_eq!(runtime.session().tool_history[0].id, "call_read_bad");
+        assert_eq!(runtime.session().tool_history[0].name, "read");
+        assert_eq!(
+            runtime.session().tool_history[0].result,
+            "path escapes cwd: ../outside.txt"
+        );
+        assert_eq!(
+            runtime.session().messages[2].tool_call_id.as_deref(),
+            Some("call_read_bad")
+        );
+        assert_eq!(
+            runtime.session().messages[2].content,
+            "path escapes cwd: ../outside.txt"
+        );
+
+        let captured = requests.lock().expect("requests").clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[1].messages[2].role, ChatRole::Tool);
+        assert_eq!(
+            captured[1].messages[2].tool_call_id.as_deref(),
+            Some("call_read_bad")
+        );
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn provider_messages_repair_missing_tool_outputs_from_saved_sessions() {
+        let messages = vec![
+            ConversationMessage {
+                role: MessageRole::User,
+                content: "question".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            },
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: vec![ChatToolCall {
+                    id: "call_missing".to_string(),
+                    name: "read".to_string(),
+                    arguments: r#"{"path":"."}"#.to_string(),
+                }],
+            },
+            ConversationMessage {
+                role: MessageRole::User,
+                content: "continue".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            },
+        ];
+
+        let request_messages = provider_messages(&messages);
+
+        assert_eq!(request_messages.len(), 4);
+        assert_eq!(request_messages[1].role, ChatRole::Assistant);
+        assert_eq!(request_messages[2].role, ChatRole::Tool);
+        assert_eq!(
+            request_messages[2].tool_call_id.as_deref(),
+            Some("call_missing")
+        );
+        assert!(request_messages[2].content.contains("did not complete"));
+        assert_eq!(request_messages[3].content, "continue");
+    }
+
+    #[tokio::test]
     async fn run_user_turn_executes_json_extension_model_tools() {
         let cwd = std::env::current_dir()
             .expect("current dir")
@@ -3449,6 +3590,10 @@ mod tests {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
     }
 
+    struct FailingToolLoopProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
     struct ExtensionToolLoopProvider {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
     }
@@ -3468,6 +3613,36 @@ mod tests {
                         id: "call_read_1".to_string(),
                         name: "read".to_string(),
                         arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    },
+                    StreamEvent::Stop {
+                        reason: "toolUse".to_string(),
+                    },
+                ]);
+            }
+            Ok(vec![
+                StreamEvent::Text("done".to_string()),
+                StreamEvent::Stop {
+                    reason: "stop".to_string(),
+                },
+            ])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FailingToolLoopProvider {
+        async fn complete(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            let mut requests = self.requests.lock().expect("requests");
+            let call_index = requests.len();
+            requests.push(request);
+            if call_index == 0 {
+                return Ok(vec![
+                    StreamEvent::ToolCall {
+                        id: "call_read_bad".to_string(),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"../outside.txt"}"#.to_string(),
                     },
                     StreamEvent::Stop {
                         reason: "toolUse".to_string(),

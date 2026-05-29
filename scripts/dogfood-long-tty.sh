@@ -107,7 +107,7 @@ tmux resize-window -t "${session_name}" -x 72 -y 18
 sleep 0.4
 capture "${work_dir}/small-pane.txt"
 grep -Fq "pi>" "${work_dir}/small-pane.txt"
-grep -Fq "model:" "${work_dir}/small-pane.txt"
+grep -Fq "faux/echo" "${work_dir}/small-pane.txt"
 
 tmux resize-window -t "${session_name}" -x 132 -y 38
 sleep 0.4

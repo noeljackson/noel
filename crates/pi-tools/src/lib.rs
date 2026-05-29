@@ -303,19 +303,30 @@ fn resolve_under_cwd(cwd: &Path, input: &str) -> Result<PathBuf, ToolError> {
     } else {
         cwd.join(input)
     };
+    let canonical_cwd = cwd.canonicalize().map_err(|source| ToolError::Io {
+        path: cwd.to_path_buf(),
+        source,
+    })?;
+
+    if let Ok(canonical_candidate) = candidate.canonicalize() {
+        if !canonical_candidate.starts_with(&canonical_cwd) {
+            return Err(ToolError::PathEscapesCwd(input.to_string()));
+        }
+        return Ok(canonical_candidate);
+    }
+
     let parent = candidate.parent().unwrap_or(cwd);
     let canonical_parent = parent.canonicalize().map_err(|source| ToolError::Io {
         path: parent.to_path_buf(),
         source,
     })?;
-    let canonical_cwd = cwd.canonicalize().map_err(|source| ToolError::Io {
-        path: cwd.to_path_buf(),
-        source,
-    })?;
     if !canonical_parent.starts_with(&canonical_cwd) {
         return Err(ToolError::PathEscapesCwd(input.to_string()));
     }
-    Ok(canonical_parent.join(candidate.file_name().unwrap_or_default()))
+    Ok(candidate
+        .file_name()
+        .map(|file_name| canonical_parent.join(file_name))
+        .unwrap_or(canonical_parent))
 }
 
 fn resolve_under_cwd_for_write(cwd: &Path, input: &str) -> Result<PathBuf, ToolError> {
@@ -328,6 +339,13 @@ fn resolve_under_cwd_for_write(cwd: &Path, input: &str) -> Result<PathBuf, ToolE
         path: cwd.to_path_buf(),
         source,
     })?;
+    if let Ok(canonical_candidate) = candidate.canonicalize() {
+        if !canonical_candidate.starts_with(&canonical_cwd) {
+            return Err(ToolError::PathEscapesCwd(input.to_string()));
+        }
+        return Ok(canonical_candidate);
+    }
+
     let mut existing_parent = candidate.parent().unwrap_or(cwd);
     while !existing_parent.exists() {
         existing_parent = existing_parent.parent().unwrap_or(cwd);
@@ -492,6 +510,39 @@ mod tests {
         .await
         .expect("bash");
         assert_eq!(bash.output, "tool-ok");
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn dot_paths_resolve_to_cwd() {
+        let cwd =
+            std::env::temp_dir().join(format!("pi-tools-dot-path-test-{}", std::process::id()));
+        fs::create_dir_all(cwd.join("src")).expect("create temp dir");
+        fs::write(cwd.join("src/a.txt"), "alpha\n").expect("write a");
+
+        let ls = execute_tool(
+            &cwd,
+            ToolRequest::Ls {
+                path: Some(".".to_string()),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("ls dot");
+        assert!(ls.output.contains("src/"));
+
+        let grep = execute_tool(
+            &cwd,
+            ToolRequest::Grep {
+                path: Some(".".to_string()),
+                pattern: "alpha".to_string(),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("grep dot");
+        assert_eq!(grep.output, "src/a.txt:1:alpha");
 
         let _ = fs::remove_dir_all(cwd);
     }

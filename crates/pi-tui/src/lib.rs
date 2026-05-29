@@ -93,6 +93,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "show commands",
     },
     CommandHelp {
+        command: "/clear",
+        description: "clear visible transcript",
+    },
+    CommandHelp {
         command: "/settings",
         description: "open settings selector",
     },

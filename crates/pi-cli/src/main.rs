@@ -16,12 +16,14 @@ use base64::Engine;
 use clap::CommandFactory;
 use clap::{Parser, ValueEnum};
 use crossterm::{
+    cursor::MoveTo,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear as TerminalClear, ClearType},
 };
 use pi_ai::{
     create_provider, generate_images, ImageGenerationInput, ImageGenerationOutput,
@@ -2073,6 +2075,10 @@ async fn run_interactive(
     let auto_restart = AutoRestart::from_env();
     enable_raw_mode()?;
     execute!(io::stdout(), EnableBracketedPaste)?;
+    let _ = execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let _restore = TerminalRestore;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
@@ -2086,10 +2092,10 @@ async fn run_interactive(
     let mut restart = false;
     loop {
         app.refresh_chrome(&config, &runtime);
-        redraw_tui(&mut terminal, &mut app)?;
+        redraw_tui(&mut terminal, &mut app, &config)?;
         if auto_restart.should_restart()? {
             app.push(TuiEntryKind::System, "rebuilt; restarting");
-            redraw_tui(&mut terminal, &mut app)?;
+            redraw_tui(&mut terminal, &mut app, &config)?;
             restart = true;
             break;
         }
@@ -2222,6 +2228,7 @@ struct TerminalRestore;
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
 }
@@ -2454,6 +2461,8 @@ struct TuiApp {
     live_entry_index: Option<usize>,
     history_cursor: Option<usize>,
     history_draft: Option<String>,
+    history_draft_typed_newlines: Option<Vec<usize>>,
+    typed_input_newlines: Vec<usize>,
 }
 
 impl TuiApp {
@@ -2541,11 +2550,13 @@ impl TuiApp {
             Some(cursor) => cursor.saturating_sub(1),
             None => {
                 self.history_draft = Some(self.input.clone());
+                self.history_draft_typed_newlines = Some(self.typed_input_newlines.clone());
                 history.len().saturating_sub(1)
             }
         };
         self.history_cursor = Some(next);
         self.input = history[next].clone();
+        self.typed_input_newlines = newline_offsets(&self.input);
     }
 
     fn history_next(&mut self) {
@@ -2557,20 +2568,66 @@ impl TuiApp {
             let next = cursor + 1;
             self.history_cursor = Some(next);
             self.input = history[next].clone();
+            self.typed_input_newlines = newline_offsets(&self.input);
         } else {
             self.history_cursor = None;
             self.input = self.history_draft.take().unwrap_or_default();
+            self.typed_input_newlines =
+                self.history_draft_typed_newlines.take().unwrap_or_default();
         }
     }
 
     fn reset_history_navigation(&mut self) {
         self.history_cursor = None;
         self.history_draft = None;
+        self.history_draft_typed_newlines = None;
     }
 
     fn paste_text(&mut self, text: &str) {
         self.input.push_str(text);
         self.reset_history_navigation();
+    }
+
+    fn push_input_char(&mut self, ch: char) {
+        self.input.push(ch);
+        self.reset_history_navigation();
+    }
+
+    fn pop_input_char(&mut self) {
+        let Some((offset, ch)) = self.input.char_indices().next_back() else {
+            self.reset_history_navigation();
+            return;
+        };
+        self.input.pop();
+        if ch == '\n' && self.typed_input_newlines.last() == Some(&offset) {
+            self.typed_input_newlines.pop();
+        }
+        self.reset_history_navigation();
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.typed_input_newlines.clear();
+        self.reset_history_navigation();
+    }
+
+    fn clear_visible(&mut self) {
+        self.entries.clear();
+        self.clear_input();
+        self.multiline = None;
+        self.selector = None;
+        self.live_entry_index = None;
+        self.history_emitted_entries = 0;
+    }
+
+    fn insert_input_newline(&mut self) {
+        self.typed_input_newlines.push(self.input.len());
+        self.input.push('\n');
+        self.reset_history_navigation();
+    }
+
+    fn typed_input_rows(&self) -> usize {
+        self.typed_input_newlines.len() + 1
     }
 
     fn push_placeholder(&mut self, kind: TuiEntryKind, text: impl Into<String>) -> usize {
@@ -2644,12 +2701,19 @@ impl TuiApp {
     }
 }
 
+fn newline_offsets(input: &str) -> Vec<usize> {
+    input
+        .char_indices()
+        .filter_map(|(offset, ch)| (ch == '\n').then_some(offset))
+        .collect()
+}
+
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 const TUI_VIEWPORT_HEIGHT: u16 = 12;
 
-fn redraw_tui(terminal: &mut TuiTerminal, app: &mut TuiApp) -> Result<()> {
+fn redraw_tui(terminal: &mut TuiTerminal, app: &mut TuiApp, config: &LoadedConfig) -> Result<()> {
     emit_finalized_history(terminal, app)?;
-    terminal.draw(|frame| draw_tui(frame, app))?;
+    terminal.draw(|frame| draw_tui(frame, app, config))?;
     Ok(())
 }
 
@@ -2683,21 +2747,42 @@ fn rendered_lines_height(lines: &[Line<'_>], width: usize) -> u16 {
         .min(u16::MAX as usize) as u16
 }
 
-fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
+fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
+    let slash_matches = slash_command_matches(config, app);
+    let slash_match_height = slash_matches.len().min(SLASH_MATCH_LIMIT) as u16;
+    let input_height = input_area_height(app, frame.area().height, slash_match_height);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
+            Constraint::Length(slash_match_height),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(frame.area());
     draw_live_history(frame, root[0], app);
     draw_input(frame, root[1], app);
-    draw_footer(frame, root[2], root[3], app);
+    draw_slash_matches(frame, root[2], &slash_matches);
+    draw_footer(frame, root[3], root[4], app);
     draw_selector_overlay(frame, app);
     set_tui_cursor(frame, root[1], app);
+}
+
+fn input_area_height(app: &TuiApp, frame_height: u16, slash_match_height: u16) -> u16 {
+    let desired = if app.multiline.is_some() {
+        3
+    } else {
+        app.typed_input_rows()
+            .saturating_add(1)
+            .max(3)
+            .min(u16::MAX as usize) as u16
+    };
+    let available = frame_height
+        .saturating_sub(slash_match_height)
+        .saturating_sub(2)
+        .max(1);
+    desired.min(available)
 }
 
 fn draw_live_history(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -2825,28 +2910,16 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str) {
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let prompt = if app.multiline.is_some() {
-        "multi> "
-    } else {
-        "pi> "
-    };
+    let prompt = input_prompt(app);
     let input_bg = Color::Rgb(48, 48, 48);
     let input_style = Style::default().bg(input_bg);
     let muted_style = Style::default().bg(input_bg);
-    let mut lines = vec![
-        Line::from(Span::styled("", input_style)),
-        Line::from(vec![
+    let mut lines = render_input_lines(app, area.height as usize, input_style, muted_style);
+    if lines.is_empty() {
+        lines.push(Line::from(vec![
             Span::styled(prompt, muted_style),
-            Span::styled(app.input.as_str(), input_style),
-        ]),
-    ];
-    if app.multiline.is_some() {
-        lines.push(Line::from(Span::styled(
-            "submit with . on its own line",
-            muted_style,
-        )));
-    } else {
-        lines.push(Line::from(Span::styled("", input_style)));
+            Span::styled("", input_style),
+        ]));
     }
     frame.render_widget(Block::default().style(Style::default().bg(input_bg)), area);
     let paragraph = Paragraph::new(lines)
@@ -2856,12 +2929,135 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
+fn input_prompt(app: &TuiApp) -> &'static str {
+    if app.multiline.is_some() {
+        "multi> "
+    } else {
+        "pi> "
+    }
+}
+
+fn render_input_lines(
+    app: &TuiApp,
+    area_height: usize,
+    input_style: Style,
+    muted_style: Style,
+) -> Vec<Line<'static>> {
+    if area_height == 0 {
+        return Vec::new();
+    }
+    let prompt = input_prompt(app);
+    let input_rows = input_visible_rows(app, area_height);
+    let parts = app.input.split('\n').collect::<Vec<_>>();
+    let visible_count = parts.len().min(input_rows);
+    let start = parts.len().saturating_sub(visible_count);
+    let metrics = input_metrics(app, area_height);
+    let mut lines = Vec::new();
+    for _ in 0..metrics.top_padding {
+        lines.push(Line::from(Span::styled("", input_style)));
+    }
+    for (visible_offset, part) in parts.iter().enumerate().skip(start) {
+        let prefix = if visible_offset == start {
+            prompt.to_string()
+        } else {
+            " ".repeat(prompt.len())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, muted_style),
+            Span::styled((*part).to_string(), input_style),
+        ]));
+    }
+    if app.multiline.is_some() && lines.len() < area_height {
+        lines.push(Line::from(Span::styled(
+            "submit with . on its own line",
+            muted_style,
+        )));
+    }
+    lines
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputMetrics {
+    top_padding: usize,
+    visible_index: usize,
+    current_width: usize,
+}
+
+fn input_metrics(app: &TuiApp, area_height: usize) -> InputMetrics {
+    if area_height == 0 {
+        return InputMetrics {
+            top_padding: 0,
+            visible_index: 0,
+            current_width: 0,
+        };
+    }
+    let input_rows = input_visible_rows(app, area_height);
+    let parts = app.input.split('\n').collect::<Vec<_>>();
+    let visible_count = parts.len().min(input_rows);
+    let top_padding = if app.multiline.is_some() {
+        input_rows.saturating_sub(visible_count)
+    } else if area_height > visible_count {
+        1
+    } else {
+        0
+    };
+    InputMetrics {
+        top_padding,
+        visible_index: visible_count.saturating_sub(1),
+        current_width: parts.last().map(|line| line.chars().count()).unwrap_or(0),
+    }
+}
+
+fn input_visible_rows(app: &TuiApp, area_height: usize) -> usize {
+    if area_height == 0 {
+        0
+    } else if app.multiline.is_some() {
+        area_height.saturating_sub(1).max(1)
+    } else {
+        area_height
+    }
+}
+
 fn draw_footer(frame: &mut Frame<'_>, primary: Rect, secondary: Rect, app: &TuiApp) {
     let footer = Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, primary);
     let details =
         Paragraph::new(app.header_line.as_str()).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(details, secondary);
+}
+
+const SLASH_MATCH_LIMIT: usize = 6;
+
+fn slash_command_matches(config: &LoadedConfig, app: &TuiApp) -> Vec<String> {
+    if app.selector.is_some() || app.multiline.is_some() || app.input.contains('\n') {
+        return Vec::new();
+    }
+    let input = app.input.trim();
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+    command_completions(config, input)
+        .into_iter()
+        .take(SLASH_MATCH_LIMIT)
+        .collect()
+}
+
+fn draw_slash_matches(frame: &mut Frame<'_>, area: Rect, matches: &[String]) {
+    if area.height == 0 || matches.is_empty() {
+        return;
+    }
+    let lines = matches
+        .iter()
+        .take(area.height as usize)
+        .map(|command| {
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(command.clone(), Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let paragraph = Paragraph::new(lines).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
@@ -2962,15 +3158,18 @@ fn set_tui_cursor(frame: &mut Frame<'_>, input_area: Rect, app: &TuiApp) {
         frame.set_cursor_position(Position::new(x, y));
         return;
     }
+    let prompt_width = input_prompt(app).chars().count() as u16;
+    let metrics = input_metrics(app, input_area.height as usize);
     let max_x = input_area.right().saturating_sub(2);
     let x = input_area
         .x
-        .saturating_add(if app.multiline.is_some() { 7 } else { 4 })
-        .saturating_add(app.input.chars().count() as u16)
+        .saturating_add(prompt_width)
+        .saturating_add(metrics.current_width as u16)
         .min(max_x);
     let y = input_area
         .y
-        .saturating_add(1)
+        .saturating_add(metrics.top_padding as u16)
+        .saturating_add(metrics.visible_index as u16)
         .min(input_area.bottom().saturating_sub(1));
     frame.set_cursor_position(Position::new(x, y));
 }
@@ -3020,13 +3219,11 @@ async fn handle_tui_key(
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
         KeyCode::Esc => {
-            app.input.clear();
+            app.clear_input();
             app.multiline = None;
-            app.reset_history_navigation();
         }
         KeyCode::Backspace => {
-            app.input.pop();
-            app.reset_history_navigation();
+            app.pop_input_char();
         }
         KeyCode::Up if app.multiline.is_none() => {
             app.history_previous();
@@ -3034,10 +3231,12 @@ async fn handle_tui_key(
         KeyCode::Down if app.multiline.is_none() => {
             app.history_next();
         }
+        KeyCode::Enter if is_shift_enter(&key) => {
+            app.insert_input_newline();
+        }
         KeyCode::Enter => {
             let line = app.input.trim().to_string();
-            app.input.clear();
-            app.reset_history_navigation();
+            app.clear_input();
             if !line.is_empty() {
                 let quit = match handle_tui_submission(
                     app, terminal, runtime, config, offline, line,
@@ -3058,13 +3257,16 @@ async fn handle_tui_key(
             }
         }
         KeyCode::Char(ch) => {
-            app.input.push(ch);
-            app.reset_history_navigation();
+            app.push_input_char(ch);
         }
         _ => {}
     }
     app.refresh_chrome(config, runtime);
     Ok(false)
+}
+
+fn is_shift_enter(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Enter) && key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 fn handle_tui_selector_key(
@@ -3471,6 +3673,10 @@ async fn handle_tui_submission(
     }
     match line.as_str() {
         "/help" => app.push(TuiEntryKind::System, terminal_renderer(config).help()),
+        "/clear" => {
+            app.clear_visible();
+            clear_terminal_screen(terminal)?;
+        }
         "/models" => app.push(
             TuiEntryKind::System,
             config
@@ -3861,6 +4067,17 @@ async fn handle_tui_submission(
     Ok(false)
 }
 
+fn clear_terminal_screen(terminal: &mut TuiTerminal) -> Result<()> {
+    execute!(
+        terminal.backend_mut(),
+        MoveTo(0, 0),
+        TerminalClear(ClearType::All),
+        TerminalClear(ClearType::Purge)
+    )?;
+    terminal.clear()?;
+    Ok(())
+}
+
 async fn handle_tui_bang(
     app: &mut TuiApp,
     terminal: &mut TuiTerminal,
@@ -3881,7 +4098,7 @@ async fn handle_tui_bang(
     };
     let entry_index = if terminal_progress_enabled(config) {
         let index = app.push_placeholder(TuiEntryKind::Tool, format_bash_running(&command));
-        redraw_tui(terminal, app)?;
+        redraw_tui(terminal, app, config)?;
         Some(index)
     } else {
         None
@@ -4005,7 +4222,7 @@ async fn run_prompt_once_tui(
             "Working...".to_string()
         },
     );
-    redraw_tui(terminal, app)?;
+    redraw_tui(terminal, app, config)?;
     let provider = provider_for_runtime(runtime, config, offline)?;
     let message_start = runtime.session().messages.len();
     if kind == TuiEntryKind::Tool {
@@ -4019,7 +4236,7 @@ async fn run_prompt_once_tui(
             app.replace_entry(entry_index, response);
         }
         app.finish_live_entry();
-        redraw_tui(terminal, app)?;
+        redraw_tui(terminal, app, config)?;
         return Ok(());
     }
 
@@ -4031,7 +4248,7 @@ async fn run_prompt_once_tui(
                 saw_delta = true;
             }
             app.append_entry(entry_index, delta);
-            let _ = redraw_tui(terminal, app);
+            let _ = redraw_tui(terminal, app, config);
         })
         .await?;
     if !saw_delta {
@@ -4039,7 +4256,7 @@ async fn run_prompt_once_tui(
     }
     insert_new_tool_messages(app, runtime, message_start, entry_index);
     app.finish_live_entry();
-    redraw_tui(terminal, app)?;
+    redraw_tui(terminal, app, config)?;
     Ok(())
 }
 
@@ -4298,8 +4515,8 @@ fn thinking_budget_tokens(config: &LoadedConfig, level: Option<&str>) -> Option<
 
 fn format_model_selection(model: &ModelRef, thinking: Option<&str>) -> String {
     match thinking {
-        Some(level) => format!("model: {}/{}\nthinking: {level}", model.provider, model.id),
-        None => format!("model: {}/{}", model.provider, model.id),
+        Some(level) => format!("{}/{} {level}", model.provider, model.id),
+        None => format!("{}/{}", model.provider, model.id),
     }
 }
 
@@ -4531,29 +4748,16 @@ fn format_hotkeys(config: &LoadedConfig) -> String {
 }
 
 fn format_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) -> String {
-    format!(
-        "status\tmodel:{}\tthinking:{}\ttheme:{}\tqueue:{}\thistory:{}\tdiagnostics:{}",
-        runtime
-            .session()
-            .active_model
-            .as_ref()
-            .map(|model| format!("{}/{}", model.provider, model.id))
-            .unwrap_or_else(|| "-".to_string()),
-        active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string()),
-        config
-            .settings
-            .theme
-            .clone()
-            .unwrap_or_else(|| "-".to_string()),
-        runtime.session().queued_messages.len(),
-        editor_state.history().len(),
-        config.diagnostics.len()
-    )
+    format!("status\t{}", compact_status(config, runtime, editor_state))
 }
 
 fn footer_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) -> String {
-    format!(
-        "model: {}  thinking: {}  theme: {}  queue: {}  history: {}  diagnostics: {}",
+    compact_status(config, runtime, editor_state)
+}
+
+fn compact_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &EditorState) -> String {
+    let mut output = format!(
+        "{} {} {} ≡ {} ↺ {}",
         runtime
             .session()
             .active_model
@@ -4567,9 +4771,12 @@ fn footer_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &Editor
             .clone()
             .unwrap_or_else(|| "-".to_string()),
         runtime.session().queued_messages.len(),
-        editor_state.history().len(),
-        config.diagnostics.len()
-    )
+        editor_state.history().len()
+    );
+    if !config.diagnostics.is_empty() {
+        output.push_str(&format!(" d:{}", config.diagnostics.len()));
+    }
+    output
 }
 
 fn format_media_fallback(media: &MediaInput) -> String {
@@ -5483,6 +5690,64 @@ mod tests {
     }
 
     #[test]
+    fn status_format_is_compact_and_unlabeled() {
+        let settings = Settings {
+            theme: Some("solar".to_string()),
+            ..Settings::default()
+        };
+        let config = LoadedConfig {
+            paths: test_config_paths(),
+            settings,
+            auth: AuthData::default(),
+            models: Vec::new(),
+            image_models: Vec::new(),
+            keybindings: Vec::new(),
+            context_files: Vec::new(),
+            extensions: Vec::new(),
+            skills: Vec::new(),
+            prompt_templates: Vec::new(),
+            themes: Vec::new(),
+            diagnostics: Vec::new(),
+            system_prompt: None,
+            append_system_prompt: Vec::new(),
+        };
+        let mut session = SessionState::new("session-1", PathBuf::from("."));
+        session.active_model = Some(ModelRef {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.5".to_string(),
+        });
+        session.active_thinking_level = Some("xhigh".to_string());
+        session.queued_messages.push("queued".to_string());
+        let runtime = Runtime::new(session, ReloadableSystems::default());
+        let mut editor = EditorState::default();
+        editor.record_history("old prompt");
+
+        let footer = footer_status(&config, &runtime, &editor);
+        assert_eq!(footer, "openai-codex/gpt-5.5 xhigh solar ≡ 1 ↺ 1");
+        assert_eq!(
+            format_status(&config, &runtime, &editor),
+            "status\topenai-codex/gpt-5.5 xhigh solar ≡ 1 ↺ 1"
+        );
+        for verbose in ["model:", "thinking:", "theme:", "queue:", "history:"] {
+            assert!(!footer.contains(verbose));
+        }
+    }
+
+    #[test]
+    fn model_selection_format_is_compact_and_unlabeled() {
+        let model = ModelRef {
+            provider: "openai-codex".to_string(),
+            id: "gpt-5.5".to_string(),
+        };
+
+        assert_eq!(
+            format_model_selection(&model, Some("xhigh")),
+            "openai-codex/gpt-5.5 xhigh"
+        );
+        assert_eq!(format_model_selection(&model, None), "openai-codex/gpt-5.5");
+    }
+
+    #[test]
     fn live_entries_are_not_finalized_until_complete() {
         let mut app = TuiApp::default();
         app.push(TuiEntryKind::User, "hello");
@@ -5561,8 +5826,144 @@ mod tests {
 
         app.paste_text(" pasted");
         assert_eq!(app.input, "old prompt pasted");
+        assert_eq!(input_area_height(&app, 20, 0), 3);
         app.history_next();
         assert_eq!(app.input, "old prompt pasted");
+    }
+
+    #[test]
+    fn shift_enter_adds_newline_to_input() {
+        let mut app = TuiApp {
+            input: "first".to_string(),
+            ..TuiApp::default()
+        };
+        app.editor_state.record_history("old prompt");
+        app.history_previous();
+        assert_eq!(app.input, "old prompt");
+
+        app.input = "first".to_string();
+        app.insert_input_newline();
+        app.input.push_str("second");
+
+        assert_eq!(app.input, "first\nsecond");
+        assert!(is_shift_enter(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_shift_enter(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+        app.history_next();
+        assert_eq!(app.input, "first\nsecond");
+    }
+
+    #[test]
+    fn single_line_input_stays_vertically_centered() {
+        let app = TuiApp {
+            input: "draft".to_string(),
+            ..TuiApp::default()
+        };
+
+        let metrics = input_metrics(&app, 3);
+        let lines = render_input_lines(&app, 3, Style::default(), Style::default());
+
+        assert_eq!(metrics.top_padding, 1);
+        assert_eq!(metrics.visible_index, 0);
+        assert_eq!(line_text(&lines[0]), "");
+        assert_eq!(line_text(&lines[1]), "pi> draft");
+    }
+
+    #[test]
+    fn typed_newlines_expand_input_area_but_paste_newlines_do_not() {
+        let mut app = TuiApp {
+            input: "one".to_string(),
+            ..TuiApp::default()
+        };
+        for line in ["two", "three", "four"] {
+            app.insert_input_newline();
+            for ch in line.chars() {
+                app.push_input_char(ch);
+            }
+        }
+
+        assert_eq!(app.typed_input_rows(), 4);
+        assert_eq!(input_area_height(&app, 20, 0), 5);
+        let metrics = input_metrics(&app, 5);
+        let lines = render_input_lines(&app, 5, Style::default(), Style::default());
+        assert_eq!(metrics.top_padding, 1);
+        assert_eq!(line_text(&lines[0]), "");
+        assert_eq!(line_text(&lines[1]), "pi> one");
+        assert_eq!(line_text(&lines[2]), "    two");
+        assert_eq!(line_text(&lines[3]), "    three");
+        assert_eq!(line_text(&lines[4]), "    four");
+
+        let mut pasted = TuiApp::default();
+        pasted.paste_text("one\ntwo\nthree\nfour");
+        assert_eq!(pasted.typed_input_rows(), 1);
+        assert_eq!(input_area_height(&pasted, 20, 0), 3);
+    }
+
+    #[test]
+    fn clear_visible_resets_transient_tui_state_only() {
+        let mut app = TuiApp {
+            input: "draft".to_string(),
+            multiline: Some(vec!["one".to_string()]),
+            history_emitted_entries: 1,
+            live_entry_index: Some(0),
+            ..TuiApp::default()
+        };
+        app.push(TuiEntryKind::User, "hello");
+        app.editor_state.record_history("old prompt");
+        app.history_previous();
+
+        app.clear_visible();
+
+        assert!(app.entries.is_empty());
+        assert!(app.input.is_empty());
+        assert!(app.multiline.is_none());
+        assert!(app.selector.is_none());
+        assert_eq!(app.history_emitted_entries, 0);
+        assert!(app.live_entry_index.is_none());
+        assert_eq!(app.typed_input_rows(), 1);
+        assert_eq!(app.editor_state.history(), ["old prompt"]);
+    }
+
+    #[test]
+    fn slash_command_matches_follow_current_input() {
+        let config = LoadedConfig {
+            paths: test_config_paths(),
+            settings: Settings::default(),
+            auth: AuthData::default(),
+            models: Vec::new(),
+            image_models: Vec::new(),
+            keybindings: Vec::new(),
+            context_files: Vec::new(),
+            extensions: vec![test_resource("json-ext")],
+            skills: Vec::new(),
+            prompt_templates: Vec::new(),
+            themes: Vec::new(),
+            diagnostics: Vec::new(),
+            system_prompt: None,
+            append_system_prompt: Vec::new(),
+        };
+        let mut app = TuiApp {
+            input: "/cl".to_string(),
+            ..TuiApp::default()
+        };
+
+        let matches = slash_command_matches(&config, &app);
+        assert!(matches.contains(&"/clear".to_string()));
+        assert!(matches.contains(&"/clone [id|name|path]".to_string()));
+
+        app.input = "not slash".to_string();
+        assert!(slash_command_matches(&config, &app).is_empty());
+
+        app.input = "/extension:j".to_string();
+        assert_eq!(
+            slash_command_matches(&config, &app),
+            vec!["/extension:json-ext".to_string()]
+        );
     }
 
     #[test]
@@ -5627,6 +6028,27 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn test_config_paths() -> ConfigPaths {
+        ConfigPaths {
+            cwd: PathBuf::from("."),
+            agent_dir: PathBuf::from(".pi/agent"),
+            session_dir: PathBuf::from(".pi/agent/sessions"),
+            settings_path: PathBuf::from(".pi/agent/settings.json"),
+            project_settings_path: PathBuf::from(".pi/settings.json"),
+            auth_path: PathBuf::from(".pi/agent/auth.json"),
+            models_path: PathBuf::from(".pi/agent/models.json"),
+            model_cache_path: PathBuf::from(".pi/agent/model-cache.json"),
+            keybindings_path: PathBuf::from(".pi/agent/keybindings.json"),
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 
     #[test]

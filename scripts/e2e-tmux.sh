@@ -18,6 +18,7 @@ prompt_file="${work_dir}/prompt-ready"
 
 cleanup() {
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
+  tmux kill-session -t "pi-e2e-clear-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-one-follow-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-disabled-${$}" >/dev/null 2>&1 || true
 }
@@ -111,6 +112,27 @@ tmux send-keys -t "${session_name}" "wheel draft"
 sleep 0.1
 tmux send-keys -t "${session_name}" Escape "[<64;5;10M"
 sleep 0.1
+tmux send-keys -t "${session_name}" Enter
+sleep 0.35
+tmux send-keys -t "${session_name}" "shift enter one"
+tmux send-keys -t "${session_name}" Escape "[13;2u"
+sleep 0.1
+tmux send-keys -t "${session_name}" "shift enter two"
+tmux send-keys -t "${session_name}" Escape "[13;2u"
+sleep 0.1
+tmux send-keys -t "${session_name}" "shift enter three"
+tmux send-keys -t "${session_name}" Escape "[13;2u"
+sleep 0.1
+tmux send-keys -t "${session_name}" "shift enter four"
+sleep 0.2
+tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/expanded-input-pane.txt"
+for expected in "shift enter one" "shift enter two" "shift enter three" "shift enter four"; do
+  if ! grep -Fq "${expected}" "${work_dir}/expanded-input-pane.txt"; then
+    cat "${work_dir}/expanded-input-pane.txt" >&2
+    echo "expanded input did not show: ${expected}" >&2
+    exit 1
+  fi
+done
 tmux send-keys -t "${session_name}" Enter
 sleep 0.35
 send_line "/image ${work_dir}/pixel.png describe image"
@@ -218,6 +240,10 @@ require_output "[faux/echo] editor-prompt"
 require_output "hello from tmux e2e"
 require_output "[faux/echo] history draft"
 require_output "[faux/echo] wheel draft"
+require_output "[faux/echo] shift enter one"
+require_output "shift enter two"
+require_output "shift enter three"
+require_output "shift enter four"
 require_output "image/png"
 require_output "1x1"
 require_output "[faux/echo] describe image [media:1]"
@@ -255,7 +281,7 @@ require_output "fix broken thing"
 require_output "theme: dark"
 require_output "theme selector"
 require_output "model selector"
-require_output "model: faux/echo"
+require_output "faux/echo"
 require_output "submit"
 require_output "reload"
 require_output "[faux/echo] after reload"
@@ -457,6 +483,47 @@ if ! grep -Fq "tool is disabled: write" "${work_dir}/disabled-pane.txt"; then
 fi
 if [ -f "${cwd_dir}/blocked.txt" ]; then
   echo "disabled tool unexpectedly wrote blocked.txt" >&2
+  exit 1
+fi
+
+clear_session="pi-e2e-clear-${$}"
+tmux new-session -d -s "${clear_session}" -x 100 -y 20
+tmux send-keys -t "${clear_session}" \
+  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  Enter
+
+for _ in $(seq 1 80); do
+  if tmux capture-pane -t "${clear_session}" -p -S -2000 | grep -q "pi>"; then
+    break
+  fi
+  sleep 0.25
+done
+
+tmux send-keys -t "${clear_session}" "clear-screen-marker" Enter
+sleep 0.6
+clear_before="$(tmux capture-pane -t "${clear_session}" -p -S -2000 2>/dev/null || true)"
+if ! printf '%s\n' "${clear_before}" | grep -Fq "clear-screen-marker"; then
+  printf '%s\n' "${clear_before}" >&2
+  echo "clear smoke marker did not appear before /clear" >&2
+  exit 1
+fi
+
+tmux send-keys -t "${clear_session}" "/clear" Enter
+sleep 0.5
+clear_output="$(tmux capture-pane -t "${clear_session}" -p -S -2000 2>/dev/null || true)"
+printf '%s\n' "${clear_output}" > "${work_dir}/clear-pane.txt"
+tmux send-keys -t "${clear_session}" "/quit" Enter
+sleep 0.5
+tmux kill-session -t "${clear_session}" >/dev/null 2>&1 || true
+
+if printf '%s\n' "${clear_output}" | grep -Fq "clear-screen-marker"; then
+  cat "${work_dir}/clear-pane.txt" >&2
+  echo "/clear did not remove prior pane output" >&2
+  exit 1
+fi
+if ! printf '%s\n' "${clear_output}" | grep -Fq "pi>"; then
+  cat "${work_dir}/clear-pane.txt" >&2
+  echo "/clear did not redraw the input prompt" >&2
   exit 1
 fi
 

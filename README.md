@@ -404,6 +404,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 ## Interactive Commands
 
 - `/help`
+- `/clear`
 - `/settings`
 - `/settings show`
 - `/status`
