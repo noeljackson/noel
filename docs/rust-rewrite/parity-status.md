@@ -1,7 +1,8 @@
 # Rust Rewrite Parity Status
 
-The Rust implementation uses the TypeScript reference as a behavioral oracle.
-Reference code must run only inside Docker through `make ts-parity-fixtures`,
+The Rust implementation uses the tip of upstream TypeScript `main` from
+`https://github.com/earendil-works/pi` as a behavioral oracle. Reference code
+must run only inside Docker through `make ts-parity-fixtures`,
 `make ts-parity-update`, or `make ts-parity-drift`.
 
 Parity is enforced in three layers:

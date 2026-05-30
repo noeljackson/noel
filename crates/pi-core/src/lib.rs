@@ -1599,6 +1599,13 @@ impl Runtime {
     }
 }
 
+/// Maximum number of model responses that may contain tool calls before the
+/// agent gives up on a single user turn. Each iteration can issue several tool
+/// calls at once, but real coding work (read, edit, run tests, iterate) still
+/// needs far more than a handful of rounds, so keep this generous while still
+/// bounding a runaway tool loop.
+const MAX_TOOL_CALL_TURNS: usize = 50;
+
 pub async fn run_user_turn(
     runtime: &mut Runtime,
     provider: &dyn Provider,
@@ -1611,7 +1618,7 @@ pub async fn run_user_turn_streaming(
     runtime: &mut Runtime,
     provider: &dyn Provider,
     prompt: String,
-    on_text: impl FnMut(&str),
+    on_text: impl FnMut(&str) + Send,
 ) -> Result<String, AgentError> {
     run_user_turn_streaming_with_media(runtime, provider, prompt, Vec::new(), on_text).await
 }
@@ -1621,7 +1628,7 @@ pub async fn run_user_turn_streaming_with_media(
     provider: &dyn Provider,
     prompt: String,
     media: Vec<MediaInput>,
-    mut on_text: impl FnMut(&str),
+    mut on_text: impl FnMut(&str) + Send,
 ) -> Result<String, AgentError> {
     runtime.push_message(ConversationMessage {
         role: MessageRole::User,
@@ -1663,15 +1670,20 @@ pub async fn run_user_turn_streaming_with_media(
 
     let system_prompt = runtime_system_prompt(runtime);
     let mut final_text = String::new();
-    for _ in 0..8 {
+    for _ in 0..MAX_TOOL_CALL_TURNS {
         let request = provider_request(runtime, system_prompt.clone());
-        let events = complete_with_retry(provider, request, &runtime.systems.retry).await?;
+        let events =
+            complete_with_retry_streaming(provider, request, &runtime.systems.retry, |event| {
+                if let StreamEvent::Text(delta) = event {
+                    on_text(delta);
+                }
+            })
+            .await?;
         let mut text = String::new();
         let mut tool_calls = Vec::new();
         for event in events {
             match event {
                 StreamEvent::Text(delta) => {
-                    on_text(&delta);
                     text.push_str(&delta);
                 }
                 StreamEvent::ToolCall {
@@ -1801,10 +1813,11 @@ fn conversation_to_chat_message(message: &ConversationMessage) -> ChatMessage {
     }
 }
 
-async fn complete_with_retry(
+async fn complete_with_retry_streaming(
     provider: &dyn Provider,
     request: ProviderRequest,
     retry: &RuntimeRetrySettings,
+    mut on_event: impl FnMut(&StreamEvent) + Send,
 ) -> Result<Vec<StreamEvent>, ProviderError> {
     let max_attempts = if retry.enabled {
         retry.max_retries.saturating_add(1)
@@ -1813,8 +1826,17 @@ async fn complete_with_retry(
     };
     let mut attempt = 0;
     loop {
-        match provider.complete(request.clone()).await {
-            Ok(events) => return Ok(events),
+        let mut events = Vec::new();
+        let result = provider
+            .complete_streaming(request.clone(), &mut |event| {
+                on_event(&event);
+                events.push(event);
+                Ok(())
+            })
+            .await;
+        match result {
+            Ok(()) => return Ok(events),
+            Err(error) if !events.is_empty() => return Err(error),
             Err(error) if is_context_overflow_error(&error) => return Err(error),
             Err(error) if attempt + 1 >= max_attempts => return Err(error),
             Err(_) => {
@@ -2488,7 +2510,7 @@ fn new_session_id() -> String {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
         Arc, Mutex,
     };
 
@@ -3165,6 +3187,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_user_turn_emits_provider_events_before_completion() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let saw_delta = Arc::new(AtomicBool::new(false));
+        let provider = ObservingStreamingProvider {
+            saw_delta: Arc::clone(&saw_delta),
+        };
+
+        let response =
+            run_user_turn_streaming(&mut runtime, &provider, "hello".to_string(), |delta| {
+                if delta == "early" {
+                    saw_delta.store(true, AtomicOrdering::SeqCst);
+                }
+            })
+            .await
+            .expect("run streaming turn");
+
+        assert_eq!(response, "early done");
+        assert_eq!(runtime.session().messages[1].content, response);
+    }
+
+    #[tokio::test]
     async fn run_user_turn_executes_model_tool_calls_and_continues() {
         let cwd =
             std::env::temp_dir().join(format!("pi-model-tool-loop-test-{}", new_session_id()));
@@ -3596,6 +3642,37 @@ mod tests {
 
     struct ExtensionToolLoopProvider {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
+    struct ObservingStreamingProvider {
+        saw_delta: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ObservingStreamingProvider {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            unreachable!("streaming provider should use complete_streaming")
+        }
+
+        async fn complete_streaming(
+            &self,
+            _request: ProviderRequest,
+            on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+        ) -> Result<(), ProviderError> {
+            on_event(StreamEvent::Text("early".to_string()))?;
+            assert!(
+                self.saw_delta.load(AtomicOrdering::SeqCst),
+                "text callback was not invoked before provider completion"
+            );
+            on_event(StreamEvent::Text(" done".to_string()))?;
+            on_event(StreamEvent::Stop {
+                reason: "stop".to_string(),
+            })?;
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]

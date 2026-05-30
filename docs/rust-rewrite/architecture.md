@@ -5,7 +5,8 @@ Original tracking issue: https://github.com/noeljackson/pi/issues/4
 Current doc refresh: https://github.com/noeljackson/pi/issues/38
 
 This document records the implemented Rust architecture. The product path is
-CLI/TUI-only, Rust-only, and keeps `ts-reference` only as a behavioral reference.
+CLI/TUI-only and Rust-only. TypeScript behavioral reference should use the tip
+of upstream `main` from `https://github.com/earendil-works/pi`.
 
 ## Goals
 
@@ -206,8 +207,8 @@ Required properties:
 - Persists active model and active thinking level.
 - Supports JSON, JSONL, and local HTML export/import where applicable.
 
-Legacy TypeScript sessions are intentionally not migrated automatically. Keep
-the `ts-reference` branch for reading old behavior.
+Legacy TypeScript sessions are intentionally not migrated automatically. Check
+out the tip of upstream `main` for reading TypeScript behavior.
 
 ## Provider Architecture
 

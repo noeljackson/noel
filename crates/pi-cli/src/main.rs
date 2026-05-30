@@ -2772,6 +2772,19 @@ fn rendered_lines_height(lines: &[Line<'_>], width: usize) -> u16 {
 const TRANSCRIPT_RENDER_OVERSCAN_ROWS: u16 = 4;
 const STREAM_RENDER_INTERVAL_MS: u64 = 16;
 
+// Dim/secondary text color (markers, tool output, footer, slash matches).
+// Use an explicit truecolor gray instead of the named dark-gray ANSI color so
+// it renders the same regardless of the terminal's bright-black palette slot,
+// which on some themes maps to a too-dark blue. Bump this to taste.
+const DIM_TEXT: Color = Color::Rgb(0xB0, 0xB0, 0xB0);
+
+// Entry marker glyph. A terminal cell is a fixed size, so a glyph cannot be
+// literally scaled; use a larger filled circle instead of the small `•`
+// (U+2022). `●` (U+25CF) is single-width and reliably bigger. Swap to `⬤`
+// (U+2B24) for a still-larger circle, but that one is wide/font-dependent and
+// can misalign the two-space continuation indent.
+const BULLET: &str = "●";
+
 struct VisibleTranscript {
     lines: Vec<Line<'static>>,
     visual_height: u16,
@@ -2892,18 +2905,20 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
+            Constraint::Length(1),
             Constraint::Length(input_height),
             Constraint::Length(slash_match_height),
-            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(frame.area());
     draw_transcript(frame, root[0], app);
-    draw_input(frame, root[1], app);
-    draw_slash_matches(frame, root[2], &slash_matches);
-    draw_footer(frame, root[3], root[4], app);
+    // root[1] is an intentional blank spacer so the gray input box never butts
+    // directly against the chat transcript.
+    draw_input(frame, root[2], app);
+    draw_slash_matches(frame, root[3], &slash_matches);
+    draw_footer(frame, root[4], app);
     draw_selector_overlay(frame, app);
-    set_tui_cursor(frame, root[1], app);
+    set_tui_cursor(frame, root[2], app);
 }
 
 fn input_area_height(app: &TuiApp, frame_height: u16, slash_match_height: u16) -> u16 {
@@ -2957,7 +2972,7 @@ fn render_entry_lines(entries: &[TuiEntry]) -> Vec<Line<'static>> {
                 &mut lines,
                 "",
                 &entry.text,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(DIM_TEXT),
                 Style::default().fg(Color::Gray),
             ),
             TuiEntryKind::User | TuiEntryKind::Assistant => {
@@ -2965,7 +2980,7 @@ fn render_entry_lines(entries: &[TuiEntry]) -> Vec<Line<'static>> {
                     &mut lines,
                     "",
                     &entry.text,
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(DIM_TEXT),
                     Style::default().fg(Color::White),
                 );
             }
@@ -2985,9 +3000,9 @@ fn push_marked_lines(
     let mut text_lines = text.lines();
     let first = text_lines.next().unwrap_or_default();
     let prefix = if label.is_empty() {
-        "• ".to_string()
+        format!("{BULLET} ")
     } else {
-        format!("• {label} ")
+        format!("{BULLET} {label} ")
     };
     lines.push(Line::from(vec![
         Span::styled(prefix, marker_style),
@@ -3018,7 +3033,7 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str) {
         _ => "Ran tool".to_string(),
     };
     lines.push(Line::from(vec![
-        Span::styled("• ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{BULLET} "), Style::default().fg(DIM_TEXT)),
         Span::styled(
             title,
             Style::default()
@@ -3039,13 +3054,13 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str) {
         for line in output.lines() {
             lines.push(Line::from(Span::styled(
                 format!("  {line}"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(DIM_TEXT),
             )));
         }
     } else if state.starts_with("completed") {
         lines.push(Line::from(Span::styled(
             "  (no output)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(DIM_TEXT),
         )));
     }
 }
@@ -3159,12 +3174,14 @@ fn input_visible_rows(app: &TuiApp, area_height: usize) -> usize {
     }
 }
 
-fn draw_footer(frame: &mut Frame<'_>, primary: Rect, secondary: Rect, app: &TuiApp) {
-    let footer = Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(footer, primary);
-    let details =
-        Paragraph::new(app.header_line.as_str()).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(details, secondary);
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let line = if app.header_line.is_empty() {
+        app.status.clone()
+    } else {
+        format!("{}  {}", app.status, app.header_line)
+    };
+    let footer = Paragraph::new(line).style(Style::default().fg(Color::White));
+    frame.render_widget(footer, area);
 }
 
 const SLASH_MATCH_LIMIT: usize = 6;
@@ -3194,11 +3211,11 @@ fn draw_slash_matches(frame: &mut Frame<'_>, area: Rect, matches: &[String]) {
         .map(|command| {
             Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled(command.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(command.clone(), Style::default().fg(DIM_TEXT)),
             ])
         })
         .collect::<Vec<_>>();
-    let paragraph = Paragraph::new(lines).style(Style::default().fg(Color::DarkGray));
+    let paragraph = Paragraph::new(lines).style(Style::default().fg(DIM_TEXT));
     frame.render_widget(paragraph, area);
 }
 
@@ -3214,7 +3231,7 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
         .saturating_sub(available.saturating_sub(1));
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("filter ", Style::default().fg(Color::DarkGray)),
+            Span::styled("filter ", Style::default().fg(DIM_TEXT)),
             Span::raw(selector.query.as_str()),
         ]),
         Line::from(""),
@@ -3253,18 +3270,15 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
     if selector.filtered_indices.is_empty() {
         lines.push(Line::from(Span::styled(
             "no matches",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(DIM_TEXT),
         )));
     }
     if let Some(level) = selector.selected_thinking_level() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("thinking ", Style::default().fg(Color::DarkGray)),
+            Span::styled("thinking ", Style::default().fg(DIM_TEXT)),
             Span::styled(level, Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "  left/right to adjust",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("  left/right to adjust", Style::default().fg(DIM_TEXT)),
         ]));
     }
     let action = if selector.kind == "settings" {
@@ -4477,7 +4491,7 @@ async fn run_prompt_once_tui(
     let mut saw_delta = false;
     let mut queued_inputs = Vec::new();
     let (delta_tx, delta_rx) = std::sync::mpsc::channel::<String>();
-    let response = {
+    let turn_result = {
         let turn = run_user_turn_streaming_with_media(
             runtime,
             provider.as_ref(),
@@ -4502,7 +4516,7 @@ async fn run_prompt_once_tui(
                     if pending_redraw {
                         redraw_tui(surface.terminal, app, config)?;
                     }
-                    break result?;
+                    break result;
                 }
                 _ = tick.tick() => {
                     while let Ok(delta) = delta_rx.try_recv() {
@@ -4520,11 +4534,30 @@ async fn run_prompt_once_tui(
             }
         }
     };
-    if !saw_delta {
-        app.replace_entry(entry_index, response);
-    }
     for queued_input in queued_inputs {
         runtime.queue_message(queued_input)?;
+    }
+
+    // On a mid-turn failure (e.g. exceeding the tool-call turn limit, a network
+    // drop, or a rate limit), keep whatever was already streamed instead of
+    // discarding the live entry. The error itself is surfaced as a separate
+    // entry by the caller.
+    let response = match turn_result {
+        Ok(response) => response,
+        Err(error) => {
+            if saw_delta {
+                app.finish_live_entry();
+            } else {
+                app.drop_live_entry();
+            }
+            insert_new_tool_messages(app, runtime, message_start, entry_index);
+            redraw_tui(surface.terminal, app, config)?;
+            return Err(error.into());
+        }
+    };
+
+    if !saw_delta {
+        app.replace_entry(entry_index, response);
     }
     insert_new_tool_messages(app, runtime, message_start, entry_index);
     app.finish_live_entry();

@@ -21,6 +21,7 @@ cleanup() {
   tmux kill-session -t "pi-e2e-clear-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-one-follow-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-disabled-${$}" >/dev/null 2>&1 || true
+  tmux kill-session -t "pi-e2e-stream-${$}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -483,6 +484,60 @@ if ! grep -Fq "tool is disabled: write" "${work_dir}/disabled-pane.txt"; then
 fi
 if [ -f "${cwd_dir}/blocked.txt" ]; then
   echo "disabled tool unexpectedly wrote blocked.txt" >&2
+  exit 1
+fi
+
+stream_session="pi-e2e-stream-${$}"
+stream_ready="${work_dir}/stream-ready"
+stream_done="${work_dir}/stream-done"
+stream_prompt="$(printf 'stream%.0s' $(seq 1 120))"
+tmux new-session -d -s "${stream_session}" -x 100 -y 24
+tmux send-keys -t "${stream_session}" \
+  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_FAUX_STREAM_DELAY_MS=4 PI_FAUX_STREAM_CHARS=1 '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  Enter
+
+for _ in $(seq 1 80); do
+  if tmux capture-pane -t "${stream_session}" -p -S -2000 | grep -q "pi>"; then
+    touch "${stream_ready}"
+    break
+  fi
+  sleep 0.25
+done
+
+if [ ! -f "${stream_ready}" ]; then
+  tmux capture-pane -t "${stream_session}" -p -S -2000 >&2
+  echo "streaming responsiveness prompt did not appear" >&2
+  exit 1
+fi
+
+tmux send-keys -t "${stream_session}" -l "${stream_prompt}"
+tmux send-keys -t "${stream_session}" Enter
+sleep 0.2
+tmux send-keys -t "${stream_session}" -l "draft while streaming"
+sleep 0.35
+tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-draft-pane.txt"
+if ! grep -Fq "pi> draft while streaming" "${work_dir}/stream-draft-pane.txt"; then
+  cat "${work_dir}/stream-draft-pane.txt" >&2
+  echo "typing during streaming did not update the input draft" >&2
+  exit 1
+fi
+
+tmux send-keys -t "${stream_session}" Enter
+for _ in $(seq 1 120); do
+  tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-queued-pane.txt"
+  if grep -Fq "[faux/echo] draft while streaming" "${work_dir}/stream-queued-pane.txt"; then
+    touch "${stream_done}"
+    break
+  fi
+  sleep 0.1
+done
+tmux send-keys -t "${stream_session}" "/quit" Enter
+sleep 0.5
+tmux kill-session -t "${stream_session}" >/dev/null 2>&1 || true
+
+if [ ! -f "${stream_done}" ]; then
+  cat "${work_dir}/stream-queued-pane.txt" >&2
+  echo "streaming draft was not queued after Enter" >&2
   exit 1
 fi
 

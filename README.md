@@ -656,6 +656,8 @@ smoke and the real-provider Opus OAuth smoke.
 
 ## Development Notes
 
-The old TypeScript implementation is preserved on the `ts-reference` branch for behavioral reference. Active development on `main` is Rust-only.
+For TypeScript behavioral reference, check out the tip of upstream `main` from
+`https://github.com/earendil-works/pi`. Active development in this repository's
+`main` branch is Rust-only.
 
-Rust live sessions use an append-only replay JSONL log. JSONL export/import and direct session open support the TypeScript v3 session-tree shape where applicable, including a `type:"session"` header and entry `id`/`parentId` chain. Full in-place active-leaf tree editing is still tracked as parity work. Legacy TypeScript session logs are not migrated automatically; keep `ts-reference` for reading old session behavior. `/share` writes a local HTML export; web or gist sharing is intentionally unsupported in the Rust-only CLI.
+Rust live sessions use an append-only replay JSONL log. JSONL export/import and direct session open support the TypeScript v3 session-tree shape where applicable, including a `type:"session"` header and entry `id`/`parentId` chain. Full in-place active-leaf tree editing is still tracked as parity work. Legacy TypeScript session logs are not migrated automatically; use the tip of upstream `main` for reading TypeScript session behavior. `/share` writes a local HTML export; web or gist sharing is intentionally unsupported in the Rust-only CLI.

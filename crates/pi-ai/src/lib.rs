@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env};
+use std::{collections::BTreeMap, env, time::Duration};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -183,6 +183,17 @@ pub enum ProviderError {
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError>;
+
+    async fn complete_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        for event in self.complete(request).await? {
+            on_event(event)?;
+        }
+        Ok(())
+    }
 }
 
 pub fn create_provider(config: ProviderConfig) -> Box<dyn Provider> {
@@ -387,6 +398,36 @@ impl Provider for FauxProvider {
             },
         ])
     }
+
+    async fn complete_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let delay_ms = env::var("PI_FAUX_STREAM_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        let split_chars = env::var("PI_FAUX_STREAM_CHARS").ok().as_deref() == Some("1");
+        for event in self.complete(request).await? {
+            if split_chars {
+                if let StreamEvent::Text(text) = event {
+                    for ch in text.chars() {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        on_event(StreamEvent::Text(ch.to_string()))?;
+                    }
+                    continue;
+                }
+            }
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            on_event(event)?;
+        }
+        Ok(())
+    }
 }
 
 struct OpenAiProvider {
@@ -434,6 +475,56 @@ impl Provider for OpenAiProvider {
         });
         Ok(events)
     }
+
+    async fn complete_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        if let ProviderAuth::ChatGptOAuth { .. } = &self.config.auth {
+            return self
+                .complete_with_chatgpt_streaming(request, on_event)
+                .await;
+        }
+        let api_key = self.api_key()?;
+        let url = format!(
+            "{}/chat/completions",
+            self.chat_base_url()?.trim_end_matches('/')
+        );
+        let response = reqwest::Client::new()
+            .post(url)
+            .headers(openai_compatible_headers(
+                &self.config,
+                &api_key,
+                request_has_media(&request),
+            )?)
+            .json(&openai_chat_completions_body(&self.config, &request))
+            .send()
+            .await?;
+        let response = error_for_status_with_body(response).await?;
+        let mut parser = OpenAiChatCompletionsSseParser::default();
+        let stream =
+            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
+        if stream.saw_data {
+            parser.finish(on_event)?;
+            on_event(StreamEvent::Stop {
+                reason: "stop".to_string(),
+            })?;
+            return Ok(());
+        }
+        let response = serde_json::from_str::<Value>(&stream.body)
+            .map_err(|_| ProviderError::InvalidResponse(stream.body.clone()))?;
+        let events = parse_openai_chat_completions_events(&response)
+            .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
+        emit_events(events, on_event)?;
+        on_event(StreamEvent::Stop {
+            reason: response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_string(),
+        })
+    }
 }
 
 impl OpenAiProvider {
@@ -469,6 +560,45 @@ impl OpenAiProvider {
         Ok(events)
     }
 
+    async fn complete_with_chatgpt_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let url = format!(
+            "{}/responses",
+            self.config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://chatgpt.com/backend-api/codex")
+                .trim_end_matches('/')
+        );
+        let response = reqwest::Client::new()
+            .post(url)
+            .headers(chatgpt_headers(&self.config.auth)?)
+            .json(&openai_responses_body(&self.config, &request))
+            .send()
+            .await?;
+        let response = error_for_status_with_body(response).await?;
+        let mut parser = OpenAiResponsesSseParser::default();
+        let stream =
+            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
+        if stream.saw_data {
+            on_event(StreamEvent::Stop {
+                reason: "completed".to_string(),
+            })?;
+            return Ok(());
+        }
+        let events = serde_json::from_str::<Value>(&stream.body)
+            .ok()
+            .and_then(|response| parse_openai_responses_events(&response))
+            .ok_or_else(|| ProviderError::InvalidResponse(stream.body.clone()))?;
+        emit_events(events, on_event)?;
+        on_event(StreamEvent::Stop {
+            reason: "completed".to_string(),
+        })
+    }
+
     fn api_key(&self) -> Result<String, ProviderError> {
         match &self.config.auth {
             ProviderAuth::ApiKey(api_key) => Ok(api_key.clone()),
@@ -492,13 +622,13 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
     let mut body = json!({
         "model": config.model.id,
         "messages": openai_chat_messages(config, request),
+        "stream": true,
     });
     if !request.tools.is_empty() {
         body["tools"] = json!(openai_chat_tools(&request.tools));
         body["tool_choice"] = json!("auto");
     }
     if config.model.provider == "openrouter" {
-        body["stream"] = json!(true);
         body["stream_options"] = json!({ "include_usage": true });
         body["store"] = json!(false);
         if let Some(effort) = openrouter_reasoning_effort(config.thinking_level.as_deref()) {
@@ -508,7 +638,6 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
         config.model.provider.as_str(),
         "cloudflare-ai-gateway" | "cloudflare-workers-ai"
     ) {
-        body["stream"] = json!(true);
         body["stream_options"] = json!({ "include_usage": true });
     }
     body
@@ -786,6 +915,42 @@ impl Provider for OpenAiResponsesProvider {
         });
         Ok(events)
     }
+
+    async fn complete_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let (url, headers, model) = self.request_parts(request_has_media(&request))?;
+        let response = reqwest::Client::new()
+            .post(url)
+            .headers(headers)
+            .json(&{
+                let mut body = openai_responses_body(&self.config, &request);
+                body["model"] = json!(model);
+                body
+            })
+            .send()
+            .await?;
+        let response = error_for_status_with_body(response).await?;
+        let mut parser = OpenAiResponsesSseParser::default();
+        let stream =
+            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
+        if stream.saw_data {
+            on_event(StreamEvent::Stop {
+                reason: "completed".to_string(),
+            })?;
+            return Ok(());
+        }
+        let events = serde_json::from_str::<Value>(&stream.body)
+            .ok()
+            .and_then(|response| parse_openai_responses_events(&response))
+            .ok_or_else(|| ProviderError::InvalidResponse(stream.body.clone()))?;
+        emit_events(events, on_event)?;
+        on_event(StreamEvent::Stop {
+            reason: "completed".to_string(),
+        })
+    }
 }
 
 impl OpenAiResponsesProvider {
@@ -881,6 +1046,42 @@ impl Provider for AnthropicProvider {
         });
         Ok(events)
     }
+
+    async fn complete_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let url = anthropic_messages_url(&self.config)?;
+        let response = reqwest::Client::new()
+            .post(url)
+            .headers(anthropic_headers(&self.config)?)
+            .json(&anthropic_body(&self.config, &request))
+            .send()
+            .await?;
+        let response = error_for_status_with_body(response).await?;
+        let mut parser = AnthropicSseParser::default();
+        let stream =
+            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
+        if stream.saw_data {
+            on_event(StreamEvent::Stop {
+                reason: "stop".to_string(),
+            })?;
+            return Ok(());
+        }
+        let response = serde_json::from_str::<Value>(&stream.body)
+            .map_err(|_| ProviderError::InvalidResponse(stream.body.clone()))?;
+        let events = parse_anthropic_response_events(&response)
+            .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
+        emit_events(events, on_event)?;
+        on_event(StreamEvent::Stop {
+            reason: response
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_string(),
+        })
+    }
 }
 
 fn anthropic_messages_url(config: &ProviderConfig) -> Result<String, ProviderError> {
@@ -920,18 +1121,25 @@ fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
 }
 
 fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+    // Anthropic allows at most 4 cache_control breakpoints per request, and
+    // caching is prefix-based: a single breakpoint on the last tool caches all
+    // preceding tool definitions. Marking every tool would blow the budget once
+    // system blocks and the last user message add their own breakpoints.
+    let last_index = tools.len().saturating_sub(1);
     tools
         .iter()
-        .map(|tool| {
-            json!({
+        .enumerate()
+        .map(|(index, tool)| {
+            let mut value = json!({
                 "name": tool.name,
                 "description": tool.description,
                 "eager_input_streaming": true,
                 "input_schema": tool.parameters,
-                "cache_control": {
-                    "type": "ephemeral",
-                },
-            })
+            });
+            if index == last_index {
+                value["cache_control"] = json!({ "type": "ephemeral" });
+            }
+            value
         })
         .collect()
 }
@@ -1035,6 +1243,8 @@ fn supports_anthropic_adaptive_thinking(model_id: &str) -> bool {
         || model_id.contains("opus-4.6")
         || model_id.contains("opus-4-7")
         || model_id.contains("opus-4.7")
+        || model_id.contains("opus-4-8")
+        || model_id.contains("opus-4.8")
         || model_id.contains("sonnet-4-6")
         || model_id.contains("sonnet-4.6")
 }
@@ -1102,6 +1312,34 @@ impl Provider for GoogleProvider {
             serde_json::from_str::<Value>(&body)
                 .map_err(|_| ProviderError::InvalidResponse(body.clone()))?,
         )
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let api_key = self.api_key()?;
+        let response = reqwest::Client::new()
+            .post(google_url(&self.config)?)
+            .headers(google_headers(&api_key)?)
+            .json(&google_body(&self.config, &request))
+            .send()
+            .await?;
+        let response = error_for_status_with_body(response).await?;
+        let stream =
+            stream_sse_response(response, |data| parse_google_sse_data(data, on_event)).await?;
+        if stream.saw_data {
+            on_event(StreamEvent::Stop {
+                reason: "STOP".to_string(),
+            })?;
+            return Ok(());
+        }
+        let events = parse_google_response(
+            serde_json::from_str::<Value>(&stream.body)
+                .map_err(|_| ProviderError::InvalidResponse(stream.body.clone()))?,
+        )?;
+        emit_events(events, on_event)
     }
 }
 
@@ -1290,6 +1528,52 @@ impl Provider for MistralProvider {
             return Ok(events);
         }
         Err(ProviderError::InvalidResponse(response.to_string()))
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let api_key = self.api_key()?;
+        let base_url = resolve_env_placeholders(
+            self.config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://api.mistral.ai/v1"),
+        )?;
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/chat/completions",
+                base_url.trim_end_matches('/')
+            ))
+            .headers(mistral_headers(&self.config, &api_key)?)
+            .json(&mistral_chat_body(&self.config, &request))
+            .send()
+            .await?;
+        let response = error_for_status_with_body(response).await?;
+        let mut parser = OpenAiChatCompletionsSseParser::default();
+        let stream =
+            stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
+        if stream.saw_data {
+            parser.finish(on_event)?;
+            on_event(StreamEvent::Stop {
+                reason: "stop".to_string(),
+            })?;
+            return Ok(());
+        }
+        let response = serde_json::from_str::<Value>(&stream.body)
+            .map_err(|_| ProviderError::InvalidResponse(stream.body.clone()))?;
+        let events = parse_openai_chat_completions_events(&response)
+            .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
+        emit_events(events, on_event)?;
+        on_event(StreamEvent::Stop {
+            reason: response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_string(),
+        })
     }
 }
 
@@ -1507,6 +1791,7 @@ fn bedrock_supports_adaptive_thinking(model_id: &str) -> bool {
     let normalized = model_id.to_ascii_lowercase().replace(['_', '.', ':'], "-");
     normalized.contains("opus-4-6")
         || normalized.contains("opus-4-7")
+        || normalized.contains("opus-4-8")
         || normalized.contains("sonnet-4-6")
 }
 
@@ -1515,7 +1800,7 @@ fn bedrock_adaptive_effort(model_id: &str, level: &str) -> &'static str {
     if level == "max" || (level == "xhigh" && normalized.contains("opus-4-6")) {
         return "max";
     }
-    if level == "xhigh" && normalized.contains("opus-4-7") {
+    if level == "xhigh" && (normalized.contains("opus-4-7") || normalized.contains("opus-4-8")) {
         return "xhigh";
     }
     match level {
@@ -1598,6 +1883,25 @@ fn parse_google_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
     } else {
         Some(events)
     }
+}
+
+fn parse_google_sse_data(
+    data: &str,
+    on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+) -> Result<(), ProviderError> {
+    let Ok(event) = serde_json::from_str::<Value>(data) else {
+        return Ok(());
+    };
+    let Some(parts) = event
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    if let Some(events) = google_part_events(parts) {
+        emit_events(events, on_event)?;
+    }
+    Ok(())
 }
 
 fn google_part_events(parts: &[Value]) -> Option<Vec<StreamEvent>> {
@@ -1728,6 +2032,101 @@ struct PendingAnthropicToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+#[derive(Default)]
+struct AnthropicSseParser {
+    pending_tool_calls: BTreeMap<u64, PendingAnthropicToolCall>,
+}
+
+impl AnthropicSseParser {
+    fn parse_data(
+        &mut self,
+        data: &str,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return Ok(());
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                    return Ok(());
+                };
+                let Some(block) = event.get("content_block") else {
+                    return Ok(());
+                };
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    let Some(id) = block.get("id").and_then(Value::as_str) else {
+                        return Ok(());
+                    };
+                    let Some(name) = block.get("name").and_then(Value::as_str) else {
+                        return Ok(());
+                    };
+                    let arguments = block
+                        .get("input")
+                        .filter(|input| !input.is_null())
+                        .filter(|input| input.as_object().is_none_or(|object| !object.is_empty()))
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    self.pending_tool_calls.insert(
+                        index,
+                        PendingAnthropicToolCall {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            arguments,
+                        },
+                    );
+                }
+            }
+            Some("content_block_delta") => {
+                let Some(delta) = event.get("delta") else {
+                    return Ok(());
+                };
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                on_event(StreamEvent::Text(text.to_string()))?;
+                            }
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                            return Ok(());
+                        };
+                        let Some(partial_json) = delta.get("partial_json").and_then(Value::as_str)
+                        else {
+                            return Ok(());
+                        };
+                        if let Some(tool_call) = self.pending_tool_calls.get_mut(&index) {
+                            tool_call.arguments.push_str(partial_json);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_stop") => {
+                let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                    return Ok(());
+                };
+                let Some(tool_call) = self.pending_tool_calls.remove(&index) else {
+                    return Ok(());
+                };
+                on_event(StreamEvent::ToolCall {
+                    id: tool_call.id,
+                    name: tool_call.name,
+                    arguments: if tool_call.arguments.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        tool_call.arguments
+                    },
+                })?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn parse_anthropic_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
@@ -1896,6 +2295,113 @@ async fn error_for_status_with_body(
     }
     let body = response.text().await.unwrap_or_default();
     Err(ProviderError::Status { status, body })
+}
+
+struct SseStreamResult {
+    body: String,
+    saw_data: bool,
+}
+
+async fn stream_sse_response(
+    mut response: reqwest::Response,
+    mut on_data: impl FnMut(&str) -> Result<(), ProviderError>,
+) -> Result<SseStreamResult, ProviderError> {
+    let mut pending = Vec::new();
+    let mut body = Vec::new();
+    let mut saw_data = false;
+    while let Some(chunk) = response.chunk().await? {
+        body.extend_from_slice(&chunk);
+        pending.extend_from_slice(&chunk);
+        process_complete_sse_blocks(&mut pending, &mut saw_data, &mut on_data)?;
+    }
+    process_remaining_sse_block(&mut pending, &mut saw_data, &mut on_data)?;
+    let body = String::from_utf8(body)
+        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+    Ok(SseStreamResult { body, saw_data })
+}
+
+fn process_complete_sse_blocks(
+    pending: &mut Vec<u8>,
+    saw_data: &mut bool,
+    on_data: &mut impl FnMut(&str) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    while let Some((end, delimiter_len)) = find_sse_delimiter(pending) {
+        let block = pending.drain(..end).collect::<Vec<_>>();
+        pending.drain(..delimiter_len);
+        process_sse_block(&block, saw_data, on_data)?;
+    }
+    Ok(())
+}
+
+fn process_remaining_sse_block(
+    pending: &mut Vec<u8>,
+    saw_data: &mut bool,
+    on_data: &mut impl FnMut(&str) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let block = std::mem::take(pending);
+    process_sse_block(&block, saw_data, on_data)
+}
+
+fn process_sse_block(
+    block: &[u8],
+    saw_data: &mut bool,
+    on_data: &mut impl FnMut(&str) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    let block = String::from_utf8(block.to_vec())
+        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+    let Some(data) = sse_block_data(&block) else {
+        return Ok(());
+    };
+    *saw_data = true;
+    if data == "[DONE]" {
+        return Ok(());
+    }
+    on_data(&data)
+}
+
+fn sse_block_data(block: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for line in block.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        parts.push(data.strip_prefix(' ').unwrap_or(data));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_subsequence(buffer, b"\n\n").map(|index| (index, 2));
+    let crlf = find_subsequence(buffer, b"\r\n\r\n").map(|index| (index, 4));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(found), None) | (None, Some(found)) => Some(found),
+        (None, None) => None,
+    }
+}
+
+fn find_subsequence(buffer: &[u8], needle: &[u8]) -> Option<usize> {
+    buffer
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn emit_events(
+    events: Vec<StreamEvent>,
+    on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+) -> Result<(), ProviderError> {
+    for event in events {
+        on_event(event)?;
+    }
+    Ok(())
 }
 
 fn request_has_media(request: &ProviderRequest) -> bool {
@@ -2415,6 +2921,47 @@ fn parse_openai_responses_events(response: &Value) -> Option<Vec<StreamEvent>> {
     }
 }
 
+#[derive(Default)]
+struct OpenAiResponsesSseParser {
+    saw_text_delta: bool,
+}
+
+impl OpenAiResponsesSseParser {
+    fn parse_data(
+        &mut self,
+        data: &str,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return Ok(());
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") | Some("output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    if !delta.is_empty() {
+                        self.saw_text_delta = true;
+                        on_event(StreamEvent::Text(delta.to_string()))?;
+                    }
+                }
+            }
+            Some("response.output_item.done") | Some("output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    if !self.saw_text_delta {
+                        if let Some(text) = parse_openai_responses_item_text(item) {
+                            on_event(StreamEvent::Text(text))?;
+                        }
+                    }
+                    if let Some(tool_call) = parse_openai_responses_function_call(item) {
+                        on_event(tool_call)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 fn parse_openai_responses_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
     let mut events = Vec::new();
     for line in body.lines() {
@@ -2533,6 +3080,68 @@ fn parse_openai_chat_completions_sse_text(body: &str) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+#[derive(Default)]
+struct OpenAiChatCompletionsSseParser {
+    tool_calls: Vec<(String, String, String)>,
+}
+
+impl OpenAiChatCompletionsSseParser {
+    fn parse_data(
+        &mut self,
+        data: &str,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return Ok(());
+        };
+        let Some(delta) = event.pointer("/choices/0/delta") else {
+            return Ok(());
+        };
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            if !text.is_empty() {
+                on_event(StreamEvent::Text(text.to_string()))?;
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                while self.tool_calls.len() <= index {
+                    self.tool_calls
+                        .push((String::new(), String::new(), String::new()));
+                }
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    self.tool_calls[index].0.push_str(id);
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    self.tool_calls[index].1.push_str(name);
+                }
+                if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
+                {
+                    self.tool_calls[index].2.push_str(arguments);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        for (id, name, arguments) in self.tool_calls {
+            if id.is_empty() || name.is_empty() {
+                continue;
+            }
+            on_event(StreamEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -3032,6 +3641,86 @@ mod tests {
                 arguments: r#"{"path":"a.txt"}"#.to_string(),
             }])
         );
+    }
+
+    #[test]
+    fn openai_chat_stream_parser_emits_text_before_finish() {
+        let mut parser = OpenAiChatCompletionsSseParser::default();
+        let mut events = Vec::new();
+        parser
+            .parse_data(
+                r#"{"choices":[{"delta":{"content":"hel"}}]}"#,
+                &mut |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .expect("parse text");
+        assert_eq!(events, [StreamEvent::Text("hel".to_string())]);
+
+        parser
+            .parse_data(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+                &mut |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .expect("parse tool start");
+        parser
+            .parse_data(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]}}]}"#,
+                &mut |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .expect("parse tool end");
+        assert_eq!(events, [StreamEvent::Text("hel".to_string())]);
+
+        parser
+            .finish(&mut |event| {
+                events.push(event);
+                Ok(())
+            })
+            .expect("finish");
+        assert_eq!(
+            events,
+            [
+                StreamEvent::Text("hel".to_string()),
+                StreamEvent::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: r#"{"path":"a.txt"}"#.to_string(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_responses_stream_parser_does_not_duplicate_done_text_after_delta() {
+        let mut parser = OpenAiResponsesSseParser::default();
+        let mut events = Vec::new();
+        parser
+            .parse_data(
+                r#"{"type":"response.output_text.delta","delta":"hello"}"#,
+                &mut |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .expect("parse delta");
+        parser
+            .parse_data(
+                r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"hello"}]}}"#,
+                &mut |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .expect("parse done");
+
+        assert_eq!(events, [StreamEvent::Text("hello".to_string())]);
     }
 
     #[test]
@@ -4209,6 +4898,76 @@ mod tests {
         let body = anthropic_body(&config, &request);
 
         assert_eq!(body, fixture["request"]["body"]);
+    }
+
+    #[test]
+    fn anthropic_body_stays_within_cache_control_budget() {
+        fn count_cache_control(value: &Value) -> usize {
+            match value {
+                Value::Object(map) => {
+                    let here = usize::from(map.contains_key("cache_control"));
+                    here + map.values().map(count_cache_control).sum::<usize>()
+                }
+                Value::Array(items) => items.iter().map(count_cache_control).sum(),
+                _ => 0,
+            }
+        }
+
+        let request = ProviderRequest {
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            // More tools than the 4-breakpoint cap so a per-tool breakpoint would overflow.
+            tools: vec![
+                fixture_echo_tool(),
+                fixture_echo_tool(),
+                fixture_echo_tool(),
+                fixture_echo_tool(),
+                fixture_echo_tool(),
+                fixture_echo_tool(),
+                fixture_echo_tool(),
+            ],
+        };
+        // OAuth path emits two system breakpoints, the most a request can carry.
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "anthropic".to_string(),
+                id: "claude-opus-4-8".to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: None,
+            auth: ProviderAuth::ClaudeCodeOAuth {
+                access_token: "token".to_string(),
+            },
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        let body = anthropic_body(&config, &request);
+
+        assert!(
+            count_cache_control(&body) <= 4,
+            "expected <= 4 cache_control breakpoints, found {} in {body}",
+            count_cache_control(&body)
+        );
+
+        let tools = body["tools"].as_array().expect("tools array");
+        for tool in &tools[..tools.len() - 1] {
+            assert!(
+                tool.get("cache_control").is_none(),
+                "only the last tool should carry cache_control"
+            );
+        }
+        assert!(
+            tools.last().unwrap().get("cache_control").is_some(),
+            "last tool should carry cache_control"
+        );
     }
 
     #[test]

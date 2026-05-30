@@ -35,8 +35,8 @@ Rust does not automatically read or migrate old TypeScript session logs.
 
 Reason: Rust live sessions have a durable replay JSONL contract. TypeScript v3
 JSONL export/import and direct open are supported where practical, but old logs
-are not automatically migrated in place. The TypeScript reference branch remains
-available for forensic reading of old behavior.
+are not automatically migrated in place. Check out the tip of upstream `main`
+for forensic reading of TypeScript behavior.
 
 ### No Live Providers in Normal Tests
 

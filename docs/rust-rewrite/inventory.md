@@ -5,8 +5,9 @@ Original tracking issue: https://github.com/noeljackson/pi/issues/3
 Current doc refresh: https://github.com/noeljackson/pi/issues/38
 
 This document records the TypeScript reference behavior that the Rust rewrite
-preserved, replaced, or intentionally dropped. The reference branch is
-`ts-reference`; active implementation is Rust-only.
+preserved, replaced, or intentionally dropped. The TypeScript reference is the
+tip of upstream `main` from `https://github.com/earendil-works/pi`; active
+implementation is Rust-only.
 
 ## Product Scope
 
@@ -18,7 +19,7 @@ Current target:
 - Normal explicit reload of runtime systems without clearing the active conversation.
 - Docker-only execution path for TypeScript reference fixture generation.
 
-Reference packages from `ts-reference`:
+Reference packages from the checked-out upstream TypeScript repository:
 
 - `packages/coding-agent`: CLI entrypoint, TUI mode, sessions, tools, settings, extensions, auth, slash commands.
 - `packages/agent`: generic agent loop, message/session helpers, compaction.
