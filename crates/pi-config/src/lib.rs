@@ -2000,6 +2000,13 @@ fn default_models() -> Vec<ModelDefinition> {
         },
         ModelDefinition {
             provider: "anthropic".to_string(),
+            id: "claude-opus-4-8".to_string(),
+            name: Some("Claude Opus 4.8".to_string()),
+            api: ProviderApi::Anthropic,
+            base_url: None,
+        },
+        ModelDefinition {
+            provider: "anthropic".to_string(),
             id: "claude-opus-4-7".to_string(),
             name: Some("Claude Opus 4.7".to_string()),
             api: ProviderApi::Anthropic,
