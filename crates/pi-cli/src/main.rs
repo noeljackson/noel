@@ -52,7 +52,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal, TerminalOptions, Viewport,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -2080,13 +2080,8 @@ async fn run_interactive(
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
     let _restore = TerminalRestore;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(TUI_VIEWPORT_HEIGHT),
-        },
-    )?;
+    let mut viewport_height = terminal_viewport_height();
+    let mut terminal = new_tui_terminal(viewport_height)?;
     terminal.clear()?;
 
     let mut restart = false;
@@ -2106,7 +2101,10 @@ async fn run_interactive(
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 handle_tui_key(
                     key,
-                    &mut terminal,
+                    &mut TuiSurface {
+                        terminal: &mut terminal,
+                        viewport_height: &mut viewport_height,
+                    },
                     &mut app,
                     &mut runtime,
                     &mut config,
@@ -2120,6 +2118,10 @@ async fn run_interactive(
             }
             Event::Paste(text) => {
                 app.paste_text(&text);
+                false
+            }
+            Event::Resize(_, _) => {
+                resize_tui_viewport(&mut terminal, &mut viewport_height)?;
                 false
             }
             _ => false,
@@ -2320,6 +2322,15 @@ impl TuiSelectorState {
         };
     }
 
+    fn jump_to_start(&mut self) {
+        self.selected = 0;
+    }
+
+    fn jump_to_end(&mut self) {
+        let len = self.filtered_indices.len();
+        self.selected = len.saturating_sub(1);
+    }
+
     fn push_query_char(&mut self, ch: char) {
         self.query.push(ch);
         self.selected = 0;
@@ -2441,6 +2452,8 @@ fn supports_anthropic_adaptive_thinking(model_id: &str) -> bool {
         || model_id.contains("opus-4.6")
         || model_id.contains("opus-4-7")
         || model_id.contains("opus-4.7")
+        || model_id.contains("opus-4-8")
+        || model_id.contains("opus-4.8")
         || model_id.contains("sonnet-4-6")
         || model_id.contains("sonnet-4.6")
 }
@@ -2457,7 +2470,6 @@ struct TuiApp {
     header_line: String,
     status: String,
     show_hardware_cursor: bool,
-    history_emitted_entries: usize,
     live_entry_index: Option<usize>,
     history_cursor: Option<usize>,
     history_draft: Option<String>,
@@ -2617,7 +2629,6 @@ impl TuiApp {
         self.multiline = None;
         self.selector = None;
         self.live_entry_index = None;
-        self.history_emitted_entries = 0;
     }
 
     fn insert_input_newline(&mut self) {
@@ -2674,11 +2685,12 @@ impl TuiApp {
         let Some(index) = self.live_entry_index.take() else {
             return;
         };
-        if index >= self.history_emitted_entries && index < self.entries.len() {
+        if index < self.entries.len() {
             self.entries.remove(index);
         }
     }
 
+    #[cfg(test)]
     fn finalized_entry_count(&self) -> usize {
         self.live_entry_index.unwrap_or(self.entries.len())
     }
@@ -2709,42 +2721,167 @@ fn newline_offsets(input: &str) -> Vec<usize> {
 }
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
-const TUI_VIEWPORT_HEIGHT: u16 = 12;
+
+struct TuiSurface<'a> {
+    terminal: &'a mut TuiTerminal,
+    viewport_height: &'a mut u16,
+}
+
+fn new_tui_terminal(height: u16) -> Result<TuiTerminal> {
+    let backend = CrosstermBackend::new(io::stdout());
+    Ok(Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height.max(1)),
+        },
+    )?)
+}
+
+fn terminal_viewport_height() -> u16 {
+    crossterm::terminal::size()
+        .map(|(_, height)| height.max(1))
+        .unwrap_or(24)
+}
+
+fn resize_tui_viewport(terminal: &mut TuiTerminal, viewport_height: &mut u16) -> Result<()> {
+    let desired = terminal_viewport_height();
+    if desired == *viewport_height {
+        terminal.autoresize()?;
+        return Ok(());
+    }
+    *terminal = new_tui_terminal(desired)?;
+    terminal.clear()?;
+    *viewport_height = desired;
+    Ok(())
+}
 
 fn redraw_tui(terminal: &mut TuiTerminal, app: &mut TuiApp, config: &LoadedConfig) -> Result<()> {
-    emit_finalized_history(terminal, app)?;
     terminal.draw(|frame| draw_tui(frame, app, config))?;
     Ok(())
 }
 
-fn emit_finalized_history(terminal: &mut TuiTerminal, app: &mut TuiApp) -> Result<()> {
-    let emit_until = app.finalized_entry_count();
-    if emit_until <= app.history_emitted_entries {
-        return Ok(());
-    }
-    let lines = render_entry_lines(&app.entries[app.history_emitted_entries..emit_until]);
-    if lines.is_empty() {
-        app.history_emitted_entries = emit_until;
-        return Ok(());
-    }
-    let width = terminal.size()?.width.max(1) as usize;
-    let height = rendered_lines_height(&lines, width);
-    let render_lines = lines.clone();
-    terminal.insert_before(height, move |buffer| {
-        Paragraph::new(render_lines)
-            .wrap(Wrap { trim: false })
-            .render(buffer.area, buffer);
-    })?;
-    app.history_emitted_entries = emit_until;
-    Ok(())
-}
-
+#[cfg(test)]
 fn rendered_lines_height(lines: &[Line<'_>], width: usize) -> u16 {
     lines
         .iter()
         .map(|line| line.width().max(1).div_ceil(width))
         .sum::<usize>()
         .min(u16::MAX as usize) as u16
+}
+
+const TRANSCRIPT_RENDER_OVERSCAN_ROWS: u16 = 4;
+const STREAM_RENDER_INTERVAL_MS: u64 = 16;
+
+struct VisibleTranscript {
+    lines: Vec<Line<'static>>,
+    visual_height: u16,
+    #[cfg(test)]
+    entries_used: usize,
+}
+
+fn visible_transcript(entries: &[TuiEntry], width: usize, height: u16) -> VisibleTranscript {
+    let width = width.max(1);
+    let target_height = height.saturating_add(TRANSCRIPT_RENDER_OVERSCAN_ROWS) as usize;
+    let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut scan_height: usize = 0;
+    #[cfg(test)]
+    let mut entries_used = 0;
+
+    for entry in entries.iter().rev() {
+        let mut chunk = render_entry_lines(std::slice::from_ref(entry));
+        if chunks.is_empty() {
+            while chunk.last().map(Line::width) == Some(0) {
+                chunk.pop();
+            }
+        }
+        if chunk.is_empty() {
+            continue;
+        }
+
+        let chunk = wrap_transcript_lines(chunk, width);
+        scan_height = scan_height.saturating_add(chunk.len());
+        chunks.push(chunk);
+        #[cfg(test)]
+        {
+            entries_used += 1;
+        }
+        if scan_height >= target_height {
+            break;
+        }
+    }
+
+    chunks.reverse();
+    let mut lines = chunks.into_iter().flatten().collect::<Vec<_>>();
+    if lines.len() > height as usize {
+        lines = lines[lines.len() - height as usize..].to_vec();
+    }
+    let visual_height = lines.len().min(u16::MAX as usize) as u16;
+    VisibleTranscript {
+        lines,
+        visual_height,
+        #[cfg(test)]
+        entries_used,
+    }
+}
+
+fn wrap_transcript_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    for line in lines {
+        wrap_transcript_line(line, width.max(1), &mut rows);
+    }
+    rows
+}
+
+fn wrap_transcript_line(line: Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
+    let mut current = Vec::new();
+    let mut current_width: usize = 0;
+    let mut row_has_content = false;
+    let mut emitted_row = false;
+
+    for span in line.spans {
+        let style = span.style;
+        let mut segment = String::new();
+        for ch in span.content.chars() {
+            let ch_width = transcript_char_width(ch);
+            if ch_width > 0 && current_width > 0 && current_width.saturating_add(ch_width) > width {
+                push_transcript_segment(&mut current, &mut segment, style);
+                rows.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+                emitted_row = true;
+            }
+            segment.push(ch);
+            current_width = current_width.saturating_add(ch_width);
+            row_has_content = true;
+            if current_width >= width {
+                push_transcript_segment(&mut current, &mut segment, style);
+                rows.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+                row_has_content = false;
+                emitted_row = true;
+            }
+        }
+        push_transcript_segment(&mut current, &mut segment, style);
+    }
+
+    if row_has_content || !emitted_row {
+        rows.push(Line::from(current));
+    }
+}
+
+fn push_transcript_segment(current: &mut Vec<Span<'static>>, segment: &mut String, style: Style) {
+    if !segment.is_empty() {
+        current.push(Span::styled(std::mem::take(segment), style));
+    }
+}
+
+fn transcript_char_width(ch: char) -> usize {
+    if ch == '\t' {
+        4
+    } else if ch.is_control() {
+        0
+    } else {
+        1
+    }
 }
 
 fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
@@ -2761,7 +2898,7 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-    draw_live_history(frame, root[0], app);
+    draw_transcript(frame, root[0], app);
     draw_input(frame, root[1], app);
     draw_slash_matches(frame, root[2], &slash_matches);
     draw_footer(frame, root[3], root[4], app);
@@ -2770,14 +2907,7 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
 }
 
 fn input_area_height(app: &TuiApp, frame_height: u16, slash_match_height: u16) -> u16 {
-    let desired = if app.multiline.is_some() {
-        3
-    } else {
-        app.typed_input_rows()
-            .saturating_add(1)
-            .max(3)
-            .min(u16::MAX as usize) as u16
-    };
+    let desired = input_desired_height(app);
     let available = frame_height
         .saturating_sub(slash_match_height)
         .saturating_sub(2)
@@ -2785,19 +2915,30 @@ fn input_area_height(app: &TuiApp, frame_height: u16, slash_match_height: u16) -
     desired.min(available)
 }
 
-fn draw_live_history(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let Some(live_index) = app.live_entry_index else {
-        return;
-    };
-    let mut lines = render_entry_lines(&app.entries[live_index..]);
-    let available = area.height as usize;
-    if lines.len() > available {
-        lines = lines[lines.len() - available..].to_vec();
+fn input_desired_height(app: &TuiApp) -> u16 {
+    if app.multiline.is_some() {
+        3
+    } else {
+        app.typed_input_rows()
+            .saturating_add(1)
+            .max(3)
+            .min(u16::MAX as usize) as u16
     }
-    let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(Color::White))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+}
+
+fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let visible = visible_transcript(&app.entries, area.width as usize, area.height);
+    if visible.lines.is_empty() {
+        return;
+    }
+    let y = area.y + area.height.saturating_sub(visible.visual_height);
+    let height = visible.visual_height.min(area.height);
+    let render_area = Rect { y, height, ..area };
+    let paragraph = Paragraph::new(visible.lines).style(Style::default().fg(Color::White));
+    frame.render_widget(paragraph, render_area);
 }
 
 fn render_entry_lines(entries: &[TuiEntry]) -> Vec<Line<'static>> {
@@ -3027,6 +3168,7 @@ fn draw_footer(frame: &mut Frame<'_>, primary: Rect, secondary: Rect, app: &TuiA
 }
 
 const SLASH_MATCH_LIMIT: usize = 6;
+const SELECTOR_PAGE_STEP: usize = 10;
 
 fn slash_command_matches(config: &LoadedConfig, app: &TuiApp) -> Vec<String> {
     if app.selector.is_some() || app.multiline.is_some() || app.input.contains('\n') {
@@ -3130,7 +3272,12 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
     } else {
         "enter select"
     };
-    let title = format!(" {} selector  {action}  esc cancel ", selector.title);
+    let total = selector.filtered_indices.len();
+    let position = if total == 0 { 0 } else { selector.selected + 1 };
+    let title = format!(
+        " {} selector  {position}/{total}  {action}  pgup/pgdn home/end  esc cancel ",
+        selector.title
+    );
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -3205,7 +3352,7 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 
 async fn handle_tui_key(
     key: KeyEvent,
-    terminal: &mut TuiTerminal,
+    surface: &mut TuiSurface<'_>,
     app: &mut TuiApp,
     runtime: &mut Runtime,
     config: &mut LoadedConfig,
@@ -3238,10 +3385,8 @@ async fn handle_tui_key(
             let line = app.input.trim().to_string();
             app.clear_input();
             if !line.is_empty() {
-                let quit = match handle_tui_submission(
-                    app, terminal, runtime, config, offline, line,
-                )
-                .await
+                let quit = match handle_tui_submission(app, surface, runtime, config, offline, line)
+                    .await
                 {
                     Ok(quit) => quit,
                     Err(error) => {
@@ -3263,6 +3408,74 @@ async fn handle_tui_key(
     }
     app.refresh_chrome(config, runtime);
     Ok(false)
+}
+
+fn handle_streaming_tui_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    queued_inputs: &mut Vec<String>,
+) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            app.clear_input();
+            app.multiline = None;
+            true
+        }
+        KeyCode::Backspace => {
+            app.pop_input_char();
+            true
+        }
+        KeyCode::Enter if is_shift_enter(&key) => {
+            app.insert_input_newline();
+            true
+        }
+        KeyCode::Enter => {
+            let line = app.input.trim().to_string();
+            app.clear_input();
+            if !line.is_empty() {
+                queued_inputs.push(line);
+            }
+            true
+        }
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.push_input_char(ch);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn drain_streaming_tui_events(
+    surface: &mut TuiSurface<'_>,
+    app: &mut TuiApp,
+    queued_inputs: &mut Vec<String>,
+) -> Result<bool> {
+    let mut changed = false;
+    while event::poll(Duration::ZERO)? {
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                changed |= handle_streaming_tui_key(key, app, queued_inputs);
+            }
+            Event::Paste(text) => {
+                app.paste_text(&text);
+                changed = true;
+            }
+            Event::Resize(_, _) => {
+                resize_tui_viewport(surface.terminal, surface.viewport_height)?;
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(changed)
+}
+
+fn apply_stream_delta(app: &mut TuiApp, entry_index: usize, saw_delta: &mut bool, delta: &str) {
+    if !*saw_delta {
+        app.replace_entry(entry_index, "");
+        *saw_delta = true;
+    }
+    app.append_entry(entry_index, delta);
 }
 
 fn is_shift_enter(key: &KeyEvent) -> bool {
@@ -3287,6 +3500,26 @@ fn handle_tui_selector_key(
         KeyCode::Down => {
             if let Some(selector) = app.selector.as_mut() {
                 selector.move_selection(1);
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.move_selection(-(SELECTOR_PAGE_STEP as isize));
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.move_selection(SELECTOR_PAGE_STEP as isize);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.jump_to_start();
+            }
+        }
+        KeyCode::End => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.jump_to_end();
             }
         }
         KeyCode::Left => {
@@ -3644,7 +3877,7 @@ fn write_user_setting(path: &Path, keys: &[&str], value: serde_json::Value) -> R
 
 async fn handle_tui_submission(
     app: &mut TuiApp,
-    terminal: &mut TuiTerminal,
+    surface: &mut TuiSurface<'_>,
     runtime: &mut Runtime,
     config: &mut LoadedConfig,
     offline: bool,
@@ -3654,7 +3887,7 @@ async fn handle_tui_submission(
         if line == "." {
             let prompt = lines.join("\n");
             app.multiline = None;
-            submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline).await;
+            submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
         } else {
             lines.push(line);
         }
@@ -3668,24 +3901,15 @@ async fn handle_tui_submission(
         }
         return Ok(true);
     }
-    if handle_tui_bang(app, terminal, runtime, config, &line).await? {
+    if handle_tui_bang(app, surface, runtime, config, &line).await? {
         return Ok(false);
     }
     match line.as_str() {
         "/help" => app.push(TuiEntryKind::System, terminal_renderer(config).help()),
         "/clear" => {
             app.clear_visible();
-            clear_terminal_screen(terminal)?;
+            clear_terminal_screen(surface.terminal)?;
         }
-        "/models" => app.push(
-            TuiEntryKind::System,
-            config
-                .models
-                .iter()
-                .map(|model| format!("{}/{}", model.provider, model.id))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
         "/image-models" => app.push(TuiEntryKind::System, format_image_models(config, "")),
         "/thinking" => app.push(
             TuiEntryKind::System,
@@ -3694,7 +3918,9 @@ async fn handle_tui_submission(
                 active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string())
             ),
         ),
-        "/model" | "/scoped-models" => open_tui_selector(app, config, runtime, "model", "")?,
+        "/model" | "/models" | "/scoped-models" => {
+            open_tui_selector(app, config, runtime, "model", "")?
+        }
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
         "/changelog" => app.push(TuiEntryKind::System, format_changelog()),
         "/settings" => open_tui_selector(app, config, runtime, "settings", "")?,
@@ -3800,7 +4026,7 @@ async fn handle_tui_submission(
             let initial = line.trim_start_matches("/editor").trim();
             match read_external_editor_prompt(initial) {
                 Ok(prompt) if !prompt.trim().is_empty() => {
-                    submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline)
+                    submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline)
                         .await;
                 }
                 Ok(_) => app.push(TuiEntryKind::System, "editor returned an empty prompt"),
@@ -3821,7 +4047,7 @@ async fn handle_tui_submission(
                     if !prompt.is_empty() {
                         submit_tui_prompt(
                             app,
-                            terminal,
+                            surface,
                             runtime,
                             config,
                             prompt.to_string(),
@@ -3837,6 +4063,14 @@ async fn handle_tui_submission(
         _ if line.starts_with("/image-models ") => {
             let search = line.trim_start_matches("/image-models ").trim();
             app.push(TuiEntryKind::System, format_image_models(config, search));
+        }
+        _ if line.starts_with("/models ") => {
+            let query = line.trim_start_matches("/models ").trim();
+            open_tui_selector(app, config, runtime, "model", query)?;
+        }
+        _ if line.starts_with("/scoped-models ") => {
+            let query = line.trim_start_matches("/scoped-models ").trim();
+            open_tui_selector(app, config, runtime, "model", query)?;
         }
         _ if line.starts_with("/generate-image ") => {
             let rest = line.trim_start_matches("/generate-image ").trim();
@@ -3921,7 +4155,7 @@ async fn handle_tui_submission(
             } else {
                 format!("{}\n\n{}", skill.content, input)
             };
-            submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline).await;
+            submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
         }
         _ if line.starts_with("/extension:") => {
             let (name, input) = split_resource_command(&line, "/extension:");
@@ -3939,7 +4173,7 @@ async fn handle_tui_submission(
             } else {
                 format!("{}\n\n{}", extension.content, input)
             };
-            submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline).await;
+            submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
         }
         _ if line.starts_with("/prompt ") => {
             let rest = line.trim_start_matches("/prompt ").trim();
@@ -3947,7 +4181,7 @@ async fn handle_tui_submission(
             let template = find_resource(&config.prompt_templates, name)
                 .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
             let prompt = expand_prompt_template(&template.content, input);
-            submit_tui_prompt(app, terminal, runtime, config, prompt, Vec::new(), offline).await;
+            submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
         }
         _ if line.starts_with("/theme ") => {
             let name = line.trim_start_matches("/theme ").trim();
@@ -4062,7 +4296,7 @@ async fn handle_tui_submission(
                 format!("share exported {}", path.display()),
             );
         }
-        _ => submit_tui_prompt(app, terminal, runtime, config, line, Vec::new(), offline).await,
+        _ => submit_tui_prompt(app, surface, runtime, config, line, Vec::new(), offline).await,
     }
     Ok(false)
 }
@@ -4080,7 +4314,7 @@ fn clear_terminal_screen(terminal: &mut TuiTerminal) -> Result<()> {
 
 async fn handle_tui_bang(
     app: &mut TuiApp,
-    terminal: &mut TuiTerminal,
+    surface: &mut TuiSurface<'_>,
     runtime: &mut Runtime,
     config: &LoadedConfig,
     line: &str,
@@ -4098,7 +4332,7 @@ async fn handle_tui_bang(
     };
     let entry_index = if terminal_progress_enabled(config) {
         let index = app.push_placeholder(TuiEntryKind::Tool, format_bash_running(&command));
-        redraw_tui(terminal, app, config)?;
+        redraw_tui(surface.terminal, app, config)?;
         Some(index)
     } else {
         None
@@ -4127,7 +4361,7 @@ async fn handle_tui_bang(
 
 async fn submit_tui_prompt(
     app: &mut TuiApp,
-    terminal: &mut TuiTerminal,
+    surface: &mut TuiSurface<'_>,
     runtime: &mut Runtime,
     config: &LoadedConfig,
     prompt: String,
@@ -4137,7 +4371,7 @@ async fn submit_tui_prompt(
     app.editor_state.record_history(prompt.clone());
     app.push(TuiEntryKind::User, prompt.clone());
     if let Err(error) =
-        run_prompt_with_queue_tui(app, terminal, runtime, config, prompt, media, offline).await
+        run_prompt_with_queue_tui(app, surface, runtime, config, prompt, media, offline).await
     {
         app.drop_live_entry();
         app.push(
@@ -4166,7 +4400,7 @@ fn format_tui_error(error: &anyhow::Error, runtime: &Runtime, config: &LoadedCon
 
 async fn run_prompt_with_queue_tui(
     app: &mut TuiApp,
-    terminal: &mut TuiTerminal,
+    surface: &mut TuiSurface<'_>,
     runtime: &mut Runtime,
     config: &LoadedConfig,
     prompt: String,
@@ -4174,7 +4408,7 @@ async fn run_prompt_with_queue_tui(
     offline: bool,
 ) -> Result<()> {
     maybe_auto_compact(runtime, config, false)?;
-    run_prompt_once_tui(app, terminal, runtime, config, prompt, media, offline).await?;
+    run_prompt_once_tui(app, surface, runtime, config, prompt, media, offline).await?;
     while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
         let remaining = runtime
             .session()
@@ -4185,7 +4419,7 @@ async fn run_prompt_with_queue_tui(
             .collect();
         runtime.replace_queued_messages(remaining)?;
         app.push(TuiEntryKind::System, format!("queued> {prompt}"));
-        run_prompt_once_tui(app, terminal, runtime, config, prompt, Vec::new(), offline).await?;
+        run_prompt_once_tui(app, surface, runtime, config, prompt, Vec::new(), offline).await?;
         if follow_up_mode(config) == "one-at-a-time" {
             break;
         }
@@ -4203,7 +4437,7 @@ fn follow_up_mode(config: &LoadedConfig) -> &str {
 
 async fn run_prompt_once_tui(
     app: &mut TuiApp,
-    terminal: &mut TuiTerminal,
+    surface: &mut TuiSurface<'_>,
     runtime: &mut Runtime,
     config: &LoadedConfig,
     prompt: String,
@@ -4222,7 +4456,7 @@ async fn run_prompt_once_tui(
             "Working...".to_string()
         },
     );
-    redraw_tui(terminal, app, config)?;
+    redraw_tui(surface.terminal, app, config)?;
     let provider = provider_for_runtime(runtime, config, offline)?;
     let message_start = runtime.session().messages.len();
     if kind == TuiEntryKind::Tool {
@@ -4236,27 +4470,65 @@ async fn run_prompt_once_tui(
             app.replace_entry(entry_index, response);
         }
         app.finish_live_entry();
-        redraw_tui(terminal, app, config)?;
+        redraw_tui(surface.terminal, app, config)?;
         return Ok(());
     }
 
     let mut saw_delta = false;
-    let response =
-        run_user_turn_streaming_with_media(runtime, provider.as_ref(), prompt, media, |delta| {
-            if !saw_delta {
-                app.replace_entry(entry_index, "");
-                saw_delta = true;
+    let mut queued_inputs = Vec::new();
+    let (delta_tx, delta_rx) = std::sync::mpsc::channel::<String>();
+    let response = {
+        let turn = run_user_turn_streaming_with_media(
+            runtime,
+            provider.as_ref(),
+            prompt,
+            media,
+            move |delta| {
+                let _ = delta_tx.send(delta.to_string());
+            },
+        );
+        tokio::pin!(turn);
+        let mut tick = tokio::time::interval(Duration::from_millis(STREAM_RENDER_INTERVAL_MS));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut pending_redraw = false;
+
+        loop {
+            tokio::select! {
+                result = &mut turn => {
+                    while let Ok(delta) = delta_rx.try_recv() {
+                        apply_stream_delta(app, entry_index, &mut saw_delta, &delta);
+                        pending_redraw = true;
+                    }
+                    if pending_redraw {
+                        redraw_tui(surface.terminal, app, config)?;
+                    }
+                    break result?;
+                }
+                _ = tick.tick() => {
+                    while let Ok(delta) = delta_rx.try_recv() {
+                        apply_stream_delta(app, entry_index, &mut saw_delta, &delta);
+                        pending_redraw = true;
+                    }
+                    if drain_streaming_tui_events(surface, app, &mut queued_inputs)? {
+                        pending_redraw = true;
+                    }
+                    if pending_redraw {
+                        redraw_tui(surface.terminal, app, config)?;
+                        pending_redraw = false;
+                    }
+                }
             }
-            app.append_entry(entry_index, delta);
-            let _ = redraw_tui(terminal, app, config);
-        })
-        .await?;
+        }
+    };
     if !saw_delta {
         app.replace_entry(entry_index, response);
     }
+    for queued_input in queued_inputs {
+        runtime.queue_message(queued_input)?;
+    }
     insert_new_tool_messages(app, runtime, message_start, entry_index);
     app.finish_live_entry();
-    redraw_tui(terminal, app, config)?;
+    redraw_tui(surface.terminal, app, config)?;
     Ok(())
 }
 
@@ -5761,6 +6033,122 @@ mod tests {
     }
 
     #[test]
+    fn transcript_height_accounts_for_wrapped_streaming_text() {
+        let lines = vec![Line::from("123456"), Line::from("ab")];
+        assert_eq!(rendered_lines_height(&lines, 3), 3);
+    }
+
+    #[test]
+    fn transcript_lines_drop_trailing_entry_spacer_for_viewport() {
+        let mut lines = render_entry_lines(&[TuiEntry {
+            kind: TuiEntryKind::Assistant,
+            text: "done".to_string(),
+        }]);
+        while lines.last().map(Line::width) == Some(0) {
+            lines.pop();
+        }
+
+        assert_eq!(lines.last().map(Line::width), Some(6));
+    }
+
+    #[test]
+    fn transcript_render_is_bounded_while_streaming() {
+        let mut app = TuiApp::default();
+        for index in 0..1_000 {
+            app.push(TuiEntryKind::Assistant, format!("old response {index}"));
+        }
+        app.push_placeholder(TuiEntryKind::Assistant, "word ".repeat(300));
+
+        let visible = visible_transcript(&app.entries, 20, 12);
+
+        assert_eq!(visible.entries_used, 1);
+        assert!(visible.visual_height >= 12);
+    }
+
+    #[test]
+    fn transcript_render_is_bounded_after_streaming() {
+        let mut app = TuiApp::default();
+        for index in 0..1_000 {
+            app.push(TuiEntryKind::Assistant, format!("old response {index}"));
+        }
+
+        let visible = visible_transcript(&app.entries, 80, 20);
+
+        assert!(visible.entries_used < app.entries.len());
+        assert!(visible.entries_used <= 24);
+        assert!(visible.visual_height >= 20);
+    }
+
+    #[test]
+    fn transcript_render_keeps_latest_entry_after_wrapped_history() {
+        let entries = vec![
+            TuiEntry {
+                kind: TuiEntryKind::Assistant,
+                text: "stream".repeat(120),
+            },
+            TuiEntry {
+                kind: TuiEntryKind::System,
+                text: "queued> draft while streaming".to_string(),
+            },
+            TuiEntry {
+                kind: TuiEntryKind::Assistant,
+                text: "[faux/echo] draft while streaming".to_string(),
+            },
+        ];
+
+        let visible = visible_transcript(&entries, 80, 8);
+        let text = visible
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("[faux/echo] draft while streaming"));
+    }
+
+    #[test]
+    fn streaming_input_key_updates_draft_while_response_is_live() {
+        let mut app = TuiApp::default();
+        app.push_placeholder(TuiEntryKind::Assistant, "streaming");
+        let mut queued_inputs = Vec::new();
+
+        for ch in "next prompt".chars() {
+            let changed = handle_streaming_tui_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut app,
+                &mut queued_inputs,
+            );
+            assert!(changed);
+        }
+
+        assert_eq!(app.input, "next prompt");
+        assert!(queued_inputs.is_empty());
+        assert_eq!(app.entries[0].text, "streaming");
+        assert_eq!(app.live_entry_index, Some(0));
+    }
+
+    #[test]
+    fn streaming_enter_queues_draft_without_touching_live_response() {
+        let mut app = TuiApp::default();
+        app.push_placeholder(TuiEntryKind::Assistant, "streaming");
+        app.input = "next prompt".to_string();
+        let mut queued_inputs = Vec::new();
+
+        let changed = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut queued_inputs,
+        );
+
+        assert!(changed);
+        assert!(app.input.is_empty());
+        assert_eq!(queued_inputs, ["next prompt"]);
+        assert_eq!(app.entries[0].text, "streaming");
+        assert_eq!(app.live_entry_index, Some(0));
+    }
+
+    #[test]
     fn prompt_history_navigates_with_draft_restore() {
         let mut app = TuiApp::default();
         app.editor_state.record_history("first");
@@ -5909,7 +6297,6 @@ mod tests {
         let mut app = TuiApp {
             input: "draft".to_string(),
             multiline: Some(vec!["one".to_string()]),
-            history_emitted_entries: 1,
             live_entry_index: Some(0),
             ..TuiApp::default()
         };
@@ -5923,7 +6310,6 @@ mod tests {
         assert!(app.input.is_empty());
         assert!(app.multiline.is_none());
         assert!(app.selector.is_none());
-        assert_eq!(app.history_emitted_entries, 0);
         assert!(app.live_entry_index.is_none());
         assert_eq!(app.typed_input_rows(), 1);
         assert_eq!(app.editor_state.history(), ["old prompt"]);
