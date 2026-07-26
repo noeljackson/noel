@@ -409,11 +409,19 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn create(session_dir: &Path, cwd: PathBuf) -> Result<(Self, SessionState), SessionError> {
+        Self::create_with_id(session_dir, cwd, new_session_id())
+    }
+
+    pub fn create_with_id(
+        session_dir: &Path,
+        cwd: PathBuf,
+        session_id: impl Into<String>,
+    ) -> Result<(Self, SessionState), SessionError> {
         fs::create_dir_all(session_dir).map_err(|source| SessionError::CreateDir {
             path: session_dir.to_path_buf(),
             source,
         })?;
-        let session_id = new_session_id();
+        let session_id = session_id.into();
         let path = session_dir.join(format!("{session_id}.jsonl"));
         let store = Self { path };
         let state = SessionState::new(session_id.clone(), cwd.clone());

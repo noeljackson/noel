@@ -23,30 +23,43 @@
       "accountId": "account-id"
     },
     "providers": [
-      "anthropic",
-      "openai-codex"
+      {
+        "providerId": "anthropic",
+        "type": "api_key"
+      },
+      {
+        "providerId": "openai-codex",
+        "type": "oauth"
+      }
     ],
     "status": {
       "anthropic": {
-        "configured": true,
-        "source": "stored"
+        "type": "api_key",
+        "key": "stored-anthropic-api-key"
       },
       "openaiCodex": {
-        "configured": true,
-        "source": "stored"
+        "type": "oauth",
+        "access": "stored-codex-access-token",
+        "refresh": "stored-codex-refresh-token",
+        "expires": 4102444800000,
+        "accountId": "account-id"
       }
     }
   },
   "precedence": {
     "order": [
       "runtime",
-      "stored_api_key",
-      "stored_oauth",
-      "environment",
-      "fallback"
+      "stored",
+      "environment"
     ],
-    "runtimeOverride": "runtime-anthropic-api-key",
-    "fallback": "fallback-custom-provider-key"
+    "runtimeOverride": {
+      "type": "api_key",
+      "key": "runtime-anthropic-api-key"
+    },
+    "stored": {
+      "type": "api_key",
+      "key": "stored-anthropic-api-key"
+    }
   },
   "env": [
     {
@@ -59,7 +72,7 @@
       "expectedApiKey": "claude-oauth-env-token",
       "expectedSource": "environment",
       "status": {
-        "configured": false,
+        "configured": true,
         "source": "environment",
         "label": "ANTHROPIC_OAUTH_TOKEN"
       },
@@ -74,7 +87,7 @@
       "expectedApiKey": "openai-api-key",
       "expectedSource": "environment",
       "status": {
-        "configured": false,
+        "configured": true,
         "source": "environment",
         "label": "OPENAI_API_KEY"
       },
@@ -89,7 +102,7 @@
       "expectedApiKey": "azure-api-key",
       "expectedSource": "environment",
       "status": {
-        "configured": false,
+        "configured": true,
         "source": "environment",
         "label": "AZURE_OPENAI_API_KEY"
       },

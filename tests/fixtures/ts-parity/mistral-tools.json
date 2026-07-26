@@ -14,11 +14,12 @@
       "authorization": "Bearer <redacted>",
       "content-type": "application/json",
       "cookie": "",
-      "user-agent": "mistral-client-typescript/2.2.1",
+      "user-agent": "mistral-client-typescript/2.2.6",
       "x-affinity": "session_ts_parity"
     },
     "body": {
       "model": "devstral-medium-latest",
+      "max_tokens": 258001,
       "stream": true,
       "messages": [
         {
@@ -50,7 +51,8 @@
             }
           }
         }
-      ]
+      ],
+      "prompt_cache_key": "session_ts_parity"
     }
   }
 }

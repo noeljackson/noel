@@ -5,6 +5,12 @@ import {
 	AuthStorage,
 	type AuthCredential,
 } from "/ts-reference/packages/coding-agent/src/core/auth-storage.ts";
+import { RuntimeCredentials } from "/ts-reference/packages/coding-agent/src/core/runtime-credentials.ts";
+import { defaultProviderAuthContext } from "/ts-reference/packages/ai/src/auth/context.ts";
+import { resolveProviderAuth } from "/ts-reference/packages/ai/src/auth/resolve.ts";
+import { anthropicProvider } from "/ts-reference/packages/ai/src/providers/anthropic.ts";
+import { azureOpenAIResponsesProvider } from "/ts-reference/packages/ai/src/providers/azure-openai-responses.ts";
+import { openaiProvider } from "/ts-reference/packages/ai/src/providers/openai.ts";
 
 type ProviderEnvCase = {
 	provider: string;
@@ -61,14 +67,26 @@ function withEnv<T>(values: Record<string, string>, fn: () => T): T {
 }
 
 async function summarizeEnvCase(testCase: ProviderEnvCase) {
-	const storage = AuthStorage.inMemory();
-	return withEnv(testCase.env, async () => {
-		return {
-			...testCase,
-			status: storage.getAuthStatus(testCase.provider),
-			apiKey: await storage.getApiKey(testCase.provider, { includeFallback: false }),
-		};
+	const provider = {
+		anthropic: anthropicProvider(),
+		openai: openaiProvider(),
+		"azure-openai-responses": azureOpenAIResponsesProvider(),
+	}[testCase.provider];
+	if (!provider) {
+		throw new Error(`unsupported auth fixture provider: ${testCase.provider}`);
+	}
+	const result = await resolveProviderAuth(provider, AuthStorage.inMemory(), defaultProviderAuthContext(), {
+		env: testCase.env,
 	});
+	return {
+		...testCase,
+		status: {
+			configured: Boolean(result),
+			source: "environment",
+			label: result?.source,
+		},
+		apiKey: result?.auth.apiKey,
+	};
 }
 
 async function main() {
@@ -91,10 +109,8 @@ async function main() {
 		},
 	};
 	const stored = AuthStorage.inMemory(storedCredentials);
-	stored.setRuntimeApiKey("anthropic", "runtime-anthropic-api-key");
-	stored.setFallbackResolver((provider) =>
-		provider === "custom-provider" ? "fallback-custom-provider-key" : undefined,
-	);
+	const runtime = new RuntimeCredentials(stored);
+	runtime.setRuntimeApiKey("anthropic", "runtime-anthropic-api-key");
 
 	const fixture = {
 		source: {
@@ -108,22 +124,20 @@ async function main() {
 			credentialTypes: ["api_key", "oauth"],
 			apiKeyCredential: storedCredentials.anthropic,
 			oauthCredential: storedCredentials["openai-codex"],
-			providers: stored.list(),
+			providers: await stored.list(),
 			status: {
-				anthropic: stored.getAuthStatus("anthropic"),
-				openaiCodex: stored.getAuthStatus("openai-codex"),
+				anthropic: await stored.read("anthropic"),
+				openaiCodex: await stored.read("openai-codex"),
 			},
 		},
 		precedence: {
 			order: [
 				"runtime",
-				"stored_api_key",
-				"stored_oauth",
+				"stored",
 				"environment",
-				"fallback",
 			],
-			runtimeOverride: await stored.getApiKey("anthropic", { includeFallback: false }),
-			fallback: await stored.getApiKey("custom-provider"),
+			runtimeOverride: await runtime.read("anthropic"),
+			stored: await stored.read("anthropic"),
 		},
 		env: await Promise.all(envCases.map(summarizeEnvCase)),
 		interopLoginFiles: {

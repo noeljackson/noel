@@ -13,10 +13,11 @@
       "accept": "text/event-stream",
       "authorization": "Bearer <redacted>",
       "chatgpt-account-id": "acct_ts_parity",
+      "content-encoding": "zstd",
       "content-type": "application/json",
       "openai-beta": "responses=experimental",
       "originator": "pi",
-      "user-agent": "pi (browser)"
+      "user-agent": "pi (linux 7.1.3-arch1-1; x64)"
     },
     "body": {
       "model": "gpt-5.5",

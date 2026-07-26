@@ -13,8 +13,16 @@
       "long": "append-system-prompt"
     },
     {
+      "long": "approve",
+      "short": "a"
+    },
+    {
       "long": "continue",
       "short": "c"
+    },
+    {
+      "long": "exclude-tools",
+      "short": "xt"
     },
     {
       "long": "export"
@@ -41,6 +49,14 @@
     },
     {
       "long": "models"
+    },
+    {
+      "long": "name",
+      "short": "n"
+    },
+    {
+      "long": "no-approve",
+      "short": "na"
     },
     {
       "long": "no-builtin-tools",
@@ -94,6 +110,9 @@
     },
     {
       "long": "session-dir"
+    },
+    {
+      "long": "session-id"
     },
     {
       "long": "skill"

@@ -8,7 +8,7 @@ import type {
 	AgentTool,
 	StreamFn,
 } from "/ts-reference/packages/agent/src/types.ts";
-import { getModel } from "/ts-reference/packages/ai/src/models.ts";
+import { getModel } from "/ts-reference/packages/ai/src/compat.ts";
 import { Type } from "/ts-reference/packages/ai/src/index.ts";
 import { createAssistantMessageEventStream } from "/ts-reference/packages/ai/src/utils/event-stream.ts";
 

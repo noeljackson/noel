@@ -8,12 +8,15 @@ TS_PARITY_TRACKING_REF ?= main
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
+SYSTEM_PREFIX ?= /usr/local
+SYSTEM_BINDIR ?= $(SYSTEM_PREFIX)/bin
+SUDO ?= sudo
 INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install run dogfood dogfood-release fmt lint test check ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -21,6 +24,7 @@ help:
 		'  build        Build the workspace' \
 		'  release      Build the pi CLI release binary' \
 		'  install      Install the pi CLI release binary to $$(PREFIX)/bin' \
+		'  install-system Install the pi CLI release binary to /usr/local/bin' \
 		'  run          Run the pi CLI; pass RUN_ARGS="..." for CLI args' \
 		'  dogfood     Run dev TUI with rebuild/restart watcher' \
 		'  fmt          Check Rust formatting' \
@@ -55,6 +59,10 @@ install:
 	CARGO="$(CARGO)" $(INSTALL_BUILD_SCRIPT)
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/pi "$(BINDIR)/pi"
+
+install-system: release
+	$(SUDO) install -d "$(SYSTEM_BINDIR)"
+	$(SUDO) install -m 0755 target/release/pi "$(SYSTEM_BINDIR)/pi"
 
 run:
 	$(CARGO) run -p pi-cli -- $(RUN_ARGS)

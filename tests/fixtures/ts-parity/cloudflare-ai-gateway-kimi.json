@@ -21,9 +21,9 @@
       "x-stainless-lang": "js",
       "x-stainless-os": "Linux",
       "x-stainless-package-version": "6.26.0",
-      "x-stainless-retry-count": "2",
+      "x-stainless-retry-count": "0",
       "x-stainless-runtime": "node",
-      "x-stainless-runtime-version": "v22.22.3"
+      "x-stainless-runtime-version": "v24.16.0"
     },
     "body": {
       "model": "workers-ai/@cf/moonshotai/kimi-k2.6",
@@ -40,7 +40,8 @@
       "stream": true,
       "stream_options": {
         "include_usage": true
-      }
+      },
+      "max_tokens": 251899
     }
   }
 }

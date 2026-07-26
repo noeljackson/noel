@@ -33,7 +33,9 @@
         }
       }
     ],
-    "inferenceConfig": {},
+    "inferenceConfig": {
+      "maxTokens": 128000
+    },
     "toolConfig": {
       "tools": [
         {
@@ -63,7 +65,7 @@
         "display": "summarized"
       },
       "output_config": {
-        "effort": "max"
+        "effort": "high"
       }
     }
   }

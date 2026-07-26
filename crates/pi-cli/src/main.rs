@@ -31,8 +31,9 @@ use pi_ai::{
     ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig,
 };
 use pi_config::{
-    auth_for_provider, has_auth_for_provider, load_config, read_model_cache, write_model_cache,
-    AuthCredential, AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
+    auth_for_provider, has_auth_for_provider, load_config, load_config_with_project_trust,
+    project_is_trusted, read_model_cache, save_project_trust, write_model_cache, AuthCredential,
+    AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
     ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig, ModelCache,
     ModelDefinition, ModelRefreshSettings, PackageSource, ProviderApi as ConfigProviderApi,
     ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
@@ -92,6 +93,9 @@ struct Cli {
     session: Option<String>,
 
     #[arg(long)]
+    session_id: Option<String>,
+
+    #[arg(long)]
     session_dir: Option<PathBuf>,
 
     #[arg(long)]
@@ -123,6 +127,9 @@ struct Cli {
 
     #[arg(short = 't', long, value_delimiter = ',')]
     tools: Vec<String>,
+
+    #[arg(long, value_delimiter = ',')]
+    exclude_tools: Vec<String>,
 
     #[arg(long)]
     no_builtin_tools: bool,
@@ -162,6 +169,15 @@ struct Cli {
 
     #[arg(long)]
     verbose: bool,
+
+    #[arg(short = 'n', long)]
+    name: Option<String>,
+
+    #[arg(short = 'a', long)]
+    approve: bool,
+
+    #[arg(long)]
+    no_approve: bool,
 
     #[arg(long)]
     offline: bool,
@@ -1032,9 +1048,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse_from(normalized_cli_args(std::env::args()));
+    validate_session_id_flags(&cli)?;
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd.clone(), cli.session_dir.clone())?;
-    let mut config = load_config(paths)?;
+    let project_trusted = if cli.approve {
+        true
+    } else if cli.no_approve {
+        false
+    } else {
+        project_is_trusted(&paths.agent_dir, &cwd)?
+    };
+    let mut config = load_config_with_project_trust(paths, project_trusted)?;
     if cli.session_dir.is_none() && std::env::var_os(ENV_SESSION_DIR).is_none() {
         if let Some(session_dir) = &config.settings.session_dir {
             config.paths = config.paths.with_session_dir(session_dir)?;
@@ -1050,7 +1074,7 @@ async fn main() -> Result<()> {
 
     if let Some(search) = &cli.list_models {
         let search = search.as_deref().map(str::to_lowercase);
-        for model in &config.models {
+        for model in sorted_models(&config.models) {
             if let Some(search) = &search {
                 let display = format!(
                     "{}/{} {} {:?}",
@@ -1072,9 +1096,21 @@ async fn main() -> Result<()> {
     let systems = ReloadableSystems::from_config(&config, 1);
     let mut runtime = create_runtime(&cli, &cwd, &config, systems)?;
     select_initial_model(&mut runtime, &config, &cli)?;
-    if cli.no_tools || cli.no_builtin_tools || !cli.tools.is_empty() {
-        let active_tools = runtime.systems().available_tool_names.clone();
+    if cli.no_tools
+        || cli.no_builtin_tools
+        || !cli.tools.is_empty()
+        || !cli.exclude_tools.is_empty()
+    {
+        let mut active_tools = runtime.systems().available_tool_names.clone();
+        active_tools.retain(|tool| !cli.exclude_tools.iter().any(|excluded| excluded == tool));
         runtime.set_active_tools(active_tools)?;
+    }
+    if let Some(name) = &cli.name {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("--name requires a non-empty value"));
+        }
+        runtime.rename_session(Some(name.to_string()))?;
     }
 
     let stdin_is_terminal = io::stdin().is_terminal();
@@ -1333,10 +1369,36 @@ fn normalized_cli_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
             "-ns" => "--no-skills".to_string(),
             "-np" => "--no-prompt-templates".to_string(),
             "-nc" => "--no-context-files".to_string(),
+            "-xt" => "--exclude-tools".to_string(),
+            "-na" => "--no-approve".to_string(),
             "-v" => "--version".to_string(),
             _ => arg,
         })
         .collect()
+}
+
+fn validate_session_id_flags(cli: &Cli) -> Result<()> {
+    let Some(session_id) = &cli.session_id else {
+        return Ok(());
+    };
+    if cli.session.is_some() || cli.r#continue || cli.resume {
+        return Err(anyhow!(
+            "--session-id cannot be combined with --session, --continue, or --resume"
+        ));
+    }
+    let bytes = session_id.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if !valid {
+        return Err(anyhow!(
+            "session id must be non-empty, use alphanumeric characters, '-', '_', or '.', and start and end with an alphanumeric character"
+        ));
+    }
+    Ok(())
 }
 
 fn offline_enabled(cli_offline: bool) -> bool {
@@ -1962,6 +2024,17 @@ fn create_runtime(
         let path = resolve_session_reference(&config.paths.session_dir, reference)?;
         let (_store, source_state) = SessionStore::open(path)?;
         let (store, state) = SessionStore::fork(&config.paths.session_dir, &source_state, false)?;
+        return Ok(Runtime::with_store(state, systems, store));
+    }
+
+    if let Some(session_id) = &cli.session_id {
+        let path = config.paths.session_dir.join(format!("{session_id}.jsonl"));
+        if path.exists() {
+            let (store, state) = SessionStore::open(path)?;
+            return Ok(Runtime::with_store(state, systems, store));
+        }
+        let (store, state) =
+            SessionStore::create_with_id(&config.paths.session_dir, cwd.to_path_buf(), session_id)?;
         return Ok(Runtime::with_store(state, systems, store));
     }
 
@@ -4024,6 +4097,18 @@ async fn handle_tui_submission(
             output.push_str("\nreloaded");
             app.push(TuiEntryKind::System, output);
         }
+        "/trust" => {
+            let cwd = &runtime.session().cwd;
+            let trust_path = save_project_trust(&config.paths.agent_dir, cwd, true)?;
+            app.push(
+                TuiEntryKind::System,
+                format!(
+                    "saved trust decision: trusted {} ({})",
+                    cwd.display(),
+                    trust_path.display()
+                ),
+            );
+        }
         _ if line.starts_with("/complete ") => {
             let prefix = line.trim_start_matches("/complete ").trim();
             let completions = command_completions(config, prefix);
@@ -5299,9 +5384,8 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
     match kind {
         "model" | "models" | "scoped-models" => Ok(Selector::new(
             "model",
-            config
-                .models
-                .iter()
+            sorted_models(&config.models)
+                .into_iter()
                 .map(|model| {
                     let value = format!("{}/{}", model.provider, model.id);
                     SelectorItem {
@@ -5364,6 +5448,16 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
         "settings" => Ok(Selector::new("settings", settings_selector_items(config))),
         _ => Err(anyhow!("unknown selector: {kind}")),
     }
+}
+
+fn sorted_models(models: &[ModelDefinition]) -> Vec<&ModelDefinition> {
+    let mut models = models.iter().collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    models
 }
 
 fn settings_selector_items(config: &LoadedConfig) -> Vec<SelectorItem> {
@@ -6471,6 +6565,39 @@ mod tests {
     }
 
     #[test]
+    fn model_lists_are_grouped_by_provider_and_id() {
+        let models = vec![
+            test_model("openai-codex", "gpt-5.6-terra-wm"),
+            test_model("anthropic", "claude-sonnet-4-6"),
+            test_model("openai-codex", "gpt-5.6-luna-wm"),
+        ];
+
+        let sorted = sorted_models(&models)
+            .into_iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sorted,
+            [
+                "anthropic/claude-sonnet-4-6",
+                "openai-codex/gpt-5.6-luna-wm",
+                "openai-codex/gpt-5.6-terra-wm",
+            ]
+        );
+    }
+
+    fn test_model(provider: &str, id: &str) -> ModelDefinition {
+        ModelDefinition {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            name: None,
+            api: ConfigProviderApi::default(),
+            base_url: None,
+        }
+    }
+
+    #[test]
     fn cli_contract_covers_upstream_ts_options_and_commands() {
         let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
             "../../../tests/fixtures/ts-parity/cli-contract.json"
@@ -6513,7 +6640,7 @@ mod tests {
             }
         }
         for option in [
-            "help", "h", "version", "v", "nt", "nbt", "ne", "ns", "np", "nc",
+            "help", "h", "version", "v", "nt", "nbt", "ne", "ns", "np", "nc", "xt", "na",
         ] {
             options.insert(option.to_string());
         }

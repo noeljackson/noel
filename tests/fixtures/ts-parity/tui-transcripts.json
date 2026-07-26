@@ -28,7 +28,8 @@
         "/session",
         "/settings",
         "/share",
-        "/tree"
+        "/tree",
+        "/trust"
       ]
     },
     {

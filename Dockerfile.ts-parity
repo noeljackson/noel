@@ -1,4 +1,4 @@
-FROM node:22-bookworm
+FROM node:24-bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
@@ -13,6 +13,7 @@ RUN git clone --filter=blob:none "${TS_REFERENCE_REPO}" /ts-reference \
 
 WORKDIR /ts-reference
 RUN npm ci --ignore-scripts
+RUN npm --prefix packages/ai run generate-models
 
 COPY scripts/ts-parity /ts-parity
 

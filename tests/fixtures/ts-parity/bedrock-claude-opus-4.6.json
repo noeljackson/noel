@@ -33,14 +33,16 @@
         }
       }
     ],
-    "inferenceConfig": {},
+    "inferenceConfig": {
+      "maxTokens": 128000
+    },
     "additionalModelRequestFields": {
       "thinking": {
         "type": "adaptive",
         "display": "summarized"
       },
       "output_config": {
-        "effort": "max"
+        "effort": "high"
       }
     }
   }

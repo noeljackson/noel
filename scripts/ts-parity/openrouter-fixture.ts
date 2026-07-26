@@ -48,8 +48,8 @@ async function captureOpenRouterRequest(): Promise<CapturedRequest> {
 
 	try {
 		const [{ getModel }, { streamSimple }] = await Promise.all([
-			import("/ts-reference/packages/ai/src/models.ts"),
-			import("/ts-reference/packages/ai/src/stream.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
 		]);
 		const model = getModel("openrouter", "moonshotai/kimi-k2.6");
 		const stream = streamSimple(

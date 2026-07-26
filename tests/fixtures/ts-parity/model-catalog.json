@@ -4,7 +4,7 @@
     "ref": "main",
     "script": "/ts-parity/model-catalog-fixture.ts"
   },
-  "providerCount": 32,
+  "providerCount": 37,
   "targets": [
     {
       "provider": "anthropic",
@@ -19,10 +19,12 @@
         "low",
         "medium",
         "high",
-        "xhigh"
+        "xhigh",
+        "max"
       ],
       "thinkingLevelMap": {
-        "xhigh": "xhigh"
+        "xhigh": "xhigh",
+        "max": "max"
       },
       "context": null
     },
@@ -52,7 +54,6 @@
       "reasoning": true,
       "thinkingLevels": [
         "off",
-        "minimal",
         "low",
         "medium",
         "high",
@@ -60,7 +61,12 @@
       ],
       "thinkingLevelMap": {
         "off": "none",
-        "xhigh": "xhigh"
+        "minimal": null,
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": null
       },
       "context": null
     },
@@ -102,7 +108,11 @@
       "thinkingLevelMap": {
         "off": null,
         "minimal": "low",
-        "xhigh": "xhigh"
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": null
       },
       "context": null
     },
@@ -119,10 +129,10 @@
         "low",
         "medium",
         "high",
-        "xhigh"
+        "max"
       ],
       "thinkingLevelMap": {
-        "xhigh": "max"
+        "max": "max"
       },
       "context": null
     },

@@ -285,6 +285,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "reload config without clearing context",
     },
     CommandHelp {
+        command: "/trust",
+        description: "save project trust decision for future sessions",
+    },
+    CommandHelp {
         command: "/read <path>",
         description: "read file",
     },

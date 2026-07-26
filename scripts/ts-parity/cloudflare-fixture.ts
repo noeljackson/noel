@@ -47,11 +47,9 @@ async function captureCloudflareGatewayRequest(): Promise<CapturedRequest> {
 	};
 
 	try {
-		process.env.CLOUDFLARE_ACCOUNT_ID = "acct_ts_parity";
-		process.env.CLOUDFLARE_GATEWAY_ID = "gateway_ts_parity";
 		const [{ getModel }, { streamSimple }] = await Promise.all([
-			import("/ts-reference/packages/ai/src/models.ts"),
-			import("/ts-reference/packages/ai/src/stream.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
 		]);
 		const model = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
 		const stream = streamSimple(
@@ -67,9 +65,13 @@ async function captureCloudflareGatewayRequest(): Promise<CapturedRequest> {
 				],
 			},
 			{
-				apiKey: "cf_ts_parity_token",
 				reasoning: "xhigh",
 				sessionId: "session_ts_parity",
+				env: {
+					CLOUDFLARE_API_KEY: "cf_ts_parity_token",
+					CLOUDFLARE_ACCOUNT_ID: "acct_ts_parity",
+					CLOUDFLARE_GATEWAY_ID: "gateway_ts_parity",
+				},
 			},
 		);
 		await stream.result();

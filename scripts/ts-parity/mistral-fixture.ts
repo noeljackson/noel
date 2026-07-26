@@ -121,8 +121,8 @@ async function captureMistralRequestForContext(context: Record<string, unknown>)
 
 	try {
 		const [{ getModel }, { streamSimple }] = await Promise.all([
-			import("/ts-reference/packages/ai/src/models.ts"),
-			import("/ts-reference/packages/ai/src/stream.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
 		]);
 		const model = getModel("mistral", "devstral-medium-latest");
 		const stream = streamSimple(

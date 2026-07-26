@@ -640,6 +640,14 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
     ) {
         body["stream_options"] = json!({ "include_usage": true });
     }
+    if let Some(max_tokens) = provider_max_tokens(config, request) {
+        let field = if config.model.provider == "openrouter" {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body[field] = json!(max_tokens);
+    }
     body
 }
 
@@ -663,12 +671,7 @@ fn openai_chat_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> Vec<Value> {
     let mut messages = Vec::new();
     if let Some(system_prompt) = &request.system_prompt {
-        let role = if config.model.provider == "openrouter" {
-            "developer"
-        } else {
-            "system"
-        };
-        messages.push(json!({ "role": role, "content": system_prompt }));
+        messages.push(json!({ "role": "system", "content": system_prompt }));
     }
     messages.extend(request.messages.iter().map(|message| {
         if message.role == ChatRole::Tool {
@@ -774,6 +777,22 @@ fn openrouter_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
     }
 }
 
+fn provider_max_tokens(config: &ProviderConfig, request: &ProviderRequest) -> Option<u64> {
+    match (config.model.provider.as_str(), config.model.id.as_str()) {
+        ("openai", "gpt-5.4") | ("github-copilot", "gpt-5.4") => Some(128_000),
+        ("google", "gemini-2.5-pro") => Some(65_536),
+        ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1") => Some(128_000),
+        ("mistral", "devstral-medium-latest") => Some(if request.tools.is_empty() {
+            258_043
+        } else {
+            258_001
+        }),
+        ("openrouter", "moonshotai/kimi-k2.6") => Some(258_043),
+        ("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") => Some(251_899),
+        _ => None,
+    }
+}
+
 fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     if config.model.provider == "openai-codex" {
         return openai_codex_responses_body(config, request);
@@ -797,6 +816,9 @@ fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> 
             "summary": "auto",
         });
     }
+    if let Some(max_tokens) = provider_max_tokens(config, request) {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
     body
 }
 
@@ -813,6 +835,9 @@ fn github_copilot_responses_body(config: &ProviderConfig, request: &ProviderRequ
             "effort": effort,
             "summary": "auto",
         });
+    }
+    if let Some(max_tokens) = provider_max_tokens(config, request) {
+        body["max_output_tokens"] = json!(max_tokens);
     }
     body
 }
@@ -1377,6 +1402,9 @@ fn google_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
 
 fn google_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     let mut generation_config = json!({});
+    if let Some(max_tokens) = provider_max_tokens(config, request) {
+        generation_config["maxOutputTokens"] = json!(max_tokens);
+    }
     if let Some(thinking_config) = google_thinking_config(config) {
         generation_config["thinkingConfig"] = thinking_config;
     }
@@ -1593,7 +1621,7 @@ fn mistral_headers(config: &ProviderConfig, api_key: &str) -> Result<HeaderMap, 
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     headers.insert(
         USER_AGENT,
-        HeaderValue::from_static("mistral-client-typescript/2.2.1"),
+        HeaderValue::from_static("mistral-client-typescript/2.2.6"),
     );
     if let Some(session_id) = &config.session_id {
         headers.insert("x-affinity", HeaderValue::from_str(session_id)?);
@@ -1609,6 +1637,12 @@ fn mistral_chat_body(config: &ProviderConfig, request: &ProviderRequest) -> Valu
     });
     if !request.tools.is_empty() {
         body["tools"] = json!(openai_chat_tools(&request.tools));
+    }
+    if let Some(max_tokens) = provider_max_tokens(config, request) {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(session_id) = &config.session_id {
+        body["prompt_cache_key"] = json!(session_id);
     }
     body
 }
@@ -1692,7 +1726,9 @@ fn bedrock_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     let mut body = json!({
         "modelId": config.model.id,
         "messages": bedrock_messages_with_cache(config, &request.messages),
-        "inferenceConfig": {},
+        "inferenceConfig": provider_max_tokens(config, request)
+            .map(|max_tokens| json!({ "maxTokens": max_tokens }))
+            .unwrap_or_else(|| json!({})),
     });
     if !request.tools.is_empty() {
         body["toolConfig"] = json!({
@@ -1797,7 +1833,7 @@ fn bedrock_supports_adaptive_thinking(model_id: &str) -> bool {
 
 fn bedrock_adaptive_effort(model_id: &str, level: &str) -> &'static str {
     let normalized = model_id.to_ascii_lowercase().replace(['_', '.', ':'], "-");
-    if level == "max" || (level == "xhigh" && normalized.contains("opus-4-6")) {
+    if level == "max" {
         return "max";
     }
     if level == "xhigh" && (normalized.contains("opus-4-7") || normalized.contains("opus-4-8")) {

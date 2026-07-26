@@ -39,7 +39,8 @@
     },
     {
       "name": "login",
-      "description": "Configure provider authentication"
+      "description": "Configure provider authentication",
+      "argumentHint": "<provider>"
     },
     {
       "name": "logout",
@@ -47,7 +48,8 @@
     },
     {
       "name": "model",
-      "description": "Select model (opens selector UI)"
+      "description": "Select model (opens selector UI)",
+      "argumentHint": "<provider/model>"
     },
     {
       "name": "name",
@@ -63,7 +65,7 @@
     },
     {
       "name": "reload",
-      "description": "Reload keybindings, extensions, skills, prompts, and themes"
+      "description": "Reload keybindings, extensions, skills, prompts, themes, and context files"
     },
     {
       "name": "resume",
@@ -88,6 +90,10 @@
     {
       "name": "tree",
       "description": "Navigate session tree (switch branches)"
+    },
+    {
+      "name": "trust",
+      "description": "Save project trust decision for future sessions"
     }
   ]
 }

@@ -50,8 +50,8 @@ async function captureAnthropicRequest(apiKey: string, withTools = false): Promi
 	try {
 		process.env.ANTHROPIC_API_KEY = apiKey;
 		const [{ getModel }, { streamSimple }] = await Promise.all([
-			import("/ts-reference/packages/ai/src/models.ts"),
-			import("/ts-reference/packages/ai/src/stream.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
 		]);
 		const model = getModel("anthropic", "claude-sonnet-4-6");
 		const stream = streamSimple(

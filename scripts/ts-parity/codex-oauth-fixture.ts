@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { zstdDecompressSync } from "node:zlib";
 
 type CapturedRequest = {
 	url: string;
@@ -23,6 +24,12 @@ function normalizeHeaders(headers: HeadersInit | undefined): Record<string, stri
 async function requestBody(input: RequestInfo | URL, init: RequestInit | undefined): Promise<string> {
 	if (typeof init?.body === "string") {
 		return init.body;
+	}
+	if (init?.body instanceof Uint8Array) {
+		const contentEncoding = new Headers(init.headers).get("content-encoding");
+		return contentEncoding === "zstd"
+			? zstdDecompressSync(init.body).toString("utf8")
+			: Buffer.from(init.body).toString("utf8");
 	}
 	if (input instanceof Request) {
 		return input.clone().text();
@@ -63,12 +70,12 @@ async function captureCodexOAuthRequest(): Promise<CapturedRequest> {
 	};
 
 	try {
-		const [{ getModel }, { streamOpenAICodexResponses }] = await Promise.all([
-			import("/ts-reference/packages/ai/src/models.ts"),
-			import("/ts-reference/packages/ai/src/providers/openai-codex-responses.ts"),
+		const [{ getModel }, { stream }] = await Promise.all([
+			import("/ts-reference/packages/ai/src/compat.ts"),
+			import("/ts-reference/packages/ai/src/api/openai-codex-responses.ts"),
 		]);
 		const model = getModel("openai-codex", "gpt-5.5");
-		const stream = streamOpenAICodexResponses(
+		const response = stream(
 			model,
 			{
 				systemPrompt: "pi rust cli",
@@ -86,7 +93,7 @@ async function captureCodexOAuthRequest(): Promise<CapturedRequest> {
 				transport: "sse",
 			},
 		);
-		await stream.result();
+		await response.result();
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

@@ -11,6 +11,7 @@ pub const APP_NAME: &str = "pi";
 pub const CONFIG_DIR_NAME: &str = ".pi";
 pub const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 pub const ENV_SESSION_DIR: &str = "PI_CODING_AGENT_SESSION_DIR";
+pub const PROJECT_TRUST_FILE_NAME: &str = "trust.json";
 const RESOURCE_IGNORE_FILES: [&str; 3] = [".gitignore", ".ignore", ".fdignore"];
 
 #[derive(Debug, Error)]
@@ -88,6 +89,39 @@ impl ConfigPaths {
         };
         Ok(next)
     }
+}
+
+pub fn save_project_trust(
+    agent_dir: &Path,
+    cwd: &Path,
+    trusted: bool,
+) -> Result<PathBuf, ConfigError> {
+    let trust_path = agent_dir.join(PROJECT_TRUST_FILE_NAME);
+    let mut decisions =
+        read_optional_json::<BTreeMap<String, bool>>(&trust_path)?.unwrap_or_default();
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    decisions.insert(cwd.to_string_lossy().into_owned(), trusted);
+    let content =
+        serde_json::to_string_pretty(&decisions).expect("serialize project trust decisions");
+    fs::create_dir_all(agent_dir).map_err(|source| ConfigError::Write {
+        path: agent_dir.to_path_buf(),
+        source,
+    })?;
+    fs::write(&trust_path, format!("{content}\n")).map_err(|source| ConfigError::Write {
+        path: trust_path.clone(),
+        source,
+    })?;
+    Ok(trust_path)
+}
+
+pub fn project_is_trusted(agent_dir: &Path, cwd: &Path) -> Result<bool, ConfigError> {
+    let trust_path = agent_dir.join(PROJECT_TRUST_FILE_NAME);
+    let decisions = read_optional_json::<BTreeMap<String, bool>>(&trust_path)?.unwrap_or_default();
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    Ok(decisions
+        .get(&cwd.to_string_lossy().into_owned())
+        .copied()
+        .unwrap_or(false))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -653,8 +687,19 @@ pub struct ResourceFile {
 }
 
 pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
+    load_config_with_project_trust(paths, true)
+}
+
+pub fn load_config_with_project_trust(
+    paths: ConfigPaths,
+    project_trusted: bool,
+) -> Result<LoadedConfig, ConfigError> {
     let global_settings = read_optional_settings(&paths.settings_path)?;
-    let project_settings = read_optional_settings(&paths.project_settings_path)?;
+    let project_settings = if project_trusted {
+        read_optional_settings(&paths.project_settings_path)?
+    } else {
+        None
+    };
     let global_settings = global_settings.unwrap_or_default();
     let project_settings = project_settings.unwrap_or_default();
     let settings = global_settings.clone().merge(project_settings.clone());
@@ -690,11 +735,13 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
     let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
         .map(KeybindingsFile::into_keybindings)
         .unwrap_or_default();
-    let context_files = load_context_files(&paths.cwd, &paths.agent_dir)?;
-    let mut extensions = load_resource_files(&paths, "extensions", &mut diagnostics);
-    let mut skills = load_skill_resource_files(&paths, &mut diagnostics);
-    let mut prompt_templates = load_resource_files(&paths, "prompts", &mut diagnostics);
-    let mut themes = load_resource_files(&paths, "themes", &mut diagnostics);
+    let context_files = load_context_files(&paths.cwd, &paths.agent_dir, project_trusted)?;
+    let mut extensions =
+        load_resource_files(&paths, "extensions", project_trusted, &mut diagnostics);
+    let mut skills = load_skill_resource_files(&paths, project_trusted, &mut diagnostics);
+    let mut prompt_templates =
+        load_resource_files(&paths, "prompts", project_trusted, &mut diagnostics);
+    let mut themes = load_resource_files(&paths, "themes", project_trusted, &mut diagnostics);
     extend_resource_files(
         &mut extensions,
         &paths.agent_dir,
@@ -719,31 +766,33 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
         &global_settings.themes,
         &mut diagnostics,
     );
-    let project_base = paths.cwd.join(CONFIG_DIR_NAME);
-    extend_resource_files(
-        &mut extensions,
-        &project_base,
-        &project_settings.extensions,
-        &mut diagnostics,
-    );
-    extend_resource_files(
-        &mut skills,
-        &project_base,
-        &project_settings.skills,
-        &mut diagnostics,
-    );
-    extend_resource_files(
-        &mut prompt_templates,
-        &project_base,
-        &project_settings.prompts,
-        &mut diagnostics,
-    );
-    extend_resource_files(
-        &mut themes,
-        &project_base,
-        &project_settings.themes,
-        &mut diagnostics,
-    );
+    if project_trusted {
+        let project_base = paths.cwd.join(CONFIG_DIR_NAME);
+        extend_resource_files(
+            &mut extensions,
+            &project_base,
+            &project_settings.extensions,
+            &mut diagnostics,
+        );
+        extend_resource_files(
+            &mut skills,
+            &project_base,
+            &project_settings.skills,
+            &mut diagnostics,
+        );
+        extend_resource_files(
+            &mut prompt_templates,
+            &project_base,
+            &project_settings.prompts,
+            &mut diagnostics,
+        );
+        extend_resource_files(
+            &mut themes,
+            &project_base,
+            &project_settings.themes,
+            &mut diagnostics,
+        );
+    }
     load_package_resources(
         &paths.cwd,
         &settings.packages,
@@ -1146,10 +1195,17 @@ fn resolve_prompt_input(input: Option<&str>) -> Result<Option<String>, ConfigErr
     Ok(Some(input.to_string()))
 }
 
-fn load_context_files(cwd: &Path, agent_dir: &Path) -> Result<Vec<ContextFile>, ConfigError> {
+fn load_context_files(
+    cwd: &Path,
+    agent_dir: &Path,
+    project_trusted: bool,
+) -> Result<Vec<ContextFile>, ConfigError> {
     let mut result = Vec::new();
     if let Some(file) = load_context_file_from_dir(agent_dir)? {
         result.push(file);
+    }
+    if !project_trusted {
+        return Ok(result);
     }
 
     let mut ancestors = Vec::new();
@@ -1182,12 +1238,13 @@ fn load_context_file_from_dir(dir: &Path) -> Result<Option<ContextFile>, ConfigE
 fn load_resource_files(
     paths: &ConfigPaths,
     resource_dir_name: &str,
+    project_trusted: bool,
     diagnostics: &mut Vec<String>,
 ) -> Vec<ResourceFile> {
-    let dirs = [
-        paths.agent_dir.join(resource_dir_name),
-        paths.cwd.join(CONFIG_DIR_NAME).join(resource_dir_name),
-    ];
+    let mut dirs = vec![paths.agent_dir.join(resource_dir_name)];
+    if project_trusted {
+        dirs.push(paths.cwd.join(CONFIG_DIR_NAME).join(resource_dir_name));
+    }
     let mut resources = BTreeMap::<String, ResourceFile>::new();
     for dir in dirs {
         if !dir.exists() {
@@ -1226,15 +1283,18 @@ fn load_resource_files(
 
 fn load_skill_resource_files(
     paths: &ConfigPaths,
+    project_trusted: bool,
     diagnostics: &mut Vec<String>,
 ) -> Vec<ResourceFile> {
-    let resources = load_resource_files(paths, "skills", diagnostics);
+    let resources = load_resource_files(paths, "skills", project_trusted, diagnostics);
     let mut map = resources
         .into_iter()
         .map(|resource| (resource.name.clone(), resource))
         .collect::<BTreeMap<_, _>>();
-    for dir in ancestor_agents_skill_dirs(&paths.cwd) {
-        collect_agent_skill_path(&mut map, &dir, diagnostics);
+    if project_trusted {
+        for dir in ancestor_agents_skill_dirs(&paths.cwd) {
+            collect_agent_skill_path(&mut map, &dir, diagnostics);
+        }
     }
     map.into_values().collect()
 }

@@ -1,7 +1,8 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getModels, getProviders, getSupportedThinkingLevels } from "/ts-reference/packages/ai/src/models.ts";
+import { getSupportedThinkingLevels } from "/ts-reference/packages/ai/src/models.ts";
+import { getModels, getProviders } from "/ts-reference/packages/ai/src/compat.ts";
 
 const targets = [
 	["anthropic", "claude-opus-4-7"],

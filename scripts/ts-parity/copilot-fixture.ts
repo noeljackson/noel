@@ -48,8 +48,8 @@ async function captureCopilotRequest(): Promise<CapturedRequest> {
 
 	try {
 		const [{ getModel }, { streamSimple }] = await Promise.all([
-			import("/ts-reference/packages/ai/src/models.ts"),
-			import("/ts-reference/packages/ai/src/stream.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
+			import("/ts-reference/packages/ai/src/compat.ts"),
 		]);
 		const model = getModel("github-copilot", "gpt-5.4");
 		const stream = streamSimple(
