@@ -1448,6 +1448,13 @@ fn model_cache_needs_refresh(path: &Path, ttl_hours: u64) -> bool {
     let Ok(Some(cache)) = read_model_cache(path) else {
         return true;
     };
+    if cache
+        .models
+        .iter()
+        .any(|model| model.provider == "openai-codex" && model.id.ends_with("-wm"))
+    {
+        return true;
+    }
     let Some(now) = unix_seconds() else {
         return true;
     };
@@ -1647,41 +1654,36 @@ async fn fetch_chatgpt_codex_models(
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<Vec<ModelDefinition>> {
-    let client = reqwest::Client::new();
-    let mut last_error = None;
-    for endpoint in [
-        "https://chatgpt.com/backend-api/codex/models",
-        "https://chatgpt.com/backend-api/models",
-    ] {
-        let response = client
-            .get(endpoint)
-            .headers(chatgpt_model_headers(access_token, account_id)?)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            last_error = Some(anyhow!("status {status} from {endpoint}: {body}"));
-            continue;
-        }
-        let value = response.json::<serde_json::Value>().await?;
-        let ids = collect_codex_model_ids(&value);
-        if ids.is_empty() {
-            last_error = Some(anyhow!("no Codex model IDs in response from {endpoint}"));
-            continue;
-        }
-        return Ok(ids
-            .into_iter()
-            .map(|id| ModelDefinition {
-                provider: "openai-codex".to_string(),
-                name: Some(model_display_name(&id)),
-                id,
-                api: ConfigProviderApi::OpenAiCodexResponses,
-                base_url: Some("https://chatgpt.com/backend-api".to_string()),
-            })
-            .collect());
+    let endpoint = format!(
+        "https://chatgpt.com/backend-api/codex/models?client_version={}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let response = reqwest::Client::new()
+        .get(&endpoint)
+        .headers(chatgpt_model_headers(access_token, account_id)?)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("status {status} from {endpoint}: {body}"));
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("no Codex model refresh endpoint succeeded")))
+    let ids = collect_codex_model_ids(&response.json::<serde_json::Value>().await?);
+    if ids.is_empty() {
+        return Err(anyhow!(
+            "no selectable Codex model IDs in response from {endpoint}"
+        ));
+    }
+    Ok(ids
+        .into_iter()
+        .map(|id| ModelDefinition {
+            provider: "openai-codex".to_string(),
+            name: Some(model_display_name(&id)),
+            id,
+            api: ConfigProviderApi::OpenAiCodexResponses,
+            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+        })
+        .collect())
 }
 
 fn chatgpt_model_headers(access_token: &str, account_id: Option<&str>) -> Result<HeaderMap> {
@@ -1705,34 +1707,28 @@ fn chatgpt_model_headers(access_token: &str, account_id: Option<&str>) -> Result
 }
 
 fn collect_codex_model_ids(value: &serde_json::Value) -> BTreeSet<String> {
-    let mut ids = BTreeSet::new();
-    collect_codex_model_ids_from_value(value, &mut ids);
-    ids
-}
-
-fn collect_codex_model_ids_from_value(value: &serde_json::Value, ids: &mut BTreeSet<String>) {
-    match value {
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_codex_model_ids_from_value(item, ids);
-            }
-        }
-        serde_json::Value::Object(object) => {
-            for key in ["id", "slug", "model", "name"] {
-                if let Some(id) = object
-                    .get(key)
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|id| model_supported_for_provider("openai-codex", id))
-                {
-                    ids.insert(id.to_string());
-                }
-            }
-            for nested in object.values() {
-                collect_codex_model_ids_from_value(nested, ids);
-            }
-        }
-        _ => {}
-    }
+    let models = value
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array());
+    models
+        .into_iter()
+        .flatten()
+        .filter(|model| {
+            model
+                .get("visibility")
+                .and_then(serde_json::Value::as_str)
+                .map(|visibility| visibility == "list")
+                .unwrap_or(true)
+        })
+        .filter_map(|model| {
+            ["slug", "id", "model"]
+                .into_iter()
+                .find_map(|key| model.get(key).and_then(serde_json::Value::as_str))
+        })
+        .filter(|id| model_supported_for_provider("openai-codex", id))
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn model_supported_for_provider(provider: &str, id: &str) -> bool {
@@ -6584,6 +6580,24 @@ mod tests {
                 "openai-codex/gpt-5.6-luna-wm",
                 "openai-codex/gpt-5.6-terra-wm",
             ]
+        );
+    }
+
+    #[test]
+    fn codex_discovery_uses_selectable_model_slugs_only() {
+        let response = serde_json::json!({
+            "models": [
+                {"slug": "gpt-5.6-terra", "visibility": "list"},
+                {"slug": "gpt-5.6-luna", "visibility": "list"},
+                {"slug": "codex-auto-review", "visibility": "hide"},
+                {"slug": "gpt-5.6-sol-wm", "visibility": "hide"},
+            ],
+            "unrelated": {"id": "gpt-5.6-terra-wm"},
+        });
+
+        assert_eq!(
+            collect_codex_model_ids(&response),
+            BTreeSet::from(["gpt-5.6-luna".to_string(), "gpt-5.6-terra".to_string(),])
         );
     }
 
