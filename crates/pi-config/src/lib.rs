@@ -124,6 +124,20 @@ pub fn project_is_trusted(agent_dir: &Path, cwd: &Path) -> Result<bool, ConfigEr
         .unwrap_or(false))
 }
 
+pub fn codex_client_version() -> Option<String> {
+    #[derive(Deserialize)]
+    struct CodexModelsCache {
+        client_version: Option<String>,
+    }
+
+    let path = home_dir().ok()?.join(".codex").join("models_cache.json");
+    read_optional_json::<CodexModelsCache>(&path)
+        .ok()
+        .flatten()?
+        .client_version
+        .filter(|version| !version.trim().is_empty())
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {

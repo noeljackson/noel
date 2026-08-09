@@ -31,13 +31,13 @@ use pi_ai::{
     ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig,
 };
 use pi_config::{
-    auth_for_provider, has_auth_for_provider, load_config, load_config_with_project_trust,
-    project_is_trusted, read_model_cache, save_project_trust, write_model_cache, AuthCredential,
-    AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
-    ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig, ModelCache,
-    ModelDefinition, ModelRefreshSettings, PackageSource, ProviderApi as ConfigProviderApi,
-    ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
-    ENV_SESSION_DIR,
+    auth_for_provider, codex_client_version, has_auth_for_provider, load_config,
+    load_config_with_project_trust, project_is_trusted, read_model_cache, save_project_trust,
+    write_model_cache, AuthCredential, AuthData, CompactionSettings, ConfigPaths,
+    ImageModelDefinition, ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig,
+    ModelCache, ModelDefinition, ModelRefreshSettings, PackageSource,
+    ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, RetrySettings, Settings,
+    TerminalSettings, WarningSettings, ENV_SESSION_DIR,
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
@@ -1656,7 +1656,7 @@ async fn fetch_chatgpt_codex_models(
 ) -> Result<Vec<ModelDefinition>> {
     let endpoint = format!(
         "https://chatgpt.com/backend-api/codex/models?client_version={}",
-        env!("CARGO_PKG_VERSION")
+        codex_client_version().unwrap_or_else(|| "0.145.0".to_string())
     );
     let response = reqwest::Client::new()
         .get(&endpoint)
