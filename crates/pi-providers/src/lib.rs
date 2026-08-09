@@ -340,14 +340,12 @@ impl CredentialResolver {
         }
         let home = self.home.as_deref()?;
         match provider {
-            "openai" | "openai-codex" => {
-                read_codex_login(&home.join(".codex/auth.json")).map(|credential| {
-                    ResolvedCredential {
-                        credential,
-                        source: CredentialSource::CodexLogin,
-                    }
-                })
-            }
+            "openai-codex" => read_codex_login(&home.join(".codex/auth.json")).map(|credential| {
+                ResolvedCredential {
+                    credential,
+                    source: CredentialSource::CodexLogin,
+                }
+            }),
             "anthropic" => {
                 read_claude_login(&home.join(".claude/.credentials.json")).map(|credential| {
                     ResolvedCredential {

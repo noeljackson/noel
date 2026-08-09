@@ -28,16 +28,13 @@ impl Default for RetryPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum FinalOutputPolicy {
+    #[default]
     Text,
-    RequiredTool { name: String },
-}
-
-impl Default for FinalOutputPolicy {
-    fn default() -> Self {
-        Self::Text
-    }
+    RequiredTool {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +116,7 @@ pub trait CompactionHook: Send + Sync {
     fn compact_if_needed(&self, messages: &mut Vec<ChatMessage>) -> Result<(), String>;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     provider: &dyn Provider,
     state: &mut AgentState,
@@ -162,6 +160,10 @@ pub async fn run_turn(
             |event| on_event(&AgentEvent::Provider(event.clone())),
         )
         .await?;
+        if cancellation.is_cancelled() {
+            on_event(&AgentEvent::TurnCancelled);
+            return Err(AgentError::Cancelled);
+        }
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();
@@ -332,6 +334,19 @@ mod tests {
         }
     }
 
+    struct CancellingProvider(CancellationToken);
+
+    #[async_trait]
+    impl Provider for CancellingProvider {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            self.0.cancel();
+            Ok(vec![StreamEvent::Text("too late".into())])
+        }
+    }
+
     #[tokio::test]
     async fn returns_text_and_keeps_normalized_history() {
         let provider = FixedProvider(vec![StreamEvent::Text("hello".to_string())]);
@@ -359,9 +374,11 @@ mod tests {
             name: "submit_review".to_string(),
             arguments: r#"{"decision":"deny"}"#.to_string(),
         }]);
-        let mut config = AgentConfig::default();
-        config.final_output = FinalOutputPolicy::RequiredTool {
-            name: "submit_review".to_string(),
+        let config = AgentConfig {
+            final_output: FinalOutputPolicy::RequiredTool {
+                name: "submit_review".to_string(),
+            },
+            ..Default::default()
         };
         let output = run_turn(
             &provider,
@@ -382,5 +399,24 @@ mod tests {
                 arguments: serde_json::json!({"decision": "deny"}),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_a_provider_request_wins() {
+        let cancellation = CancellationToken::default();
+        let provider = CancellingProvider(cancellation.clone());
+        let error = run_turn(
+            &provider,
+            &mut AgentState::default(),
+            "hi".into(),
+            &AgentConfig::default(),
+            &NoTools,
+            &cancellation,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentError::Cancelled));
     }
 }

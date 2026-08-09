@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "pi-agent"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "pi-ai",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ai"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "pi-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "pi-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pi-ai",
  "pi-providers",
@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "pi-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "pi-agent",
@@ -1610,14 +1610,14 @@ dependencies = [
 
 [[package]]
 name = "pi-parity"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "pi-providers"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pi-ai",
  "reqwest",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "pi-session"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pi-ai",
  "serde",
@@ -1640,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "pi-tools"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "pi-tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
