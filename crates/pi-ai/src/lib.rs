@@ -31,8 +31,10 @@ pub enum StreamEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ProviderApi {
+    #[default]
     Faux,
     OpenAi,
     OpenAiResponses,
@@ -70,7 +72,7 @@ pub struct ImageProviderConfig {
     pub output_modalities: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum ProviderAuth {
     #[default]
     None,
@@ -82,6 +84,23 @@ pub enum ProviderAuth {
         access_token: String,
         account_id: Option<String>,
     },
+}
+
+impl std::fmt::Debug for ProviderAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => formatter.write_str("None"),
+            Self::ApiKey(_) => formatter.write_str("ApiKey([REDACTED])"),
+            Self::ClaudeCodeOAuth { .. } => {
+                formatter.write_str("ClaudeCodeOAuth { access_token: [REDACTED] }")
+            }
+            Self::ChatGptOAuth { account_id, .. } => formatter
+                .debug_struct("ChatGptOAuth")
+                .field("access_token", &"[REDACTED]")
+                .field("account_id", account_id)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,26 +216,38 @@ pub trait Provider: Send + Sync {
 }
 
 pub fn create_provider(config: ProviderConfig) -> Box<dyn Provider> {
+    create_provider_with_client(config, reqwest::Client::new())
+}
+
+/// Builds a provider with a caller-owned client, allowing applications to set
+/// proxy, timeout, certificate, and connection-pool policy in one place.
+pub fn create_provider_with_client(
+    config: ProviderConfig,
+    client: reqwest::Client,
+) -> Box<dyn Provider> {
     match config.api {
         ProviderApi::Faux => Box::new(FauxProvider { config }),
-        ProviderApi::OpenAi => Box::new(OpenAiProvider { config }),
+        ProviderApi::OpenAi => Box::new(OpenAiProvider { config, client }),
         ProviderApi::OpenAiResponses => Box::new(OpenAiResponsesProvider {
             config,
             endpoint: OpenAiResponsesEndpoint::OpenAi,
+            client,
         }),
         ProviderApi::OpenAiCodexResponses => Box::new(OpenAiResponsesProvider {
             config,
             endpoint: OpenAiResponsesEndpoint::Codex,
+            client,
         }),
         ProviderApi::AzureOpenAiResponses => Box::new(OpenAiResponsesProvider {
             config,
             endpoint: OpenAiResponsesEndpoint::Azure,
+            client,
         }),
-        ProviderApi::Anthropic => Box::new(AnthropicProvider { config }),
-        ProviderApi::Google => Box::new(GoogleProvider { config }),
-        ProviderApi::GoogleVertex => Box::new(GoogleVertexProvider { config }),
-        ProviderApi::Bedrock => Box::new(BedrockProvider { config }),
-        ProviderApi::Mistral => Box::new(MistralProvider { config }),
+        ProviderApi::Anthropic => Box::new(AnthropicProvider { config, client }),
+        ProviderApi::Google => Box::new(GoogleProvider { config, client }),
+        ProviderApi::GoogleVertex => Box::new(GoogleVertexProvider { config, client }),
+        ProviderApi::Bedrock => Box::new(BedrockProvider { config, client }),
+        ProviderApi::Mistral => Box::new(MistralProvider { config, client }),
     }
 }
 
@@ -432,6 +463,7 @@ impl Provider for FauxProvider {
 
 struct OpenAiProvider {
     config: ProviderConfig,
+    client: reqwest::Client,
 }
 
 #[async_trait]
@@ -445,7 +477,8 @@ impl Provider for OpenAiProvider {
             "{}/chat/completions",
             self.chat_base_url()?.trim_end_matches('/')
         );
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(url)
             .headers(openai_compatible_headers(
                 &self.config,
@@ -491,7 +524,8 @@ impl Provider for OpenAiProvider {
             "{}/chat/completions",
             self.chat_base_url()?.trim_end_matches('/')
         );
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(url)
             .headers(openai_compatible_headers(
                 &self.config,
@@ -540,7 +574,8 @@ impl OpenAiProvider {
                 .unwrap_or("https://chatgpt.com/backend-api/codex")
                 .trim_end_matches('/')
         );
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(url)
             .headers(chatgpt_headers(&self.config.auth)?)
             .json(&openai_responses_body(&self.config, &request))
@@ -573,7 +608,8 @@ impl OpenAiProvider {
                 .unwrap_or("https://chatgpt.com/backend-api/codex")
                 .trim_end_matches('/')
         );
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(url)
             .headers(chatgpt_headers(&self.config.auth)?)
             .json(&openai_responses_body(&self.config, &request))
@@ -911,13 +947,15 @@ enum OpenAiResponsesEndpoint {
 struct OpenAiResponsesProvider {
     config: ProviderConfig,
     endpoint: OpenAiResponsesEndpoint,
+    client: reqwest::Client,
 }
 
 #[async_trait]
 impl Provider for OpenAiResponsesProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
         let (url, headers, model) = self.request_parts(request_has_media(&request))?;
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(url)
             .headers(headers)
             .json(&{
@@ -947,7 +985,8 @@ impl Provider for OpenAiResponsesProvider {
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
     ) -> Result<(), ProviderError> {
         let (url, headers, model) = self.request_parts(request_has_media(&request))?;
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(url)
             .headers(headers)
             .json(&{
@@ -1038,6 +1077,7 @@ impl OpenAiResponsesProvider {
 
 struct AnthropicProvider {
     config: ProviderConfig,
+    client: reqwest::Client,
 }
 
 #[async_trait]
@@ -1045,7 +1085,8 @@ impl Provider for AnthropicProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
         let url = anthropic_messages_url(&self.config)?;
 
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(url)
             .headers(anthropic_headers(&self.config)?)
             .json(&anthropic_body(&self.config, &request))
@@ -1078,7 +1119,8 @@ impl Provider for AnthropicProvider {
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
     ) -> Result<(), ProviderError> {
         let url = anthropic_messages_url(&self.config)?;
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(url)
             .headers(anthropic_headers(&self.config)?)
             .json(&anthropic_body(&self.config, &request))
@@ -1314,13 +1356,15 @@ fn normalized_thinking_level(level: Option<&str>) -> Option<&'static str> {
 
 struct GoogleProvider {
     config: ProviderConfig,
+    client: reqwest::Client,
 }
 
 #[async_trait]
 impl Provider for GoogleProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
         let api_key = self.api_key()?;
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(google_url(&self.config)?)
             .headers(google_headers(&api_key)?)
             .json(&google_body(&self.config, &request))
@@ -1345,7 +1389,8 @@ impl Provider for GoogleProvider {
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
     ) -> Result<(), ProviderError> {
         let api_key = self.api_key()?;
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(google_url(&self.config)?)
             .headers(google_headers(&api_key)?)
             .json(&google_body(&self.config, &request))
@@ -1481,6 +1526,7 @@ fn google_default_thinking_budget(model_id: &str, level: &str) -> i64 {
 
 struct GoogleVertexProvider {
     config: ProviderConfig,
+    client: reqwest::Client,
 }
 
 #[async_trait]
@@ -1488,7 +1534,8 @@ impl Provider for GoogleVertexProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
         let api_key = self.api_key()?;
         let url = google_vertex_url(&self.config)?;
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(format!("{url}?key={api_key}"))
             .json(&google_body(&self.config, &request))
             .send()
@@ -1515,6 +1562,7 @@ impl GoogleVertexProvider {
 
 struct MistralProvider {
     config: ProviderConfig,
+    client: reqwest::Client,
 }
 
 #[async_trait]
@@ -1527,7 +1575,8 @@ impl Provider for MistralProvider {
                 .as_deref()
                 .unwrap_or("https://api.mistral.ai/v1"),
         )?;
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(format!(
                 "{}/chat/completions",
                 base_url.trim_end_matches('/')
@@ -1570,7 +1619,8 @@ impl Provider for MistralProvider {
                 .as_deref()
                 .unwrap_or("https://api.mistral.ai/v1"),
         )?;
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(format!(
                 "{}/chat/completions",
                 base_url.trim_end_matches('/')
@@ -1691,6 +1741,7 @@ fn mistral_messages(config: &ProviderConfig, request: &ProviderRequest) -> Vec<V
 
 struct BedrockProvider {
     config: ProviderConfig,
+    client: reqwest::Client,
 }
 
 #[async_trait]
@@ -1703,7 +1754,8 @@ impl Provider for BedrockProvider {
                 .as_deref()
                 .unwrap_or("https://bedrock-runtime.us-east-1.amazonaws.com"),
         )?;
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(format!(
                 "{}/model/{}/converse",
                 base_url.trim_end_matches('/'),
@@ -5213,6 +5265,7 @@ mod tests {
         let provider = OpenAiResponsesProvider {
             config: config.clone(),
             endpoint: OpenAiResponsesEndpoint::OpenAi,
+            client: reqwest::Client::new(),
         };
         let (url, headers, _) = provider.request_parts(false).expect("request parts");
 
@@ -5359,6 +5412,7 @@ mod tests {
         let fixture_request = &fixture["request"];
         let provider = OpenAiProvider {
             config: config.clone(),
+            client: reqwest::Client::new(),
         };
 
         assert_eq!(

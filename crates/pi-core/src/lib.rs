@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use pi_agent::{CancellationToken, RetryPolicy};
 use pi_ai::{
     ChatMessage, ChatRole, ChatToolCall, MediaInput, ModelRef, Provider, ProviderError,
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
@@ -19,7 +20,6 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationMessage {
@@ -313,6 +313,8 @@ pub enum ReloadError {
 
 #[derive(Debug, Error)]
 pub enum SessionError {
+    #[error(transparent)]
+    Journal(#[from] pi_session::JournalError),
     #[error("failed to create session directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -793,22 +795,8 @@ impl SessionStore {
     }
 
     fn append(&self, record: &SessionRecord) -> Result<(), SessionError> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|source| SessionError::Open {
-                path: self.path.clone(),
-                source,
-            })?;
-        let line = serde_json::to_string(record).map_err(|source| SessionError::Parse {
-            path: self.path.clone(),
-            source,
-        })?;
-        writeln!(file, "{line}").map_err(|source| SessionError::Write {
-            path: self.path.clone(),
-            source,
-        })
+        pi_session::append_jsonl_record(&self.path, record)?;
+        Ok(())
     }
 }
 
@@ -1827,35 +1815,22 @@ async fn complete_with_retry_streaming(
     retry: &RuntimeRetrySettings,
     mut on_event: impl FnMut(&StreamEvent) + Send,
 ) -> Result<Vec<StreamEvent>, ProviderError> {
-    let max_attempts = if retry.enabled {
-        retry.max_retries.saturating_add(1)
-    } else {
-        1
+    let retry = RetryPolicy {
+        max_retries: if retry.enabled { retry.max_retries } else { 0 },
+        base_delay_ms: retry.base_delay_ms,
     };
-    let mut attempt = 0;
-    loop {
-        let mut events = Vec::new();
-        let result = provider
-            .complete_streaming(request.clone(), &mut |event| {
-                on_event(&event);
-                events.push(event);
-                Ok(())
-            })
-            .await;
-        match result {
-            Ok(()) => return Ok(events),
-            Err(error) if !events.is_empty() => return Err(error),
-            Err(error) if is_context_overflow_error(&error) => return Err(error),
-            Err(error) if attempt + 1 >= max_attempts => return Err(error),
-            Err(_) => {
-                let delay_ms = retry_delay_ms(retry.base_delay_ms, attempt);
-                if delay_ms > 0 {
-                    sleep(Duration::from_millis(delay_ms)).await;
-                }
-                attempt += 1;
-            }
-        }
-    }
+    pi_agent::complete_with_retry(
+        provider,
+        request,
+        &retry,
+        &CancellationToken::default(),
+        |event| on_event(event),
+    )
+    .await
+    .map_err(|error| match error {
+        pi_agent::AgentError::Provider(error) => error,
+        other => ProviderError::Config(other.to_string()),
+    })
 }
 
 fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
@@ -2328,54 +2303,6 @@ fn optional_number_tool_arg(args: &serde_json::Value, names: &[&str]) -> Option<
     names
         .iter()
         .find_map(|name| args.get(*name).and_then(serde_json::Value::as_u64))
-}
-
-fn is_context_overflow_error(error: &ProviderError) -> bool {
-    let message = error.to_string().to_lowercase();
-    let non_overflow = [
-        "throttling error:",
-        "service unavailable:",
-        "rate limit",
-        "too many requests",
-    ];
-    if non_overflow.iter().any(|pattern| message.contains(pattern)) {
-        return false;
-    }
-    [
-        "prompt is too long",
-        "request_too_large",
-        "input is too long for requested model",
-        "exceeds the context window",
-        "input token count",
-        "maximum prompt length is",
-        "reduce the length of the messages",
-        "maximum context length is",
-        "longer than the model's context length",
-        "longer than the models context length",
-        "exceeds the limit of",
-        "exceeds the available context size",
-        "greater than the context length",
-        "context window exceeds limit",
-        "exceeded model token limit",
-        "too large for model with",
-        "model_context_window_exceeded",
-        "prompt too long; exceeded context length",
-        "prompt too long; exceeded max context length",
-        "context_length_exceeded",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "413",
-    ]
-    .iter()
-    .any(|pattern| message.contains(pattern))
-}
-
-fn retry_delay_ms(base_delay_ms: u64, attempt: u64) -> u64 {
-    let multiplier = 1_u64
-        .checked_shl(attempt.min(16) as u32)
-        .unwrap_or(u64::MAX);
-    base_delay_ms.saturating_mul(multiplier)
 }
 
 pub async fn run_excluded_bash(runtime: &Runtime, command: String) -> Result<String, AgentError> {

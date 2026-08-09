@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+pi-ai = { path = "../pi-ai" }
+pi-providers = { path = "../pi-providers" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

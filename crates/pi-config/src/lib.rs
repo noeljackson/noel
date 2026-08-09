@@ -1966,7 +1966,28 @@ fn resource_name(path: &Path) -> Option<String> {
 }
 
 fn default_models() -> Vec<ModelDefinition> {
-    vec![
+    let mut models = pi_providers::builtin_models()
+        .into_iter()
+        .map(|model| ModelDefinition {
+            provider: model.provider,
+            id: model.id,
+            name: Some(model.name),
+            api: match model.api {
+                pi_ai::ProviderApi::Faux => ProviderApi::Faux,
+                pi_ai::ProviderApi::OpenAi => ProviderApi::OpenAi,
+                pi_ai::ProviderApi::OpenAiResponses => ProviderApi::OpenAiResponses,
+                pi_ai::ProviderApi::OpenAiCodexResponses => ProviderApi::OpenAiCodexResponses,
+                pi_ai::ProviderApi::AzureOpenAiResponses => ProviderApi::AzureOpenAiResponses,
+                pi_ai::ProviderApi::Anthropic => ProviderApi::Anthropic,
+                pi_ai::ProviderApi::Google => ProviderApi::Google,
+                pi_ai::ProviderApi::GoogleVertex => ProviderApi::GoogleVertex,
+                pi_ai::ProviderApi::Bedrock => ProviderApi::Bedrock,
+                pi_ai::ProviderApi::Mistral => ProviderApi::Mistral,
+            },
+            base_url: model.base_url,
+        })
+        .collect::<Vec<_>>();
+    models.extend([
         ModelDefinition {
             provider: "faux".to_string(),
             id: "echo".to_string(),
@@ -2309,7 +2330,8 @@ fn default_models() -> Vec<ModelDefinition> {
                     .to_string(),
             ),
         },
-    ]
+    ]);
+    merge_model_definitions(Vec::new(), Vec::new(), models)
 }
 
 fn default_image_models() -> Vec<ImageModelDefinition> {

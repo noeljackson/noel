@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 pi-ai = { path = "../pi-ai" }
+pi-agent = { path = "../pi-agent" }
 pi-config = { path = "../pi-config" }
+pi-session = { path = "../pi-session" }
 pi-tools = { path = "../pi-tools" }
 serde.workspace = true
 serde_json.workspace = true
