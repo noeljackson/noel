@@ -108,6 +108,7 @@ Current user files:
 - `auth.json`
 - `models.json`
 - `model-cache.json`
+- `usage-cache.json`
 - `keybindings.json`
 - `extensions/`
 - `skills/`

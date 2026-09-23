@@ -54,3 +54,14 @@ Reason: provider sampling, shell timing, terminal dimensions, and network state
 make full transcripts brittle. The harness instead captures deterministic
 contracts for request shape, normalized messages, tool dispatch, storage,
 settings, and TUI markers.
+
+### Named Multi-Account auth.json
+
+Rust writes `auth.json` as `{ "<provider>": { "<account>": <credential> } }`
+instead of the flat TypeScript shape. Flat files are read and migrated
+transparently, so existing setups keep working; only the write format diverges.
+
+Reason: multiple accounts per provider (work/personal, plan variants) need a
+named account layer for session binding (`/account`), per-account OAuth
+refresh, and per-account quota probes (`pi accounts status`). The TypeScript
+shape cannot represent that.

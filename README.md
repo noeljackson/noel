@@ -185,6 +185,7 @@ Supported files:
 - `auth.json`
 - `models.json`
 - `model-cache.json`
+- `usage-cache.json`
 - `keybindings.json`
 - `extensions/`
 - `skills/`
@@ -218,51 +219,61 @@ Environment overrides:
 }
 ```
 
-Provider API keys can be stored in `auth.json`:
+Provider API keys can be stored in `auth.json`, keyed by provider and named
+account:
 
 ```json
 {
-  "openai": { "type": "api_key", "key": "env:OPENAI_API_KEY" },
-  "openai-codex": { "type": "oauth", "access_token": "env:CODEX_ACCESS_TOKEN", "expires": 0 },
-  "azure-openai-responses": { "type": "api_key", "key": "env:AZURE_OPENAI_API_KEY" },
-  "anthropic": { "type": "api_key", "key": "env:ANTHROPIC_API_KEY" },
-  "google": { "type": "api_key", "key": "env:GEMINI_API_KEY" },
-  "google-vertex": { "type": "api_key", "key": "env:GOOGLE_CLOUD_API_KEY" },
-  "github-copilot": { "type": "api_key", "key": "env:COPILOT_GITHUB_TOKEN" },
-  "openrouter": { "type": "api_key", "key": "env:OPENROUTER_API_KEY" },
-  "deepseek": { "type": "api_key", "key": "env:DEEPSEEK_API_KEY" },
-  "groq": { "type": "api_key", "key": "env:GROQ_API_KEY" },
-  "cerebras": { "type": "api_key", "key": "env:CEREBRAS_API_KEY" },
-  "xai": { "type": "api_key", "key": "env:XAI_API_KEY" },
-  "zai": { "type": "api_key", "key": "env:ZAI_API_KEY" },
-  "huggingface": { "type": "api_key", "key": "env:HF_TOKEN" },
-  "together": { "type": "api_key", "key": "env:TOGETHER_API_KEY" },
-  "moonshotai": { "type": "api_key", "key": "env:MOONSHOT_API_KEY" },
-  "moonshotai-cn": { "type": "api_key", "key": "env:MOONSHOT_API_KEY" },
-  "opencode": { "type": "api_key", "key": "env:OPENCODE_API_KEY" },
-  "opencode-go": { "type": "api_key", "key": "env:OPENCODE_API_KEY" },
-  "vercel-ai-gateway": { "type": "api_key", "key": "env:AI_GATEWAY_API_KEY" },
-  "fireworks": { "type": "api_key", "key": "env:FIREWORKS_API_KEY" },
-  "minimax": { "type": "api_key", "key": "env:MINIMAX_API_KEY" },
-  "minimax-cn": { "type": "api_key", "key": "env:MINIMAX_CN_API_KEY" },
-  "kimi-coding": { "type": "api_key", "key": "env:KIMI_API_KEY" },
-  "xiaomi": { "type": "api_key", "key": "env:XIAOMI_API_KEY" },
-  "xiaomi-token-plan-cn": { "type": "api_key", "key": "env:XIAOMI_TOKEN_PLAN_CN_API_KEY" },
-  "xiaomi-token-plan-ams": { "type": "api_key", "key": "env:XIAOMI_TOKEN_PLAN_AMS_API_KEY" },
-  "xiaomi-token-plan-sgp": { "type": "api_key", "key": "env:XIAOMI_TOKEN_PLAN_SGP_API_KEY" },
-  "amazon-bedrock": { "type": "api_key", "key": "env:AWS_BEARER_TOKEN_BEDROCK" },
-  "mistral": { "type": "api_key", "key": "env:MISTRAL_API_KEY" },
-  "cloudflare-workers-ai": { "type": "api_key", "key": "env:CLOUDFLARE_API_KEY" },
-  "cloudflare-ai-gateway": { "type": "api_key", "key": "env:CLOUDFLARE_API_KEY" }
+  "openai": { "default": { "type": "api_key", "key": "env:OPENAI_API_KEY" } },
+  "openai-codex": { "default": { "type": "oauth", "access_token": "env:CODEX_ACCESS_TOKEN", "expires": 0 } },
+  "anthropic": {
+    "default": { "type": "api_key", "key": "env:ANTHROPIC_API_KEY" },
+    "work": { "type": "api_key", "key": "env:WORK_ANTHROPIC_API_KEY" }
+  },
+  "azure-openai-responses": { "default": { "type": "api_key", "key": "env:AZURE_OPENAI_API_KEY" } },
+  "google": { "default": { "type": "api_key", "key": "env:GEMINI_API_KEY" } },
+  "google-vertex": { "default": { "type": "api_key", "key": "env:GOOGLE_CLOUD_API_KEY" } },
+  "github-copilot": { "default": { "type": "api_key", "key": "env:COPILOT_GITHUB_TOKEN" } },
+  "openrouter": { "default": { "type": "api_key", "key": "env:OPENROUTER_API_KEY" } },
+  "deepseek": { "default": { "type": "api_key", "key": "env:DEEPSEEK_API_KEY" } },
+  "groq": { "default": { "type": "api_key", "key": "env:GROQ_API_KEY" } },
+  "cerebras": { "default": { "type": "api_key", "key": "env:CEREBRAS_API_KEY" } },
+  "xai": { "default": { "type": "api_key", "key": "env:XAI_API_KEY" } },
+  "zai": { "default": { "type": "api_key", "key": "env:ZAI_API_KEY" } },
+  "huggingface": { "default": { "type": "api_key", "key": "env:HF_TOKEN" } },
+  "together": { "default": { "type": "api_key", "key": "env:TOGETHER_API_KEY" } },
+  "moonshotai": { "default": { "type": "api_key", "key": "env:MOONSHOT_API_KEY" } },
+  "moonshotai-cn": { "default": { "type": "api_key", "key": "env:MOONSHOT_API_KEY" } },
+  "opencode": { "default": { "type": "api_key", "key": "env:OPENCODE_API_KEY" } },
+  "opencode-go": { "default": { "type": "api_key", "key": "env:OPENCODE_API_KEY" } },
+  "vercel-ai-gateway": { "default": { "type": "api_key", "key": "env:AI_GATEWAY_API_KEY" } },
+  "fireworks": { "default": { "type": "api_key", "key": "env:FIREWORKS_API_KEY" } },
+  "minimax": { "default": { "type": "api_key", "key": "env:MINIMAX_API_KEY" } },
+  "minimax-cn": { "default": { "type": "api_key", "key": "env:MINIMAX_CN_API_KEY" } },
+  "kimi-coding": { "default": { "type": "api_key", "key": "env:KIMI_API_KEY" } },
+  "xiaomi": { "default": { "type": "api_key", "key": "env:XIAOMI_API_KEY" } },
+  "xiaomi-token-plan-cn": { "default": { "type": "api_key", "key": "env:XIAOMI_TOKEN_PLAN_CN_API_KEY" } },
+  "xiaomi-token-plan-ams": { "default": { "type": "api_key", "key": "env:XIAOMI_TOKEN_PLAN_AMS_API_KEY" } },
+  "xiaomi-token-plan-sgp": { "default": { "type": "api_key", "key": "env:XIAOMI_TOKEN_PLAN_SGP_API_KEY" } },
+  "amazon-bedrock": { "default": { "type": "api_key", "key": "env:AWS_BEARER_TOKEN_BEDROCK" } },
+  "mistral": { "default": { "type": "api_key", "key": "env:MISTRAL_API_KEY" } },
+  "cloudflare-workers-ai": { "default": { "type": "api_key", "key": "env:CLOUDFLARE_API_KEY" } },
+  "cloudflare-ai-gateway": { "default": { "type": "api_key", "key": "env:CLOUDFLARE_API_KEY" } }
 }
 ```
+
+Older flat files (`{ "openai": { "type": "api_key", ... } }`) are migrated on
+read; writes always use the nested form. Without an explicit selection the
+`default` account is used, or the sole account when only one exists.
 
 Or use the CLI helper:
 
 ```bash
 pi login anthropic --api-key env:ANTHROPIC_API_KEY
 printf '%s' "$ANTHROPIC_API_KEY" | pi login anthropic --api-key -
+pi login anthropic --account work --api-key env:WORK_ANTHROPIC_API_KEY
 pi logout anthropic
+pi logout anthropic --account work
 ```
 
 When no explicit API key is configured, `pi` can reuse existing CLI login credentials:
@@ -270,7 +281,17 @@ When no explicit API key is configured, `pi` can reuse existing CLI login creden
 - Claude Code: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or `~/.claude/.credentials.json`
 - Codex/ChatGPT: `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json` for `openai` and `openai-codex`
 
-Explicit API keys still take precedence over login tokens.
+Explicit API keys still take precedence over login tokens. Imported OAuth
+credentials are refreshed automatically when they expire; refreshed tokens are
+persisted to pi's own `auth.json` as `codex-import`/`claude-import` accounts
+and never written back to the imported files.
+
+`/account [name]` binds an account to the current session (bare `/account`
+opens a selector; the binding is journaled and survives resume). `pi accounts
+status` and `/accounts` show auth state, plan windows, and balance for every
+configured account, including environment and imported pseudo-accounts; results
+are cached for 15 minutes in `usage-cache.json` (`--refresh` bypasses the
+cache).
 
 Provider-specific environment:
 
@@ -450,6 +471,8 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/compact`
 - `/login [provider]`
 - `/logout <provider>`
+- `/account [name]`
+- `/accounts`
 - `/reload`
 - `/read <path>`
 - `/write <path> <text>`

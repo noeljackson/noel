@@ -111,10 +111,7 @@ pub fn save_project_trust(
         path: agent_dir.to_path_buf(),
         source,
     })?;
-    fs::write(&trust_path, format!("{content}\n")).map_err(|source| ConfigError::Write {
-        path: trust_path.clone(),
-        source,
-    })?;
+    write_file_atomic(&trust_path, format!("{content}\n").as_bytes())?;
     Ok(trust_path)
 }
 

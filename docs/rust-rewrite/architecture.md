@@ -252,9 +252,13 @@ Implemented providers:
 - Kimi Coding.
 - Xiaomi MiMo.
 
-Credential resolution supports runtime API keys, `auth.json`, environment
-variables, Claude Code login token fallback, Codex/ChatGPT login token fallback,
-and provider-specific environment settings.
+Credential resolution supports runtime API keys, named multi-account
+`auth.json` entries, environment variables, Claude Code login token fallback,
+Codex/ChatGPT login token fallback, and provider-specific environment
+settings. Imported Claude Code and Codex/ChatGPT OAuth tokens are refreshed
+automatically when they expire; refreshed credentials persist to pi's own
+`auth.json`. Per-account quota probes feed `pi accounts status` and are cached
+in `usage-cache.json`.
 
 Model refresh runs in the background when enabled, online, stale, and
 authenticated. It does not block startup. Refreshed models become visible after
