@@ -11,6 +11,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod oauth_refresh;
+#[cfg_attr(not(test), allow(dead_code))]
+mod usage;
 
 use anyhow::{anyhow, Result};
 use base64::Engine;

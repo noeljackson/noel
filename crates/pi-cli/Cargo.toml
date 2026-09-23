@@ -22,4 +22,5 @@ ratatui.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+time = { workspace = true, features = ["parsing"] }
 tokio.workspace = true

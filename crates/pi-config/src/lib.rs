@@ -726,6 +726,39 @@ pub struct ModelCache {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountUsage {
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub windows: Vec<UsageWindow>,
+    #[serde(default)]
+    pub balance: Option<Balance>,
+    pub fetched_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageWindow {
+    pub label: String,
+    pub used_pct: f64,
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Balance {
+    pub amount: f64,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCache {
+    pub refreshed_at: u64,
+    #[serde(default)]
+    pub accounts: BTreeMap<String, AccountUsage>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderApi {
     #[serde(rename = "openai-completions", alias = "open-ai")]
@@ -1109,6 +1142,24 @@ fn listed_accounts(
 
 pub fn read_model_cache(path: &Path) -> Result<Option<ModelCache>, ConfigError> {
     read_optional_json::<ModelCache>(path)
+}
+
+pub fn read_usage_cache(path: &Path) -> Result<Option<UsageCache>, ConfigError> {
+    read_optional_json::<UsageCache>(path)
+}
+
+pub fn write_usage_cache(path: &Path, cache: &UsageCache) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let content = serde_json::to_string_pretty(cache).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    write_file_atomic(path, format!("{content}\n").as_bytes())
 }
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -4374,6 +4425,41 @@ mod tests {
             encode(r#"{"alg":"none"}"#),
             encode(payload)
         )
+    }
+
+    #[test]
+    fn usage_cache_round_trips_through_file() {
+        let root = test_dir("pi-config-usage-cache");
+        let path = root.join("agent").join("usage-cache.json");
+        let mut cache = UsageCache {
+            refreshed_at: 1_000,
+            accounts: BTreeMap::new(),
+        };
+        cache.accounts.insert(
+            "openai-codex:default".to_string(),
+            AccountUsage {
+                plan: Some("plus".to_string()),
+                windows: vec![UsageWindow {
+                    label: "5h".to_string(),
+                    used_pct: 42.5,
+                    resets_at: Some(1_800_000_000),
+                }],
+                balance: Some(Balance {
+                    amount: 10.5,
+                    currency: "USD".to_string(),
+                }),
+                fetched_at: 1_000,
+            },
+        );
+
+        write_usage_cache(&path, &cache).expect("write usage cache");
+        let loaded = read_usage_cache(&path).expect("read usage cache");
+        assert_eq!(loaded, Some(cache));
+
+        let missing = read_usage_cache(&root.join("missing.json")).expect("missing cache");
+        assert_eq!(missing, None);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
