@@ -65,3 +65,15 @@ Reason: multiple accounts per provider (work/personal, plan variants) need a
 named account layer for session binding (`/account`), per-account OAuth
 refresh, and per-account quota probes (`pi accounts status`). The TypeScript
 shape cannot represent that.
+
+### Native OAuth Enrollment Flows
+
+Rust supports interactive OAuth login (`pi login openai-codex` device
+authorization, `pi login anthropic` PKCE paste-code) using the official Codex
+CLI and Claude Code public client registrations and endpoint contracts.
+
+Reason: upstream pi authenticates via API keys or imported credential files.
+Native enrollment removes the manual import step while storing credentials in
+the same v2 accounts and refresh machinery. The official CLIs' flows are
+public, documented in their shipped binaries, and produce tokens for the same
+upstream services.

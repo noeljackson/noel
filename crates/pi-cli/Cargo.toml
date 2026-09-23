@@ -13,6 +13,7 @@ anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+getrandom.workspace = true
 image.workspace = true
 pi-ai = { path = "../pi-ai" }
 pi-config = { path = "../pi-config" }
@@ -22,5 +23,6 @@ ratatui.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 time = { workspace = true, features = ["parsing"] }
 tokio.workspace = true

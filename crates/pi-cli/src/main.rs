@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod oauth_login;
 mod oauth_refresh;
 mod usage;
 
@@ -434,7 +435,7 @@ fn image_extension_for_mime_type(mime_type: &str) -> Option<&'static str> {
     }
 }
 
-fn try_run_package_command() -> Result<bool> {
+async fn try_run_package_command() -> Result<bool> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let Some(command) = args.first().map(String::as_str) else {
         return Ok(false);
@@ -461,7 +462,7 @@ fn try_run_package_command() -> Result<bool> {
             Ok(true)
         }
         "login" => {
-            run_auth_login(&args[1..])?;
+            run_auth_login(&args[1..]).await?;
             Ok(true)
         }
         "logout" => {
@@ -472,7 +473,7 @@ fn try_run_package_command() -> Result<bool> {
     }
 }
 
-fn run_auth_login(args: &[String]) -> Result<()> {
+async fn run_auth_login(args: &[String]) -> Result<()> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print_auth_help("login");
         return Ok(());
@@ -508,9 +509,19 @@ fn run_auth_login(args: &[String]) -> Result<()> {
         }
         index += 1;
     }
-    let provider =
-        provider.ok_or_else(|| anyhow!("usage: pi login <provider> --api-key <key|env:VAR|->"))?;
+    let provider = provider.ok_or_else(|| {
+        anyhow!("usage: pi login <provider> [--account <name>] [--api-key <key|env:VAR|->]")
+    })?;
     let account = account.unwrap_or_else(|| DEFAULT_ACCOUNT_NAME.to_string());
+    let cwd = std::env::current_dir()?;
+    let paths = ConfigPaths::discover(cwd, None)?;
+    if api_key.is_none() {
+        match provider.as_str() {
+            "openai" | "openai-codex" => return run_codex_login(&paths, &account).await,
+            "anthropic" => return run_claude_login(&paths, &account).await,
+            _ => {}
+        }
+    }
     let key = match api_key {
         Some(value) if value == "-" => {
             let mut input = String::new();
@@ -525,13 +536,15 @@ fn run_auth_login(args: &[String]) -> Result<()> {
                     .filter(|value| !value.trim().is_empty())
                     .map(|_| format!("env:{name}"))
             })
-            .ok_or_else(|| anyhow!("usage: pi login {provider} --api-key <key|env:VAR|->"))?,
+            .ok_or_else(|| {
+                anyhow!(
+                    "usage: pi login {provider} --api-key <key|env:VAR|-> (OAuth login is available for: openai-codex, anthropic)"
+                )
+            })?,
     };
     if key.trim().is_empty() {
         return Err(anyhow!("api key is empty"));
     }
-    let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd, None)?;
     let mut auth = read_auth_data(&paths.auth_path)?;
     auth.insert(&provider, &account, AuthCredential::ApiKey { key });
     write_auth_data(&paths.auth_path, &auth)?;
@@ -549,6 +562,98 @@ fn account_suffix(account: &str) -> String {
     } else {
         format!(" (account {account})")
     }
+}
+
+fn login_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+async fn run_codex_login(paths: &ConfigPaths, account: &str) -> Result<()> {
+    let client = login_http_client();
+    let tokens = oauth_login::run_codex_device_login(
+        &client,
+        oauth_login::CODEX_ISSUER,
+        oauth_refresh::CODEX_TOKEN_URL,
+        |device| {
+            println!(
+                "open {} in your browser and enter code {}",
+                device.verification_url, device.user_code
+            );
+            println!("waiting for authorization (the code expires in 15 minutes)...");
+        },
+    )
+    .await?;
+    let mut auth = read_auth_data(&paths.auth_path)?;
+    let replaced = auth.credential("openai-codex", account).is_some();
+    for provider in ["openai", "openai-codex"] {
+        auth.insert(
+            provider,
+            account,
+            AuthCredential::OAuth {
+                access_token: tokens.access_token.clone(),
+                refresh_token: tokens.refresh_token.clone(),
+                expires: tokens.expires,
+                account_id: tokens.account_id.clone(),
+            },
+        );
+    }
+    write_auth_data(&paths.auth_path, &auth)?;
+    println!(
+        "logged in as account {account}{}",
+        if replaced {
+            " (replaced existing login)"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+async fn run_claude_login(paths: &ConfigPaths, account: &str) -> Result<()> {
+    let client = login_http_client();
+    let tokens = tokio::time::timeout(
+        oauth_login::LOGIN_TIMEOUT,
+        oauth_login::run_claude_pkce_login(
+            &client,
+            oauth_login::CLAUDE_AUTHORIZE_URL,
+            oauth_refresh::CLAUDE_TOKEN_URL,
+            |url| {
+                println!("open this URL and sign in:\n{url}");
+                println!("after signing in, paste the full code shown (code#state): ");
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                Ok(input)
+            },
+        ),
+    )
+    .await
+    .map_err(|_| anyhow!("login timed out after 15 minutes"))??;
+    let mut auth = read_auth_data(&paths.auth_path)?;
+    let replaced = auth.credential("anthropic", account).is_some();
+    auth.insert(
+        "anthropic",
+        account,
+        AuthCredential::OAuth {
+            access_token: tokens.access_token.clone(),
+            refresh_token: tokens.refresh_token.clone(),
+            expires: tokens.expires,
+            account_id: tokens.account_id.clone(),
+        },
+    );
+    write_auth_data(&paths.auth_path, &auth)?;
+    println!(
+        "logged in as account {account}{}",
+        if replaced {
+            " (replaced existing login)"
+        } else {
+            ""
+        }
+    );
+    Ok(())
 }
 
 fn run_auth_logout(args: &[String]) -> Result<()> {
@@ -1122,7 +1227,7 @@ fn print_package_help(command: &str) {
 fn print_auth_help(command: &str) {
     match command {
         "login" => println!(
-            "usage: pi login <provider> [--account <name>] [--api-key <key|env:VAR|->]\n\nStore API-key auth in ~/.pi/agent/auth.json. Without --api-key, pi stores env:<provider default> when that environment variable is present. Without --account, the account is \"default\"."
+            "usage: pi login <provider> [--account <name>] [--api-key <key|env:VAR|->]\n\nStore API-key auth in ~/.pi/agent/auth.json. Without --api-key, pi starts the OAuth login flow for providers that support it (openai-codex, anthropic); other providers store env:<provider default> when that environment variable is present. Without --account, the account is \"default\"."
         ),
         "logout" => println!(
             "usage: pi logout <provider> [--account <name>]\n\nRemove stored provider auth. Without --account, removes the \"default\" account."
@@ -1142,7 +1247,7 @@ async fn main() -> Result<()> {
     if try_run_accounts_command().await? {
         return Ok(());
     }
-    if try_run_package_command()? {
+    if try_run_package_command().await? {
         return Ok(());
     }
     let cli = Cli::parse_from(normalized_cli_args(std::env::args()));

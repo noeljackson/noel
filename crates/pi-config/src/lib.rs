@@ -1414,7 +1414,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
-fn jwt_exp_claim(token: &str) -> Option<u64> {
+pub fn jwt_exp_claim(token: &str) -> Option<u64> {
     let parts = token.split('.').collect::<Vec<_>>();
     if parts.len() != 3 {
         return None;

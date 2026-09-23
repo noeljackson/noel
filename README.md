@@ -276,6 +276,25 @@ pi logout anthropic
 pi logout anthropic --account work
 ```
 
+Native OAuth enrollment is available for ChatGPT/Codex and Claude using the
+official CLIs' public clients:
+
+```bash
+pi login openai-codex              # device authorization flow (browser + one-time code)
+pi login openai-codex --account work
+pi login anthropic                 # PKCE authorize + paste-code flow
+pi login anthropic --account work
+```
+
+`pi login openai-codex` stores the OAuth credential for both `openai` and
+`openai-codex` (mirroring the codex import mapping); `pi login anthropic`
+stores it for `anthropic`. Expiry and `account_id` come from the issued token
+(JWT `exp` for Codex, `expires_in` for Claude), and the stored credentials
+refresh automatically when they expire. Importing credentials from
+`~/.codex/auth.json` and `~/.claude/.credentials.json` still works as a
+fallback when no stored account exists. Re-running login for an existing
+account replaces it.
+
 When no explicit API key is configured, `pi` can reuse existing CLI login credentials:
 
 - Claude Code: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or `~/.claude/.credentials.json`
