@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -916,6 +918,35 @@ pub fn read_model_cache(path: &Path) -> Result<Option<ModelCache>, ConfigError> 
     read_optional_json::<ModelCache>(path)
 }
 
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state".to_string());
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)
+    })();
+    if let Err(source) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
+}
+
 pub fn write_model_cache(path: &Path, cache: &ModelCache) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
@@ -927,10 +958,7 @@ pub fn write_model_cache(path: &Path, cache: &ModelCache) -> Result<(), ConfigEr
         path: path.to_path_buf(),
         source,
     })?;
-    fs::write(path, format!("{content}\n")).map_err(|source| ConfigError::Write {
-        path: path.to_path_buf(),
-        source,
-    })
+    write_file_atomic(path, format!("{content}\n").as_bytes())
 }
 
 fn merge_model_definitions(
@@ -3678,6 +3706,44 @@ mod tests {
             })
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomic_round_trips_contents() {
+        let root = test_dir("pi-config-atomic-write");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("state.json");
+
+        write_file_atomic(&path, br#"{"ok":true}"#).expect("write");
+
+        assert_eq!(fs::read(&path).expect("read"), br#"{"ok":true}"#);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomic_overwrites_existing_file() {
+        let root = test_dir("pi-config-atomic-overwrite");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("state.json");
+        fs::write(&path, b"old").expect("write old");
+
+        write_file_atomic(&path, b"new").expect("write new");
+
+        assert_eq!(fs::read_to_string(&path).expect("read"), "new");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomic_leaves_no_temp_file() {
+        let root = test_dir("pi-config-atomic-clean");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("state.json");
+
+        write_file_atomic(&path, b"data").expect("write");
+
+        let entries: Vec<_> = fs::read_dir(&root).expect("read dir").collect();
+        assert_eq!(entries.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 

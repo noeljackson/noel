@@ -33,9 +33,9 @@ use pi_ai::{
 use pi_config::{
     auth_for_provider, codex_client_version, has_auth_for_provider, load_config,
     load_config_with_project_trust, project_is_trusted, read_model_cache, save_project_trust,
-    write_model_cache, AuthCredential, AuthData, CompactionSettings, ConfigPaths,
-    ImageModelDefinition, ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig,
-    ModelCache, ModelDefinition, ModelRefreshSettings, PackageSource,
+    write_file_atomic, write_model_cache, AuthCredential, AuthData, CompactionSettings,
+    ConfigPaths, ImageModelDefinition, ImageProviderApi as ConfigImageProviderApi, ImageSettings,
+    LoadedConfig, ModelCache, ModelDefinition, ModelRefreshSettings, PackageSource,
     ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, RetrySettings, Settings,
     TerminalSettings, WarningSettings, ENV_SESSION_DIR,
 };
@@ -5948,9 +5948,9 @@ fn write_auth_file(config: &LoadedConfig) -> Result<()> {
     if let Some(parent) = config.paths.auth_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(
+    write_file_atomic(
         &config.paths.auth_path,
-        serde_json::to_string_pretty(&config.auth)?,
+        serde_json::to_string_pretty(&config.auth)?.as_bytes(),
     )?;
     Ok(())
 }
