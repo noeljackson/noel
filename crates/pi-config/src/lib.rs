@@ -554,13 +554,105 @@ pub enum AuthCredential {
     OAuth {
         #[serde(alias = "access")]
         access_token: String,
+        #[serde(default, alias = "refresh")]
+        refresh_token: Option<String>,
         expires: u64,
         #[serde(default, alias = "accountId")]
         account_id: Option<String>,
     },
 }
 
-pub type AuthData = BTreeMap<String, AuthCredential>;
+pub const DEFAULT_ACCOUNT_NAME: &str = "default";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthData {
+    pub providers: BTreeMap<String, BTreeMap<String, AuthCredential>>,
+}
+
+impl AuthData {
+    pub fn accounts_for_provider(&self, provider: &str) -> Vec<String> {
+        self.providers
+            .get(provider)
+            .map(|accounts| accounts.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn credential(&self, provider: &str, account: &str) -> Option<&AuthCredential> {
+        self.providers.get(provider)?.get(account)
+    }
+
+    pub fn insert(&mut self, provider: &str, account: &str, credential: AuthCredential) {
+        self.providers
+            .entry(provider.to_string())
+            .or_default()
+            .insert(account.to_string(), credential);
+    }
+
+    pub fn remove(&mut self, provider: &str, account: &str) -> Option<AuthCredential> {
+        let accounts = self.providers.get_mut(provider)?;
+        let removed = accounts.remove(account);
+        if accounts.is_empty() {
+            self.providers.remove(provider);
+        }
+        removed
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    fn default_credential(&self, provider: &str) -> Option<&AuthCredential> {
+        let accounts = self.providers.get(provider)?;
+        if let Some(credential) = accounts.get(DEFAULT_ACCOUNT_NAME) {
+            return Some(credential);
+        }
+        match accounts.len() {
+            1 => accounts.values().next(),
+            _ => None,
+        }
+    }
+}
+
+impl From<BTreeMap<String, AuthCredential>> for AuthData {
+    fn from(flat: BTreeMap<String, AuthCredential>) -> Self {
+        flat.into_iter()
+            .map(|(provider, credential)| {
+                (
+                    provider,
+                    BTreeMap::from([(DEFAULT_ACCOUNT_NAME.to_string(), credential)]),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into()
+    }
+}
+
+impl From<BTreeMap<String, BTreeMap<String, AuthCredential>>> for AuthData {
+    fn from(providers: BTreeMap<String, BTreeMap<String, AuthCredential>>) -> Self {
+        Self { providers }
+    }
+}
+
+impl Serialize for AuthData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.providers.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthData {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum AuthDataFile {
+            V2(BTreeMap<String, BTreeMap<String, AuthCredential>>),
+            V1(BTreeMap<String, AuthCredential>),
+        }
+        match AuthDataFile::deserialize(deserializer)? {
+            AuthDataFile::V2(providers) => Ok(providers.into()),
+            AuthDataFile::V1(flat) => Ok(flat.into()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedAuth {
@@ -885,15 +977,27 @@ fn filter_enabled_models(
         .collect()
 }
 
-pub fn api_key_for_provider(auth: &AuthData, provider: &str) -> Option<String> {
-    match auth_for_provider(auth, provider) {
+pub fn api_key_for_provider(
+    auth: &AuthData,
+    provider: &str,
+    account: Option<&str>,
+) -> Option<String> {
+    match auth_for_provider(auth, provider, account) {
         Some(ResolvedAuth::ApiKey(api_key)) => Some(api_key),
         _ => None,
     }
 }
 
-pub fn auth_for_provider(auth: &AuthData, provider: &str) -> Option<ResolvedAuth> {
-    if let Some(credential) = auth.get(provider) {
+pub fn auth_for_provider(
+    auth: &AuthData,
+    provider: &str,
+    account: Option<&str>,
+) -> Option<ResolvedAuth> {
+    let credential = match account {
+        Some(account) => auth.credential(provider, account),
+        None => auth.default_credential(provider),
+    };
+    if let Some(credential) = credential {
         return match credential {
             AuthCredential::ApiKey { key } => Some(ResolvedAuth::ApiKey(resolve_config_value(key))),
             AuthCredential::OAuth {
@@ -910,8 +1014,8 @@ pub fn auth_for_provider(auth: &AuthData, provider: &str) -> Option<ResolvedAuth
     env_auth(provider).or_else(|| login_auth(provider))
 }
 
-pub fn has_auth_for_provider(auth: &AuthData, provider: &str) -> bool {
-    auth_for_provider(auth, provider).is_some()
+pub fn has_auth_for_provider(auth: &AuthData, provider: &str, account: Option<&str>) -> bool {
+    auth_for_provider(auth, provider, account).is_some()
 }
 
 pub fn read_model_cache(path: &Path) -> Result<Option<ModelCache>, ConfigError> {
@@ -3178,11 +3282,12 @@ mod tests {
 
     #[test]
     fn explicit_oauth_maps_to_provider_specific_auth() {
-        let auth = BTreeMap::from([
+        let auth = AuthData::from(BTreeMap::from([
             (
                 "anthropic".to_string(),
                 AuthCredential::OAuth {
                     access_token: "claude-token".to_string(),
+                    refresh_token: None,
                     expires: 0,
                     account_id: None,
                 },
@@ -3191,20 +3296,21 @@ mod tests {
                 "openai".to_string(),
                 AuthCredential::OAuth {
                     access_token: "codex-token".to_string(),
+                    refresh_token: Some("codex-refresh".to_string()),
                     expires: 0,
                     account_id: Some("account-id".to_string()),
                 },
             ),
-        ]);
+        ]));
 
         assert_eq!(
-            auth_for_provider(&auth, "anthropic"),
+            auth_for_provider(&auth, "anthropic", None),
             Some(ResolvedAuth::ClaudeCodeOAuth {
                 access_token: "claude-token".to_string()
             })
         );
         assert_eq!(
-            auth_for_provider(&auth, "openai"),
+            auth_for_provider(&auth, "openai", None),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "codex-token".to_string(),
                 account_id: Some("account-id".to_string())
@@ -3232,16 +3338,25 @@ mod tests {
             fixture["authJson"]["oauthCredential"].clone(),
         )
         .expect("parse oauth credential");
-        let auth = BTreeMap::from([
+        assert_eq!(
+            oauth_credential,
+            AuthCredential::OAuth {
+                access_token: "stored-codex-access-token".to_string(),
+                refresh_token: Some("stored-codex-refresh-token".to_string()),
+                expires: 4102444800000,
+                account_id: Some("account-id".to_string()),
+            }
+        );
+        let auth = AuthData::from(BTreeMap::from([
             ("anthropic".to_string(), api_key_credential),
             ("openai-codex".to_string(), oauth_credential),
-        ]);
+        ]));
         assert_eq!(
-            auth_for_provider(&auth, "anthropic"),
+            auth_for_provider(&auth, "anthropic", None),
             Some(ResolvedAuth::ApiKey("stored-anthropic-api-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&auth, "openai-codex"),
+            auth_for_provider(&auth, "openai-codex", None),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "stored-codex-access-token".to_string(),
                 account_id: Some("account-id".to_string())
@@ -3267,13 +3382,13 @@ mod tests {
         env::set_var("ANTHROPIC_OAUTH_TOKEN", "claude-oauth-env-token");
         env::set_var("ANTHROPIC_API_KEY", "anthropic-api-key");
         assert_eq!(
-            auth_for_provider(&BTreeMap::new(), "anthropic"),
+            auth_for_provider(&AuthData::default(), "anthropic", None),
             Some(ResolvedAuth::ClaudeCodeOAuth {
                 access_token: "claude-oauth-env-token".to_string()
             })
         );
         assert_eq!(
-            auth_for_provider(&auth, "anthropic"),
+            auth_for_provider(&auth, "anthropic", None),
             Some(ResolvedAuth::ApiKey("stored-anthropic-api-key".to_string()))
         );
 
@@ -3282,11 +3397,11 @@ mod tests {
         env::set_var("OPENAI_API_KEY", "openai-api-key");
         env::set_var("AZURE_OPENAI_API_KEY", "azure-api-key");
         assert_eq!(
-            auth_for_provider(&BTreeMap::new(), "openai"),
+            auth_for_provider(&AuthData::default(), "openai", None),
             Some(ResolvedAuth::ApiKey("openai-api-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&BTreeMap::new(), "azure-openai-responses"),
+            auth_for_provider(&AuthData::default(), "azure-openai-responses", None),
             Some(ResolvedAuth::ApiKey("azure-api-key".to_string()))
         );
 
@@ -3323,6 +3438,182 @@ mod tests {
             })
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auth_data_v1_file_loads_as_default_account() {
+        let auth = serde_json::from_str::<AuthData>(
+            r#"{"openai":{"type":"api_key","key":"v1-key"},"anthropic":{"type":"oauth","access_token":"v1-token","expires":0}}"#,
+        )
+        .expect("parse v1 auth");
+
+        assert_eq!(auth.accounts_for_provider("openai"), vec!["default"]);
+        assert_eq!(
+            auth_for_provider(&auth, "openai", None),
+            Some(ResolvedAuth::ApiKey("v1-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&auth, "anthropic", None),
+            Some(ResolvedAuth::ClaudeCodeOAuth {
+                access_token: "v1-token".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn auth_data_write_emits_v2_shape() {
+        let mut auth = AuthData::default();
+        auth.insert(
+            "openai",
+            DEFAULT_ACCOUNT_NAME,
+            AuthCredential::ApiKey {
+                key: "stored-key".to_string(),
+            },
+        );
+
+        let written = serde_json::to_string(&auth).expect("serialize auth");
+        let value = serde_json::from_str::<serde_json::Value>(&written).expect("parse written");
+        assert_eq!(value["openai"]["default"]["type"], "api_key");
+        assert_eq!(value["openai"]["default"]["key"], "stored-key");
+
+        let reloaded = serde_json::from_str::<AuthData>(&written).expect("reload v2 auth");
+        assert_eq!(reloaded, auth);
+    }
+
+    #[test]
+    fn auth_data_v2_round_trips_identically() {
+        let raw = r#"{"anthropic":{"default":{"type":"api_key","key":"personal"},"work":{"type":"oauth","access_token":"work-token","refresh_token":"work-refresh","expires":4102444800000,"account_id":"acct-1"}}}"#;
+
+        let auth = serde_json::from_str::<AuthData>(raw).expect("parse v2 auth");
+        assert_eq!(
+            auth.accounts_for_provider("anthropic"),
+            vec!["default".to_string(), "work".to_string()]
+        );
+
+        let written = serde_json::to_string(&auth).expect("serialize auth");
+        let value = serde_json::from_str::<serde_json::Value>(&written).expect("parse written");
+        let original = serde_json::from_str::<serde_json::Value>(raw).expect("parse original");
+        assert_eq!(value, original);
+    }
+
+    #[test]
+    fn requested_account_wins_over_default_and_env() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let saved = save_env("OPENAI_API_KEY");
+        env::set_var("OPENAI_API_KEY", "env-key");
+
+        let mut auth = AuthData::default();
+        auth.insert(
+            "openai",
+            DEFAULT_ACCOUNT_NAME,
+            AuthCredential::ApiKey {
+                key: "default-key".to_string(),
+            },
+        );
+        auth.insert(
+            "openai",
+            "work",
+            AuthCredential::ApiKey {
+                key: "work-key".to_string(),
+            },
+        );
+
+        assert_eq!(
+            auth_for_provider(&auth, "openai", Some("work")),
+            Some(ResolvedAuth::ApiKey("work-key".to_string()))
+        );
+        assert_eq!(
+            auth_for_provider(&auth, "openai", None),
+            Some(ResolvedAuth::ApiKey("default-key".to_string()))
+        );
+        assert_eq!(
+            api_key_for_provider(&auth, "openai", Some("work")),
+            Some("work-key".to_string())
+        );
+
+        restore_env("OPENAI_API_KEY", saved.1);
+    }
+
+    #[test]
+    fn sole_account_resolves_without_default_name() {
+        let mut auth = AuthData::default();
+        auth.insert(
+            "openai",
+            "work",
+            AuthCredential::ApiKey {
+                key: "work-key".to_string(),
+            },
+        );
+
+        assert_eq!(
+            auth_for_provider(&auth, "openai", None),
+            Some(ResolvedAuth::ApiKey("work-key".to_string()))
+        );
+        assert!(has_auth_for_provider(&auth, "openai", None));
+    }
+
+    #[test]
+    fn ambiguous_accounts_fall_through_to_env() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let saved = save_env("OPENAI_API_KEY");
+        env::set_var("OPENAI_API_KEY", "env-key");
+
+        let mut auth = AuthData::default();
+        for account in ["personal", "work"] {
+            auth.insert(
+                "openai",
+                account,
+                AuthCredential::ApiKey {
+                    key: format!("{account}-key"),
+                },
+            );
+        }
+
+        assert_eq!(
+            auth_for_provider(&auth, "openai", None),
+            Some(ResolvedAuth::ApiKey("env-key".to_string()))
+        );
+
+        restore_env("OPENAI_API_KEY", saved.1);
+    }
+
+    #[test]
+    fn named_account_resolves_env_indirection() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let saved = save_env("WORK_OPENAI_KEY");
+        env::set_var("WORK_OPENAI_KEY", "indirected-key");
+
+        let mut auth = AuthData::default();
+        auth.insert(
+            "openai",
+            "work",
+            AuthCredential::ApiKey {
+                key: "env:WORK_OPENAI_KEY".to_string(),
+            },
+        );
+
+        assert_eq!(
+            auth_for_provider(&auth, "openai", Some("work")),
+            Some(ResolvedAuth::ApiKey("indirected-key".to_string()))
+        );
+
+        restore_env("WORK_OPENAI_KEY", saved.1);
+    }
+
+    #[test]
+    fn remove_prunes_empty_provider_entry() {
+        let mut auth = AuthData::default();
+        auth.insert(
+            "openai",
+            DEFAULT_ACCOUNT_NAME,
+            AuthCredential::ApiKey {
+                key: "key".to_string(),
+            },
+        );
+
+        assert!(auth.remove("openai", DEFAULT_ACCOUNT_NAME).is_some());
+        assert!(auth.is_empty());
+        assert_eq!(serde_json::to_string(&auth).expect("serialize"), "{}");
     }
 
     #[test]
@@ -3486,7 +3777,8 @@ mod tests {
     #[test]
     fn env_auth_detects_provider_parity_targets() {
         let _guard = ENV_LOCK.lock().expect("lock env");
-        let empty_auth = BTreeMap::new();
+        let empty_auth = AuthData::default();
+        let resolve = |provider: &str| auth_for_provider(&empty_auth, provider, None);
         let saved = [
             save_env("AZURE_OPENAI_API_KEY"),
             save_env("CEREBRAS_API_KEY"),
@@ -3546,115 +3838,115 @@ mod tests {
         env::set_var("CHATGPT_ACCOUNT_ID", "account-id");
 
         assert_eq!(
-            auth_for_provider(&empty_auth, "azure-openai-responses"),
+            resolve("azure-openai-responses"),
             Some(ResolvedAuth::ApiKey("azure-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "github-copilot"),
+            resolve("github-copilot"),
             Some(ResolvedAuth::ApiKey("copilot-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "openrouter"),
+            resolve("openrouter"),
             Some(ResolvedAuth::ApiKey("openrouter-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "deepseek"),
+            resolve("deepseek"),
             Some(ResolvedAuth::ApiKey("deepseek-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "groq"),
+            resolve("groq"),
             Some(ResolvedAuth::ApiKey("groq-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "cerebras"),
+            resolve("cerebras"),
             Some(ResolvedAuth::ApiKey("cerebras-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "xai"),
+            resolve("xai"),
             Some(ResolvedAuth::ApiKey("xai-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "zai"),
+            resolve("zai"),
             Some(ResolvedAuth::ApiKey("zai-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "huggingface"),
+            resolve("huggingface"),
             Some(ResolvedAuth::ApiKey("hf-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "together"),
+            resolve("together"),
             Some(ResolvedAuth::ApiKey("together-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "moonshotai"),
+            resolve("moonshotai"),
             Some(ResolvedAuth::ApiKey("moonshot-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "moonshotai-cn"),
+            resolve("moonshotai-cn"),
             Some(ResolvedAuth::ApiKey("moonshot-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "opencode"),
+            resolve("opencode"),
             Some(ResolvedAuth::ApiKey("opencode-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "opencode-go"),
+            resolve("opencode-go"),
             Some(ResolvedAuth::ApiKey("opencode-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "fireworks"),
+            resolve("fireworks"),
             Some(ResolvedAuth::ApiKey("fireworks-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "minimax"),
+            resolve("minimax"),
             Some(ResolvedAuth::ApiKey("minimax-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "minimax-cn"),
+            resolve("minimax-cn"),
             Some(ResolvedAuth::ApiKey("minimax-cn-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "kimi-coding"),
+            resolve("kimi-coding"),
             Some(ResolvedAuth::ApiKey("kimi-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "xiaomi"),
+            resolve("xiaomi"),
             Some(ResolvedAuth::ApiKey("xiaomi-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "xiaomi-token-plan-cn"),
+            resolve("xiaomi-token-plan-cn"),
             Some(ResolvedAuth::ApiKey("xiaomi-cn-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "xiaomi-token-plan-ams"),
+            resolve("xiaomi-token-plan-ams"),
             Some(ResolvedAuth::ApiKey("xiaomi-ams-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "xiaomi-token-plan-sgp"),
+            resolve("xiaomi-token-plan-sgp"),
             Some(ResolvedAuth::ApiKey("xiaomi-sgp-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "vercel-ai-gateway"),
+            resolve("vercel-ai-gateway"),
             Some(ResolvedAuth::ApiKey("vercel-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "google-vertex"),
+            resolve("google-vertex"),
             Some(ResolvedAuth::ApiKey("vertex-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "amazon-bedrock"),
+            resolve("amazon-bedrock"),
             Some(ResolvedAuth::ApiKey("bedrock-token".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "mistral"),
+            resolve("mistral"),
             Some(ResolvedAuth::ApiKey("mistral-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "cloudflare-ai-gateway"),
+            resolve("cloudflare-ai-gateway"),
             Some(ResolvedAuth::ApiKey("cloudflare-key".to_string()))
         );
         assert_eq!(
-            auth_for_provider(&empty_auth, "openai-codex"),
+            resolve("openai-codex"),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "codex-token".to_string(),
                 account_id: Some("account-id".to_string())

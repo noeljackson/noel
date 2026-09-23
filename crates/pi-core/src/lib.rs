@@ -244,7 +244,8 @@ impl ReloadableSystems {
             .models
             .iter()
             .filter(|model| {
-                model.provider == "faux" || has_auth_for_provider(&config.auth, &model.provider)
+                model.provider == "faux"
+                    || has_auth_for_provider(&config.auth, &model.provider, None)
             })
             .map(|model| model.provider.clone())
             .collect();

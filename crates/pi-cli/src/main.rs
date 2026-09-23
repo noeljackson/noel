@@ -37,7 +37,7 @@ use pi_config::{
     ConfigPaths, ImageModelDefinition, ImageProviderApi as ConfigImageProviderApi, ImageSettings,
     LoadedConfig, ModelCache, ModelDefinition, ModelRefreshSettings, PackageSource,
     ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, RetrySettings, Settings,
-    TerminalSettings, WarningSettings, ENV_SESSION_DIR,
+    TerminalSettings, WarningSettings, DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR,
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
@@ -331,7 +331,7 @@ async fn generate_image_to_path(
     }
     let model = resolve_image_model_reference(config, model_ref)
         .ok_or_else(|| anyhow!("image model not found: {model_ref}"))?;
-    let auth = auth_for_provider(&config.auth, &model.provider).ok_or_else(|| {
+    let auth = auth_for_provider(&config.auth, &model.provider, None).ok_or_else(|| {
         anyhow!(
             "provider {} requires auth; set auth.json or {}",
             model.provider,
@@ -474,6 +474,7 @@ fn run_auth_login(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let mut provider = None;
+    let mut account = None;
     let mut api_key = None;
     let mut index = 0;
     while index < args.len() {
@@ -484,6 +485,13 @@ fn run_auth_login(args: &[String]) -> Result<()> {
                     return Err(anyhow!("--api-key requires a value"));
                 };
                 api_key = Some(value.clone());
+            }
+            "--account" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(anyhow!("--account requires a value"));
+                };
+                account = Some(value.clone());
             }
             value if value.starts_with('-') => {
                 return Err(anyhow!("unknown login option: {value}"))
@@ -498,6 +506,7 @@ fn run_auth_login(args: &[String]) -> Result<()> {
     }
     let provider =
         provider.ok_or_else(|| anyhow!("usage: pi login <provider> --api-key <key|env:VAR|->"))?;
+    let account = account.unwrap_or_else(|| DEFAULT_ACCOUNT_NAME.to_string());
     let key = match api_key {
         Some(value) if value == "-" => {
             let mut input = String::new();
@@ -520,13 +529,22 @@ fn run_auth_login(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd, None)?;
     let mut auth = read_auth_data(&paths.auth_path)?;
-    auth.insert(provider.clone(), AuthCredential::ApiKey { key });
+    auth.insert(&provider, &account, AuthCredential::ApiKey { key });
     write_auth_data(&paths.auth_path, &auth)?;
     println!(
-        "stored API-key auth for {provider} in {}",
+        "stored API-key auth for {provider}{} in {}",
+        account_suffix(&account),
         paths.auth_path.display()
     );
     Ok(())
+}
+
+fn account_suffix(account: &str) -> String {
+    if account == DEFAULT_ACCOUNT_NAME {
+        String::new()
+    } else {
+        format!(" (account {account})")
+    }
 }
 
 fn run_auth_logout(args: &[String]) -> Result<()> {
@@ -534,17 +552,43 @@ fn run_auth_logout(args: &[String]) -> Result<()> {
         print_auth_help("logout");
         return Ok(());
     }
-    let [provider] = args else {
-        return Err(anyhow!("usage: pi logout <provider>"));
-    };
+    let mut provider = None;
+    let mut account = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--account" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(anyhow!("--account requires a value"));
+                };
+                account = Some(value.clone());
+            }
+            value if value.starts_with('-') => {
+                return Err(anyhow!("unknown logout option: {value}"))
+            }
+            value => {
+                if provider.replace(value.to_string()).is_some() {
+                    return Err(anyhow!("unexpected logout argument: {value}"));
+                }
+            }
+        }
+        index += 1;
+    }
+    let provider =
+        provider.ok_or_else(|| anyhow!("usage: pi logout <provider> [--account <name>]"))?;
+    let account = account.unwrap_or_else(|| DEFAULT_ACCOUNT_NAME.to_string());
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd, None)?;
     let mut auth = read_auth_data(&paths.auth_path)?;
-    if auth.remove(provider).is_some() {
+    if auth.remove(&provider, &account).is_some() {
         write_auth_data(&paths.auth_path, &auth)?;
-        println!("removed stored auth for {provider}");
+        println!(
+            "removed stored auth for {provider}{}",
+            account_suffix(&account)
+        );
     } else {
-        println!("no stored auth for {provider}");
+        println!("no stored auth for {provider}{}", account_suffix(&account));
     }
     Ok(())
 }
@@ -988,7 +1032,10 @@ fn write_auth_data(path: &Path, auth: &AuthData) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, format!("{}\n", serde_json::to_string_pretty(auth)?))?;
+    write_file_atomic(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(auth)?).as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -1032,9 +1079,11 @@ fn print_package_help(command: &str) {
 fn print_auth_help(command: &str) {
     match command {
         "login" => println!(
-            "usage: pi login <provider> [--api-key <key|env:VAR|->]\n\nStore API-key auth in ~/.pi/agent/auth.json. Without --api-key, pi stores env:<provider default> when that environment variable is present."
+            "usage: pi login <provider> [--account <name>] [--api-key <key|env:VAR|->]\n\nStore API-key auth in ~/.pi/agent/auth.json. Without --api-key, pi stores env:<provider default> when that environment variable is present. Without --account, the account is \"default\"."
         ),
-        "logout" => println!("usage: pi logout <provider>\n\nRemove stored provider auth."),
+        "logout" => println!(
+            "usage: pi logout <provider> [--account <name>]\n\nRemove stored provider auth. Without --account, removes the \"default\" account."
+        ),
         _ => {}
     }
 }
@@ -1351,7 +1400,8 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
             anyhow!("--api-key requires --provider, --model, or configured default provider")
         })?;
         config.auth.insert(
-            provider,
+            &provider,
+            DEFAULT_ACCOUNT_NAME,
             AuthCredential::ApiKey {
                 key: api_key.clone(),
             },
@@ -1467,7 +1517,7 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
     let mut refreshed_models = Vec::new();
     let mut diagnostics = Vec::new();
 
-    if let Some(auth) = auth_for_provider(&auth, "anthropic") {
+    if let Some(auth) = auth_for_provider(&auth, "anthropic", None) {
         match fetch_anthropic_models(auth).await {
             Ok(models) => {
                 refreshed_providers.insert("anthropic".to_string());
@@ -1477,7 +1527,7 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
         }
     }
 
-    if let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, "openai") {
+    if let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, "openai", None) {
         match fetch_openai_api_models("openai", ConfigProviderApi::OpenAiResponses, None, &api_key)
             .await
         {
@@ -1489,7 +1539,7 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
         }
     }
 
-    if let Some(auth) = auth_for_provider(&auth, "openai-codex") {
+    if let Some(auth) = auth_for_provider(&auth, "openai-codex", None) {
         match fetch_codex_models(auth).await {
             Ok(models) => {
                 refreshed_providers.insert("openai-codex".to_string());
@@ -2099,7 +2149,7 @@ fn select_initial_model(runtime: &mut Runtime, config: &LoadedConfig, cli: &Cli)
                 config
                     .models
                     .iter()
-                    .find(|model| has_auth_for_provider(&config.auth, &model.provider))
+                    .find(|model| has_auth_for_provider(&config.auth, &model.provider, None))
             })
             .map(|model| ModelRef {
                 provider: model.provider.clone(),
@@ -3708,7 +3758,11 @@ fn apply_tui_selector_selection(
             );
         }
         "logout" => {
-            if config.auth.remove(&item.value).is_some() {
+            if config
+                .auth
+                .remove(&item.value, DEFAULT_ACCOUNT_NAME)
+                .is_some()
+            {
                 write_auth_file(config)?;
                 app.push(
                     TuiEntryKind::System,
@@ -4359,20 +4413,28 @@ async fn handle_tui_submission(
             }
         }
         _ if line.starts_with("/logout") => {
-            let provider = line.trim_start_matches("/logout").trim();
-            if provider.is_empty() {
+            let args = line.trim_start_matches("/logout").trim();
+            if args.is_empty() {
                 open_tui_selector(app, config, runtime, "logout", "")?;
-            } else if config.auth.remove(provider).is_some() {
-                write_auth_file(config)?;
-                app.push(
-                    TuiEntryKind::System,
-                    format!("removed stored auth for {provider}"),
-                );
             } else {
-                app.push(
-                    TuiEntryKind::System,
-                    format!("no stored auth for {provider}"),
-                );
+                let mut parts = args.split_whitespace();
+                let provider = parts.next().unwrap_or_default();
+                let account = parts.next().unwrap_or(DEFAULT_ACCOUNT_NAME);
+                if config.auth.remove(provider, account).is_some() {
+                    write_auth_file(config)?;
+                    app.push(
+                        TuiEntryKind::System,
+                        format!(
+                            "removed stored auth for {provider}{}",
+                            account_suffix(account)
+                        ),
+                    );
+                } else {
+                    app.push(
+                        TuiEntryKind::System,
+                        format!("no stored auth for {provider}{}", account_suffix(account)),
+                    );
+                }
             }
         }
         _ if line.starts_with("/share") => {
@@ -4859,7 +4921,7 @@ fn provider_for_runtime(
         model,
         api: map_provider_api(&definition.api),
         base_url: definition.base_url.clone(),
-        auth: map_provider_auth(auth_for_provider(&config.auth, &definition.provider)),
+        auth: map_provider_auth(auth_for_provider(&config.auth, &definition.provider, None)),
         session_id: Some(runtime.session().session_id.clone()),
     }))
 }
@@ -5365,7 +5427,11 @@ fn select_from_selector_message(
         }
         "auth" | "login" => Ok(format_login_status(config, &item.value)),
         "logout" => {
-            if config.auth.remove(&item.value).is_some() {
+            if config
+                .auth
+                .remove(&item.value, DEFAULT_ACCOUNT_NAME)
+                .is_some()
+            {
                 write_auth_file(config)?;
                 Ok(format!("removed stored auth for {}", item.value))
             } else {
@@ -5431,13 +5497,13 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .map(|provider| SelectorItem {
-                    label: if auth_for_provider(&config.auth, &provider).is_some() {
+                    label: if auth_for_provider(&config.auth, &provider, None).is_some() {
                         format!("{provider}: available")
                     } else {
                         format!("{provider}: missing")
                     },
                     value: provider.clone(),
-                    active: auth_for_provider(&config.auth, &provider).is_some(),
+                    active: auth_for_provider(&config.auth, &provider, None).is_some(),
                 })
                 .collect(),
         )),
@@ -5806,10 +5872,15 @@ fn format_login_status(config: &LoadedConfig, provider: &str) -> String {
     providers
         .into_iter()
         .map(|provider| {
-            let status = if auth_for_provider(&config.auth, &provider).is_some() {
-                "available"
+            let accounts = config.auth.accounts_for_provider(&provider);
+            let status = if accounts.is_empty() {
+                if auth_for_provider(&config.auth, &provider, None).is_some() {
+                    "available".to_string()
+                } else {
+                    "missing".to_string()
+                }
             } else {
-                "missing"
+                format!("accounts: {}", accounts.join(", "))
             };
             format!("{provider}: {status}")
         })

@@ -322,8 +322,8 @@ fn login_commands_manage_api_key_auth() {
         &fs::read_to_string(agent.join("auth.json")).expect("auth settings"),
     )
     .expect("parse auth settings");
-    assert_eq!(auth["anthropic"]["type"], "api_key");
-    assert_eq!(auth["anthropic"]["key"], "env:ANTHROPIC_API_KEY");
+    assert_eq!(auth["anthropic"]["default"]["type"], "api_key");
+    assert_eq!(auth["anthropic"]["default"]["key"], "env:ANTHROPIC_API_KEY");
 
     let logout = pi_command()
         .current_dir(&root)
@@ -341,6 +341,64 @@ fn login_commands_manage_api_key_auth() {
     )
     .expect("parse auth after logout");
     assert!(auth.as_object().expect("auth object").is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn login_logout_round_trip_named_accounts() {
+    let root = test_dir("pi-cli-named-accounts");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+
+    for args in [
+        vec!["login", "anthropic", "--api-key", "personal-key"],
+        vec![
+            "login",
+            "anthropic",
+            "--account",
+            "work",
+            "--api-key",
+            "work-key",
+        ],
+    ] {
+        let login = pi_command()
+            .current_dir(&root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .args(&args)
+            .output()
+            .expect("login anthropic");
+        assert!(
+            login.status.success(),
+            "{}",
+            String::from_utf8_lossy(&login.stderr)
+        );
+    }
+
+    let auth = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(agent.join("auth.json")).expect("auth settings"),
+    )
+    .expect("parse auth settings");
+    assert_eq!(auth["anthropic"]["default"]["key"], "personal-key");
+    assert_eq!(auth["anthropic"]["work"]["key"], "work-key");
+
+    let logout = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["logout", "anthropic", "--account", "work"])
+        .output()
+        .expect("logout work account");
+    assert!(
+        logout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&logout.stderr)
+    );
+    let auth = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(agent.join("auth.json")).expect("auth after logout"),
+    )
+    .expect("parse auth after logout");
+    assert_eq!(auth["anthropic"]["default"]["key"], "personal-key");
+    assert!(auth["anthropic"].get("work").is_none());
 
     let _ = fs::remove_dir_all(root);
 }
