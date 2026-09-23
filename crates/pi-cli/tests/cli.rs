@@ -404,6 +404,68 @@ fn login_logout_round_trip_named_accounts() {
 }
 
 #[test]
+fn accounts_status_prints_table_or_empty_state() {
+    let root = test_dir("pi-cli-accounts-status");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+
+    let base = |args: &[&str]| {
+        let mut command = pi_command();
+        command
+            .current_dir(&root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .env("HOME", &root)
+            .args(args);
+        for name in [
+            "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "CEREBRAS_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "FIREWORKS_API_KEY",
+            "HF_TOKEN",
+            "KIMI_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_CN_API_KEY",
+            "MOONSHOT_API_KEY",
+            "CODEX_API_KEY",
+            "CHATGPT_ACCOUNT_ID",
+            "OPENCODE_API_KEY",
+            "TOGETHER_API_KEY",
+            "AI_GATEWAY_API_KEY",
+            "XAI_API_KEY",
+            "XIAOMI_API_KEY",
+            "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+            "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+            "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+            "ZAI_API_KEY",
+        ] {
+            command.env_remove(name);
+        }
+        command.output().expect("accounts status")
+    };
+
+    let output = base(&["accounts", "status"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "no accounts configured");
+
+    let refresh = base(&["accounts", "status", "--refresh"]);
+    assert!(
+        refresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refresh.stderr)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn continue_reopens_most_recent_session() {
     let root = test_dir("pi-cli-continue");
     let sessions = root.join("sessions");

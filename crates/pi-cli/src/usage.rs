@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use pi_config::{
-    read_usage_cache, write_usage_cache, AccountUsage, Balance, ResolvedAuth, UsageWindow,
+    auth_for_provider, is_expired, listed_accounts_for_provider, read_usage_cache,
+    write_usage_cache, AccountSource, AccountUsage, Balance, LoadedConfig, ResolvedAuth,
+    UsageWindow,
 };
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -458,9 +461,284 @@ fn parse_copilot_usage(body: &str, now: i64) -> Result<AccountUsage, String> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStatusTarget {
+    pub provider: String,
+    pub account: String,
+    pub source: AccountSource,
+}
+
+pub fn account_status_targets(config: &LoadedConfig) -> Vec<AccountStatusTarget> {
+    let mut providers: BTreeSet<String> = config
+        .models
+        .iter()
+        .map(|model| model.provider.clone())
+        .collect();
+    providers.extend(config.auth.providers.keys().cloned());
+    providers
+        .into_iter()
+        .flat_map(|provider| {
+            listed_accounts_for_provider(&config.auth, &provider)
+                .into_iter()
+                .map(move |(account, source)| AccountStatusTarget {
+                    provider: provider.clone(),
+                    account,
+                    source,
+                })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthState {
+    Ok,
+    Expired,
+    Invalid,
+    Missing,
+}
+
+impl AuthState {
+    fn label(self) -> &'static str {
+        match self {
+            AuthState::Ok => "ok",
+            AuthState::Expired => "expired",
+            AuthState::Invalid => "invalid",
+            AuthState::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountStatusRow {
+    pub provider: String,
+    pub account: String,
+    auth_state: AuthState,
+    usage: Option<AccountUsage>,
+    unsupported: bool,
+    error: Option<String>,
+}
+
+pub async fn collect_account_status(
+    config: &LoadedConfig,
+    refresh: bool,
+    endpoint_override: Option<&str>,
+    now: i64,
+) -> Vec<AccountStatusRow> {
+    let client = usage_http_client();
+    let cache_path = config.paths.agent_dir.join("usage-cache.json");
+    let mut rows = Vec::new();
+    for target in account_status_targets(config) {
+        rows.push(
+            probe_account_row(
+                &client,
+                config,
+                &cache_path,
+                &target,
+                refresh,
+                endpoint_override,
+                now,
+            )
+            .await,
+        );
+    }
+    rows
+}
+
+async fn probe_account_row(
+    client: &reqwest::Client,
+    config: &LoadedConfig,
+    cache_path: &Path,
+    target: &AccountStatusTarget,
+    refresh: bool,
+    endpoint_override: Option<&str>,
+    now: i64,
+) -> AccountStatusRow {
+    let base_row = |auth_state, usage, unsupported, error| AccountStatusRow {
+        provider: target.provider.clone(),
+        account: target.account.clone(),
+        auth_state,
+        usage,
+        unsupported,
+        error,
+    };
+    let Some(auth) = auth_for_provider(&config.auth, &target.provider, Some(&target.account))
+    else {
+        return base_row(AuthState::Missing, None, false, None);
+    };
+    let mut auth_state = if is_expired(auth.expires(), now.max(0) as u64) {
+        AuthState::Expired
+    } else {
+        AuthState::Ok
+    };
+    let base_url = config
+        .models
+        .iter()
+        .find(|model| model.provider == target.provider)
+        .and_then(|model| model.base_url.as_deref());
+    match get_usage(
+        client,
+        cache_path,
+        UsageRequest {
+            provider: &target.provider,
+            account: &target.account,
+            auth: &auth,
+            base_url,
+            refresh,
+            endpoint_override,
+        },
+        now,
+    )
+    .await
+    {
+        UsageProbeResult::Usage(usage) => base_row(auth_state, Some(usage), false, None),
+        UsageProbeResult::Unsupported => base_row(auth_state, None, true, None),
+        UsageProbeResult::Failed(reason) => {
+            if reason.contains("status 401") {
+                auth_state = AuthState::Invalid;
+            }
+            base_row(auth_state, None, false, Some(short_reason(&reason)))
+        }
+    }
+}
+
+fn short_reason(reason: &str) -> String {
+    let first_line = reason.lines().next().unwrap_or(reason);
+    const MAX_LEN: usize = 40;
+    if first_line.len() > MAX_LEN {
+        format!("{}…", &first_line[..MAX_LEN])
+    } else {
+        first_line.to_string()
+    }
+}
+
+fn format_relative_duration(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "now".to_string();
+    }
+    let days = seconds / 86_400;
+    let hours = seconds % 86_400 / 3_600;
+    let minutes = seconds % 3_600 / 60;
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn windows_cell(row: &AccountStatusRow) -> String {
+    if row.error.is_some() {
+        return "error".to_string();
+    }
+    if row.unsupported {
+        return "n/a".to_string();
+    }
+    let Some(usage) = &row.usage else {
+        return "-".to_string();
+    };
+    if usage.windows.is_empty() {
+        return "-".to_string();
+    }
+    usage
+        .windows
+        .iter()
+        .map(|window| {
+            let left = (100.0 - window.used_pct).round().clamp(0.0, 100.0) as i64;
+            format!("{}: {left}% left", window.label)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn balance_cell(row: &AccountStatusRow) -> String {
+    if row.error.is_some() {
+        return "-".to_string();
+    }
+    if row.unsupported {
+        return "n/a".to_string();
+    }
+    row.usage
+        .as_ref()
+        .and_then(|usage| usage.balance.as_ref())
+        .map(|balance| format!("{:.2} {}", balance.amount, balance.currency))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn resets_cell(row: &AccountStatusRow, now: i64) -> String {
+    if row.error.is_some() {
+        return "-".to_string();
+    }
+    if row.unsupported {
+        return "n/a".to_string();
+    }
+    let Some(usage) = &row.usage else {
+        return "-".to_string();
+    };
+    let resets = usage
+        .windows
+        .iter()
+        .filter_map(|window| window.resets_at)
+        .map(|resets_at| format_relative_duration(resets_at - now))
+        .collect::<Vec<_>>();
+    if resets.is_empty() {
+        "-".to_string()
+    } else {
+        resets.join(", ")
+    }
+}
+
+pub fn format_account_status(rows: &[AccountStatusRow], now: i64) -> String {
+    if rows.is_empty() {
+        return "no accounts configured".to_string();
+    }
+    let headers = [
+        "provider", "account", "auth", "windows", "balance", "resets", "note",
+    ];
+    let mut cells = Vec::with_capacity(rows.len());
+    for row in rows {
+        cells.push([
+            row.provider.clone(),
+            row.account.clone(),
+            row.auth_state.label().to_string(),
+            windows_cell(row),
+            balance_cell(row),
+            resets_cell(row, now),
+            row.error.clone().unwrap_or_default(),
+        ]);
+    }
+    let mut widths = [0usize; 7];
+    for column in 0..7 {
+        widths[column] = headers[column]
+            .len()
+            .max(cells.iter().map(|row| row[column].len()).max().unwrap_or(0));
+    }
+    let render = |row: &[String; 7]| {
+        row.iter()
+            .enumerate()
+            .map(|(column, cell)| {
+                if column == 6 {
+                    cell.clone()
+                } else {
+                    format!("{cell:<width$}", width = widths[column])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_string()
+    };
+    let mut lines = vec![render(&headers.map(str::to_string))];
+    lines.extend(cells.iter().map(render));
+    lines.push(String::new());
+    lines.push("% = share of window quota remaining".to_string());
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_config::{AuthCredential, AuthData};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -955,6 +1233,240 @@ mod tests {
         }
         assert!(!cache_path.exists());
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn status_test_config(root: &Path, auth: AuthData) -> LoadedConfig {
+        let agent_dir = root.join("agent");
+        LoadedConfig {
+            paths: pi_config::ConfigPaths {
+                cwd: root.to_path_buf(),
+                session_dir: agent_dir.join("sessions"),
+                settings_path: agent_dir.join("settings.json"),
+                project_settings_path: root.join(".pi/settings.json"),
+                auth_path: agent_dir.join("auth.json"),
+                models_path: agent_dir.join("models.json"),
+                model_cache_path: agent_dir.join("model-cache.json"),
+                keybindings_path: agent_dir.join("keybindings.json"),
+                agent_dir,
+            },
+            settings: pi_config::Settings::default(),
+            auth,
+            models: Vec::new(),
+            image_models: Vec::new(),
+            keybindings: Vec::new(),
+            context_files: Vec::new(),
+            extensions: Vec::new(),
+            skills: Vec::new(),
+            prompt_templates: Vec::new(),
+            themes: Vec::new(),
+            diagnostics: Vec::new(),
+            system_prompt: None,
+            append_system_prompt: Vec::new(),
+        }
+    }
+
+    fn status_row(
+        provider: &str,
+        account: &str,
+        auth_state: AuthState,
+        usage: Option<AccountUsage>,
+        unsupported: bool,
+        error: Option<&str>,
+    ) -> AccountStatusRow {
+        AccountStatusRow {
+            provider: provider.to_string(),
+            account: account.to_string(),
+            auth_state,
+            usage,
+            unsupported,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn format_account_status_renders_fixed_width_rows() {
+        let now = 1_799_996_880;
+        let rows = vec![
+            status_row(
+                "openai-codex",
+                "default",
+                AuthState::Ok,
+                Some(AccountUsage {
+                    plan: Some("plus".to_string()),
+                    windows: vec![
+                        UsageWindow {
+                            label: "5h".to_string(),
+                            used_pct: 5.0,
+                            resets_at: Some(1_800_000_000),
+                        },
+                        UsageWindow {
+                            label: "weekly".to_string(),
+                            used_pct: 34.0,
+                            resets_at: Some(1_800_500_000),
+                        },
+                    ],
+                    balance: Some(Balance {
+                        amount: 10.5,
+                        currency: "USD".to_string(),
+                    }),
+                    fetched_at: now - 60,
+                }),
+                false,
+                None,
+            ),
+            status_row(
+                "anthropic",
+                "claude-import",
+                AuthState::Expired,
+                Some(AccountUsage {
+                    plan: None,
+                    windows: vec![UsageWindow {
+                        label: "5h".to_string(),
+                        used_pct: 42.0,
+                        resets_at: None,
+                    }],
+                    balance: None,
+                    fetched_at: now - 60,
+                }),
+                false,
+                None,
+            ),
+            status_row(
+                "openrouter",
+                "env",
+                AuthState::Invalid,
+                None,
+                false,
+                Some("status 401: unauthorized"),
+            ),
+            status_row(
+                "moonshotai",
+                "default",
+                AuthState::Missing,
+                None,
+                false,
+                None,
+            ),
+            status_row("zai-coding", "default", AuthState::Ok, None, true, None),
+        ];
+
+        let output = format_account_status(&rows, now);
+        let lines: Vec<&str> = output.lines().collect();
+        let header = lines[0];
+        let starts: Vec<usize> = [
+            "provider", "account", "auth", "windows", "balance", "resets", "note",
+        ]
+        .iter()
+        .map(|name| header.find(name).expect("header column"))
+        .collect();
+        assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let cell = |line: &str, column: usize| {
+            let end = if column + 1 < starts.len() {
+                starts[column + 1].min(line.len())
+            } else {
+                line.len()
+            };
+            line.get(starts[column].min(line.len())..end)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        assert_eq!(cell(lines[1], 3), "5h: 95% left, weekly: 66% left");
+        assert_eq!(cell(lines[1], 4), "10.50 USD");
+        assert_eq!(cell(lines[1], 5), "52m, 5d19h");
+        assert_eq!(cell(lines[2], 2), "expired");
+        assert_eq!(cell(lines[2], 3), "5h: 58% left");
+        assert_eq!(cell(lines[3], 2), "invalid");
+        assert_eq!(cell(lines[3], 3), "error");
+        assert_eq!(cell(lines[3], 6), "status 401: unauthorized");
+        assert_eq!(cell(lines[4], 2), "missing");
+        assert_eq!(cell(lines[4], 3), "-");
+        assert_eq!(cell(lines[5], 3), "n/a");
+        assert_eq!(cell(lines[5], 4), "n/a");
+        assert_eq!(
+            lines[lines.len() - 1],
+            "% = share of window quota remaining"
+        );
+
+        assert_eq!(format_account_status(&[], now), "no accounts configured");
+    }
+
+    #[test]
+    fn format_relative_duration_formats_compactly() {
+        assert_eq!(format_relative_duration(0), "now");
+        assert_eq!(format_relative_duration(-5), "now");
+        assert_eq!(format_relative_duration(540), "9m");
+        assert_eq!(format_relative_duration(3_120), "52m");
+        assert_eq!(format_relative_duration(11_520), "3h12m");
+        assert_eq!(format_relative_duration(503_120), "5d19h");
+    }
+
+    #[tokio::test]
+    async fn collect_account_status_covers_stored_and_env_accounts() {
+        let root = test_dir("pi-cli-accounts-status");
+        let saved = std::env::var("OPENROUTER_API_KEY").ok();
+        std::env::set_var("OPENROUTER_API_KEY", "or-env-key");
+
+        let mut auth = AuthData::default();
+        auth.insert(
+            "faux",
+            "work",
+            AuthCredential::ApiKey {
+                key: "faux-key".to_string(),
+            },
+        );
+        let mut config = status_test_config(&root, auth);
+        for (provider, id) in [("faux", "echo"), ("openrouter", "or-model")] {
+            config.models.push(pi_config::ModelDefinition {
+                provider: provider.to_string(),
+                id: id.to_string(),
+                name: None,
+                api: pi_config::ProviderApi::Faux,
+                base_url: None,
+            });
+        }
+        let stub = spawn_stub(200, r#"{"data":{"total_credits":10.0,"total_usage":2.5}}"#);
+
+        let rows = collect_account_status(&config, false, Some(&stub.url), 1_000).await;
+        assert_eq!(rows.len(), 2);
+        let faux_row = rows
+            .iter()
+            .find(|row| row.provider == "faux")
+            .expect("faux row");
+        assert_eq!(faux_row.account, "work");
+        assert_eq!(faux_row.auth_state, AuthState::Ok);
+        assert!(faux_row.unsupported);
+
+        let env_row = rows
+            .iter()
+            .find(|row| row.provider == "openrouter")
+            .expect("openrouter row");
+        assert_eq!(env_row.account, "env");
+        assert_eq!(env_row.auth_state, AuthState::Ok);
+        let usage = env_row.usage.as_ref().expect("env row usage");
+        assert_eq!(
+            usage.balance,
+            Some(Balance {
+                amount: 7.5,
+                currency: "USD".to_string()
+            })
+        );
+        assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
+
+        let cached = collect_account_status(&config, false, Some(&stub.url), 1_100).await;
+        assert_eq!(cached.len(), 2);
+        assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
+
+        let refreshed = collect_account_status(&config, true, Some(&stub.url), 1_100).await;
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(stub.hits.load(Ordering::SeqCst), 2);
+
+        match saved {
+            Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
+            None => std::env::remove_var("OPENROUTER_API_KEY"),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

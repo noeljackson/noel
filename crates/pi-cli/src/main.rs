@@ -11,7 +11,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod oauth_refresh;
-#[cfg_attr(not(test), allow(dead_code))]
 mod usage;
 
 use anyhow::{anyhow, Result};
@@ -598,6 +597,45 @@ fn run_auth_logout(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+async fn try_run_accounts_command() -> Result<bool> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) != Some("accounts") {
+        return Ok(false);
+    }
+    run_accounts_status(&args[1..]).await?;
+    Ok(true)
+}
+
+async fn run_accounts_status(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_auth_help("accounts");
+        return Ok(());
+    }
+    let mut action = None;
+    let mut refresh = false;
+    for arg in args {
+        match arg.as_str() {
+            "status" => {
+                if action.replace(()).is_some() {
+                    return Err(anyhow!("unexpected accounts argument: status"));
+                }
+            }
+            "--refresh" => refresh = true,
+            value => return Err(anyhow!("unknown accounts argument: {value}")),
+        }
+    }
+    if action.is_none() {
+        return Err(anyhow!("usage: pi accounts status [--refresh]"));
+    }
+    let cwd = std::env::current_dir()?;
+    let paths = ConfigPaths::discover(cwd, None)?;
+    let config = load_config(paths)?;
+    let now = unix_seconds().unwrap_or(0) as i64;
+    let rows = usage::collect_account_status(&config, refresh, None, now).await;
+    println!("{}", usage::format_account_status(&rows, now));
+    Ok(())
+}
+
 fn run_package_install(args: &[String]) -> Result<()> {
     let (local, rest) = parse_package_scope_args(args)?;
     if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -1089,6 +1127,9 @@ fn print_auth_help(command: &str) {
         "logout" => println!(
             "usage: pi logout <provider> [--account <name>]\n\nRemove stored provider auth. Without --account, removes the \"default\" account."
         ),
+        "accounts" => println!(
+            "usage: pi accounts status [--refresh]\n\nShow auth and quota status for every configured account. --refresh bypasses the 15-minute usage cache."
+        ),
         _ => {}
     }
 }
@@ -1096,6 +1137,9 @@ fn print_auth_help(command: &str) {
 #[tokio::main]
 async fn main() -> Result<()> {
     if try_run_image_command().await? {
+        return Ok(());
+    }
+    if try_run_accounts_command().await? {
         return Ok(());
     }
     if try_run_package_command()? {
@@ -4085,6 +4129,16 @@ async fn handle_tui_submission(
             open_tui_selector(app, config, runtime, "model", "")?
         }
         "/account" => open_tui_selector(app, config, runtime, "account", "")?,
+        "/accounts" => {
+            let checking = app.push_placeholder(
+                TuiEntryKind::System,
+                "checking account status...".to_string(),
+            );
+            redraw_tui(surface.terminal, app, config)?;
+            let now = unix_seconds().unwrap_or(0) as i64;
+            let rows = usage::collect_account_status(config, false, None, now).await;
+            app.replace_entry(checking, usage::format_account_status(&rows, now));
+        }
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
         "/changelog" => app.push(TuiEntryKind::System, format_changelog()),
         "/settings" => open_tui_selector(app, config, runtime, "settings", "")?,
