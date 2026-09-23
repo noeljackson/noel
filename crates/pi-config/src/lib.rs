@@ -1058,6 +1058,55 @@ pub fn has_auth_for_provider(auth: &AuthData, provider: &str, account: Option<&s
     auth_for_provider(auth, provider, account).is_some()
 }
 
+pub fn import_account_name(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "claude-import",
+        _ => "codex-import",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSource {
+    Stored,
+    Environment,
+    ImportedFile,
+}
+
+pub fn listed_accounts_for_provider(
+    auth: &AuthData,
+    provider: &str,
+) -> Vec<(String, AccountSource)> {
+    listed_accounts(
+        auth,
+        provider,
+        env_auth(provider).is_some(),
+        login_auth(provider).is_some(),
+    )
+}
+
+fn listed_accounts(
+    auth: &AuthData,
+    provider: &str,
+    env_present: bool,
+    import_present: bool,
+) -> Vec<(String, AccountSource)> {
+    let mut accounts: Vec<(String, AccountSource)> = auth
+        .accounts_for_provider(provider)
+        .into_iter()
+        .map(|account| (account, AccountSource::Stored))
+        .collect();
+    if env_present && !accounts.iter().any(|(account, _)| account == "env") {
+        accounts.push(("env".to_string(), AccountSource::Environment));
+    }
+    if import_present {
+        let import = import_account_name(provider);
+        if !accounts.iter().any(|(account, _)| account == import) {
+            accounts.push((import.to_string(), AccountSource::ImportedFile));
+        }
+    }
+    accounts
+}
+
 pub fn read_model_cache(path: &Path) -> Result<Option<ModelCache>, ConfigError> {
     read_optional_json::<ModelCache>(path)
 }
@@ -3697,6 +3746,53 @@ mod tests {
         );
 
         restore_env("WORK_OPENAI_KEY", saved.1);
+    }
+
+    #[test]
+    fn listed_accounts_combine_stored_and_pseudo_accounts() {
+        let mut auth = AuthData::default();
+        auth.insert(
+            "openai",
+            "work",
+            AuthCredential::ApiKey {
+                key: "work-key".to_string(),
+            },
+        );
+
+        assert_eq!(
+            listed_accounts(&auth, "openai", false, false),
+            vec![("work".to_string(), AccountSource::Stored)]
+        );
+        assert_eq!(
+            listed_accounts(&auth, "openai", true, true),
+            vec![
+                ("work".to_string(), AccountSource::Stored),
+                ("env".to_string(), AccountSource::Environment),
+                ("codex-import".to_string(), AccountSource::ImportedFile),
+            ]
+        );
+        assert_eq!(
+            listed_accounts(&auth, "anthropic", true, true),
+            vec![
+                ("env".to_string(), AccountSource::Environment),
+                ("claude-import".to_string(), AccountSource::ImportedFile),
+            ]
+        );
+
+        auth.insert(
+            "openai",
+            "env",
+            AuthCredential::ApiKey {
+                key: "stored-env".to_string(),
+            },
+        );
+        assert_eq!(
+            listed_accounts(&auth, "openai", true, false)
+                .iter()
+                .filter(|(account, _)| account == "env")
+                .count(),
+            1
+        );
     }
 
     #[test]

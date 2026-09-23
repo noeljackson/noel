@@ -33,13 +33,14 @@ use pi_ai::{
     ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig,
 };
 use pi_config::{
-    auth_for_provider, codex_client_version, has_auth_for_provider, load_config,
-    load_config_with_project_trust, project_is_trusted, read_model_cache, save_project_trust,
-    write_file_atomic, write_model_cache, AuthCredential, AuthData, CompactionSettings,
-    ConfigPaths, ImageModelDefinition, ImageProviderApi as ConfigImageProviderApi, ImageSettings,
-    LoadedConfig, ModelCache, ModelDefinition, ModelRefreshSettings, PackageSource,
-    ProviderApi as ConfigProviderApi, ResolvedAuth, ResourceFile, RetrySettings, Settings,
-    TerminalSettings, WarningSettings, DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR,
+    auth_for_provider, codex_client_version, has_auth_for_provider, listed_accounts_for_provider,
+    load_config, load_config_with_project_trust, project_is_trusted, read_model_cache,
+    save_project_trust, write_file_atomic, write_model_cache, AccountSource, AuthCredential,
+    AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
+    ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig, ModelCache,
+    ModelDefinition, ModelRefreshSettings, PackageSource, ProviderApi as ConfigProviderApi,
+    ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
+    DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR,
 };
 use pi_core::{
     run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
@@ -1246,6 +1247,7 @@ async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) 
                 match runtime.reload(ReloadableSystems::from_config(&config, next_generation)) {
                     Ok(report) => Ok(serde_json::json!({
                         "activeModelValid": report.active_model_valid,
+                        "activeAccountValid": report.active_account_valid,
                         "removedActiveTools": report.removed_active_tools,
                     })),
                     Err(error) => Err((1, error.to_string())),
@@ -3760,6 +3762,25 @@ fn apply_tui_selector_selection(
                 format_login_status(config, &item.value),
             );
         }
+        "account" => {
+            let account = if item.value.is_empty() {
+                None
+            } else {
+                Some(item.value.clone())
+            };
+            runtime.set_active_account(account)?;
+            app.push(
+                TuiEntryKind::System,
+                format!(
+                    "account: {}",
+                    if item.value.is_empty() {
+                        "auto"
+                    } else {
+                        item.value.as_str()
+                    }
+                ),
+            );
+        }
         "logout" => {
             if config
                 .auth
@@ -4061,6 +4082,7 @@ async fn handle_tui_submission(
         "/model" | "/models" | "/scoped-models" => {
             open_tui_selector(app, config, runtime, "model", "")?
         }
+        "/account" => open_tui_selector(app, config, runtime, "account", "")?,
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
         "/changelog" => app.push(TuiEntryKind::System, format_changelog()),
         "/settings" => open_tui_selector(app, config, runtime, "settings", "")?,
@@ -4140,6 +4162,9 @@ async fn handle_tui_submission(
             if !report.active_model_valid {
                 output
                     .push_str("\nactive model is no longer available; use /model <provider/model>");
+            }
+            if !report.active_account_valid {
+                output.push_str("\nactive account is no longer available; use /account");
             }
             if !report.removed_active_tools.is_empty() {
                 output.push_str(&format!(
@@ -4406,6 +4431,21 @@ async fn handle_tui_submission(
             let (store, state) = SessionStore::import_path(&config.paths.session_dir, &path)?;
             runtime.replace_session(state, Some(store));
             app.push(TuiEntryKind::System, format_session(runtime));
+        }
+        _ if line.starts_with("/account ") => {
+            let account = line.trim_start_matches("/account ").trim();
+            runtime.set_active_account(if account.is_empty() {
+                None
+            } else {
+                Some(account.to_string())
+            })?;
+            app.push(
+                TuiEntryKind::System,
+                format!(
+                    "account: {}",
+                    if account.is_empty() { "auto" } else { account }
+                ),
+            );
         }
         _ if line.starts_with("/login") => {
             let provider = line.trim_start_matches("/login").trim();
@@ -4926,6 +4966,7 @@ async fn provider_for_runtime(
         &config.paths.auth_path,
         &config.auth,
         &definition.provider,
+        runtime.session().active_account.as_deref(),
         None,
         unix_seconds().unwrap_or(0),
     )
@@ -5226,7 +5267,10 @@ fn compact_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &Edito
             .session()
             .active_model
             .as_ref()
-            .map(|model| format!("{}/{}", model.provider, model.id))
+            .map(|model| match &runtime.session().active_account {
+                Some(account) => format!("{}/{}@{account}", model.provider, model.id),
+                None => format!("{}/{}", model.provider, model.id),
+            })
             .unwrap_or_else(|| "-".to_string()),
         active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string()),
         config
@@ -5442,6 +5486,22 @@ fn select_from_selector_message(
             Ok(format_session(runtime))
         }
         "auth" | "login" => Ok(format_login_status(config, &item.value)),
+        "account" => {
+            let account = if item.value.is_empty() {
+                None
+            } else {
+                Some(item.value.clone())
+            };
+            runtime.set_active_account(account)?;
+            Ok(format!(
+                "account: {}",
+                if item.value.is_empty() {
+                    "auto"
+                } else {
+                    item.value.as_str()
+                }
+            ))
+        }
         "logout" => {
             if config
                 .auth
@@ -5523,6 +5583,10 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
                 })
                 .collect(),
         )),
+        "account" => Ok(Selector::new(
+            "account",
+            account_selector_items(config, runtime),
+        )),
         "settings" => Ok(Selector::new("settings", settings_selector_items(config))),
         _ => Err(anyhow!("unknown selector: {kind}")),
     }
@@ -5536,6 +5600,34 @@ fn sorted_models(models: &[ModelDefinition]) -> Vec<&ModelDefinition> {
             .then_with(|| left.id.cmp(&right.id))
     });
     models
+}
+
+fn account_selector_items(config: &LoadedConfig, runtime: &Runtime) -> Vec<SelectorItem> {
+    let Some(model) = runtime.session().active_model.clone() else {
+        return Vec::new();
+    };
+    let active = runtime.session().active_account.as_deref();
+    let mut items = vec![SelectorItem {
+        label: "auto (default resolution)".to_string(),
+        value: String::new(),
+        active: active.is_none(),
+    }];
+    items.extend(
+        listed_accounts_for_provider(&config.auth, &model.provider)
+            .into_iter()
+            .map(|(account, source)| SelectorItem {
+                label: match source {
+                    AccountSource::Stored => account.clone(),
+                    AccountSource::Environment => format!("{account} (environment, read-only)"),
+                    AccountSource::ImportedFile => {
+                        format!("{account} (imported login file, read-only)")
+                    }
+                },
+                active: active == Some(account.as_str()),
+                value: account,
+            }),
+    );
+    items
 }
 
 fn settings_selector_items(config: &LoadedConfig) -> Vec<SelectorItem> {
@@ -6213,6 +6305,141 @@ mod tests {
         for verbose in ["model:", "thinking:", "theme:", "queue:", "history:"] {
             assert!(!footer.contains(verbose));
         }
+    }
+
+    fn account_test_config(auth: AuthData) -> LoadedConfig {
+        LoadedConfig {
+            paths: test_config_paths(),
+            settings: Settings::default(),
+            auth,
+            models: Vec::new(),
+            image_models: Vec::new(),
+            keybindings: Vec::new(),
+            context_files: Vec::new(),
+            extensions: Vec::new(),
+            skills: Vec::new(),
+            prompt_templates: Vec::new(),
+            themes: Vec::new(),
+            diagnostics: Vec::new(),
+            system_prompt: None,
+            append_system_prompt: Vec::new(),
+        }
+    }
+
+    fn account_test_runtime(provider: &str, active_account: Option<&str>) -> Runtime {
+        let mut session = SessionState::new("session-1", PathBuf::from("."));
+        session.active_model = Some(ModelRef {
+            provider: provider.to_string(),
+            id: "echo".to_string(),
+        });
+        session.active_account = active_account.map(str::to_string);
+        Runtime::new(session, ReloadableSystems::default())
+    }
+
+    #[test]
+    fn account_selector_lists_stored_accounts_with_auto_entry() {
+        let mut auth = AuthData::default();
+        auth.insert(
+            "faux",
+            "default",
+            AuthCredential::ApiKey {
+                key: "default-key".to_string(),
+            },
+        );
+        auth.insert(
+            "faux",
+            "work",
+            AuthCredential::ApiKey {
+                key: "work-key".to_string(),
+            },
+        );
+        let config = account_test_config(auth);
+        let runtime = account_test_runtime("faux", Some("work"));
+
+        let items = account_selector_items(&config, &runtime);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.label.as_str(), item.value.as_str(), item.active))
+                .collect::<Vec<_>>(),
+            vec![
+                ("auto (default resolution)", "", false),
+                ("default", "default", false),
+                ("work", "work", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn account_selector_labels_env_pseudo_account() {
+        let saved = std::env::var("OPENROUTER_API_KEY").ok();
+        std::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key");
+        let config = account_test_config(AuthData::default());
+        let runtime = account_test_runtime("openrouter", None);
+
+        let items = account_selector_items(&config, &runtime);
+        assert!(items.iter().any(|item| {
+            item.value == "env" && item.label == "env (environment, read-only)" && !item.active
+        }));
+        assert!(items[0].active);
+
+        match saved {
+            Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
+            None => std::env::remove_var("OPENROUTER_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn status_line_marks_bound_account() {
+        let config = account_test_config(AuthData::default());
+        let runtime = account_test_runtime("openai-codex", Some("work"));
+        let editor = EditorState::default();
+
+        let footer = footer_status(&config, &runtime, &editor);
+        assert!(footer.starts_with("openai-codex/echo@work "), "{footer}");
+    }
+
+    #[test]
+    fn select_account_message_binds_and_clears_account() {
+        let mut auth = AuthData::default();
+        auth.insert(
+            "faux",
+            "work",
+            AuthCredential::ApiKey {
+                key: "work-key".to_string(),
+            },
+        );
+        let mut config = account_test_config(auth);
+        let mut runtime = account_test_runtime("faux", None);
+
+        let message =
+            select_from_selector_message(&mut config, &mut runtime, "/select account work")
+                .expect("select account");
+        assert_eq!(message, "account: work");
+        assert_eq!(runtime.session().active_account, Some("work".to_string()));
+
+        let message =
+            select_from_selector_message(&mut config, &mut runtime, "/select account auto")
+                .expect("clear account");
+        assert_eq!(message, "account: auto");
+        assert_eq!(runtime.session().active_account, None);
+    }
+
+    #[tokio::test]
+    async fn provider_construction_tolerates_bound_account_without_matching_credential() {
+        let mut config = account_test_config(AuthData::default());
+        config.models.push(ModelDefinition {
+            provider: "faux".to_string(),
+            id: "echo".to_string(),
+            name: None,
+            api: ConfigProviderApi::Faux,
+            base_url: None,
+        });
+        let runtime = account_test_runtime("faux", Some("work"));
+
+        provider_for_runtime(&runtime, &config, false)
+            .await
+            .expect("faux provider builds regardless of account binding");
     }
 
     #[test]

@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use pi_config::{
-    auth_for_provider, expires_within, is_expired, write_file_atomic, AuthCredential, AuthData,
-    ResolvedAuth,
+    auth_for_provider, expires_within, import_account_name, is_expired, write_file_atomic,
+    AuthCredential, AuthData, ResolvedAuth,
 };
 use serde::Deserialize;
 
@@ -42,16 +42,10 @@ fn token_endpoint(provider: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-fn import_account_name(provider: &str) -> &'static str {
-    match provider {
-        "anthropic" => "claude-import",
-        _ => "codex-import",
-    }
-}
-
-fn persisted_account_name(auth: &AuthData, provider: &str) -> String {
-    auth.account_for_resolution(provider)
+fn persisted_account_name(auth: &AuthData, provider: &str, bound: Option<&str>) -> String {
+    bound
         .map(str::to_string)
+        .or_else(|| auth.account_for_resolution(provider).map(str::to_string))
         .unwrap_or_else(|| import_account_name(provider).to_string())
 }
 
@@ -222,16 +216,17 @@ pub async fn refresh_expiring_auth(
     auth_path: &Path,
     auth: &AuthData,
     provider: &str,
+    account: Option<&str>,
     endpoint_override: Option<(&str, &str)>,
     now: u64,
 ) -> Result<Option<ResolvedAuth>> {
-    let Some(resolved) = auth_for_provider(auth, provider, None) else {
+    let Some(resolved) = auth_for_provider(auth, provider, account) else {
         return Ok(None);
     };
     if !expires_within(resolved.expires(), now, REFRESH_WINDOW_SECONDS) {
         return Ok(Some(resolved));
     }
-    let account = persisted_account_name(auth, provider);
+    let account = persisted_account_name(auth, provider, account);
     if !needs_refresh(&resolved, now) {
         if is_expired(resolved.expires(), now) {
             return Err(refresh_failure(
@@ -532,6 +527,7 @@ mod tests {
             &auth_path,
             &auth,
             "openai-codex",
+            None,
             Some((&stub.url, "test-client")),
             1_000,
         )
@@ -568,6 +564,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_expiring_auth_persists_under_bound_account() {
+        let root = test_dir("pi-cli-oauth-bound-account");
+        let auth_path = root.join("agent").join("auth.json");
+        let stub = spawn_stub(
+            200,
+            r#"{"access_token":"work-access","refresh_token":"work-refresh","expires_in":3600}"#,
+        );
+        let auth = expired_stored_auth("openai-codex", "work");
+        let client = reqwest::Client::new();
+
+        let resolved = refresh_expiring_auth(
+            &client,
+            &auth_path,
+            &auth,
+            "openai-codex",
+            Some("work"),
+            Some((&stub.url, "test-client")),
+            1_000,
+        )
+        .await
+        .expect("refresh")
+        .expect("auth");
+        assert_eq!(resolved.refresh_token(), Some("work-refresh"));
+
+        let persisted = read_auth_file(&auth_path);
+        assert!(persisted
+            .credential("openai-codex", "work")
+            .is_some_and(|credential| {
+                matches!(
+                    credential,
+                    AuthCredential::OAuth { access_token, .. } if access_token == "work-access"
+                )
+            }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn refresh_expiring_auth_collapses_concurrent_refreshes() {
         let root = test_dir("pi-cli-oauth-single-flight");
         let auth_path = root.join("agent").join("auth.json");
@@ -584,6 +618,7 @@ mod tests {
                 &auth_path,
                 &auth,
                 "openai-codex",
+                None,
                 Some((&stub.url, "test-client")),
                 1_000,
             ),
@@ -592,6 +627,7 @@ mod tests {
                 &auth_path,
                 &auth,
                 "openai-codex",
+                None,
                 Some((&stub.url, "test-client")),
                 1_000,
             ),
@@ -627,6 +663,7 @@ mod tests {
             &auth_path,
             &auth,
             "openai-codex",
+            None,
             Some((&stub.url, "test-client")),
             1_000,
         )
@@ -656,9 +693,10 @@ mod tests {
         );
         let client = reqwest::Client::new();
 
-        let error = refresh_expiring_auth(&client, &auth_path, &auth, "anthropic", None, 5_000)
-            .await
-            .expect_err("expired token without refresh token should fail");
+        let error =
+            refresh_expiring_auth(&client, &auth_path, &auth, "anthropic", None, None, 5_000)
+                .await
+                .expect_err("expired token without refresh token should fail");
         let message = error.to_string();
         assert!(message.contains("account default"), "{message}");
         assert!(message.contains("claude login"), "{message}");
@@ -693,6 +731,7 @@ mod tests {
             &auth_path,
             &auth,
             "anthropic",
+            None,
             Some((&stub.url, "test-client")),
             1_000,
         )

@@ -277,6 +277,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "show auth status",
     },
     CommandHelp {
+        command: "/account [name]",
+        description: "switch auth account for the active provider",
+    },
+    CommandHelp {
         command: "/logout <provider>",
         description: "remove stored auth",
     },

@@ -11,7 +11,7 @@ use pi_ai::{
     ChatMessage, ChatRole, ChatToolCall, MediaInput, ModelRef, Provider, ProviderError,
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
 };
-use pi_config::{has_auth_for_provider, LoadedConfig, ResourceFile};
+use pi_config::{has_auth_for_provider, listed_accounts_for_provider, LoadedConfig, ResourceFile};
 use pi_tools::{
     builtin_tool_definitions, execute_tool, ToolError, ToolRequest, ToolRuntimeOptions,
 };
@@ -68,6 +68,8 @@ pub struct SessionState {
     pub active_model: Option<ModelRef>,
     #[serde(default)]
     pub active_thinking_level: Option<String>,
+    #[serde(default)]
+    pub active_account: Option<String>,
     pub active_tool_names: BTreeSet<String>,
 }
 
@@ -86,6 +88,7 @@ impl SessionState {
             branch_summaries: Vec::new(),
             active_model: None,
             active_thinking_level: None,
+            active_account: None,
             active_tool_names: builtin_tool_definitions()
                 .into_iter()
                 .map(|definition| definition.name)
@@ -123,6 +126,8 @@ pub struct SessionExport {
     pub active_model: Option<ModelRef>,
     #[serde(default)]
     pub active_thinking_level: Option<String>,
+    #[serde(default)]
+    pub active_account: Option<String>,
     pub active_tool_names: BTreeSet<String>,
 }
 
@@ -141,6 +146,7 @@ impl From<&SessionState> for SessionExport {
             branch_summaries: state.branch_summaries.clone(),
             active_model: state.active_model.clone(),
             active_thinking_level: state.active_thinking_level.clone(),
+            active_account: state.active_account.clone(),
             active_tool_names: state.active_tool_names.clone(),
         }
     }
@@ -160,6 +166,7 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         branch_summaries: export.branch_summaries,
         active_model: export.active_model,
         active_thinking_level: export.active_thinking_level,
+        active_account: export.active_account,
         active_tool_names: export.active_tool_names,
     }
 }
@@ -195,6 +202,7 @@ pub struct ReloadableSystems {
     pub context_messages: Vec<String>,
     pub available_models: Vec<ModelRef>,
     pub configured_providers: BTreeSet<String>,
+    pub available_accounts: BTreeMap<String, Vec<String>>,
     pub available_tool_names: BTreeSet<String>,
     pub extension_tools: BTreeMap<String, ExtensionTool>,
     pub keybinding_generation: u64,
@@ -249,6 +257,20 @@ impl ReloadableSystems {
             })
             .map(|model| model.provider.clone())
             .collect();
+        let available_accounts = config
+            .models
+            .iter()
+            .map(|model| model.provider.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|provider| {
+                let accounts = listed_accounts_for_provider(&config.auth, &provider)
+                    .into_iter()
+                    .map(|(account, _)| account)
+                    .collect();
+                (provider, accounts)
+            })
+            .collect();
         let extension_tools = extension_tools_from_resources(&config.extensions);
         let available_tool_names = match &config.settings.enabled_tools {
             Some(enabled_tools) => enabled_tools.iter().cloned().collect(),
@@ -271,6 +293,7 @@ impl ReloadableSystems {
             context_messages,
             available_models,
             configured_providers,
+            available_accounts,
             available_tool_names,
             extension_tools,
             keybinding_generation: generation,
@@ -303,6 +326,7 @@ impl ReloadableSystems {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadReport {
     pub active_model_valid: bool,
+    pub active_account_valid: bool,
     pub removed_active_tools: Vec<String>,
 }
 
@@ -384,6 +408,9 @@ enum SessionRecord {
     },
     ActiveModel {
         model: Option<ModelRef>,
+    },
+    ActiveAccount {
+        account: Option<String>,
     },
     ActiveThinkingLevel {
         level: Option<String>,
@@ -510,6 +537,10 @@ impl SessionStore {
 
     pub fn record_active_model(&self, model: Option<ModelRef>) -> Result<(), SessionError> {
         self.append(&SessionRecord::ActiveModel { model })
+    }
+
+    pub fn record_active_account(&self, account: Option<String>) -> Result<(), SessionError> {
+        self.append(&SessionRecord::ActiveAccount { account })
     }
 
     pub fn record_active_thinking_level(&self, level: Option<String>) -> Result<(), SessionError> {
@@ -727,6 +758,11 @@ impl SessionStore {
                         state.active_model = model;
                     }
                 }
+                SessionRecord::ActiveAccount { account } => {
+                    if let Some(state) = &mut state {
+                        state.active_account = account;
+                    }
+                }
                 SessionRecord::ActiveThinkingLevel { level } => {
                     if let Some(state) = &mut state {
                         state.active_thinking_level = level;
@@ -773,6 +809,7 @@ impl SessionStore {
         })?;
         self.record_metadata(state)?;
         self.record_active_model(state.active_model.clone())?;
+        self.record_active_account(state.active_account.clone())?;
         self.record_active_thinking_level(state.active_thinking_level.clone())?;
         self.record_active_tools(state.active_tool_names.iter().cloned().collect())?;
         for message in &state.messages {
@@ -1457,6 +1494,14 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn set_active_account(&mut self, account: Option<String>) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_active_account(account.clone())?;
+        }
+        self.session.active_account = account;
+        Ok(())
+    }
+
     pub fn set_active_thinking_level(&mut self, level: Option<String>) -> Result<(), SessionError> {
         if let Some(store) = &self.store {
             store.record_active_thinking_level(level.clone())?;
@@ -1580,6 +1625,15 @@ impl Runtime {
                     .any(|candidate| candidate == model)
             })
             .unwrap_or(true);
+        let active_account_valid = match (&self.session.active_account, &self.session.active_model)
+        {
+            (Some(account), Some(model)) => next
+                .available_accounts
+                .get(&model.provider)
+                .map(|accounts| accounts.contains(account))
+                .unwrap_or(false),
+            _ => true,
+        };
         let removed_active_tools = self
             .session
             .active_tool_names
@@ -1591,6 +1645,7 @@ impl Runtime {
         self.systems = next;
         Ok(ReloadReport {
             active_model_valid,
+            active_account_valid,
             removed_active_tools,
         })
     }
@@ -2553,6 +2608,65 @@ mod tests {
                 id: "removed".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn reload_reports_invalid_active_account_without_clearing_it() {
+        let mut session = SessionState::new("session-1", PathBuf::from("/repo"));
+        session.active_model = Some(ModelRef {
+            provider: "openai".to_string(),
+            id: "gpt-test".to_string(),
+        });
+        session.active_account = Some("work".to_string());
+
+        let mut runtime = Runtime::new(session, ReloadableSystems::default());
+        let report = runtime
+            .reload(ReloadableSystems {
+                config_generation: 1,
+                available_models: vec![ModelRef {
+                    provider: "openai".to_string(),
+                    id: "gpt-test".to_string(),
+                }],
+                available_accounts: BTreeMap::from([(
+                    "openai".to_string(),
+                    vec!["default".to_string()],
+                )]),
+                ..ReloadableSystems::default()
+            })
+            .expect("reload should keep the session and report invalid account");
+
+        assert!(report.active_model_valid);
+        assert!(!report.active_account_valid);
+        assert_eq!(runtime.session().active_account, Some("work".to_string()));
+    }
+
+    #[test]
+    fn session_store_round_trips_active_account() {
+        let base = std::env::temp_dir().join(format!("pi-session-test-{}", new_session_id()));
+        let (store, _state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        store
+            .record_active_account(Some("work".to_string()))
+            .expect("record account");
+
+        let path = store.path().to_path_buf();
+        let (_store, loaded) = SessionStore::open(path.clone()).expect("open session");
+        assert_eq!(loaded.active_account, Some("work".to_string()));
+
+        let mut runtime = Runtime::new(loaded, ReloadableSystems::default());
+        runtime.set_store(store);
+        runtime
+            .set_active_account(Some("default".to_string()))
+            .expect("set account");
+        assert_eq!(
+            runtime.session().active_account,
+            Some("default".to_string())
+        );
+
+        let (_store, reloaded) = SessionStore::open(path).expect("reopen journaled session");
+        assert_eq!(reloaded.active_account, Some("default".to_string()));
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
