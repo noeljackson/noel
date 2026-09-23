@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod oauth_refresh;
+
 use anyhow::{anyhow, Result};
 use base64::Engine;
 #[cfg(test)]
@@ -4615,7 +4617,7 @@ async fn run_prompt_once_tui(
         },
     );
     redraw_tui(surface.terminal, app, config)?;
-    let provider = provider_for_runtime(runtime, config, offline)?;
+    let provider = provider_for_runtime(runtime, config, offline).await?;
     let message_start = runtime.session().messages.len();
     if kind == TuiEntryKind::Tool {
         let tool_prompt = prompt.clone();
@@ -4846,7 +4848,7 @@ async fn run_prompt_once(
     offline: bool,
     stream_output: bool,
 ) -> Result<String> {
-    let provider = provider_for_runtime(runtime, config, offline)?;
+    let provider = provider_for_runtime(runtime, config, offline).await?;
     if !stream_output {
         if media.is_empty() {
             return run_user_turn(runtime, provider.as_ref(), prompt)
@@ -4887,7 +4889,7 @@ async fn run_prompt_once(
     Ok(response)
 }
 
-fn provider_for_runtime(
+async fn provider_for_runtime(
     runtime: &Runtime,
     config: &LoadedConfig,
     offline: bool,
@@ -4916,13 +4918,25 @@ fn provider_for_runtime(
             )
         })?;
     let thinking_level = active_thinking_level(runtime, config, &model);
+    let resolved_auth = oauth_refresh::refresh_expiring_auth(
+        &reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
+        &config.paths.auth_path,
+        &config.auth,
+        &definition.provider,
+        None,
+        unix_seconds().unwrap_or(0),
+    )
+    .await?;
     Ok(create_provider(ProviderConfig {
         thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
         thinking_level,
         model,
         api: map_provider_api(&definition.api),
         base_url: definition.base_url.clone(),
-        auth: map_provider_auth(auth_for_provider(&config.auth, &definition.provider, None)),
+        auth: map_provider_auth(resolved_auth),
         session_id: Some(runtime.session().session_id.clone()),
     }))
 }

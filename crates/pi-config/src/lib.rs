@@ -603,15 +603,20 @@ impl AuthData {
         self.providers.is_empty()
     }
 
-    fn default_credential(&self, provider: &str) -> Option<&AuthCredential> {
+    pub fn account_for_resolution(&self, provider: &str) -> Option<&str> {
         let accounts = self.providers.get(provider)?;
-        if let Some(credential) = accounts.get(DEFAULT_ACCOUNT_NAME) {
-            return Some(credential);
+        if accounts.contains_key(DEFAULT_ACCOUNT_NAME) {
+            return Some(DEFAULT_ACCOUNT_NAME);
         }
         match accounts.len() {
-            1 => accounts.values().next(),
+            1 => accounts.keys().next().map(String::as_str),
             _ => None,
         }
+    }
+
+    fn default_credential(&self, provider: &str) -> Option<&AuthCredential> {
+        self.account_for_resolution(provider)
+            .and_then(|account| self.credential(provider, account))
     }
 }
 
@@ -3692,6 +3697,42 @@ mod tests {
         );
 
         restore_env("WORK_OPENAI_KEY", saved.1);
+    }
+
+    #[test]
+    fn account_for_resolution_mirrors_default_resolution() {
+        let mut auth = AuthData::default();
+        assert_eq!(auth.account_for_resolution("openai"), None);
+
+        auth.insert(
+            "openai",
+            "work",
+            AuthCredential::ApiKey {
+                key: "work-key".to_string(),
+            },
+        );
+        assert_eq!(auth.account_for_resolution("openai"), Some("work"));
+
+        auth.insert(
+            "openai",
+            "personal",
+            AuthCredential::ApiKey {
+                key: "personal-key".to_string(),
+            },
+        );
+        assert_eq!(auth.account_for_resolution("openai"), None);
+
+        auth.insert(
+            "openai",
+            DEFAULT_ACCOUNT_NAME,
+            AuthCredential::ApiKey {
+                key: "default-key".to_string(),
+            },
+        );
+        assert_eq!(
+            auth.account_for_resolution("openai"),
+            Some(DEFAULT_ACCOUNT_NAME)
+        );
     }
 
     #[test]
