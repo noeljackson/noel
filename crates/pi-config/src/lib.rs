@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
 pub const APP_NAME: &str = "pi";
 pub const CONFIG_DIR_NAME: &str = ".pi";
 pub const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
@@ -659,11 +661,41 @@ pub enum ResolvedAuth {
     ApiKey(String),
     ClaudeCodeOAuth {
         access_token: String,
+        refresh_token: Option<String>,
+        expires: u64,
     },
     ChatGptOAuth {
         access_token: String,
+        refresh_token: Option<String>,
+        expires: u64,
         account_id: Option<String>,
     },
+}
+
+impl ResolvedAuth {
+    pub fn refresh_token(&self) -> Option<&str> {
+        match self {
+            ResolvedAuth::ClaudeCodeOAuth { refresh_token, .. }
+            | ResolvedAuth::ChatGptOAuth { refresh_token, .. } => refresh_token.as_deref(),
+            ResolvedAuth::ApiKey(_) => None,
+        }
+    }
+
+    pub fn expires(&self) -> u64 {
+        match self {
+            ResolvedAuth::ClaudeCodeOAuth { expires, .. }
+            | ResolvedAuth::ChatGptOAuth { expires, .. } => *expires,
+            ResolvedAuth::ApiKey(_) => 0,
+        }
+    }
+}
+
+pub fn is_expired(expires: u64, now: u64) -> bool {
+    expires != 0 && now >= expires
+}
+
+pub fn expires_within(expires: u64, now: u64, within_seconds: u64) -> bool {
+    expires != 0 && now.saturating_add(within_seconds) >= expires
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1002,11 +1034,14 @@ pub fn auth_for_provider(
             AuthCredential::ApiKey { key } => Some(ResolvedAuth::ApiKey(resolve_config_value(key))),
             AuthCredential::OAuth {
                 access_token,
+                refresh_token,
+                expires,
                 account_id,
-                ..
             } => Some(oauth_for_provider(
                 provider,
                 resolve_config_value(access_token),
+                refresh_token.as_deref().map(resolve_config_value),
+                *expires,
                 account_id.clone(),
             )),
         };
@@ -1124,7 +1159,11 @@ fn env_auth(provider: &str) -> Option<ResolvedAuth> {
         "anthropic" => read_non_empty_env("ANTHROPIC_OAUTH_TOKEN")
             .or_else(|| read_non_empty_env("ANTHROPIC_AUTH_TOKEN"))
             .or_else(|| read_non_empty_env("CLAUDE_CODE_OAUTH_TOKEN"))
-            .map(|access_token| ResolvedAuth::ClaudeCodeOAuth { access_token })
+            .map(|access_token| ResolvedAuth::ClaudeCodeOAuth {
+                access_token,
+                refresh_token: None,
+                expires: 0,
+            })
             .or_else(|| env_api_key(provider).map(ResolvedAuth::ApiKey)),
         "openai" => env_api_key(provider)
             .map(ResolvedAuth::ApiKey)
@@ -1133,6 +1172,8 @@ fn env_auth(provider: &str) -> Option<ResolvedAuth> {
                 read_non_empty_env("CODEX_ACCESS_TOKEN").map(|access_token| {
                     ResolvedAuth::ChatGptOAuth {
                         access_token,
+                        refresh_token: None,
+                        expires: 0,
                         account_id: read_non_empty_env("CHATGPT_ACCOUNT_ID"),
                     }
                 })
@@ -1140,6 +1181,8 @@ fn env_auth(provider: &str) -> Option<ResolvedAuth> {
         "openai-codex" => read_non_empty_env("CODEX_ACCESS_TOKEN").map(|access_token| {
             ResolvedAuth::ChatGptOAuth {
                 access_token,
+                refresh_token: None,
+                expires: 0,
                 account_id: read_non_empty_env("CHATGPT_ACCOUNT_ID"),
             }
         }),
@@ -1158,16 +1201,26 @@ fn login_auth(provider: &str) -> Option<ResolvedAuth> {
 fn oauth_for_provider(
     provider: &str,
     access_token: String,
+    refresh_token: Option<String>,
+    expires: u64,
     account_id: Option<String>,
 ) -> ResolvedAuth {
     match provider {
-        "anthropic" => ResolvedAuth::ClaudeCodeOAuth { access_token },
+        "anthropic" => ResolvedAuth::ClaudeCodeOAuth {
+            access_token,
+            refresh_token,
+            expires,
+        },
         "openai" => ResolvedAuth::ChatGptOAuth {
             access_token,
+            refresh_token,
+            expires,
             account_id,
         },
         "openai-codex" => ResolvedAuth::ChatGptOAuth {
             access_token,
+            refresh_token,
+            expires,
             account_id,
         },
         _ => ResolvedAuth::ApiKey(access_token),
@@ -1195,6 +1248,10 @@ struct ClaudeCredentialsFile {
 #[serde(rename_all = "camelCase")]
 struct ClaudeAiOAuth {
     access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at: Option<u64>,
 }
 
 fn read_claude_code_oauth() -> Option<ResolvedAuth> {
@@ -1206,11 +1263,15 @@ fn read_claude_code_oauth_from_path(path: &Path) -> Option<ResolvedAuth> {
     let credentials = read_optional_json::<ClaudeCredentialsFile>(path)
         .ok()
         .flatten()?;
-    let access_token = credentials.claude_ai_oauth?.access_token;
-    if access_token.trim().is_empty() {
+    let oauth = credentials.claude_ai_oauth?;
+    if oauth.access_token.trim().is_empty() {
         return None;
     }
-    Some(ResolvedAuth::ClaudeCodeOAuth { access_token })
+    Some(ResolvedAuth::ClaudeCodeOAuth {
+        access_token: oauth.access_token,
+        refresh_token: non_empty(oauth.refresh_token),
+        expires: oauth.expires_at.map(|millis| millis / 1000).unwrap_or(0),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1221,6 +1282,8 @@ struct CodexAuthFile {
 #[derive(Debug, Deserialize)]
 struct CodexAuthTokens {
     access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
     #[serde(default)]
     account_id: Option<String>,
 }
@@ -1236,10 +1299,27 @@ fn read_codex_chatgpt_oauth_from_path(path: &Path) -> Option<ResolvedAuth> {
     if tokens.access_token.trim().is_empty() {
         return None;
     }
+    let expires = jwt_exp_claim(&tokens.access_token).unwrap_or(0);
     Some(ResolvedAuth::ChatGptOAuth {
         access_token: tokens.access_token,
+        refresh_token: non_empty(tokens.refresh_token),
+        expires,
         account_id: tokens.account_id,
     })
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn jwt_exp_claim(token: &str) -> Option<u64> {
+    let parts = token.split('.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let payload = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
+    payload.get("exp").and_then(serde_json::Value::as_u64)
 }
 
 fn read_optional_settings(path: &Path) -> Result<Option<Settings>, ConfigError> {
@@ -3306,13 +3386,17 @@ mod tests {
         assert_eq!(
             auth_for_provider(&auth, "anthropic", None),
             Some(ResolvedAuth::ClaudeCodeOAuth {
-                access_token: "claude-token".to_string()
+                access_token: "claude-token".to_string(),
+                refresh_token: None,
+                expires: 0,
             })
         );
         assert_eq!(
             auth_for_provider(&auth, "openai", None),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "codex-token".to_string(),
+                refresh_token: Some("codex-refresh".to_string()),
+                expires: 0,
                 account_id: Some("account-id".to_string())
             })
         );
@@ -3359,6 +3443,8 @@ mod tests {
             auth_for_provider(&auth, "openai-codex", None),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "stored-codex-access-token".to_string(),
+                refresh_token: Some("stored-codex-refresh-token".to_string()),
+                expires: 4102444800000,
                 account_id: Some("account-id".to_string())
             })
         );
@@ -3384,7 +3470,9 @@ mod tests {
         assert_eq!(
             auth_for_provider(&AuthData::default(), "anthropic", None),
             Some(ResolvedAuth::ClaudeCodeOAuth {
-                access_token: "claude-oauth-env-token".to_string()
+                access_token: "claude-oauth-env-token".to_string(),
+                refresh_token: None,
+                expires: 0,
             })
         );
         assert_eq!(
@@ -3427,13 +3515,17 @@ mod tests {
         assert_eq!(
             read_claude_code_oauth_from_path(&root.join(".claude").join(".credentials.json")),
             Some(ResolvedAuth::ClaudeCodeOAuth {
-                access_token: "claude-access".to_string()
+                access_token: "claude-access".to_string(),
+                refresh_token: Some("redacted".to_string()),
+                expires: 0,
             })
         );
         assert_eq!(
             read_codex_chatgpt_oauth_from_path(&root.join(".codex").join("auth.json")),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "codex-access".to_string(),
+                refresh_token: Some("redacted".to_string()),
+                expires: 0,
                 account_id: Some("account-id".to_string())
             })
         );
@@ -3455,7 +3547,9 @@ mod tests {
         assert_eq!(
             auth_for_provider(&auth, "anthropic", None),
             Some(ResolvedAuth::ClaudeCodeOAuth {
-                access_token: "v1-token".to_string()
+                access_token: "v1-token".to_string(),
+                refresh_token: None,
+                expires: 0,
             })
         );
     }
@@ -3949,6 +4043,8 @@ mod tests {
             resolve("openai-codex"),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "codex-token".to_string(),
+                refresh_token: None,
+                expires: 0,
                 account_id: Some("account-id".to_string())
             })
         );
@@ -3972,7 +4068,9 @@ mod tests {
         assert_eq!(
             read_claude_code_oauth_from_path(&path),
             Some(ResolvedAuth::ClaudeCodeOAuth {
-                access_token: "claude-access".to_string()
+                access_token: "claude-access".to_string(),
+                refresh_token: Some("redacted".to_string()),
+                expires: 0,
             })
         );
 
@@ -3994,11 +4092,151 @@ mod tests {
             read_codex_chatgpt_oauth_from_path(&path),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "codex-access".to_string(),
+                refresh_token: Some("redacted".to_string()),
+                expires: 0,
                 account_id: Some("account-id".to_string())
             })
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_auth_file_captures_refresh_and_jwt_expiry() {
+        let root = test_dir("pi-config-codex-jwt");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("auth.json");
+        let access_token = fake_jwt(r#"{"exp":4102444800}"#);
+        fs::write(
+            &path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","last_refresh":"2026-01-01T00:00:00Z","tokens":{{"access_token":"{access_token}","refresh_token":"codex-refresh","account_id":"account-id"}}}}"#
+            ),
+        )
+        .expect("write auth");
+
+        assert_eq!(
+            read_codex_chatgpt_oauth_from_path(&path),
+            Some(ResolvedAuth::ChatGptOAuth {
+                access_token,
+                refresh_token: Some("codex-refresh".to_string()),
+                expires: 4102444800,
+                account_id: Some("account-id".to_string())
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_auth_file_without_refresh_or_jwt_is_lenient() {
+        let root = test_dir("pi-config-codex-lenient");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("auth.json");
+        fs::write(&path, r#"{"tokens":{"access_token":"opaque-token"}}"#).expect("write auth");
+
+        assert_eq!(
+            read_codex_chatgpt_oauth_from_path(&path),
+            Some(ResolvedAuth::ChatGptOAuth {
+                access_token: "opaque-token".to_string(),
+                refresh_token: None,
+                expires: 0,
+                account_id: None,
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_credentials_capture_refresh_and_expiry() {
+        let root = test_dir("pi-config-claude-expiry");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".credentials.json");
+        fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"claude-access","refreshToken":"claude-refresh","expiresAt":4102444800000}}"#,
+        )
+        .expect("write credentials");
+
+        assert_eq!(
+            read_claude_code_oauth_from_path(&path),
+            Some(ResolvedAuth::ClaudeCodeOAuth {
+                access_token: "claude-access".to_string(),
+                refresh_token: Some("claude-refresh".to_string()),
+                expires: 4102444800,
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_credentials_without_refresh_or_expiry_are_lenient() {
+        let root = test_dir("pi-config-claude-lenient");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join(".credentials.json");
+        fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"claude-access"}}"#,
+        )
+        .expect("write credentials");
+
+        assert_eq!(
+            read_claude_code_oauth_from_path(&path),
+            Some(ResolvedAuth::ClaudeCodeOAuth {
+                access_token: "claude-access".to_string(),
+                refresh_token: None,
+                expires: 0,
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stored_oauth_threads_refresh_metadata_with_env_indirection() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let saved = save_env("CODEX_REFRESH_TOKEN");
+        env::set_var("CODEX_REFRESH_TOKEN", "indirected-refresh");
+
+        let mut auth = AuthData::default();
+        auth.insert(
+            "openai-codex",
+            DEFAULT_ACCOUNT_NAME,
+            AuthCredential::OAuth {
+                access_token: "codex-access".to_string(),
+                refresh_token: Some("env:CODEX_REFRESH_TOKEN".to_string()),
+                expires: 4102444800,
+                account_id: Some("account-id".to_string()),
+            },
+        );
+
+        let resolved = auth_for_provider(&auth, "openai-codex", None).expect("resolved");
+        assert_eq!(resolved.refresh_token(), Some("indirected-refresh"));
+        assert_eq!(resolved.expires(), 4102444800);
+
+        restore_env("CODEX_REFRESH_TOKEN", saved.1);
+    }
+
+    #[test]
+    fn expiry_helpers_treat_zero_as_unknown() {
+        assert!(!is_expired(0, 1000));
+        assert!(!expires_within(0, 1000, 60));
+        assert!(is_expired(1000, 1000));
+        assert!(!is_expired(1001, 1000));
+        assert!(expires_within(1000, 999, 60));
+        assert!(!expires_within(1000, 100, 60));
+        assert!(expires_within(u64::MAX, u64::MAX - 1, 60));
+    }
+
+    fn fake_jwt(payload: &str) -> String {
+        let encode = |json: &str| URL_SAFE_NO_PAD.encode(json.as_bytes());
+        format!(
+            "{}.{}.signature",
+            encode(r#"{"alg":"none"}"#),
+            encode(payload)
+        )
     }
 
     #[test]

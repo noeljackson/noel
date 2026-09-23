@@ -1620,7 +1620,7 @@ fn anthropic_model_headers(auth: &ResolvedAuth) -> Result<HeaderMap> {
         ResolvedAuth::ApiKey(api_key) => {
             headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
         }
-        ResolvedAuth::ClaudeCodeOAuth { access_token } => {
+        ResolvedAuth::ClaudeCodeOAuth { access_token, .. } => {
             headers.insert(
                 AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {access_token}"))?,
@@ -1695,6 +1695,7 @@ async fn fetch_codex_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinition>> 
         ResolvedAuth::ChatGptOAuth {
             access_token,
             account_id,
+            ..
         } => fetch_chatgpt_codex_models(&access_token, account_id.as_deref()).await,
         ResolvedAuth::ClaudeCodeOAuth { .. } => Err(anyhow!("unsupported Codex auth type")),
     }
@@ -4971,12 +4972,13 @@ fn format_model_selection(model: &ModelRef, thinking: Option<&str>) -> String {
 fn map_provider_auth(auth: Option<ResolvedAuth>) -> ProviderAuth {
     match auth {
         Some(ResolvedAuth::ApiKey(api_key)) => ProviderAuth::ApiKey(api_key),
-        Some(ResolvedAuth::ClaudeCodeOAuth { access_token }) => {
+        Some(ResolvedAuth::ClaudeCodeOAuth { access_token, .. }) => {
             ProviderAuth::ClaudeCodeOAuth { access_token }
         }
         Some(ResolvedAuth::ChatGptOAuth {
             access_token,
             account_id,
+            ..
         }) => ProviderAuth::ChatGptOAuth {
             access_token,
             account_id,
