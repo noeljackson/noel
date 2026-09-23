@@ -31,6 +31,7 @@ pub enum UsageProbeResult {
 
 pub fn usage_http_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -209,6 +210,10 @@ fn bearer_headers(value: &str) -> reqwest::header::HeaderMap {
         reqwest::header::ACCEPT,
         reqwest::header::HeaderValue::from_static("application/json"),
     );
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static("pi"),
+    );
     headers
 }
 
@@ -238,9 +243,9 @@ async fn fetch_usage(
             .headers(headers)
             .send()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error_chain(&error))?;
         let status = response.status();
-        let body = response.text().await.map_err(|error| error.to_string())?;
+        let body = response.text().await.map_err(|error| error_chain(&error))?;
         if !status.is_success() {
             return Err(format!("status {status}: {body}"));
         }
@@ -251,6 +256,16 @@ async fn fetch_usage(
         Ok(usage) => UsageProbeResult::Usage(usage),
         Err(reason) => UsageProbeResult::Failed(reason),
     }
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut chain = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(error) = source {
+        chain.push(error.to_string());
+        source = error.source();
+    }
+    chain.join(": ")
 }
 
 fn origin_of(base_url: &str) -> Option<&str> {
@@ -352,32 +367,49 @@ fn parse_claude_usage(body: &str, now: i64) -> Result<AccountUsage, String> {
 
 fn parse_zai_usage(body: &str, now: i64) -> Result<AccountUsage, String> {
     let value = serde_json::from_str::<Value>(body).map_err(|error| error.to_string())?;
-    let limits = value
-        .get("data")
-        .and_then(|data| data.get("limits"))
-        .and_then(Value::as_array);
+    let data = value.get("data").cloned().unwrap_or(Value::Null);
+    let plan = data
+        .get("level")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let limits = data.get("limits").and_then(Value::as_array);
     let mut windows = Vec::new();
     for limit in limits.into_iter().flatten() {
         let kind = limit.get("type").and_then(Value::as_str).unwrap_or("");
         let label = match kind {
-            "TIME_LIMIT" => "5h",
-            "TOKENS_LIMIT" => "weekly",
-            other => other,
+            "TIME_LIMIT" => "5h".to_string(),
+            "TOKENS_LIMIT" => "weekly".to_string(),
+            "CREDIT_LIMIT" => zai_credit_window_label(limit),
+            other => other.to_string(),
         };
         if let Some(window) = window(
-            label,
+            &label,
             limit.get("percentage").and_then(flexible_f64),
-            limit.get("next_reset_time").and_then(flexible_epoch),
+            limit
+                .get("nextResetTime")
+                .or_else(|| limit.get("next_reset_time"))
+                .and_then(flexible_epoch),
         ) {
             windows.push(window);
         }
     }
     Ok(AccountUsage {
-        plan: None,
+        plan,
         windows,
         balance: None,
         fetched_at: now,
     })
+}
+
+fn zai_credit_window_label(limit: &Value) -> String {
+    let number = limit.get("number").and_then(flexible_f64).unwrap_or(0.0);
+    match limit.get("unit").and_then(flexible_f64) {
+        // unit 3 measures hours, unit 6 measures days; the 1-day window is the weekly quota
+        Some(3.0) => format!("{}h", number as i64),
+        Some(6.0) if number == 1.0 => "weekly".to_string(),
+        Some(6.0) => format!("{}d", number as i64),
+        _ => "credit".to_string(),
+    }
 }
 
 fn parse_moonshot_balance(body: &str, now: i64) -> Result<AccountUsage, String> {
@@ -603,7 +635,7 @@ async fn probe_account_row(
 
 fn short_reason(reason: &str) -> String {
     let first_line = reason.lines().next().unwrap_or(reason);
-    const MAX_LEN: usize = 40;
+    const MAX_LEN: usize = 80;
     if first_line.len() > MAX_LEN {
         format!("{}…", &first_line[..MAX_LEN])
     } else {
@@ -900,6 +932,25 @@ mod tests {
         assert_eq!(usage.windows[0].resets_at, Some(1800000000));
         assert_eq!(usage.windows[1].label, "weekly");
         assert_eq!(usage.windows[1].resets_at, Some(1800500000));
+    }
+
+    #[test]
+    fn parse_zai_usage_handles_credit_limit_windows() {
+        let usage = parse_zai_usage(
+            r#"{"code":200,"data":{"level":"max","limits":[
+                {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":335,"remaining":27664,"percentage":1,"nextResetTime":1790148374072},
+                {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":113681,"remaining":26318,"percentage":81,"nextResetTime":1790569993976}]}}"#,
+            1000,
+        )
+        .expect("parse zai credit usage");
+        assert_eq!(usage.plan.as_deref(), Some("max"));
+        assert_eq!(usage.windows.len(), 2);
+        assert_eq!(usage.windows[0].label, "5h");
+        assert_eq!(usage.windows[0].used_pct, 1.0);
+        assert_eq!(usage.windows[0].resets_at, Some(1790148374));
+        assert_eq!(usage.windows[1].label, "weekly");
+        assert_eq!(usage.windows[1].used_pct, 81.0);
+        assert_eq!(usage.windows[1].resets_at, Some(1790569993));
     }
 
     #[test]
