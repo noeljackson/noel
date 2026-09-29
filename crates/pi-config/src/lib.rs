@@ -713,14 +713,24 @@ pub struct ModelDefinition {
     pub base_url: Option<String>,
 }
 
+/// Caches written by older builds (or without this field) are treated as stale
+/// so refreshed model lists pick up fetcher fixes immediately.
+pub const MODEL_CACHE_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCache {
     pub refreshed_at: u64,
     #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
     pub models: Vec<ModelDefinition>,
     #[serde(default)]
     pub diagnostics: Vec<String>,
+    /// Latest published Claude Code version, fetched from the npm registry
+    /// during refresh and used as the `claude-cli/<version>` user-agent.
+    #[serde(default)]
+    pub claude_code_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1234,7 +1244,7 @@ fn env_api_key(provider: &str) -> Option<String> {
         "google-vertex" => &["GOOGLE_CLOUD_API_KEY"][..],
         "groq" => &["GROQ_API_KEY"][..],
         "huggingface" => &["HF_TOKEN"][..],
-        "kimi-coding" => &["KIMI_API_KEY"][..],
+        "kimi-coding" | "kimi-coding-openai" => &["KIMI_API_KEY"][..],
         "minimax" => &["MINIMAX_API_KEY"][..],
         "minimax-cn" => &["MINIMAX_CN_API_KEY"][..],
         "moonshotai" | "moonshotai-cn" => &["MOONSHOT_API_KEY"][..],
@@ -1250,7 +1260,7 @@ fn env_api_key(provider: &str) -> Option<String> {
         "xiaomi-token-plan-ams" => &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"][..],
         "xiaomi-token-plan-cn" => &["XIAOMI_TOKEN_PLAN_CN_API_KEY"][..],
         "xiaomi-token-plan-sgp" => &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"][..],
-        "zai" => &["ZAI_API_KEY"][..],
+        "zai" | "zai-coding" | "zai-anthropic" => &["ZAI_API_KEY"][..],
         _ => &[],
     };
     names.iter().find_map(|name| env::var(name).ok())
@@ -3242,6 +3252,8 @@ mod tests {
             &agent_dir.join("model-cache.json"),
             &ModelCache {
                 refreshed_at: 123,
+                version: MODEL_CACHE_VERSION,
+                claude_code_version: None,
                 models: vec![ModelDefinition {
                     provider: "anthropic".to_string(),
                     id: "claude-opus-4-1-20250805".to_string(),

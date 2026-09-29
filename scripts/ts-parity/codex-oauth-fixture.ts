@@ -109,6 +109,14 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 	if (sanitized.authorization) {
 		sanitized.authorization = "Bearer <redacted>";
 	}
+	if (sanitized["user-agent"]) {
+		// The TS client embeds the host kernel release, which makes fixtures
+		// drift on every kernel upgrade; pin it to a stable placeholder.
+		sanitized["user-agent"] = sanitized["user-agent"].replace(
+			/(linux )[^;]+(;)/,
+			"$1<kernel>$2",
+		);
+	}
 	return sanitized;
 }
 

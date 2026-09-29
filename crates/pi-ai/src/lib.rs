@@ -1211,6 +1211,41 @@ fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
+/// Minimum version accepted for current OAuth-gated models; the CLI replaces
+/// this with the latest published Claude Code version whenever it can reach
+/// the npm registry.
+pub const DEFAULT_CLAUDE_CODE_VERSION: &str = "2.1.280";
+pub const CLAUDE_CODE_VERSION_ENV: &str = "PI_CLAUDE_CODE_VERSION";
+
+static CLAUDE_CODE_VERSION_OVERRIDE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+pub fn set_claude_code_version(version: impl Into<String>) {
+    *CLAUDE_CODE_VERSION_OVERRIDE
+        .write()
+        .expect("claude code version lock") = Some(version.into());
+}
+
+pub fn claude_code_version() -> String {
+    resolve_claude_code_version(
+        env::var(CLAUDE_CODE_VERSION_ENV).ok().as_deref(),
+        CLAUDE_CODE_VERSION_OVERRIDE
+            .read()
+            .expect("claude code version lock")
+            .as_deref(),
+    )
+}
+
+fn resolve_claude_code_version(env_value: Option<&str>, override_value: Option<&str>) -> String {
+    [env_value, override_value]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|version| !version.is_empty())
+        .unwrap_or(DEFAULT_CLAUDE_CODE_VERSION)
+        .to_string()
+}
+
 fn anthropic_headers(config: &ProviderConfig) -> Result<HeaderMap, ProviderError> {
     let mut headers = HeaderMap::new();
     match &config.auth {
@@ -1230,7 +1265,10 @@ fn anthropic_headers(config: &ProviderConfig) -> Result<HeaderMap, ProviderError
                 "anthropic-dangerous-direct-browser-access",
                 HeaderValue::from_static("true"),
             );
-            headers.insert(USER_AGENT, HeaderValue::from_static("claude-cli/2.1.75"));
+            headers.insert(
+                USER_AGENT,
+                HeaderValue::from_str(&format!("claude-cli/{}", claude_code_version()))?,
+            );
             headers.insert("x-app", HeaderValue::from_static("cli"));
         }
         _ => {
@@ -1288,7 +1326,7 @@ fn apply_anthropic_thinking(body: &mut Value, config: &ProviderConfig) {
         body["thinking"] = json!({ "type": "disabled" });
         return;
     }
-    if supports_anthropic_adaptive_thinking(&config.model.id) {
+    if anthropic_supports_adaptive_thinking(&config.model.id) {
         body["thinking"] = json!({
             "type": "adaptive",
             "display": "summarized",
@@ -1305,15 +1343,24 @@ fn apply_anthropic_thinking(body: &mut Value, config: &ProviderConfig) {
     }
 }
 
-fn supports_anthropic_adaptive_thinking(model_id: &str) -> bool {
-    model_id.contains("opus-4-6")
-        || model_id.contains("opus-4.6")
-        || model_id.contains("opus-4-7")
-        || model_id.contains("opus-4.7")
-        || model_id.contains("opus-4-8")
-        || model_id.contains("opus-4.8")
-        || model_id.contains("sonnet-4-6")
-        || model_id.contains("sonnet-4.6")
+/// Parses the `(major, minor)` version of a Claude model id for a family
+/// ("opus", "sonnet", ...), tolerating `-`, `.`, `_`, `:` separators and
+/// prefixes/suffixes such as `us.anthropic.claude-opus-4-6-v1`.
+pub fn claude_model_version(model_id: &str, family: &str) -> Option<(u32, u32)> {
+    let normalized = model_id.to_ascii_lowercase().replace(['.', '_', ':'], "-");
+    let rest = normalized.split(&format!("{family}-")).nth(1)?;
+    let mut parts = rest.split('-');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Adaptive thinking (`thinking.type = "adaptive"` + `output_config.effort`)
+/// is supported by Opus >= 4.6 and Sonnet >= 4.6. Version-parsed so new
+/// models work without a code change.
+pub fn anthropic_supports_adaptive_thinking(model_id: &str) -> bool {
+    claude_model_version(model_id, "opus").is_some_and(|v| v >= (4, 6))
+        || claude_model_version(model_id, "sonnet").is_some_and(|v| v >= (4, 6))
 }
 
 fn anthropic_adaptive_effort(model_id: &str, level: &str) -> &'static str {
@@ -1876,19 +1923,14 @@ fn bedrock_supports_prompt_cache(model_id: &str) -> bool {
 }
 
 fn bedrock_supports_adaptive_thinking(model_id: &str) -> bool {
-    let normalized = model_id.to_ascii_lowercase().replace(['_', '.', ':'], "-");
-    normalized.contains("opus-4-6")
-        || normalized.contains("opus-4-7")
-        || normalized.contains("opus-4-8")
-        || normalized.contains("sonnet-4-6")
+    anthropic_supports_adaptive_thinking(model_id)
 }
 
 fn bedrock_adaptive_effort(model_id: &str, level: &str) -> &'static str {
-    let normalized = model_id.to_ascii_lowercase().replace(['_', '.', ':'], "-");
     if level == "max" {
         return "max";
     }
-    if level == "xhigh" && (normalized.contains("opus-4-7") || normalized.contains("opus-4-8")) {
+    if level == "xhigh" && claude_model_version(model_id, "opus").is_some_and(|v| v >= (4, 7)) {
         return "xhigh";
     }
     match level {
@@ -4692,7 +4734,100 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_thinking_support_is_version_parsed() {
+        assert_eq!(
+            claude_model_version("claude-opus-5-5", "opus"),
+            Some((5, 5))
+        );
+        assert_eq!(
+            claude_model_version("us.anthropic.claude-opus-4-6-v1", "opus"),
+            Some((4, 6))
+        );
+        assert_eq!(
+            claude_model_version("claude-opus-4.7", "opus"),
+            Some((4, 7))
+        );
+        assert_eq!(claude_model_version("claude-3-opus-20240229", "opus"), None);
+        assert_eq!(claude_model_version("gpt-5.5", "opus"), None);
+
+        for id in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-5-5",
+            "claude-sonnet-4-6",
+            "us.anthropic.claude-opus-5-5-v1",
+        ] {
+            assert!(anthropic_supports_adaptive_thinking(id), "{id}");
+        }
+        for id in ["claude-sonnet-4-5", "claude-3-5-haiku", "claude-opus"] {
+            assert!(!anthropic_supports_adaptive_thinking(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn opus_5_5_uses_adaptive_thinking_with_xhigh() {
+        let request = ProviderRequest {
+            system_prompt: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+        };
+        let opus = ProviderConfig {
+            model: ModelRef {
+                provider: "anthropic".to_string(),
+                id: "claude-opus-5-5".to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: Some("xhigh".to_string()),
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        let body = anthropic_body(&opus, &request);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert_eq!(
+            bedrock_adaptive_effort("us.anthropic.claude-opus-5-5-v1", "xhigh"),
+            "xhigh"
+        );
+        assert_eq!(
+            bedrock_adaptive_effort("us.anthropic.claude-opus-4-6-v1", "xhigh"),
+            "high"
+        );
+    }
+
+    #[test]
+    fn claude_code_version_resolution_prefers_env_then_override() {
+        assert_eq!(
+            resolve_claude_code_version(None, None),
+            DEFAULT_CLAUDE_CODE_VERSION
+        );
+        assert_eq!(
+            resolve_claude_code_version(None, Some("2.1.300")),
+            "2.1.300"
+        );
+        assert_eq!(
+            resolve_claude_code_version(Some("9.9.9"), Some("2.1.300")),
+            "9.9.9"
+        );
+        assert_eq!(
+            resolve_claude_code_version(Some("   "), Some("")),
+            DEFAULT_CLAUDE_CODE_VERSION
+        );
+    }
+
+    #[test]
     fn anthropic_claude_code_oauth_matches_ts_identity_shape() {
+        // The runtime version tracks the latest published Claude Code release;
+        // pin it to the fixture's value to compare the identity shape.
+        set_claude_code_version("2.1.75");
         let fixture = serde_json::from_str::<Value>(include_str!(
             "../../../tests/fixtures/ts-parity/anthropic-claude-code-oauth.json"
         ))

@@ -318,6 +318,7 @@ Provider-specific environment:
 - Google Vertex: set `GOOGLE_CLOUD_PROJECT` or `GCLOUD_PROJECT`, plus `GOOGLE_CLOUD_LOCATION`.
 - Cloudflare: set `CLOUDFLARE_ACCOUNT_ID`; AI Gateway also needs `CLOUDFLARE_GATEWAY_ID`.
 - Amazon Bedrock: Rust direct calls currently use Bedrock bearer-token auth via `AWS_BEARER_TOKEN_BEDROCK`.
+- Claude Code OAuth: requests identify as `claude-cli/<version>`. The version tracks the latest published Claude Code release (fetched from the npm registry during model refresh, cached in `model-cache.json`); set `PI_CLAUDE_CODE_VERSION` to pin it.
 
 `models.json` may override the built-in model list:
 
@@ -346,11 +347,14 @@ Provider-specific environment:
 cached models, and explicit `models.json` entries immediately, then starts a
 non-blocking background refresh when `modelRefresh.enabled` is not false,
 `PI_OFFLINE`/`--offline` is not set, the cache is older than `ttlHours`, and a
-provider has supported auth. Refreshed models are available after `/reload` or
-the next startup. Anthropic API-key refresh uses the official Models API;
-Claude Code OAuth and ChatGPT/Codex OAuth refresh are best-effort against the
-same provider auth paths used for model requests. Refresh failures are ignored
-unless verbose logging is enabled.
+provider has supported auth. `/reload` also kicks a refresh. Refreshed models
+are available after `/reload` or the next startup. Refresh covers `anthropic`,
+`openai`, and `openai-codex` (API key or OAuth login), plus the
+OpenAI-compatible `zai`, `zai-coding`, `moonshotai`, and `kimi-coding-openai`
+endpoints via their API keys. Anthropic refresh paginates the official Models
+API; OAuth refresh is best-effort against the same provider auth paths used
+for model requests. Refresh failures are ignored unless verbose logging is
+enabled.
 
 Thinking levels can be set with `--thinking <level>` or `/thinking <level>`.
 Supported levels are model-specific. Opus exposes `high`, `xhigh`, and `max`;
@@ -492,6 +496,8 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/logout <provider>`
 - `/account [name]`
 - `/accounts`
+- `/todos`
+- `/diff`
 - `/reload`
 - `/read <path>`
 - `/write <path> <text>`
@@ -505,6 +511,8 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/quit`
 
 `/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
+
+The model can track multi-step work with the built-in `todo` tool: it maintains a checklist (`pending`/`in_progress`/`completed`) that is journaled with the session and survives resume. The list renders as a widget above the prompt (`ctrl+t` expands it); `/todos` reprints it in the transcript. Files the model changes with the `edit`/`write` tools are tracked per session; `/diff` toggles a right-side panel listing them with git change stats, and Enter on a file shows its uncommitted diff (new files show their content).
 
 Interactive assistant responses stream text as provider deltas arrive. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history. `/editor` uses `PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`. The TUI runs in an inline terminal viewport: finalized transcript rows are written to normal terminal scrollback, so native mouse selection and mouse-wheel scrollback remain terminal-owned while Up/Down navigate prompt history. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 
