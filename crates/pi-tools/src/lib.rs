@@ -72,13 +72,15 @@ pub struct ToolRuntimeOptions {
 }
 
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
-    ["read", "bash", "edit", "write", "grep", "find", "ls"]
-        .into_iter()
-        .map(|name| ToolDefinition {
-            name: name.to_string(),
-            read_only: matches!(name, "read" | "grep" | "find" | "ls"),
-        })
-        .collect()
+    [
+        "read", "bash", "edit", "write", "grep", "find", "ls", "todo",
+    ]
+    .into_iter()
+    .map(|name| ToolDefinition {
+        name: name.to_string(),
+        read_only: matches!(name, "read" | "grep" | "find" | "ls" | "todo"),
+    })
+    .collect()
 }
 
 pub async fn execute_tool(
@@ -391,7 +393,12 @@ mod tests {
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
-        assert_eq!(rust_names, upstream_names);
+        // Rust intentionally adds tools beyond the upstream set (see
+        // docs/rust-rewrite/non-parity-register.md); upstream names must all
+        // be covered, but equality is not required.
+        for name in &upstream_names {
+            assert!(rust_names.contains(name), "missing upstream tool {name}");
+        }
 
         let read_only = rust_tools
             .iter()
@@ -404,6 +411,7 @@ mod tests {
         assert!(!read_only["bash"]);
         assert!(!read_only["edit"]);
         assert!(!read_only["write"]);
+        assert!(read_only["todo"]);
 
         let grep = fixture["tools"]
             .as_array()

@@ -285,6 +285,14 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "show auth and quota status for all accounts",
     },
     CommandHelp {
+        command: "/todos",
+        description: "show the current task list",
+    },
+    CommandHelp {
+        command: "/diff",
+        description: "toggle the edited-files panel",
+    },
+    CommandHelp {
         command: "/logout <provider>",
         description: "remove stored auth",
     },
@@ -612,6 +620,10 @@ pub fn default_keybindings() -> KeybindingMap {
             Keybinding {
                 action: "session".to_string(),
                 keys: vec!["ctrl+s".to_string()],
+            },
+            Keybinding {
+                action: "todos".to_string(),
+                keys: vec!["ctrl+t".to_string()],
             },
         ],
     }

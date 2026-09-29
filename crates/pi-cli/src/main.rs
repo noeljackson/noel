@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, Cursor, IsTerminal, Read, Write};
@@ -30,7 +30,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, Clear as TerminalClear, ClearType},
 };
 use pi_ai::{
-    create_provider, generate_images, ImageGenerationInput, ImageGenerationOutput,
+    anthropic_supports_adaptive_thinking, create_provider, generate_images,
+    set_claude_code_version, ImageGenerationInput, ImageGenerationOutput,
     ImageProviderApi as AiImageProviderApi, ImageProviderConfig, MediaInput, ModelRef,
     ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig,
 };
@@ -42,12 +43,12 @@ use pi_config::{
     ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig, ModelCache,
     ModelDefinition, ModelRefreshSettings, PackageSource, ProviderApi as ConfigProviderApi,
     ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
-    DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR,
+    DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR, MODEL_CACHE_VERSION,
 };
 use pi_core::{
-    run_excluded_bash, run_user_turn, run_user_turn_streaming, run_user_turn_streaming_with_media,
-    write_session_export, CompactionKind, ConversationMessage, MessageRole, ReloadableSystems,
-    Runtime, SessionState, SessionStore,
+    format_todo_list, run_excluded_bash, run_user_turn, run_user_turn_streaming,
+    run_user_turn_streaming_with_media, write_session_export, CompactionKind, ConversationMessage,
+    MessageRole, ReloadableSystems, Runtime, SessionState, SessionStore, TodoItem, TodoStatus,
 };
 use pi_tui::{
     EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector, SelectorItem, SessionView,
@@ -1273,6 +1274,7 @@ async fn main() -> Result<()> {
         eprintln!("session dir: {}", config.paths.session_dir.display());
     }
     let offline = offline_enabled(cli.offline);
+    apply_cached_claude_code_version(&config);
     start_model_refresh(&config, offline, cli.verbose);
 
     if let Some(search) = &cli.list_models {
@@ -1394,6 +1396,7 @@ async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) 
             },
             "reload" => {
                 config = load_config(config.paths.clone())?;
+                start_model_refresh(&config, offline, false);
                 let next_generation = runtime.systems().config_generation + 1;
                 match runtime.reload(ReloadableSystems::from_config(&config, next_generation)) {
                     Ok(report) => Ok(serde_json::json!({
@@ -1614,6 +1617,14 @@ fn offline_enabled(cli_offline: bool) -> bool {
             .unwrap_or(false)
 }
 
+fn apply_cached_claude_code_version(config: &LoadedConfig) {
+    if let Ok(Some(cache)) = read_model_cache(&config.paths.model_cache_path) {
+        if let Some(version) = cache.claude_code_version {
+            set_claude_code_version(version);
+        }
+    }
+}
+
 fn start_model_refresh(config: &LoadedConfig, offline: bool, verbose: bool) {
     if offline || !model_refresh_enabled(&config.settings) {
         return;
@@ -1653,11 +1664,7 @@ fn model_cache_needs_refresh(path: &Path, ttl_hours: u64) -> bool {
     let Ok(Some(cache)) = read_model_cache(path) else {
         return true;
     };
-    if cache
-        .models
-        .iter()
-        .any(|model| model.provider == "openai-codex" && model.id.ends_with("-wm"))
-    {
+    if cache.version < MODEL_CACHE_VERSION {
         return true;
     }
     let Some(now) = unix_seconds() else {
@@ -1682,16 +1689,46 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
         }
     }
 
-    if let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, "openai", None) {
-        match fetch_openai_api_models("openai", ConfigProviderApi::OpenAiResponses, None, &api_key)
+    match auth_for_provider(&auth, "openai", None) {
+        Some(ResolvedAuth::ApiKey(api_key)) => {
+            match fetch_openai_api_models(
+                "openai",
+                ConfigProviderApi::OpenAiResponses,
+                None,
+                OPENAI_MODELS_URL,
+                &api_key,
+            )
             .await
-        {
-            Ok(models) => {
-                refreshed_providers.insert("openai".to_string());
-                refreshed_models.extend(models);
+            {
+                Ok(models) => {
+                    refreshed_providers.insert("openai".to_string());
+                    refreshed_models.extend(models);
+                }
+                Err(error) => diagnostics.push(format!("openai model refresh failed: {error}")),
             }
-            Err(error) => diagnostics.push(format!("openai model refresh failed: {error}")),
         }
+        Some(ResolvedAuth::ChatGptOAuth {
+            access_token,
+            account_id,
+            ..
+        }) => {
+            match fetch_chatgpt_backend_models(
+                "openai",
+                ConfigProviderApi::OpenAiResponses,
+                None,
+                &access_token,
+                account_id.as_deref(),
+            )
+            .await
+            {
+                Ok(models) => {
+                    refreshed_providers.insert("openai".to_string());
+                    refreshed_models.extend(models);
+                }
+                Err(error) => diagnostics.push(format!("openai model refresh failed: {error}")),
+            }
+        }
+        _ => {}
     }
 
     if let Some(auth) = auth_for_provider(&auth, "openai-codex", None) {
@@ -1704,6 +1741,49 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
         }
     }
 
+    for (provider, base_url) in [
+        ("zai", "https://api.z.ai/api/paas/v4"),
+        ("zai-coding", "https://api.z.ai/api/coding/paas/v4"),
+        ("moonshotai", "https://api.moonshot.ai/v1"),
+        ("kimi-coding-openai", "https://api.kimi.com/coding/v1"),
+    ] {
+        let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, provider, None) else {
+            continue;
+        };
+        let models_url = format!("{base_url}/models");
+        match fetch_openai_api_models(
+            provider,
+            ConfigProviderApi::OpenAi,
+            Some(base_url.to_string()),
+            &models_url,
+            &api_key,
+        )
+        .await
+        {
+            Ok(models) => {
+                refreshed_providers.insert(provider.to_string());
+                refreshed_models.extend(models);
+            }
+            Err(error) => diagnostics.push(format!("{provider} model refresh failed: {error}")),
+        }
+    }
+
+    let mut claude_code_version = None;
+    if matches!(
+        auth_for_provider(&auth, "anthropic", None),
+        Some(ResolvedAuth::ClaudeCodeOAuth { .. })
+    ) {
+        match fetch_latest_claude_code_version().await {
+            Ok(version) => {
+                set_claude_code_version(&version);
+                claude_code_version = Some(version);
+            }
+            Err(error) => {
+                diagnostics.push(format!("claude code version check failed: {error}"));
+            }
+        }
+    }
+
     if refreshed_providers.is_empty() && diagnostics.is_empty() {
         return Ok(());
     }
@@ -1713,6 +1793,7 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
         .flatten()
         .unwrap_or_default();
     let existing_refreshed_at = existing.refreshed_at;
+    let existing_claude_code_version = existing.claude_code_version.clone();
     let mut models = existing
         .models
         .into_iter()
@@ -1723,8 +1804,10 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
         &paths.model_cache_path,
         &ModelCache {
             refreshed_at: unix_seconds().unwrap_or(existing_refreshed_at),
+            version: MODEL_CACHE_VERSION,
             models,
             diagnostics: Vec::new(),
+            claude_code_version: claude_code_version.or(existing_claude_code_version),
         },
     )?;
     if !diagnostics.is_empty() {
@@ -1736,6 +1819,10 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
 #[derive(Debug, Deserialize)]
 struct AnthropicModelsResponse {
     data: Vec<AnthropicModel>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    last_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1744,10 +1831,64 @@ struct AnthropicModel {
     display_name: String,
 }
 
+const ANTHROPIC_MODELS_MAX_PAGES: usize = 16;
+
+fn anthropic_models_url(starting_after: Option<&str>) -> String {
+    match starting_after {
+        Some(cursor) => {
+            format!("https://api.anthropic.com/v1/models?limit=1000&starting_after={cursor}")
+        }
+        None => "https://api.anthropic.com/v1/models?limit=1000".to_string(),
+    }
+}
+
 async fn fetch_anthropic_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinition>> {
+    let client = reqwest::Client::new();
+    let headers = anthropic_model_headers(&auth)?;
+    let mut models = Vec::new();
+    let mut cursor = None;
+    for _ in 0..ANTHROPIC_MODELS_MAX_PAGES {
+        let response = client
+            .get(anthropic_models_url(cursor.as_deref()))
+            .headers(headers.clone())
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("status {status}: {body}"));
+        }
+        let page = response.json::<AnthropicModelsResponse>().await?;
+        let next = if page.has_more {
+            page.last_id.clone()
+        } else {
+            None
+        };
+        models.extend(page.data.into_iter().map(|model| ModelDefinition {
+            provider: "anthropic".to_string(),
+            id: model.id,
+            name: Some(model.display_name),
+            api: ConfigProviderApi::Anthropic,
+            base_url: None,
+        }));
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(models),
+        }
+    }
+    Ok(models)
+}
+
+const CLAUDE_CODE_NPM_LATEST_URL: &str =
+    "https://registry.npmjs.org/@anthropic-ai/claude-code/latest";
+
+/// Claude Code publishes to npm; the registry's `latest` dist-tag tells us the
+/// version string Anthropic's API expects in the `claude-cli/<version>`
+/// user-agent for OAuth-gated models.
+async fn fetch_latest_claude_code_version() -> Result<String> {
     let response = reqwest::Client::new()
-        .get("https://api.anthropic.com/v1/models")
-        .headers(anthropic_model_headers(&auth)?)
+        .get(CLAUDE_CODE_NPM_LATEST_URL)
+        .header(ACCEPT, "application/json")
         .send()
         .await?;
     let status = response.status();
@@ -1755,18 +1896,22 @@ async fn fetch_anthropic_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinitio
         let body = response.text().await.unwrap_or_default();
         return Err(anyhow!("status {status}: {body}"));
     }
-    let response = response.json::<AnthropicModelsResponse>().await?;
-    Ok(response
-        .data
-        .into_iter()
-        .map(|model| ModelDefinition {
-            provider: "anthropic".to_string(),
-            id: model.id,
-            name: Some(model.display_name),
-            api: ConfigProviderApi::Anthropic,
-            base_url: None,
-        })
-        .collect())
+    let document = response.json::<serde_json::Value>().await?;
+    let version = document
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|version| is_valid_claude_code_version(version))
+        .ok_or_else(|| anyhow!("missing version in npm registry response"))?;
+    Ok(version.to_string())
+}
+
+fn is_valid_claude_code_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 32
+        && version
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+'))
 }
 
 fn anthropic_model_headers(auth: &ResolvedAuth) -> Result<HeaderMap> {
@@ -1804,14 +1949,17 @@ struct OpenAiModel {
     id: String,
 }
 
+const OPENAI_MODELS_URL: &str = "https://api.openai.com/v1/models";
+
 async fn fetch_openai_api_models(
     provider: &str,
     api: ConfigProviderApi,
     base_url: Option<String>,
+    models_url: &str,
     api_key: &str,
 ) -> Result<Vec<ModelDefinition>> {
     let response = reqwest::Client::new()
-        .get("https://api.openai.com/v1/models")
+        .get(models_url)
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
         .header(ACCEPT, "application/json")
         .send()
@@ -1843,6 +1991,7 @@ async fn fetch_codex_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinition>> 
                 "openai-codex",
                 ConfigProviderApi::OpenAiCodexResponses,
                 Some("https://chatgpt.com/backend-api".to_string()),
+                OPENAI_MODELS_URL,
                 &api_key,
             )
             .await
@@ -1851,12 +2000,24 @@ async fn fetch_codex_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinition>> 
             access_token,
             account_id,
             ..
-        } => fetch_chatgpt_codex_models(&access_token, account_id.as_deref()).await,
+        } => {
+            fetch_chatgpt_backend_models(
+                "openai-codex",
+                ConfigProviderApi::OpenAiCodexResponses,
+                Some("https://chatgpt.com/backend-api".to_string()),
+                &access_token,
+                account_id.as_deref(),
+            )
+            .await
+        }
         ResolvedAuth::ClaudeCodeOAuth { .. } => Err(anyhow!("unsupported Codex auth type")),
     }
 }
 
-async fn fetch_chatgpt_codex_models(
+async fn fetch_chatgpt_backend_models(
+    provider: &str,
+    api: ConfigProviderApi,
+    base_url: Option<String>,
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<Vec<ModelDefinition>> {
@@ -1874,20 +2035,20 @@ async fn fetch_chatgpt_codex_models(
         let body = response.text().await.unwrap_or_default();
         return Err(anyhow!("status {status} from {endpoint}: {body}"));
     }
-    let ids = collect_codex_model_ids(&response.json::<serde_json::Value>().await?);
+    let ids = collect_codex_model_ids(&response.json::<serde_json::Value>().await?, provider);
     if ids.is_empty() {
         return Err(anyhow!(
-            "no selectable Codex model IDs in response from {endpoint}"
+            "no selectable {provider} model IDs in response from {endpoint}"
         ));
     }
     Ok(ids
         .into_iter()
         .map(|id| ModelDefinition {
-            provider: "openai-codex".to_string(),
+            provider: provider.to_string(),
             name: Some(model_display_name(&id)),
             id,
-            api: ConfigProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
+            api: api.clone(),
+            base_url: base_url.clone(),
         })
         .collect())
 }
@@ -1912,7 +2073,7 @@ fn chatgpt_model_headers(access_token: &str, account_id: Option<&str>) -> Result
     Ok(headers)
 }
 
-fn collect_codex_model_ids(value: &serde_json::Value) -> BTreeSet<String> {
+fn collect_codex_model_ids(value: &serde_json::Value, provider: &str) -> BTreeSet<String> {
     let models = value
         .get("models")
         .and_then(serde_json::Value::as_array)
@@ -1932,26 +2093,31 @@ fn collect_codex_model_ids(value: &serde_json::Value) -> BTreeSet<String> {
                 .into_iter()
                 .find_map(|key| model.get(key).and_then(serde_json::Value::as_str))
         })
-        .filter(|id| model_supported_for_provider("openai-codex", id))
+        .filter(|id| model_supported_for_provider(provider, id))
         .map(ToString::to_string)
         .collect()
 }
 
 fn model_supported_for_provider(provider: &str, id: &str) -> bool {
+    let excludes_non_chat = || {
+        id.contains("audio")
+            || id.contains("realtime")
+            || id.contains("transcribe")
+            || id.contains("tts")
+            || id.contains("image")
+            || id.contains("moderation")
+            || id.contains("embedding")
+    };
     match provider {
         "openai" => {
             (id.starts_with("gpt-")
                 || id.starts_with("o1")
                 || id.starts_with("o3")
                 || id.starts_with("o4"))
-                && !id.contains("audio")
-                && !id.contains("realtime")
-                && !id.contains("transcribe")
-                && !id.contains("tts")
-                && !id.contains("image")
-                && !id.contains("moderation")
+                && !excludes_non_chat()
         }
-        "openai-codex" => id.starts_with("gpt-5.") || id.contains("codex"),
+        "openai-codex" => (id.starts_with("gpt-") || id.contains("codex")) && !excludes_non_chat(),
+        "zai" | "zai-coding" | "moonshotai" | "kimi-coding-openai" => !excludes_non_chat(),
         _ => false,
     }
 }
@@ -2677,9 +2843,9 @@ fn model_ref_from_value(value: &str) -> Option<ModelRef> {
 fn model_thinking_levels(model: &ModelRef) -> &'static [&'static str] {
     match model.provider.as_str() {
         "anthropic" => {
-            if model.id.contains("opus") && supports_anthropic_adaptive_thinking(&model.id) {
+            if model.id.contains("opus") && anthropic_supports_adaptive_thinking(&model.id) {
                 &["off", "high", "xhigh", "max"]
-            } else if supports_anthropic_adaptive_thinking(&model.id) {
+            } else if anthropic_supports_adaptive_thinking(&model.id) {
                 &["off", "low", "medium", "high", "xhigh"]
             } else if model.id.contains("claude-") {
                 &["off", "minimal", "low", "medium", "high"]
@@ -2722,17 +2888,6 @@ fn normalized_thinking_level(level: &str) -> Option<&'static str> {
     }
 }
 
-fn supports_anthropic_adaptive_thinking(model_id: &str) -> bool {
-    model_id.contains("opus-4-6")
-        || model_id.contains("opus-4.6")
-        || model_id.contains("opus-4-7")
-        || model_id.contains("opus-4.7")
-        || model_id.contains("opus-4-8")
-        || model_id.contains("opus-4.8")
-        || model_id.contains("sonnet-4-6")
-        || model_id.contains("sonnet-4.6")
-}
-
 #[derive(Debug, Default)]
 struct TuiApp {
     entries: Vec<TuiEntry>,
@@ -2750,6 +2905,31 @@ struct TuiApp {
     history_draft: Option<String>,
     history_draft_typed_newlines: Option<Vec<usize>>,
     typed_input_newlines: Vec<usize>,
+    todos: Vec<TodoItem>,
+    todos_expanded: bool,
+    diff_panel: Option<DiffPanelState>,
+}
+
+#[derive(Debug)]
+struct DiffPanelState {
+    files: Vec<DiffFileEntry>,
+    selected: usize,
+    detail: Option<DiffDetail>,
+}
+
+#[derive(Debug)]
+struct DiffFileEntry {
+    path: String,
+    added: Option<u64>,
+    removed: Option<u64>,
+    untracked: bool,
+}
+
+#[derive(Debug)]
+struct DiffDetail {
+    path: String,
+    lines: Vec<String>,
+    scroll: usize,
 }
 
 impl TuiApp {
@@ -2799,6 +2979,24 @@ impl TuiApp {
         );
         self.status = footer_status(config, runtime, &self.editor_state);
         self.show_hardware_cursor = config.settings.show_hardware_cursor.unwrap_or(true);
+        self.todos = runtime.session().todos.clone();
+    }
+
+    fn refresh_diff_panel(&mut self, runtime: &Runtime) {
+        if let Some(panel) = self.diff_panel.as_mut() {
+            let selected = panel.selected;
+            panel.files =
+                collect_diff_file_entries(&runtime.session().cwd, &runtime.session().edited_files);
+            panel.selected = selected.min(panel.files.len().saturating_sub(1));
+            let open_detail = panel.detail.as_ref().map(|detail| detail.path.clone());
+            if let Some(detail_path) = open_detail {
+                panel.detail = panel
+                    .files
+                    .iter()
+                    .find(|entry| entry.path == detail_path)
+                    .map(|entry| build_diff_detail(&runtime.session().cwd, entry));
+            }
+        }
     }
 
     fn push(&mut self, kind: TuiEntryKind, text: impl Into<String>) {
@@ -3176,24 +3374,151 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
     let slash_matches = slash_command_matches(config, app);
     let slash_match_height = slash_matches.len().min(SLASH_MATCH_LIMIT) as u16;
     let input_height = input_area_height(app, frame.area().height, slash_match_height);
+    let todo_height = todo_panel_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
+            Constraint::Length(todo_height),
             Constraint::Length(1),
             Constraint::Length(input_height),
             Constraint::Length(slash_match_height),
             Constraint::Length(1),
         ])
         .split(frame.area());
-    draw_transcript(frame, root[0], app);
-    // root[1] is an intentional blank spacer so the gray input box never butts
+    let transcript_area = if app.diff_panel.is_some() {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(DIFF_PANEL_WIDTH)])
+            .split(root[0]);
+        draw_diff_panel(frame, columns[1], app);
+        columns[0]
+    } else {
+        root[0]
+    };
+    draw_transcript(frame, transcript_area, app);
+    draw_todo_panel(frame, root[1], app);
+    // root[2] is an intentional blank spacer so the gray input box never butts
     // directly against the chat transcript.
-    draw_input(frame, root[2], app);
-    draw_slash_matches(frame, root[3], &slash_matches);
-    draw_footer(frame, root[4], app);
+    draw_input(frame, root[3], app);
+    draw_slash_matches(frame, root[4], &slash_matches);
+    draw_footer(frame, root[5], app);
     draw_selector_overlay(frame, app);
-    set_tui_cursor(frame, root[2], app);
+    set_tui_cursor(frame, root[3], app);
+}
+
+const DIFF_PANEL_WIDTH: u16 = 48;
+const TODO_COLLAPSED_ROWS: usize = 5;
+const TODO_EXPANDED_ROW_LIMIT: usize = 15;
+
+fn todo_panel_height(app: &TuiApp) -> u16 {
+    if app.todos.is_empty() {
+        return 0;
+    }
+    if app.todos_expanded {
+        return app.todos.len().min(TODO_EXPANDED_ROW_LIMIT) as u16;
+    }
+    let rows = app.todos.len().min(TODO_COLLAPSED_ROWS);
+    let overflow = usize::from(app.todos.len() > TODO_COLLAPSED_ROWS);
+    (rows + overflow) as u16
+}
+
+fn draw_todo_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.height == 0 || app.todos.is_empty() {
+        return;
+    }
+    let visible = if app.todos_expanded {
+        app.todos.len().min(TODO_EXPANDED_ROW_LIMIT)
+    } else {
+        app.todos.len().min(TODO_COLLAPSED_ROWS)
+    };
+    let mut lines = Vec::new();
+    for todo in app.todos.iter().take(visible) {
+        let (marker, style) = match todo.status {
+            TodoStatus::Completed => ("✓", Style::default().fg(Color::DarkGray)),
+            TodoStatus::InProgress => ("●", Style::default().fg(Color::Yellow)),
+            TodoStatus::Pending => ("○", Style::default().fg(Color::Gray)),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), style),
+            Span::raw(todo.content.clone()),
+        ]));
+    }
+    if !app.todos_expanded && app.todos.len() > visible {
+        let done = app
+            .todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::Completed)
+            .count();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "… +{} more ({} done) · ctrl+t to expand",
+                app.todos.len() - visible,
+                done
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_diff_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(panel) = app.diff_panel.as_ref() else {
+        return;
+    };
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let block = Block::default().borders(Borders::LEFT);
+    if let Some(detail) = panel.detail.as_ref() {
+        let block = block.title(format!(" {} ", detail.path));
+        let visible_height = area.height.saturating_sub(1) as usize;
+        let lines = detail
+            .lines
+            .iter()
+            .skip(detail.scroll)
+            .take(visible_height)
+            .map(|line| colorized_diff_line(line))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+    let block = block.title(format!(" edited files ({}) ", panel.files.len()));
+    let mut lines = Vec::new();
+    for (index, entry) in panel.files.iter().enumerate() {
+        let stats = match (entry.added, entry.removed) {
+            (Some(added), Some(removed)) => format!(" +{added} -{removed}"),
+            _ if entry.untracked => " new".to_string(),
+            _ => String::new(),
+        };
+        let line = Line::from(format!("{}{stats}", entry.path));
+        lines.push(if index == panel.selected {
+            line.style(Style::default().add_modifier(Modifier::REVERSED))
+        } else {
+            line
+        });
+    }
+    if panel.files.is_empty() {
+        lines.push(
+            Line::from("no files edited this session").style(Style::default().fg(Color::DarkGray)),
+        );
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn colorized_diff_line(line: &str) -> Line<'static> {
+    let style = if line.starts_with("+++") || line.starts_with("---") {
+        Style::default().fg(Color::DarkGray)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with("@@") {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    Line::from(line.to_string()).style(style)
 }
 
 fn input_area_height(app: &TuiApp, frame_height: u16, slash_match_height: u16) -> u16 {
@@ -3652,8 +3977,15 @@ async fn handle_tui_key(
         app.status = footer_status(config, runtime, &app.editor_state);
         return Ok(false);
     }
+    if app.diff_panel.is_some() && handle_diff_panel_key(&key, app, runtime) {
+        app.refresh_chrome(config, runtime);
+        return Ok(false);
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.todos_expanded = !app.todos_expanded;
+        }
         KeyCode::Esc => {
             app.clear_input();
             app.multiline = None;
@@ -3699,12 +4031,55 @@ async fn handle_tui_key(
     Ok(false)
 }
 
+fn handle_diff_panel_key(key: &KeyEvent, app: &mut TuiApp, runtime: &Runtime) -> bool {
+    let Some(panel) = app.diff_panel.as_mut() else {
+        return false;
+    };
+    if let Some(detail) = panel.detail.as_mut() {
+        match key.code {
+            KeyCode::Esc => panel.detail = None,
+            KeyCode::Up => detail.scroll = detail.scroll.saturating_sub(1),
+            KeyCode::Down => {
+                detail.scroll = (detail.scroll + 1).min(detail.lines.len().saturating_sub(1));
+            }
+            KeyCode::PageUp => detail.scroll = detail.scroll.saturating_sub(20),
+            KeyCode::PageDown => {
+                detail.scroll = (detail.scroll + 20).min(detail.lines.len().saturating_sub(1));
+            }
+            _ => return false,
+        }
+        return true;
+    }
+    match key.code {
+        KeyCode::Up => panel.selected = panel.selected.saturating_sub(1),
+        KeyCode::Down => {
+            panel.selected = (panel.selected + 1).min(panel.files.len().saturating_sub(1));
+        }
+        KeyCode::Enter if app.input.trim().is_empty() => {
+            let detail = panel
+                .files
+                .get(panel.selected)
+                .map(|entry| build_diff_detail(&runtime.session().cwd, entry));
+            if let Some(detail) = detail {
+                panel.detail = Some(detail);
+            }
+        }
+        KeyCode::Esc if app.input.is_empty() => app.diff_panel = None,
+        _ => return false,
+    }
+    true
+}
+
 fn handle_streaming_tui_key(
     key: KeyEvent,
     app: &mut TuiApp,
     queued_inputs: &mut Vec<String>,
 ) -> bool {
     match key.code {
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.todos_expanded = !app.todos_expanded;
+            true
+        }
         KeyCode::Esc => {
             app.clear_input();
             app.multiline = None;
@@ -4234,6 +4609,26 @@ async fn handle_tui_submission(
             open_tui_selector(app, config, runtime, "model", "")?
         }
         "/account" => open_tui_selector(app, config, runtime, "account", "")?,
+        "/todos" => {
+            app.push(
+                TuiEntryKind::System,
+                format_todo_list(&runtime.session().todos),
+            );
+        }
+        "/diff" => {
+            if app.diff_panel.is_some() {
+                app.diff_panel = None;
+            } else {
+                app.diff_panel = Some(DiffPanelState {
+                    files: collect_diff_file_entries(
+                        &runtime.session().cwd,
+                        &runtime.session().edited_files,
+                    ),
+                    selected: 0,
+                    detail: None,
+                });
+            }
+        }
         "/accounts" => {
             let checking = app.push_placeholder(
                 TuiEntryKind::System,
@@ -4314,6 +4709,7 @@ async fn handle_tui_submission(
             let lifecycle_diagnostics =
                 notify_extension_lifecycle(&config.extensions, "reload", &runtime.session().cwd);
             *config = load_config(config.paths.clone())?;
+            start_model_refresh(config, offline, false);
             let next_generation = runtime.systems().config_generation + 1;
             let report = runtime.reload(ReloadableSystems::from_config(config, next_generation))?;
             let mut output = format_diagnostics(config);
@@ -4740,6 +5136,7 @@ async fn submit_tui_prompt(
             format_tui_error(&error, runtime, config),
         );
     }
+    app.refresh_diff_panel(runtime);
 }
 
 fn format_tui_error(error: &anyhow::Error, runtime: &Runtime, config: &LoadedConfig) -> String {
@@ -4937,6 +5334,104 @@ fn format_model_tool_message(message: &ConversationMessage) -> String {
         return format!("completed {tool_name}");
     }
     format!("completed {tool_name}\n{}", message.content)
+}
+
+fn collect_diff_file_entries(cwd: &Path, paths: &[String]) -> Vec<DiffFileEntry> {
+    let stats = git_numstat(cwd, paths);
+    let untracked = git_untracked_paths(cwd);
+    paths
+        .iter()
+        .map(|path| {
+            let (added, removed) = stats.get(path.as_str()).copied().unwrap_or((None, None));
+            DiffFileEntry {
+                path: path.clone(),
+                added,
+                removed,
+                untracked: untracked.contains(path),
+            }
+        })
+        .collect()
+}
+
+fn git_numstat(cwd: &Path, paths: &[String]) -> BTreeMap<String, (Option<u64>, Option<u64>)> {
+    if paths.is_empty() {
+        return BTreeMap::new();
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["diff", "--numstat", "--relative", "--"])
+        .args(paths)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_numstat(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => BTreeMap::new(),
+    }
+}
+
+fn parse_numstat(text: &str) -> BTreeMap<String, (Option<u64>, Option<u64>)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut columns = line.split('\t');
+            let added = columns.next()?.parse::<u64>().ok();
+            let removed = columns.next()?.parse::<u64>().ok();
+            let path = columns.next()?.to_string();
+            Some((path, (added, removed)))
+        })
+        .collect()
+}
+
+fn git_untracked_paths(cwd: &Path) -> BTreeSet<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(ToString::to_string)
+            .collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+fn build_diff_detail(cwd: &Path, entry: &DiffFileEntry) -> DiffDetail {
+    let lines = if entry.untracked {
+        match fs::read_to_string(cwd.join(&entry.path)) {
+            Ok(content) => content
+                .lines()
+                .take(500)
+                .map(|line| format!("+{line}"))
+                .collect(),
+            Err(_) => vec!["unable to read file".to_string()],
+        }
+    } else {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["diff", "--relative", "--"])
+            .arg(&entry.path)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if text.trim().is_empty() {
+                    vec!["no uncommitted changes".to_string()]
+                } else {
+                    text.lines().map(ToString::to_string).collect()
+                }
+            }
+            _ => vec!["git diff unavailable".to_string()],
+        }
+    };
+    DiffDetail {
+        path: entry.path.clone(),
+        lines,
+        scroll: 0,
+    }
 }
 
 fn response_kind_for_prompt(prompt: &str) -> TuiEntryKind {
@@ -6618,6 +7113,36 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_thinking_levels_follow_model_version() {
+        let opus_5 = ModelRef {
+            provider: "anthropic".to_string(),
+            id: "claude-opus-5-5".to_string(),
+        };
+        assert_eq!(
+            model_thinking_levels(&opus_5),
+            &["off", "high", "xhigh", "max"]
+        );
+
+        let sonnet_4_6 = ModelRef {
+            provider: "anthropic".to_string(),
+            id: "claude-sonnet-4-6".to_string(),
+        };
+        assert_eq!(
+            model_thinking_levels(&sonnet_4_6),
+            &["off", "low", "medium", "high", "xhigh"]
+        );
+
+        let sonnet_4_5 = ModelRef {
+            provider: "anthropic".to_string(),
+            id: "claude-sonnet-4-5".to_string(),
+        };
+        assert_eq!(
+            model_thinking_levels(&sonnet_4_5),
+            &["off", "minimal", "low", "medium", "high"]
+        );
+    }
+
+    #[test]
     fn live_entries_are_not_finalized_until_complete() {
         let mut app = TuiApp::default();
         app.push(TuiEntryKind::User, "hello");
@@ -7063,6 +7588,7 @@ mod tests {
         let response = serde_json::json!({
             "models": [
                 {"slug": "gpt-5.6-terra", "visibility": "list"},
+                {"slug": "gpt-6-sol", "visibility": "list"},
                 {"slug": "gpt-5.6-luna", "visibility": "list"},
                 {"slug": "codex-auto-review", "visibility": "hide"},
                 {"slug": "gpt-5.6-sol-wm", "visibility": "hide"},
@@ -7071,9 +7597,220 @@ mod tests {
         });
 
         assert_eq!(
-            collect_codex_model_ids(&response),
-            BTreeSet::from(["gpt-5.6-luna".to_string(), "gpt-5.6-terra".to_string(),])
+            collect_codex_model_ids(&response, "openai-codex"),
+            BTreeSet::from([
+                "gpt-5.6-luna".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "gpt-6-sol".to_string(),
+            ])
         );
+    }
+
+    #[test]
+    fn model_filter_admits_new_generation_ids() {
+        assert!(model_supported_for_provider("openai", "gpt-6-sol"));
+        assert!(model_supported_for_provider("openai-codex", "gpt-6-sol"));
+        assert!(model_supported_for_provider(
+            "openai-codex",
+            "gpt-5.3-codex"
+        ));
+        assert!(!model_supported_for_provider(
+            "openai-codex",
+            "gpt-6-sol-realtime"
+        ));
+        assert!(model_supported_for_provider("zai", "glm-5.1"));
+        assert!(model_supported_for_provider("zai-coding", "glm-5.1"));
+        assert!(!model_supported_for_provider("zai", "embedding-3"));
+        assert!(model_supported_for_provider(
+            "moonshotai",
+            "kimi-k3-0905-preview"
+        ));
+        assert!(model_supported_for_provider(
+            "kimi-coding-openai",
+            "kimi-for-coding"
+        ));
+        assert!(!model_supported_for_provider("github-copilot", "gpt-6-sol"));
+    }
+
+    #[test]
+    fn anthropic_models_url_paginates_with_cursor() {
+        assert_eq!(
+            anthropic_models_url(None),
+            "https://api.anthropic.com/v1/models?limit=1000"
+        );
+        assert_eq!(
+            anthropic_models_url(Some("claude-opus-4-8")),
+            "https://api.anthropic.com/v1/models?limit=1000&starting_after=claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn anthropic_models_response_reads_pagination_fields() {
+        let page: AnthropicModelsResponse = serde_json::from_value(serde_json::json!({
+            "data": [{"id": "claude-opus-4-8", "display_name": "Claude Opus 4.8"}],
+            "has_more": true,
+            "first_id": "claude-opus-4-8",
+            "last_id": "claude-opus-4-8",
+        }))
+        .expect("parse page");
+        assert!(page.has_more);
+        assert_eq!(page.last_id.as_deref(), Some("claude-opus-4-8"));
+
+        let legacy: AnthropicModelsResponse = serde_json::from_value(serde_json::json!({
+            "data": [{"id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6"}],
+        }))
+        .expect("parse legacy page");
+        assert!(!legacy.has_more);
+        assert_eq!(legacy.last_id, None);
+    }
+
+    #[test]
+    fn model_cache_version_forces_refresh_for_old_caches() {
+        let root = std::env::temp_dir().join(format!(
+            "pi-cli-model-cache-version-{}",
+            unique_temp_suffix()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("model-cache.json");
+        let now = unix_seconds().expect("unix seconds");
+
+        write_model_cache(
+            &path,
+            &ModelCache {
+                refreshed_at: now,
+                ..ModelCache::default()
+            },
+        )
+        .expect("write legacy cache");
+        assert!(model_cache_needs_refresh(&path, 24));
+
+        write_model_cache(
+            &path,
+            &ModelCache {
+                refreshed_at: now,
+                version: MODEL_CACHE_VERSION,
+                models: Vec::new(),
+                diagnostics: Vec::new(),
+                claude_code_version: None,
+            },
+        )
+        .expect("write current cache");
+        assert!(!model_cache_needs_refresh(&path, 24));
+        assert!(model_cache_needs_refresh(&path, 0));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_code_version_validation_rejects_header_unsafe_values() {
+        assert!(is_valid_claude_code_version("2.1.280"));
+        assert!(is_valid_claude_code_version("2.2.0-beta.1+build"));
+        assert!(!is_valid_claude_code_version(""));
+        assert!(!is_valid_claude_code_version("2.1.280\r\nx-injected: yes"));
+        assert!(!is_valid_claude_code_version(&"1".repeat(33)));
+    }
+
+    #[test]
+    fn numstat_parses_text_and_binary_entries() {
+        let stats = parse_numstat("3\t1\tsrc/a.rs\n-\t-\tassets/logo.png\n");
+        assert_eq!(stats["src/a.rs"], (Some(3), Some(1)));
+        assert_eq!(stats["assets/logo.png"], (None, None));
+        assert!(parse_numstat("").is_empty());
+    }
+
+    #[test]
+    fn todo_panel_height_collapses_and_expands() {
+        let mut app = TuiApp::default();
+        assert_eq!(todo_panel_height(&app), 0);
+        app.todos = (0..8)
+            .map(|index| TodoItem {
+                content: format!("task {index}"),
+                status: TodoStatus::Pending,
+            })
+            .collect();
+        assert_eq!(todo_panel_height(&app), 6);
+        app.todos_expanded = true;
+        assert_eq!(todo_panel_height(&app), 8);
+        app.todos = (0..3)
+            .map(|index| TodoItem {
+                content: format!("task {index}"),
+                status: TodoStatus::Pending,
+            })
+            .collect();
+        assert_eq!(todo_panel_height(&app), 3);
+    }
+
+    #[test]
+    fn diff_panel_keys_navigate_and_open_detail() {
+        let cwd =
+            std::env::temp_dir().join(format!("pi-cli-diff-panel-test-{}", unique_temp_suffix()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        fs::write(cwd.join("new.rs"), "fn main() {}\n").expect("write file");
+        let runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let mut app = TuiApp {
+            diff_panel: Some(DiffPanelState {
+                files: vec![
+                    DiffFileEntry {
+                        path: "new.rs".to_string(),
+                        added: None,
+                        removed: None,
+                        untracked: true,
+                    },
+                    DiffFileEntry {
+                        path: "other.rs".to_string(),
+                        added: None,
+                        removed: None,
+                        untracked: true,
+                    },
+                ],
+                selected: 0,
+                detail: None,
+            }),
+            ..TuiApp::default()
+        };
+
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert!(handle_diff_panel_key(&down, &mut app, &runtime));
+        assert_eq!(app.diff_panel.as_ref().expect("panel").selected, 1);
+        assert!(handle_diff_panel_key(&down, &mut app, &runtime));
+        assert_eq!(app.diff_panel.as_ref().expect("panel").selected, 1);
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(handle_diff_panel_key(&enter, &mut app, &runtime));
+        let panel = app.diff_panel.as_ref().expect("panel");
+        let detail = panel.detail.as_ref().expect("detail");
+        assert_eq!(detail.path, "other.rs");
+        assert_eq!(detail.lines, ["unable to read file".to_string()]);
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(handle_diff_panel_key(&esc, &mut app, &runtime));
+        assert!(app.diff_panel.as_ref().expect("panel").detail.is_none());
+        assert!(handle_diff_panel_key(&esc, &mut app, &runtime));
+        assert!(app.diff_panel.is_none());
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn diff_detail_renders_untracked_file_as_additions() {
+        let cwd =
+            std::env::temp_dir().join(format!("pi-cli-diff-detail-test-{}", unique_temp_suffix()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        fs::write(cwd.join("new.rs"), "fn main() {}\n").expect("write file");
+        let entry = DiffFileEntry {
+            path: "new.rs".to_string(),
+            added: None,
+            removed: None,
+            untracked: true,
+        };
+
+        let detail = build_diff_detail(&cwd, &entry);
+
+        assert_eq!(detail.lines, ["+fn main() {}".to_string()]);
+        let _ = fs::remove_dir_all(cwd);
     }
 
     fn test_model(provider: &str, id: &str) -> ModelDefinition {

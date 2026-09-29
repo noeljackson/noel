@@ -51,6 +51,39 @@ pub struct ToolEvent {
     pub result: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+pub fn format_todo_list(todos: &[TodoItem]) -> String {
+    if todos.is_empty() {
+        return "no todos".to_string();
+    }
+    todos
+        .iter()
+        .enumerate()
+        .map(|(index, todo)| {
+            let marker = match todo.status {
+                TodoStatus::Completed => "[x]",
+                TodoStatus::InProgress => "[~]",
+                TodoStatus::Pending => "[ ]",
+            };
+            format!("{}. {} {}", index + 1, marker, todo.content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
     pub session_id: String,
@@ -71,6 +104,10 @@ pub struct SessionState {
     #[serde(default)]
     pub active_account: Option<String>,
     pub active_tool_names: BTreeSet<String>,
+    #[serde(default)]
+    pub todos: Vec<TodoItem>,
+    #[serde(default)]
+    pub edited_files: Vec<String>,
 }
 
 impl SessionState {
@@ -93,6 +130,8 @@ impl SessionState {
                 .into_iter()
                 .map(|definition| definition.name)
                 .collect(),
+            todos: Vec::new(),
+            edited_files: Vec::new(),
         }
     }
 }
@@ -129,6 +168,10 @@ pub struct SessionExport {
     #[serde(default)]
     pub active_account: Option<String>,
     pub active_tool_names: BTreeSet<String>,
+    #[serde(default)]
+    pub todos: Vec<TodoItem>,
+    #[serde(default)]
+    pub edited_files: Vec<String>,
 }
 
 impl From<&SessionState> for SessionExport {
@@ -148,6 +191,8 @@ impl From<&SessionState> for SessionExport {
             active_thinking_level: state.active_thinking_level.clone(),
             active_account: state.active_account.clone(),
             active_tool_names: state.active_tool_names.clone(),
+            todos: state.todos.clone(),
+            edited_files: state.edited_files.clone(),
         }
     }
 }
@@ -168,6 +213,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         active_thinking_level: export.active_thinking_level,
         active_account: export.active_account,
         active_tool_names: export.active_tool_names,
+        todos: export.todos,
+        edited_files: export.edited_files,
     }
 }
 
@@ -418,6 +465,12 @@ enum SessionRecord {
     ActiveTools {
         tools: Vec<String>,
     },
+    Todos {
+        todos: Vec<TodoItem>,
+    },
+    EditedFiles {
+        paths: Vec<String>,
+    },
     QueuedMessage {
         message: String,
     },
@@ -549,6 +602,14 @@ impl SessionStore {
 
     pub fn record_active_tools(&self, tools: Vec<String>) -> Result<(), SessionError> {
         self.append(&SessionRecord::ActiveTools { tools })
+    }
+
+    pub fn record_todos(&self, todos: Vec<TodoItem>) -> Result<(), SessionError> {
+        self.append(&SessionRecord::Todos { todos })
+    }
+
+    pub fn record_edited_files(&self, paths: Vec<String>) -> Result<(), SessionError> {
+        self.append(&SessionRecord::EditedFiles { paths })
     }
 
     pub fn record_metadata(&self, state: &SessionState) -> Result<(), SessionError> {
@@ -773,6 +834,16 @@ impl SessionStore {
                         state.active_tool_names = tools.into_iter().collect();
                     }
                 }
+                SessionRecord::Todos { todos } => {
+                    if let Some(state) = &mut state {
+                        state.todos = todos;
+                    }
+                }
+                SessionRecord::EditedFiles { paths } => {
+                    if let Some(state) = &mut state {
+                        state.edited_files = paths;
+                    }
+                }
                 SessionRecord::QueuedMessage { message } => {
                     if let Some(state) = &mut state {
                         state.queued_messages.push(message);
@@ -812,6 +883,8 @@ impl SessionStore {
         self.record_active_account(state.active_account.clone())?;
         self.record_active_thinking_level(state.active_thinking_level.clone())?;
         self.record_active_tools(state.active_tool_names.iter().cloned().collect())?;
+        self.record_todos(state.todos.clone())?;
+        self.record_edited_files(state.edited_files.clone())?;
         for message in &state.messages {
             self.record_message(message.clone())?;
         }
@@ -1518,6 +1591,30 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn set_todos(&mut self, todos: Vec<TodoItem>) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_todos(todos.clone())?;
+        }
+        self.session.todos = todos;
+        Ok(())
+    }
+
+    pub fn note_edited_files(&mut self, paths: Vec<String>) -> Result<(), SessionError> {
+        let mut changed = false;
+        for path in paths {
+            if !self.session.edited_files.contains(&path) {
+                self.session.edited_files.push(path);
+                changed = true;
+            }
+        }
+        if changed {
+            if let Some(store) = &self.store {
+                store.record_edited_files(self.session.edited_files.clone())?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_store(&mut self, store: SessionStore) {
         self.store = Some(store);
     }
@@ -1695,6 +1792,10 @@ pub async fn run_user_turn_streaming_with_media(
         if !runtime.session.active_tool_names.contains(&command.name) {
             return Err(AgentError::DisabledTool(command.name));
         }
+        let edited_path = match &command.request {
+            ToolRequest::Edit { path, .. } | ToolRequest::Write { path, .. } => Some(path.clone()),
+            _ => None,
+        };
         let result = execute_tool(
             &runtime.session.cwd,
             command.request,
@@ -1704,6 +1805,9 @@ pub async fn run_user_turn_streaming_with_media(
             },
         )
         .await?;
+        if let Some(path) = edited_path {
+            runtime.note_edited_files(vec![path])?;
+        }
         runtime.push_tool_event(ToolEvent {
             id: format!("tool-{}", runtime.session.tool_history.len() + 1),
             name: command.name.clone(),
@@ -2020,6 +2124,30 @@ fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
                 "required": []
             }),
         },
+        "todo" => AiToolDefinition {
+            name: "todo".to_string(),
+            description: "Track multi-step work as a checklist. Replaces the current list; keep exactly one item in_progress.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"]
+                                }
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["todos"]
+            }),
+        },
         _ => return None,
     };
     Some(definition)
@@ -2119,6 +2247,11 @@ fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
     paths
 }
 
+#[derive(Debug, Deserialize)]
+struct TodoToolArgs {
+    todos: Vec<TodoItem>,
+}
+
 async fn execute_model_tool_call(
     runtime: &mut Runtime,
     tool_call: &ChatToolCall,
@@ -2133,11 +2266,30 @@ async fn execute_model_tool_call(
             Ok(output) => vec![output],
             Err(error) => vec![error.to_string()],
         }
+    } else if tool_call.name == "todo" {
+        if model_tool_enabled(runtime, "todo") {
+            match serde_json::from_str::<TodoToolArgs>(&tool_call.arguments) {
+                Ok(args) => match runtime.set_todos(args.todos) {
+                    Ok(()) => vec![format_todo_list(&runtime.session.todos)],
+                    Err(error) => vec![error.to_string()],
+                },
+                Err(error) => vec![format!("invalid todo arguments: {error}")],
+            }
+        } else {
+            vec![format!("Tool {} not found", tool_call.name)]
+        }
     } else {
         match model_tool_requests(tool_call) {
             Ok(requests) if model_tool_enabled(runtime, &tool_call.name) => {
                 let mut outputs = Vec::new();
+                let mut edited_paths = Vec::new();
                 for request in requests {
+                    let edited_path = match &request {
+                        ToolRequest::Edit { path, .. } | ToolRequest::Write { path, .. } => {
+                            Some(path.clone())
+                        }
+                        _ => None,
+                    };
                     let output = match execute_tool(
                         &runtime.session.cwd,
                         request,
@@ -2148,10 +2300,18 @@ async fn execute_model_tool_call(
                     )
                     .await
                     {
-                        Ok(result) => result.output,
+                        Ok(result) => {
+                            if let Some(path) = edited_path {
+                                edited_paths.push(path);
+                            }
+                            result.output
+                        }
                         Err(error) => error.to_string(),
                     };
                     outputs.push(output);
+                }
+                if !edited_paths.is_empty() {
+                    runtime.note_edited_files(edited_paths)?;
                 }
                 outputs
             }
@@ -3035,7 +3195,12 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
 
-        assert_eq!(actual, expected);
+        // Rust intentionally adds tools beyond the upstream set (see
+        // docs/rust-rewrite/non-parity-register.md); upstream tools must keep
+        // their schema keys, but rust-only tools are not in the fixture.
+        for (name, keys) in &expected {
+            assert_eq!(actual.get(name), Some(keys), "schema keys for {name}");
+        }
     }
 
     #[test]
@@ -3301,6 +3466,182 @@ mod tests {
             Some("call_read_1")
         );
 
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn todo_tool_call_updates_session_todos() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let tool_call = ChatToolCall {
+            id: "call_todo_1".to_string(),
+            name: "todo".to_string(),
+            arguments: serde_json::json!({
+                "todos": [
+                    {"content": "first", "status": "completed"},
+                    {"content": "second", "status": "in_progress"},
+                    {"content": "third", "status": "pending"}
+                ]
+            })
+            .to_string(),
+        };
+
+        execute_model_tool_call(&mut runtime, &tool_call)
+            .await
+            .expect("execute todo tool");
+
+        assert_eq!(runtime.session().todos.len(), 3);
+        assert_eq!(runtime.session().todos[1].status, TodoStatus::InProgress);
+        let event = runtime.session().tool_history.last().expect("tool event");
+        assert_eq!(event.name, "todo");
+        assert_eq!(event.result, "1. [x] first\n2. [~] second\n3. [ ] third");
+    }
+
+    #[tokio::test]
+    async fn todo_tool_call_rejects_invalid_arguments() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let tool_call = ChatToolCall {
+            id: "call_todo_2".to_string(),
+            name: "todo".to_string(),
+            arguments: "{\"todos\": \"not-a-list\"}".to_string(),
+        };
+
+        execute_model_tool_call(&mut runtime, &tool_call)
+            .await
+            .expect("execute todo tool");
+
+        assert!(runtime.session().todos.is_empty());
+        let event = runtime.session().tool_history.last().expect("tool event");
+        assert!(event.result.contains("invalid todo arguments"));
+    }
+
+    #[test]
+    fn session_store_restores_todos_on_load() {
+        let base = std::env::temp_dir().join(format!("pi-session-todos-test-{}", new_session_id()));
+        let (store, _state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        store
+            .record_todos(vec![TodoItem {
+                content: "task".to_string(),
+                status: TodoStatus::Pending,
+            }])
+            .expect("record todos");
+
+        let loaded = store.load().expect("load session");
+
+        assert_eq!(
+            loaded.todos,
+            vec![TodoItem {
+                content: "task".to_string(),
+                status: TodoStatus::Pending,
+            }]
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn todo_list_formats_checklist() {
+        assert_eq!(format_todo_list(&[]), "no todos");
+        assert_eq!(
+            format_todo_list(&[
+                TodoItem {
+                    content: "a".to_string(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "b".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    content: "c".to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ]),
+            "1. [x] a\n2. [~] b\n3. [ ] c"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_tool_call_tracks_edited_files() {
+        let cwd = std::env::temp_dir().join(format!("pi-edited-files-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let tool_call = ChatToolCall {
+            id: "call_write_1".to_string(),
+            name: "write".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/new.rs",
+                "content": "fn main() {}\n"
+            })
+            .to_string(),
+        };
+
+        execute_model_tool_call(&mut runtime, &tool_call)
+            .await
+            .expect("execute write tool");
+        execute_model_tool_call(&mut runtime, &tool_call)
+            .await
+            .expect("execute write tool again");
+
+        assert_eq!(runtime.session().edited_files, ["src/new.rs".to_string()]);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn session_store_restores_edited_files_on_load() {
+        let base =
+            std::env::temp_dir().join(format!("pi-session-edited-test-{}", new_session_id()));
+        let (store, _state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        store
+            .record_edited_files(vec!["src/new.rs".to_string()])
+            .expect("record edited files");
+
+        let loaded = store.load().expect("load session");
+
+        assert_eq!(loaded.edited_files, ["src/new.rs".to_string()]);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn user_write_slash_command_tracks_edited_files() {
+        let cwd =
+            std::env::temp_dir().join(format!("pi-user-write-track-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let provider = create_provider(ProviderConfig {
+            model: ModelRef {
+                provider: "faux".to_string(),
+                id: "echo".to_string(),
+            },
+            api: ProviderApi::Faux,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        });
+
+        run_user_turn(
+            &mut runtime,
+            provider.as_ref(),
+            "/write note.txt hi".to_string(),
+        )
+        .await
+        .expect("run write command");
+
+        assert_eq!(runtime.session().edited_files, ["note.txt".to_string()]);
         let _ = fs::remove_dir_all(cwd);
     }
 

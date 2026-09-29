@@ -77,3 +77,32 @@ Native enrollment removes the manual import step while storing credentials in
 the same v2 accounts and refresh machinery. The official CLIs' flows are
 public, documented in their shipped binaries, and produce tokens for the same
 upstream services.
+
+### Todo Tool and Edited-Files Panel
+
+Rust adds a `todo` builtin tool (checklist with `pending`/`in_progress`/
+`completed`, journaled as a `todos` session record) and per-session
+edited-file tracking (`edited_files` journal record) powering the TUI task
+widget (`ctrl+t`) and the `/diff` side panel. The TypeScript upstream has no
+equivalent tool or panel, so `local-tools.json` does not list `todo`; the
+parity tests assert upstream coverage rather than exact tool-set equality.
+
+Reason: agent CLIs (Claude Code's TodoWrite, Codex's update_plan, Kimi's task
+list) converge on a model-callable task list as standard scaffolding for
+multi-step work, and on a session diff view for edited files. Both need
+journaled session state to survive resume, which the upstream session schema
+does not carry.
+
+### Claude Code Version User-Agent
+
+For Claude Code OAuth requests, TypeScript pins `user-agent: claude-cli/2.1.75`.
+Rust reports `claude-cli/<latest published version>` instead: the model refresh
+fetches the newest `@anthropic-ai/claude-code` version from the npm registry,
+caches it in `model-cache.json`, and falls back to a bundled minimum
+(`PI_CLAUDE_CODE_VERSION` overrides both). The parity test pins the version to
+the fixture value to keep comparing the identity shape.
+
+Reason: Anthropic's API rejects OAuth requests for new models when the
+reported Claude Code version is too old ("version X or newer is required"). A
+pinned version strands every new model until the next pi release; tracking the
+published version keeps OAuth-gated models usable.

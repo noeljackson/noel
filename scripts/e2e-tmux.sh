@@ -139,6 +139,18 @@ sleep 0.35
 send_line "/image ${work_dir}/pixel.png describe image"
 send_line "/write ${cwd_dir}/file.txt e2e-ok"
 send_line "/read ${cwd_dir}/file.txt"
+send_line "/todos"
+send_line "/diff"
+sleep 0.35
+tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/diff-pane.txt"
+for expected in "edited files (1)" "file.txt"; do
+  if ! grep -Fq "${expected}" "${work_dir}/diff-pane.txt"; then
+    cat "${work_dir}/diff-pane.txt" >&2
+    echo "diff panel did not show: ${expected}" >&2
+    exit 1
+  fi
+done
+send_line "/diff"
 send_line "/reload"
 send_line "/queue queued followup"
 send_line "after reload"
@@ -249,6 +261,7 @@ require_output "image/png"
 require_output "1x1"
 require_output "[faux/echo] describe image [media:1]"
 require_output "wrote ${cwd_dir}/file.txt"
+require_output "no todos"
 require_output "e2e-ok"
 require_output "reloaded"
 require_output "queued: 1"
