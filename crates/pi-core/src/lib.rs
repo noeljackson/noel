@@ -500,6 +500,9 @@ enum SessionRecord {
     BranchSummary {
         summary: BranchSummary,
     },
+    /// Records written by other binary versions are ignored on load.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -879,6 +882,7 @@ impl SessionStore {
                         state.branch_summaries.push(summary);
                     }
                 }
+                SessionRecord::Unknown => {}
             }
         }
         Ok(state.unwrap_or_else(|| SessionState::new("recovered", PathBuf::from("."))))
@@ -3601,6 +3605,31 @@ mod tests {
         for definition in builtin_tool_definitions() {
             assert!(state.active_tool_names.contains(&definition.name));
         }
+    }
+
+    #[test]
+    fn unknown_record_types_are_skipped_on_load() {
+        let base =
+            std::env::temp_dir().join(format!("pi-unknown-record-test-{}", new_session_id()));
+        fs::create_dir_all(&base).expect("create session dir");
+        let path = base.join("session-1.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"started\",\"session_id\":\"session-1\",\"cwd\":\"/repo\"}\n",
+                "{\"type\":\"active_tools\",\"tools\":[\"read\"]}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\",",
+                "\"media\":[],\"tool_call_id\":null,\"tool_name\":null,\"tool_calls\":[]}}\n",
+            ),
+        )
+        .expect("write session");
+
+        let (_store, loaded) = SessionStore::open(path).expect("open session");
+
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].content, "hi");
+        assert_eq!(loaded.active_tool_names, default_active_tool_names());
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
