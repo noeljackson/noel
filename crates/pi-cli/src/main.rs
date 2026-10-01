@@ -1423,6 +1423,7 @@ async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) 
                 Ok(reference) => match resolve_model_reference(&config, &reference) {
                     Some(model) => {
                         runtime.set_active_model(Some(model.clone()))?;
+                        persist_default_model(&mut config, &model)?;
                         Ok(serde_json::json!({
                             "provider": model.provider,
                             "id": model.id,
@@ -4274,6 +4275,7 @@ fn apply_tui_selector_selection(
             let thinking = selector.selected_thinking_level();
             runtime.set_active_model(Some(model.clone()))?;
             runtime.set_active_thinking_level(thinking.clone())?;
+            persist_default_model(config, &model)?;
             app.push(
                 TuiEntryKind::System,
                 format_model_selection(&model, thinking.as_deref()),
@@ -4565,6 +4567,22 @@ fn write_user_setting(path: &Path, keys: &[&str], value: serde_json::Value) -> R
     fs::write(
         path,
         format!("{}\n", serde_json::to_string_pretty(&settings)?),
+    )?;
+    Ok(())
+}
+
+fn persist_default_model(config: &mut LoadedConfig, model: &ModelRef) -> Result<()> {
+    config.settings.default_provider = Some(model.provider.clone());
+    config.settings.default_model = Some(model.id.clone());
+    write_user_setting(
+        &config.paths.settings_path,
+        &["defaultProvider"],
+        model.provider.clone().into(),
+    )?;
+    write_user_setting(
+        &config.paths.settings_path,
+        &["defaultModel"],
+        model.id.clone().into(),
     )?;
     Ok(())
 }
@@ -4862,6 +4880,7 @@ async fn handle_tui_submission(
             let thinking = active_thinking_level(runtime, config, &model);
             runtime.set_active_model(Some(model.clone()))?;
             runtime.set_active_thinking_level(thinking.clone())?;
+            persist_default_model(config, &model)?;
             app.push(
                 TuiEntryKind::System,
                 format_model_selection(&model, thinking.as_deref()),
@@ -6136,6 +6155,7 @@ fn select_from_selector_message(
             let thinking = active_thinking_level(runtime, config, &model);
             runtime.set_active_model(Some(model.clone()))?;
             runtime.set_active_thinking_level(thinking.clone())?;
+            persist_default_model(config, &model)?;
             Ok(format_model_selection(&model, thinking.as_deref()))
         }
         "theme" | "themes" => {
@@ -7558,6 +7578,62 @@ mod tests {
             model_cache_path: PathBuf::from(".pi/agent/model-cache.json"),
             keybindings_path: PathBuf::from(".pi/agent/keybindings.json"),
         }
+    }
+
+    #[test]
+    fn persist_default_model_writes_settings_and_preserves_other_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "pi-persist-model-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let settings_path = root.join("settings.json");
+        fs::write(&settings_path, "{\n  \"theme\": \"dark\"\n}\n").expect("seed settings");
+        let mut config = LoadedConfig {
+            paths: ConfigPaths {
+                settings_path: settings_path.clone(),
+                ..test_config_paths()
+            },
+            settings: Settings::default(),
+            auth: AuthData::default(),
+            models: Vec::new(),
+            image_models: Vec::new(),
+            keybindings: Vec::new(),
+            context_files: Vec::new(),
+            extensions: Vec::new(),
+            skills: Vec::new(),
+            prompt_templates: Vec::new(),
+            themes: Vec::new(),
+            diagnostics: Vec::new(),
+            system_prompt: None,
+            append_system_prompt: Vec::new(),
+        };
+        let model = ModelRef {
+            provider: "anthropic".to_string(),
+            id: "claude-sonnet-4-6".to_string(),
+        };
+
+        persist_default_model(&mut config, &model).expect("persist default model");
+
+        assert_eq!(
+            config.settings.default_provider.as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            config.settings.default_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
+                .expect("parse settings");
+        assert_eq!(written["defaultProvider"], "anthropic");
+        assert_eq!(written["defaultModel"], "claude-sonnet-4-6");
+        assert_eq!(written["theme"], "dark");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn line_text(line: &Line<'_>) -> String {
