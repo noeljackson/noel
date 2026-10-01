@@ -527,9 +527,16 @@ tmux send-keys -t "${stream_session}" -l "${stream_prompt}"
 tmux send-keys -t "${stream_session}" Enter
 sleep 0.2
 tmux send-keys -t "${stream_session}" -l "draft while streaming"
-sleep 0.35
-tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-draft-pane.txt"
-if ! grep -Fq "pi> draft while streaming" "${work_dir}/stream-draft-pane.txt"; then
+stream_draft_seen=""
+for _ in $(seq 1 40); do
+  sleep 0.1
+  tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-draft-pane.txt"
+  if grep -Fq "pi> draft while streaming" "${work_dir}/stream-draft-pane.txt"; then
+    stream_draft_seen=1
+    break
+  fi
+done
+if [ -z "${stream_draft_seen}" ]; then
   cat "${work_dir}/stream-draft-pane.txt" >&2
   echo "typing during streaming did not update the input draft" >&2
   exit 1
@@ -577,8 +584,14 @@ if ! printf '%s\n' "${clear_before}" | grep -Fq "clear-screen-marker"; then
 fi
 
 tmux send-keys -t "${clear_session}" "/clear" Enter
-sleep 0.5
-clear_output="$(tmux capture-pane -t "${clear_session}" -p -S -2000 2>/dev/null || true)"
+clear_output=""
+for _ in $(seq 1 30); do
+  sleep 0.1
+  clear_output="$(tmux capture-pane -t "${clear_session}" -p -S -2000 2>/dev/null || true)"
+  if ! printf '%s\n' "${clear_output}" | grep -Fq "clear-screen-marker"; then
+    break
+  fi
+done
 printf '%s\n' "${clear_output}" > "${work_dir}/clear-pane.txt"
 tmux send-keys -t "${clear_session}" "/quit" Enter
 sleep 0.5

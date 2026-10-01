@@ -595,6 +595,24 @@ impl TerminalRenderer {
 }
 
 pub fn default_keybindings() -> KeybindingMap {
+    let line_start_keys = if cfg!(target_os = "macos") {
+        vec![
+            "ctrl+a".to_string(),
+            "home".to_string(),
+            "super+left".to_string(),
+        ]
+    } else {
+        vec!["ctrl+a".to_string(), "home".to_string()]
+    };
+    let line_end_keys = if cfg!(target_os = "macos") {
+        vec![
+            "ctrl+e".to_string(),
+            "end".to_string(),
+            "super+right".to_string(),
+        ]
+    } else {
+        vec!["ctrl+e".to_string(), "end".to_string()]
+    };
     KeybindingMap {
         bindings: vec![
             Keybinding {
@@ -607,7 +625,23 @@ pub fn default_keybindings() -> KeybindingMap {
             },
             Keybinding {
                 action: "interrupt".to_string(),
-                keys: vec!["ctrl+c".to_string()],
+                keys: vec!["ctrl+c".to_string(), "ctrl+d".to_string()],
+            },
+            Keybinding {
+                action: "cursor-left".to_string(),
+                keys: vec!["left".to_string()],
+            },
+            Keybinding {
+                action: "cursor-right".to_string(),
+                keys: vec!["right".to_string()],
+            },
+            Keybinding {
+                action: "line-start".to_string(),
+                keys: line_start_keys,
+            },
+            Keybinding {
+                action: "line-end".to_string(),
+                keys: line_end_keys,
             },
             Keybinding {
                 action: "reload".to_string(),
@@ -644,6 +678,24 @@ mod tests {
         assert!(bindings.matches("submit", "ctrl+j"));
         assert!(!bindings.matches("submit", "enter"));
         assert!(bindings.matches("reload", "ctrl+r"));
+    }
+
+    #[test]
+    fn default_keybindings_include_editor_navigation_and_quit() {
+        let bindings = default_keybindings();
+
+        assert!(bindings.matches("line-start", "ctrl+a"));
+        assert!(bindings.matches("line-start", "home"));
+        assert!(bindings.matches("line-end", "ctrl+e"));
+        assert!(bindings.matches("line-end", "end"));
+        assert!(bindings.matches("cursor-left", "left"));
+        assert!(bindings.matches("cursor-right", "right"));
+        assert!(bindings.matches("interrupt", "ctrl+c"));
+        assert!(bindings.matches("interrupt", "ctrl+d"));
+        if cfg!(target_os = "macos") {
+            assert!(bindings.matches("line-start", "super+left"));
+            assert!(bindings.matches("line-end", "super+right"));
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod oauth_login;
 mod oauth_refresh;
@@ -2900,6 +2900,8 @@ fn normalized_thinking_level(level: &str) -> Option<&'static str> {
 struct TuiApp {
     entries: Vec<TuiEntry>,
     input: String,
+    input_cursor: usize,
+    quit_armed_since: Option<Instant>,
     editor_state: EditorState,
     last_shell_command: Option<String>,
     multiline: Option<Vec<String>>,
@@ -2986,6 +2988,13 @@ impl TuiApp {
             session.queued_messages.len()
         );
         self.status = footer_status(config, runtime, &self.editor_state);
+        if let Some(since) = self.quit_armed_since {
+            if since.elapsed() < QUIT_CONFIRM_WINDOW {
+                self.status = "press ctrl+c/ctrl+d again to quit".to_string();
+            } else {
+                self.quit_armed_since = None;
+            }
+        }
         self.show_hardware_cursor = config.settings.show_hardware_cursor.unwrap_or(true);
         self.todos = runtime.session().todos.clone();
     }
@@ -3049,6 +3058,7 @@ impl TuiApp {
         };
         self.history_cursor = Some(next);
         self.input = history[next].clone();
+        self.input_cursor = self.input.len();
         self.typed_input_newlines = newline_offsets(&self.input);
     }
 
@@ -3068,6 +3078,7 @@ impl TuiApp {
             self.typed_input_newlines =
                 self.history_draft_typed_newlines.take().unwrap_or_default();
         }
+        self.input_cursor = self.input.len();
     }
 
     fn reset_history_navigation(&mut self) {
@@ -3077,29 +3088,87 @@ impl TuiApp {
     }
 
     fn paste_text(&mut self, text: &str) {
-        self.input.push_str(text);
+        self.insert_input_str(text);
+    }
+
+    fn insert_input_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let cursor = self.input_cursor;
+        self.input.insert_str(cursor, text);
+        let inserted = text.len();
+        for offset in &mut self.typed_input_newlines {
+            if *offset >= cursor {
+                *offset += inserted;
+            }
+        }
+        self.input_cursor += inserted;
+        self.reset_history_navigation();
+    }
+
+    #[cfg(test)]
+    fn set_input(&mut self, value: impl Into<String>) {
+        self.input = value.into();
+        self.input_cursor = self.input.len();
+        self.typed_input_newlines.clear();
         self.reset_history_navigation();
     }
 
     fn push_input_char(&mut self, ch: char) {
-        self.input.push(ch);
-        self.reset_history_navigation();
+        let mut buf = [0u8; 4];
+        self.insert_input_str(ch.encode_utf8(&mut buf));
     }
 
     fn pop_input_char(&mut self) {
-        let Some((offset, ch)) = self.input.char_indices().next_back() else {
+        let Some((offset, ch)) = self.input[..self.input_cursor].char_indices().next_back() else {
             self.reset_history_navigation();
             return;
         };
-        self.input.pop();
-        if ch == '\n' && self.typed_input_newlines.last() == Some(&offset) {
-            self.typed_input_newlines.pop();
-        }
+        let removed = ch.len_utf8();
+        self.input.drain(offset..offset + removed);
+        self.input_cursor = offset;
+        self.typed_input_newlines.retain_mut(|newline| {
+            if ch == '\n' && *newline == offset {
+                return false;
+            }
+            if *newline > offset {
+                *newline -= removed;
+            }
+            true
+        });
         self.reset_history_navigation();
+    }
+
+    fn move_cursor_left(&mut self) {
+        if let Some((offset, _)) = self.input[..self.input_cursor].char_indices().next_back() {
+            self.input_cursor = offset;
+        }
+    }
+
+    fn move_cursor_right(&mut self) {
+        if let Some(ch) = self.input[self.input_cursor..].chars().next() {
+            self.input_cursor += ch.len_utf8();
+        }
+    }
+
+    fn cursor_to_line_start(&mut self) {
+        self.input_cursor = self.input[..self.input_cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+    }
+
+    fn cursor_to_line_end(&mut self) {
+        self.input_cursor = self.input[self.input_cursor..]
+            .find('\n')
+            .map(|index| self.input_cursor + index)
+            .unwrap_or(self.input.len());
     }
 
     fn clear_input(&mut self) {
         self.input.clear();
+        self.input_cursor = 0;
         self.typed_input_newlines.clear();
         self.reset_history_navigation();
     }
@@ -3113,9 +3182,34 @@ impl TuiApp {
     }
 
     fn insert_input_newline(&mut self) {
-        self.typed_input_newlines.push(self.input.len());
-        self.input.push('\n');
+        let cursor = self.input_cursor;
+        self.input.insert(cursor, '\n');
+        for offset in &mut self.typed_input_newlines {
+            if *offset >= cursor {
+                *offset += 1;
+            }
+        }
+        self.typed_input_newlines.push(cursor);
+        self.typed_input_newlines.sort_unstable();
+        self.input_cursor = cursor + 1;
         self.reset_history_navigation();
+    }
+
+    /// Double-press gate for quit keys: the first press clears any draft and
+    /// arms a confirmation window; a second press inside the window quits.
+    fn quit_requested(&mut self, now: Instant) -> bool {
+        let armed = self
+            .quit_armed_since
+            .map(|since| now.saturating_duration_since(since) < QUIT_CONFIRM_WINDOW)
+            .unwrap_or(false);
+        if armed {
+            return true;
+        }
+        self.quit_armed_since = Some(now);
+        if !self.input.is_empty() {
+            self.clear_input();
+        }
+        false
     }
 
     fn typed_input_rows(&self) -> usize {
@@ -3711,10 +3805,8 @@ fn render_input_lines(
         return Vec::new();
     }
     let prompt = input_prompt(app);
-    let input_rows = input_visible_rows(app, area_height);
     let parts = app.input.split('\n').collect::<Vec<_>>();
-    let visible_count = parts.len().min(input_rows);
-    let start = parts.len().saturating_sub(visible_count);
+    let start = input_visible_start(app, area_height);
     let metrics = input_metrics(app, area_height);
     let mut lines = Vec::new();
     for _ in 0..metrics.top_padding {
@@ -3756,8 +3848,8 @@ fn input_metrics(app: &TuiApp, area_height: usize) -> InputMetrics {
         };
     }
     let input_rows = input_visible_rows(app, area_height);
-    let parts = app.input.split('\n').collect::<Vec<_>>();
-    let visible_count = parts.len().min(input_rows);
+    let parts_count = app.input.split('\n').count();
+    let visible_count = parts_count.min(input_rows);
     let top_padding = if app.multiline.is_some() {
         input_rows.saturating_sub(visible_count)
     } else if area_height > visible_count {
@@ -3765,11 +3857,31 @@ fn input_metrics(app: &TuiApp, area_height: usize) -> InputMetrics {
     } else {
         0
     };
+    let cursor_line = app.input[..app.input_cursor]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let line_start = app.input[..app.input_cursor]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let current_width = app.input[line_start..app.input_cursor].chars().count();
     InputMetrics {
         top_padding,
-        visible_index: visible_count.saturating_sub(1),
-        current_width: parts.last().map(|line| line.chars().count()).unwrap_or(0),
+        visible_index: cursor_line.saturating_sub(input_visible_start(app, area_height)),
+        current_width,
     }
+}
+
+fn input_visible_start(app: &TuiApp, area_height: usize) -> usize {
+    let parts_count = app.input.split('\n').count();
+    let visible_count = parts_count.min(input_visible_rows(app, area_height));
+    let end_anchored = parts_count.saturating_sub(visible_count);
+    let cursor_line = app.input[..app.input_cursor]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    end_anchored.min(cursor_line)
 }
 
 fn input_visible_rows(app: &TuiApp, area_height: usize) -> usize {
@@ -3989,11 +4101,43 @@ async fn handle_tui_key(
         app.refresh_chrome(config, runtime);
         return Ok(false);
     }
-    match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
-        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.todos_expanded = !app.todos_expanded;
+    if let Some(name) = key_event_name(&key) {
+        let bindings = keybinding_map(config);
+        if bindings.matches("interrupt", &name) {
+            if app.quit_requested(Instant::now()) {
+                return Ok(true);
+            }
+            app.refresh_chrome(config, runtime);
+            return Ok(false);
         }
+        app.quit_armed_since = None;
+        if bindings.matches("todos", &name) {
+            app.todos_expanded = !app.todos_expanded;
+            app.refresh_chrome(config, runtime);
+            return Ok(false);
+        }
+        if bindings.matches("line-start", &name) {
+            app.cursor_to_line_start();
+            app.refresh_chrome(config, runtime);
+            return Ok(false);
+        }
+        if bindings.matches("line-end", &name) {
+            app.cursor_to_line_end();
+            app.refresh_chrome(config, runtime);
+            return Ok(false);
+        }
+        if bindings.matches("cursor-left", &name) {
+            app.move_cursor_left();
+            app.refresh_chrome(config, runtime);
+            return Ok(false);
+        }
+        if bindings.matches("cursor-right", &name) {
+            app.move_cursor_right();
+            app.refresh_chrome(config, runtime);
+            return Ok(false);
+        }
+    }
+    match key.code {
         KeyCode::Esc => {
             app.clear_input();
             app.multiline = None;
@@ -4030,13 +4174,45 @@ async fn handle_tui_key(
                 return Ok(quit);
             }
         }
-        KeyCode::Char(ch) => {
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.push_input_char(ch);
         }
         _ => {}
     }
     app.refresh_chrome(config, runtime);
     Ok(false)
+}
+
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+
+fn key_event_name(key: &KeyEvent) -> Option<String> {
+    let base = match key.code {
+        KeyCode::Char(ch) => ch.to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "escape".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        _ => return None,
+    };
+    let mut name = String::new();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        name.push_str("ctrl+");
+    }
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        name.push_str("super+");
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        name.push_str("alt+");
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        name.push_str("shift+");
+    }
+    name.push_str(&base);
+    Some(name)
 }
 
 fn handle_diff_panel_key(key: &KeyEvent, app: &mut TuiApp, runtime: &Runtime) -> bool {
@@ -4082,12 +4258,32 @@ fn handle_streaming_tui_key(
     key: KeyEvent,
     app: &mut TuiApp,
     queued_inputs: &mut Vec<String>,
+    config: &LoadedConfig,
 ) -> bool {
-    match key.code {
-        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+    if let Some(name) = key_event_name(&key) {
+        let bindings = keybinding_map(config);
+        if bindings.matches("todos", &name) {
             app.todos_expanded = !app.todos_expanded;
-            true
+            return true;
         }
+        if bindings.matches("line-start", &name) {
+            app.cursor_to_line_start();
+            return true;
+        }
+        if bindings.matches("line-end", &name) {
+            app.cursor_to_line_end();
+            return true;
+        }
+        if bindings.matches("cursor-left", &name) {
+            app.move_cursor_left();
+            return true;
+        }
+        if bindings.matches("cursor-right", &name) {
+            app.move_cursor_right();
+            return true;
+        }
+    }
+    match key.code {
         KeyCode::Esc => {
             app.clear_input();
             app.multiline = None;
@@ -4121,12 +4317,13 @@ fn drain_streaming_tui_events(
     surface: &mut TuiSurface<'_>,
     app: &mut TuiApp,
     queued_inputs: &mut Vec<String>,
+    config: &LoadedConfig,
 ) -> Result<bool> {
     let mut changed = false;
     while event::poll(Duration::ZERO)? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                changed |= handle_streaming_tui_key(key, app, queued_inputs);
+                changed |= handle_streaming_tui_key(key, app, queued_inputs, config);
             }
             Event::Paste(text) => {
                 app.paste_text(&text);
@@ -5293,7 +5490,7 @@ async fn run_prompt_once_tui(
                         apply_stream_delta(app, entry_index, &mut saw_delta, &delta);
                         pending_redraw = true;
                     }
-                    if drain_streaming_tui_events(surface, app, &mut queued_inputs)? {
+                    if drain_streaming_tui_events(surface, app, &mut queued_inputs, config)? {
                         pending_redraw = true;
                     }
                     if pending_redraw {
@@ -7262,12 +7459,14 @@ mod tests {
         let mut app = TuiApp::default();
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
         let mut queued_inputs = Vec::new();
+        let config = minimal_test_config();
 
         for ch in "next prompt".chars() {
             let changed = handle_streaming_tui_key(
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
                 &mut app,
                 &mut queued_inputs,
+                &config,
             );
             assert!(changed);
         }
@@ -7282,13 +7481,15 @@ mod tests {
     fn streaming_enter_queues_draft_without_touching_live_response() {
         let mut app = TuiApp::default();
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
-        app.input = "next prompt".to_string();
+        app.set_input("next prompt");
         let mut queued_inputs = Vec::new();
+        let config = minimal_test_config();
 
         let changed = handle_streaming_tui_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut app,
             &mut queued_inputs,
+            &config,
         );
 
         assert!(changed);
@@ -7303,7 +7504,7 @@ mod tests {
         let mut app = TuiApp::default();
         app.editor_state.record_history("first");
         app.editor_state.record_history("second");
-        app.input = "draft".to_string();
+        app.set_input("draft");
 
         app.history_previous();
         assert_eq!(app.input, "second");
@@ -7371,17 +7572,15 @@ mod tests {
 
     #[test]
     fn shift_enter_adds_newline_to_input() {
-        let mut app = TuiApp {
-            input: "first".to_string(),
-            ..TuiApp::default()
-        };
+        let mut app = TuiApp::default();
+        app.set_input("first");
         app.editor_state.record_history("old prompt");
         app.history_previous();
         assert_eq!(app.input, "old prompt");
 
-        app.input = "first".to_string();
+        app.set_input("first");
         app.insert_input_newline();
-        app.input.push_str("second");
+        app.insert_input_str("second");
 
         assert_eq!(app.input, "first\nsecond");
         assert!(is_shift_enter(&KeyEvent::new(
@@ -7398,10 +7597,8 @@ mod tests {
 
     #[test]
     fn single_line_input_stays_vertically_centered() {
-        let app = TuiApp {
-            input: "draft".to_string(),
-            ..TuiApp::default()
-        };
+        let mut app = TuiApp::default();
+        app.set_input("draft");
 
         let metrics = input_metrics(&app, 3);
         let lines = render_input_lines(&app, 3, Style::default(), Style::default());
@@ -7414,10 +7611,8 @@ mod tests {
 
     #[test]
     fn typed_newlines_expand_input_area_but_paste_newlines_do_not() {
-        let mut app = TuiApp {
-            input: "one".to_string(),
-            ..TuiApp::default()
-        };
+        let mut app = TuiApp::default();
+        app.set_input("one");
         for line in ["two", "three", "four"] {
             app.insert_input_newline();
             for ch in line.chars() {
@@ -7445,11 +7640,11 @@ mod tests {
     #[test]
     fn clear_visible_resets_transient_tui_state_only() {
         let mut app = TuiApp {
-            input: "draft".to_string(),
             multiline: Some(vec!["one".to_string()]),
             live_entry_index: Some(0),
             ..TuiApp::default()
         };
+        app.set_input("draft");
         app.push(TuiEntryKind::User, "hello");
         app.editor_state.record_history("old prompt");
         app.history_previous();
@@ -7483,19 +7678,17 @@ mod tests {
             system_prompt: None,
             append_system_prompt: Vec::new(),
         };
-        let mut app = TuiApp {
-            input: "/cl".to_string(),
-            ..TuiApp::default()
-        };
+        let mut app = TuiApp::default();
+        app.set_input("/cl");
 
         let matches = slash_command_matches(&config, &app);
         assert!(matches.contains(&"/clear".to_string()));
         assert!(matches.contains(&"/clone [id|name|path]".to_string()));
 
-        app.input = "not slash".to_string();
+        app.set_input("not slash");
         assert!(slash_command_matches(&config, &app).is_empty());
 
-        app.input = "/extension:j".to_string();
+        app.set_input("/extension:j");
         assert_eq!(
             slash_command_matches(&config, &app),
             vec!["/extension:json-ext".to_string()]
@@ -7578,6 +7771,105 @@ mod tests {
             model_cache_path: PathBuf::from(".pi/agent/model-cache.json"),
             keybindings_path: PathBuf::from(".pi/agent/keybindings.json"),
         }
+    }
+
+    fn minimal_test_config() -> LoadedConfig {
+        LoadedConfig {
+            paths: test_config_paths(),
+            settings: Settings::default(),
+            auth: AuthData::default(),
+            models: Vec::new(),
+            image_models: Vec::new(),
+            keybindings: Vec::new(),
+            context_files: Vec::new(),
+            extensions: Vec::new(),
+            skills: Vec::new(),
+            prompt_templates: Vec::new(),
+            themes: Vec::new(),
+            diagnostics: Vec::new(),
+            system_prompt: None,
+            append_system_prompt: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn input_cursor_inserts_and_deletes_at_cursor() {
+        let mut app = TuiApp::default();
+        for ch in "helo".chars() {
+            app.push_input_char(ch);
+        }
+        app.move_cursor_left();
+        app.push_input_char('l');
+        assert_eq!(app.input, "hello");
+        assert_eq!(app.input_cursor, 4);
+
+        app.cursor_to_line_start();
+        app.push_input_char('>');
+        assert_eq!(app.input, ">hello");
+
+        app.cursor_to_line_end();
+        app.move_cursor_left();
+        app.pop_input_char();
+        assert_eq!(app.input, ">helo");
+        assert_eq!(app.input_cursor, 4);
+    }
+
+    #[test]
+    fn line_navigation_respects_newlines() {
+        let mut app = TuiApp::default();
+        app.set_input("first\nsecond");
+
+        app.cursor_to_line_start();
+        assert_eq!(app.input_cursor, 6);
+        app.move_cursor_left();
+        assert_eq!(app.input_cursor, 5);
+        app.cursor_to_line_start();
+        assert_eq!(app.input_cursor, 0);
+        app.cursor_to_line_end();
+        assert_eq!(app.input_cursor, 5);
+        app.move_cursor_right();
+        app.cursor_to_line_end();
+        assert_eq!(app.input_cursor, 12);
+    }
+
+    #[test]
+    fn quit_requires_double_press_within_window() {
+        let mut app = TuiApp::default();
+        app.set_input("draft");
+        let now = Instant::now();
+
+        assert!(!app.quit_requested(now));
+        assert!(app.input.is_empty(), "first press clears the draft");
+        assert!(app.quit_requested(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn quit_arm_expires() {
+        let mut app = TuiApp::default();
+        let now = Instant::now();
+
+        assert!(!app.quit_requested(now));
+        assert!(!app.quit_requested(now + QUIT_CONFIRM_WINDOW));
+    }
+
+    #[test]
+    fn key_event_name_formats_modifiers() {
+        assert_eq!(
+            key_event_name(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Some("ctrl+a".to_string())
+        );
+        assert_eq!(
+            key_event_name(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            Some("home".to_string())
+        );
+        assert_eq!(
+            key_event_name(&KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER)),
+            Some("super+left".to_string())
+        );
+        assert_eq!(
+            key_event_name(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some("shift+enter".to_string())
+        );
     }
 
     #[test]
