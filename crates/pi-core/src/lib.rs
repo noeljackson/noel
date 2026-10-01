@@ -105,6 +105,8 @@ pub struct SessionState {
     pub active_account: Option<String>,
     pub active_tool_names: BTreeSet<String>,
     #[serde(default)]
+    pub disabled_tools: BTreeSet<String>,
+    #[serde(default)]
     pub todos: Vec<TodoItem>,
     #[serde(default)]
     pub edited_files: Vec<String>,
@@ -126,14 +128,26 @@ impl SessionState {
             active_model: None,
             active_thinking_level: None,
             active_account: None,
-            active_tool_names: builtin_tool_definitions()
-                .into_iter()
-                .map(|definition| definition.name)
-                .collect(),
+            active_tool_names: default_active_tool_names(),
+            disabled_tools: BTreeSet::new(),
             todos: Vec::new(),
             edited_files: Vec::new(),
         }
     }
+}
+
+pub fn default_active_tool_names() -> BTreeSet<String> {
+    builtin_tool_definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect()
+}
+
+fn active_tools_with(disabled_tools: &BTreeSet<String>) -> BTreeSet<String> {
+    default_active_tool_names()
+        .difference(disabled_tools)
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,7 +181,8 @@ pub struct SessionExport {
     pub active_thinking_level: Option<String>,
     #[serde(default)]
     pub active_account: Option<String>,
-    pub active_tool_names: BTreeSet<String>,
+    #[serde(default)]
+    pub disabled_tools: BTreeSet<String>,
     #[serde(default)]
     pub todos: Vec<TodoItem>,
     #[serde(default)]
@@ -190,7 +205,7 @@ impl From<&SessionState> for SessionExport {
             active_model: state.active_model.clone(),
             active_thinking_level: state.active_thinking_level.clone(),
             active_account: state.active_account.clone(),
-            active_tool_names: state.active_tool_names.clone(),
+            disabled_tools: state.disabled_tools.clone(),
             todos: state.todos.clone(),
             edited_files: state.edited_files.clone(),
         }
@@ -198,6 +213,7 @@ impl From<&SessionState> for SessionExport {
 }
 
 fn session_state_from_export(export: SessionExport, session_id: String) -> SessionState {
+    let active_tool_names = active_tools_with(&export.disabled_tools);
     SessionState {
         session_id,
         cwd: export.cwd,
@@ -212,7 +228,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         active_model: export.active_model,
         active_thinking_level: export.active_thinking_level,
         active_account: export.active_account,
-        active_tool_names: export.active_tool_names,
+        active_tool_names,
+        disabled_tools: export.disabled_tools,
         todos: export.todos,
         edited_files: export.edited_files,
     }
@@ -462,7 +479,7 @@ enum SessionRecord {
     ActiveThinkingLevel {
         level: Option<String>,
     },
-    ActiveTools {
+    DisabledTools {
         tools: Vec<String>,
     },
     Todos {
@@ -509,9 +526,6 @@ impl SessionStore {
         let store = Self { path };
         let state = SessionState::new(session_id.clone(), cwd.clone());
         store.append(&SessionRecord::Started { session_id, cwd })?;
-        store.append(&SessionRecord::ActiveTools {
-            tools: state.active_tool_names.iter().cloned().collect(),
-        })?;
         Ok((store, state))
     }
 
@@ -600,8 +614,8 @@ impl SessionStore {
         self.append(&SessionRecord::ActiveThinkingLevel { level })
     }
 
-    pub fn record_active_tools(&self, tools: Vec<String>) -> Result<(), SessionError> {
-        self.append(&SessionRecord::ActiveTools { tools })
+    pub fn record_disabled_tools(&self, tools: Vec<String>) -> Result<(), SessionError> {
+        self.append(&SessionRecord::DisabledTools { tools })
     }
 
     pub fn record_todos(&self, todos: Vec<TodoItem>) -> Result<(), SessionError> {
@@ -829,9 +843,10 @@ impl SessionStore {
                         state.active_thinking_level = level;
                     }
                 }
-                SessionRecord::ActiveTools { tools } => {
+                SessionRecord::DisabledTools { tools } => {
                     if let Some(state) = &mut state {
-                        state.active_tool_names = tools.into_iter().collect();
+                        state.disabled_tools = tools.into_iter().collect();
+                        state.active_tool_names = active_tools_with(&state.disabled_tools);
                     }
                 }
                 SessionRecord::Todos { todos } => {
@@ -882,7 +897,7 @@ impl SessionStore {
         self.record_active_model(state.active_model.clone())?;
         self.record_active_account(state.active_account.clone())?;
         self.record_active_thinking_level(state.active_thinking_level.clone())?;
-        self.record_active_tools(state.active_tool_names.iter().cloned().collect())?;
+        self.record_disabled_tools(state.disabled_tools.iter().cloned().collect())?;
         self.record_todos(state.todos.clone())?;
         self.record_edited_files(state.edited_files.clone())?;
         for message in &state.messages {
@@ -978,7 +993,7 @@ fn ts_jsonl_export_records(state: &SessionState) -> Vec<Value> {
             "customType": "rust_session_state",
             "data": {
                 "labels": state.labels,
-                "active_tool_names": state.active_tool_names,
+                "disabled_tools": state.disabled_tools,
                 "queued_messages": state.queued_messages,
                 "tool_history": state.tool_history,
             },
@@ -1266,12 +1281,13 @@ fn restore_rust_session_state(state: &mut SessionState, data: &Value) {
             .map(ToString::to_string)
             .collect();
     }
-    if let Some(tools) = data.get("active_tool_names").and_then(Value::as_array) {
-        state.active_tool_names = tools
+    if let Some(tools) = data.get("disabled_tools").and_then(Value::as_array) {
+        state.disabled_tools = tools
             .iter()
             .filter_map(Value::as_str)
             .map(ToString::to_string)
             .collect();
+        state.active_tool_names = active_tools_with(&state.disabled_tools);
     }
     if let Some(messages) = data.get("queued_messages").and_then(Value::as_array) {
         state.queued_messages = messages
@@ -1583,11 +1599,12 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn set_active_tools(&mut self, tools: BTreeSet<String>) -> Result<(), SessionError> {
+    pub fn set_disabled_tools(&mut self, tools: BTreeSet<String>) -> Result<(), SessionError> {
         if let Some(store) = &self.store {
-            store.record_active_tools(tools.iter().cloned().collect())?;
+            store.record_disabled_tools(tools.iter().cloned().collect())?;
         }
-        self.session.active_tool_names = tools;
+        self.session.disabled_tools = tools;
+        self.session.active_tool_names = active_tools_with(&self.session.disabled_tools);
         Ok(())
     }
 
@@ -2017,6 +2034,7 @@ fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
 fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
     (runtime.session.active_tool_names.contains(name)
         || runtime.systems.extension_tools.contains_key(name))
+        && !runtime.session.disabled_tools.contains(name)
         && (runtime.systems.available_tool_names.is_empty()
             || runtime.systems.available_tool_names.contains(name))
 }
@@ -2877,7 +2895,8 @@ mod tests {
             id: "claude".to_string(),
         });
         state.active_thinking_level = Some("xhigh".to_string());
-        state.active_tool_names = BTreeSet::from(["read".to_string()]);
+        state.disabled_tools = BTreeSet::from(["write".to_string()]);
+        state.active_tool_names = active_tools_with(&state.disabled_tools);
         state.queued_messages = vec!["next prompt".to_string()];
         state.messages.push(ConversationMessage {
             role: MessageRole::User,
@@ -2919,8 +2938,8 @@ mod tests {
             .record_active_thinking_level(state.active_thinking_level.clone())
             .expect("record thinking");
         store
-            .record_active_tools(state.active_tool_names.iter().cloned().collect())
-            .expect("record tools");
+            .record_disabled_tools(state.disabled_tools.iter().cloned().collect())
+            .expect("record disabled tools");
         store
             .record_message(state.messages[0].clone())
             .expect("record user");
@@ -3013,7 +3032,10 @@ mod tests {
         assert_eq!(opened.session_id, state.session_id);
         assert_eq!(opened.messages, state.messages);
         assert_eq!(opened.active_model, state.active_model);
+        assert_eq!(opened.disabled_tools, state.disabled_tools);
         assert_eq!(opened.active_tool_names, state.active_tool_names);
+        assert!(!opened.active_tool_names.contains("write"));
+        assert!(opened.active_tool_names.contains("read"));
         assert_eq!(opened.labels, state.labels);
 
         let _ = fs::remove_dir_all(base);
@@ -3545,6 +3567,43 @@ mod tests {
     }
 
     #[test]
+    fn disabled_tools_persist_and_derive_active_tools_on_load() {
+        let base =
+            std::env::temp_dir().join(format!("pi-disabled-tools-test-{}", new_session_id()));
+        let (store, state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        assert_eq!(state.active_tool_names, default_active_tool_names());
+        assert!(state.disabled_tools.is_empty());
+
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store.clone());
+        runtime
+            .set_disabled_tools(BTreeSet::from(["write".to_string()]))
+            .expect("disable write");
+
+        let (_store, loaded) = SessionStore::open(store.path().to_path_buf()).expect("reopen");
+
+        assert_eq!(loaded.disabled_tools, BTreeSet::from(["write".to_string()]));
+        assert!(!loaded.active_tool_names.contains("write"));
+        assert_eq!(
+            loaded.active_tool_names,
+            default_active_tool_names()
+                .difference(&BTreeSet::from(["write".to_string()]))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn fresh_session_enables_all_builtin_tools() {
+        let state = SessionState::new("session-1", PathBuf::from("/repo"));
+        assert!(state.disabled_tools.is_empty());
+        for definition in builtin_tool_definitions() {
+            assert!(state.active_tool_names.contains(&definition.name));
+        }
+    }
+
+    #[test]
     fn todo_list_formats_checklist() {
         assert_eq!(format_todo_list(&[]), "no todos");
         assert_eq!(
@@ -3982,7 +4041,8 @@ mod tests {
         let cwd = std::env::temp_dir().join(format!("pi-disabled-tool-test-{}", new_session_id()));
         fs::create_dir_all(&cwd).expect("create temp dir");
         let mut session = SessionState::new("session-1", cwd.clone());
-        session.active_tool_names.remove("write");
+        session.disabled_tools = BTreeSet::from(["write".to_string()]);
+        session.active_tool_names = active_tools_with(&session.disabled_tools);
         let mut runtime = Runtime::new(session, ReloadableSystems::default());
         let provider = create_provider(ProviderConfig {
             model: ModelRef {

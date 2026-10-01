@@ -210,7 +210,7 @@ Environment overrides:
   "defaultModel": "echo",
   "defaultThinkingLevel": "xhigh",
   "enabledModels": ["faux/echo"],
-  "enabledTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
+  "enabledTools": ["read", "bash", "edit", "write", "grep", "find", "ls", "todo"],
   "sessionDir": "sessions",
   "modelRefresh": {
     "enabled": true,

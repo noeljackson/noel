@@ -46,9 +46,10 @@ use pi_config::{
     DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR, MODEL_CACHE_VERSION,
 };
 use pi_core::{
-    format_todo_list, run_excluded_bash, run_user_turn, run_user_turn_streaming,
-    run_user_turn_streaming_with_media, write_session_export, CompactionKind, ConversationMessage,
-    MessageRole, ReloadableSystems, Runtime, SessionState, SessionStore, TodoItem, TodoStatus,
+    default_active_tool_names, format_todo_list, run_excluded_bash, run_user_turn,
+    run_user_turn_streaming, run_user_turn_streaming_with_media, write_session_export,
+    CompactionKind, ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionState,
+    SessionStore, TodoItem, TodoStatus,
 };
 use pi_tui::{
     EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector, SelectorItem, SessionView,
@@ -1301,14 +1302,20 @@ async fn main() -> Result<()> {
     let systems = ReloadableSystems::from_config(&config, 1);
     let mut runtime = create_runtime(&cli, &cwd, &config, systems)?;
     select_initial_model(&mut runtime, &config, &cli)?;
-    if cli.no_tools
-        || cli.no_builtin_tools
-        || !cli.tools.is_empty()
-        || !cli.exclude_tools.is_empty()
-    {
-        let mut active_tools = runtime.systems().available_tool_names.clone();
-        active_tools.retain(|tool| !cli.exclude_tools.iter().any(|excluded| excluded == tool));
-        runtime.set_active_tools(active_tools)?;
+    if cli.no_tools || cli.no_builtin_tools {
+        runtime.set_disabled_tools(default_active_tool_names())?;
+    } else {
+        let mut disabled: BTreeSet<String> = cli.exclude_tools.iter().cloned().collect();
+        if !cli.tools.is_empty() {
+            for name in default_active_tool_names() {
+                if !cli.tools.contains(&name) {
+                    disabled.insert(name);
+                }
+            }
+        }
+        if !disabled.is_empty() {
+            runtime.set_disabled_tools(disabled)?;
+        }
     }
     if let Some(name) = &cli.name {
         let name = name.trim();
