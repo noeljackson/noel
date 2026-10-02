@@ -49,7 +49,7 @@ use pi_core::{
     default_active_tool_names, format_todo_list, run_excluded_bash, run_user_turn,
     run_user_turn_streaming, run_user_turn_streaming_with_media, write_session_export,
     CompactionKind, ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionState,
-    SessionStore, TodoItem, TodoStatus,
+    SessionStore, SteeringMailbox, SteeringMode, TodoItem, TodoStatus,
 };
 use pi_tui::{
     EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector, SelectorItem, SessionView,
@@ -4136,6 +4136,9 @@ async fn handle_tui_key(
             app.refresh_chrome(config, runtime);
             return Ok(false);
         }
+        if bindings.matches("steer", &name) {
+            return submit_tui_input(surface, app, runtime, config, offline).await;
+        }
     }
     match key.code {
         KeyCode::Esc => {
@@ -4155,29 +4158,41 @@ async fn handle_tui_key(
             app.insert_input_newline();
         }
         KeyCode::Enter => {
-            let line = app.input.trim().to_string();
-            app.clear_input();
-            if !line.is_empty() {
-                let quit = match handle_tui_submission(app, surface, runtime, config, offline, line)
-                    .await
-                {
-                    Ok(quit) => quit,
-                    Err(error) => {
-                        app.push(
-                            TuiEntryKind::Error,
-                            format_tui_error(&error, runtime, config),
-                        );
-                        false
-                    }
-                };
-                app.refresh_chrome(config, runtime);
-                return Ok(quit);
-            }
+            return submit_tui_input(surface, app, runtime, config, offline).await;
         }
         KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.push_input_char(ch);
         }
         _ => {}
+    }
+    app.refresh_chrome(config, runtime);
+    Ok(false)
+}
+
+/// Submits the current input as a prompt. Shared by Enter and the steer
+/// binding, which sends immediately when no turn is streaming.
+async fn submit_tui_input(
+    surface: &mut TuiSurface<'_>,
+    app: &mut TuiApp,
+    runtime: &mut Runtime,
+    config: &mut LoadedConfig,
+    offline: bool,
+) -> Result<bool> {
+    let line = app.input.trim().to_string();
+    app.clear_input();
+    if !line.is_empty() {
+        let quit = match handle_tui_submission(app, surface, runtime, config, offline, line).await {
+            Ok(quit) => quit,
+            Err(error) => {
+                app.push(
+                    TuiEntryKind::Error,
+                    format_tui_error(&error, runtime, config),
+                );
+                false
+            }
+        };
+        app.refresh_chrome(config, runtime);
+        return Ok(quit);
     }
     app.refresh_chrome(config, runtime);
     Ok(false)
@@ -4258,10 +4273,20 @@ fn handle_streaming_tui_key(
     key: KeyEvent,
     app: &mut TuiApp,
     queued_inputs: &mut Vec<String>,
+    steering: &SteeringMailbox,
     config: &LoadedConfig,
 ) -> bool {
     if let Some(name) = key_event_name(&key) {
         let bindings = keybinding_map(config);
+        if bindings.matches("steer", &name) {
+            let line = app.input.trim().to_string();
+            app.clear_input();
+            if !line.is_empty() {
+                steering.send(line.clone());
+                app.push(TuiEntryKind::System, format!("steering> {line}"));
+            }
+            return true;
+        }
         if bindings.matches("todos", &name) {
             app.todos_expanded = !app.todos_expanded;
             return true;
@@ -4317,13 +4342,14 @@ fn drain_streaming_tui_events(
     surface: &mut TuiSurface<'_>,
     app: &mut TuiApp,
     queued_inputs: &mut Vec<String>,
+    steering: &SteeringMailbox,
     config: &LoadedConfig,
 ) -> Result<bool> {
     let mut changed = false;
     while event::poll(Duration::ZERO)? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                changed |= handle_streaming_tui_key(key, app, queued_inputs, config);
+                changed |= handle_streaming_tui_key(key, app, queued_inputs, steering, config);
             }
             Event::Paste(text) => {
                 app.paste_text(&text);
@@ -5416,6 +5442,14 @@ fn follow_up_mode(config: &LoadedConfig) -> &str {
         .unwrap_or("one-at-a-time")
 }
 
+fn steering_mailbox(config: &LoadedConfig) -> SteeringMailbox {
+    let mode = match config.settings.steering_mode.as_deref() {
+        Some("all") => SteeringMode::All,
+        _ => SteeringMode::OneAtATime,
+    };
+    SteeringMailbox::new(mode)
+}
+
 async fn run_prompt_once_tui(
     app: &mut TuiApp,
     surface: &mut TuiSurface<'_>,
@@ -5440,11 +5474,18 @@ async fn run_prompt_once_tui(
     redraw_tui(surface.terminal, app, config)?;
     let provider = provider_for_runtime(runtime, config, offline).await?;
     let message_start = runtime.session().messages.len();
+    let steering = steering_mailbox(config);
     if kind == TuiEntryKind::Tool {
         let tool_prompt = prompt.clone();
-        let response =
-            run_user_turn_streaming_with_media(runtime, provider.as_ref(), prompt, media, |_| {})
-                .await?;
+        let response = run_user_turn_streaming_with_media(
+            runtime,
+            provider.as_ref(),
+            prompt,
+            media,
+            &steering,
+            |_| {},
+        )
+        .await?;
         if progress_enabled {
             app.replace_entry(entry_index, format_tool_completed(&tool_prompt, &response));
         } else {
@@ -5464,6 +5505,7 @@ async fn run_prompt_once_tui(
             provider.as_ref(),
             prompt,
             media,
+            &steering,
             move |delta| {
                 let _ = delta_tx.send(delta.to_string());
             },
@@ -5490,7 +5532,7 @@ async fn run_prompt_once_tui(
                         apply_stream_delta(app, entry_index, &mut saw_delta, &delta);
                         pending_redraw = true;
                     }
-                    if drain_streaming_tui_events(surface, app, &mut queued_inputs, config)? {
+                    if drain_streaming_tui_events(surface, app, &mut queued_inputs, &steering, config)? {
                         pending_redraw = true;
                     }
                     if pending_redraw {
@@ -5503,6 +5545,11 @@ async fn run_prompt_once_tui(
     };
     for queued_input in queued_inputs {
         runtime.queue_message(queued_input)?;
+    }
+    // Steering input that arrived after the turn's last injection point
+    // becomes a regular follow-up instead of being dropped.
+    for leftover in steering.drain() {
+        runtime.queue_message(leftover)?;
     }
 
     // On a mid-turn failure (e.g. exceeding the tool-call turn limit, a network
@@ -5779,6 +5826,7 @@ async fn run_prompt_once(
             provider.as_ref(),
             prompt,
             media,
+            &SteeringMailbox::default(),
             |_| {},
         )
         .await
@@ -5793,11 +5841,18 @@ async fn run_prompt_once(
         })
         .await?
     } else {
-        run_user_turn_streaming_with_media(runtime, provider.as_ref(), prompt, media, |delta| {
-            printed = true;
-            print!("{delta}");
-            let _ = io::stdout().flush();
-        })
+        run_user_turn_streaming_with_media(
+            runtime,
+            provider.as_ref(),
+            prompt,
+            media,
+            &SteeringMailbox::default(),
+            |delta| {
+                printed = true;
+                print!("{delta}");
+                let _ = io::stdout().flush();
+            },
+        )
         .await?
     };
     if printed {
@@ -7459,6 +7514,7 @@ mod tests {
         let mut app = TuiApp::default();
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
         let mut queued_inputs = Vec::new();
+        let steering = SteeringMailbox::default();
         let config = minimal_test_config();
 
         for ch in "next prompt".chars() {
@@ -7466,6 +7522,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
                 &mut app,
                 &mut queued_inputs,
+                &steering,
                 &config,
             );
             assert!(changed);
@@ -7483,12 +7540,14 @@ mod tests {
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
         app.set_input("next prompt");
         let mut queued_inputs = Vec::new();
+        let steering = SteeringMailbox::default();
         let config = minimal_test_config();
 
         let changed = handle_streaming_tui_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut app,
             &mut queued_inputs,
+            &steering,
             &config,
         );
 
@@ -7497,6 +7556,52 @@ mod tests {
         assert_eq!(queued_inputs, ["next prompt"]);
         assert_eq!(app.entries[0].text, "streaming");
         assert_eq!(app.live_entry_index, Some(0));
+    }
+
+    #[test]
+    fn streaming_steer_sends_draft_to_the_mailbox() {
+        let mut app = TuiApp::default();
+        app.push_placeholder(TuiEntryKind::Assistant, "streaming");
+        app.set_input("change course");
+        let mut queued_inputs = Vec::new();
+        let steering = SteeringMailbox::default();
+        let config = minimal_test_config();
+
+        let changed = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut queued_inputs,
+            &steering,
+            &config,
+        );
+
+        assert!(changed);
+        assert!(app.input.is_empty());
+        assert!(queued_inputs.is_empty());
+        assert_eq!(steering.drain(), ["change course"]);
+        assert_eq!(app.entries[1].text, "steering> change course");
+        assert_eq!(app.live_entry_index, Some(0));
+    }
+
+    #[test]
+    fn streaming_steer_with_empty_input_does_nothing() {
+        let mut app = TuiApp::default();
+        app.push_placeholder(TuiEntryKind::Assistant, "streaming");
+        let mut queued_inputs = Vec::new();
+        let steering = SteeringMailbox::default();
+        let config = minimal_test_config();
+
+        let changed = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut queued_inputs,
+            &steering,
+            &config,
+        );
+
+        assert!(changed);
+        assert_eq!(steering.pending(), 0);
+        assert_eq!(app.entries.len(), 1);
     }
 
     #[test]

@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pi_agent::{CancellationToken, RetryPolicy};
@@ -1790,7 +1791,74 @@ pub async fn run_user_turn_streaming(
     prompt: String,
     on_text: impl FnMut(&str) + Send,
 ) -> Result<String, AgentError> {
-    run_user_turn_streaming_with_media(runtime, provider, prompt, Vec::new(), on_text).await
+    run_user_turn_streaming_with_media(
+        runtime,
+        provider,
+        prompt,
+        Vec::new(),
+        &SteeringMailbox::default(),
+        on_text,
+    )
+    .await
+}
+
+/// How many pending steering messages the turn loop injects per provider
+/// round: everything queued so far, or a single message per round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringMode {
+    All,
+    OneAtATime,
+}
+
+/// Mailbox for mid-turn steering messages. Senders (for example the TUI
+/// key handler) push while a turn is streaming; the turn loop drains pending
+/// messages into the conversation before the next provider request.
+#[derive(Debug, Clone)]
+pub struct SteeringMailbox {
+    messages: Arc<Mutex<VecDeque<String>>>,
+    mode: SteeringMode,
+}
+
+impl SteeringMailbox {
+    pub fn new(mode: SteeringMode) -> Self {
+        Self {
+            messages: Arc::new(Mutex::new(VecDeque::new())),
+            mode,
+        }
+    }
+
+    pub fn send(&self, message: String) {
+        self.messages
+            .lock()
+            .expect("steering mailbox")
+            .push_back(message);
+    }
+
+    pub fn pending(&self) -> usize {
+        self.messages.lock().expect("steering mailbox").len()
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        self.messages
+            .lock()
+            .expect("steering mailbox")
+            .drain(..)
+            .collect()
+    }
+
+    fn take_batch(&self) -> Vec<String> {
+        let mut messages = self.messages.lock().expect("steering mailbox");
+        match self.mode {
+            SteeringMode::All => messages.drain(..).collect(),
+            SteeringMode::OneAtATime => messages.pop_front().into_iter().collect(),
+        }
+    }
+}
+
+impl Default for SteeringMailbox {
+    fn default() -> Self {
+        Self::new(SteeringMode::OneAtATime)
+    }
 }
 
 pub async fn run_user_turn_streaming_with_media(
@@ -1798,6 +1866,7 @@ pub async fn run_user_turn_streaming_with_media(
     provider: &dyn Provider,
     prompt: String,
     media: Vec<MediaInput>,
+    steering: &SteeringMailbox,
     mut on_text: impl FnMut(&str) + Send,
 ) -> Result<String, AgentError> {
     runtime.push_message(ConversationMessage {
@@ -1848,6 +1917,7 @@ pub async fn run_user_turn_streaming_with_media(
     let system_prompt = runtime_system_prompt(runtime);
     let mut final_text = String::new();
     for _ in 0..MAX_TOOL_CALL_TURNS {
+        inject_steering_messages(runtime, steering)?;
         let request = provider_request(runtime, system_prompt.clone());
         let events =
             complete_with_retry_streaming(provider, request, &runtime.systems.retry, |event| {
@@ -1888,7 +1958,12 @@ pub async fn run_user_turn_streaming_with_media(
         })?;
 
         if tool_calls.is_empty() {
-            return Ok(final_text);
+            // A steering message that arrived while the final response was
+            // streaming keeps the turn going instead of being dropped.
+            if inject_steering_messages(runtime, steering)? == 0 {
+                return Ok(final_text);
+            }
+            continue;
         }
 
         for tool_call in tool_calls {
@@ -1900,6 +1975,25 @@ pub async fn run_user_turn_streaming_with_media(
         tool: "agent".to_string(),
         message: "model exceeded maximum tool-call turns".to_string(),
     })
+}
+
+fn inject_steering_messages(
+    runtime: &mut Runtime,
+    steering: &SteeringMailbox,
+) -> Result<usize, AgentError> {
+    let messages = steering.take_batch();
+    let count = messages.len();
+    for message in messages {
+        runtime.push_message(ConversationMessage {
+            role: MessageRole::User,
+            content: message,
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        })?;
+    }
+    Ok(count)
 }
 
 fn runtime_system_prompt(runtime: &Runtime) -> Option<String> {
@@ -3452,6 +3546,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_messages_join_the_conversation_mid_turn() {
+        let cwd = std::env::temp_dir().join(format!("pi-steering-loop-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        fs::write(cwd.join("a.txt"), "file contents").expect("write fixture");
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ToolLoopProvider {
+            requests: requests.clone(),
+        };
+        let steering = SteeringMailbox::default();
+        steering.send("steer one".to_string());
+        steering.send("steer two".to_string());
+
+        let response = run_user_turn_streaming_with_media(
+            &mut runtime,
+            &provider,
+            "read the file".to_string(),
+            Vec::new(),
+            &steering,
+            |_| {},
+        )
+        .await
+        .expect("run steered tool loop");
+
+        assert_eq!(response, "done");
+        // one-at-a-time mode injects a single steering message per round.
+        let captured = requests.lock().expect("requests").clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].messages[0].content, "read the file");
+        assert_eq!(captured[0].messages[1].content, "steer one");
+        assert_eq!(captured[1].messages[3].role, ChatRole::Tool);
+        assert_eq!(captured[1].messages.last().unwrap().content, "steer two");
+
+        let roles = runtime
+            .session()
+            .messages
+            .iter()
+            .map(|message| message.role.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec![
+                MessageRole::User,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::Tool,
+                MessageRole::User,
+                MessageRole::Assistant,
+            ]
+        );
+        assert_eq!(runtime.session().messages[1].content, "steer one");
+        assert_eq!(runtime.session().messages[4].content, "steer two");
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn steering_sent_during_the_final_response_keeps_the_turn_alive() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let steering = SteeringMailbox::default();
+        let provider = SteeringProvider {
+            requests: requests.clone(),
+            steering: steering.clone(),
+        };
+
+        let response = run_user_turn_streaming_with_media(
+            &mut runtime,
+            &provider,
+            "hello".to_string(),
+            Vec::new(),
+            &steering,
+            |_| {},
+        )
+        .await
+        .expect("run steered turn");
+
+        assert_eq!(response, "donedone");
+        let captured = requests.lock().expect("requests").clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[1].messages[2].content, "late steer");
+        let contents = runtime
+            .session()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["hello", "done", "late steer", "done"]);
+    }
+
+    #[tokio::test]
+    async fn steering_mode_all_injects_every_pending_message_at_once() {
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let provider = create_provider(ProviderConfig {
+            model: ModelRef {
+                provider: "faux".to_string(),
+                id: "echo".to_string(),
+            },
+            api: ProviderApi::Faux,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        });
+        let steering = SteeringMailbox::new(SteeringMode::All);
+        steering.send("one".to_string());
+        steering.send("two".to_string());
+
+        run_user_turn_streaming_with_media(
+            &mut runtime,
+            provider.as_ref(),
+            "hello".to_string(),
+            Vec::new(),
+            &steering,
+            |_| {},
+        )
+        .await
+        .expect("run steered turn");
+
+        let contents = runtime
+            .session()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents[0], "hello");
+        assert_eq!(contents[1], "one");
+        assert_eq!(contents[2], "two");
+        assert_eq!(steering.pending(), 0);
+    }
+
+    #[tokio::test]
     async fn run_user_turn_executes_model_tool_calls_and_continues() {
         let cwd =
             std::env::temp_dir().join(format!("pi-model-tool-loop-test-{}", new_session_id()));
@@ -4114,6 +4350,33 @@ mod tests {
 
     struct ToolLoopProvider {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
+    struct SteeringProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        steering: SteeringMailbox,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SteeringProvider {
+        async fn complete(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            let mut requests = self.requests.lock().expect("requests");
+            let call_index = requests.len();
+            requests.push(request);
+            drop(requests);
+            if call_index == 0 {
+                self.steering.send("late steer".to_string());
+            }
+            Ok(vec![
+                StreamEvent::Text("done".to_string()),
+                StreamEvent::Stop {
+                    reason: "stop".to_string(),
+                },
+            ])
+        }
     }
 
     struct FailingToolLoopProvider {

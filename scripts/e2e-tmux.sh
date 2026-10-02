@@ -551,13 +551,35 @@ for _ in $(seq 1 120); do
   fi
   sleep 0.1
 done
-tmux send-keys -t "${stream_session}" "/quit" Enter
-sleep 0.5
-tmux kill-session -t "${stream_session}" >/dev/null 2>&1 || true
 
 if [ ! -f "${stream_done}" ]; then
   cat "${work_dir}/stream-queued-pane.txt" >&2
   echo "streaming draft was not queued after Enter" >&2
+  exit 1
+fi
+
+tmux send-keys -t "${stream_session}" -l "${stream_prompt}"
+tmux send-keys -t "${stream_session}" Enter
+sleep 0.5
+tmux send-keys -t "${stream_session}" -l "steer mid turn"
+tmux send-keys -t "${stream_session}" C-s
+stream_steered=""
+for _ in $(seq 1 100); do
+  sleep 0.1
+  tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-steer-pane.txt"
+  if grep -Fq "steering> steer mid turn" "${work_dir}/stream-steer-pane.txt" \
+    && grep -Fq "[faux/echo] steer mid turn" "${work_dir}/stream-steer-pane.txt"; then
+    stream_steered=1
+    break
+  fi
+done
+tmux send-keys -t "${stream_session}" "/quit" Enter
+sleep 0.5
+tmux kill-session -t "${stream_session}" >/dev/null 2>&1 || true
+
+if [ -z "${stream_steered}" ]; then
+  cat "${work_dir}/stream-steer-pane.txt" >&2
+  echo "ctrl+s did not steer the streaming turn" >&2
   exit 1
 fi
 

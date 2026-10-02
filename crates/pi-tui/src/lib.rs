@@ -652,7 +652,7 @@ pub fn default_keybindings() -> KeybindingMap {
                 keys: vec!["ctrl+m".to_string()],
             },
             Keybinding {
-                action: "session".to_string(),
+                action: "steer".to_string(),
                 keys: vec!["ctrl+s".to_string()],
             },
             Keybinding {
