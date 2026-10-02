@@ -573,6 +573,19 @@ for _ in $(seq 1 100); do
     break
   fi
 done
+tmux send-keys -t "${stream_session}" -l "${stream_prompt}"
+tmux send-keys -t "${stream_session}" Enter
+sleep 0.5
+tmux send-keys -t "${stream_session}" C-c
+stream_interrupted=""
+for _ in $(seq 1 60); do
+  sleep 0.1
+  tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-interrupt-pane.txt"
+  if grep -Fq "interrupted" "${work_dir}/stream-interrupt-pane.txt"; then
+    stream_interrupted=1
+    break
+  fi
+done
 tmux send-keys -t "${stream_session}" "/quit" Enter
 sleep 0.5
 tmux kill-session -t "${stream_session}" >/dev/null 2>&1 || true
@@ -580,6 +593,12 @@ tmux kill-session -t "${stream_session}" >/dev/null 2>&1 || true
 if [ -z "${stream_steered}" ]; then
   cat "${work_dir}/stream-steer-pane.txt" >&2
   echo "ctrl+s did not steer the streaming turn" >&2
+  exit 1
+fi
+
+if [ -z "${stream_interrupted}" ]; then
+  cat "${work_dir}/stream-interrupt-pane.txt" >&2
+  echo "ctrl+c did not interrupt the streaming turn" >&2
   exit 1
 fi
 

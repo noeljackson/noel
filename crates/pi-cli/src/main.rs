@@ -33,7 +33,7 @@ use pi_ai::{
     anthropic_supports_adaptive_thinking, create_provider, generate_images,
     set_claude_code_version, ImageGenerationInput, ImageGenerationOutput,
     ImageProviderApi as AiImageProviderApi, ImageProviderConfig, MediaInput, ModelRef,
-    ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig,
+    ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig, StreamEvent,
 };
 use pi_config::{
     auth_for_provider, codex_client_version, has_auth_for_provider, listed_accounts_for_provider,
@@ -47,9 +47,10 @@ use pi_config::{
 };
 use pi_core::{
     default_active_tool_names, format_todo_list, run_excluded_bash, run_user_turn,
-    run_user_turn_streaming, run_user_turn_streaming_with_media, write_session_export,
-    CompactionKind, ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionState,
-    SessionStore, SteeringMailbox, SteeringMode, TodoItem, TodoStatus,
+    run_user_turn_streaming, run_user_turn_streaming_events_with_media,
+    run_user_turn_streaming_with_media, write_session_export, AgentError, CompactionKind,
+    ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionState, SessionStore,
+    SteeringMailbox, SteeringMode, TodoItem, TodoStatus,
 };
 use pi_tui::{
     EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector, SelectorItem, SessionView,
@@ -2521,7 +2522,10 @@ async fn run_interactive(
     offline: bool,
 ) -> Result<()> {
     let mut app = TuiApp::new(&config, &runtime);
-    let auto_restart = AutoRestart::from_env();
+    if let Some(hint) = resume_hint(&runtime) {
+        app.push(TuiEntryKind::System, hint);
+    }
+    let mut auto_restart = AutoRestart::from_env();
     enable_raw_mode()?;
     execute!(io::stdout(), EnableBracketedPaste)?;
     let _ = execute!(
@@ -2537,45 +2541,47 @@ async fn run_interactive(
     loop {
         app.refresh_chrome(&config, &runtime);
         redraw_tui(&mut terminal, &mut app, &config)?;
+        // Input wins over a pending restart so quit keys are honored even
+        // while the dogfood watcher is rebuilding continuously.
+        if event::poll(Duration::from_millis(100))? {
+            let quit = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_tui_key(
+                        key,
+                        &mut TuiSurface {
+                            terminal: &mut terminal,
+                            viewport_height: &mut viewport_height,
+                        },
+                        &mut app,
+                        &mut runtime,
+                        &mut config,
+                        offline,
+                    )
+                    .await?
+                }
+                Event::Mouse(mouse) => {
+                    let _ = mouse;
+                    false
+                }
+                Event::Paste(text) => {
+                    app.paste_text(&text);
+                    false
+                }
+                Event::Resize(_, _) => {
+                    resize_tui_viewport(&mut terminal, &mut viewport_height)?;
+                    false
+                }
+                _ => false,
+            };
+            if quit {
+                break;
+            }
+            continue;
+        }
         if auto_restart.should_restart()? {
             app.push(TuiEntryKind::System, "rebuilt; restarting");
             redraw_tui(&mut terminal, &mut app, &config)?;
             restart = true;
-            break;
-        }
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
-        }
-        let quit = match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                handle_tui_key(
-                    key,
-                    &mut TuiSurface {
-                        terminal: &mut terminal,
-                        viewport_height: &mut viewport_height,
-                    },
-                    &mut app,
-                    &mut runtime,
-                    &mut config,
-                    offline,
-                )
-                .await?
-            }
-            Event::Mouse(mouse) => {
-                let _ = mouse;
-                false
-            }
-            Event::Paste(text) => {
-                app.paste_text(&text);
-                false
-            }
-            Event::Resize(_, _) => {
-                resize_tui_viewport(&mut terminal, &mut viewport_height)?;
-                false
-            }
-            _ => false,
-        };
-        if quit {
             break;
         }
     }
@@ -2595,10 +2601,38 @@ async fn run_interactive(
     Ok(())
 }
 
+/// Startup note for resumed sessions whose last turn was cut off (the
+/// conversation ends at a tool result) or that still hold queued follow-ups.
+fn resume_hint(runtime: &Runtime) -> Option<String> {
+    let queued = runtime.session().queued_messages.len();
+    let mid_turn = matches!(
+        runtime.session().messages.last(),
+        Some(message) if message.role == MessageRole::Tool
+    );
+    match (mid_turn, queued) {
+        (false, 0) => None,
+        (true, 0) => {
+            Some("resumed mid-turn; send a prompt to pick up where it stopped".to_string())
+        }
+        (false, n) => Some(format!(
+            "{n} queued message(s) pending; they run after your next prompt (/queue to list, /queue-clear to clear)"
+        )),
+        (true, n) => Some(format!(
+            "resumed mid-turn with {n} queued message(s) pending; send a prompt to continue"
+        )),
+    }
+}
+
 struct AutoRestart {
     executable: PathBuf,
     modified: Option<SystemTime>,
+    pending: Option<(SystemTime, Instant)>,
 }
+
+/// A changed binary must stay untouched this long before the restart fires,
+/// so a watcher that rebuilds continuously does not trap the UI in a
+/// restart loop.
+const RESTART_DEBOUNCE: Duration = Duration::from_secs(2);
 
 impl AutoRestart {
     fn from_env() -> Self {
@@ -2607,6 +2641,7 @@ impl AutoRestart {
             return Self {
                 executable: PathBuf::new(),
                 modified: None,
+                pending: None,
             };
         }
         let executable = std::env::var_os("PI_DOGFOOD_RESTART_EXE")
@@ -2620,10 +2655,11 @@ impl AutoRestart {
         Self {
             executable,
             modified,
+            pending: None,
         }
     }
 
-    fn should_restart(&self) -> Result<bool> {
+    fn should_restart(&mut self) -> Result<bool> {
         let Some(modified) = self.modified else {
             return Ok(false);
         };
@@ -2632,7 +2668,21 @@ impl AutoRestart {
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok();
-        Ok(current.map(|current| current != modified).unwrap_or(false))
+        let Some(current) = current else {
+            self.pending = None;
+            return Ok(false);
+        };
+        if current == modified {
+            self.pending = None;
+            return Ok(false);
+        }
+        match self.pending {
+            Some((mtime, since)) if mtime == current => Ok(since.elapsed() >= RESTART_DEBOUNCE),
+            _ => {
+                self.pending = Some((current, Instant::now()));
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -2686,6 +2736,7 @@ impl Drop for TerminalRestore {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TuiEntryKind {
+    Thinking,
     System,
     User,
     Assistant,
@@ -3025,6 +3076,9 @@ impl TuiApp {
 
     fn restore_session_messages(&mut self, runtime: &Runtime) {
         for message in &runtime.session().messages {
+            if message.role == MessageRole::Assistant {
+                self.push(TuiEntryKind::Thinking, message.thinking.clone());
+            }
             let kind = match message.role {
                 MessageRole::User => TuiEntryKind::User,
                 MessageRole::Assistant => TuiEntryKind::Assistant,
@@ -3275,6 +3329,7 @@ impl TuiApp {
             .iter()
             .map(|entry| {
                 let label = match entry.kind {
+                    TuiEntryKind::Thinking => "thinking",
                     TuiEntryKind::System => "system",
                     TuiEntryKind::User => "user",
                     TuiEntryKind::Assistant => "assistant",
@@ -3367,7 +3422,17 @@ struct VisibleTranscript {
     entries_used: usize,
 }
 
+#[cfg(test)]
 fn visible_transcript(entries: &[TuiEntry], width: usize, height: u16) -> VisibleTranscript {
+    visible_transcript_with_thinking(entries, width, height, false)
+}
+
+fn visible_transcript_with_thinking(
+    entries: &[TuiEntry],
+    width: usize,
+    height: u16,
+    hide_thinking: bool,
+) -> VisibleTranscript {
     let width = width.max(1);
     let target_height = height.saturating_add(TRANSCRIPT_RENDER_OVERSCAN_ROWS) as usize;
     let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
@@ -3376,6 +3441,9 @@ fn visible_transcript(entries: &[TuiEntry], width: usize, height: u16) -> Visibl
     let mut entries_used = 0;
 
     for entry in entries.iter().rev() {
+        if hide_thinking && entry.kind == TuiEntryKind::Thinking {
+            continue;
+        }
         let mut chunk = render_entry_lines(std::slice::from_ref(entry));
         if chunks.is_empty() {
             while chunk.last().map(Line::width) == Some(0) {
@@ -3498,7 +3566,7 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
     } else {
         root[0]
     };
-    draw_transcript(frame, transcript_area, app);
+    draw_transcript(frame, transcript_area, app, config);
     draw_todo_panel(frame, root[1], app);
     // root[2] is an intentional blank spacer so the gray input box never butts
     // directly against the chat transcript.
@@ -3643,11 +3711,16 @@ fn input_desired_height(app: &TuiApp) -> u16 {
     }
 }
 
-fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, config: &LoadedConfig) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let visible = visible_transcript(&app.entries, area.width as usize, area.height);
+    let visible = visible_transcript_with_thinking(
+        &app.entries,
+        area.width as usize,
+        area.height,
+        config.settings.hide_thinking_block.unwrap_or(false),
+    );
     if visible.lines.is_empty() {
         return;
     }
@@ -3662,6 +3735,14 @@ fn render_entry_lines(entries: &[TuiEntry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
         match entry.kind {
+            TuiEntryKind::Thinking if entry.text.is_empty() => continue,
+            TuiEntryKind::Thinking => push_marked_lines(
+                &mut lines,
+                "thinking",
+                &entry.text,
+                Style::default().fg(DIM_TEXT),
+                Style::default().fg(DIM_TEXT).add_modifier(Modifier::ITALIC),
+            ),
             TuiEntryKind::Tool => push_tool_lines(&mut lines, &entry.text),
             TuiEntryKind::Error => push_marked_lines(
                 &mut lines,
@@ -4269,15 +4350,37 @@ fn handle_diff_panel_key(key: &KeyEvent, app: &mut TuiApp, runtime: &Runtime) ->
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingKeyOutcome {
+    Ignored,
+    Changed,
+    Interrupt,
+    Quit,
+}
+
+/// How a streaming turn ended: the provider finished, the user interrupted,
+/// or the user asked to quit mid-turn.
+enum StreamEnd {
+    Finished(Result<String, AgentError>),
+    Interrupted,
+    Quit,
+}
+
 fn handle_streaming_tui_key(
     key: KeyEvent,
     app: &mut TuiApp,
     queued_inputs: &mut Vec<String>,
     steering: &SteeringMailbox,
     config: &LoadedConfig,
-) -> bool {
+) -> StreamingKeyOutcome {
     if let Some(name) = key_event_name(&key) {
         let bindings = keybinding_map(config);
+        if bindings.matches("interrupt", &name) {
+            if app.quit_requested(Instant::now()) {
+                return StreamingKeyOutcome::Quit;
+            }
+            return StreamingKeyOutcome::Interrupt;
+        }
         if bindings.matches("steer", &name) {
             let line = app.input.trim().to_string();
             app.clear_input();
@@ -4285,42 +4388,42 @@ fn handle_streaming_tui_key(
                 steering.send(line.clone());
                 app.push(TuiEntryKind::System, format!("steering> {line}"));
             }
-            return true;
+            return StreamingKeyOutcome::Changed;
         }
         if bindings.matches("todos", &name) {
             app.todos_expanded = !app.todos_expanded;
-            return true;
+            return StreamingKeyOutcome::Changed;
         }
         if bindings.matches("line-start", &name) {
             app.cursor_to_line_start();
-            return true;
+            return StreamingKeyOutcome::Changed;
         }
         if bindings.matches("line-end", &name) {
             app.cursor_to_line_end();
-            return true;
+            return StreamingKeyOutcome::Changed;
         }
         if bindings.matches("cursor-left", &name) {
             app.move_cursor_left();
-            return true;
+            return StreamingKeyOutcome::Changed;
         }
         if bindings.matches("cursor-right", &name) {
             app.move_cursor_right();
-            return true;
+            return StreamingKeyOutcome::Changed;
         }
     }
     match key.code {
         KeyCode::Esc => {
             app.clear_input();
             app.multiline = None;
-            true
+            StreamingKeyOutcome::Changed
         }
         KeyCode::Backspace => {
             app.pop_input_char();
-            true
+            StreamingKeyOutcome::Changed
         }
         KeyCode::Enter if is_shift_enter(&key) => {
             app.insert_input_newline();
-            true
+            StreamingKeyOutcome::Changed
         }
         KeyCode::Enter => {
             let line = app.input.trim().to_string();
@@ -4328,13 +4431,13 @@ fn handle_streaming_tui_key(
             if !line.is_empty() {
                 queued_inputs.push(line);
             }
-            true
+            StreamingKeyOutcome::Changed
         }
         KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.push_input_char(ch);
-            true
+            StreamingKeyOutcome::Changed
         }
-        _ => false,
+        _ => StreamingKeyOutcome::Ignored,
     }
 }
 
@@ -4344,12 +4447,20 @@ fn drain_streaming_tui_events(
     queued_inputs: &mut Vec<String>,
     steering: &SteeringMailbox,
     config: &LoadedConfig,
-) -> Result<bool> {
+) -> Result<(bool, Option<TurnControl>)> {
     let mut changed = false;
+    let mut control = None;
     while event::poll(Duration::ZERO)? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                changed |= handle_streaming_tui_key(key, app, queued_inputs, steering, config);
+                match handle_streaming_tui_key(key, app, queued_inputs, steering, config) {
+                    StreamingKeyOutcome::Ignored => {}
+                    StreamingKeyOutcome::Changed => changed = true,
+                    StreamingKeyOutcome::Interrupt => control = Some(TurnControl::Interrupted),
+                    StreamingKeyOutcome::Quit => {
+                        control = Some(TurnControl::Quit);
+                    }
+                }
             }
             Event::Paste(text) => {
                 app.paste_text(&text);
@@ -4362,7 +4473,7 @@ fn drain_streaming_tui_events(
             _ => {}
         }
     }
-    Ok(changed)
+    Ok((changed, control))
 }
 
 fn apply_stream_delta(app: &mut TuiApp, entry_index: usize, saw_delta: &mut bool, delta: &str) {
@@ -4822,10 +4933,11 @@ async fn handle_tui_submission(
         if line == "." {
             let prompt = lines.join("\n");
             app.multiline = None;
-            submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
-        } else {
-            lines.push(line);
+            let quit =
+                submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
+            return Ok(quit);
         }
+        lines.push(line);
         return Ok(false);
     }
     if line == "/quit" {
@@ -5008,8 +5120,16 @@ async fn handle_tui_submission(
             let initial = line.trim_start_matches("/editor").trim();
             match read_external_editor_prompt(initial) {
                 Ok(prompt) if !prompt.trim().is_empty() => {
-                    submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline)
-                        .await;
+                    return Ok(submit_tui_prompt(
+                        app,
+                        surface,
+                        runtime,
+                        config,
+                        prompt,
+                        Vec::new(),
+                        offline,
+                    )
+                    .await);
                 }
                 Ok(_) => app.push(TuiEntryKind::System, "editor returned an empty prompt"),
                 Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
@@ -5027,7 +5147,7 @@ async fn handle_tui_submission(
                 Ok(media) => {
                     app.push(TuiEntryKind::System, format_media_fallback(&media));
                     if !prompt.is_empty() {
-                        submit_tui_prompt(
+                        return Ok(submit_tui_prompt(
                             app,
                             surface,
                             runtime,
@@ -5036,7 +5156,7 @@ async fn handle_tui_submission(
                             vec![media],
                             offline,
                         )
-                        .await;
+                        .await);
                     }
                 }
                 Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
@@ -5138,7 +5258,16 @@ async fn handle_tui_submission(
             } else {
                 format!("{}\n\n{}", skill.content, input)
             };
-            submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
+            return Ok(submit_tui_prompt(
+                app,
+                surface,
+                runtime,
+                config,
+                prompt,
+                Vec::new(),
+                offline,
+            )
+            .await);
         }
         _ if line.starts_with("/extension:") => {
             let (name, input) = split_resource_command(&line, "/extension:");
@@ -5156,7 +5285,16 @@ async fn handle_tui_submission(
             } else {
                 format!("{}\n\n{}", extension.content, input)
             };
-            submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
+            return Ok(submit_tui_prompt(
+                app,
+                surface,
+                runtime,
+                config,
+                prompt,
+                Vec::new(),
+                offline,
+            )
+            .await);
         }
         _ if line.starts_with("/prompt ") => {
             let rest = line.trim_start_matches("/prompt ").trim();
@@ -5164,7 +5302,16 @@ async fn handle_tui_submission(
             let template = find_resource(&config.prompt_templates, name)
                 .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
             let prompt = expand_prompt_template(&template.content, input);
-            submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
+            return Ok(submit_tui_prompt(
+                app,
+                surface,
+                runtime,
+                config,
+                prompt,
+                Vec::new(),
+                offline,
+            )
+            .await);
         }
         _ if line.starts_with("/theme ") => {
             let name = line.trim_start_matches("/theme ").trim();
@@ -5302,7 +5449,11 @@ async fn handle_tui_submission(
                 format!("share exported {}", path.display()),
             );
         }
-        _ => submit_tui_prompt(app, surface, runtime, config, line, Vec::new(), offline).await,
+        _ => {
+            return Ok(
+                submit_tui_prompt(app, surface, runtime, config, line, Vec::new(), offline).await,
+            )
+        }
     }
     Ok(false)
 }
@@ -5373,19 +5524,35 @@ async fn submit_tui_prompt(
     prompt: String,
     media: Vec<MediaInput>,
     offline: bool,
-) {
+) -> bool {
     app.editor_state.record_history(prompt.clone());
     app.push(TuiEntryKind::User, prompt.clone());
-    if let Err(error) =
-        run_prompt_with_queue_tui(app, surface, runtime, config, prompt, media, offline).await
+    let control = match run_prompt_with_queue_tui(
+        app, surface, runtime, config, prompt, media, offline,
+    )
+    .await
     {
-        app.drop_live_entry();
-        app.push(
-            TuiEntryKind::Error,
-            format_tui_error(&error, runtime, config),
-        );
-    }
+        Ok(control) => control,
+        Err(error) => {
+            app.drop_live_entry();
+            app.push(
+                TuiEntryKind::Error,
+                format_tui_error(&error, runtime, config),
+            );
+            TurnControl::Completed
+        }
+    };
     app.refresh_diff_panel(runtime);
+    matches!(control, TurnControl::Quit)
+}
+
+/// How a submitted turn ended: normally, interrupted by the user, or with a
+/// quit request that the interactive loop should honor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnControl {
+    Completed,
+    Interrupted,
+    Quit,
 }
 
 fn format_tui_error(error: &anyhow::Error, runtime: &Runtime, config: &LoadedConfig) -> String {
@@ -5413,9 +5580,12 @@ async fn run_prompt_with_queue_tui(
     prompt: String,
     media: Vec<MediaInput>,
     offline: bool,
-) -> Result<()> {
+) -> Result<TurnControl> {
     maybe_auto_compact(runtime, config, false)?;
-    run_prompt_once_tui(app, surface, runtime, config, prompt, media, offline).await?;
+    match run_prompt_once_tui(app, surface, runtime, config, prompt, media, offline).await? {
+        TurnControl::Completed => {}
+        control => return Ok(control),
+    }
     while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
         let remaining = runtime
             .session()
@@ -5426,12 +5596,17 @@ async fn run_prompt_with_queue_tui(
             .collect();
         runtime.replace_queued_messages(remaining)?;
         app.push(TuiEntryKind::System, format!("queued> {prompt}"));
-        run_prompt_once_tui(app, surface, runtime, config, prompt, Vec::new(), offline).await?;
+        match run_prompt_once_tui(app, surface, runtime, config, prompt, Vec::new(), offline)
+            .await?
+        {
+            TurnControl::Completed => {}
+            control => return Ok(control),
+        }
         if follow_up_mode(config) == "one-at-a-time" {
             break;
         }
     }
-    Ok(())
+    Ok(TurnControl::Completed)
 }
 
 fn follow_up_mode(config: &LoadedConfig) -> &str {
@@ -5458,9 +5633,16 @@ async fn run_prompt_once_tui(
     prompt: String,
     media: Vec<MediaInput>,
     offline: bool,
-) -> Result<()> {
+) -> Result<TurnControl> {
     let kind = response_kind_for_prompt(&prompt);
     let progress_enabled = terminal_progress_enabled(config);
+    let thinking_index = app.entries.len();
+    if kind != TuiEntryKind::Tool {
+        app.entries.push(TuiEntry {
+            kind: TuiEntryKind::Thinking,
+            text: String::new(),
+        });
+    }
     let entry_index = app.push_placeholder(
         kind.clone(),
         if kind == TuiEntryKind::Tool && progress_enabled {
@@ -5493,21 +5675,21 @@ async fn run_prompt_once_tui(
         }
         app.finish_live_entry();
         redraw_tui(surface.terminal, app, config)?;
-        return Ok(());
+        return Ok(TurnControl::Completed);
     }
 
     let mut saw_delta = false;
     let mut queued_inputs = Vec::new();
-    let (delta_tx, delta_rx) = std::sync::mpsc::channel::<String>();
-    let turn_result = {
-        let turn = run_user_turn_streaming_with_media(
+    let (delta_tx, delta_rx) = std::sync::mpsc::channel::<StreamEvent>();
+    let stream_end = {
+        let turn = run_user_turn_streaming_events_with_media(
             runtime,
             provider.as_ref(),
             prompt,
             media,
             &steering,
             move |delta| {
-                let _ = delta_tx.send(delta.to_string());
+                let _ = delta_tx.send(delta.clone());
             },
         );
         tokio::pin!(turn);
@@ -5519,20 +5701,36 @@ async fn run_prompt_once_tui(
             tokio::select! {
                 result = &mut turn => {
                     while let Ok(delta) = delta_rx.try_recv() {
-                        apply_stream_delta(app, entry_index, &mut saw_delta, &delta);
+                        match delta {
+                            StreamEvent::Text(text) => apply_stream_delta(app, entry_index, &mut saw_delta, &text),
+                            StreamEvent::Thinking(text) => app.append_entry(thinking_index, &text),
+                            _ => {}
+                        }
                         pending_redraw = true;
                     }
                     if pending_redraw {
                         redraw_tui(surface.terminal, app, config)?;
                     }
-                    break result;
+                    break StreamEnd::Finished(result);
                 }
                 _ = tick.tick() => {
                     while let Ok(delta) = delta_rx.try_recv() {
-                        apply_stream_delta(app, entry_index, &mut saw_delta, &delta);
+                        match delta {
+                            StreamEvent::Text(text) => apply_stream_delta(app, entry_index, &mut saw_delta, &text),
+                            StreamEvent::Thinking(text) => app.append_entry(thinking_index, &text),
+                            _ => {}
+                        }
                         pending_redraw = true;
                     }
-                    if drain_streaming_tui_events(surface, app, &mut queued_inputs, &steering, config)? {
+                    let (changed, control) =
+                        drain_streaming_tui_events(surface, app, &mut queued_inputs, &steering, config)?;
+                    if let Some(control) = control {
+                        break match control {
+                            TurnControl::Quit => StreamEnd::Quit,
+                            _ => StreamEnd::Interrupted,
+                        };
+                    }
+                    if changed {
                         pending_redraw = true;
                     }
                     if pending_redraw {
@@ -5551,6 +5749,28 @@ async fn run_prompt_once_tui(
     for leftover in steering.drain() {
         runtime.queue_message(leftover)?;
     }
+
+    // Interrupt and quit drop the in-flight turn future, which cancels the
+    // provider request; whatever already streamed stays visible.
+    let turn_result = match stream_end {
+        StreamEnd::Finished(result) => result,
+        StreamEnd::Interrupted | StreamEnd::Quit => {
+            if saw_delta {
+                app.finish_live_entry();
+            } else {
+                app.drop_live_entry();
+            }
+            insert_new_tool_messages(app, runtime, message_start, entry_index);
+            let control = if matches!(stream_end, StreamEnd::Interrupted) {
+                app.push(TuiEntryKind::System, "interrupted");
+                TurnControl::Interrupted
+            } else {
+                TurnControl::Quit
+            };
+            redraw_tui(surface.terminal, app, config)?;
+            return Ok(control);
+        }
+    };
 
     // On a mid-turn failure (e.g. exceeding the tool-call turn limit, a network
     // drop, or a rate limit), keep whatever was already streamed instead of
@@ -5576,7 +5796,7 @@ async fn run_prompt_once_tui(
     insert_new_tool_messages(app, runtime, message_start, entry_index);
     app.finish_live_entry();
     redraw_tui(surface.terminal, app, config)?;
-    Ok(())
+    Ok(TurnControl::Completed)
 }
 
 fn insert_new_tool_messages(
@@ -7435,6 +7655,59 @@ mod tests {
     }
 
     #[test]
+    fn thinking_visibility_can_be_toggled_without_losing_entries() {
+        let entries = vec![
+            TuiEntry {
+                kind: TuiEntryKind::Thinking,
+                text: "summary".into(),
+            },
+            TuiEntry {
+                kind: TuiEntryKind::Assistant,
+                text: "answer".into(),
+            },
+        ];
+        let shown = visible_transcript_with_thinking(&entries, 80, 24, false);
+        let hidden = visible_transcript_with_thinking(&entries, 80, 24, true);
+        assert_eq!(shown.entries_used, 2);
+        assert_eq!(hidden.entries_used, 1);
+        assert!(!hidden
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.content.contains("summary")));
+        assert_eq!(
+            visible_transcript_with_thinking(&entries, 80, 24, false).entries_used,
+            2
+        );
+    }
+
+    #[test]
+    fn thinking_is_dimmed_and_separate_from_answer() {
+        let lines = render_entry_lines(&[
+            TuiEntry {
+                kind: TuiEntryKind::Thinking,
+                text: "summary".into(),
+            },
+            TuiEntry {
+                kind: TuiEntryKind::Assistant,
+                text: "answer".into(),
+            },
+        ]);
+        let summary = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("summary"))
+            .unwrap();
+        assert_eq!(summary.style.fg, Some(DIM_TEXT));
+        assert!(summary.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(render_entry_lines(&[TuiEntry {
+            kind: TuiEntryKind::Thinking,
+            text: String::new()
+        }])
+        .is_empty());
+    }
+
+    #[test]
     fn transcript_height_accounts_for_wrapped_streaming_text() {
         let lines = vec![Line::from("123456"), Line::from("ab")];
         assert_eq!(rendered_lines_height(&lines, 3), 3);
@@ -7525,7 +7798,7 @@ mod tests {
                 &steering,
                 &config,
             );
-            assert!(changed);
+            assert_eq!(changed, StreamingKeyOutcome::Changed);
         }
 
         assert_eq!(app.input, "next prompt");
@@ -7551,7 +7824,7 @@ mod tests {
             &config,
         );
 
-        assert!(changed);
+        assert_eq!(changed, StreamingKeyOutcome::Changed);
         assert!(app.input.is_empty());
         assert_eq!(queued_inputs, ["next prompt"]);
         assert_eq!(app.entries[0].text, "streaming");
@@ -7575,7 +7848,7 @@ mod tests {
             &config,
         );
 
-        assert!(changed);
+        assert_eq!(changed, StreamingKeyOutcome::Changed);
         assert!(app.input.is_empty());
         assert!(queued_inputs.is_empty());
         assert_eq!(steering.drain(), ["change course"]);
@@ -7599,9 +7872,108 @@ mod tests {
             &config,
         );
 
-        assert!(changed);
+        assert_eq!(changed, StreamingKeyOutcome::Changed);
         assert_eq!(steering.pending(), 0);
         assert_eq!(app.entries.len(), 1);
+    }
+
+    #[test]
+    fn streaming_ctrl_c_interrupts_then_second_press_quits() {
+        let mut app = TuiApp::default();
+        app.push_placeholder(TuiEntryKind::Assistant, "streaming");
+        let mut queued_inputs = Vec::new();
+        let steering = SteeringMailbox::default();
+        let config = minimal_test_config();
+
+        let first = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut queued_inputs,
+            &steering,
+            &config,
+        );
+        assert_eq!(first, StreamingKeyOutcome::Interrupt);
+
+        let second = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut app,
+            &mut queued_inputs,
+            &steering,
+            &config,
+        );
+        assert_eq!(second, StreamingKeyOutcome::Quit);
+    }
+
+    #[test]
+    fn auto_restart_debounces_binary_changes() {
+        let dir = std::env::temp_dir().join(format!("pi-autorestart-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let exe = dir.join("pi");
+        fs::write(&exe, b"v1").expect("write binary");
+        let original = fs::metadata(&exe)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let mut restart = AutoRestart {
+            executable: exe.clone(),
+            modified: Some(original),
+            pending: None,
+        };
+
+        assert!(!restart.should_restart().expect("check"));
+
+        let rebuilt = original + Duration::from_secs(10);
+        fs::File::options()
+            .write(true)
+            .open(&exe)
+            .expect("open")
+            .set_modified(rebuilt)
+            .expect("set mtime");
+        assert!(!restart.should_restart().expect("first sighting"));
+        assert!(!restart.should_restart().expect("within debounce"));
+
+        restart.pending = restart
+            .pending
+            .map(|(mtime, since)| (mtime, since - RESTART_DEBOUNCE));
+        assert!(restart.should_restart().expect("after debounce"));
+
+        let rebuilt_again = rebuilt + Duration::from_secs(10);
+        fs::File::options()
+            .write(true)
+            .open(&exe)
+            .expect("open")
+            .set_modified(rebuilt_again)
+            .expect("set mtime");
+        assert!(!restart.should_restart().expect("new build resets debounce"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resume_hint_flags_interrupted_turns_and_pending_queue() {
+        let mut session = SessionState::new("session-1", PathBuf::from("."));
+        assert!(
+            resume_hint(&Runtime::new(session.clone(), ReloadableSystems::default())).is_none()
+        );
+
+        session.messages.push(ConversationMessage {
+            thinking: String::new(),
+            role: MessageRole::Tool,
+            content: "partial".to_string(),
+            media: Vec::new(),
+            tool_call_id: Some("call_1".to_string()),
+            tool_name: Some("bash".to_string()),
+            tool_calls: Vec::new(),
+        });
+        let hint = resume_hint(&Runtime::new(session.clone(), ReloadableSystems::default()))
+            .expect("mid-turn hint");
+        assert!(hint.contains("mid-turn"));
+
+        session.queued_messages = vec!["follow up".to_string()];
+        let hint = resume_hint(&Runtime::new(session, ReloadableSystems::default()))
+            .expect("mid-turn and queue hint");
+        assert!(hint.contains("mid-turn"));
+        assert!(hint.contains("1 queued"));
     }
 
     #[test]
@@ -7628,6 +8000,7 @@ mod tests {
     fn restored_session_user_messages_populate_prompt_history() {
         let mut session = SessionState::new("session-1", PathBuf::from("."));
         session.messages.push(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::User,
             content: "first prompt".to_string(),
             media: Vec::new(),
@@ -7636,6 +8009,7 @@ mod tests {
             tool_calls: Vec::new(),
         });
         session.messages.push(ConversationMessage {
+            thinking: "saved summary".into(),
             role: MessageRole::Assistant,
             content: "first response".to_string(),
             media: Vec::new(),
@@ -7644,6 +8018,7 @@ mod tests {
             tool_calls: Vec::new(),
         });
         session.messages.push(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::User,
             content: "second prompt".to_string(),
             media: Vec::new(),
@@ -7655,6 +8030,9 @@ mod tests {
         let mut app = TuiApp::default();
 
         app.restore_session_messages(&runtime);
+        assert_eq!(app.entries[1].kind, TuiEntryKind::Thinking);
+        assert_eq!(app.entries[1].text, "saved summary");
+        assert_eq!(app.entries[2].text, "first response");
         app.history_previous();
         assert_eq!(app.input, "second prompt");
         app.history_previous();
@@ -7807,6 +8185,7 @@ mod tests {
         let assistant_index = app.push_placeholder(TuiEntryKind::Assistant, "done");
         let mut session = SessionState::new("session-1", PathBuf::from("."));
         session.messages.push(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::User,
             content: "read a file".to_string(),
             media: Vec::new(),
@@ -7815,6 +8194,7 @@ mod tests {
             tool_calls: Vec::new(),
         });
         session.messages.push(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::Tool,
             content: "file contents".to_string(),
             media: Vec::new(),
@@ -7823,6 +8203,7 @@ mod tests {
             tool_calls: Vec::new(),
         });
         session.messages.push(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::Assistant,
             content: "done".to_string(),
             media: Vec::new(),

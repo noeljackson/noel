@@ -2038,6 +2038,13 @@ fn google_part_events(parts: &[Value]) -> Option<Vec<StreamEvent>> {
     let mut events = Vec::new();
     for (index, part) in parts.iter().enumerate() {
         if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            if let Some(text) = part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                events.push(StreamEvent::Thinking(text.to_string()));
+            }
             continue;
         }
         if let Some(text) = part.get("text").and_then(Value::as_str) {
@@ -2130,6 +2137,15 @@ fn parse_anthropic_response_events(response: &Value) -> Option<Vec<StreamEvent>>
                     }
                 }
             }
+            Some("thinking") => {
+                if let Some(text) = item
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    events.push(StreamEvent::Thinking(text.to_string()));
+                }
+            }
             Some("tool_use") => {
                 let Some(id) = item.get("id").and_then(Value::as_str) else {
                     continue;
@@ -2186,6 +2202,15 @@ impl AnthropicSseParser {
                 let Some(block) = event.get("content_block") else {
                     return Ok(());
                 };
+                if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                    if let Some(text) = block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        on_event(StreamEvent::Thinking(text.to_string()))?;
+                    }
+                }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     let Some(id) = block.get("id").and_then(Value::as_str) else {
                         return Ok(());
@@ -2219,6 +2244,15 @@ impl AnthropicSseParser {
                             if !text.is_empty() {
                                 on_event(StreamEvent::Text(text.to_string()))?;
                             }
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                        {
+                            on_event(StreamEvent::Thinking(text.to_string()))?;
                         }
                     }
                     Some("input_json_delta") => {
@@ -2278,6 +2312,15 @@ fn parse_anthropic_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
                 let Some(block) = event.get("content_block") else {
                     continue;
                 };
+                if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                    if let Some(text) = block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        events.push(StreamEvent::Thinking(text.to_string()));
+                    }
+                }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     let Some(id) = block.get("id").and_then(Value::as_str) else {
                         continue;
@@ -2311,6 +2354,15 @@ fn parse_anthropic_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
                             if !text.is_empty() {
                                 events.push(StreamEvent::Text(text.to_string()));
                             }
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                        {
+                            events.push(StreamEvent::Thinking(text.to_string()));
                         }
                     }
                     Some("input_json_delta") => {
@@ -3066,6 +3118,16 @@ impl OpenAiResponsesSseParser {
             return Ok(());
         };
         match event.get("type").and_then(Value::as_str) {
+            Some("response.reasoning_summary_text.delta")
+            | Some("response.reasoning_text.delta") => {
+                if let Some(delta) = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    on_event(StreamEvent::Thinking(delta.to_string()))?;
+                }
+            }
             Some("response.output_text.delta") | Some("output_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     if !delta.is_empty() {
@@ -3105,6 +3167,16 @@ fn parse_openai_responses_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
             continue;
         };
         match event.get("type").and_then(Value::as_str) {
+            Some("response.reasoning_summary_text.delta")
+            | Some("response.reasoning_text.delta") => {
+                if let Some(delta) = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    events.push(StreamEvent::Thinking(delta.to_string()));
+                }
+            }
             Some("response.output_text.delta") | Some("output_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     events.push(StreamEvent::Text(delta.to_string()));
@@ -3664,6 +3736,73 @@ mod tests {
 
         assert_eq!(events[0], StreamEvent::Text("[faux/echo] ".to_string()));
         assert_eq!(events[1], StreamEvent::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn thinking_events_are_separate_from_answer_text() {
+        let anthropic = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"first\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" second\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"private-signature\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+        );
+        let expected = vec![
+            StreamEvent::Thinking("first".into()),
+            StreamEvent::Thinking(" second".into()),
+            StreamEvent::Text("answer".into()),
+        ];
+        assert_eq!(
+            parse_anthropic_sse_events(anthropic),
+            Some(expected.clone())
+        );
+        let mut streamed = Vec::new();
+        let mut parser = AnthropicSseParser::default();
+        for line in anthropic
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+        {
+            parser
+                .parse_data(line, &mut |event| {
+                    streamed.push(event);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(streamed, expected);
+
+        let openai = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"first\"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\" second\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
+        );
+        assert_eq!(
+            parse_openai_responses_sse_events(openai),
+            Some(expected.clone())
+        );
+        let mut streamed = Vec::new();
+        let mut parser = OpenAiResponsesSseParser::default();
+        for line in openai
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+        {
+            parser
+                .parse_data(line, &mut |event| {
+                    streamed.push(event);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(streamed, expected);
+        assert_eq!(
+            google_part_events(&[
+                json!({"thought": true, "text": "first"}),
+                json!({"text": "answer"})
+            ]),
+            Some(vec![
+                StreamEvent::Thinking("first".into()),
+                StreamEvent::Text("answer".into())
+            ])
+        );
     }
 
     #[test]

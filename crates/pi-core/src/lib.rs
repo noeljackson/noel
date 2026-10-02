@@ -26,6 +26,9 @@ use tokio::process::Command;
 pub struct ConversationMessage {
     pub role: MessageRole,
     pub content: String,
+    /// Provider-supplied thinking, kept separate from conversational context.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
     #[serde(default)]
     pub media: Vec<MediaInput>,
     #[serde(default)]
@@ -1090,6 +1093,7 @@ fn ts_jsonl_message(message: &ConversationMessage) -> Value {
     json!({
         "role": role,
         "content": message.content,
+        "thinking": message.thinking,
         "media": message.media,
         "toolCallId": message.tool_call_id,
         "toolName": message.tool_name,
@@ -1321,6 +1325,25 @@ fn ts_jsonl_conversation_message(value: &Value) -> Option<ConversationMessage> {
         _ => return None,
     };
     Some(ConversationMessage {
+        thinking: value
+            .get("thinking")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                value
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter(|part| {
+                                part.get("type").and_then(Value::as_str) == Some("thinking")
+                            })
+                            .filter_map(|part| part.get("thinking").and_then(Value::as_str))
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default()
+            }),
         role,
         content: ts_jsonl_text_content(value.get("content").unwrap_or(&Value::Null)),
         media: value
@@ -1393,6 +1416,13 @@ fn write_html_export(state: &SessionState, path: &Path) -> Result<(), SessionErr
     }
     for message in &state.messages {
         content.push_str("<section class=\"message\">");
+
+        if !message.thinking.is_empty() {
+            content.push_str(&format!(
+                "<details class=\"thinking\"><summary>Thinking</summary><pre>{}</pre></details>",
+                escape_html(&message.thinking)
+            ));
+        }
         content.push_str(&format!(
             "<div class=\"role\">{:?}</div><pre>{}</pre>",
             message.role,
@@ -1710,6 +1740,7 @@ impl Runtime {
         };
         if omitted_messages > 0 {
             let mut messages = vec![ConversationMessage {
+                thinking: String::new(),
                 role: MessageRole::System,
                 content: summary,
                 media: Vec::new(),
@@ -1869,7 +1900,26 @@ pub async fn run_user_turn_streaming_with_media(
     steering: &SteeringMailbox,
     mut on_text: impl FnMut(&str) + Send,
 ) -> Result<String, AgentError> {
+    run_user_turn_streaming_events_with_media(runtime, provider, prompt, media, steering, |event| {
+        if let StreamEvent::Text(delta) = event {
+            on_text(delta);
+        }
+    })
+    .await
+}
+
+/// Streams assistant text and provider-supplied thinking separately. Thinking is
+/// persisted separately and never added to the next provider request.
+pub async fn run_user_turn_streaming_events_with_media(
+    runtime: &mut Runtime,
+    provider: &dyn Provider,
+    prompt: String,
+    media: Vec<MediaInput>,
+    steering: &SteeringMailbox,
+    mut on_event: impl FnMut(&StreamEvent) + Send,
+) -> Result<String, AgentError> {
     runtime.push_message(ConversationMessage {
+        thinking: String::new(),
         role: MessageRole::User,
         content: prompt.clone(),
         media,
@@ -1904,6 +1954,7 @@ pub async fn run_user_turn_streaming_with_media(
             result: result.output.clone(),
         })?;
         runtime.push_message(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::Tool,
             content: result.output.clone(),
             media: Vec::new(),
@@ -1921,12 +1972,13 @@ pub async fn run_user_turn_streaming_with_media(
         let request = provider_request(runtime, system_prompt.clone());
         let events =
             complete_with_retry_streaming(provider, request, &runtime.systems.retry, |event| {
-                if let StreamEvent::Text(delta) = event {
-                    on_text(delta);
+                if matches!(event, StreamEvent::Text(_) | StreamEvent::Thinking(_)) {
+                    on_event(event);
                 }
             })
             .await?;
         let mut text = String::new();
+        let mut thinking = String::new();
         let mut tool_calls = Vec::new();
         for event in events {
             match event {
@@ -1942,13 +1994,14 @@ pub async fn run_user_turn_streaming_with_media(
                     name,
                     arguments,
                 }),
-                StreamEvent::Thinking(_) | StreamEvent::Usage { .. } | StreamEvent::Stop { .. } => {
-                }
+                StreamEvent::Thinking(delta) => thinking.push_str(&delta),
+                StreamEvent::Usage { .. } | StreamEvent::Stop { .. } => {}
             }
         }
 
         final_text.push_str(&text);
         runtime.push_message(ConversationMessage {
+            thinking,
             role: MessageRole::Assistant,
             content: text,
             media: Vec::new(),
@@ -1985,6 +2038,7 @@ fn inject_steering_messages(
     let count = messages.len();
     for message in messages {
         runtime.push_message(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::User,
             content: message,
             media: Vec::new(),
@@ -2442,6 +2496,7 @@ async fn execute_model_tool_call(
         result: output.clone(),
     })?;
     runtime.push_message(ConversationMessage {
+        thinking: String::new(),
         role: MessageRole::Tool,
         content: output,
         media: Vec::new(),
@@ -2786,6 +2841,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thinking_is_optional_in_old_sessions_and_separate_in_block_imports() {
+        let old = json!({"role": "assistant", "content": "answer"});
+        let message: ConversationMessage = serde_json::from_value(old).unwrap();
+        assert!(message.thinking.is_empty());
+        let imported = ts_jsonl_conversation_message(&json!({
+            "role": "assistant", "content": [
+                {"type": "thinking", "thinking": "summary"},
+                {"type": "text", "text": "answer"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(imported.thinking, "summary");
+        assert_eq!(imported.content, "answer");
+    }
+
+    #[test]
     fn reload_preserves_session_context() {
         let cwd = PathBuf::from("/repo");
         let model = ModelRef {
@@ -2794,6 +2865,7 @@ mod tests {
         };
         let mut session = SessionState::new("session-1", cwd.clone());
         session.messages.push(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::User,
             content: "keep this".to_string(),
             media: Vec::new(),
@@ -2951,6 +3023,7 @@ mod tests {
         let (store, mut state) =
             SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
         state.messages.push(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::User,
             content: "hello".to_string(),
             media: Vec::new(),
@@ -2997,6 +3070,7 @@ mod tests {
         state.active_tool_names = active_tools_with(&state.disabled_tools);
         state.queued_messages = vec!["next prompt".to_string()];
         state.messages.push(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::User,
             content: "hello <world>".to_string(),
             media: Vec::new(),
@@ -3005,6 +3079,7 @@ mod tests {
             tool_calls: Vec::new(),
         });
         state.messages.push(ConversationMessage {
+            thinking: "summary <private>".into(),
             role: MessageRole::Assistant,
             content: "done".to_string(),
             media: Vec::new(),
@@ -3067,6 +3142,10 @@ mod tests {
         let json_content = fs::read_to_string(&json).expect("read json");
         let exported =
             serde_json::from_str::<serde_json::Value>(&json_content).expect("parse json export");
+        assert_eq!(exported["messages"][1]["thinking"], "summary <private>");
+        assert!(fs::read_to_string(&html)
+            .unwrap()
+            .contains("summary &lt;private&gt;"));
         assert_eq!(exported["name"], "exported");
         assert_eq!(exported["parent_session_id"], "parent-session");
         assert_eq!(exported["active_thinking_level"], "xhigh");
@@ -3331,6 +3410,7 @@ mod tests {
         state.name = Some("main".to_string());
         state.labels = BTreeSet::from(["feature".to_string()]);
         state.messages.push(ConversationMessage {
+            thinking: String::new(),
             role: MessageRole::User,
             content: "parent prompt".to_string(),
             media: Vec::new(),
@@ -3366,6 +3446,7 @@ mod tests {
             SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
         for index in 0..8 {
             state.messages.push(ConversationMessage {
+                thinking: String::new(),
                 role: MessageRole::User,
                 content: format!("message {index}"),
                 media: Vec::new(),
@@ -3430,6 +3511,7 @@ mod tests {
             SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
         store
             .record_message(ConversationMessage {
+                thinking: String::new(),
                 role: MessageRole::User,
                 content: "old".to_string(),
                 media: Vec::new(),
@@ -3440,6 +3522,7 @@ mod tests {
             .expect("record message");
         store
             .record_messages_snapshot(vec![ConversationMessage {
+                thinking: String::new(),
                 role: MessageRole::System,
                 content: "summary".to_string(),
                 media: Vec::new(),
@@ -3519,6 +3602,59 @@ mod tests {
         assert_eq!(deltas, ["[faux/echo] ", "hello"]);
         assert_eq!(response, "[faux/echo] hello");
         assert_eq!(runtime.session().messages[1].content, response);
+    }
+
+    #[tokio::test]
+    async fn thinking_is_streamed_but_not_mixed_into_answer_or_history() {
+        struct ThinkingProvider;
+        #[async_trait::async_trait]
+        impl Provider for ThinkingProvider {
+            async fn complete(
+                &self,
+                _request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                Ok(vec![
+                    StreamEvent::Thinking("summary".into()),
+                    StreamEvent::Text("answer".into()),
+                ])
+            }
+        }
+        let mut runtime = Runtime::new(
+            SessionState::new("thinking-test", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let mut events = Vec::new();
+        let answer = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &ThinkingProvider,
+            "hello".into(),
+            Vec::new(),
+            &SteeringMailbox::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Thinking("summary".into()),
+                StreamEvent::Text("answer".into())
+            ]
+        );
+        assert_eq!(answer, "answer");
+        assert_eq!(runtime.session().messages[1].content, "answer");
+        assert_eq!(runtime.session().messages[1].thinking, "summary");
+        assert_eq!(
+            provider_messages(&runtime.session().messages)[1].content,
+            "answer"
+        );
+        let mut text = String::new();
+        run_user_turn_streaming(&mut runtime, &ThinkingProvider, "again".into(), |delta| {
+            text.push_str(delta)
+        })
+        .await
+        .unwrap();
+        assert_eq!(text, "answer");
     }
 
     #[tokio::test]
@@ -4056,6 +4192,7 @@ mod tests {
     fn provider_messages_repair_missing_tool_outputs_from_saved_sessions() {
         let messages = vec![
             ConversationMessage {
+                thinking: String::new(),
                 role: MessageRole::User,
                 content: "question".to_string(),
                 media: Vec::new(),
@@ -4064,6 +4201,7 @@ mod tests {
                 tool_calls: Vec::new(),
             },
             ConversationMessage {
+                thinking: String::new(),
                 role: MessageRole::Assistant,
                 content: String::new(),
                 media: Vec::new(),
@@ -4076,6 +4214,7 @@ mod tests {
                 }],
             },
             ConversationMessage {
+                thinking: String::new(),
                 role: MessageRole::User,
                 content: "continue".to_string(),
                 media: Vec::new(),
