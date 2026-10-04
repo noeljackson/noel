@@ -60,7 +60,7 @@ grep -Fq "disabled extensions: -" "${work_dir}/config-enabled.txt"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && env -u NO_COLOR PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -99,6 +99,39 @@ send_enter() {
   sleep 0.35
 }
 
+# The main test process unsets NO_COLOR inherited from a shared tmux server.
+# Exercise real SGR transitions, including removal of fixed light/dark colors.
+require_live_color() {
+  local expected="$1"
+  local output="$2"
+  tmux capture-pane -t "${session_name}" -p -e > "${work_dir}/${output}.txt"
+  if ! grep -Fq "${expected}" "${work_dir}/${output}.txt"; then
+    cat "${work_dir}/${output}.txt" >&2
+    echo "missing terminal color ${expected}" >&2
+    exit 1
+  fi
+}
+
+send_line "/theme light"
+require_live_color "38;2;36;41;50" "theme-light"
+send_line "/theme dark"
+require_live_color "38;2;228;231;236" "theme-dark"
+send_line "/theme kimi"
+require_live_color "38;2;37;99;235" "theme-kimi"
+send_line "/accent magenta"
+require_live_color "38;5;5m" "theme-accent"
+send_line "/reload"
+require_live_color "38;5;5m" "theme-reload"
+grep -Fq '"theme": "kimi"' "${agent_dir}/settings.json"
+grep -Fq '"accentColor": "magenta"' "${agent_dir}/settings.json"
+send_line "/accent auto"
+send_line "/theme system"
+tmux capture-pane -t "${session_name}" -p -e > "${work_dir}/theme-system.txt"
+if grep -Eq '(38|48);2;' "${work_dir}/theme-system.txt"; then
+  cat "${work_dir}/theme-system.txt" >&2
+  echo "system theme retained fixed RGB colors" >&2
+  exit 1
+fi
 send_line "/session"
 send_line "hello from tmux e2e"
 send_line "/complete /mo"
@@ -293,6 +326,11 @@ require_output "json-ext saw protocol input"
 require_output "fix"
 require_output "fix broken thing"
 require_output "theme: dark"
+require_output "theme: light"
+require_output "theme: kimi"
+require_output "theme: system"
+require_output "accent: magenta"
+require_output "accent: auto"
 require_output "theme selector"
 require_output "model selector"
 require_output "faux/echo"
@@ -576,6 +614,38 @@ done
 tmux send-keys -t "${stream_session}" -l "${stream_prompt}"
 tmux send-keys -t "${stream_session}" Enter
 sleep 0.5
+tmux send-keys -t "${stream_session}" -l "typed follow-up"
+tmux send-keys -t "${stream_session}" Enter
+sleep 0.2
+tmux send-keys -t "${stream_session}" -l "/queue"
+tmux send-keys -t "${stream_session}" Enter
+stream_mid_queue=""
+for _ in $(seq 1 60); do
+  sleep 0.1
+  tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-midqueue-pane.txt"
+  if grep -Fq "1. typed follow-up" "${work_dir}/stream-midqueue-pane.txt" \
+    && grep -Fq "+1 queued" "${work_dir}/stream-midqueue-pane.txt" \
+    && grep -Fq "esc interrupt" "${work_dir}/stream-midqueue-pane.txt"; then
+    stream_mid_queue=1
+    break
+  fi
+done
+for _ in $(seq 1 120); do
+  tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-followup-pane.txt"
+  if grep -Fq "[faux/echo] typed follow-up" "${work_dir}/stream-followup-pane.txt"; then
+    break
+  fi
+  sleep 0.1
+done
+if [ -z "${stream_mid_queue}" ]; then
+  cat "${work_dir}/stream-midqueue-pane.txt" >&2
+  echo "mid-turn /queue or activity indicator did not render" >&2
+  exit 1
+fi
+
+tmux send-keys -t "${stream_session}" -l "${stream_prompt}"
+tmux send-keys -t "${stream_session}" Enter
+sleep 0.5
 tmux send-keys -t "${stream_session}" C-c
 stream_interrupted=""
 for _ in $(seq 1 60); do
@@ -583,6 +653,20 @@ for _ in $(seq 1 60); do
   tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-interrupt-pane.txt"
   if grep -Fq "interrupted" "${work_dir}/stream-interrupt-pane.txt"; then
     stream_interrupted=1
+    break
+  fi
+done
+
+tmux send-keys -t "${stream_session}" -l "${stream_prompt}"
+tmux send-keys -t "${stream_session}" Enter
+sleep 0.5
+tmux send-keys -t "${stream_session}" Escape
+stream_esc_interrupted=""
+for _ in $(seq 1 60); do
+  sleep 0.1
+  tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-esc-pane.txt"
+  if grep -Fq "interrupted" "${work_dir}/stream-esc-pane.txt"; then
+    stream_esc_interrupted=1
     break
   fi
 done
@@ -599,6 +683,12 @@ fi
 if [ -z "${stream_interrupted}" ]; then
   cat "${work_dir}/stream-interrupt-pane.txt" >&2
   echo "ctrl+c did not interrupt the streaming turn" >&2
+  exit 1
+fi
+
+if [ -z "${stream_esc_interrupted}" ]; then
+  cat "${work_dir}/stream-esc-pane.txt" >&2
+  echo "esc did not interrupt the streaming turn" >&2
   exit 1
 fi
 

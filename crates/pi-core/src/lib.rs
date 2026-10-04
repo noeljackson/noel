@@ -1901,7 +1901,7 @@ pub async fn run_user_turn_streaming_with_media(
     mut on_text: impl FnMut(&str) + Send,
 ) -> Result<String, AgentError> {
     run_user_turn_streaming_events_with_media(runtime, provider, prompt, media, steering, |event| {
-        if let StreamEvent::Text(delta) = event {
+        if let TurnEvent::Provider(StreamEvent::Text(delta)) = event {
             on_text(delta);
         }
     })
@@ -1910,13 +1910,52 @@ pub async fn run_user_turn_streaming_with_media(
 
 /// Streams assistant text and provider-supplied thinking separately. Thinking is
 /// persisted separately and never added to the next provider request.
+/// Live progress of a streaming turn: provider deltas plus tool lifecycle,
+/// so a UI can show what the agent is doing between text blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEvent {
+    Provider(StreamEvent),
+    ToolStarted { name: String },
+    ToolFinished { name: String, is_error: bool },
+}
+
+/// Follow-up prompts typed while a turn streams. Shared between the key
+/// handler (which appends and lists) and the turn runner (which moves them
+/// into the session queue once the turn ends).
+#[derive(Debug, Clone, Default)]
+pub struct FollowUpQueue {
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+impl FollowUpQueue {
+    pub fn push(&self, message: String) {
+        self.messages.lock().expect("follow-up queue").push(message);
+    }
+
+    pub fn list(&self) -> Vec<String> {
+        self.messages.lock().expect("follow-up queue").clone()
+    }
+
+    pub fn clear(&self) -> usize {
+        std::mem::take(&mut *self.messages.lock().expect("follow-up queue")).len()
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        std::mem::take(&mut *self.messages.lock().expect("follow-up queue"))
+    }
+
+    pub fn pending(&self) -> usize {
+        self.messages.lock().expect("follow-up queue").len()
+    }
+}
+
 pub async fn run_user_turn_streaming_events_with_media(
     runtime: &mut Runtime,
     provider: &dyn Provider,
     prompt: String,
     media: Vec<MediaInput>,
     steering: &SteeringMailbox,
-    mut on_event: impl FnMut(&StreamEvent) + Send,
+    mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     runtime.push_message(ConversationMessage {
         thinking: String::new(),
@@ -1973,7 +2012,7 @@ pub async fn run_user_turn_streaming_events_with_media(
         let events =
             complete_with_retry_streaming(provider, request, &runtime.systems.retry, |event| {
                 if matches!(event, StreamEvent::Text(_) | StreamEvent::Thinking(_)) {
-                    on_event(event);
+                    on_event(&TurnEvent::Provider(event.clone()));
                 }
             })
             .await?;
@@ -2020,7 +2059,15 @@ pub async fn run_user_turn_streaming_events_with_media(
         }
 
         for tool_call in tool_calls {
-            execute_model_tool_call(runtime, &tool_call).await?;
+            on_event(&TurnEvent::ToolStarted {
+                name: tool_call.name.clone(),
+            });
+            let result = execute_model_tool_call(runtime, &tool_call).await;
+            on_event(&TurnEvent::ToolFinished {
+                name: tool_call.name.clone(),
+                is_error: result.is_err(),
+            });
+            result?;
         }
     }
 
@@ -3605,6 +3652,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_events_report_tool_lifecycle() {
+        let cwd = std::env::temp_dir().join(format!("pi-turn-events-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        fs::write(cwd.join("a.txt"), "file contents").expect("write fixture");
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ToolLoopProvider {
+            requests: requests.clone(),
+        };
+        let mut events = Vec::new();
+
+        let answer = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "read the file".to_string(),
+            Vec::new(),
+            &SteeringMailbox::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .expect("run tool loop");
+
+        assert_eq!(answer, "done");
+        assert_eq!(
+            events,
+            vec![
+                TurnEvent::ToolStarted {
+                    name: "read".to_string()
+                },
+                TurnEvent::ToolFinished {
+                    name: "read".to_string(),
+                    is_error: false,
+                },
+                TurnEvent::Provider(StreamEvent::Text("done".to_string())),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
     async fn thinking_is_streamed_but_not_mixed_into_answer_or_history() {
         struct ThinkingProvider;
         #[async_trait::async_trait]
@@ -3637,8 +3728,8 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                StreamEvent::Thinking("summary".into()),
-                StreamEvent::Text("answer".into())
+                TurnEvent::Provider(StreamEvent::Thinking("summary".into())),
+                TurnEvent::Provider(StreamEvent::Text("answer".into()))
             ]
         );
         assert_eq!(answer, "answer");

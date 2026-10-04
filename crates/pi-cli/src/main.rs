@@ -49,17 +49,18 @@ use pi_core::{
     default_active_tool_names, format_todo_list, run_excluded_bash, run_user_turn,
     run_user_turn_streaming, run_user_turn_streaming_events_with_media,
     run_user_turn_streaming_with_media, write_session_export, AgentError, CompactionKind,
-    ConversationMessage, MessageRole, ReloadableSystems, Runtime, SessionState, SessionStore,
-    SteeringMailbox, SteeringMode, TodoItem, TodoStatus,
+    ConversationMessage, FollowUpQueue, MessageRole, ReloadableSystems, Runtime, SessionState,
+    SessionStore, SteeringMailbox, SteeringMode, TodoItem, TodoStatus, TurnEvent,
 };
 use pi_tui::{
-    EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector, SelectorItem, SessionView,
-    SettingsView, TerminalRenderer, TerminalTheme,
+    parse_theme_color, EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector,
+    SelectorItem, SessionView, SettingsView, TerminalRenderer, TerminalTheme, ThemePalette,
+    BUILTIN_THEMES,
 };
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Position, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal, TerminalOptions, Viewport,
@@ -1076,9 +1077,9 @@ fn mutate_settings_packages(
     mutate(&mut packages);
     packages.sort_by(|left, right| left.source().cmp(right.source()));
     settings["packages"] = serde_json::to_value(packages)?;
-    fs::write(
+    write_file_atomic(
         path,
-        format!("{}\n", serde_json::to_string_pretty(&settings)?),
+        format!("{}\n", serde_json::to_string_pretty(&settings)?).as_bytes(),
     )?;
     Ok(())
 }
@@ -1519,11 +1520,16 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
     if !cli.tools.is_empty() {
         config.settings.enabled_tools = Some(cli.tools.clone());
     }
-    if let Some(theme) = &cli.theme {
-        config.settings.theme = Some(theme.clone());
-    }
     if cli.no_themes {
         config.settings.theme = None;
+        config.settings.accent_color = None;
+        config.themes.clear();
+    } else if let Some(theme) = &cli.theme {
+        let resolved = resolve_terminal_theme(config, theme)?;
+        config.settings.theme = Some(resolved.name.clone());
+        resolved
+            .with_accent(config.settings.accent_color.as_deref())
+            .map_err(|error| anyhow!(error))?;
     }
     if let Some(thinking) = &cli.thinking {
         config.settings.default_thinking_level = Some(thinking.clone());
@@ -2913,7 +2919,10 @@ fn model_thinking_levels(model: &ModelRef) -> &'static [&'static str] {
             }
         }
         "openai" | "openai-codex" | "azure-openai-responses" => {
-            if model.id.starts_with("gpt-5") || model.id.contains("codex") {
+            if model.id.starts_with("gpt-5")
+                || model.id.starts_with("gpt-6")
+                || model.id.contains("codex")
+            {
                 &["off", "minimal", "low", "medium", "high", "xhigh"]
             } else {
                 &[]
@@ -3008,6 +3017,9 @@ impl TuiApp {
             ),
         );
         app.restore_session_messages(runtime);
+        if let Err(error) = terminal_theme(config) {
+            app.push(TuiEntryKind::Error, format!("{error}; using system theme"));
+        }
         app.status = footer_status(config, runtime, &app.editor_state);
         app
     }
@@ -3025,7 +3037,7 @@ impl TuiApp {
                 .settings
                 .theme
                 .clone()
-                .unwrap_or_else(|| "default".to_string()),
+                .unwrap_or_else(|| "system".to_string()),
             model
         );
         let session = runtime.session();
@@ -3402,12 +3414,6 @@ fn rendered_lines_height(lines: &[Line<'_>], width: usize) -> u16 {
 const TRANSCRIPT_RENDER_OVERSCAN_ROWS: u16 = 4;
 const STREAM_RENDER_INTERVAL_MS: u64 = 16;
 
-// Dim/secondary text color (markers, tool output, footer, slash matches).
-// Use an explicit truecolor gray instead of the named dark-gray ANSI color so
-// it renders the same regardless of the terminal's bright-black palette slot,
-// which on some themes maps to a too-dark blue. Bump this to taste.
-const DIM_TEXT: Color = Color::Rgb(0xB0, 0xB0, 0xB0);
-
 // Entry marker glyph. A terminal cell is a fixed size, so a glyph cannot be
 // literally scaled; use a larger filled circle instead of the small `•`
 // (U+2022). `●` (U+25CF) is single-width and reliably bigger. Swap to `⬤`
@@ -3424,7 +3430,7 @@ struct VisibleTranscript {
 
 #[cfg(test)]
 fn visible_transcript(entries: &[TuiEntry], width: usize, height: u16) -> VisibleTranscript {
-    visible_transcript_with_thinking(entries, width, height, false)
+    visible_transcript_with_thinking(entries, width, height, false, &ThemePalette::default())
 }
 
 fn visible_transcript_with_thinking(
@@ -3432,6 +3438,7 @@ fn visible_transcript_with_thinking(
     width: usize,
     height: u16,
     hide_thinking: bool,
+    palette: &ThemePalette,
 ) -> VisibleTranscript {
     let width = width.max(1);
     let target_height = height.saturating_add(TRANSCRIPT_RENDER_OVERSCAN_ROWS) as usize;
@@ -3444,7 +3451,7 @@ fn visible_transcript_with_thinking(
         if hide_thinking && entry.kind == TuiEntryKind::Thinking {
             continue;
         }
-        let mut chunk = render_entry_lines(std::slice::from_ref(entry));
+        let mut chunk = render_entry_lines(std::slice::from_ref(entry), palette);
         if chunks.is_empty() {
             while chunk.last().map(Line::width) == Some(0) {
                 chunk.pop();
@@ -3541,6 +3548,8 @@ fn transcript_char_width(ch: char) -> usize {
 }
 
 fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
+    let palette = terminal_theme(config).unwrap_or_default().palette;
+    frame.render_widget(Block::default().style(palette.base()), frame.area());
     let slash_matches = slash_command_matches(config, app);
     let slash_match_height = slash_matches.len().min(SLASH_MATCH_LIMIT) as u16;
     let input_height = input_area_height(app, frame.area().height, slash_match_height);
@@ -3561,19 +3570,19 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(40), Constraint::Length(DIFF_PANEL_WIDTH)])
             .split(root[0]);
-        draw_diff_panel(frame, columns[1], app);
+        draw_diff_panel(frame, columns[1], app, &palette);
         columns[0]
     } else {
         root[0]
     };
-    draw_transcript(frame, transcript_area, app, config);
-    draw_todo_panel(frame, root[1], app);
-    // root[2] is an intentional blank spacer so the gray input box never butts
+    draw_transcript(frame, transcript_area, app, config, &palette);
+    draw_todo_panel(frame, root[1], app, &palette);
+    // root[2] is an intentional blank spacer so the input surface never butts
     // directly against the chat transcript.
-    draw_input(frame, root[3], app);
-    draw_slash_matches(frame, root[4], &slash_matches);
-    draw_footer(frame, root[5], app);
-    draw_selector_overlay(frame, app);
+    draw_input(frame, root[3], app, &palette);
+    draw_slash_matches(frame, root[4], &slash_matches, &palette);
+    draw_footer(frame, root[5], app, &palette);
+    draw_selector_overlay(frame, app, &palette);
     set_tui_cursor(frame, root[3], app);
 }
 
@@ -3593,7 +3602,7 @@ fn todo_panel_height(app: &TuiApp) -> u16 {
     (rows + overflow) as u16
 }
 
-fn draw_todo_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+fn draw_todo_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemePalette) {
     if area.height == 0 || app.todos.is_empty() {
         return;
     }
@@ -3605,9 +3614,9 @@ fn draw_todo_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let mut lines = Vec::new();
     for todo in app.todos.iter().take(visible) {
         let (marker, style) = match todo.status {
-            TodoStatus::Completed => ("✓", Style::default().fg(Color::DarkGray)),
-            TodoStatus::InProgress => ("●", Style::default().fg(Color::Yellow)),
-            TodoStatus::Pending => ("○", Style::default().fg(Color::Gray)),
+            TodoStatus::Completed => ("✓", Style::default().fg(palette.success)),
+            TodoStatus::InProgress => ("●", Style::default().fg(palette.accent)),
+            TodoStatus::Pending => ("○", palette.secondary()),
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} "), style),
@@ -3626,20 +3635,22 @@ fn draw_todo_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 app.todos.len() - visible,
                 done
             ),
-            Style::default().fg(Color::DarkGray),
+            palette.secondary(),
         )));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_diff_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+fn draw_diff_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemePalette) {
     let Some(panel) = app.diff_panel.as_ref() else {
         return;
     };
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let block = Block::default().borders(Borders::LEFT);
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(palette.border));
     if let Some(detail) = panel.detail.as_ref() {
         let block = block.title(format!(" {} ", detail.path));
         let visible_height = area.height.saturating_sub(1) as usize;
@@ -3648,7 +3659,7 @@ fn draw_diff_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .iter()
             .skip(detail.scroll)
             .take(visible_height)
-            .map(|line| colorized_diff_line(line))
+            .map(|line| colorized_diff_line(line, palette))
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(lines).block(block), area);
         return;
@@ -3663,28 +3674,26 @@ fn draw_diff_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         };
         let line = Line::from(format!("{}{stats}", entry.path));
         lines.push(if index == panel.selected {
-            line.style(Style::default().add_modifier(Modifier::REVERSED))
+            line.style(palette.selected())
         } else {
             line
         });
     }
     if panel.files.is_empty() {
-        lines.push(
-            Line::from("no files edited this session").style(Style::default().fg(Color::DarkGray)),
-        );
+        lines.push(Line::from("no files edited this session").style(palette.secondary()));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn colorized_diff_line(line: &str) -> Line<'static> {
+fn colorized_diff_line(line: &str, palette: &ThemePalette) -> Line<'static> {
     let style = if line.starts_with("+++") || line.starts_with("---") {
-        Style::default().fg(Color::DarkGray)
+        palette.secondary()
     } else if line.starts_with('+') {
-        Style::default().fg(Color::Green)
+        Style::default().fg(palette.success)
     } else if line.starts_with('-') {
-        Style::default().fg(Color::Red)
+        Style::default().fg(palette.error)
     } else if line.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(palette.accent)
     } else {
         Style::default()
     };
@@ -3711,7 +3720,13 @@ fn input_desired_height(app: &TuiApp) -> u16 {
     }
 }
 
-fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, config: &LoadedConfig) {
+fn draw_transcript(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    config: &LoadedConfig,
+    palette: &ThemePalette,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -3720,6 +3735,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, config: &Loa
         area.width as usize,
         area.height,
         config.settings.hide_thinking_block.unwrap_or(false),
+        palette,
     );
     if visible.lines.is_empty() {
         return;
@@ -3727,11 +3743,11 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, config: &Loa
     let y = area.y + area.height.saturating_sub(visible.visual_height);
     let height = visible.visual_height.min(area.height);
     let render_area = Rect { y, height, ..area };
-    let paragraph = Paragraph::new(visible.lines).style(Style::default().fg(Color::White));
+    let paragraph = Paragraph::new(visible.lines).style(Style::default().fg(palette.foreground));
     frame.render_widget(paragraph, render_area);
 }
 
-fn render_entry_lines(entries: &[TuiEntry]) -> Vec<Line<'static>> {
+fn render_entry_lines(entries: &[TuiEntry], palette: &ThemePalette) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
         match entry.kind {
@@ -3740,31 +3756,33 @@ fn render_entry_lines(entries: &[TuiEntry]) -> Vec<Line<'static>> {
                 &mut lines,
                 "thinking",
                 &entry.text,
-                Style::default().fg(DIM_TEXT),
-                Style::default().fg(DIM_TEXT).add_modifier(Modifier::ITALIC),
+                palette.secondary(),
+                palette.secondary().add_modifier(Modifier::ITALIC),
             ),
-            TuiEntryKind::Tool => push_tool_lines(&mut lines, &entry.text),
+            TuiEntryKind::Tool => push_tool_lines(&mut lines, &entry.text, palette),
             TuiEntryKind::Error => push_marked_lines(
                 &mut lines,
                 "error",
                 &entry.text,
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                Style::default().fg(Color::Red),
+                Style::default()
+                    .fg(palette.error)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(palette.error),
             ),
             TuiEntryKind::System => push_marked_lines(
                 &mut lines,
                 "",
                 &entry.text,
-                Style::default().fg(DIM_TEXT),
-                Style::default().fg(Color::Gray),
+                palette.secondary(),
+                palette.secondary(),
             ),
             TuiEntryKind::User | TuiEntryKind::Assistant => {
                 push_marked_lines(
                     &mut lines,
                     "",
                     &entry.text,
-                    Style::default().fg(DIM_TEXT),
-                    Style::default().fg(Color::White),
+                    palette.secondary(),
+                    Style::default().fg(palette.foreground),
                 );
             }
         }
@@ -3796,7 +3814,7 @@ fn push_marked_lines(
     }
 }
 
-fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str) {
+fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palette: &ThemePalette) {
     let mut parts = text.lines();
     let state = parts.next().unwrap_or_default();
     let detail = parts.next().unwrap_or_default();
@@ -3815,21 +3833,26 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str) {
         }
         _ => "Ran tool".to_string(),
     };
+    let marker_style = if state.starts_with("failed") {
+        Style::default().fg(palette.error)
+    } else if state.starts_with("running") {
+        Style::default().fg(palette.accent)
+    } else {
+        palette.secondary()
+    };
     lines.push(Line::from(vec![
-        Span::styled(format!("{BULLET} "), Style::default().fg(DIM_TEXT)),
+        Span::styled(format!("{BULLET} "), marker_style),
         Span::styled(
             title,
             Style::default()
-                .fg(Color::White)
+                .fg(palette.foreground)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
     if !detail.is_empty() && !matches!(state, "running" | "completed" | "failed") {
         lines.push(Line::from(Span::styled(
             format!("  {detail}"),
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
+            palette.secondary().add_modifier(Modifier::BOLD),
         )));
     }
     let output = parts.collect::<Vec<_>>().join("\n");
@@ -3837,22 +3860,21 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str) {
         for line in output.lines() {
             lines.push(Line::from(Span::styled(
                 format!("  {line}"),
-                Style::default().fg(DIM_TEXT),
+                palette.secondary(),
             )));
         }
     } else if state.starts_with("completed") {
         lines.push(Line::from(Span::styled(
             "  (no output)",
-            Style::default().fg(DIM_TEXT),
+            palette.secondary(),
         )));
     }
 }
 
-fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemePalette) {
     let prompt = input_prompt(app);
-    let input_bg = Color::Rgb(48, 48, 48);
-    let input_style = Style::default().bg(input_bg);
-    let muted_style = Style::default().bg(input_bg);
+    let input_style = Style::default().fg(palette.foreground).bg(palette.surface);
+    let muted_style = Style::default().fg(palette.accent).bg(palette.surface);
     let mut lines = render_input_lines(app, area.height as usize, input_style, muted_style);
     if lines.is_empty() {
         lines.push(Line::from(vec![
@@ -3860,7 +3882,7 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Span::styled("", input_style),
         ]));
     }
-    frame.render_widget(Block::default().style(Style::default().bg(input_bg)), area);
+    frame.render_widget(Block::default().style(input_style), area);
     let paragraph = Paragraph::new(lines)
         .style(input_style)
         .wrap(Wrap { trim: false })
@@ -3975,13 +3997,13 @@ fn input_visible_rows(app: &TuiApp, area_height: usize) -> usize {
     }
 }
 
-fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemePalette) {
     let line = if app.header_line.is_empty() {
         app.status.clone()
     } else {
         format!("{}  {}", app.status, app.header_line)
     };
-    let footer = Paragraph::new(line).style(Style::default().fg(Color::White));
+    let footer = Paragraph::new(line).style(palette.secondary());
     frame.render_widget(footer, area);
 }
 
@@ -4002,7 +4024,12 @@ fn slash_command_matches(config: &LoadedConfig, app: &TuiApp) -> Vec<String> {
         .collect()
 }
 
-fn draw_slash_matches(frame: &mut Frame<'_>, area: Rect, matches: &[String]) {
+fn draw_slash_matches(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    matches: &[String],
+    palette: &ThemePalette,
+) {
     if area.height == 0 || matches.is_empty() {
         return;
     }
@@ -4012,27 +4039,31 @@ fn draw_slash_matches(frame: &mut Frame<'_>, area: Rect, matches: &[String]) {
         .map(|command| {
             Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled(command.clone(), Style::default().fg(DIM_TEXT)),
+                Span::styled(command.clone(), palette.secondary()),
             ])
         })
         .collect::<Vec<_>>();
-    let paragraph = Paragraph::new(lines).style(Style::default().fg(DIM_TEXT));
+    let paragraph = Paragraph::new(lines).style(palette.secondary());
     frame.render_widget(paragraph, area);
 }
 
-fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
+fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp, palette: &ThemePalette) {
     let Some(selector) = &app.selector else {
         return;
     };
     let area = centered_rect(frame.area(), 82, 68);
     frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(palette.base().bg(palette.surface)),
+        area,
+    );
     let available = area.height.saturating_sub(5) as usize;
     let start = selector
         .selected
         .saturating_sub(available.saturating_sub(1));
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("filter ", Style::default().fg(DIM_TEXT)),
+            Span::styled("filter ", palette.secondary()),
             Span::raw(selector.query.as_str()),
         ]),
         Line::from(""),
@@ -4052,9 +4083,9 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
         };
         let active = if item.active { "*" } else { " " };
         let style = if position == selector.selected {
-            Style::default().add_modifier(Modifier::REVERSED)
+            palette.selected()
         } else if item.active {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(palette.accent)
         } else {
             Style::default()
         };
@@ -4069,17 +4100,14 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
         )));
     }
     if selector.filtered_indices.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no matches",
-            Style::default().fg(DIM_TEXT),
-        )));
+        lines.push(Line::from(Span::styled("no matches", palette.secondary())));
     }
     if let Some(level) = selector.selected_thinking_level() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("thinking ", Style::default().fg(DIM_TEXT)),
-            Span::styled(level, Style::default().fg(Color::Cyan)),
-            Span::styled("  left/right to adjust", Style::default().fg(DIM_TEXT)),
+            Span::styled("thinking ", palette.secondary()),
+            Span::styled(level, Style::default().fg(palette.accent)),
+            Span::styled("  left/right to adjust", palette.secondary()),
         ]));
     }
     let action = if selector.kind == "settings" {
@@ -4093,9 +4121,12 @@ fn draw_selector_overlay(frame: &mut Frame<'_>, app: &TuiApp) {
         " {} selector  {position}/{total}  {action}  pgup/pgdn home/end  esc cancel ",
         selector.title
     );
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.border))
+            .title(title),
+    );
     frame.render_widget(paragraph, area);
 }
 
@@ -4369,7 +4400,7 @@ enum StreamEnd {
 fn handle_streaming_tui_key(
     key: KeyEvent,
     app: &mut TuiApp,
-    queued_inputs: &mut Vec<String>,
+    followups: &FollowUpQueue,
     steering: &SteeringMailbox,
     config: &LoadedConfig,
 ) -> StreamingKeyOutcome {
@@ -4412,11 +4443,7 @@ fn handle_streaming_tui_key(
         }
     }
     match key.code {
-        KeyCode::Esc => {
-            app.clear_input();
-            app.multiline = None;
-            StreamingKeyOutcome::Changed
-        }
+        KeyCode::Esc => StreamingKeyOutcome::Interrupt,
         KeyCode::Backspace => {
             app.pop_input_char();
             StreamingKeyOutcome::Changed
@@ -4428,8 +4455,11 @@ fn handle_streaming_tui_key(
         KeyCode::Enter => {
             let line = app.input.trim().to_string();
             app.clear_input();
+            if let Some(command) = line.strip_prefix('/') {
+                return handle_streaming_command(command, app, followups, config);
+            }
             if !line.is_empty() {
-                queued_inputs.push(line);
+                followups.push(line);
             }
             StreamingKeyOutcome::Changed
         }
@@ -4441,10 +4471,63 @@ fn handle_streaming_tui_key(
     }
 }
 
+/// Slash commands typed mid-turn. Only turn-local actions work here: the
+/// session itself is borrowed by the running turn, so anything that needs
+/// it is rejected with a note instead of being swallowed as prompt text.
+fn handle_streaming_command(
+    command: &str,
+    app: &mut TuiApp,
+    followups: &FollowUpQueue,
+    config: &LoadedConfig,
+) -> StreamingKeyOutcome {
+    match command {
+        "queue" => {
+            let pending = followups.list();
+            if pending.is_empty() {
+                app.push(TuiEntryKind::System, "no pending follow-ups");
+            } else {
+                let list = pending
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| format!("{}. {}", index + 1, message))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                app.push(TuiEntryKind::System, format!("pending follow-ups:\n{list}"));
+            }
+            StreamingKeyOutcome::Changed
+        }
+        "queue-clear" => {
+            let cleared = followups.clear();
+            app.push(
+                TuiEntryKind::System,
+                format!("cleared {cleared} pending follow-up(s)"),
+            );
+            StreamingKeyOutcome::Changed
+        }
+        "todos" => {
+            app.todos_expanded = !app.todos_expanded;
+            StreamingKeyOutcome::Changed
+        }
+        "help" => {
+            app.push(TuiEntryKind::System, terminal_renderer(config).help());
+            StreamingKeyOutcome::Changed
+        }
+        "interrupt" => StreamingKeyOutcome::Interrupt,
+        "quit" => StreamingKeyOutcome::Quit,
+        _ => {
+            app.push(
+                TuiEntryKind::System,
+                format!("/{command} is not available while a turn is running"),
+            );
+            StreamingKeyOutcome::Changed
+        }
+    }
+}
+
 fn drain_streaming_tui_events(
     surface: &mut TuiSurface<'_>,
     app: &mut TuiApp,
-    queued_inputs: &mut Vec<String>,
+    followups: &FollowUpQueue,
     steering: &SteeringMailbox,
     config: &LoadedConfig,
 ) -> Result<(bool, Option<TurnControl>)> {
@@ -4453,7 +4536,7 @@ fn drain_streaming_tui_events(
     while event::poll(Duration::ZERO)? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                match handle_streaming_tui_key(key, app, queued_inputs, steering, config) {
+                match handle_streaming_tui_key(key, app, followups, steering, config) {
                     StreamingKeyOutcome::Ignored => {}
                     StreamingKeyOutcome::Changed => changed = true,
                     StreamingKeyOutcome::Interrupt => control = Some(TurnControl::Interrupted),
@@ -4482,6 +4565,63 @@ fn apply_stream_delta(app: &mut TuiApp, entry_index: usize, saw_delta: &mut bool
         *saw_delta = true;
     }
     app.append_entry(entry_index, delta);
+}
+
+/// What the running turn is doing right now, shown in the footer spinner.
+enum Activity {
+    Waiting,
+    Thinking,
+    Writing,
+    Tool(String),
+}
+
+const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+
+fn activity_status(started: Instant, activity: &Activity, pending_followups: usize) -> String {
+    let elapsed = started.elapsed();
+    let frame = SPINNER_FRAMES[(elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len()];
+    let phase = match activity {
+        Activity::Waiting => "waiting".to_string(),
+        Activity::Thinking => "thinking".to_string(),
+        Activity::Writing => "writing".to_string(),
+        Activity::Tool(name) => format!("running {name}"),
+    };
+    let queued = if pending_followups > 0 {
+        format!(" · +{pending_followups} queued")
+    } else {
+        String::new()
+    };
+    format!(
+        "{frame} {phase} · {}s{queued} · esc interrupt",
+        elapsed.as_secs()
+    )
+}
+
+fn apply_turn_event(
+    app: &mut TuiApp,
+    entry_index: usize,
+    thinking_index: usize,
+    saw_delta: &mut bool,
+    activity: &mut Activity,
+    event: &TurnEvent,
+) {
+    match event {
+        TurnEvent::Provider(StreamEvent::Text(text)) => {
+            *activity = Activity::Writing;
+            apply_stream_delta(app, entry_index, saw_delta, text);
+        }
+        TurnEvent::Provider(StreamEvent::Thinking(text)) => {
+            *activity = Activity::Thinking;
+            app.append_entry(thinking_index, text);
+        }
+        TurnEvent::ToolStarted { name } => {
+            *activity = Activity::Tool(name.clone());
+        }
+        TurnEvent::ToolFinished { .. } => {
+            *activity = Activity::Waiting;
+        }
+        _ => {}
+    }
 }
 
 fn is_shift_enter(key: &KeyEvent) -> bool {
@@ -4616,8 +4756,8 @@ fn apply_tui_selector_selection(
             );
         }
         "theme" | "themes" => {
-            config.settings.theme = Some(item.value.clone());
-            app.push(TuiEntryKind::System, format!("theme: {}", item.value));
+            let name = persist_theme(config, &item.value)?;
+            app.push(TuiEntryKind::System, format!("theme: {name}"));
         }
         "session" | "sessions" | "resume" | "tree" => {
             let path = resolve_session_reference(&config.paths.session_dir, &item.value)?;
@@ -5018,10 +5158,7 @@ async fn handle_tui_submission(
             TuiEntryKind::System,
             format_resources("prompts", &config.prompt_templates),
         ),
-        "/themes" => app.push(
-            TuiEntryKind::System,
-            format_resources("themes", &config.themes),
-        ),
+        "/themes" => app.push(TuiEntryKind::System, format_themes(config)),
         "/extensions" => app.push(
             TuiEntryKind::System,
             format_resources("extensions", &config.extensions),
@@ -5313,12 +5450,22 @@ async fn handle_tui_submission(
             )
             .await);
         }
+        "/accent" => app.push(
+            TuiEntryKind::System,
+            format!(
+                "accent: {}",
+                config.settings.accent_color.as_deref().unwrap_or("auto")
+            ),
+        ),
+        _ if line.starts_with("/accent ") => {
+            let color = line.trim_start_matches("/accent ").trim();
+            persist_accent(config, color)?;
+            app.push(TuiEntryKind::System, format!("accent: {color}"));
+        }
         _ if line.starts_with("/theme ") => {
             let name = line.trim_start_matches("/theme ").trim();
-            let theme = find_resource(&config.themes, name)
-                .ok_or_else(|| anyhow!("theme not found: {name}"))?;
-            config.settings.theme = Some(theme.name.clone());
-            app.push(TuiEntryKind::System, format!("theme: {}", theme.name));
+            let name = persist_theme(config, name)?;
+            app.push(TuiEntryKind::System, format!("theme: {name}"));
         }
         _ if line.starts_with("/new") => {
             let (store, state) =
@@ -5679,8 +5826,10 @@ async fn run_prompt_once_tui(
     }
 
     let mut saw_delta = false;
-    let mut queued_inputs = Vec::new();
-    let (delta_tx, delta_rx) = std::sync::mpsc::channel::<StreamEvent>();
+    let followups = FollowUpQueue::default();
+    let activity_started = Instant::now();
+    let mut activity = Activity::Waiting;
+    let (delta_tx, delta_rx) = std::sync::mpsc::channel::<TurnEvent>();
     let stream_end = {
         let turn = run_user_turn_streaming_events_with_media(
             runtime,
@@ -5688,61 +5837,45 @@ async fn run_prompt_once_tui(
             prompt,
             media,
             &steering,
-            move |delta| {
-                let _ = delta_tx.send(delta.clone());
+            move |event| {
+                let _ = delta_tx.send(event.clone());
             },
         );
         tokio::pin!(turn);
         let mut tick = tokio::time::interval(Duration::from_millis(STREAM_RENDER_INTERVAL_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut pending_redraw = false;
 
         loop {
             tokio::select! {
                 result = &mut turn => {
-                    while let Ok(delta) = delta_rx.try_recv() {
-                        match delta {
-                            StreamEvent::Text(text) => apply_stream_delta(app, entry_index, &mut saw_delta, &text),
-                            StreamEvent::Thinking(text) => app.append_entry(thinking_index, &text),
-                            _ => {}
-                        }
-                        pending_redraw = true;
+                    while let Ok(event) = delta_rx.try_recv() {
+                        apply_turn_event(app, entry_index, thinking_index, &mut saw_delta, &mut activity, &event);
                     }
-                    if pending_redraw {
-                        redraw_tui(surface.terminal, app, config)?;
-                    }
+                    app.status = activity_status(activity_started, &activity, followups.pending());
+                    redraw_tui(surface.terminal, app, config)?;
                     break StreamEnd::Finished(result);
                 }
                 _ = tick.tick() => {
-                    while let Ok(delta) = delta_rx.try_recv() {
-                        match delta {
-                            StreamEvent::Text(text) => apply_stream_delta(app, entry_index, &mut saw_delta, &text),
-                            StreamEvent::Thinking(text) => app.append_entry(thinking_index, &text),
-                            _ => {}
-                        }
-                        pending_redraw = true;
+                    while let Ok(event) = delta_rx.try_recv() {
+                        apply_turn_event(app, entry_index, thinking_index, &mut saw_delta, &mut activity, &event);
                     }
-                    let (changed, control) =
-                        drain_streaming_tui_events(surface, app, &mut queued_inputs, &steering, config)?;
+                    let (_, control) =
+                        drain_streaming_tui_events(surface, app, &followups, &steering, config)?;
                     if let Some(control) = control {
                         break match control {
                             TurnControl::Quit => StreamEnd::Quit,
                             _ => StreamEnd::Interrupted,
                         };
                     }
-                    if changed {
-                        pending_redraw = true;
-                    }
-                    if pending_redraw {
-                        redraw_tui(surface.terminal, app, config)?;
-                        pending_redraw = false;
-                    }
+                    app.status = activity_status(activity_started, &activity, followups.pending());
+                    redraw_tui(surface.terminal, app, config)?;
                 }
             }
         }
     };
-    for queued_input in queued_inputs {
-        runtime.queue_message(queued_input)?;
+    app.status = footer_status(config, runtime, &app.editor_state);
+    for followup in followups.drain() {
+        runtime.queue_message(followup)?;
     }
     // Steering input that arrived after the turn's last injection point
     // becomes a regular follow-up instead of being dropped.
@@ -6221,13 +6354,89 @@ fn print_response(mode: &OutputMode, response: &str) {
 }
 
 fn terminal_renderer(config: &LoadedConfig) -> TerminalRenderer {
-    TerminalRenderer::new(TerminalTheme {
-        name: config
-            .settings
-            .theme
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
-    })
+    TerminalRenderer::new(terminal_theme(config).unwrap_or_default())
+}
+
+fn terminal_theme(config: &LoadedConfig) -> Result<TerminalTheme> {
+    resolve_terminal_theme(config, config.settings.theme.as_deref().unwrap_or("system"))?
+        .with_accent(config.settings.accent_color.as_deref())
+        .map_err(|error| anyhow!(error))
+}
+
+fn resolve_terminal_theme(config: &LoadedConfig, name: &str) -> Result<TerminalTheme> {
+    // Loaded resources can customize built-ins; /theme system always restores native colors.
+    if name != "system" && name != "default" {
+        if let Some(resource) = find_resource(&config.themes, name) {
+            return TerminalTheme::from_json(&resource.name, &resource.content)
+                .map_err(|error| anyhow!(error));
+        }
+    }
+    if let Some(theme) = TerminalTheme::builtin(name) {
+        return Ok(theme);
+    }
+    let path = Path::new(name);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config.paths.cwd.join(path)
+    };
+    if path.is_file() {
+        let mut theme =
+            TerminalTheme::from_json(&resource_name(&path), &fs::read_to_string(&path)?)
+                .map_err(|error| anyhow!(error))?;
+        theme.name = fs::canonicalize(path)?.display().to_string();
+        return Ok(theme);
+    }
+    Err(anyhow!("theme not found: {name}"))
+}
+
+fn persist_theme(config: &mut LoadedConfig, name: &str) -> Result<String> {
+    let theme = resolve_terminal_theme(config, name)?;
+    // Validate before persisting, so malformed themes never replace a working selection.
+    theme
+        .clone()
+        .with_accent(config.settings.accent_color.as_deref())
+        .map_err(|error| anyhow!(error))?;
+    write_user_setting(
+        &config.paths.settings_path,
+        &["theme"],
+        theme.name.clone().into(),
+    )?;
+    config.settings.theme = Some(theme.name.clone());
+    Ok(theme.name)
+}
+
+fn persist_accent(config: &mut LoadedConfig, color: &str) -> Result<()> {
+    let accent = if color == "auto" {
+        None
+    } else {
+        parse_theme_color(color).map_err(|error| anyhow!(error))?;
+        Some(color.to_string())
+    };
+    write_user_setting(
+        &config.paths.settings_path,
+        &["accentColor"],
+        serde_json::to_value(&accent)?,
+    )?;
+    config.settings.accent_color = accent;
+    Ok(())
+}
+
+fn theme_names(config: &LoadedConfig) -> Vec<String> {
+    let mut names = BUILTIN_THEMES
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    for resource in &config.themes {
+        if !names.contains(&resource.name) {
+            names.push(resource.name.clone());
+        }
+    }
+    names
+}
+
+fn format_themes(config: &LoadedConfig) -> String {
+    format!("themes\n{}", theme_names(config).join("\n"))
 }
 
 fn keybinding_map(config: &LoadedConfig) -> KeybindingMap {
@@ -6393,7 +6602,13 @@ fn format_settings(config: &LoadedConfig, runtime: &Runtime) -> String {
             .active_model
             .as_ref()
             .map(|model| format!("{}/{}", model.provider, model.id)),
-        theme: config.settings.theme.clone(),
+        theme: Some(
+            config
+                .settings
+                .theme
+                .clone()
+                .unwrap_or_else(|| "system".to_string()),
+        ),
     })
 }
 
@@ -6431,7 +6646,7 @@ fn compact_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &Edito
             .settings
             .theme
             .clone()
-            .unwrap_or_else(|| "-".to_string()),
+            .unwrap_or_else(|| "system".to_string()),
         runtime.session().queued_messages.len(),
         editor_state.history().len()
     );
@@ -6515,11 +6730,20 @@ fn command_completions(config: &LoadedConfig, prefix: &str) -> Vec<String> {
         "/prompt ",
         &config.prompt_templates,
     ));
-    completions.extend(resource_command_completions(
-        prefix,
-        "/theme ",
-        &config.themes,
-    ));
+    completions.extend(
+        theme_names(config)
+            .into_iter()
+            .map(|name| format!("/theme {name}"))
+            .filter(|command| command.starts_with(prefix)),
+    );
+    completions.extend(
+        [
+            "auto", "cyan", "blue", "magenta", "green", "yellow", "red", "default",
+        ]
+        .into_iter()
+        .map(|color| format!("/accent {color}"))
+        .filter(|command| command.starts_with(prefix)),
+    );
     completions.sort();
     completions.dedup();
     completions
@@ -6584,6 +6808,9 @@ fn unique_temp_suffix() -> u128 {
 fn format_diagnostics(config: &LoadedConfig) -> String {
     let mut diagnostics = config.diagnostics.clone();
     diagnostics.extend(extension_manifest_diagnostics(&config.extensions));
+    if let Err(error) = terminal_theme(config) {
+        diagnostics.push(format!("{error}; using system theme"));
+    }
     if diagnostics.is_empty() {
         return "no diagnostics".to_string();
     }
@@ -6631,8 +6858,8 @@ fn select_from_selector_message(
             Ok(format_model_selection(&model, thinking.as_deref()))
         }
         "theme" | "themes" => {
-            config.settings.theme = Some(item.value.clone());
-            Ok(format!("theme: {}", item.value))
+            let name = persist_theme(config, &item.value)?;
+            Ok(format!("theme: {name}"))
         }
         "session" | "sessions" | "resume" | "tree" => {
             let path = resolve_session_reference(&config.paths.session_dir, &item.value)?;
@@ -6698,13 +6925,14 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
         )),
         "theme" | "themes" => Ok(Selector::new(
             "theme",
-            config
-                .themes
-                .iter()
-                .map(|theme| SelectorItem {
-                    label: theme.name.clone(),
-                    value: theme.name.clone(),
-                    active: config.settings.theme.as_deref() == Some(theme.name.as_str()),
+            theme_names(config)
+                .into_iter()
+                .map(|name| SelectorItem {
+                    active: config.settings.theme.as_deref().unwrap_or("system") == name
+                        || (name == "system"
+                            && config.settings.theme.as_deref() == Some("default")),
+                    label: name.clone(),
+                    value: name,
                 })
                 .collect(),
         )),
@@ -7419,6 +7647,301 @@ mod tests {
     }
 
     #[test]
+    fn themes_are_available_without_resources_and_do_not_duplicate_builtins() {
+        let mut config = account_test_config(AuthData::default());
+        let runtime = account_test_runtime("faux", None);
+        config.themes = vec![test_resource("dark"), test_resource("custom")];
+        assert_eq!(
+            theme_names(&config),
+            ["system", "light", "dark", "kimi", "custom"]
+        );
+        let selector = selector_for_kind(&config, &runtime, "theme").unwrap();
+        assert!(selector.items[0].active);
+        assert!(command_completions(&config, "/theme k").contains(&"/theme kimi".to_string()));
+        assert!(command_completions(&config, "/accent m").contains(&"/accent magenta".to_string()));
+        assert!(format_themes(&config).contains("system\nlight\ndark\nkimi"));
+    }
+
+    #[test]
+    fn theme_and_accent_persist_validate_and_reload_without_session_loss() {
+        use ratatui::style::Color;
+        let root = std::env::temp_dir().join(format!("pi-cli-theme-{}", unique_temp_suffix()));
+        fs::create_dir_all(root.join("themes")).unwrap();
+        let mut config = account_test_config(AuthData::default());
+        config.paths = ConfigPaths {
+            cwd: root.clone(),
+            agent_dir: root.clone(),
+            settings_path: root.join("settings.json"),
+            project_settings_path: root.join(".pi/settings.json"),
+            ..test_config_paths()
+        };
+        fs::write(
+            &config.paths.settings_path,
+            r#"{"unknownSetting":123,"defaultProvider":"faux","defaultModel":"echo"}"#,
+        )
+        .unwrap();
+        let theme_path = root.join("themes/custom.json");
+        fs::write(
+            &theme_path,
+            r##"{"base":"dark","colors":{"accent":"#123456"}}"##,
+        )
+        .unwrap();
+        config = load_config(config.paths).unwrap();
+        let mut session = SessionState::new("keep-session", root.clone());
+        session.active_model = Some(ModelRef {
+            provider: "faux".into(),
+            id: "echo".into(),
+        });
+        session.queued_messages.push("followup".into());
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            content: "answer".into(),
+            thinking: "summary".into(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        });
+        session.tool_history.push(pi_core::ToolEvent {
+            id: "tool-1".into(),
+            name: "read".into(),
+            result: "contents".into(),
+        });
+        let mut runtime = Runtime::new(session, ReloadableSystems::from_config(&config, 1));
+        let before = runtime.session().clone();
+        let mut app = TuiApp::new(&config, &runtime);
+        app.set_input("draft");
+        let selector = TuiSelectorState::new(
+            "theme",
+            selector_for_kind(&config, &runtime, "theme").unwrap(),
+            "custom",
+            None,
+        );
+        apply_tui_selector_selection(&mut app, &mut runtime, &mut config, selector).unwrap();
+        assert_eq!(config.settings.theme.as_deref(), Some("custom"));
+        assert_eq!(
+            terminal_theme(&config).unwrap().palette.accent,
+            Color::Rgb(0x12, 0x34, 0x56)
+        );
+        persist_accent(&mut config, "magenta").unwrap();
+        assert_eq!(
+            terminal_theme(&config).unwrap().palette.accent,
+            Color::Magenta
+        );
+        let saved = fs::read_to_string(&config.paths.settings_path).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&saved).unwrap()["unknownSetting"],
+            123
+        );
+        assert!(persist_theme(&mut config, "missing").is_err());
+        assert!(persist_accent(&mut config, "bad-color").is_err());
+        assert_eq!(
+            fs::read_to_string(&config.paths.settings_path).unwrap(),
+            saved
+        );
+        fs::write(
+            &theme_path,
+            r##"{"base":"light","colors":{"accent":"#654321"}}"##,
+        )
+        .unwrap();
+        config = load_config(config.paths.clone()).unwrap();
+        runtime
+            .reload(ReloadableSystems::from_config(&config, 2))
+            .unwrap();
+        app.refresh_chrome(&config, &runtime);
+        assert_eq!(runtime.session(), &before);
+        assert_eq!(app.input, "draft");
+        assert!(app.entries.iter().any(|entry| entry.text == "answer"));
+        assert_eq!(
+            terminal_theme(&config).unwrap().palette.background,
+            TerminalTheme::builtin("light").unwrap().palette.background
+        );
+        assert_eq!(
+            terminal_theme(&config).unwrap().palette.accent,
+            Color::Magenta
+        );
+        persist_accent(&mut config, "auto").unwrap();
+        assert_eq!(
+            terminal_theme(&config).unwrap().palette.accent,
+            Color::Rgb(0x65, 0x43, 0x21)
+        );
+        assert_eq!(
+            select_from_selector_message(&mut config, &mut runtime, "/select theme kimi").unwrap(),
+            "theme: kimi"
+        );
+        assert_eq!(persist_theme(&mut config, "default").unwrap(), "system");
+        assert_eq!(
+            terminal_theme(&load_config(config.paths.clone()).unwrap()).unwrap(),
+            TerminalTheme::default()
+        );
+        // --theme accepts JSON paths as well as built-in and resource names.
+        assert_eq!(
+            resolve_terminal_theme(&config, "themes/custom.json")
+                .unwrap()
+                .palette
+                .accent,
+            Color::Rgb(0x65, 0x43, 0x21)
+        );
+        fs::write(&theme_path, "bad JSON").unwrap();
+        config = load_config(config.paths.clone()).unwrap();
+        let saved = fs::read_to_string(&config.paths.settings_path).unwrap();
+        assert!(persist_theme(&mut config, "custom").is_err());
+        assert_eq!(
+            fs::read_to_string(&config.paths.settings_path).unwrap(),
+            saved
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn frame_palette_covers_input_transcript_footer_and_selector() {
+        use ratatui::{backend::TestBackend, buffer::Cell, style::Color};
+        let mut config = account_test_config(AuthData::default());
+        let runtime = account_test_runtime("faux", None);
+        let mut app = TuiApp::new(&config, &runtime);
+        app.entries.clear();
+        app.push(TuiEntryKind::Assistant, "neutral-answer");
+        app.push(TuiEntryKind::Thinking, "secondary-thinking");
+        app.push(
+            TuiEntryKind::Tool,
+            "completed bash\ncommand-detail\nsecondary-output",
+        );
+        app.push(TuiEntryKind::Error, "error-output");
+        app.set_input("draft");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        for name in BUILTIN_THEMES {
+            config.settings.theme = Some(name.to_string());
+            app.refresh_chrome(&config, &runtime);
+            let palette = terminal_theme(&config).unwrap().palette;
+            terminal
+                .draw(|frame| draw_tui(frame, &app, &config))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let cell_for = |text: &str| -> &Cell {
+                for y in 0..buffer.area.height {
+                    let row = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>();
+                    if let Some(x) = row.find(text) {
+                        return &buffer[(x as u16, y)];
+                    }
+                }
+                panic!("missing rendered text {text}");
+            };
+            assert_eq!(cell_for("neutral-answer").fg, palette.foreground);
+            assert_eq!(cell_for("secondary-thinking").fg, palette.muted);
+            assert_eq!(cell_for("secondary-output").fg, palette.muted);
+            assert_eq!(cell_for("error-output").fg, palette.error);
+            assert_eq!(cell_for("pi> ").fg, palette.accent);
+            assert_eq!(cell_for("draft").fg, palette.foreground);
+            assert_eq!(cell_for("draft").bg, palette.surface);
+            assert_eq!(cell_for("faux/echo").fg, palette.muted);
+            if *name == "system" {
+                assert!(buffer.content.iter().all(|cell| cell.bg == Color::Reset));
+                assert!(buffer
+                    .content
+                    .iter()
+                    .all(|cell| !matches!(cell.fg, Color::Rgb(_, _, _))));
+            }
+            app.selector = Some(TuiSelectorState::new(
+                "theme",
+                selector_for_kind(&config, &runtime, "theme").unwrap(),
+                "",
+                None,
+            ));
+            terminal
+                .draw(|frame| draw_tui(frame, &app, &config))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let selected = buffer
+                .content
+                .iter()
+                .find(|cell| cell.modifier.contains(Modifier::REVERSED))
+                .unwrap();
+            assert_eq!(selected.fg, palette.accent);
+            assert_eq!(selected.bg, palette.surface);
+            let area = centered_rect(buffer.area, 82, 68);
+            assert_eq!(buffer[(area.x, area.y)].fg, palette.border);
+            app.selector = None;
+        }
+    }
+
+    #[test]
+    fn invalid_configured_theme_reports_diagnostic_and_renders_native_fallback() {
+        use ratatui::{backend::TestBackend, style::Color};
+        let mut config = account_test_config(AuthData::default());
+        let runtime = account_test_runtime("faux", None);
+        for (theme, accent) in [("missing", None), ("kimi", Some("bad-color"))] {
+            config.settings.theme = Some(theme.into());
+            config.settings.accent_color = accent.map(str::to_string);
+            assert!(terminal_theme(&config).is_err());
+            assert!(format_diagnostics(&config).contains("using system theme"));
+            let app = TuiApp::new(&config, &runtime);
+            assert!(app
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TuiEntryKind::Error
+                    && entry.text.contains("using system theme")));
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| draw_tui(frame, &app, &config))
+                .unwrap();
+            assert!(terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.bg == Color::Reset));
+        }
+    }
+
+    #[test]
+    fn diff_and_todo_widgets_use_semantic_colors() {
+        use ratatui::{backend::TestBackend, style::Color};
+        for name in BUILTIN_THEMES {
+            let palette = TerminalTheme::builtin(name).unwrap().palette;
+            assert_eq!(
+                colorized_diff_line("+added", &palette).style.fg,
+                Some(palette.success)
+            );
+            assert_eq!(
+                colorized_diff_line("-removed", &palette).style.fg,
+                Some(palette.error)
+            );
+            assert_eq!(
+                colorized_diff_line("@@ hunk", &palette).style.fg,
+                Some(palette.accent)
+            );
+            let app = TuiApp {
+                todos: vec![
+                    TodoItem {
+                        content: "completed".into(),
+                        status: TodoStatus::Completed,
+                    },
+                    TodoItem {
+                        content: "active".into(),
+                        status: TodoStatus::InProgress,
+                    },
+                    TodoItem {
+                        content: "pending".into(),
+                        status: TodoStatus::Pending,
+                    },
+                ],
+                ..TuiApp::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(30, 3)).unwrap();
+            terminal
+                .draw(|frame| draw_todo_panel(frame, frame.area(), &app, &palette))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, 0)].fg, palette.success);
+            assert_eq!(buffer[(0, 1)].fg, palette.accent);
+            assert_eq!(buffer[(0, 2)].fg, palette.muted);
+            assert_eq!(buffer[(2, 2)].fg, Color::Reset);
+        }
+    }
+
+    #[test]
     fn status_format_is_compact_and_unlabeled() {
         let settings = Settings {
             theme: Some("solar".to_string()),
@@ -7612,6 +8135,19 @@ mod tests {
     }
 
     #[test]
+    fn gpt6_thinking_levels_are_available() {
+        for provider in ["openai", "openai-codex", "azure-openai-responses"] {
+            let model = ModelRef {
+                provider: provider.to_string(),
+                id: "gpt-6.1-sol".to_string(),
+            };
+            assert!(model_thinking_levels(&model).contains(&"high"));
+            assert!(model_thinking_levels(&model).contains(&"xhigh"));
+            assert_eq!(default_thinking_for_model(&model), Some("xhigh"));
+        }
+    }
+
+    #[test]
     fn anthropic_thinking_levels_follow_model_version() {
         let opus_5 = ModelRef {
             provider: "anthropic".to_string(),
@@ -7666,8 +8202,10 @@ mod tests {
                 text: "answer".into(),
             },
         ];
-        let shown = visible_transcript_with_thinking(&entries, 80, 24, false);
-        let hidden = visible_transcript_with_thinking(&entries, 80, 24, true);
+        let shown =
+            visible_transcript_with_thinking(&entries, 80, 24, false, &ThemePalette::default());
+        let hidden =
+            visible_transcript_with_thinking(&entries, 80, 24, true, &ThemePalette::default());
         assert_eq!(shown.entries_used, 2);
         assert_eq!(hidden.entries_used, 1);
         assert!(!hidden
@@ -7676,34 +8214,41 @@ mod tests {
             .flat_map(|line| &line.spans)
             .any(|span| span.content.contains("summary")));
         assert_eq!(
-            visible_transcript_with_thinking(&entries, 80, 24, false).entries_used,
+            visible_transcript_with_thinking(&entries, 80, 24, false, &ThemePalette::default())
+                .entries_used,
             2
         );
     }
 
     #[test]
     fn thinking_is_dimmed_and_separate_from_answer() {
-        let lines = render_entry_lines(&[
-            TuiEntry {
-                kind: TuiEntryKind::Thinking,
-                text: "summary".into(),
-            },
-            TuiEntry {
-                kind: TuiEntryKind::Assistant,
-                text: "answer".into(),
-            },
-        ]);
+        let lines = render_entry_lines(
+            &[
+                TuiEntry {
+                    kind: TuiEntryKind::Thinking,
+                    text: "summary".into(),
+                },
+                TuiEntry {
+                    kind: TuiEntryKind::Assistant,
+                    text: "answer".into(),
+                },
+            ],
+            &ThemePalette::default(),
+        );
         let summary = lines
             .iter()
             .flat_map(|line| &line.spans)
             .find(|span| span.content.contains("summary"))
             .unwrap();
-        assert_eq!(summary.style.fg, Some(DIM_TEXT));
+        assert_eq!(summary.style.fg, Some(ThemePalette::default().muted));
         assert!(summary.style.add_modifier.contains(Modifier::ITALIC));
-        assert!(render_entry_lines(&[TuiEntry {
-            kind: TuiEntryKind::Thinking,
-            text: String::new()
-        }])
+        assert!(render_entry_lines(
+            &[TuiEntry {
+                kind: TuiEntryKind::Thinking,
+                text: String::new()
+            }],
+            &ThemePalette::default()
+        )
         .is_empty());
     }
 
@@ -7715,10 +8260,13 @@ mod tests {
 
     #[test]
     fn transcript_lines_drop_trailing_entry_spacer_for_viewport() {
-        let mut lines = render_entry_lines(&[TuiEntry {
-            kind: TuiEntryKind::Assistant,
-            text: "done".to_string(),
-        }]);
+        let mut lines = render_entry_lines(
+            &[TuiEntry {
+                kind: TuiEntryKind::Assistant,
+                text: "done".to_string(),
+            }],
+            &ThemePalette::default(),
+        );
         while lines.last().map(Line::width) == Some(0) {
             lines.pop();
         }
@@ -7786,7 +8334,7 @@ mod tests {
     fn streaming_input_key_updates_draft_while_response_is_live() {
         let mut app = TuiApp::default();
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
-        let mut queued_inputs = Vec::new();
+        let followups = FollowUpQueue::default();
         let steering = SteeringMailbox::default();
         let config = minimal_test_config();
 
@@ -7794,7 +8342,7 @@ mod tests {
             let changed = handle_streaming_tui_key(
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
                 &mut app,
-                &mut queued_inputs,
+                &followups,
                 &steering,
                 &config,
             );
@@ -7802,7 +8350,7 @@ mod tests {
         }
 
         assert_eq!(app.input, "next prompt");
-        assert!(queued_inputs.is_empty());
+        assert_eq!(followups.pending(), 0);
         assert_eq!(app.entries[0].text, "streaming");
         assert_eq!(app.live_entry_index, Some(0));
     }
@@ -7812,21 +8360,21 @@ mod tests {
         let mut app = TuiApp::default();
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
         app.set_input("next prompt");
-        let mut queued_inputs = Vec::new();
+        let followups = FollowUpQueue::default();
         let steering = SteeringMailbox::default();
         let config = minimal_test_config();
 
         let changed = handle_streaming_tui_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut app,
-            &mut queued_inputs,
+            &followups,
             &steering,
             &config,
         );
 
         assert_eq!(changed, StreamingKeyOutcome::Changed);
         assert!(app.input.is_empty());
-        assert_eq!(queued_inputs, ["next prompt"]);
+        assert_eq!(followups.list(), ["next prompt"]);
         assert_eq!(app.entries[0].text, "streaming");
         assert_eq!(app.live_entry_index, Some(0));
     }
@@ -7836,21 +8384,21 @@ mod tests {
         let mut app = TuiApp::default();
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
         app.set_input("change course");
-        let mut queued_inputs = Vec::new();
+        let followups = FollowUpQueue::default();
         let steering = SteeringMailbox::default();
         let config = minimal_test_config();
 
         let changed = handle_streaming_tui_key(
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             &mut app,
-            &mut queued_inputs,
+            &followups,
             &steering,
             &config,
         );
 
         assert_eq!(changed, StreamingKeyOutcome::Changed);
         assert!(app.input.is_empty());
-        assert!(queued_inputs.is_empty());
+        assert_eq!(followups.pending(), 0);
         assert_eq!(steering.drain(), ["change course"]);
         assert_eq!(app.entries[1].text, "steering> change course");
         assert_eq!(app.live_entry_index, Some(0));
@@ -7860,14 +8408,14 @@ mod tests {
     fn streaming_steer_with_empty_input_does_nothing() {
         let mut app = TuiApp::default();
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
-        let mut queued_inputs = Vec::new();
+        let followups = FollowUpQueue::default();
         let steering = SteeringMailbox::default();
         let config = minimal_test_config();
 
         let changed = handle_streaming_tui_key(
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             &mut app,
-            &mut queued_inputs,
+            &followups,
             &steering,
             &config,
         );
@@ -7881,14 +8429,14 @@ mod tests {
     fn streaming_ctrl_c_interrupts_then_second_press_quits() {
         let mut app = TuiApp::default();
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
-        let mut queued_inputs = Vec::new();
+        let followups = FollowUpQueue::default();
         let steering = SteeringMailbox::default();
         let config = minimal_test_config();
 
         let first = handle_streaming_tui_key(
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             &mut app,
-            &mut queued_inputs,
+            &followups,
             &steering,
             &config,
         );
@@ -7897,7 +8445,7 @@ mod tests {
         let second = handle_streaming_tui_key(
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             &mut app,
-            &mut queued_inputs,
+            &followups,
             &steering,
             &config,
         );
@@ -7974,6 +8522,114 @@ mod tests {
             .expect("mid-turn and queue hint");
         assert!(hint.contains("mid-turn"));
         assert!(hint.contains("1 queued"));
+    }
+
+    #[test]
+    fn streaming_esc_interrupts_the_turn() {
+        let mut app = TuiApp::default();
+        app.push_placeholder(TuiEntryKind::Assistant, "streaming");
+        let followups = FollowUpQueue::default();
+        let steering = SteeringMailbox::default();
+        let config = minimal_test_config();
+
+        let outcome = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+
+        assert_eq!(outcome, StreamingKeyOutcome::Interrupt);
+    }
+
+    #[test]
+    fn streaming_slash_commands_act_on_the_pending_followups() {
+        let mut app = TuiApp::default();
+        app.push_placeholder(TuiEntryKind::Assistant, "streaming");
+        let followups = FollowUpQueue::default();
+        let steering = SteeringMailbox::default();
+        let config = minimal_test_config();
+        followups.push("first follow-up".to_string());
+
+        let outcome = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert_eq!(outcome, StreamingKeyOutcome::Changed);
+
+        app.set_input("/queue");
+        let outcome = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert_eq!(outcome, StreamingKeyOutcome::Changed);
+        assert!(app
+            .entries
+            .iter()
+            .any(|entry| entry.text.contains("1. first follow-up")));
+
+        app.set_input("/queue-clear");
+        handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert_eq!(followups.pending(), 0);
+
+        app.set_input("/model");
+        let outcome = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert_eq!(outcome, StreamingKeyOutcome::Changed);
+        assert!(app.entries.iter().any(|entry| entry
+            .text
+            .contains("/model is not available while a turn is running")));
+
+        app.set_input("/interrupt");
+        let outcome = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert_eq!(outcome, StreamingKeyOutcome::Interrupt);
+
+        app.set_input("/quit");
+        let outcome = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert_eq!(outcome, StreamingKeyOutcome::Quit);
+    }
+
+    #[test]
+    fn activity_status_shows_phase_and_pending_followups() {
+        let started = Instant::now();
+        let waiting = activity_status(started, &Activity::Waiting, 0);
+        assert!(waiting.contains("waiting"));
+        assert!(waiting.contains("esc interrupt"));
+        assert!(!waiting.contains("queued"));
+
+        let tool = activity_status(started, &Activity::Tool("bash".to_string()), 2);
+        assert!(tool.contains("running bash"));
+        assert!(tool.contains("+2 queued"));
     }
 
     #[test]
