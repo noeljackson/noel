@@ -159,6 +159,7 @@ pub struct Settings {
     #[serde(default)]
     pub enabled_models: Option<Vec<String>>,
     pub theme: Option<String>,
+    pub accent_color: Option<String>,
     #[serde(default)]
     pub quiet_startup: Option<bool>,
     #[serde(default)]
@@ -223,6 +224,7 @@ impl Settings {
             enabled_tools: overrides.enabled_tools.or(self.enabled_tools),
             enabled_models: overrides.enabled_models.or(self.enabled_models),
             theme: overrides.theme.or(self.theme),
+            accent_color: overrides.accent_color.or(self.accent_color),
             quiet_startup: overrides.quiet_startup.or(self.quiet_startup),
             session_dir: overrides.session_dir.or(self.session_dir),
             packages: if overrides.packages.is_empty() {
@@ -3374,6 +3376,19 @@ mod tests {
 
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn theme_and_accent_settings_merge_independently() {
+        let global: Settings =
+            serde_json::from_str(r#"{"theme":"dark","accentColor":"cyan"}"#).unwrap();
+        let project: Settings = serde_json::from_str(r##"{"accentColor":"#123456"}"##).unwrap();
+        let settings = global.merge(project);
+        assert_eq!(settings.theme.as_deref(), Some("dark"));
+        assert_eq!(settings.accent_color.as_deref(), Some("#123456"));
+        let settings = settings.merge(serde_json::from_str(r#"{"theme":"kimi"}"#).unwrap());
+        assert_eq!(settings.theme.as_deref(), Some("kimi"));
+        assert_eq!(settings.accent_color.as_deref(), Some("#123456"));
     }
 
     #[test]

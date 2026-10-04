@@ -1,3 +1,6 @@
+mod theme;
+pub use theme::{parse_theme_color, TerminalTheme, ThemePalette, BUILTIN_THEMES};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,19 +42,6 @@ impl KeybindingMap {
         self.keys_for(action)
             .map(|keys| keys.iter().any(|candidate| candidate == key))
             .unwrap_or(false)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalTheme {
-    pub name: String,
-}
-
-impl Default for TerminalTheme {
-    fn default() -> Self {
-        Self {
-            name: "default".to_string(),
-        }
     }
 }
 
@@ -178,7 +168,11 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "/theme <name>",
-        description: "switch theme",
+        description: "switch and save theme",
+    },
+    CommandHelp {
+        command: "/accent <color|auto>",
+        description: "override or restore theme accent",
     },
     CommandHelp {
         command: "/models",
@@ -620,6 +614,14 @@ pub fn default_keybindings() -> KeybindingMap {
                 keys: vec!["enter".to_string()],
             },
             Keybinding {
+                action: "newline".to_string(),
+                keys: vec!["shift+enter".to_string(), "ctrl+j".to_string()],
+            },
+            Keybinding {
+                action: "editor".to_string(),
+                keys: vec!["ctrl+g".to_string()],
+            },
+            Keybinding {
                 action: "cancel".to_string(),
                 keys: vec!["escape".to_string()],
             },
@@ -692,6 +694,10 @@ mod tests {
         assert!(bindings.matches("cursor-right", "right"));
         assert!(bindings.matches("interrupt", "ctrl+c"));
         assert!(bindings.matches("interrupt", "ctrl+d"));
+        assert!(bindings.matches("newline", "shift+enter"));
+        assert!(bindings.matches("newline", "ctrl+j"));
+        assert!(bindings.matches("editor", "ctrl+g"));
+        assert!(bindings.matches("steer", "ctrl+s"));
         if cfg!(target_os = "macos") {
             assert!(bindings.matches("line-start", "super+left"));
             assert!(bindings.matches("line-end", "super+right"));

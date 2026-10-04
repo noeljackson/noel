@@ -3261,7 +3261,7 @@ impl TuiApp {
         self.reset_history_navigation();
     }
 
-    /// Double-press gate for quit keys: the first press clears any draft and
+    /// Double-press gate for quit keys on an empty input: the first press
     /// arms a confirmation window; a second press inside the window quits.
     fn quit_requested(&mut self, now: Instant) -> bool {
         let armed = self
@@ -3272,9 +3272,6 @@ impl TuiApp {
             return true;
         }
         self.quit_armed_since = Some(now);
-        if !self.input.is_empty() {
-            self.clear_input();
-        }
         false
     }
 
@@ -4216,6 +4213,16 @@ async fn handle_tui_key(
     if let Some(name) = key_event_name(&key) {
         let bindings = keybinding_map(config);
         if bindings.matches("interrupt", &name) {
+            if !app.input.is_empty() {
+                // With a draft present, ctrl+c clears it and ctrl+d does
+                // nothing; neither arms quit.
+                if name != "ctrl+d" {
+                    app.clear_input();
+                }
+                app.quit_armed_since = None;
+                app.refresh_chrome(config, runtime);
+                return Ok(false);
+            }
             if app.quit_requested(Instant::now()) {
                 return Ok(true);
             }
@@ -4225,6 +4232,16 @@ async fn handle_tui_key(
         app.quit_armed_since = None;
         if bindings.matches("todos", &name) {
             app.todos_expanded = !app.todos_expanded;
+            app.refresh_chrome(config, runtime);
+            return Ok(false);
+        }
+        if bindings.matches("newline", &name) {
+            app.insert_input_newline();
+            app.refresh_chrome(config, runtime);
+            return Ok(false);
+        }
+        if bindings.matches("editor", &name) {
+            edit_input_in_external_editor(app);
             app.refresh_chrome(config, runtime);
             return Ok(false);
         }
@@ -4266,9 +4283,6 @@ async fn handle_tui_key(
         KeyCode::Down if app.multiline.is_none() => {
             app.history_next();
         }
-        KeyCode::Enter if is_shift_enter(&key) => {
-            app.insert_input_newline();
-        }
         KeyCode::Enter => {
             return submit_tui_input(surface, app, runtime, config, offline).await;
         }
@@ -4279,6 +4293,18 @@ async fn handle_tui_key(
     }
     app.refresh_chrome(config, runtime);
     Ok(false)
+}
+
+/// Opens the external editor seeded with the current draft and replaces the
+/// input with the edited content (ctrl+g).
+fn edit_input_in_external_editor(app: &mut TuiApp) {
+    match read_external_editor_prompt(&app.input) {
+        Ok(content) => {
+            app.clear_input();
+            app.insert_input_str(content.trim_end_matches('\n'));
+        }
+        Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+    }
 }
 
 /// Submits the current input as a prompt. Shared by Enter and the steer
@@ -4407,9 +4433,6 @@ fn handle_streaming_tui_key(
     if let Some(name) = key_event_name(&key) {
         let bindings = keybinding_map(config);
         if bindings.matches("interrupt", &name) {
-            if app.quit_requested(Instant::now()) {
-                return StreamingKeyOutcome::Quit;
-            }
             return StreamingKeyOutcome::Interrupt;
         }
         if bindings.matches("steer", &name) {
@@ -4423,6 +4446,10 @@ fn handle_streaming_tui_key(
         }
         if bindings.matches("todos", &name) {
             app.todos_expanded = !app.todos_expanded;
+            return StreamingKeyOutcome::Changed;
+        }
+        if bindings.matches("newline", &name) {
+            app.insert_input_newline();
             return StreamingKeyOutcome::Changed;
         }
         if bindings.matches("line-start", &name) {
@@ -4446,10 +4473,6 @@ fn handle_streaming_tui_key(
         KeyCode::Esc => StreamingKeyOutcome::Interrupt,
         KeyCode::Backspace => {
             app.pop_input_char();
-            StreamingKeyOutcome::Changed
-        }
-        KeyCode::Enter if is_shift_enter(&key) => {
-            app.insert_input_newline();
             StreamingKeyOutcome::Changed
         }
         KeyCode::Enter => {
@@ -4513,7 +4536,7 @@ fn handle_streaming_command(
             StreamingKeyOutcome::Changed
         }
         "interrupt" => StreamingKeyOutcome::Interrupt,
-        "quit" => StreamingKeyOutcome::Quit,
+        "quit" | "exit" | "q" => StreamingKeyOutcome::Quit,
         _ => {
             app.push(
                 TuiEntryKind::System,
@@ -4592,7 +4615,7 @@ fn activity_status(started: Instant, activity: &Activity, pending_followups: usi
         String::new()
     };
     format!(
-        "{frame} {phase} · {}s{queued} · esc interrupt",
+        "{frame} {phase} · {}s{queued} · esc to interrupt",
         elapsed.as_secs()
     )
 }
@@ -4622,10 +4645,6 @@ fn apply_turn_event(
         }
         _ => {}
     }
-}
-
-fn is_shift_enter(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Enter) && key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 fn handle_tui_selector_key(
@@ -5080,7 +5099,7 @@ async fn handle_tui_submission(
         lines.push(line);
         return Ok(false);
     }
-    if line == "/quit" {
+    if matches!(line.as_str(), "/quit" | "/exit" | "/q") {
         for diagnostic in
             notify_extension_lifecycle(&config.extensions, "shutdown", &runtime.session().cwd)
         {
@@ -8426,30 +8445,23 @@ mod tests {
     }
 
     #[test]
-    fn streaming_ctrl_c_interrupts_then_second_press_quits() {
+    fn streaming_ctrl_c_interrupts_without_arming_quit() {
         let mut app = TuiApp::default();
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
         let followups = FollowUpQueue::default();
         let steering = SteeringMailbox::default();
         let config = minimal_test_config();
 
-        let first = handle_streaming_tui_key(
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            &mut app,
-            &followups,
-            &steering,
-            &config,
-        );
-        assert_eq!(first, StreamingKeyOutcome::Interrupt);
-
-        let second = handle_streaming_tui_key(
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            &mut app,
-            &followups,
-            &steering,
-            &config,
-        );
-        assert_eq!(second, StreamingKeyOutcome::Quit);
+        for _ in 0..2 {
+            let outcome = handle_streaming_tui_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut app,
+                &followups,
+                &steering,
+                &config,
+            );
+            assert_eq!(outcome, StreamingKeyOutcome::Interrupt);
+        }
     }
 
     #[test]
@@ -8624,7 +8636,7 @@ mod tests {
         let started = Instant::now();
         let waiting = activity_status(started, &Activity::Waiting, 0);
         assert!(waiting.contains("waiting"));
-        assert!(waiting.contains("esc interrupt"));
+        assert!(waiting.contains("esc to interrupt"));
         assert!(!waiting.contains("queued"));
 
         let tool = activity_status(started, &Activity::Tool("bash".to_string()), 2);
@@ -8722,14 +8734,10 @@ mod tests {
         app.insert_input_str("second");
 
         assert_eq!(app.input, "first\nsecond");
-        assert!(is_shift_enter(&KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::SHIFT
-        )));
-        assert!(!is_shift_enter(&KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE
-        )));
+        let bindings = keybinding_map(&minimal_test_config());
+        assert!(bindings.matches("newline", "shift+enter"));
+        assert!(bindings.matches("newline", "ctrl+j"));
+        assert!(!bindings.matches("newline", "enter"));
         app.history_next();
         assert_eq!(app.input, "first\nsecond");
     }
@@ -8977,12 +8985,19 @@ mod tests {
     #[test]
     fn quit_requires_double_press_within_window() {
         let mut app = TuiApp::default();
-        app.set_input("draft");
         let now = Instant::now();
 
         assert!(!app.quit_requested(now));
-        assert!(app.input.is_empty(), "first press clears the draft");
         assert!(app.quit_requested(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn quit_arm_does_not_touch_the_draft() {
+        let mut app = TuiApp::default();
+        app.set_input("draft");
+
+        assert!(!app.quit_requested(Instant::now()));
+        assert_eq!(app.input, "draft");
     }
 
     #[test]

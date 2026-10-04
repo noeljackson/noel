@@ -625,7 +625,7 @@ for _ in $(seq 1 60); do
   tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-midqueue-pane.txt"
   if grep -Fq "1. typed follow-up" "${work_dir}/stream-midqueue-pane.txt" \
     && grep -Fq "+1 queued" "${work_dir}/stream-midqueue-pane.txt" \
-    && grep -Fq "esc interrupt" "${work_dir}/stream-midqueue-pane.txt"; then
+    && grep -Fq "esc to interrupt" "${work_dir}/stream-midqueue-pane.txt"; then
     stream_mid_queue=1
     break
   fi

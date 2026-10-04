@@ -41,6 +41,84 @@ fn print_mode_uses_faux_model_without_session() {
 }
 
 #[test]
+fn theme_flag_accepts_presets_paths_and_no_themes_fallback() {
+    let root = test_dir("pi-cli-theme-flags");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        root.join("custom.json"),
+        r##"{"base":"light","colors":{"accent":"#123456"}}"##,
+    )
+    .unwrap();
+    for theme in ["system", "light", "dark", "kimi", "default", "custom.json"] {
+        let output = pi_command()
+            .current_dir(&root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .args([
+                "--offline",
+                "--no-session",
+                "-p",
+                "--model",
+                "faux/echo",
+                "--theme",
+                theme,
+                "hello",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "[faux/echo] hello\n"
+        );
+        assert!(!agent.join("settings.json").exists());
+    }
+    let output = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args([
+            "--offline",
+            "--no-session",
+            "-p",
+            "--model",
+            "faux/echo",
+            "--theme",
+            "missing",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("theme not found: missing"));
+    let output = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args([
+            "--offline",
+            "--no-session",
+            "-p",
+            "--model",
+            "faux/echo",
+            "--theme",
+            "missing",
+            "--no-themes",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn json_mode_prints_structured_response() {
     let output = pi_command()
         .args([

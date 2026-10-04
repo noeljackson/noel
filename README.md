@@ -219,6 +219,57 @@ Environment overrides:
 }
 ```
 
+### Terminal themes
+
+The default `system` theme inherits your terminal's foreground, background, and
+ANSI palette, including on light terminals. Secondary text uses terminal dim
+intensity rather than a fixed gray. OS accent colors are not detected.
+
+Use `/themes` to list presets and resources, `/theme` to open the selector, or
+`/theme system`, `/theme light`, `/theme dark`, or `/theme kimi` to switch
+immediately. `kimi` is a Kimi-inspired light preset with neutral conversation
+text and restrained blue accents, not an exact reproduction. `default` is an
+alias for `system`.
+
+`/accent magenta` or `/accent #2563EB` overrides the accent; `/accent auto`
+restores the preset's accent. Colors accept ANSI names (such as `cyan` or
+`light-blue`), palette indices `0`–`255`, `#RRGGBB`, and `default`/`reset` for the
+terminal default. Theme and accent commands save to user `settings.json`,
+preserving unrelated keys:
+
+```json
+{
+  "theme": "system",
+  "accentColor": "cyan"
+}
+```
+
+Set `accentColor` to `null` or omit it to use the theme accent. Project settings
+still take precedence on startup and `/reload`. `--theme <name|path>` selects a
+preset, loaded resource, or JSON file for this invocation; `--no-themes` starts
+with native colors and no accent override.
+
+Custom resources in `themes/` or trusted `.pi/themes/` use their filename stem
+as the theme name. They can extend a built-in preset and override any of
+`foreground`, `background`, `surface`, `muted`, `border`, `accent`, `success`,
+`warning`, and `error`:
+
+```json
+{
+  "base": "system",
+  "colors": {
+    "accent": "magenta",
+    "surface": "default"
+  }
+}
+```
+
+Name-only legacy files still work: a built-in filename uses its preset;
+other names inherit `system`. Invalid selections are rejected without replacing
+saved settings. Invalid configured themes produce a diagnostic and fall back
+to `system`. `/reload` picks up resource and settings edits without clearing
+conversation, session identity, tool history, queued messages, or input.
+
 Provider API keys can be stored in `auth.json`, keyed by provider and named
 account:
 
@@ -466,6 +517,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/prompt <name> [input]`
 - `/themes`
 - `/theme <name>`
+- `/accent <color|auto>`
 - `/queue [prompt]`
 - `/queue-clear`
 - `/interrupt`
@@ -514,7 +566,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 
 The model can track multi-step work with the built-in `todo` tool: it maintains a checklist (`pending`/`in_progress`/`completed`) that is journaled with the session and survives resume. The list renders as a widget above the prompt (`ctrl+t` expands it); `/todos` reprints it in the transcript. Files the model changes with the `edit`/`write` tools are tracked per session; `/diff` toggles a right-side panel listing them with git change stats, and Enter on a file shows its uncommitted diff (new files show their content).
 
-Interactive assistant responses stream text as provider deltas arrive. While a response streams, Enter queues the draft as a follow-up and ctrl+s steers the running turn: the draft joins the conversation before the next provider request (`steeringMode` selects `one-at-a-time` or `all` per round). `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history. `/editor` uses `PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`. The TUI runs in an inline terminal viewport: finalized transcript rows are written to normal terminal scrollback, so native mouse selection and mouse-wheel scrollback remain terminal-owned while Up/Down navigate prompt history. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
+Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, esc or ctrl+c interrupts the turn, Enter queues the draft as a follow-up, and ctrl+s steers the running turn: the draft joins the conversation before the next provider request (`steeringMode` selects `one-at-a-time` or `all` per round). Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history. The TUI runs in an inline terminal viewport: finalized transcript rows are written to normal terminal scrollback, so native mouse selection and mouse-wheel scrollback remain terminal-owned while Up/Down navigate prompt history. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 
 ## RPC Methods
 
