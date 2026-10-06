@@ -151,6 +151,7 @@ pub async fn run_turn(
         let events = complete_with_retry(
             provider,
             ProviderRequest {
+                max_output_tokens: None,
                 system_prompt: config.system_prompt.clone(),
                 messages: state.messages.clone(),
                 tools: config.tools.clone(),

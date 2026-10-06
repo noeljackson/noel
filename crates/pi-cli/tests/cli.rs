@@ -909,3 +909,172 @@ fn unique_suffix() -> u128 {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default()
 }
+
+#[test]
+fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_original_transcript() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    let root = test_dir("pi-cli-semantic-rpc");
+    let agent = root.join("agent");
+    let sessions = root.join("sessions");
+    fs::create_dir_all(&agent).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let captured = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        for _ in 0..4 {
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "local provider timed out"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("local server: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let body_start = loop {
+                let mut chunk = [0u8; 4096];
+                let n = socket.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..body_start]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while bytes.len() < body_start + length {
+                let mut chunk = [0u8; 4096];
+                let n = socket.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&bytes[body_start..body_start + length]).unwrap();
+            let compact = request["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("Create a concise continuation checkpoint"));
+            captured.lock().unwrap().push(request);
+            let answer = if compact {
+                "Decisions: SQLite; use transactions. Next steps: finish migration."
+            } else {
+                "ack"
+            };
+            let body = serde_json::json!({"choices":[{"message":{"content":answer},"finish_reason":"stop"}],"usage":{"prompt_tokens":30,"completion_tokens":10}}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    fs::write(agent.join("settings.json"), r#"{"modelRefresh":{"enabled":false},"retry":{"enabled":false},"compaction":{"enabled":false,"keepRecentTokens":0}}"#).unwrap();
+    fs::write(agent.join("models.json"), serde_json::json!([{
+        "provider":"local","id":"test","api":"openai-completions","baseUrl":url,"contextWindow":8192
+    }]).to_string()).unwrap();
+    fs::write(
+        agent.join("auth.json"),
+        r#"{"local":{"type":"api_key","key":"fake-local-key"}}"#,
+    )
+    .unwrap();
+    let mut command = pi_command();
+    command
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args([
+            "--mode",
+            "rpc",
+            "--model",
+            "local/test",
+            "--no-context-files",
+            "--no-tools",
+            "--session-dir",
+        ])
+        .arg(&sessions)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for (id, prompt) in [
+        (
+            1,
+            format!("use SQLite transactions {}", "reference ".repeat(300)),
+        ),
+        (2, "current migration".into()),
+    ] {
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({"id":id,"method":"prompt","params":{"prompt":prompt}})
+        )
+        .unwrap();
+    }
+    writeln!(stdin, "{}", serde_json::json!({"id":3,"method":"compact","params":{"focus":"preserve database decisions"}})).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"id":4,"method":"prompt","params":{"prompt":"continue"}})
+    )
+    .unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    let responses = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 4);
+    assert_eq!(responses[2]["result"]["omitted_messages"], 2);
+    assert!(responses[2]["result"]["summary"]
+        .as_str()
+        .unwrap()
+        .contains("SQLite"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].get("tools").is_none());
+    assert_eq!(requests[2]["max_tokens"], 2048);
+    assert!(requests[2]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("preserve database decisions"));
+    assert!(requests[3]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Previous conversation checkpoint"));
+    let journal_path = fs::read_dir(&sessions)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let journal = fs::read_to_string(&journal_path).unwrap();
+    assert!(journal.contains("use SQLite transactions reference"));
+    assert!(journal.contains("compaction_checkpoint"));
+    let (_, loaded) = pi_core::SessionStore::open(journal_path).unwrap();
+    assert_eq!(loaded.compactions.len(), 1);
+    assert_eq!(loaded.usage.requests, 4);
+    fs::remove_dir_all(root).unwrap();
+}

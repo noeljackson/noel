@@ -168,6 +168,8 @@ pub enum ChatRole {
 
 #[derive(Debug, Clone)]
 pub struct ProviderRequest {
+    /// Optional request-local output budget (includes provider reasoning).
+    pub max_output_tokens: Option<u64>,
     pub system_prompt: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
@@ -540,10 +542,12 @@ impl Provider for OpenAiProvider {
         let stream =
             stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
         if stream.saw_data {
+            let reason = parser
+                .stop_reason
+                .clone()
+                .unwrap_or_else(|| "stop".to_string());
             parser.finish(on_event)?;
-            on_event(StreamEvent::Stop {
-                reason: "stop".to_string(),
-            })?;
+            on_event(StreamEvent::Stop { reason })?;
             return Ok(());
         }
         let response = serde_json::from_str::<Value>(&stream.body)
@@ -663,6 +667,9 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
     if !request.tools.is_empty() {
         body["tools"] = json!(openai_chat_tools(&request.tools));
         body["tool_choice"] = json!("auto");
+    }
+    if config.model.provider == "openai" {
+        body["stream_options"] = json!({ "include_usage": true });
     }
     if config.model.provider == "openrouter" {
         body["stream_options"] = json!({ "include_usage": true });
@@ -814,6 +821,9 @@ fn openrouter_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
 }
 
 fn provider_max_tokens(config: &ProviderConfig, request: &ProviderRequest) -> Option<u64> {
+    if let Some(limit) = request.max_output_tokens {
+        return Some(limit.max(1));
+    }
     match (config.model.provider.as_str(), config.model.id.as_str()) {
         ("openai", "gpt-5.4") | ("github-copilot", "gpt-5.4") => Some(128_000),
         ("google", "gemini-2.5-pro") => Some(65_536),
@@ -1132,7 +1142,7 @@ impl Provider for AnthropicProvider {
             stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
         if stream.saw_data {
             on_event(StreamEvent::Stop {
-                reason: "stop".to_string(),
+                reason: parser.stop_reason.unwrap_or_else(|| "stop".to_string()),
             })?;
             return Ok(());
         }
@@ -1175,7 +1185,7 @@ fn anthropic_messages_url(config: &ProviderConfig) -> Result<String, ProviderErr
 fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     let mut body = json!({
         "model": config.model.id,
-        "max_tokens": 4096,
+        "max_tokens": request.max_output_tokens.unwrap_or(4096).max(1),
         "stream": true,
         "system": anthropic_system(config, request),
         "messages": anthropic_messages_with_cache_control(&request.messages, true),
@@ -1184,6 +1194,19 @@ fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
         body["tools"] = json!(anthropic_tools(&request.tools));
     }
     apply_anthropic_thinking(&mut body, config);
+    if request.max_output_tokens.is_some()
+        && body.pointer("/thinking/type").and_then(Value::as_str) == Some("enabled")
+    {
+        let limit = request.max_output_tokens.unwrap_or(4096);
+        if limit <= 1024 {
+            body["thinking"] = json!({"type":"disabled"});
+        } else if let Some(budget) = body
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64)
+        {
+            body["thinking"]["budget_tokens"] = json!(budget.min((limit / 2).max(1024)));
+        }
+    }
     body
 }
 
@@ -1681,10 +1704,12 @@ impl Provider for MistralProvider {
         let stream =
             stream_sse_response(response, |data| parser.parse_data(data, on_event)).await?;
         if stream.saw_data {
+            let reason = parser
+                .stop_reason
+                .clone()
+                .unwrap_or_else(|| "stop".to_string());
             parser.finish(on_event)?;
-            on_event(StreamEvent::Stop {
-                reason: "stop".to_string(),
-            })?;
+            on_event(StreamEvent::Stop { reason })?;
             return Ok(());
         }
         let response = serde_json::from_str::<Value>(&stream.body)
@@ -1951,6 +1976,50 @@ impl BedrockProvider {
     }
 }
 
+/// Decode provider-reported request totals; streaming events are cumulative
+/// snapshots, not deltas. Never invent estimates when usage is absent.
+fn token_usage(usage: &Value) -> Option<StreamEvent> {
+    let input = [
+        "input_tokens",
+        "prompt_tokens",
+        "promptTokenCount",
+        "inputTokens",
+    ]
+    .iter()
+    .find_map(|key| usage.get(key).and_then(Value::as_u64));
+    let output = [
+        "output_tokens",
+        "completion_tokens",
+        "candidatesTokenCount",
+        "outputTokens",
+    ]
+    .iter()
+    .find_map(|key| usage.get(key).and_then(Value::as_u64));
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    let cached = ["cache_read_input_tokens", "cache_creation_input_tokens"]
+        .iter()
+        .filter_map(|key| usage.get(key).and_then(Value::as_u64))
+        .fold(0u64, u64::saturating_add);
+    Some(StreamEvent::Usage {
+        input_tokens: input.unwrap_or_default().saturating_add(cached),
+        output_tokens: output.unwrap_or_default().saturating_add(
+            usage
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        ),
+    })
+}
+
+fn response_usage(response: &Value) -> Option<StreamEvent> {
+    response
+        .get("usage")
+        .or_else(|| response.get("usageMetadata"))
+        .and_then(token_usage)
+}
+
 fn parse_google_response(response: Value) -> Result<Vec<StreamEvent>, ProviderError> {
     let mut events = parse_google_response_events(&response)
         .ok_or_else(|| ProviderError::InvalidResponse(response.to_string()))?;
@@ -1965,10 +2034,19 @@ fn parse_google_response(response: Value) -> Result<Vec<StreamEvent>, ProviderEr
 }
 
 fn parse_google_response_events(response: &Value) -> Option<Vec<StreamEvent>> {
-    let parts = response
+    let mut events = response
         .pointer("/candidates/0/content/parts")
-        .and_then(Value::as_array)?;
-    google_part_events(parts)
+        .and_then(Value::as_array)
+        .and_then(|parts| google_part_events(parts))
+        .unwrap_or_default();
+    if let Some(usage) = response_usage(response) {
+        events.push(usage);
+    }
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
 }
 
 #[cfg(test)]
@@ -1992,20 +2070,12 @@ fn parse_google_sse_text(body: &str) -> Option<String> {
 fn parse_google_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
     let mut events = Vec::new();
     for line in body.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        let Some(parts) = event
-            .pointer("/candidates/0/content/parts")
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        if let Some(mut part_events) = google_part_events(parts) {
-            events.append(&mut part_events);
+        if let Some(data) = line.strip_prefix("data: ") {
+            if let Ok(response) = serde_json::from_str::<Value>(data) {
+                if let Some(mut next) = parse_google_response_events(&response) {
+                    events.append(&mut next);
+                }
+            }
         }
     }
     if events.is_empty() {
@@ -2019,17 +2089,19 @@ fn parse_google_sse_data(
     data: &str,
     on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
 ) -> Result<(), ProviderError> {
-    let Ok(event) = serde_json::from_str::<Value>(data) else {
-        return Ok(());
-    };
-    let Some(parts) = event
-        .pointer("/candidates/0/content/parts")
-        .and_then(Value::as_array)
-    else {
-        return Ok(());
-    };
-    if let Some(events) = google_part_events(parts) {
-        emit_events(events, on_event)?;
+    if let Ok(response) = serde_json::from_str::<Value>(data) {
+        if response
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+            == Some("MAX_TOKENS")
+        {
+            on_event(StreamEvent::Stop {
+                reason: "max_tokens".into(),
+            })?;
+        }
+        if let Some(events) = parse_google_response_events(&response) {
+            emit_events(events, on_event)?;
+        }
     }
     Ok(())
 }
@@ -2118,6 +2190,9 @@ fn parse_bedrock_response_events(response: &Value) -> Option<Vec<StreamEvent>> {
             });
         }
     }
+    if let Some(usage) = response_usage(response) {
+        events.push(usage);
+    }
     if events.is_empty() {
         None
     } else {
@@ -2166,6 +2241,9 @@ fn parse_anthropic_response_events(response: &Value) -> Option<Vec<StreamEvent>>
             _ => {}
         }
     }
+    if let Some(usage) = response_usage(response) {
+        events.push(usage);
+    }
     if events.is_empty() {
         None
     } else {
@@ -2182,7 +2260,10 @@ struct PendingAnthropicToolCall {
 
 #[derive(Default)]
 struct AnthropicSseParser {
+    input_tokens: u64,
+    output_tokens: u64,
     pending_tool_calls: BTreeMap<u64, PendingAnthropicToolCall>,
+    stop_reason: Option<String>,
 }
 
 impl AnthropicSseParser {
@@ -2194,6 +2275,30 @@ impl AnthropicSseParser {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
+        let usage = event
+            .pointer("/message/usage")
+            .or_else(|| event.get("usage"));
+        if let Some(usage) = usage {
+            if let Some(StreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+            }) = token_usage(usage)
+            {
+                if usage.get("input_tokens").is_some() {
+                    self.input_tokens = input_tokens;
+                }
+                if usage.get("output_tokens").is_some() {
+                    self.output_tokens = output_tokens;
+                }
+                on_event(StreamEvent::Usage {
+                    input_tokens: self.input_tokens,
+                    output_tokens: self.output_tokens,
+                })?;
+            }
+        }
+        if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
+            self.stop_reason = Some(reason.into());
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("content_block_start") => {
                 let Some(index) = event.get("index").and_then(Value::as_u64) else {
@@ -2295,112 +2400,17 @@ impl AnthropicSseParser {
 
 fn parse_anthropic_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
     let mut events = Vec::new();
-    let mut pending_tool_calls: BTreeMap<u64, PendingAnthropicToolCall> = BTreeMap::new();
-
+    let mut parser = AnthropicSseParser::default();
     for line in body.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        match event.get("type").and_then(Value::as_str) {
-            Some("content_block_start") => {
-                let Some(index) = event.get("index").and_then(Value::as_u64) else {
-                    continue;
-                };
-                let Some(block) = event.get("content_block") else {
-                    continue;
-                };
-                if block.get("type").and_then(Value::as_str) == Some("thinking") {
-                    if let Some(text) = block
-                        .get("thinking")
-                        .and_then(Value::as_str)
-                        .filter(|text| !text.is_empty())
-                    {
-                        events.push(StreamEvent::Thinking(text.to_string()));
-                    }
-                }
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    let Some(id) = block.get("id").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let Some(name) = block.get("name").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let arguments = block
-                        .get("input")
-                        .filter(|input| !input.is_null())
-                        .filter(|input| input.as_object().is_none_or(|object| !object.is_empty()))
-                        .map(ToString::to_string)
-                        .unwrap_or_default();
-                    pending_tool_calls.insert(
-                        index,
-                        PendingAnthropicToolCall {
-                            id: id.to_string(),
-                            name: name.to_string(),
-                            arguments,
-                        },
-                    );
-                }
-            }
-            Some("content_block_delta") => {
-                let Some(delta) = event.get("delta") else {
-                    continue;
-                };
-                match delta.get("type").and_then(Value::as_str) {
-                    Some("text_delta") => {
-                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                            if !text.is_empty() {
-                                events.push(StreamEvent::Text(text.to_string()));
-                            }
-                        }
-                    }
-                    Some("thinking_delta") => {
-                        if let Some(text) = delta
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .filter(|text| !text.is_empty())
-                        {
-                            events.push(StreamEvent::Thinking(text.to_string()));
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        let Some(index) = event.get("index").and_then(Value::as_u64) else {
-                            continue;
-                        };
-                        let Some(partial_json) = delta.get("partial_json").and_then(Value::as_str)
-                        else {
-                            continue;
-                        };
-                        if let Some(tool_call) = pending_tool_calls.get_mut(&index) {
-                            tool_call.arguments.push_str(partial_json);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some("content_block_stop") => {
-                let Some(index) = event.get("index").and_then(Value::as_u64) else {
-                    continue;
-                };
-                let Some(tool_call) = pending_tool_calls.remove(&index) else {
-                    continue;
-                };
-                events.push(StreamEvent::ToolCall {
-                    id: tool_call.id,
-                    name: tool_call.name,
-                    arguments: if tool_call.arguments.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        tool_call.arguments
-                    },
-                });
-            }
-            _ => {}
+        if let Some(data) = line.strip_prefix("data: ") {
+            parser
+                .parse_data(data, &mut |event| {
+                    events.push(event);
+                    Ok(())
+                })
+                .ok()?;
         }
     }
-
     if events.is_empty() {
         None
     } else {
@@ -3076,6 +3086,12 @@ fn parse_openai_responses_text(response: &Value) -> Option<String> {
 }
 
 fn parse_openai_responses_events(response: &Value) -> Option<Vec<StreamEvent>> {
+    if matches!(
+        response.get("status").and_then(Value::as_str),
+        Some("incomplete" | "failed" | "cancelled")
+    ) {
+        return None;
+    }
     let mut events = Vec::new();
     let has_output_text = response
         .get("output_text")
@@ -3095,6 +3111,9 @@ fn parse_openai_responses_events(response: &Value) -> Option<Vec<StreamEvent>> {
                 events.push(tool_call);
             }
         }
+    }
+    if let Some(usage) = response_usage(response) {
+        events.push(usage);
     }
     if events.is_empty() {
         None
@@ -3117,6 +3136,19 @@ impl OpenAiResponsesSseParser {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.incomplete" | "response.failed" | "error")
+        ) {
+            return Err(ProviderError::InvalidResponse(format!(
+                "incomplete provider response: {event}"
+            )));
+        }
+        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+            if let Some(usage) = event.get("response").and_then(response_usage) {
+                on_event(usage)?;
+            }
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("response.reasoning_summary_text.delta")
             | Some("response.reasoning_text.delta") => {
@@ -3166,6 +3198,11 @@ fn parse_openai_responses_sse_events(body: &str) -> Option<Vec<StreamEvent>> {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             continue;
         };
+        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+            if let Some(usage) = event.get("response").and_then(response_usage) {
+                events.push(usage);
+            }
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("response.reasoning_summary_text.delta")
             | Some("response.reasoning_text.delta") => {
@@ -3288,6 +3325,7 @@ fn parse_openai_chat_completions_sse_text(body: &str) -> Option<String> {
 #[derive(Default)]
 struct OpenAiChatCompletionsSseParser {
     tool_calls: Vec<(String, String, String)>,
+    stop_reason: Option<String>,
 }
 
 impl OpenAiChatCompletionsSseParser {
@@ -3299,6 +3337,15 @@ impl OpenAiChatCompletionsSseParser {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
+        if let Some(reason) = event
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.stop_reason = Some(reason.into());
+        }
+        if let Some(usage) = response_usage(&event) {
+            on_event(usage)?;
+        }
         let Some(delta) = event.pointer("/choices/0/delta") else {
             return Ok(());
         };
@@ -3360,6 +3407,9 @@ fn parse_openai_chat_completions_sse_events(body: &str) -> Option<Vec<StreamEven
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             continue;
         };
+        if let Some(usage) = response_usage(&event) {
+            events.push(usage);
+        }
         let Some(delta) = event.pointer("/choices/0/delta") else {
             continue;
         };
@@ -3428,6 +3478,9 @@ fn parse_openai_chat_completions_events(response: &Value) -> Option<Vec<StreamEv
                     .to_string(),
             });
         }
+    }
+    if let Some(usage) = response_usage(response) {
+        events.push(usage);
     }
     if events.is_empty() {
         None
@@ -3703,6 +3756,96 @@ fn role_name(role: &ChatRole) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_local_output_budget_overrides_provider_defaults_without_changing_regular_requests() {
+        let request = ProviderRequest {
+            max_output_tokens: Some(512),
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "openai".into(),
+                id: "gpt-5.4".into(),
+            },
+            api: ProviderApi::OpenAi,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        assert_eq!(
+            openai_chat_completions_body(&config, &request)["max_tokens"],
+            512
+        );
+        assert_eq!(
+            openai_responses_body(&config, &request)["max_output_tokens"],
+            512
+        );
+        assert_eq!(anthropic_body(&config, &request)["max_tokens"], 512);
+        assert_eq!(
+            google_body(&config, &request)["generationConfig"]["maxOutputTokens"],
+            512
+        );
+        assert_eq!(mistral_chat_body(&config, &request)["max_tokens"], 512);
+        assert_eq!(
+            bedrock_body(&config, &request)["inferenceConfig"]["maxTokens"],
+            512
+        );
+        let regular = ProviderRequest {
+            max_output_tokens: None,
+            ..request
+        };
+        assert_eq!(provider_max_tokens(&config, &regular), Some(128_000));
+    }
+
+    #[test]
+    fn streaming_parsers_preserve_truncation_instead_of_accepting_partial_checkpoints() {
+        let mut chat = OpenAiChatCompletionsSseParser::default();
+        chat.parse_data(
+            r#"{"choices":[{"finish_reason":"length","delta":{}}]}"#,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(chat.stop_reason.as_deref(), Some("length"));
+        let mut anthropic = AnthropicSseParser::default();
+        anthropic
+            .parse_data(
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(anthropic.stop_reason.as_deref(), Some("max_tokens"));
+        let mut google = Vec::new();
+        parse_google_sse_data(
+            r#"{"candidates":[{"finishReason":"MAX_TOKENS"}]}"#,
+            &mut |event| {
+                google.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            google,
+            [StreamEvent::Stop {
+                reason: "max_tokens".into()
+            }]
+        );
+        for status in ["incomplete", "failed", "cancelled"] {
+            assert!(parse_openai_responses_events(
+                &json!({"status":status,"output_text":"partial"})
+            )
+            .is_none());
+        }
+        for kind in ["response.incomplete", "response.failed", "error"] {
+            assert!(OpenAiResponsesSseParser::default()
+                .parse_data(&json!({"type":kind}).to_string(), &mut |_| Ok(()))
+                .is_err());
+        }
+    }
+
     #[tokio::test]
     async fn faux_provider_echoes_last_user_message() {
         let provider = create_provider(ProviderConfig {
@@ -3720,6 +3863,7 @@ mod tests {
 
         let events = provider
             .complete(ProviderRequest {
+                max_output_tokens: None,
                 system_prompt: None,
                 messages: vec![ChatMessage {
                     role: ChatRole::User,
@@ -3736,6 +3880,87 @@ mod tests {
 
         assert_eq!(events[0], StreamEvent::Text("[faux/echo] ".to_string()));
         assert_eq!(events[1], StreamEvent::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn usage_is_decoded_for_all_response_apis_and_streams() {
+        let expected = StreamEvent::Usage {
+            input_tokens: 12,
+            output_tokens: 5,
+        };
+        let responses = [
+            parse_openai_chat_completions_events(
+                &json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":12,"completion_tokens":5}}),
+            ),
+            parse_openai_responses_events(
+                &json!({"output_text":"ok","usage":{"input_tokens":12,"output_tokens":5}}),
+            ),
+            parse_anthropic_response_events(
+                &json!({"content":[],"usage":{"input_tokens":2,"cache_read_input_tokens":8,"cache_creation_input_tokens":2,"output_tokens":5}}),
+            ),
+            parse_google_response_events(
+                &json!({"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":3,"thoughtsTokenCount":2}}),
+            ),
+            parse_bedrock_response_events(
+                &json!({"output":{"message":{"content":[]}},"usage":{"inputTokens":12,"outputTokens":5}}),
+            ),
+        ];
+        for events in responses {
+            assert_eq!(events.unwrap().last(), Some(&expected));
+        }
+        assert!(response_usage(&json!({"usage": null})).is_none());
+        let chat = r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5}}"#;
+        let responses = r#"{"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":5}}}"#;
+        let google = r#"{"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5}}"#;
+        for (data, buffered) in [
+            (
+                chat,
+                parse_openai_chat_completions_sse_events(&format!("data: {chat}\n")),
+            ),
+            (
+                responses,
+                parse_openai_responses_sse_events(&format!("data: {responses}\n")),
+            ),
+            (
+                google,
+                parse_google_sse_events(&format!("data: {google}\n")),
+            ),
+        ] {
+            assert_eq!(buffered.unwrap(), std::slice::from_ref(&expected));
+            let mut events = Vec::new();
+            let mut callback = |event| {
+                events.push(event);
+                Ok(())
+            };
+            if data == chat {
+                OpenAiChatCompletionsSseParser::default()
+                    .parse_data(data, &mut callback)
+                    .unwrap();
+            } else if data == responses {
+                OpenAiResponsesSseParser::default()
+                    .parse_data(data, &mut callback)
+                    .unwrap();
+            } else {
+                parse_google_sse_data(data, &mut callback).unwrap();
+            }
+            assert_eq!(events, std::slice::from_ref(&expected));
+        }
+        let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":2,"cache_read_input_tokens":10,"output_tokens":1}}}"#;
+        let delta = r#"{"type":"message_delta","usage":{"output_tokens":5}}"#;
+        let body = format!("data: {start}\ndata: {delta}\n");
+        let buffered = parse_anthropic_sse_events(&body).unwrap();
+        assert_eq!(buffered.last(), Some(&expected));
+        let mut parser = AnthropicSseParser::default();
+        let mut events = Vec::new();
+        for data in [start, delta] {
+            parser
+                .parse_data(data, &mut |event| {
+                    events.push(event);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(events, buffered);
     }
 
     #[test]
@@ -4005,6 +4230,7 @@ mod tests {
     #[test]
     fn provider_message_converters_include_image_parts() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -4052,6 +4278,7 @@ mod tests {
     #[test]
     fn openai_responses_input_preserves_tool_calls_and_results() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![
                 ChatMessage {
@@ -4105,6 +4332,7 @@ mod tests {
             .as_str()
             .expect("raw tool call id");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![
                 ChatMessage {
@@ -4141,6 +4369,7 @@ mod tests {
     #[test]
     fn openai_responses_tool_result_keeps_images_inside_function_output() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![ChatMessage {
                 role: ChatRole::Tool,
@@ -4175,6 +4404,7 @@ mod tests {
     #[test]
     fn openai_chat_body_preserves_tools_calls_and_results() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![
                 ChatMessage {
@@ -4221,6 +4451,12 @@ mod tests {
             session_id: None,
         };
 
+        let mut openai = config.clone();
+        openai.model.provider = "openai".into();
+        assert_eq!(
+            openai_chat_completions_body(&openai, &request)["stream_options"]["include_usage"],
+            true
+        );
         let body = openai_chat_completions_body(&config, &request);
         assert_eq!(body["tools"][0]["function"]["name"], "read");
         assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
@@ -4232,6 +4468,7 @@ mod tests {
     fn openai_chat_body_normalizes_responses_tool_call_ids() {
         let raw_id = "call_1234567890abcdefghijklmnopqrstuvwxyzEXTRA|fc_foreign_item";
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![
                 ChatMessage {
@@ -4285,6 +4522,7 @@ mod tests {
     #[test]
     fn anthropic_body_preserves_tools_calls_and_results() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![
                 ChatMessage {
@@ -4414,6 +4652,7 @@ mod tests {
     #[test]
     fn google_body_preserves_tools_calls_and_results() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![
                 ChatMessage {
@@ -4538,6 +4777,7 @@ mod tests {
     #[test]
     fn mistral_body_preserves_tools_calls_and_results() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![
                 ChatMessage {
@@ -4596,6 +4836,7 @@ mod tests {
     #[test]
     fn bedrock_body_preserves_tools_calls_and_results() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![
                 ChatMessage {
@@ -4829,6 +5070,7 @@ mod tests {
     #[test]
     fn thinking_levels_map_to_provider_payloads() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("system".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -4906,6 +5148,7 @@ mod tests {
     #[test]
     fn opus_5_5_uses_adaptive_thinking_with_xhigh() {
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: None,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -4972,6 +5215,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5027,6 +5271,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5133,6 +5378,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5188,6 +5434,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5234,6 +5481,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5276,6 +5524,7 @@ mod tests {
         }
 
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5339,6 +5588,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5373,6 +5623,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5410,6 +5661,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5460,6 +5712,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5512,6 +5765,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5573,6 +5827,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5621,6 +5876,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5657,6 +5913,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5734,6 +5991,7 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
+            max_output_tokens: None,
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,

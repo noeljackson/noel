@@ -264,7 +264,7 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "/compact",
-        description: "compact older messages with a summary",
+        description: "compact older context; optional preservation focus",
     },
     CommandHelp {
         command: "/login [provider]",

@@ -1,3 +1,6 @@
+mod compaction;
+pub use compaction::RuntimeCompactionSettings;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -53,6 +56,8 @@ pub struct ToolEvent {
     pub id: String,
     pub name: String,
     pub result: String,
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +93,14 @@ pub fn format_todo_list(todos: &[TodoItem]) -> String {
         .join("\n")
 }
 
+/// Provider-reported token totals, independent of context trimming and undo.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub requests: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
     pub session_id: String,
@@ -114,6 +127,8 @@ pub struct SessionState {
     pub todos: Vec<TodoItem>,
     #[serde(default)]
     pub edited_files: Vec<String>,
+    #[serde(default)]
+    pub usage: SessionUsage,
 }
 
 impl SessionState {
@@ -136,6 +151,7 @@ impl SessionState {
             disabled_tools: BTreeSet::new(),
             todos: Vec::new(),
             edited_files: Vec::new(),
+            usage: SessionUsage::default(),
         }
     }
 }
@@ -191,6 +207,8 @@ pub struct SessionExport {
     pub todos: Vec<TodoItem>,
     #[serde(default)]
     pub edited_files: Vec<String>,
+    #[serde(default)]
+    pub usage: SessionUsage,
 }
 
 impl From<&SessionState> for SessionExport {
@@ -212,6 +230,7 @@ impl From<&SessionState> for SessionExport {
             disabled_tools: state.disabled_tools.clone(),
             todos: state.todos.clone(),
             edited_files: state.edited_files.clone(),
+            usage: state.usage.clone(),
         }
     }
 }
@@ -236,6 +255,7 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         disabled_tools: export.disabled_tools,
         todos: export.todos,
         edited_files: export.edited_files,
+        usage: export.usage,
     }
 }
 
@@ -277,6 +297,8 @@ pub struct ReloadableSystems {
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
     pub retry: RuntimeRetrySettings,
+    pub compaction: RuntimeCompactionSettings,
+    pub model_context_windows: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +383,25 @@ impl ReloadableSystems {
             context_messages,
             available_models,
             configured_providers,
+            model_context_windows: config
+                .models
+                .iter()
+                .map(|model| {
+                    (
+                        format!("{}/{}", model.provider, model.id),
+                        pi_config::model_context_window(model),
+                    )
+                })
+                .collect(),
+            compaction: {
+                let settings = config.settings.compaction.clone().unwrap_or_default();
+                RuntimeCompactionSettings {
+                    enabled: settings.enabled.unwrap_or(true),
+                    reserve_tokens: settings.reserve_tokens.unwrap_or(16_384),
+                    keep_recent_tokens: settings.keep_recent_tokens.unwrap_or(20_000),
+                    trigger_percent: settings.trigger_percent.unwrap_or(80).clamp(1, 99),
+                }
+            },
             available_accounts,
             available_tool_names,
             extension_tools,
@@ -407,6 +448,8 @@ pub enum ReloadError {
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error(transparent)]
+    Config(#[from] pi_config::ConfigError),
+    #[error(transparent)]
     Journal(#[from] pi_session::JournalError),
     #[error("failed to create session directory {path}: {source}")]
     CreateDir {
@@ -437,6 +480,8 @@ pub enum SessionError {
 
 #[derive(Debug, Error)]
 pub enum AgentError {
+    #[error("compaction failed: {0}")]
+    Compaction(String),
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error(transparent)]
@@ -492,6 +537,9 @@ enum SessionRecord {
     EditedFiles {
         paths: Vec<String>,
     },
+    Usage {
+        usage: SessionUsage,
+    },
     QueuedMessage {
         message: String,
     },
@@ -500,6 +548,10 @@ enum SessionRecord {
     },
     Compaction {
         record: CompactionRecord,
+    },
+    CompactionCheckpoint {
+        record: CompactionRecord,
+        messages: Vec<ConversationMessage>,
     },
     BranchSummary {
         summary: BranchSummary,
@@ -633,6 +685,10 @@ impl SessionStore {
         self.append(&SessionRecord::EditedFiles { paths })
     }
 
+    pub fn record_usage(&self, usage: SessionUsage) -> Result<(), SessionError> {
+        self.append(&SessionRecord::Usage { usage })
+    }
+
     pub fn record_metadata(&self, state: &SessionState) -> Result<(), SessionError> {
         self.append(&SessionRecord::Metadata {
             name: state.name.clone(),
@@ -654,6 +710,33 @@ impl SessionStore {
 
     pub fn record_compaction(&self, record: CompactionRecord) -> Result<(), SessionError> {
         self.append(&SessionRecord::Compaction { record })
+    }
+
+    fn record_compaction_checkpoint(
+        &self,
+        record: CompactionRecord,
+        messages: Vec<ConversationMessage>,
+    ) -> Result<(), SessionError> {
+        let mut journal = fs::read(&self.path).map_err(|source| SessionError::Read {
+            path: self.path.clone(),
+            source,
+        })?;
+        let checkpoint =
+            serde_json::to_vec(&SessionRecord::CompactionCheckpoint { record, messages }).map_err(
+                |source| SessionError::Parse {
+                    path: self.path.clone(),
+                    source,
+                },
+            )?;
+        if !journal.ends_with(b"\n") {
+            journal.push(b'\n');
+        }
+        journal.extend(checkpoint);
+        journal.push(b'\n');
+        // Rename a synced temporary file: a failed write leaves the old
+        // journal and active context unchanged, with no partial checkpoint.
+        pi_config::write_file_atomic(&self.path, &journal)?;
+        Ok(())
     }
 
     pub fn record_branch_summary(&self, summary: BranchSummary) -> Result<(), SessionError> {
@@ -881,9 +964,20 @@ impl SessionStore {
                         state.compactions.push(record);
                     }
                 }
+                SessionRecord::CompactionCheckpoint { record, messages } => {
+                    if let Some(state) = &mut state {
+                        state.messages = messages;
+                        state.compactions.push(record);
+                    }
+                }
                 SessionRecord::BranchSummary { summary } => {
                     if let Some(state) = &mut state {
                         state.branch_summaries.push(summary);
+                    }
+                }
+                SessionRecord::Usage { usage } => {
+                    if let Some(state) = &mut state {
+                        state.usage = usage;
                     }
                 }
                 SessionRecord::Unknown => {}
@@ -908,6 +1002,7 @@ impl SessionStore {
         self.record_disabled_tools(state.disabled_tools.iter().cloned().collect())?;
         self.record_todos(state.todos.clone())?;
         self.record_edited_files(state.edited_files.clone())?;
+        self.record_usage(state.usage.clone())?;
         for message in &state.messages {
             self.record_message(message.clone())?;
         }
@@ -1004,6 +1099,7 @@ fn ts_jsonl_export_records(state: &SessionState) -> Vec<Value> {
                 "disabled_tools": state.disabled_tools,
                 "queued_messages": state.queued_messages,
                 "tool_history": state.tool_history,
+                "usage": state.usage,
             },
         }),
     );
@@ -1283,6 +1379,12 @@ fn reduce_ts_jsonl_entry(state: &mut SessionState, entry: &Value) {
 }
 
 fn restore_rust_session_state(state: &mut SessionState, data: &Value) {
+    if let Some(usage) = data
+        .get("usage")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    {
+        state.usage = usage;
+    }
     if let Some(labels) = data.get("labels").and_then(Value::as_array) {
         state.labels = labels
             .iter()
@@ -1481,33 +1583,6 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
-}
-
-fn summarize_messages(messages: &[ConversationMessage], omitted_messages: usize) -> String {
-    if omitted_messages == 0 {
-        return "No compaction was needed.".to_string();
-    }
-    let role_counts = messages
-        .iter()
-        .take(omitted_messages)
-        .fold(BTreeSet::new(), |mut roles, message| {
-            roles.insert(format!("{:?}", message.role).to_lowercase());
-            roles
-        })
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let first = messages
-        .first()
-        .map(|message| trim_summary_text(&message.content))
-        .unwrap_or_else(|| "-".to_string());
-    let last_omitted = messages
-        .get(omitted_messages.saturating_sub(1))
-        .map(|message| trim_summary_text(&message.content))
-        .unwrap_or_else(|| "-".to_string());
-    format!(
-        "Compacted {omitted_messages} earlier message(s). Omitted roles: {role_counts}. First omitted: {first}. Last omitted: {last_omitted}."
-    )
 }
 
 fn summarize_branch(source: &SessionState) -> String {
@@ -1714,48 +1789,16 @@ impl Runtime {
         Ok(count)
     }
 
-    pub fn compact_messages(
-        &mut self,
-        kind: CompactionKind,
-    ) -> Result<CompactionRecord, SessionError> {
-        let original_count = self.session.messages.len();
-        let retained_messages = self
-            .session
-            .messages
-            .iter()
-            .rev()
-            .take(4)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>();
-        let omitted_messages = original_count.saturating_sub(retained_messages.len());
-        let summary = summarize_messages(&self.session.messages, omitted_messages);
-        let record = CompactionRecord {
-            kind,
-            omitted_messages,
-            retained_messages: retained_messages.len(),
-            summary: summary.clone(),
-        };
-        if omitted_messages > 0 {
-            let mut messages = vec![ConversationMessage {
-                thinking: String::new(),
-                role: MessageRole::System,
-                content: summary,
-                media: Vec::new(),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: Vec::new(),
-            }];
-            messages.extend(retained_messages);
-            self.replace_messages(messages)?;
-        }
+    fn record_usage(&mut self, input_tokens: u64, output_tokens: u64) -> Result<(), SessionError> {
+        let mut usage = self.session.usage.clone();
+        usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
+        usage.requests = usage.requests.saturating_add(1);
         if let Some(store) = &self.store {
-            store.record_compaction(record.clone())?;
+            store.record_usage(usage.clone())?;
         }
-        self.session.compactions.push(record.clone());
-        Ok(record)
+        self.session.usage = usage;
+        Ok(())
     }
 
     pub fn reload(&mut self, next: ReloadableSystems) -> Result<ReloadReport, ReloadError> {
@@ -1851,6 +1894,15 @@ pub struct SteeringMailbox {
 }
 
 impl SteeringMailbox {
+    pub fn list(&self) -> Vec<String> {
+        self.messages
+            .lock()
+            .expect("steering mailbox")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn new(mode: SteeringMode) -> Self {
         Self {
             messages: Arc::new(Mutex::new(VecDeque::new())),
@@ -1917,6 +1969,8 @@ pub enum TurnEvent {
     Provider(StreamEvent),
     ToolStarted { name: String },
     ToolFinished { name: String, is_error: bool },
+    CompactionStarted,
+    CompactionFinished(CompactionRecord),
 }
 
 /// Follow-up prompts typed while a turn streams. Shared between the key
@@ -1991,6 +2045,7 @@ pub async fn run_user_turn_streaming_events_with_media(
             id: format!("tool-{}", runtime.session.tool_history.len() + 1),
             name: command.name.clone(),
             result: result.output.clone(),
+            is_error: false,
         })?;
         runtime.push_message(ConversationMessage {
             thinking: String::new(),
@@ -2008,6 +2063,12 @@ pub async fn run_user_turn_streaming_events_with_media(
     let mut final_text = String::new();
     for _ in 0..MAX_TOOL_CALL_TURNS {
         inject_steering_messages(runtime, steering)?;
+        if runtime.needs_auto_compaction() {
+            on_event(&TurnEvent::CompactionStarted);
+            if let Some(record) = runtime.auto_compact(provider).await? {
+                on_event(&TurnEvent::CompactionFinished(record));
+            }
+        }
         let request = provider_request(runtime, system_prompt.clone());
         let events =
             complete_with_retry_streaming(provider, request, &runtime.systems.retry, |event| {
@@ -2019,6 +2080,7 @@ pub async fn run_user_turn_streaming_events_with_media(
         let mut text = String::new();
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
+        let mut usage = None;
         for event in events {
             match event {
                 StreamEvent::Text(delta) => {
@@ -2034,10 +2096,17 @@ pub async fn run_user_turn_streaming_events_with_media(
                     arguments,
                 }),
                 StreamEvent::Thinking(delta) => thinking.push_str(&delta),
-                StreamEvent::Usage { .. } | StreamEvent::Stop { .. } => {}
+                StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => usage = Some((input_tokens, output_tokens)),
+                StreamEvent::Stop { .. } => {}
             }
         }
 
+        if let Some((input, output)) = usage {
+            runtime.record_usage(input, output)?;
+        }
         final_text.push_str(&text);
         runtime.push_message(ConversationMessage {
             thinking,
@@ -2112,7 +2181,24 @@ fn runtime_system_prompt(runtime: &Runtime) -> Option<String> {
 }
 
 fn provider_request(runtime: &Runtime, system_prompt: Option<String>) -> ProviderRequest {
+    let mut instructions = system_prompt.into_iter().collect::<Vec<_>>();
+    instructions.extend(
+        runtime
+            .session
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == MessageRole::System && !compaction::is_checkpoint(message)
+            })
+            .map(|message| message.content.clone()),
+    );
+    let system_prompt = if instructions.is_empty() {
+        None
+    } else {
+        Some(instructions.join("\n\n"))
+    };
     ProviderRequest {
+        max_output_tokens: None,
         system_prompt,
         messages: provider_messages(&runtime.session.messages),
         tools: active_tool_definitions(runtime),
@@ -2147,7 +2233,9 @@ fn provider_messages(messages: &[ConversationMessage]) -> Vec<ChatMessage> {
             continue;
         }
 
-        if message.role != MessageRole::Tool {
+        if message.role != MessageRole::Tool
+            && (message.role != MessageRole::System || compaction::is_checkpoint(message))
+        {
             output.push(conversation_to_chat_message(message));
         }
         index += 1;
@@ -2172,6 +2260,7 @@ fn missing_tool_output(tool_call: &ChatToolCall) -> ChatMessage {
 fn conversation_to_chat_message(message: &ConversationMessage) -> ChatMessage {
     ChatMessage {
         role: match message.role {
+            _ if compaction::is_checkpoint(message) => ChatRole::User,
             MessageRole::System => ChatRole::System,
             MessageRole::User => ChatRole::User,
             MessageRole::Assistant => ChatRole::Assistant,
@@ -2541,6 +2630,7 @@ async fn execute_model_tool_call(
         id: tool_call.id.clone(),
         name: tool_call.name.clone(),
         result: output.clone(),
+        is_error: false,
     })?;
     runtime.push_message(ConversationMessage {
         thinking: String::new(),
@@ -2887,6 +2977,115 @@ mod tests {
 
     use super::*;
 
+    fn test_message(role: MessageRole, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            role,
+            content: content.into(),
+            thinking: String::new(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_retains_complete_turns_and_handles_empty_sessions() {
+        let mut runtime = Runtime::new(
+            SessionState::new("compact", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        runtime.systems.compaction.keep_recent_tokens = 0;
+        assert_eq!(
+            runtime
+                .compact_messages(&CheckpointProvider, CompactionKind::Manual, "")
+                .await
+                .unwrap()
+                .omitted_messages,
+            0
+        );
+        for role in [
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::Tool,
+            MessageRole::Assistant,
+            MessageRole::Tool,
+            MessageRole::Assistant,
+        ] {
+            runtime
+                .push_message(test_message(role, &"keep ".repeat(30)))
+                .unwrap();
+        }
+        let record = runtime
+            .compact_messages(&CheckpointProvider, CompactionKind::Manual, "")
+            .await
+            .unwrap();
+        assert_eq!(record.omitted_messages, 2);
+        assert_eq!(record.retained_messages, 6);
+        assert_eq!(runtime.session.messages[1].role, MessageRole::User);
+    }
+
+    #[tokio::test]
+    async fn usage_counts_last_snapshot_once_and_survives_reload_export_and_compaction() {
+        struct UsageProvider;
+        #[async_trait::async_trait]
+        impl Provider for UsageProvider {
+            async fn complete(
+                &self,
+                _request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                Ok(vec![
+                    StreamEvent::Usage {
+                        input_tokens: 12,
+                        output_tokens: 1,
+                    },
+                    StreamEvent::Text("ok".into()),
+                    StreamEvent::Usage {
+                        input_tokens: 12,
+                        output_tokens: 5,
+                    },
+                ])
+            }
+        }
+        let base = std::env::temp_dir().join(format!("pi-usage-test-{}", new_session_id()));
+        let (store, session) = SessionStore::create(&base, base.clone()).unwrap();
+        let mut runtime = Runtime::with_store(session, ReloadableSystems::default(), store.clone());
+        for _ in 0..3 {
+            run_user_turn(&mut runtime, &UsageProvider, "question".into())
+                .await
+                .unwrap();
+        }
+        let expected = SessionUsage {
+            input_tokens: 36,
+            output_tokens: 15,
+            requests: 3,
+        };
+        assert_eq!(runtime.session.usage, expected);
+        runtime
+            .compact_messages(&UsageProvider, CompactionKind::Manual, "")
+            .await
+            .unwrap();
+        runtime.reload(ReloadableSystems::default()).unwrap();
+        assert_eq!(store.load().unwrap().usage, expected);
+        for extension in ["json", "jsonl"] {
+            let path = base.join(format!("export.{extension}"));
+            write_session_export(runtime.session(), &path).unwrap();
+            let (_, imported) = SessionStore::import_path(&base.join("imports"), &path).unwrap();
+            assert_eq!(imported.usage, expected);
+        }
+        let mut export = serde_json::to_value(SessionExport::from(runtime.session())).unwrap();
+        export.as_object_mut().unwrap().remove("usage");
+        assert_eq!(
+            serde_json::from_value::<SessionExport>(export)
+                .unwrap()
+                .usage,
+            SessionUsage::default()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn thinking_is_optional_in_old_sessions_and_separate_in_block_imports() {
         let old = json!({"role": "assistant", "content": "answer"});
@@ -2924,6 +3123,7 @@ mod tests {
             id: "tool-1".to_string(),
             name: "read".to_string(),
             result: "ok".to_string(),
+            is_error: false,
         });
         session.queued_messages.push("next".to_string());
         session.active_model = Some(model.clone());
@@ -3138,6 +3338,7 @@ mod tests {
             id: "tool-1".to_string(),
             name: "read".to_string(),
             result: "content".to_string(),
+            is_error: false,
         });
         state.compactions.push(CompactionRecord {
             kind: CompactionKind::Manual,
@@ -3486,8 +3687,8 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    #[test]
-    fn compact_messages_persists_summary_record_and_snapshot() {
+    #[tokio::test]
+    async fn compact_messages_persists_summary_record_and_snapshot() {
         let base = std::env::temp_dir().join(format!("pi-compact-test-{}", new_session_id()));
         let (store, mut state) =
             SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
@@ -3495,7 +3696,7 @@ mod tests {
             state.messages.push(ConversationMessage {
                 thinking: String::new(),
                 role: MessageRole::User,
-                content: format!("message {index}"),
+                content: format!("message {index} {}", "detail ".repeat(30)),
                 media: Vec::new(),
                 tool_call_id: None,
                 tool_name: None,
@@ -3507,19 +3708,21 @@ mod tests {
         }
         let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store.clone());
 
+        runtime.systems.compaction.keep_recent_tokens = 0;
         let record = runtime
-            .compact_messages(CompactionKind::Manual)
+            .compact_messages(&CheckpointProvider, CompactionKind::Manual, "")
+            .await
             .expect("compact messages");
 
-        assert_eq!(record.omitted_messages, 4);
-        assert_eq!(record.retained_messages, 4);
-        assert_eq!(runtime.session().messages.len(), 5);
+        assert_eq!(record.omitted_messages, 7);
+        assert_eq!(record.retained_messages, 1);
+        assert_eq!(runtime.session().messages.len(), 2);
         assert_eq!(runtime.session().compactions, [record]);
         let (_store, loaded) =
             SessionStore::open(store.path().to_path_buf()).expect("open compacted");
         assert_eq!(loaded.compactions.len(), 1);
-        assert_eq!(loaded.messages[0].role, MessageRole::System);
-        assert!(loaded.messages[0].content.contains("Compacted 4 earlier"));
+        assert_eq!(loaded.messages[0].role, MessageRole::Assistant);
+        assert!(loaded.messages[0].content.contains("Goals and constraints"));
 
         let _ = fs::remove_dir_all(base);
     }
@@ -4571,6 +4774,20 @@ mod tests {
         let second = new_session_id();
 
         assert_ne!(first, second);
+    }
+
+    struct CheckpointProvider;
+    #[async_trait::async_trait]
+    impl Provider for CheckpointProvider {
+        async fn complete(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            assert!(request.tools.is_empty());
+            Ok(vec![StreamEvent::Text(
+                "Goals and constraints: keep working. Next steps: test.".into(),
+            )])
+        }
     }
 
     struct FlakyProvider {

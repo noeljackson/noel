@@ -375,6 +375,8 @@ pub struct CompactionSettings {
     pub enabled: Option<bool>,
     pub reserve_tokens: Option<u64>,
     pub keep_recent_tokens: Option<u64>,
+    /// Percentage of the model context window that triggers automatic compaction.
+    pub trigger_percent: Option<u8>,
 }
 
 impl MergeSettings for CompactionSettings {
@@ -383,6 +385,7 @@ impl MergeSettings for CompactionSettings {
             enabled: overrides.enabled.or(self.enabled),
             reserve_tokens: overrides.reserve_tokens.or(self.reserve_tokens),
             keep_recent_tokens: overrides.keep_recent_tokens.or(self.keep_recent_tokens),
+            trigger_percent: overrides.trigger_percent.or(self.trigger_percent),
         }
     }
 }
@@ -713,6 +716,25 @@ pub struct ModelDefinition {
     pub api: ProviderApi,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Context size in tokens. Custom models can override the compiled catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+/// Unknown/custom models use a conservative fallback unless models.json
+/// supplies contextWindow explicitly. The compiled catalog remains authoritative
+/// for known models even when older cache entries omit the field.
+pub fn model_context_window(model: &ModelDefinition) -> u64 {
+    model
+        .context_window
+        .filter(|window| *window > 0)
+        .or_else(|| {
+            pi_providers::builtin_models()
+                .iter()
+                .find(|candidate| candidate.provider == model.provider && candidate.id == model.id)
+                .and_then(|candidate| candidate.context_window)
+        })
+        .unwrap_or(128_000)
 }
 
 /// Caches written by older builds (or without this field) are treated as stale
@@ -2295,6 +2317,7 @@ fn default_models() -> Vec<ModelDefinition> {
     let mut models = pi_providers::builtin_models()
         .into_iter()
         .map(|model| ModelDefinition {
+            context_window: model.context_window,
             provider: model.provider,
             id: model.id,
             name: Some(model.name),
@@ -2315,6 +2338,7 @@ fn default_models() -> Vec<ModelDefinition> {
         .collect::<Vec<_>>();
     models.extend([
         ModelDefinition {
+            context_window: None,
             provider: "faux".to_string(),
             id: "echo".to_string(),
             name: Some("Faux Echo".to_string()),
@@ -2322,6 +2346,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai".to_string(),
             id: "gpt-5.4".to_string(),
             name: Some("OpenAI GPT 5.4".to_string()),
@@ -2329,6 +2354,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai".to_string(),
             id: "gpt-4.1".to_string(),
             name: Some("OpenAI GPT 4.1".to_string()),
@@ -2336,6 +2362,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.1".to_string(),
             name: Some("GPT 5.1".to_string()),
@@ -2343,6 +2370,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.1-codex-max".to_string(),
             name: Some("GPT 5.1 Codex Max".to_string()),
@@ -2350,6 +2378,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.1-codex-mini".to_string(),
             name: Some("GPT 5.1 Codex Mini".to_string()),
@@ -2357,6 +2386,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.2".to_string(),
             name: Some("GPT 5.2".to_string()),
@@ -2364,6 +2394,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.2-codex".to_string(),
             name: Some("GPT 5.2 Codex".to_string()),
@@ -2371,6 +2402,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.3-codex".to_string(),
             name: Some("GPT 5.3 Codex".to_string()),
@@ -2378,6 +2410,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.3-codex-spark".to_string(),
             name: Some("GPT 5.3 Codex Spark".to_string()),
@@ -2385,6 +2418,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.4".to_string(),
             name: Some("GPT 5.4".to_string()),
@@ -2392,6 +2426,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.4-mini".to_string(),
             name: Some("GPT 5.4 Mini".to_string()),
@@ -2399,6 +2434,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openai-codex".to_string(),
             id: "gpt-5.5".to_string(),
             name: Some("GPT 5.5".to_string()),
@@ -2406,6 +2442,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://chatgpt.com/backend-api".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "azure-openai-responses".to_string(),
             id: "gpt-5.2".to_string(),
             name: Some("Azure OpenAI GPT 5.2".to_string()),
@@ -2413,6 +2450,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "anthropic".to_string(),
             id: "claude-opus-4-1-20250805".to_string(),
             name: Some("Claude Opus 4.1".to_string()),
@@ -2420,6 +2458,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "anthropic".to_string(),
             id: "claude-opus-4-8".to_string(),
             name: Some("Claude Opus 4.8".to_string()),
@@ -2427,6 +2466,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "anthropic".to_string(),
             id: "claude-opus-4-7".to_string(),
             name: Some("Claude Opus 4.7".to_string()),
@@ -2434,6 +2474,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "anthropic".to_string(),
             id: "claude-opus-4-20250514".to_string(),
             name: Some("Claude Opus 4".to_string()),
@@ -2441,6 +2482,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "anthropic".to_string(),
             id: "claude-sonnet-4-5".to_string(),
             name: Some("Claude Sonnet".to_string()),
@@ -2448,6 +2490,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "anthropic".to_string(),
             id: "claude-sonnet-4-6".to_string(),
             name: Some("Claude Sonnet 4.6".to_string()),
@@ -2455,6 +2498,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "github-copilot".to_string(),
             id: "gpt-5.4".to_string(),
             name: Some("GitHub Copilot GPT 5.4".to_string()),
@@ -2462,6 +2506,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.individual.githubcopilot.com".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "openrouter".to_string(),
             id: "moonshotai/kimi-k2.6".to_string(),
             name: Some("OpenRouter Kimi K2.6".to_string()),
@@ -2469,6 +2514,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://openrouter.ai/api/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "deepseek".to_string(),
             id: "deepseek-v4-flash".to_string(),
             name: Some("DeepSeek V4 Flash".to_string()),
@@ -2476,6 +2522,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.deepseek.com".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "groq".to_string(),
             id: "openai/gpt-oss-120b".to_string(),
             name: Some("Groq GPT OSS 120B".to_string()),
@@ -2483,6 +2530,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.groq.com/openai/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "cerebras".to_string(),
             id: "gpt-oss-120b".to_string(),
             name: Some("Cerebras GPT OSS 120B".to_string()),
@@ -2490,6 +2538,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.cerebras.ai/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "xai".to_string(),
             id: "grok-code-fast-1".to_string(),
             name: Some("Grok Code Fast 1".to_string()),
@@ -2497,6 +2546,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.x.ai/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "zai".to_string(),
             id: "glm-5.1".to_string(),
             name: Some("GLM 5.1".to_string()),
@@ -2504,6 +2554,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "huggingface".to_string(),
             id: "MiniMaxAI/MiniMax-M2.7".to_string(),
             name: Some("Hugging Face MiniMax M2.7".to_string()),
@@ -2511,6 +2562,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://router.huggingface.co/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "together".to_string(),
             id: "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8".to_string(),
             name: Some("Together Qwen3 Coder 480B".to_string()),
@@ -2518,6 +2570,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.together.ai/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "moonshotai".to_string(),
             id: "kimi-k2-thinking".to_string(),
             name: Some("Kimi K2 Thinking".to_string()),
@@ -2525,6 +2578,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.moonshot.ai/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "moonshotai-cn".to_string(),
             id: "kimi-k2-thinking".to_string(),
             name: Some("Kimi K2 Thinking CN".to_string()),
@@ -2532,6 +2586,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.moonshot.cn/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "opencode".to_string(),
             id: "big-pickle".to_string(),
             name: Some("OpenCode Big Pickle".to_string()),
@@ -2539,6 +2594,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://opencode.ai/zen/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "opencode-go".to_string(),
             id: "deepseek-v4-flash".to_string(),
             name: Some("OpenCode Go DeepSeek V4 Flash".to_string()),
@@ -2546,6 +2602,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://opencode.ai/zen/go/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "fireworks".to_string(),
             id: "accounts/fireworks/models/deepseek-v4-pro".to_string(),
             name: Some("Fireworks DeepSeek V4 Pro".to_string()),
@@ -2553,6 +2610,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.fireworks.ai/inference".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "minimax".to_string(),
             id: "MiniMax-M2.7".to_string(),
             name: Some("MiniMax M2.7".to_string()),
@@ -2560,6 +2618,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.minimax.io/anthropic".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "minimax-cn".to_string(),
             id: "MiniMax-M2.7".to_string(),
             name: Some("MiniMax M2.7 CN".to_string()),
@@ -2567,6 +2626,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.minimaxi.com/anthropic".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "kimi-coding".to_string(),
             id: "kimi-for-coding".to_string(),
             name: Some("Kimi For Coding".to_string()),
@@ -2574,6 +2634,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.kimi.com/coding".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "xiaomi".to_string(),
             id: "mimo-v2.5-pro".to_string(),
             name: Some("MiMo V2.5 Pro".to_string()),
@@ -2581,6 +2642,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.xiaomimimo.com/anthropic".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "xiaomi-token-plan-cn".to_string(),
             id: "mimo-v2.5-pro".to_string(),
             name: Some("MiMo V2.5 Pro Token Plan CN".to_string()),
@@ -2588,6 +2650,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://token-plan-cn.xiaomimimo.com/anthropic".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "xiaomi-token-plan-ams".to_string(),
             id: "mimo-v2.5-pro".to_string(),
             name: Some("MiMo V2.5 Pro Token Plan AMS".to_string()),
@@ -2595,6 +2658,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://token-plan-ams.xiaomimimo.com/anthropic".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "xiaomi-token-plan-sgp".to_string(),
             id: "mimo-v2.5-pro".to_string(),
             name: Some("MiMo V2.5 Pro Token Plan SGP".to_string()),
@@ -2602,6 +2666,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://token-plan-sgp.xiaomimimo.com/anthropic".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "vercel-ai-gateway".to_string(),
             id: "alibaba/qwen3-coder".to_string(),
             name: Some("Vercel AI Gateway Qwen3 Coder".to_string()),
@@ -2609,6 +2674,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://ai-gateway.vercel.sh".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "google".to_string(),
             id: "gemini-2.5-pro".to_string(),
             name: Some("Gemini Pro".to_string()),
@@ -2616,6 +2682,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: None,
         },
         ModelDefinition {
+            context_window: None,
             provider: "google-vertex".to_string(),
             id: "gemini-2.5-pro".to_string(),
             name: Some("Gemini Pro Vertex".to_string()),
@@ -2623,6 +2690,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://{GOOGLE_CLOUD_LOCATION}-aiplatform.googleapis.com".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "amazon-bedrock".to_string(),
             id: "us.anthropic.claude-opus-4-6-v1".to_string(),
             name: Some("Bedrock Claude Opus 4.6".to_string()),
@@ -2630,6 +2698,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "mistral".to_string(),
             id: "devstral-medium-latest".to_string(),
             name: Some("Mistral Devstral Medium".to_string()),
@@ -2637,6 +2706,7 @@ fn default_models() -> Vec<ModelDefinition> {
             base_url: Some("https://api.mistral.ai/v1".to_string()),
         },
         ModelDefinition {
+            context_window: None,
             provider: "cloudflare-workers-ai".to_string(),
             id: "@cf/moonshotai/kimi-k2.6".to_string(),
             name: Some("Cloudflare Workers AI Kimi K2.6".to_string()),
@@ -2647,6 +2717,7 @@ fn default_models() -> Vec<ModelDefinition> {
             ),
         },
         ModelDefinition {
+            context_window: None,
             provider: "cloudflare-ai-gateway".to_string(),
             id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
             name: Some("Cloudflare AI Gateway Kimi K2.6".to_string()),
@@ -2808,6 +2879,34 @@ mod tests {
             "quietStartup": settings.quiet_startup.unwrap_or(false),
             "hideThinkingBlock": settings.hide_thinking_block.unwrap_or(false),
         })
+    }
+
+    #[test]
+    fn compaction_settings_merge_and_model_windows_accept_old_cache_and_custom_overrides() {
+        let global: Settings = serde_json::from_value(serde_json::json!({
+            "compaction":{"enabled":true,"reserveTokens":2048,"triggerPercent":75}
+        }))
+        .unwrap();
+        let project: Settings = serde_json::from_value(serde_json::json!({
+            "compaction":{"keepRecentTokens":6000,"triggerPercent":80}
+        }))
+        .unwrap();
+        let settings = global.merge(project).compaction.unwrap();
+        assert_eq!(settings.enabled, Some(true));
+        assert_eq!(settings.reserve_tokens, Some(2048));
+        assert_eq!(settings.keep_recent_tokens, Some(6000));
+        assert_eq!(settings.trigger_percent, Some(80));
+        let old: ModelDefinition =
+            serde_json::from_str(r#"{"provider":"openai","id":"gpt-5.4"}"#).unwrap();
+        assert_eq!(model_context_window(&old), 1_050_000);
+        let mut custom: ModelDefinition =
+            serde_json::from_str(r#"{"provider":"local","id":"test","contextWindow":8192}"#)
+                .unwrap();
+        assert_eq!(model_context_window(&custom), 8192);
+        custom.context_window = None;
+        assert_eq!(model_context_window(&custom), 128_000);
+        custom.context_window = Some(0);
+        assert_eq!(model_context_window(&custom), 128_000);
     }
 
     #[test]
@@ -3257,6 +3356,7 @@ mod tests {
                 version: MODEL_CACHE_VERSION,
                 claude_code_version: None,
                 models: vec![ModelDefinition {
+                    context_window: None,
                     provider: "anthropic".to_string(),
                     id: "claude-opus-4-1-20250805".to_string(),
                     name: Some("Claude Opus 4.1".to_string()),

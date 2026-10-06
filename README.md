@@ -543,7 +543,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/import <file>`
 - `/copy`
 - `/share [file]`
-- `/compact`
+- `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
 - `/login [provider]`
 - `/logout <provider>`
 - `/account [name]`
@@ -568,11 +568,57 @@ The model can track multi-step work with the built-in `todo` tool: it maintains 
 
 Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, esc or ctrl+c interrupts the turn, Enter queues the draft as a follow-up, and ctrl+s steers the running turn: the draft joins the conversation before the next provider request (`steeringMode` selects `one-at-a-time` or `all` per round). Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history. The TUI runs in an inline terminal viewport: finalized transcript rows are written to normal terminal scrollback, so native mouse selection and mouse-wheel scrollback remain terminal-owned while Up/Down navigate prompt history. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 
+## Context Compaction
+
+`/compact preserve architecture decisions and outstanding test failures` asks the
+active model for a continuation checkpoint with tools disabled. The summary
+preserves goals/constraints, decisions, completed work/files, errors, next steps,
+and references. Recent complete user turns remain unchanged, including paired
+tool calls/results and attachments. Persistent system/project instructions are
+not summarized and remain loaded independently. Prior checkpoints are merged on
+subsequent compactions, rather than nested first/last snippets.
+
+Automatic compaction runs before every model request, including tool rounds and
+queued prompts. It uses **estimated active-context tokens**, including instructions,
+tool schemas, calls, and attachment allowances—not billed session totals or message
+count. Configure `.pi/settings.json` or global settings:
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "triggerPercent": 80,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  }
+}
+```
+
+The trigger fires at the percentage threshold or when the response reserve is
+needed. `triggerPercent` is clamped to 1–99; the reserve is capped at half the
+window. The recent-token budget is capped at a quarter-window and applies to
+older complete turns; the latest turn is always retained intact. Oversized
+histories are summarized in bounded rolling fragments without dropping text.
+Known model windows come from the catalog/provider metadata; custom `models.json`
+entries can specify `contextWindow`. Unknown windows fall back to 128,000 tokens.
+Token counts are heuristics, not exact provider tokenization.
+
+The original transcript remains in the session journal. A validated, smaller
+checkpoint and its replacement context are committed together through an atomic
+file replacement. Empty/truncated/oversized/tool-bearing summaries, provider
+failures, or cancellation leave active history intact; no silent truncation
+fallback is used. If the latest turn or persistent instructions still cannot fit,
+pi reports an error instead of repeatedly compacting. Completed summarization
+requests count toward recorded session usage. `/export` exports the current checkpoint and
+retained context, not the pre-compaction journal transcript.
+
+
 ## RPC Methods
 
 `--mode rpc` reads one JSON object per line from stdin and writes one JSON object per line to stdout.
 
 - `prompt` with `{ "prompt": "..." }`
+- `compact` with optional `{ "focus": "..." }`
 - `reload`
 - `session`
 - `model` with `{ "model": "provider/id" }`

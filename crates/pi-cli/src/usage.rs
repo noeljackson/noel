@@ -1471,6 +1471,7 @@ mod tests {
         let mut config = status_test_config(&root, auth);
         for (provider, id) in [("faux", "echo"), ("openrouter", "or-model")] {
             config.models.push(pi_config::ModelDefinition {
+                context_window: None,
                 provider: provider.to_string(),
                 id: id.to_string(),
                 name: None,

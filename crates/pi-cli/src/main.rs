@@ -1403,6 +1403,20 @@ async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) 
                 },
                 Err(error) => Err((-32602, error)),
             },
+            "compact" => {
+                let focus = request
+                    .pointer("/params/focus")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                match provider_for_runtime(&runtime, &config, offline).await {
+                    Ok(provider) => runtime
+                        .compact_messages(provider.as_ref(), CompactionKind::Manual, focus)
+                        .await
+                        .map(|record| serde_json::json!(record))
+                        .map_err(|error| (1, error.to_string())),
+                    Err(error) => Err((1, error.to_string())),
+                }
+            }
             "reload" => {
                 config = load_config(config.paths.clone())?;
                 start_model_refresh(&config, offline, false);
@@ -1844,6 +1858,8 @@ struct AnthropicModelsResponse {
 struct AnthropicModel {
     id: String,
     display_name: String,
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
 }
 
 const ANTHROPIC_MODELS_MAX_PAGES: usize = 16;
@@ -1880,6 +1896,7 @@ async fn fetch_anthropic_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinitio
             None
         };
         models.extend(page.data.into_iter().map(|model| ModelDefinition {
+            context_window: model.max_input_tokens,
             provider: "anthropic".to_string(),
             id: model.id,
             name: Some(model.display_name),
@@ -1990,6 +2007,7 @@ async fn fetch_openai_api_models(
         .into_iter()
         .filter(|model| model_supported_for_provider(provider, &model.id))
         .map(|model| ModelDefinition {
+            context_window: None,
             provider: provider.to_string(),
             id: model.id.clone(),
             name: Some(model_display_name(&model.id)),
@@ -2050,7 +2068,8 @@ async fn fetch_chatgpt_backend_models(
         let body = response.text().await.unwrap_or_default();
         return Err(anyhow!("status {status} from {endpoint}: {body}"));
     }
-    let ids = collect_codex_model_ids(&response.json::<serde_json::Value>().await?, provider);
+    let document = response.json::<serde_json::Value>().await?;
+    let ids = collect_codex_model_ids(&document, provider);
     if ids.is_empty() {
         return Err(anyhow!(
             "no selectable {provider} model IDs in response from {endpoint}"
@@ -2059,6 +2078,24 @@ async fn fetch_chatgpt_backend_models(
     Ok(ids
         .into_iter()
         .map(|id| ModelDefinition {
+            context_window: document
+                .get("models")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|models| {
+                    models.iter().find(|model| {
+                        model
+                            .get("slug")
+                            .or_else(|| model.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(id.as_str())
+                    })
+                })
+                .and_then(|model| {
+                    model
+                        .get("context_window")
+                        .or_else(|| model.get("contextWindow"))
+                })
+                .and_then(serde_json::Value::as_u64),
             provider: provider.to_string(),
             name: Some(model_display_name(&id)),
             id,
@@ -4596,6 +4633,7 @@ enum Activity {
     Thinking,
     Writing,
     Tool(String),
+    Compacting,
 }
 
 const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
@@ -4607,6 +4645,7 @@ fn activity_status(started: Instant, activity: &Activity, pending_followups: usi
         Activity::Waiting => "waiting".to_string(),
         Activity::Thinking => "thinking".to_string(),
         Activity::Writing => "writing".to_string(),
+        Activity::Compacting => "compacting".to_string(),
         Activity::Tool(name) => format!("running {name}"),
     };
     let queued = if pending_followups > 0 {
@@ -4639,6 +4678,17 @@ fn apply_turn_event(
         }
         TurnEvent::ToolStarted { name } => {
             *activity = Activity::Tool(name.clone());
+        }
+        TurnEvent::CompactionStarted => *activity = Activity::Compacting,
+        TurnEvent::CompactionFinished(record) => {
+            *activity = Activity::Waiting;
+            app.push(
+                TuiEntryKind::System,
+                format!(
+                    "auto-compacted: omitted {} message(s)",
+                    record.omitted_messages
+                ),
+            );
         }
         TurnEvent::ToolFinished { .. } => {
             *activity = Activity::Waiting;
@@ -5202,15 +5252,11 @@ async fn handle_tui_submission(
             format_session_tree(&config.paths.session_dir)?,
         ),
         "/summaries" => app.push(TuiEntryKind::System, format_summaries(runtime)),
-        "/compact" => {
-            let record = runtime.compact_messages(CompactionKind::Manual)?;
-            app.push(
-                TuiEntryKind::System,
-                format!(
-                    "compacted: omitted {} message(s), retained {} message(s)",
-                    record.omitted_messages, record.retained_messages
-                ),
-            );
+        _ if line.split_whitespace().next() == Some("/compact") => {
+            let focus = line.strip_prefix("/compact").unwrap_or_default().trim();
+            if compact_tui_context(app, surface, runtime, config, focus, offline).await? {
+                return Ok(true);
+            }
         }
         "/copy" => app.push(TuiEntryKind::System, copy_last_assistant_message(runtime)?),
         "/theme" => open_tui_selector(app, config, runtime, "theme", "")?,
@@ -5738,6 +5784,79 @@ fn format_tui_error(error: &anyhow::Error, runtime: &Runtime, config: &LoadedCon
     )
 }
 
+async fn compact_tui_context(
+    app: &mut TuiApp,
+    surface: &mut TuiSurface<'_>,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    focus: &str,
+    offline: bool,
+) -> Result<bool> {
+    let provider = provider_for_runtime(runtime, config, offline).await?;
+    let started = Instant::now();
+    let followups = FollowUpQueue::default();
+    for message in runtime.session().queued_messages.clone() {
+        followups.push(message);
+    }
+    let steering = steering_mailbox(config);
+    let queue_store = runtime.store().cloned();
+    let mut saved_queue = followups.list();
+    let mut quit = false;
+    let result = {
+        let compact = runtime.compact_messages(provider.as_ref(), CompactionKind::Manual, focus);
+        tokio::pin!(compact);
+        let mut tick = tokio::time::interval(Duration::from_millis(STREAM_RENDER_INTERVAL_MS));
+        loop {
+            tokio::select! {
+                result = &mut compact => break Ok(Some(result)),
+                _ = tick.tick() => {
+                    app.status = activity_status(started, &Activity::Compacting, followups.pending());
+                    if let Err(error) = redraw_tui(surface.terminal, app, config) { break Err(error); }
+                    let control = match drain_streaming_tui_events(surface, app, &followups, &steering, config) {
+                        Ok((_, control)) => control,
+                        Err(error) => break Err(error),
+                    };
+                    let pending = steering.list().into_iter().chain(followups.list()).collect::<Vec<_>>();
+                    if pending != saved_queue {
+                        if let Some(store) = &queue_store {
+                            if let Err(error) = store.record_queued_messages_snapshot(pending.clone()) { break Err(error.into()); }
+                        }
+                        saved_queue = pending;
+                    }
+                    if let Some(control) = control {
+                        quit = matches!(control, TurnControl::Quit);
+                        break Ok(None);
+                    }
+                }
+            }
+        }
+    };
+    runtime.replace_queued_messages(
+        steering
+            .drain()
+            .into_iter()
+            .chain(followups.drain())
+            .collect(),
+    )?;
+    app.status = footer_status(config, runtime, &app.editor_state);
+    match result? {
+        Some(Ok(record)) => app.push(
+            TuiEntryKind::System,
+            format!(
+                "compacted: omitted {} message(s), retained {} message(s)",
+                record.omitted_messages, record.retained_messages
+            ),
+        ),
+        Some(Err(error)) => app.push(TuiEntryKind::Error, error.to_string()),
+        None => app.push(
+            TuiEntryKind::System,
+            "compaction interrupted; original history retained",
+        ),
+    }
+    redraw_tui(surface.terminal, app, config)?;
+    Ok(quit)
+}
+
 async fn run_prompt_with_queue_tui(
     app: &mut TuiApp,
     surface: &mut TuiSurface<'_>,
@@ -5747,7 +5866,6 @@ async fn run_prompt_with_queue_tui(
     media: Vec<MediaInput>,
     offline: bool,
 ) -> Result<TurnControl> {
-    maybe_auto_compact(runtime, config, false)?;
     match run_prompt_once_tui(app, surface, runtime, config, prompt, media, offline).await? {
         TurnControl::Completed => {}
         control => return Ok(control),
@@ -5821,7 +5939,7 @@ async fn run_prompt_once_tui(
     );
     redraw_tui(surface.terminal, app, config)?;
     let provider = provider_for_runtime(runtime, config, offline).await?;
-    let message_start = runtime.session().messages.len();
+    let tool_start = runtime.session().tool_history.len();
     let steering = steering_mailbox(config);
     if kind == TuiEntryKind::Tool {
         let tool_prompt = prompt.clone();
@@ -5912,7 +6030,7 @@ async fn run_prompt_once_tui(
             } else {
                 app.drop_live_entry();
             }
-            insert_new_tool_messages(app, runtime, message_start, entry_index);
+            insert_new_tool_messages(app, runtime, tool_start, entry_index);
             let control = if matches!(stream_end, StreamEnd::Interrupted) {
                 app.push(TuiEntryKind::System, "interrupted");
                 TurnControl::Interrupted
@@ -5936,7 +6054,7 @@ async fn run_prompt_once_tui(
             } else {
                 app.drop_live_entry();
             }
-            insert_new_tool_messages(app, runtime, message_start, entry_index);
+            insert_new_tool_messages(app, runtime, tool_start, entry_index);
             redraw_tui(surface.terminal, app, config)?;
             return Err(error.into());
         }
@@ -5945,7 +6063,7 @@ async fn run_prompt_once_tui(
     if !saw_delta {
         app.replace_entry(entry_index, response);
     }
-    insert_new_tool_messages(app, runtime, message_start, entry_index);
+    insert_new_tool_messages(app, runtime, tool_start, entry_index);
     app.finish_live_entry();
     redraw_tui(surface.terminal, app, config)?;
     Ok(TurnControl::Completed)
@@ -5954,16 +6072,33 @@ async fn run_prompt_once_tui(
 fn insert_new_tool_messages(
     app: &mut TuiApp,
     runtime: &Runtime,
-    message_start: usize,
+    tool_start: usize,
     assistant_entry_index: usize,
 ) {
     let tool_messages = runtime
         .session()
-        .messages
+        .tool_history
         .iter()
-        .skip(message_start)
-        .filter(|message| message.role == MessageRole::Tool)
-        .map(format_model_tool_message)
+        .skip(tool_start)
+        .map(|event| {
+            if let Some(message) = runtime.session().messages.iter().find(|message| {
+                message.role == MessageRole::Tool
+                    && message.tool_call_id.as_deref() == Some(event.id.as_str())
+            }) {
+                format_model_tool_message(message)
+            } else {
+                format!(
+                    "{} {}\n\n{}",
+                    if event.is_error {
+                        "failed"
+                    } else {
+                        "completed"
+                    },
+                    event.name,
+                    event.result
+                )
+            }
+        })
         .collect::<Vec<_>>();
     for (offset, text) in tool_messages.into_iter().enumerate() {
         app.insert_entry(assistant_entry_index + offset, TuiEntryKind::Tool, text);
@@ -6145,28 +6280,6 @@ async fn run_prompt_media(
     offline: bool,
 ) -> Result<String> {
     run_prompt_once(runtime, config, prompt, media, offline, false).await
-}
-
-fn maybe_auto_compact(
-    runtime: &mut Runtime,
-    config: &LoadedConfig,
-    stream_output: bool,
-) -> Result<()> {
-    const AUTO_COMPACT_MESSAGE_LIMIT: usize = 24;
-    if !auto_compaction_enabled(config) {
-        return Ok(());
-    }
-    if runtime.session().messages.len() <= AUTO_COMPACT_MESSAGE_LIMIT {
-        return Ok(());
-    }
-    let record = runtime.compact_messages(CompactionKind::Automatic)?;
-    if stream_output && record.omitted_messages > 0 {
-        println!(
-            "auto-compacted: omitted {} message(s)",
-            record.omitted_messages
-        );
-    }
-    Ok(())
 }
 
 fn auto_compaction_enabled(config: &LoadedConfig) -> bool {
@@ -7725,6 +7838,7 @@ mod tests {
             id: "tool-1".into(),
             name: "read".into(),
             result: "contents".into(),
+            is_error: false,
         });
         let mut runtime = Runtime::new(session, ReloadableSystems::from_config(&config, 1));
         let before = runtime.session().clone();
@@ -8126,6 +8240,7 @@ mod tests {
     async fn provider_construction_tolerates_bound_account_without_matching_credential() {
         let mut config = account_test_config(AuthData::default());
         config.models.push(ModelDefinition {
+            context_window: None,
             provider: "faux".to_string(),
             id: "echo".to_string(),
             name: None,
@@ -8632,6 +8747,68 @@ mod tests {
     }
 
     #[test]
+    fn compaction_progress_keeps_live_entries_and_uses_audit_history_after_context_shrinks() {
+        let mut app = TuiApp::default();
+        let thinking = app.entries.len();
+        app.entries.push(TuiEntry {
+            kind: TuiEntryKind::Thinking,
+            text: String::new(),
+        });
+        let entry = app.push_placeholder(TuiEntryKind::Assistant, "Working...");
+        let mut activity = Activity::Waiting;
+        let mut saw_delta = false;
+        apply_turn_event(
+            &mut app,
+            entry,
+            thinking,
+            &mut saw_delta,
+            &mut activity,
+            &TurnEvent::CompactionStarted,
+        );
+        assert!(activity_status(Instant::now(), &activity, 0).contains("compacting"));
+        apply_turn_event(
+            &mut app,
+            entry,
+            thinking,
+            &mut saw_delta,
+            &mut activity,
+            &TurnEvent::CompactionFinished(pi_core::CompactionRecord {
+                kind: CompactionKind::Automatic,
+                omitted_messages: 100,
+                retained_messages: 2,
+                summary: "checkpoint".into(),
+            }),
+        );
+        apply_turn_event(
+            &mut app,
+            entry,
+            thinking,
+            &mut saw_delta,
+            &mut activity,
+            &TurnEvent::Provider(StreamEvent::Text("done".into())),
+        );
+        assert_eq!(app.entries[entry].text, "done");
+        assert_eq!(app.live_entry_index, Some(entry));
+        let mut session = SessionState::new("audit", PathBuf::from("."));
+        session.tool_history.push(pi_core::ToolEvent {
+            id: "old".into(),
+            name: "read".into(),
+            result: "old".into(),
+            is_error: false,
+        });
+        session.tool_history.push(pi_core::ToolEvent {
+            id: "new".into(),
+            name: "bash".into(),
+            result: "test failed".into(),
+            is_error: true,
+        });
+        let runtime = Runtime::new(session, ReloadableSystems::default());
+        insert_new_tool_messages(&mut app, &runtime, 1, entry);
+        assert_eq!(app.entries[entry].text, "failed bash\n\ntest failed");
+        assert_eq!(app.entries[entry + 1].text, "done");
+    }
+
+    #[test]
     fn activity_status_shows_phase_and_pending_followups() {
         let started = Instant::now();
         let waiting = activity_status(started, &Activity::Waiting, 0);
@@ -8875,9 +9052,15 @@ mod tests {
             tool_name: None,
             tool_calls: Vec::new(),
         });
+        session.tool_history.push(pi_core::ToolEvent {
+            id: "call_1".into(),
+            name: "read".into(),
+            result: "file contents".into(),
+            is_error: false,
+        });
         let runtime = Runtime::new(session, ReloadableSystems::default());
 
-        insert_new_tool_messages(&mut app, &runtime, 1, assistant_index);
+        insert_new_tool_messages(&mut app, &runtime, 0, assistant_index);
 
         assert_eq!(app.entries[1].kind, TuiEntryKind::Tool);
         assert_eq!(app.entries[1].text, "completed read\nfile contents");
@@ -9347,6 +9530,7 @@ mod tests {
 
     fn test_model(provider: &str, id: &str) -> ModelDefinition {
         ModelDefinition {
+            context_window: None,
             provider: provider.to_string(),
             id: id.to_string(),
             name: None,
