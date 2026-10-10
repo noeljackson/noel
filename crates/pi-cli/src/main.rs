@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
@@ -10,9 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod clipboard;
 mod oauth_login;
 mod oauth_refresh;
+mod transcript_view;
 mod usage;
+use transcript_view::TranscriptView;
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
@@ -22,12 +26,16 @@ use clap::{Parser, ValueEnum};
 use crossterm::{
     cursor::MoveTo,
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, Clear as TerminalClear, ClearType},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear as TerminalClear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use pi_ai::{
     anthropic_supports_adaptive_thinking, create_provider, generate_images,
@@ -46,11 +54,12 @@ use pi_config::{
     DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR, MODEL_CACHE_VERSION,
 };
 use pi_core::{
-    default_active_tool_names, format_todo_list, run_excluded_bash, run_user_turn,
-    run_user_turn_streaming, run_user_turn_streaming_events_with_media,
-    run_user_turn_streaming_with_media, write_session_export, AgentError, CompactionKind,
-    ConversationMessage, FollowUpQueue, MessageRole, ReloadableSystems, Runtime, SessionState,
-    SessionStore, SteeringMailbox, SteeringMode, TodoItem, TodoStatus, TurnEvent,
+    continue_turn_streaming_events, default_active_tool_names, format_todo_list,
+    run_excluded_bash_result, run_user_turn, run_user_turn_streaming,
+    run_user_turn_streaming_events_with_media, run_user_turn_streaming_with_media,
+    write_session_export, AgentError, CompactionKind, ConversationMessage, FollowUpQueue,
+    MessageRole, ReloadReport, ReloadableSystems, Runtime, SessionState, SessionStore,
+    SteeringMailbox, TodoItem, TodoStatus, TurnEvent, STEERING_JOIN,
 };
 use pi_tui::{
     parse_theme_color, EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector,
@@ -58,15 +67,17 @@ use pi_tui::{
     BUILTIN_THEMES,
 };
 use ratatui::{
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Widget, Wrap},
     Frame, Terminal, TerminalOptions, Viewport,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum OutputMode {
@@ -187,6 +198,10 @@ struct Cli {
 
     #[arg(long)]
     no_approve: bool,
+
+    /// Use native inline scrollback instead of the fixed-composer owned screen.
+    #[arg(long)]
+    no_alt_screen: bool,
 
     #[arg(long)]
     offline: bool,
@@ -1301,7 +1316,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let systems = ReloadableSystems::from_config(&config, 1);
+    let mut systems = ReloadableSystems::from_config(&config, 1);
+    systems.offline = offline;
     let mut runtime = create_runtime(&cli, &cwd, &config, systems)?;
     select_initial_model(&mut runtime, &config, &cli)?;
     if cli.no_tools || cli.no_builtin_tools {
@@ -1367,7 +1383,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_interactive(runtime, config, offline).await
+    run_interactive(runtime, config, offline, !cli.no_alt_screen).await
 }
 
 async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) -> Result<()> {
@@ -1693,81 +1709,147 @@ fn model_cache_needs_refresh(path: &Path, ttl_hours: u64) -> bool {
     let Ok(Some(cache)) = read_model_cache(path) else {
         return true;
     };
+    model_cache_is_stale(&cache, unix_seconds(), ttl_hours)
+}
+
+fn model_cache_is_stale(cache: &ModelCache, now: Option<u64>, ttl_hours: u64) -> bool {
     if cache.version < MODEL_CACHE_VERSION {
         return true;
     }
-    let Some(now) = unix_seconds() else {
+    let Some(now) = now else {
         return true;
     };
     let ttl_seconds = ttl_hours.saturating_mul(60 * 60);
     now.saturating_sub(cache.refreshed_at) >= ttl_seconds
 }
 
-async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> Result<()> {
-    let mut refreshed_providers = BTreeSet::new();
-    let mut refreshed_models = Vec::new();
-    let mut diagnostics = Vec::new();
+/// Outcome of one model-cache refresh pass. Fetch results are recorded per
+/// provider so callers can report exactly what happened instead of guessing
+/// from the cache contents.
+#[derive(Debug, Default, Clone)]
+struct ModelRefreshReport {
+    /// Providers whose cached lists were replaced, with fetched model counts.
+    refreshed: Vec<(String, usize)>,
+    refreshed_providers: BTreeSet<String>,
+    refreshed_models: Vec<ModelDefinition>,
+    /// Providers that returned an empty list while cached models exist; the
+    /// cached models were deliberately kept instead of being wiped.
+    kept_cached: Vec<String>,
+    /// Providers (or aux fetches) that failed, with the error text.
+    failed: Vec<(String, String)>,
+    claude_code_version: Option<String>,
+}
+
+impl ModelRefreshReport {
+    fn record(
+        &mut self,
+        provider: &str,
+        existing: Option<&ModelCache>,
+        result: Result<Vec<ModelDefinition>>,
+    ) {
+        let models = match result {
+            Ok(models) => models,
+            Err(error) => {
+                self.failed
+                    .push((provider.to_string(), format!("{error:#}")));
+                return;
+            }
+        };
+        // An empty "success" is almost always a truncated or degraded
+        // listing. Replacing the provider's cached models with nothing is how
+        // newer models silently disappear, so keep the cache as-is.
+        if models.is_empty() {
+            let cached = existing
+                .map(|cache| {
+                    cache
+                        .models
+                        .iter()
+                        .filter(|model| model.provider == provider)
+                        .count()
+                })
+                .unwrap_or(0);
+            if cached > 0 {
+                self.kept_cached.push(provider.to_string());
+            } else {
+                self.failed
+                    .push((provider.to_string(), "returned no models".to_string()));
+            }
+            return;
+        }
+        self.refreshed.push((provider.to_string(), models.len()));
+        self.refreshed_providers.insert(provider.to_string());
+        self.refreshed_models.extend(models);
+    }
+
+    fn diagnostics(&self) -> Vec<String> {
+        let mut diagnostics = self
+            .kept_cached
+            .iter()
+            .map(|provider| {
+                format!("{provider} model refresh returned an empty list; kept cached models")
+            })
+            .collect::<Vec<_>>();
+        diagnostics.extend(
+            self.failed
+                .iter()
+                .map(|(provider, error)| format!("{provider} model refresh failed: {error}")),
+        );
+        diagnostics
+    }
+
+    fn nothing_happened(&self) -> bool {
+        self.refreshed.is_empty()
+            && self.kept_cached.is_empty()
+            && self.failed.is_empty()
+            && self.claude_code_version.is_none()
+    }
+}
+
+async fn refresh_model_cache(
+    paths: ConfigPaths,
+    auth: pi_config::AuthData,
+) -> Result<ModelRefreshReport> {
+    let mut report = ModelRefreshReport::default();
+    let cached_at_start = read_model_cache(&paths.model_cache_path).ok().flatten();
 
     if let Some(auth) = auth_for_provider(&auth, "anthropic", None) {
-        match fetch_anthropic_models(auth).await {
-            Ok(models) => {
-                refreshed_providers.insert("anthropic".to_string());
-                refreshed_models.extend(models);
-            }
-            Err(error) => diagnostics.push(format!("anthropic model refresh failed: {error}")),
-        }
+        let result = fetch_anthropic_models(auth).await;
+        report.record("anthropic", cached_at_start.as_ref(), result);
     }
 
     match auth_for_provider(&auth, "openai", None) {
         Some(ResolvedAuth::ApiKey(api_key)) => {
-            match fetch_openai_api_models(
+            let result = fetch_openai_api_models(
                 "openai",
                 ConfigProviderApi::OpenAiResponses,
                 None,
                 OPENAI_MODELS_URL,
                 &api_key,
             )
-            .await
-            {
-                Ok(models) => {
-                    refreshed_providers.insert("openai".to_string());
-                    refreshed_models.extend(models);
-                }
-                Err(error) => diagnostics.push(format!("openai model refresh failed: {error}")),
-            }
+            .await;
+            report.record("openai", cached_at_start.as_ref(), result);
         }
         Some(ResolvedAuth::ChatGptOAuth {
             access_token,
             account_id,
             ..
         }) => {
-            match fetch_chatgpt_backend_models(
+            let result = fetch_chatgpt_backend_models(
                 "openai",
                 ConfigProviderApi::OpenAiResponses,
                 None,
                 &access_token,
                 account_id.as_deref(),
             )
-            .await
-            {
-                Ok(models) => {
-                    refreshed_providers.insert("openai".to_string());
-                    refreshed_models.extend(models);
-                }
-                Err(error) => diagnostics.push(format!("openai model refresh failed: {error}")),
-            }
+            .await;
+            report.record("openai", cached_at_start.as_ref(), result);
         }
         _ => {}
     }
 
     if let Some(auth) = auth_for_provider(&auth, "openai-codex", None) {
-        match fetch_codex_models(auth).await {
-            Ok(models) => {
-                refreshed_providers.insert("openai-codex".to_string());
-                refreshed_models.extend(models);
-            }
-            Err(error) => diagnostics.push(format!("openai-codex model refresh failed: {error}")),
-        }
+        let result = fetch_codex_models(auth).await;
+        report.record("openai-codex", cached_at_start.as_ref(), result);
     }
 
     for (provider, base_url) in [
@@ -1780,24 +1862,17 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
             continue;
         };
         let models_url = format!("{base_url}/models");
-        match fetch_openai_api_models(
+        let result = fetch_openai_api_models(
             provider,
             ConfigProviderApi::OpenAi,
             Some(base_url.to_string()),
             &models_url,
             &api_key,
         )
-        .await
-        {
-            Ok(models) => {
-                refreshed_providers.insert(provider.to_string());
-                refreshed_models.extend(models);
-            }
-            Err(error) => diagnostics.push(format!("{provider} model refresh failed: {error}")),
-        }
+        .await;
+        report.record(provider, cached_at_start.as_ref(), result);
     }
 
-    let mut claude_code_version = None;
     if matches!(
         auth_for_provider(&auth, "anthropic", None),
         Some(ResolvedAuth::ClaudeCodeOAuth { .. })
@@ -1805,44 +1880,133 @@ async fn refresh_model_cache(paths: ConfigPaths, auth: pi_config::AuthData) -> R
         match fetch_latest_claude_code_version().await {
             Ok(version) => {
                 set_claude_code_version(&version);
-                claude_code_version = Some(version);
+                report.claude_code_version = Some(version);
             }
             Err(error) => {
-                diagnostics.push(format!("claude code version check failed: {error}"));
+                report.failed.push((
+                    "claude-code".to_string(),
+                    format!("version check failed: {error}"),
+                ));
             }
         }
     }
 
-    if refreshed_providers.is_empty() && diagnostics.is_empty() {
-        return Ok(());
-    }
+    report.refreshed.sort();
+    // Re-read right before writing so a refresh that finished concurrently
+    // does not clobber models another process just cached.
+    let existing = read_model_cache(&paths.model_cache_path).ok().flatten();
+    let Some(next) = next_model_cache(existing.as_ref(), &report, unix_seconds()) else {
+        return Ok(report);
+    };
+    write_model_cache(&paths.model_cache_path, &next)?;
+    Ok(report)
+}
 
-    let existing = read_model_cache(&paths.model_cache_path)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let existing_refreshed_at = existing.refreshed_at;
-    let existing_claude_code_version = existing.claude_code_version.clone();
-    let mut models = existing
-        .models
-        .into_iter()
-        .filter(|model| !refreshed_providers.contains(&model.provider))
-        .collect::<Vec<_>>();
-    models.extend(refreshed_models);
-    write_model_cache(
-        &paths.model_cache_path,
-        &ModelCache {
-            refreshed_at: unix_seconds().unwrap_or(existing_refreshed_at),
-            version: MODEL_CACHE_VERSION,
-            models,
-            diagnostics: Vec::new(),
-            claude_code_version: claude_code_version.or(existing_claude_code_version),
-        },
-    )?;
-    if !diagnostics.is_empty() {
-        return Err(anyhow!(diagnostics.join("; ")));
+/// Builds the next cache contents from a refresh report. Returning `None`
+/// means there is nothing worth writing (no auth for any refreshable
+/// provider). When every fetch failed, the previous `refreshedAt` is kept so
+/// the cache stays stale and the next startup retries instead of waiting out
+/// another full TTL.
+fn next_model_cache(
+    existing: Option<&ModelCache>,
+    report: &ModelRefreshReport,
+    now: Option<u64>,
+) -> Option<ModelCache> {
+    let existing_refreshed_at = existing.map(|cache| cache.refreshed_at).unwrap_or(0);
+    let existing_version = existing.map(|cache| cache.version).unwrap_or(0);
+    if report.refreshed_providers.is_empty() {
+        if report.nothing_happened() {
+            return None;
+        }
+        return Some(ModelCache {
+            // Keep refreshedAt and version stale so the next startup retries
+            // instead of waiting out another full TTL.
+            refreshed_at: existing_refreshed_at,
+            version: existing_version,
+            models: existing
+                .map(|cache| cache.models.clone())
+                .unwrap_or_default(),
+            diagnostics: report.diagnostics(),
+            claude_code_version: report
+                .claude_code_version
+                .clone()
+                .or_else(|| existing.and_then(|cache| cache.claude_code_version.clone())),
+        });
     }
-    Ok(())
+    let mut models = existing
+        .map(|cache| cache.models.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|model| !report.refreshed_providers.contains(&model.provider))
+        .collect::<Vec<_>>();
+    models.extend(report.refreshed_models.iter().cloned());
+    Some(ModelCache {
+        refreshed_at: now.unwrap_or(existing_refreshed_at),
+        version: MODEL_CACHE_VERSION,
+        models,
+        diagnostics: report.diagnostics(),
+        claude_code_version: report
+            .claude_code_version
+            .clone()
+            .or_else(|| existing.and_then(|cache| cache.claude_code_version.clone())),
+    })
+}
+
+/// Removes the model cache so the next refresh starts from built-in models
+/// plus explicit `models.json` entries only. Durable session state is
+/// untouched; a bad cache entry disappears immediately.
+fn reset_model_cache(path: &Path) -> Result<String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok("model cache cleared".to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok("model cache already clear".to_string())
+        }
+        Err(error) => Err(anyhow!("remove {}: {error}", path.display())),
+    }
+}
+
+fn format_model_refresh_report(report: &ModelRefreshReport, config: &LoadedConfig) -> String {
+    let mut lines = Vec::new();
+    if report.refreshed.is_empty() {
+        lines.push("no provider model lists refreshed".to_string());
+    } else {
+        let refreshed = report
+            .refreshed
+            .iter()
+            .map(|(provider, count)| format!("{provider} ({count} models)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("refreshed: {refreshed}"));
+    }
+    if !report.kept_cached.is_empty() {
+        lines.push(format!(
+            "kept cached models after empty response: {}",
+            report.kept_cached.join(", ")
+        ));
+    }
+    if !report.failed.is_empty() {
+        let failed = report
+            .failed
+            .iter()
+            .map(|(provider, error)| format!("{provider}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        lines.push(format!("failed: {failed}"));
+    }
+    lines.push(format!("{} models available", config.models.len()));
+    lines.join("\n")
+}
+
+fn format_model_refresh_after_reload(
+    report: &ModelRefreshReport,
+    config: &LoadedConfig,
+    reload_report: &ReloadReport,
+) -> String {
+    let mut output = format_model_refresh_report(report, config);
+    if !reload_report.active_model_valid {
+        output.push_str("\nactive model is no longer available; use /model <provider/model>");
+    }
+    output
 }
 
 #[derive(Debug, Deserialize)]
@@ -1908,7 +2072,11 @@ async fn fetch_anthropic_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinitio
             None => return Ok(models),
         }
     }
-    Ok(models)
+    // Returning the partial list would replace the cache with a truncated
+    // set, so treat an exhausted page budget as a failure and keep the cache.
+    Err(anyhow!(
+        "pagination exceeded {ANTHROPIC_MODELS_MAX_PAGES} pages"
+    ))
 }
 
 const CLAUDE_CODE_NPM_LATEST_URL: &str =
@@ -2285,8 +2453,21 @@ fn load_media_input(cwd: &Path, path: &Path, config: &LoadedConfig) -> Result<Me
     } else {
         cwd.join(path)
     };
-    let mut bytes = fs::read(&path)?;
-    let mut mime_type = media_mime_type(&path)?;
+    let bytes = fs::read(&path)?;
+    media_input_from_bytes(
+        bytes,
+        media_mime_type(&path)?,
+        Some(path.display().to_string()),
+        config,
+    )
+}
+
+fn media_input_from_bytes(
+    mut bytes: Vec<u8>,
+    mut mime_type: String,
+    path: Option<String>,
+    config: &LoadedConfig,
+) -> Result<MediaInput> {
     if images_auto_resize(config) {
         if let Some(resized) = resize_image_if_needed(&bytes, &mime_type)? {
             bytes = resized.bytes;
@@ -2297,10 +2478,48 @@ fn load_media_input(cwd: &Path, path: &Path, config: &LoadedConfig) -> Result<Me
     Ok(MediaInput {
         mime_type,
         data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        path: Some(path.display().to_string()),
+        path,
         width,
         height,
     })
+}
+
+fn clipboard_media(bytes: Vec<u8>, config: &LoadedConfig) -> Result<MediaInput> {
+    if images_blocked(config) {
+        return Err(anyhow!("images are blocked by settings"));
+    }
+    let format = image::guess_format(&bytes)?;
+    let mime = match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        _ => return Err(anyhow!("unsupported clipboard image format")),
+    };
+    // Validate dimensions/pixels before attaching arbitrary clipboard bytes.
+    let mut reader = image::ImageReader::with_format(Cursor::new(&bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode()?;
+    media_input_from_bytes(bytes, mime.into(), None, config)
+}
+
+async fn paste_clipboard_image(app: &mut TuiApp, config: &LoadedConfig) {
+    if images_blocked(config) {
+        app.push(TuiEntryKind::Error, "images are blocked by settings");
+        return;
+    }
+    match clipboard::image_bytes()
+        .await
+        .and_then(|bytes| clipboard_media(bytes, config))
+    {
+        Ok(media) => app.input_media.push(media),
+        Err(error) => app.push(TuiEntryKind::Error, format!("clipboard paste: {error}")),
+    }
+    app.quit_armed_since = None;
 }
 
 const MAX_AUTO_RESIZE_IMAGE_DIMENSION: u32 = 2000;
@@ -2482,6 +2701,21 @@ fn create_runtime(
     Ok(Runtime::with_store(state, systems, store))
 }
 
+/// Start fresh conversation state without changing the current selections.
+/// Persist them before replacing the runtime so reopen/resume agrees with the UI.
+fn start_new_session(runtime: &mut Runtime, config: &LoadedConfig) -> Result<()> {
+    let (store, mut state) =
+        SessionStore::create(&config.paths.session_dir, runtime.session().cwd.clone())?;
+    state.active_model = runtime.session().active_model.clone();
+    state.active_thinking_level = runtime.session().active_thinking_level.clone();
+    state.active_account = runtime.session().active_account.clone();
+    store.record_active_model(state.active_model.clone())?;
+    store.record_active_thinking_level(state.active_thinking_level.clone())?;
+    store.record_active_account(state.active_account.clone())?;
+    runtime.replace_session(state, Some(store));
+    Ok(())
+}
+
 fn resolve_session_reference(session_dir: &Path, reference: &str) -> Result<PathBuf> {
     SessionStore::resolve(session_dir, reference)?
         .ok_or_else(|| anyhow!("session not found or ambiguous: {reference}"))
@@ -2563,27 +2797,61 @@ async fn run_interactive(
     mut runtime: Runtime,
     mut config: LoadedConfig,
     offline: bool,
+    owned_screen: bool,
 ) -> Result<()> {
     let mut app = TuiApp::new(&config, &runtime);
+    app.owned_screen = owned_screen;
     if let Some(hint) = resume_hint(&runtime) {
         app.push(TuiEntryKind::System, hint);
     }
     let mut auto_restart = AutoRestart::from_env();
     enable_raw_mode()?;
+    // Install restoration before any fallible terminal setup.
+    let _restore = TerminalRestore { owned_screen };
+    if owned_screen {
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    }
     execute!(io::stdout(), EnableBracketedPaste)?;
     let _ = execute!(
         io::stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
-    let _restore = TerminalRestore;
     let mut viewport_height = terminal_viewport_height();
-    let mut terminal = new_tui_terminal(viewport_height)?;
+    let mut terminal = new_tui_terminal(viewport_height, owned_screen)?;
     terminal.clear()?;
 
     let mut restart = false;
     loop {
         app.refresh_chrome(&config, &runtime);
         redraw_tui(&mut terminal, &mut app, &config)?;
+        // Only schedule once per open/resume, never on every idle tick after
+        // an error or explicit interruption. Use the ordinary live turn UI.
+        if std::mem::take(&mut app.resume_pending) && runtime.session().has_unfinished_turn() {
+            let result = resume_turn_with_queue_tui(
+                &mut app,
+                &mut TuiSurface {
+                    terminal: &mut terminal,
+                    viewport_height: &mut viewport_height,
+                },
+                &mut runtime,
+                &config,
+                offline,
+            )
+            .await;
+            match result {
+                Ok(TurnControl::Quit) => break,
+                Ok(_) => {}
+                Err(error) => {
+                    app.drop_live_entry();
+                    app.push(
+                        TuiEntryKind::Error,
+                        format_tui_error(&error, &runtime, &config),
+                    );
+                }
+            }
+            app.refresh_diff_panel(&runtime);
+            continue;
+        }
         // Input wins over a pending restart so quit keys are honored even
         // while the dogfood watcher is rebuilding continuously.
         if event::poll(Duration::from_millis(100))? {
@@ -2603,7 +2871,8 @@ async fn run_interactive(
                     .await?
                 }
                 Event::Mouse(mouse) => {
-                    let _ = mouse;
+                    handle_transcript_mouse(mouse, &mut app);
+                    copy_pending_selection(&mut app).await;
                     false
                 }
                 Event::Paste(text) => {
@@ -2611,7 +2880,7 @@ async fn run_interactive(
                     false
                 }
                 Event::Resize(_, _) => {
-                    resize_tui_viewport(&mut terminal, &mut viewport_height)?;
+                    resize_tui_viewport(&mut terminal, &mut viewport_height, app.owned_screen)?;
                     false
                 }
                 _ => false,
@@ -2621,7 +2890,9 @@ async fn run_interactive(
             }
             continue;
         }
-        if auto_restart.should_restart()? {
+        // An error/interruption must not become an automatic retry loop just
+        // because a rebuild is pending. Restart at a completed boundary.
+        if !runtime.session().has_unfinished_turn() && auto_restart.should_restart()? {
             app.push(TuiEntryKind::System, "rebuilt; restarting");
             redraw_tui(&mut terminal, &mut app, &config)?;
             restart = true;
@@ -2644,24 +2915,21 @@ async fn run_interactive(
     Ok(())
 }
 
-/// Startup note for resumed sessions whose last turn was cut off (the
-/// conversation ends at a tool result) or that still hold queued follow-ups.
+/// Infer unfinished model work, not its stop reason. Direct slash-tool
+/// results have no call id and complete their turn without an assistant reply.
 fn resume_hint(runtime: &Runtime) -> Option<String> {
     let queued = runtime.session().queued_messages.len();
-    let mid_turn = matches!(
-        runtime.session().messages.last(),
-        Some(message) if message.role == MessageRole::Tool
-    );
+    let mid_turn = runtime.session().has_unfinished_turn();
     match (mid_turn, queued) {
         (false, 0) => None,
         (true, 0) => {
-            Some("resumed mid-turn; send a prompt to pick up where it stopped".to_string())
+            Some("resumed mid-turn; continuing automatically from saved context".to_string())
         }
         (false, n) => Some(format!(
             "{n} queued message(s) pending; they run after your next prompt (/queue to list, /queue-clear to clear)"
         )),
         (true, n) => Some(format!(
-            "resumed mid-turn with {n} queued message(s) pending; send a prompt to continue"
+            "resumed mid-turn; continuing automatically from saved context, then {n} queued message(s)"
         )),
     }
 }
@@ -2767,13 +3035,18 @@ fn strip_restart_model_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsS
     output
 }
 
-struct TerminalRestore;
+struct TerminalRestore {
+    owned_screen: bool,
+}
 
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = execute!(io::stdout(), DisableBracketedPaste);
+        if self.owned_screen {
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        }
+        let _ = disable_raw_mode();
     }
 }
 
@@ -2996,7 +3269,11 @@ fn normalized_thinking_level(level: &str) -> Option<&'static str> {
 #[derive(Debug, Default)]
 struct TuiApp {
     entries: Vec<TuiEntry>,
+    transcript_scrollback: TranscriptScrollback,
+    owned_screen: bool,
+    transcript_view: RefCell<TranscriptView>,
     input: String,
+    input_media: Vec<MediaInput>,
     input_cursor: usize,
     quit_armed_since: Option<Instant>,
     editor_state: EditorState,
@@ -3009,13 +3286,53 @@ struct TuiApp {
     show_hardware_cursor: bool,
     live_entry_index: Option<usize>,
     history_cursor: Option<usize>,
-    history_draft: Option<String>,
-    history_draft_typed_newlines: Option<Vec<usize>>,
-    typed_input_newlines: Vec<usize>,
+    history_draft: Option<InputDraft>,
+    input_pastes: Vec<CollapsedPaste>,
+    next_paste_id: usize,
     todos: Vec<TodoItem>,
     todos_expanded: bool,
+    previews_expanded: bool,
+    live_thinking_index: Option<usize>,
+    live_tool_indices: Vec<usize>,
+    queued_messages: Vec<String>,
+    turn_running: bool,
+    /// True once the running turn has made a tool call; a prose-only turn
+    /// has no interior round boundary, so ctrl+s steering only lands after
+    /// the response finishes and the hint must not promise a boundary.
+    turn_saw_tools: bool,
+    resume_pending: bool,
     diff_panel: Option<DiffPanelState>,
 }
+
+// Paste ranges refer to the full input, never to marker text. Submission,
+// queues, history, and external editors therefore always receive real text.
+#[derive(Debug, Clone)]
+struct CollapsedPaste {
+    start: usize,
+    end: usize,
+    id: usize,
+    lines: usize,
+}
+
+impl CollapsedPaste {
+    fn marker(&self) -> String {
+        format!(
+            "[paste #{} +{} {}]",
+            self.id,
+            self.lines,
+            if self.lines == 1 { "line" } else { "lines" }
+        )
+    }
+}
+
+#[derive(Debug)]
+struct InputDraft {
+    text: String,
+    cursor: usize,
+    pastes: Vec<CollapsedPaste>,
+}
+
+const LARGE_PASTE_CHARS: usize = 1_000;
 
 #[derive(Debug)]
 struct DiffPanelState {
@@ -3042,6 +3359,7 @@ struct DiffDetail {
 impl TuiApp {
     fn new(config: &LoadedConfig, runtime: &Runtime) -> Self {
         let mut app = Self {
+            resume_pending: runtime.session().has_unfinished_turn(),
             status: "Ready".to_string(),
             ..Self::default()
         };
@@ -3097,6 +3415,7 @@ impl TuiApp {
         }
         self.show_hardware_cursor = config.settings.show_hardware_cursor.unwrap_or(true);
         self.todos = runtime.session().todos.clone();
+        self.queued_messages = runtime.session().queued_messages.clone();
     }
 
     fn refresh_diff_panel(&mut self, runtime: &Runtime) {
@@ -3119,6 +3438,14 @@ impl TuiApp {
     fn push(&mut self, kind: TuiEntryKind, text: impl Into<String>) {
         let text = text.into();
         if !text.trim().is_empty() {
+            // Expansion is for inspecting existing output, not an opt-in to
+            // dump every tool result from subsequent prompts onto the screen.
+            if kind == TuiEntryKind::User {
+                self.previews_expanded = false;
+            }
+            self.transcript_view
+                .get_mut()
+                .invalidate(self.entries.len());
             self.entries.push(TuiEntry { kind, text });
         }
     }
@@ -3135,11 +3462,14 @@ impl TuiApp {
                 MessageRole::System => TuiEntryKind::System,
             };
             let text = if message.role == MessageRole::Tool {
-                format_model_tool_message(message)
+                format_session_tool_message(message, runtime)
             } else {
                 message.content.clone()
             };
             self.push(kind, text);
+            for media in &message.media {
+                self.push(TuiEntryKind::System, format_media_fallback(media));
+            }
             if message.role == MessageRole::User {
                 self.editor_state.record_history(message.content.clone());
             }
@@ -3154,15 +3484,18 @@ impl TuiApp {
         let next = match self.history_cursor {
             Some(cursor) => cursor.saturating_sub(1),
             None => {
-                self.history_draft = Some(self.input.clone());
-                self.history_draft_typed_newlines = Some(self.typed_input_newlines.clone());
+                self.history_draft = Some(InputDraft {
+                    text: self.input.clone(),
+                    cursor: self.input_cursor,
+                    pastes: self.input_pastes.clone(),
+                });
                 history.len().saturating_sub(1)
             }
         };
         self.history_cursor = Some(next);
         self.input = history[next].clone();
         self.input_cursor = self.input.len();
-        self.typed_input_newlines = newline_offsets(&self.input);
+        self.input_pastes.clear();
     }
 
     fn history_next(&mut self) {
@@ -3174,12 +3507,17 @@ impl TuiApp {
             let next = cursor + 1;
             self.history_cursor = Some(next);
             self.input = history[next].clone();
-            self.typed_input_newlines = newline_offsets(&self.input);
+            self.input_pastes.clear();
         } else {
             self.history_cursor = None;
-            self.input = self.history_draft.take().unwrap_or_default();
-            self.typed_input_newlines =
-                self.history_draft_typed_newlines.take().unwrap_or_default();
+            if let Some(draft) = self.history_draft.take() {
+                self.input = draft.text;
+                self.input_cursor = draft.cursor;
+                self.input_pastes = draft.pastes;
+                return;
+            }
+            self.input.clear();
+            self.input_pastes.clear();
         }
         self.input_cursor = self.input.len();
     }
@@ -3187,11 +3525,42 @@ impl TuiApp {
     fn reset_history_navigation(&mut self) {
         self.history_cursor = None;
         self.history_draft = None;
-        self.history_draft_typed_newlines = None;
     }
 
     fn paste_text(&mut self, text: &str) {
-        self.insert_input_str(text);
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let start = self.input_cursor;
+        self.insert_input_str(&text);
+        if text.contains('\n') || text.chars().count() > LARGE_PASTE_CHARS {
+            self.next_paste_id += 1;
+            self.input_pastes.push(CollapsedPaste {
+                start,
+                end: self.input_cursor,
+                id: self.next_paste_id,
+                lines: text.lines().count().max(1),
+            });
+            self.input_pastes.sort_by_key(|paste| paste.start);
+        }
+    }
+
+    fn display_input(&self) -> (String, usize) {
+        let mut display = String::new();
+        let mut source_start = 0;
+        let mut cursor = None;
+        for paste in &self.input_pastes {
+            if cursor.is_none() && self.input_cursor <= paste.start {
+                cursor = Some(display.len() + self.input_cursor - source_start);
+            }
+            display.push_str(&self.input[source_start..paste.start]);
+            display.push_str(&paste.marker());
+            if cursor.is_none() && self.input_cursor < paste.end {
+                cursor = Some(display.len());
+            }
+            source_start = paste.end;
+        }
+        let cursor = cursor.unwrap_or_else(|| display.len() + self.input_cursor - source_start);
+        display.push_str(&self.input[source_start..]);
+        (display, cursor)
     }
 
     fn insert_input_str(&mut self, text: &str) {
@@ -3201,11 +3570,16 @@ impl TuiApp {
         let cursor = self.input_cursor;
         self.input.insert_str(cursor, text);
         let inserted = text.len();
-        for offset in &mut self.typed_input_newlines {
-            if *offset >= cursor {
-                *offset += inserted;
+        self.input_pastes.retain_mut(|paste| {
+            if paste.start < cursor && cursor < paste.end {
+                return false;
             }
-        }
+            if paste.start >= cursor {
+                paste.start += inserted;
+                paste.end += inserted;
+            }
+            true
+        });
         self.input_cursor += inserted;
         self.reset_history_navigation();
     }
@@ -3214,7 +3588,7 @@ impl TuiApp {
     fn set_input(&mut self, value: impl Into<String>) {
         self.input = value.into();
         self.input_cursor = self.input.len();
-        self.typed_input_newlines.clear();
+        self.input_pastes.clear();
         self.reset_history_navigation();
     }
 
@@ -3224,19 +3598,49 @@ impl TuiApp {
     }
 
     fn pop_input_char(&mut self) {
-        let Some((offset, ch)) = self.input[..self.input_cursor].char_indices().next_back() else {
-            self.reset_history_navigation();
-            return;
-        };
-        let removed = ch.len_utf8();
-        self.input.drain(offset..offset + removed);
-        self.input_cursor = offset;
-        self.typed_input_newlines.retain_mut(|newline| {
-            if ch == '\n' && *newline == offset {
+        let start = self
+            .input_pastes
+            .iter()
+            .find(|paste| paste.end == self.input_cursor)
+            .map(|paste| paste.start)
+            .or_else(|| {
+                self.input[..self.input_cursor]
+                    .grapheme_indices(true)
+                    .next_back()
+                    .map(|(offset, _)| offset)
+            });
+        if let Some(start) = start {
+            self.remove_input_range(start, self.input_cursor);
+        }
+    }
+
+    fn delete_input_char(&mut self) {
+        let end = self
+            .input_pastes
+            .iter()
+            .find(|paste| paste.start == self.input_cursor)
+            .map(|paste| paste.end)
+            .or_else(|| {
+                self.input[self.input_cursor..]
+                    .graphemes(true)
+                    .next()
+                    .map(|grapheme| self.input_cursor + grapheme.len())
+            });
+        if let Some(end) = end {
+            self.remove_input_range(self.input_cursor, end);
+        }
+    }
+
+    fn remove_input_range(&mut self, start: usize, end: usize) {
+        self.input.drain(start..end);
+        self.input_cursor = start;
+        self.input_pastes.retain_mut(|paste| {
+            if paste.start < end && paste.end > start {
                 return false;
             }
-            if *newline > offset {
-                *newline -= removed;
+            if paste.start >= end {
+                paste.start -= end - start;
+                paste.end -= end - start;
             }
             true
         });
@@ -3244,58 +3648,79 @@ impl TuiApp {
     }
 
     fn move_cursor_left(&mut self) {
-        if let Some((offset, _)) = self.input[..self.input_cursor].char_indices().next_back() {
+        if let Some(paste) = self
+            .input_pastes
+            .iter()
+            .find(|paste| paste.end == self.input_cursor)
+        {
+            self.input_cursor = paste.start;
+        } else if let Some((offset, _)) = self.input[..self.input_cursor]
+            .grapheme_indices(true)
+            .next_back()
+        {
             self.input_cursor = offset;
         }
     }
 
     fn move_cursor_right(&mut self) {
-        if let Some(ch) = self.input[self.input_cursor..].chars().next() {
-            self.input_cursor += ch.len_utf8();
+        if let Some(paste) = self
+            .input_pastes
+            .iter()
+            .find(|paste| paste.start == self.input_cursor)
+        {
+            self.input_cursor = paste.end;
+        } else if let Some(grapheme) = self.input[self.input_cursor..].graphemes(true).next() {
+            self.input_cursor += grapheme.len();
         }
+    }
+
+    fn input_newline_is_visible(&self, offset: usize) -> bool {
+        !self
+            .input_pastes
+            .iter()
+            .any(|paste| paste.start <= offset && offset < paste.end)
     }
 
     fn cursor_to_line_start(&mut self) {
         self.input_cursor = self.input[..self.input_cursor]
-            .rfind('\n')
-            .map(|index| index + 1)
+            .match_indices('\n')
+            .filter(|(offset, _)| self.input_newline_is_visible(*offset))
+            .next_back()
+            .map(|(index, _)| index + 1)
             .unwrap_or(0);
     }
 
     fn cursor_to_line_end(&mut self) {
         self.input_cursor = self.input[self.input_cursor..]
-            .find('\n')
-            .map(|index| self.input_cursor + index)
+            .match_indices('\n')
+            .find(|(offset, _)| self.input_newline_is_visible(self.input_cursor + *offset))
+            .map(|(index, _)| self.input_cursor + index)
             .unwrap_or(self.input.len());
     }
 
     fn clear_input(&mut self) {
+        self.input_media.clear();
         self.input.clear();
         self.input_cursor = 0;
-        self.typed_input_newlines.clear();
+        self.input_pastes.clear();
         self.reset_history_navigation();
     }
 
     fn clear_visible(&mut self) {
         self.entries.clear();
+        self.transcript_scrollback = TranscriptScrollback::default();
+        self.transcript_view.get_mut().reset();
         self.clear_input();
         self.multiline = None;
         self.selector = None;
         self.live_entry_index = None;
+        self.live_thinking_index = None;
+        self.live_tool_indices.clear();
+        self.previews_expanded = false;
     }
 
     fn insert_input_newline(&mut self) {
-        let cursor = self.input_cursor;
-        self.input.insert(cursor, '\n');
-        for offset in &mut self.typed_input_newlines {
-            if *offset >= cursor {
-                *offset += 1;
-            }
-        }
-        self.typed_input_newlines.push(cursor);
-        self.typed_input_newlines.sort_unstable();
-        self.input_cursor = cursor + 1;
-        self.reset_history_navigation();
+        self.insert_input_str("\n");
     }
 
     /// Double-press gate for quit keys on an empty input: the first press
@@ -3312,11 +3737,10 @@ impl TuiApp {
         false
     }
 
-    fn typed_input_rows(&self) -> usize {
-        self.typed_input_newlines.len() + 1
-    }
-
     fn push_placeholder(&mut self, kind: TuiEntryKind, text: impl Into<String>) -> usize {
+        self.transcript_view
+            .get_mut()
+            .invalidate(self.entries.len());
         self.entries.push(TuiEntry {
             kind,
             text: text.into(),
@@ -3329,12 +3753,17 @@ impl TuiApp {
     fn replace_entry(&mut self, index: usize, text: impl Into<String>) {
         if let Some(entry) = self.entries.get_mut(index) {
             entry.text = text.into();
+            self.transcript_view.get_mut().replaced(index);
+            if let Some(progress) = self.transcript_scrollback.entries.get_mut(index) {
+                *progress = EntryScrollback::default();
+            }
         }
     }
 
     fn append_entry(&mut self, index: usize, text: &str) {
         if let Some(entry) = self.entries.get_mut(index) {
             entry.text.push_str(text);
+            self.transcript_view.get_mut().invalidate(index);
         }
     }
 
@@ -3345,6 +3774,8 @@ impl TuiApp {
         }
         let index = index.min(self.entries.len());
         self.entries.insert(index, TuiEntry { kind, text });
+        self.transcript_scrollback.insert(index);
+        self.transcript_view.get_mut().insert(index);
         if let Some(live_index) = self.live_entry_index.as_mut() {
             if index <= *live_index {
                 *live_index += 1;
@@ -3352,16 +3783,28 @@ impl TuiApp {
         }
     }
 
+    fn remove_entry(&mut self, index: usize) {
+        self.entries.remove(index);
+        self.transcript_scrollback.remove(index);
+        self.transcript_view.get_mut().remove(index);
+    }
+
     fn finish_live_entry(&mut self) {
+        self.live_thinking_index = None;
+        self.turn_running = false;
+        self.turn_saw_tools = false;
         self.live_entry_index = None;
     }
 
     fn drop_live_entry(&mut self) {
+        self.live_thinking_index = None;
+        self.turn_running = false;
+        self.turn_saw_tools = false;
         let Some(index) = self.live_entry_index.take() else {
             return;
         };
         if index < self.entries.len() {
-            self.entries.remove(index);
+            self.remove_entry(index);
         }
     }
 
@@ -3389,11 +3832,348 @@ impl TuiApp {
     }
 }
 
-fn newline_offsets(input: &str) -> Vec<usize> {
-    input
-        .char_indices()
-        .filter_map(|(offset, ch)| (ch == '\n').then_some(offset))
-        .collect()
+// Scrollback is a rendering watermark, not conversation state. Logical-line
+// and UTF-8 offsets survive rewrapping at a different terminal width. Tracking
+// only a count of painted rows would duplicate or skip text after a resize.
+#[derive(Debug, Default)]
+struct TranscriptScrollback {
+    entries: Vec<EntryScrollback>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct EntryScrollback {
+    position: TranscriptPosition,
+    complete: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TranscriptPosition {
+    line: usize,
+    byte: usize,
+}
+
+impl TranscriptScrollback {
+    fn insert(&mut self, index: usize) {
+        if index < self.entries.len() {
+            self.entries.insert(index, EntryScrollback::default());
+        }
+    }
+
+    fn remove(&mut self, index: usize) {
+        if index < self.entries.len() {
+            self.entries.remove(index);
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.entries.truncate(len);
+    }
+}
+
+#[derive(Debug)]
+struct TranscriptRow {
+    line: Line<'static>,
+    start: TranscriptPosition,
+    end: TranscriptPosition,
+    // Preview text can stand for a larger source range, not a literal slice.
+    synthetic: bool,
+}
+
+fn wrap_positioned_line(line: Line<'static>, index: usize, width: usize) -> Vec<TranscriptRow> {
+    let width = width.max(1);
+    let line_style = line.style;
+    let mut rows = Vec::new();
+    let mut current = Vec::new();
+    let mut cells = 0;
+    let mut byte = 0;
+    let mut start = TranscriptPosition {
+        line: index,
+        byte: 0,
+    };
+    for span in line.spans {
+        let mut segment = String::new();
+        for grapheme in span.content.graphemes(true) {
+            // Expand tabs, and keep terminal control bytes out of painted text.
+            let text = if grapheme == "\t" { "    " } else { grapheme };
+            let text = text
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .collect::<String>();
+            let used = text.width();
+            if cells > 0 && cells + used > width {
+                push_transcript_segment(&mut current, &mut segment, span.style);
+                let end = TranscriptPosition { line: index, byte };
+                rows.push(TranscriptRow {
+                    line: Line::from(std::mem::take(&mut current)).style(line_style),
+                    start,
+                    end,
+                    synthetic: false,
+                });
+                start = end;
+                cells = 0;
+            }
+            segment.push_str(&text);
+            byte += grapheme.len();
+            cells += used;
+        }
+        push_transcript_segment(&mut current, &mut segment, span.style);
+    }
+    rows.push(TranscriptRow {
+        line: Line::from(current).style(line_style),
+        start,
+        end: if byte == 0 {
+            TranscriptPosition {
+                line: index + 1,
+                byte: 0,
+            }
+        } else {
+            TranscriptPosition { line: index, byte }
+        },
+        synthetic: false,
+    });
+    rows
+}
+
+fn collapsed_tool_rows(
+    logical: &[Line<'static>],
+    rows: Vec<TranscriptRow>,
+    width: usize,
+    palette: &ThemePalette,
+) -> Vec<TranscriptRow> {
+    // Keep command/path headers on one row so a long command cannot consume
+    // the preview. On large results show the final output row, like Kimi.
+    let mut header = wrap_positioned_line(logical[0].clone(), 0, usize::MAX)
+        .remove(0)
+        .line;
+    let output = rows
+        .into_iter()
+        .filter(|row| row.start.line > 0)
+        .collect::<Vec<_>>();
+    let folded = output.len() > 2;
+    if folded {
+        let suffix = format!(" · {} more lines", output.len() - 1);
+        header = clip_line_width(header, width.saturating_sub(suffix.width()));
+        header.spans.push(Span::styled(suffix, palette.secondary()));
+    }
+    let mut preview = vec![TranscriptRow {
+        line: clip_line_width(header, width),
+        start: TranscriptPosition::default(),
+        end: TranscriptPosition { line: 1, byte: 0 },
+        synthetic: true,
+    }];
+    if folded {
+        let tail = logical.last().expect("tool output");
+        let text = tail
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let line = wrap_positioned_line(
+            Line::from(Span::styled(
+                format!("  … {}", text.trim()),
+                palette.secondary(),
+            )),
+            0,
+            usize::MAX,
+        )
+        .remove(0)
+        .line;
+        preview.push(TranscriptRow {
+            line: clip_line_width(line, width),
+            start: TranscriptPosition { line: 1, byte: 0 },
+            end: output.last().expect("folded output").end,
+            synthetic: true,
+        });
+    } else {
+        preview.extend(output);
+    }
+    preview
+}
+
+fn pending_entry_rows(
+    entry: &TuiEntry,
+    index: usize,
+    width: usize,
+    palette: &ThemePalette,
+    state: &PreviewState,
+    progress: EntryScrollback,
+) -> Vec<TranscriptRow> {
+    if progress.complete {
+        return Vec::new();
+    }
+    let mut logical = render_entry_lines(std::slice::from_ref(entry), palette);
+    if logical.is_empty() {
+        return Vec::new();
+    }
+    logical.pop(); // spacer is added after preview selection
+    let mut rows = Vec::new();
+    for (line_index, line) in logical.iter().cloned().enumerate() {
+        let mut wrapped = wrap_positioned_line(line, line_index, width);
+        if line_index + 1 < logical.len() || entry.text.ends_with('\n') {
+            wrapped.last_mut().expect("logical row").end = TranscriptPosition {
+                line: line_index + 1,
+                byte: 0,
+            };
+        }
+        rows.extend(wrapped);
+    }
+    let collapsed = state.expanded_from.is_none_or(|start| index < start);
+    if collapsed && entry.kind == TuiEntryKind::Tool {
+        rows = collapsed_tool_rows(&logical, rows, width, palette);
+    }
+    let limit = if entry.kind == TuiEntryKind::Thinking {
+        2
+    } else {
+        usize::MAX
+    };
+    if collapsed && rows.len() > limit {
+        let hidden = rows.len() - limit;
+        if state.live_thinking == Some(index) {
+            rows = rows.split_off(hidden);
+        } else {
+            let start = rows[limit].start;
+            let end = rows.last().expect("nonempty preview").end;
+            rows.truncate(limit);
+            rows.push(TranscriptRow {
+                line: clip_line_width(
+                    Line::from(Span::styled(
+                        format!("  … ({hidden} more lines, ctrl+o to expand)"),
+                        palette.secondary(),
+                    )),
+                    width,
+                ),
+                start,
+                end,
+                synthetic: true,
+            });
+        }
+    }
+    rows.push(TranscriptRow {
+        line: Line::from(""),
+        start: TranscriptPosition {
+            line: logical.len(),
+            byte: 0,
+        },
+        end: TranscriptPosition {
+            line: logical.len() + 1,
+            byte: 0,
+        },
+        synthetic: false,
+    });
+    // A new wrap can straddle the watermark after a resize. Trim only the
+    // archived prefix, using source bytes (not tab-expanded painted bytes).
+    let mut pending = Vec::new();
+    for mut row in rows {
+        if row.end <= progress.position {
+            continue;
+        }
+        if !row.synthetic && row.start < progress.position && progress.position.line < logical.len()
+        {
+            let source = &logical[progress.position.line];
+            let end = if row.end.line == progress.position.line {
+                row.end.byte
+            } else {
+                source.spans.iter().map(|span| span.content.len()).sum()
+            };
+            let mut offset = 0;
+            let spans = source
+                .spans
+                .iter()
+                .filter_map(|span| {
+                    let from = progress
+                        .position
+                        .byte
+                        .saturating_sub(offset)
+                        .min(span.content.len());
+                    let to = end.saturating_sub(offset).min(span.content.len());
+                    offset += span.content.len();
+                    (from < to)
+                        .then(|| Span::styled(span.content[from..to].to_string(), span.style))
+                })
+                .collect::<Vec<_>>();
+            row.line = wrap_positioned_line(Line::from(spans).style(source.style), 0, width)
+                .into_iter()
+                .map(|row| row.line)
+                .next()
+                .unwrap_or_default();
+            row.start = progress.position;
+        }
+        pending.push(row);
+    }
+    pending
+}
+
+fn transcript_preview_state(app: &TuiApp) -> PreviewState {
+    PreviewState {
+        expanded_from: app
+            .previews_expanded
+            .then(|| recent_turn_start(&app.entries)),
+        live_thinking: app.live_thinking_index,
+    }
+}
+
+fn transcript_overflow(
+    app: &mut TuiApp,
+    config: &LoadedConfig,
+    area: Rect,
+    palette: &ThemePalette,
+) -> Vec<Line<'static>> {
+    // Overlays and narrower diff views are temporary: do not irreversibly
+    // archive transcript text merely because a panel covers it.
+    if area.width == 0 || area.height == 0 || app.selector.is_some() || app.diff_panel.is_some() {
+        return Vec::new();
+    }
+    app.transcript_scrollback
+        .entries
+        .resize(app.entries.len(), EntryScrollback::default());
+    let state = transcript_preview_state(app);
+    let mut chunks = Vec::new();
+    let mut height = 0usize;
+    // Include all pending entries, not only overscan: a provider can deliver
+    // several screenfuls in one delta, and session replay is a single paint.
+    for (index, entry) in app.entries.iter().enumerate() {
+        if config.settings.hide_thinking_block.unwrap_or(false)
+            && entry.kind == TuiEntryKind::Thinking
+        {
+            continue;
+        }
+        let progress = app.transcript_scrollback.entries[index];
+        let rows = pending_entry_rows(entry, index, area.width as usize, palette, &state, progress);
+        height += rows.len();
+        if !rows.is_empty() {
+            chunks.push((index, rows));
+        }
+    }
+    if let Some((_, rows)) = chunks.last_mut() {
+        while rows.last().is_some_and(|row| row.line.width() == 0) {
+            rows.pop();
+            height = height.saturating_sub(1);
+        }
+    }
+    let mut remaining = height.saturating_sub(area.height as usize);
+    let mut overflow = Vec::new();
+    for (index, rows) in chunks {
+        let live = app.live_entry_index == Some(index)
+            || app.live_thinking_index == Some(index)
+            || app.live_tool_indices.contains(&index);
+        // A live entry's spacer is not final. Do not consume it or any later
+        // entry until this one finishes, preserving chronological scrollback.
+        let available = rows.len().saturating_sub(usize::from(live));
+        let count = remaining.min(available);
+        if count == 0 {
+            break;
+        }
+        let progress = &mut app.transcript_scrollback.entries[index];
+        progress.position = rows[count - 1].end;
+        // Never seal a live entry: future deltas must still be paintable.
+        progress.complete = count == rows.len() && !live;
+        overflow.extend(rows.into_iter().take(count).map(|row| row.line));
+        remaining -= count;
+        if live {
+            break;
+        }
+    }
+    overflow
 }
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -3403,12 +4183,20 @@ struct TuiSurface<'a> {
     viewport_height: &'a mut u16,
 }
 
-fn new_tui_terminal(height: u16) -> Result<TuiTerminal> {
+fn new_tui_terminal(height: u16, owned_screen: bool) -> Result<TuiTerminal> {
     let backend = CrosstermBackend::new(io::stdout());
     Ok(Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(height.max(1)),
+            // Leave a valid two-row native scroll region above the live UI.
+            // A full-screen inline viewport makes ratatui borrow a one-row
+            // region, which tmux (and VT terminals) rejects and scrolls the
+            // entire editor instead. The reserved rows hold transcript text.
+            viewport: if owned_screen {
+                Viewport::Fullscreen
+            } else {
+                Viewport::Inline(height.saturating_sub(2).max(1))
+            },
         },
     )?)
 }
@@ -3419,19 +4207,47 @@ fn terminal_viewport_height() -> u16 {
         .unwrap_or(24)
 }
 
-fn resize_tui_viewport(terminal: &mut TuiTerminal, viewport_height: &mut u16) -> Result<()> {
+fn resize_tui_viewport(
+    terminal: &mut TuiTerminal,
+    viewport_height: &mut u16,
+    owned_screen: bool,
+) -> Result<()> {
     let desired = terminal_viewport_height();
-    if desired == *viewport_height {
+    if owned_screen || desired == *viewport_height {
+        *viewport_height = desired;
         terminal.autoresize()?;
         return Ok(());
     }
-    *terminal = new_tui_terminal(desired)?;
+    *terminal = new_tui_terminal(desired, owned_screen)?;
     terminal.clear()?;
     *viewport_height = desired;
     Ok(())
 }
 
-fn redraw_tui(terminal: &mut TuiTerminal, app: &mut TuiApp, config: &LoadedConfig) -> Result<()> {
+fn redraw_tui<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut TuiApp,
+    config: &LoadedConfig,
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    terminal.autoresize()?;
+    let area = tui_layout(terminal.get_frame().area(), app, config)[0];
+    let palette = terminal_theme(config).unwrap_or_default().palette;
+    let overflow = if app.owned_screen {
+        Vec::new()
+    } else {
+        transcript_overflow(app, config, area, &palette)
+    };
+    // Bound temporary terminal buffers even when a resumed message is huge.
+    for rows in overflow.chunks(128) {
+        terminal.insert_before(rows.len() as u16, |buffer| {
+            Paragraph::new(rows.to_vec())
+                .style(palette.base())
+                .render(buffer.area, buffer);
+        })?;
+    }
     terminal.draw(|frame| draw_tui(frame, app, config))?;
     Ok(())
 }
@@ -3467,12 +4283,82 @@ fn visible_transcript(entries: &[TuiEntry], width: usize, height: u16) -> Visibl
     visible_transcript_with_thinking(entries, width, height, false, &ThemePalette::default())
 }
 
+#[cfg(test)]
 fn visible_transcript_with_thinking(
     entries: &[TuiEntry],
     width: usize,
     height: u16,
     hide_thinking: bool,
     palette: &ThemePalette,
+) -> VisibleTranscript {
+    visible_transcript_with_previews(
+        entries,
+        width,
+        height,
+        hide_thinking,
+        palette,
+        PreviewState::default(),
+    )
+}
+
+#[derive(Default)]
+struct PreviewState {
+    expanded_from: Option<usize>,
+    live_thinking: Option<usize>,
+}
+
+fn recent_turn_start(entries: &[TuiEntry]) -> usize {
+    entries
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, entry)| entry.kind == TuiEntryKind::User)
+        .nth(2)
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn preview_entry(
+    entry: &TuiEntry,
+    index: usize,
+    width: usize,
+    palette: &ThemePalette,
+    state: &PreviewState,
+) -> Vec<Line<'static>> {
+    pending_entry_rows(
+        entry,
+        index,
+        width,
+        palette,
+        state,
+        EntryScrollback::default(),
+    )
+    .into_iter()
+    .map(|row| row.line)
+    .collect()
+}
+
+#[cfg(test)]
+fn visible_transcript_with_previews(
+    entries: &[TuiEntry],
+    width: usize,
+    height: u16,
+    hide_thinking: bool,
+    palette: &ThemePalette,
+    state: PreviewState,
+) -> VisibleTranscript {
+    visible_pending_transcript(entries, width, height, hide_thinking, palette, state, &[])
+}
+
+fn visible_pending_transcript(
+    entries: &[TuiEntry],
+    width: usize,
+    height: u16,
+    hide_thinking: bool,
+    palette: &ThemePalette,
+    state: PreviewState,
+    archived: &[EntryScrollback],
 ) -> VisibleTranscript {
     let width = width.max(1);
     let target_height = height.saturating_add(TRANSCRIPT_RENDER_OVERSCAN_ROWS) as usize;
@@ -3481,11 +4367,18 @@ fn visible_transcript_with_thinking(
     #[cfg(test)]
     let mut entries_used = 0;
 
-    for entry in entries.iter().rev() {
+    for (index, entry) in entries.iter().enumerate().rev() {
         if hide_thinking && entry.kind == TuiEntryKind::Thinking {
             continue;
         }
-        let mut chunk = render_entry_lines(std::slice::from_ref(entry), palette);
+        let progress = archived.get(index).copied().unwrap_or_default();
+        if progress.complete {
+            continue;
+        }
+        let mut chunk = pending_entry_rows(entry, index, width, palette, &state, progress)
+            .into_iter()
+            .map(|row| row.line)
+            .collect::<Vec<_>>();
         if chunks.is_empty() {
             while chunk.last().map(Line::width) == Some(0) {
                 chunk.pop();
@@ -3495,7 +4388,6 @@ fn visible_transcript_with_thinking(
             continue;
         }
 
-        let chunk = wrap_transcript_lines(chunk, width);
         scan_height = scan_height.saturating_add(chunk.len());
         chunks.push(chunk);
         #[cfg(test)]
@@ -3521,158 +4413,313 @@ fn visible_transcript_with_thinking(
     }
 }
 
-fn wrap_transcript_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
-    let mut rows = Vec::new();
-    for line in lines {
-        wrap_transcript_line(line, width.max(1), &mut rows);
-    }
-    rows
-}
-
-fn wrap_transcript_line(line: Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
-    let mut current = Vec::new();
-    let mut current_width: usize = 0;
-    let mut row_has_content = false;
-    let mut emitted_row = false;
-
-    for span in line.spans {
-        let style = span.style;
-        let mut segment = String::new();
-        for ch in span.content.chars() {
-            let ch_width = transcript_char_width(ch);
-            if ch_width > 0 && current_width > 0 && current_width.saturating_add(ch_width) > width {
-                push_transcript_segment(&mut current, &mut segment, style);
-                rows.push(Line::from(std::mem::take(&mut current)));
-                current_width = 0;
-                emitted_row = true;
-            }
-            segment.push(ch);
-            current_width = current_width.saturating_add(ch_width);
-            row_has_content = true;
-            if current_width >= width {
-                push_transcript_segment(&mut current, &mut segment, style);
-                rows.push(Line::from(std::mem::take(&mut current)));
-                current_width = 0;
-                row_has_content = false;
-                emitted_row = true;
-            }
-        }
-        push_transcript_segment(&mut current, &mut segment, style);
-    }
-
-    if row_has_content || !emitted_row {
-        rows.push(Line::from(current));
-    }
-}
-
 fn push_transcript_segment(current: &mut Vec<Span<'static>>, segment: &mut String, style: Style) {
     if !segment.is_empty() {
         current.push(Span::styled(std::mem::take(segment), style));
     }
 }
 
-fn transcript_char_width(ch: char) -> usize {
-    if ch == '\t' {
-        4
-    } else if ch.is_control() {
-        0
+fn tui_layout(frame_area: Rect, app: &TuiApp, config: &LoadedConfig) -> [Rect; 7] {
+    let slash_matches = slash_command_matches(config, app);
+    let slash_match_height = (slash_matches.len().min(SLASH_MATCH_LIMIT) as u16)
+        .min(frame_area.height.saturating_sub(4));
+    let spacer_height = u16::from(app.queued_messages.is_empty());
+    let input_height = input_area_height(app, frame_area, slash_match_height);
+    let panel_budget = frame_area
+        .height
+        .saturating_sub(input_height + slash_match_height + spacer_height + 1);
+    let queue_height = queue_panel_height(app).min(panel_budget);
+    let todo_budget = panel_budget.saturating_sub(queue_height) / 2;
+    let todo_height = if todo_budget >= 4 {
+        todo_panel_height(app).min(todo_budget)
     } else {
-        1
+        0
+    };
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(todo_height),
+            Constraint::Length(queue_height),
+            Constraint::Length(spacer_height),
+            Constraint::Length(input_height),
+            Constraint::Length(slash_match_height),
+            Constraint::Length(1),
+        ])
+        .areas::<7>(frame_area)
+}
+
+fn transcript_area(area: Rect, app: &TuiApp) -> Rect {
+    if app.diff_panel.is_some() {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(DIFF_PANEL_WIDTH)])
+            .split(area)[0]
+    } else {
+        area
     }
 }
 
 fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp, config: &LoadedConfig) {
     let palette = terminal_theme(config).unwrap_or_default().palette;
     frame.render_widget(Block::default().style(palette.base()), frame.area());
+    let root = tui_layout(frame.area(), app, config);
     let slash_matches = slash_command_matches(config, app);
-    let slash_match_height = slash_matches.len().min(SLASH_MATCH_LIMIT) as u16;
-    let input_height = input_area_height(app, frame.area().height, slash_match_height);
-    let todo_height = todo_panel_height(app);
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(todo_height),
-            Constraint::Length(1),
-            Constraint::Length(input_height),
-            Constraint::Length(slash_match_height),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
-    let transcript_area = if app.diff_panel.is_some() {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(40), Constraint::Length(DIFF_PANEL_WIDTH)])
-            .split(root[0]);
-        draw_diff_panel(frame, columns[1], app, &palette);
-        columns[0]
-    } else {
-        root[0]
-    };
+    let transcript_area = transcript_area(root[0], app);
+    if app.diff_panel.is_some() {
+        let diff_area = Rect::new(
+            transcript_area.right(),
+            root[0].y,
+            root[0].right().saturating_sub(transcript_area.right()),
+            root[0].height,
+        );
+        draw_diff_panel(frame, diff_area, app, &palette);
+    }
     draw_transcript(frame, transcript_area, app, config, &palette);
     draw_todo_panel(frame, root[1], app, &palette);
-    // root[2] is an intentional blank spacer so the input surface never butts
-    // directly against the chat transcript.
-    draw_input(frame, root[3], app, &palette);
-    draw_slash_matches(frame, root[4], &slash_matches, &palette);
-    draw_footer(frame, root[5], app, &palette);
+    draw_queue_panel(frame, root[2], app, &palette);
+    // Queue hints sit directly against the editor; otherwise leave a blank row.
+    draw_input(frame, root[4], app, &palette);
+    draw_slash_matches(frame, root[5], &slash_matches, &palette);
+    draw_footer(frame, root[6], app, &palette);
     draw_selector_overlay(frame, app, &palette);
-    set_tui_cursor(frame, root[3], app);
+    set_tui_cursor(frame, root[4], app);
 }
 
 const DIFF_PANEL_WIDTH: u16 = 48;
 const TODO_COLLAPSED_ROWS: usize = 5;
 const TODO_EXPANDED_ROW_LIMIT: usize = 15;
 
+#[cfg(test)]
+fn selected_todos(todos: &[TodoItem], expanded: bool) -> Vec<usize> {
+    selected_todos_with_limit(todos, expanded, todo_row_limit(expanded))
+}
+
+fn todo_row_limit(expanded: bool) -> usize {
+    if expanded {
+        TODO_EXPANDED_ROW_LIMIT
+    } else {
+        TODO_COLLAPSED_ROWS
+    }
+}
+
+fn selected_todos_with_limit(todos: &[TodoItem], expanded: bool, limit: usize) -> Vec<usize> {
+    if expanded {
+        return (0..todos.len().min(limit)).collect();
+    }
+    let mut selected = todos
+        .iter()
+        .enumerate()
+        .filter(|(_, todo)| todo.status == TodoStatus::InProgress)
+        .map(|(index, _)| index)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let recent_done = todos
+        .iter()
+        .rposition(|todo| todo.status == TodoStatus::Completed);
+    let pending_slots = limit.saturating_sub(selected.len() + usize::from(recent_done.is_some()));
+    selected.extend(
+        todos
+            .iter()
+            .enumerate()
+            .filter(|(_, todo)| todo.status == TodoStatus::Pending)
+            .map(|(index, _)| index)
+            .take(pending_slots),
+    );
+    if let Some(index) = recent_done {
+        if selected.len() < limit {
+            selected.push(index);
+        }
+    }
+    for index in (0..todos.len()).rev() {
+        if selected.len() >= limit {
+            break;
+        }
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    selected.sort_unstable();
+    selected
+}
+
+fn todo_panel_lines(app: &TuiApp, palette: &ThemePalette) -> Vec<Line<'static>> {
+    todo_panel_lines_with_limit(app, palette, todo_row_limit(app.todos_expanded))
+}
+
+fn todo_panel_lines_with_limit(
+    app: &TuiApp,
+    palette: &ThemePalette,
+    limit: usize,
+) -> Vec<Line<'static>> {
+    if app.todos.is_empty() {
+        return Vec::new();
+    }
+    let selected = selected_todos_with_limit(&app.todos, app.todos_expanded, limit);
+    let mut lines = vec![Line::from(Span::styled(
+        "  Todo",
+        palette.secondary().add_modifier(Modifier::BOLD),
+    ))];
+    for index in &selected {
+        let todo = &app.todos[*index];
+        let (marker, marker_style, title_style) = match todo.status {
+            TodoStatus::Completed => (
+                "✓",
+                Style::default().fg(palette.success),
+                palette.secondary().add_modifier(Modifier::CROSSED_OUT),
+            ),
+            TodoStatus::InProgress => (
+                "●",
+                Style::default().fg(palette.accent),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            TodoStatus::Pending => ("○", palette.secondary(), Style::default()),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {marker} "), marker_style),
+            Span::styled(single_line(&todo.content), title_style),
+        ]));
+    }
+    let hidden = app
+        .todos
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected.contains(index))
+        .map(|(_, todo)| todo)
+        .collect::<Vec<_>>();
+    if !hidden.is_empty() {
+        let mut counts = Vec::new();
+        for (status, label) in [
+            (TodoStatus::Pending, "pending"),
+            (TodoStatus::InProgress, "active"),
+            (TodoStatus::Completed, "done"),
+        ] {
+            let count = hidden.iter().filter(|todo| todo.status == status).count();
+            if count > 0 {
+                counts.push(format!("{count} {label}"));
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  … +{} more ({}) · ctrl+t to {}",
+                hidden.len(),
+                counts.join(", "),
+                if app.todos_expanded {
+                    "collapse"
+                } else {
+                    "expand"
+                }
+            ),
+            palette.secondary(),
+        )));
+    } else if app.todos_expanded && !app.todos.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  ctrl+t to collapse",
+            palette.secondary(),
+        )));
+    }
+    lines
+}
+
+fn todo_panel_borders(app: &TuiApp) -> Borders {
+    if app.queued_messages.is_empty() {
+        Borders::TOP | Borders::BOTTOM
+    } else {
+        Borders::TOP
+    }
+}
+
 fn todo_panel_height(app: &TuiApp) -> u16 {
     if app.todos.is_empty() {
-        return 0;
+        0
+    } else {
+        todo_panel_lines(app, &ThemePalette::default()).len() as u16
+            + 1
+            + u16::from(app.queued_messages.is_empty())
     }
-    if app.todos_expanded {
-        return app.todos.len().min(TODO_EXPANDED_ROW_LIMIT) as u16;
-    }
-    let rows = app.todos.len().min(TODO_COLLAPSED_ROWS);
-    let overflow = usize::from(app.todos.len() > TODO_COLLAPSED_ROWS);
-    (rows + overflow) as u16
 }
 
 fn draw_todo_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemePalette) {
     if area.height == 0 || app.todos.is_empty() {
         return;
     }
-    let visible = if app.todos_expanded {
-        app.todos.len().min(TODO_EXPANDED_ROW_LIMIT)
+    let block = Block::default()
+        .borders(todo_panel_borders(app))
+        .border_style(palette.secondary().fg(palette.border));
+    let inner = block.inner(area);
+    let capacity = (inner.height as usize).saturating_sub(1);
+    let needs_hint =
+        app.todos_expanded || app.todos.len() > capacity.min(todo_row_limit(app.todos_expanded));
+    let limit = capacity
+        .saturating_sub(usize::from(needs_hint))
+        .min(todo_row_limit(app.todos_expanded));
+    let lines = todo_panel_lines_with_limit(app, palette, limit)
+        .into_iter()
+        .map(|line| clip_line_width(line, inner.width as usize))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+const QUEUE_VISIBLE_ROWS: usize = 4;
+
+fn queue_panel_height(app: &TuiApp) -> u16 {
+    if app.queued_messages.is_empty() {
+        0
     } else {
-        app.todos.len().min(TODO_COLLAPSED_ROWS)
-    };
-    let mut lines = Vec::new();
-    for todo in app.todos.iter().take(visible) {
-        let (marker, style) = match todo.status {
-            TodoStatus::Completed => ("✓", Style::default().fg(palette.success)),
-            TodoStatus::InProgress => ("●", Style::default().fg(palette.accent)),
-            TodoStatus::Pending => ("○", palette.secondary()),
-        };
+        (app.queued_messages.len().min(QUEUE_VISIBLE_ROWS) + 2) as u16
+    }
+}
+
+fn draw_queue_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemePalette) {
+    if area.height == 0 || app.queued_messages.is_empty() {
+        return;
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        palette.secondary().fg(palette.border),
+    ))];
+    let visible_rows = QUEUE_VISIBLE_ROWS.min(area.height.saturating_sub(2) as usize);
+    let overflow = app.queued_messages.len().saturating_sub(visible_rows);
+    for message in app.queued_messages.iter().skip(overflow) {
+        let text = single_line(message);
         lines.push(Line::from(vec![
-            Span::styled(format!("{marker} "), style),
-            Span::raw(todo.content.clone()),
+            Span::styled("  ❯ ", Style::default().fg(palette.accent)),
+            Span::styled(
+                truncate_width(&text, area.width.saturating_sub(4) as usize),
+                Style::default().fg(palette.foreground),
+            ),
         ]));
     }
-    if !app.todos_expanded && app.todos.len() > visible {
-        let done = app
-            .todos
-            .iter()
-            .filter(|todo| todo.status == TodoStatus::Completed)
-            .count();
-        lines.push(Line::from(Span::styled(
-            format!(
-                "… +{} more ({} done) · ctrl+t to expand",
-                app.todos.len() - visible,
-                done
-            ),
-            palette.secondary(),
-        )));
-    }
+    let hint = if app.turn_running {
+        if app.turn_saw_tools {
+            "↑ to edit · ctrl+s to steer at next boundary"
+        } else {
+            // A prose-only response has no tool-call round boundary to inject
+            // into: steering is delivered only after this response finishes.
+            "↑ to edit · ctrl+s queues after this response"
+        }
+    } else {
+        "↑ to edit · runs after next turn"
+    };
+    lines.push(Line::from(Span::styled(
+        if overflow > 0 {
+            format!("  … +{overflow} more · {hint}")
+        } else {
+            format!("  {hint}")
+        },
+        palette.secondary(),
+    )));
+    let lines = lines
+        .into_iter()
+        .map(|line| clip_line_width(line, area.width as usize))
+        .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn recall_queued_message(app: &mut TuiApp, message: String) {
+    app.clear_input();
+    app.input = message;
+    app.input_cursor = app.input.len();
 }
 
 fn draw_diff_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemePalette) {
@@ -3734,24 +4781,26 @@ fn colorized_diff_line(line: &str, palette: &ThemePalette) -> Line<'static> {
     Line::from(line.to_string()).style(style)
 }
 
-fn input_area_height(app: &TuiApp, frame_height: u16, slash_match_height: u16) -> u16 {
-    let desired = input_desired_height(app);
-    let available = frame_height
+const MAX_INPUT_ROWS: usize = 10;
+
+fn input_area_height(app: &TuiApp, frame_area: Rect, slash_match_height: u16) -> u16 {
+    let desired = input_desired_height(app, frame_area.width);
+    let available = frame_area
+        .height
         .saturating_sub(slash_match_height)
-        .saturating_sub(2)
-        .max(1);
+        .saturating_sub(1 + u16::from(app.queued_messages.is_empty()));
     desired.min(available)
 }
 
-fn input_desired_height(app: &TuiApp) -> u16 {
-    if app.multiline.is_some() {
-        3
-    } else {
-        app.typed_input_rows()
-            .saturating_add(1)
-            .max(3)
-            .min(u16::MAX as usize) as u16
-    }
+fn input_desired_height(app: &TuiApp, width: u16) -> u16 {
+    let inner = input_block(&ThemePalette::default()).inner(Rect::new(0, 0, width, u16::MAX));
+    (input_layout(app, inner.width as usize)
+        .rows
+        .len()
+        .min(MAX_INPUT_ROWS)
+        + 2
+        + usize::from(app.multiline.is_some())
+        + usize::from(!app.input_media.is_empty())) as u16
 }
 
 fn draw_transcript(
@@ -3761,15 +4810,45 @@ fn draw_transcript(
     config: &LoadedConfig,
     palette: &ThemePalette,
 ) {
+    if app.owned_screen {
+        let mut view = app.transcript_view.borrow_mut();
+        view.sync(
+            &app.entries,
+            area,
+            palette,
+            config.settings.hide_thinking_block.unwrap_or(false),
+            &transcript_preview_state(app),
+        );
+        let lines = view.visible_lines();
+        let body = view.area;
+        let y = view.visible_top();
+        frame.render_widget(
+            Paragraph::new(lines).style(palette.base()),
+            Rect {
+                y,
+                height: body.bottom().saturating_sub(y),
+                ..body
+            },
+        );
+        if !view.hint().is_empty() {
+            frame.render_widget(
+                Paragraph::new(view.hint()).style(palette.secondary()),
+                view.hint_area,
+            );
+        }
+        return;
+    }
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let visible = visible_transcript_with_thinking(
+    let visible = visible_pending_transcript(
         &app.entries,
         area.width as usize,
         area.height,
         config.settings.hide_thinking_block.unwrap_or(false),
         palette,
+        transcript_preview_state(app),
+        &app.transcript_scrollback.entries,
     );
     if visible.lines.is_empty() {
         return;
@@ -3849,55 +4928,90 @@ fn push_marked_lines(
 }
 
 fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palette: &ThemePalette) {
-    let mut parts = text.lines();
+    if !text.starts_with("running ")
+        && !text.starts_with("completed ")
+        && !text.starts_with("failed ")
+    {
+        push_marked_lines(
+            lines,
+            "tool",
+            text,
+            palette.secondary(),
+            palette.secondary(),
+        );
+        return;
+    }
+    let mut parts = text.splitn(3, '\n');
     let state = parts.next().unwrap_or_default();
     let detail = parts.next().unwrap_or_default();
-    let title = match state {
-        "running bash" => "Running bash".to_string(),
-        "completed bash" => "Ran bash".to_string(),
-        "failed bash" => "Failed bash".to_string(),
-        "running" => format!("Running {detail}"),
-        "completed" => format!("Ran {detail}"),
-        "failed" => format!("Failed {detail}"),
-        _ if state.starts_with("running ") => {
-            format!("Running {}", state.trim_start_matches("running "))
-        }
-        _ if state.starts_with("completed ") => {
-            format!("Ran {}", state.trim_start_matches("completed "))
-        }
-        _ => "Ran tool".to_string(),
-    };
-    let marker_style = if state.starts_with("failed") {
-        Style::default().fg(palette.error)
-    } else if state.starts_with("running") {
-        Style::default().fg(palette.accent)
+    let output = parts.next().unwrap_or_default();
+    let (phase, name) = state.split_once(' ').unwrap_or((state, "tool"));
+    let name = name.trim_start_matches('/');
+    let failed = phase == "failed";
+    let running = phase == "running";
+    let highlight = Style::default()
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled(
+        if failed { "✗ " } else { "● " },
+        if failed {
+            Style::default().fg(palette.error)
+        } else if running {
+            palette.secondary()
+        } else {
+            Style::default().fg(palette.success)
+        },
+    )];
+    if name == "bash" {
+        spans.push(Span::styled(
+            if failed {
+                "Command failed"
+            } else if running {
+                "Running a command"
+            } else {
+                "Ran a command"
+            },
+            highlight,
+        ));
     } else {
-        palette.secondary()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{BULLET} "), marker_style),
-        Span::styled(
-            title,
-            Style::default()
-                .fg(palette.foreground)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    if !detail.is_empty() && !matches!(state, "running" | "completed" | "failed") {
+        spans.push(Span::raw(if failed {
+            "Failed "
+        } else if running {
+            "Using "
+        } else {
+            "Used "
+        }));
+        let label = match name {
+            "read" => "Read",
+            "edit" => "Edit",
+            "write" => "Write",
+            "grep" => "Grep",
+            "find" => "Find",
+            "ls" => "Ls",
+            "todo" => "Todo",
+            "web_search" => "Web Search",
+            "web_fetch" => "Web Fetch",
+            _ => name,
+        };
+        spans.push(Span::styled(label.to_string(), highlight));
+    }
+    if !detail.is_empty() {
+        spans.push(Span::styled(format!(" · {detail}"), palette.secondary()));
+    }
+    if name == "read" && !running && !output.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {} lines", output.lines().count()),
+            palette.secondary(),
+        ));
+    }
+    lines.push(Line::from(spans));
+    for line in output.lines() {
         lines.push(Line::from(Span::styled(
-            format!("  {detail}"),
-            palette.secondary().add_modifier(Modifier::BOLD),
+            format!("  {line}"),
+            palette.secondary(),
         )));
     }
-    let output = parts.collect::<Vec<_>>().join("\n");
-    if !output.is_empty() {
-        for line in output.lines() {
-            lines.push(Line::from(Span::styled(
-                format!("  {line}"),
-                palette.secondary(),
-            )));
-        }
-    } else if state.starts_with("completed") {
+    if output.is_empty() && !running {
         lines.push(Line::from(Span::styled(
             "  (no output)",
             palette.secondary(),
@@ -3905,137 +5019,216 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palette: &ThemePa
     }
 }
 
+fn input_block(palette: &ThemePalette) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(palette.secondary().fg(palette.border))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().fg(palette.foreground).bg(palette.surface))
+}
+
 fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemePalette) {
-    let prompt = input_prompt(app);
+    let block = input_block(palette);
+    let inner = block.inner(area);
     let input_style = Style::default().fg(palette.foreground).bg(palette.surface);
-    let muted_style = Style::default().fg(palette.accent).bg(palette.surface);
-    let mut lines = render_input_lines(app, area.height as usize, input_style, muted_style);
-    if lines.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(prompt, muted_style),
-            Span::styled("", input_style),
-        ]));
-    }
-    frame.render_widget(Block::default().style(input_style), area);
-    let paragraph = Paragraph::new(lines)
-        .style(input_style)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().style(input_style));
-    frame.render_widget(paragraph, area);
+    let prompt_style = Style::default().fg(palette.accent).bg(palette.surface);
+    let lines = render_input_lines(app, inner, input_style, prompt_style);
+    frame.render_widget(Paragraph::new(lines).style(input_style).block(block), area);
 }
 
 fn input_prompt(app: &TuiApp) -> &'static str {
     if app.multiline.is_some() {
         "multi> "
     } else {
-        "pi> "
+        "> "
     }
 }
 
 fn render_input_lines(
     app: &TuiApp,
-    area_height: usize,
+    area: Rect,
     input_style: Style,
-    muted_style: Style,
+    prompt_style: Style,
 ) -> Vec<Line<'static>> {
-    if area_height == 0 {
+    if area.height == 0 || area.width == 0 {
         return Vec::new();
     }
     let prompt = input_prompt(app);
-    let parts = app.input.split('\n').collect::<Vec<_>>();
-    let start = input_visible_start(app, area_height);
-    let metrics = input_metrics(app, area_height);
-    let mut lines = Vec::new();
-    for _ in 0..metrics.top_padding {
-        lines.push(Line::from(Span::styled("", input_style)));
-    }
-    for (visible_offset, part) in parts.iter().enumerate().skip(start) {
-        let prefix = if visible_offset == start {
-            prompt.to_string()
-        } else {
-            " ".repeat(prompt.len())
-        };
-        lines.push(Line::from(vec![
-            Span::styled(prefix, muted_style),
-            Span::styled((*part).to_string(), input_style),
-        ]));
-    }
-    if app.multiline.is_some() && lines.len() < area_height {
+    let layout = input_layout(app, area.width as usize);
+    let visible_rows = input_visible_rows(app, area.height as usize);
+    let start = layout.visible_start(visible_rows);
+    let mut lines = layout
+        .rows
+        .into_iter()
+        .skip(start)
+        .take(visible_rows)
+        .enumerate()
+        .map(|(offset, text)| {
+            let prefix = if offset == 0 {
+                prompt.to_string()
+            } else {
+                " ".repeat(prompt.len())
+            };
+            Line::from(vec![
+                Span::styled(clip_width(&prefix, area.width as usize), prompt_style),
+                Span::styled(text, input_style),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if !app.input_media.is_empty() && lines.len() < area.height as usize {
         lines.push(Line::from(Span::styled(
-            "submit with . on its own line",
-            muted_style,
+            clip_width(
+                &format!(
+                    "[{} image{} attached · esc clears draft when idle]",
+                    app.input_media.len(),
+                    if app.input_media.len() == 1 { "" } else { "s" }
+                ),
+                area.width as usize,
+            ),
+            prompt_style,
+        )));
+    }
+    if app.multiline.is_some() && lines.len() < area.height as usize {
+        lines.push(Line::from(Span::styled(
+            clip_width("submit with . on its own line", area.width as usize),
+            prompt_style,
         )));
     }
     lines
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InputMetrics {
-    top_padding: usize,
-    visible_index: usize,
-    current_width: usize,
+struct InputLayout {
+    rows: Vec<String>,
+    cursor_row: usize,
+    cursor_column: usize,
 }
 
-fn input_metrics(app: &TuiApp, area_height: usize) -> InputMetrics {
-    if area_height == 0 {
-        return InputMetrics {
-            top_padding: 0,
-            visible_index: 0,
-            current_width: 0,
-        };
+impl InputLayout {
+    fn visible_start(&self, capacity: usize) -> usize {
+        self.rows
+            .len()
+            .saturating_sub(capacity)
+            .min(self.cursor_row)
     }
-    let input_rows = input_visible_rows(app, area_height);
-    let parts_count = app.input.split('\n').count();
-    let visible_count = parts_count.min(input_rows);
-    let top_padding = if app.multiline.is_some() {
-        input_rows.saturating_sub(visible_count)
-    } else if area_height > visible_count {
-        1
-    } else {
-        0
+}
+
+/// The editor's height, rendering, and cursor use the same grapheme/cell wrap.
+/// Only the display copy folds pastes; the underlying draft stays untouched.
+fn input_layout(app: &TuiApp, inner_width: usize) -> InputLayout {
+    let (display, cursor) = app.display_input();
+    let width = inner_width.saturating_sub(input_prompt(app).len()).max(1);
+    let mut layout = InputLayout {
+        rows: Vec::new(),
+        cursor_row: 0,
+        cursor_column: 0,
     };
-    let cursor_line = app.input[..app.input_cursor]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count();
-    let line_start = app.input[..app.input_cursor]
-        .rfind('\n')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let current_width = app.input[line_start..app.input_cursor].chars().count();
-    InputMetrics {
-        top_padding,
-        visible_index: cursor_line.saturating_sub(input_visible_start(app, area_height)),
-        current_width,
+    let mut source_offset = 0;
+    for part in display.split('\n') {
+        let mut row = String::new();
+        let mut column = 0;
+        for (offset, grapheme) in part.grapheme_indices(true) {
+            let text = if grapheme == "\t" { "    " } else { grapheme };
+            let cells = text.width();
+            if column > 0 && column + cells > width {
+                layout.rows.push(std::mem::take(&mut row));
+                column = 0;
+            }
+            if source_offset + offset == cursor {
+                layout.cursor_row = layout.rows.len();
+                layout.cursor_column = column;
+            }
+            row.push_str(text);
+            column += cells;
+        }
+        // A full final row needs an insertion cell on the next row.
+        if column >= width
+            && (source_offset + part.len() == cursor || source_offset + part.len() == display.len())
+        {
+            layout.rows.push(std::mem::take(&mut row));
+            column = 0;
+        }
+        if source_offset + part.len() == cursor {
+            layout.cursor_row = layout.rows.len();
+            layout.cursor_column = column;
+        }
+        layout.rows.push(row);
+        source_offset += part.len() + 1;
     }
+    layout
 }
 
-fn input_visible_start(app: &TuiApp, area_height: usize) -> usize {
-    let parts_count = app.input.split('\n').count();
-    let visible_count = parts_count.min(input_visible_rows(app, area_height));
-    let end_anchored = parts_count.saturating_sub(visible_count);
-    let cursor_line = app.input[..app.input_cursor]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count();
-    end_anchored.min(cursor_line)
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn clip_width(text: &str, width: usize) -> String {
+    let mut used = 0;
+    text.graphemes(true)
+        .take_while(|grapheme| {
+            used += grapheme.width();
+            used <= width
+        })
+        .collect()
+}
+
+fn truncate_width(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("{}…", clip_width(text, width - 1))
+}
+
+fn clip_line_width(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    let mut remaining = width.saturating_sub(1);
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let clipped = span.width() > remaining;
+        let content = clip_width(&span.content, remaining);
+        remaining = remaining.saturating_sub(content.width());
+        spans.push(Span::styled(content, span.style));
+        if clipped {
+            break;
+        }
+    }
+    if width > 0 {
+        spans.push(Span::styled("…", line.style));
+    }
+    Line::from(spans).style(line.style)
 }
 
 fn input_visible_rows(app: &TuiApp, area_height: usize) -> usize {
     if area_height == 0 {
         0
-    } else if app.multiline.is_some() {
-        area_height.saturating_sub(1).max(1)
     } else {
         area_height
+            .saturating_sub(
+                usize::from(app.multiline.is_some()) + usize::from(!app.input_media.is_empty()),
+            )
+            .max(1)
     }
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemePalette) {
-    let line = if app.header_line.is_empty() {
-        app.status.clone()
+    let status = if app.owned_screen && app.transcript_view.borrow().has_selection() {
+        app.status
+            .replace("esc to interrupt", "ctrl+c copies selection; esc clears")
+    } else if app.owned_screen && app.transcript_view.borrow().is_reading() {
+        app.status
+            .replace("esc to interrupt", "ctrl+c to interrupt")
     } else {
-        format!("{}  {}", app.status, app.header_line)
+        app.status.clone()
+    };
+    let line = if app.header_line.is_empty() {
+        status
+    } else {
+        format!("{}  {}", status, app.header_line)
     };
     let footer = Paragraph::new(line).style(palette.secondary());
     frame.render_widget(footer, area);
@@ -4185,19 +5378,27 @@ fn set_tui_cursor(frame: &mut Frame<'_>, input_area: Rect, app: &TuiApp) {
         frame.set_cursor_position(Position::new(x, y));
         return;
     }
-    let prompt_width = input_prompt(app).chars().count() as u16;
-    let metrics = input_metrics(app, input_area.height as usize);
-    let max_x = input_area.right().saturating_sub(2);
-    let x = input_area
+    let inner = input_block(&ThemePalette::default()).inner(input_area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let prompt_width = input_prompt(app).len() as u16;
+    let layout = input_layout(app, inner.width as usize);
+    let start = layout.visible_start(input_visible_rows(app, inner.height as usize));
+    let x = inner
         .x
         .saturating_add(prompt_width)
-        .saturating_add(metrics.current_width as u16)
-        .min(max_x);
-    let y = input_area
+        .saturating_add(layout.cursor_column.min(u16::MAX as usize) as u16)
+        .min(inner.right().saturating_sub(1));
+    let y = inner
         .y
-        .saturating_add(metrics.top_padding as u16)
-        .saturating_add(metrics.visible_index as u16)
-        .min(input_area.bottom().saturating_sub(1));
+        .saturating_add(
+            layout
+                .cursor_row
+                .saturating_sub(start)
+                .min(u16::MAX as usize) as u16,
+        )
+        .min(inner.bottom().saturating_sub(1));
     frame.set_cursor_position(Position::new(x, y));
 }
 
@@ -4230,6 +5431,60 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
         .split(vertical[1])[1]
 }
 
+fn handle_transcript_key(key: &KeyEvent, app: &mut TuiApp) -> bool {
+    if !app.owned_screen {
+        return false;
+    }
+    let view = app.transcript_view.get_mut();
+    match key.code {
+        KeyCode::Char('c')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && view.has_selection() =>
+        {
+            view.request_copy()
+        }
+        KeyCode::Esc if view.is_reading() => {
+            view.clear_selection();
+            view.jump_to_latest();
+        }
+        KeyCode::Esc if view.clear_selection() => {}
+        KeyCode::PageUp => view.page(false),
+        KeyCode::PageDown => view.page(true),
+        _ => return false,
+    }
+    true
+}
+
+fn handle_transcript_mouse(mouse: MouseEvent, app: &mut TuiApp) -> bool {
+    if !app.owned_screen || app.selector.is_some() {
+        return false;
+    }
+    let view = app.transcript_view.get_mut();
+    let position = Position::new(mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::ScrollUp if view.area.contains(position) => view.scroll(-3),
+        MouseEventKind::ScrollDown if view.area.contains(position) => view.scroll(3),
+        MouseEventKind::Down(MouseButton::Left)
+            if view.is_reading() && view.hint_area.contains(position) =>
+        {
+            view.clear_selection();
+            view.jump_to_latest()
+        }
+        MouseEventKind::Down(MouseButton::Left) if view.area.contains(position) => {
+            return view.begin_selection(position);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => return view.drag_selection(position),
+        MouseEventKind::Up(MouseButton::Left) => {
+            if view.area.contains(position) {
+                view.drag_selection(position);
+            }
+            view.finish_selection();
+        }
+        MouseEventKind::Down(_) => return view.clear_selection(),
+        _ => return false,
+    }
+    true
+}
+
 async fn handle_tui_key(
     key: KeyEvent,
     surface: &mut TuiSurface<'_>,
@@ -4243,14 +5498,30 @@ async fn handle_tui_key(
         app.status = footer_status(config, runtime, &app.editor_state);
         return Ok(false);
     }
+    let key_name = key_event_name(&key);
+    let bindings = keybinding_map(config);
+    // Editing a newline must win over panel Enter actions, including an
+    // empty draft with the diff panel open.
+    if key_name
+        .as_deref()
+        .is_some_and(|name| bindings.matches("newline", name))
+    {
+        app.insert_input_newline();
+        app.quit_armed_since = None;
+        app.refresh_chrome(config, runtime);
+        return Ok(false);
+    }
     if app.diff_panel.is_some() && handle_diff_panel_key(&key, app, runtime) {
         app.refresh_chrome(config, runtime);
         return Ok(false);
     }
-    if let Some(name) = key_event_name(&key) {
-        let bindings = keybinding_map(config);
+    if handle_transcript_key(&key, app) {
+        copy_pending_selection(app).await;
+        return Ok(false);
+    }
+    if let Some(name) = key_name {
         if bindings.matches("interrupt", &name) {
-            if !app.input.is_empty() {
+            if !app.input.is_empty() || !app.input_media.is_empty() {
                 // With a draft present, ctrl+c clears it and ctrl+d does
                 // nothing; neither arms quit.
                 if name != "ctrl+d" {
@@ -4267,13 +5538,17 @@ async fn handle_tui_key(
             return Ok(false);
         }
         app.quit_armed_since = None;
-        if bindings.matches("todos", &name) {
-            app.todos_expanded = !app.todos_expanded;
+        if bindings.matches("paste-image", &name) {
+            paste_clipboard_image(app, config).await;
             app.refresh_chrome(config, runtime);
             return Ok(false);
         }
-        if bindings.matches("newline", &name) {
-            app.insert_input_newline();
+        if bindings.matches("expand", &name) {
+            app.previews_expanded = !app.previews_expanded;
+            return Ok(false);
+        }
+        if bindings.matches("todos", &name) {
+            app.todos_expanded = !app.todos_expanded;
             app.refresh_chrome(config, runtime);
             return Ok(false);
         }
@@ -4314,8 +5589,18 @@ async fn handle_tui_key(
         KeyCode::Backspace => {
             app.pop_input_char();
         }
+        KeyCode::Delete => {
+            app.delete_input_char();
+        }
         KeyCode::Up if app.multiline.is_none() => {
-            app.history_previous();
+            if app.input.is_empty() && !runtime.session().queued_messages.is_empty() {
+                let mut queue = runtime.session().queued_messages.clone();
+                let message = queue.pop().expect("nonempty queue");
+                runtime.replace_queued_messages(queue)?;
+                recall_queued_message(app, message);
+            } else {
+                app.history_previous();
+            }
         }
         KeyCode::Down if app.multiline.is_none() => {
             app.history_next();
@@ -4337,7 +5622,9 @@ async fn handle_tui_key(
 fn edit_input_in_external_editor(app: &mut TuiApp) {
     match read_external_editor_prompt(&app.input) {
         Ok(content) => {
+            let media = std::mem::take(&mut app.input_media);
             app.clear_input();
+            app.input_media = media;
             app.insert_input_str(content.trim_end_matches('\n'));
         }
         Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
@@ -4354,8 +5641,15 @@ async fn submit_tui_input(
     offline: bool,
 ) -> Result<bool> {
     let line = app.input.trim().to_string();
+    let media = std::mem::take(&mut app.input_media);
     app.clear_input();
-    if !line.is_empty() {
+    app.input_media = media;
+    if !line.is_empty() || !app.input_media.is_empty() {
+        let line = if line.is_empty() {
+            "Describe this image.".to_string()
+        } else {
+            line
+        };
         let quit = match handle_tui_submission(app, surface, runtime, config, offline, line).await {
             Ok(quit) => quit,
             Err(error) => {
@@ -4429,7 +5723,7 @@ fn handle_diff_panel_key(key: &KeyEvent, app: &mut TuiApp, runtime: &Runtime) ->
         KeyCode::Down => {
             panel.selected = (panel.selected + 1).min(panel.files.len().saturating_sub(1));
         }
-        KeyCode::Enter if app.input.trim().is_empty() => {
+        KeyCode::Enter if key.modifiers.is_empty() && app.input.trim().is_empty() => {
             let detail = panel
                 .files
                 .get(panel.selected)
@@ -4438,7 +5732,7 @@ fn handle_diff_panel_key(key: &KeyEvent, app: &mut TuiApp, runtime: &Runtime) ->
                 panel.detail = Some(detail);
             }
         }
-        KeyCode::Esc if app.input.is_empty() => app.diff_panel = None,
+        KeyCode::Esc if app.owned_screen || app.input.is_empty() => app.diff_panel = None,
         _ => return false,
     }
     true
@@ -4467,18 +5761,58 @@ fn handle_streaming_tui_key(
     steering: &SteeringMailbox,
     config: &LoadedConfig,
 ) -> StreamingKeyOutcome {
+    if let Some(panel) = &mut app.diff_panel {
+        if let Some(detail) = &mut panel.detail {
+            match key.code {
+                KeyCode::Esc => {
+                    panel.detail = None;
+                    return StreamingKeyOutcome::Changed;
+                }
+                KeyCode::PageUp => {
+                    detail.scroll = detail.scroll.saturating_sub(20);
+                    return StreamingKeyOutcome::Changed;
+                }
+                KeyCode::PageDown => {
+                    detail.scroll = (detail.scroll + 20).min(detail.lines.len().saturating_sub(1));
+                    return StreamingKeyOutcome::Changed;
+                }
+                _ => {}
+            }
+        } else if key.code == KeyCode::Esc {
+            app.diff_panel = None;
+            return StreamingKeyOutcome::Changed;
+        }
+    }
+    if handle_transcript_key(&key, app) {
+        return StreamingKeyOutcome::Changed;
+    }
     if let Some(name) = key_event_name(&key) {
         let bindings = keybinding_map(config);
         if bindings.matches("interrupt", &name) {
             return StreamingKeyOutcome::Interrupt;
         }
         if bindings.matches("steer", &name) {
+            if !app.input_media.is_empty() {
+                app.push(
+                    TuiEntryKind::System,
+                    "image draft kept; submit after the running turn finishes",
+                );
+                return StreamingKeyOutcome::Changed;
+            }
             let line = app.input.trim().to_string();
             app.clear_input();
+            for queued in followups.drain() {
+                steering.send(queued.clone());
+                app.push(TuiEntryKind::System, format!("steering> {queued}"));
+            }
             if !line.is_empty() {
                 steering.send(line.clone());
                 app.push(TuiEntryKind::System, format!("steering> {line}"));
             }
+            return StreamingKeyOutcome::Changed;
+        }
+        if bindings.matches("expand", &name) {
+            app.previews_expanded = !app.previews_expanded;
             return StreamingKeyOutcome::Changed;
         }
         if bindings.matches("todos", &name) {
@@ -4507,12 +5841,29 @@ fn handle_streaming_tui_key(
         }
     }
     match key.code {
+        KeyCode::Up if app.input.is_empty() => {
+            if let Some(message) = followups.pop() {
+                recall_queued_message(app, message);
+            }
+            StreamingKeyOutcome::Changed
+        }
         KeyCode::Esc => StreamingKeyOutcome::Interrupt,
         KeyCode::Backspace => {
             app.pop_input_char();
             StreamingKeyOutcome::Changed
         }
+        KeyCode::Delete => {
+            app.delete_input_char();
+            StreamingKeyOutcome::Changed
+        }
         KeyCode::Enter => {
+            if !app.input_media.is_empty() {
+                app.push(
+                    TuiEntryKind::System,
+                    "image draft kept; submit after the running turn finishes",
+                );
+                return StreamingKeyOutcome::Changed;
+            }
             let line = app.input.trim().to_string();
             app.clear_input();
             if let Some(command) = line.strip_prefix('/') {
@@ -4556,12 +5907,23 @@ fn handle_streaming_command(
             }
             StreamingKeyOutcome::Changed
         }
+        command if command.starts_with("queue ") => {
+            let message = command.trim_start_matches("queue ").trim();
+            if !message.is_empty() {
+                followups.push(message.to_string());
+            }
+            StreamingKeyOutcome::Changed
+        }
         "queue-clear" => {
             let cleared = followups.clear();
             app.push(
                 TuiEntryKind::System,
                 format!("cleared {cleared} pending follow-up(s)"),
             );
+            StreamingKeyOutcome::Changed
+        }
+        "copy" if app.transcript_view.borrow().has_selection() => {
+            app.transcript_view.get_mut().request_copy();
             StreamingKeyOutcome::Changed
         }
         "todos" => {
@@ -4584,18 +5946,37 @@ fn handle_streaming_command(
     }
 }
 
-fn drain_streaming_tui_events(
+async fn drain_streaming_tui_events(
     surface: &mut TuiSurface<'_>,
     app: &mut TuiApp,
     followups: &FollowUpQueue,
     steering: &SteeringMailbox,
     config: &LoadedConfig,
 ) -> Result<(bool, Option<TurnControl>)> {
+    if app.owned_screen {
+        let root = tui_layout(surface.terminal.get_frame().area(), app, config);
+        let area = transcript_area(root[0], app);
+        let palette = terminal_theme(config).unwrap_or_default().palette;
+        app.transcript_view.borrow_mut().sync(
+            &app.entries,
+            area,
+            &palette,
+            config.settings.hide_thinking_block.unwrap_or(false),
+            &transcript_preview_state(app),
+        );
+    }
     let mut changed = false;
     let mut control = None;
     while event::poll(Duration::ZERO)? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if key_event_name(&key)
+                    .is_some_and(|name| keybinding_map(config).matches("paste-image", &name))
+                {
+                    paste_clipboard_image(app, config).await;
+                    changed = true;
+                    continue;
+                }
                 match handle_streaming_tui_key(key, app, followups, steering, config) {
                     StreamingKeyOutcome::Ignored => {}
                     StreamingKeyOutcome::Changed => changed = true,
@@ -4605,17 +5986,21 @@ fn drain_streaming_tui_events(
                     }
                 }
             }
+            Event::Mouse(mouse) => {
+                changed |= handle_transcript_mouse(mouse, app);
+            }
             Event::Paste(text) => {
                 app.paste_text(&text);
                 changed = true;
             }
             Event::Resize(_, _) => {
-                resize_tui_viewport(surface.terminal, surface.viewport_height)?;
+                resize_tui_viewport(surface.terminal, surface.viewport_height, app.owned_screen)?;
                 changed = true;
             }
             _ => {}
         }
     }
+    copy_pending_selection(app).await;
     Ok((changed, control))
 }
 
@@ -4670,16 +6055,47 @@ fn apply_turn_event(
     match event {
         TurnEvent::Provider(StreamEvent::Text(text)) => {
             *activity = Activity::Writing;
+            app.live_thinking_index = None;
             apply_stream_delta(app, entry_index, saw_delta, text);
         }
         TurnEvent::Provider(StreamEvent::Thinking(text)) => {
             *activity = Activity::Thinking;
+            app.live_thinking_index = Some(thinking_index);
             app.append_entry(thinking_index, text);
         }
         TurnEvent::ToolStarted { name } => {
             *activity = Activity::Tool(name.clone());
+            app.live_thinking_index = None;
+            app.turn_saw_tools = true;
+            app.live_tool_indices.push(app.entries.len());
+            app.push(TuiEntryKind::Tool, format!("running {name}\n\n"));
+        }
+        TurnEvent::ToolOutput {
+            call,
+            output,
+            is_error,
+        } => {
+            if let Some(index) = app.live_tool_indices.last().copied() {
+                app.replace_entry(
+                    index,
+                    format!(
+                        "{} {}\n{}\n{}",
+                        if *is_error { "failed" } else { "completed" },
+                        call.name,
+                        tool_call_detail(call),
+                        output
+                    ),
+                );
+            }
         }
         TurnEvent::CompactionStarted => *activity = Activity::Compacting,
+        TurnEvent::CompactionFailed(reason) => {
+            *activity = Activity::Waiting;
+            app.push(
+                TuiEntryKind::System,
+                format!("auto-compaction skipped: {reason}; continuing with full history"),
+            );
+        }
         TurnEvent::CompactionFinished(record) => {
             *activity = Activity::Waiting;
             app.push(
@@ -4690,6 +6106,7 @@ fn apply_turn_event(
                 ),
             );
         }
+        TurnEvent::TodosUpdated(todos) => app.todos = todos.clone(),
         TurnEvent::ToolFinished { .. } => {
             *activity = Activity::Waiting;
         }
@@ -4832,6 +6249,10 @@ fn apply_tui_selector_selection(
             let path = resolve_session_reference(&config.paths.session_dir, &item.value)?;
             let (store, state) = SessionStore::open(path)?;
             runtime.replace_session(state, Some(store));
+            app.resume_pending = runtime.session().has_unfinished_turn();
+            if let Some(hint) = resume_hint(runtime) {
+                app.push(TuiEntryKind::System, hint);
+            }
             app.push(TuiEntryKind::System, format_session(runtime));
         }
         "auth" | "login" => {
@@ -5058,16 +6479,8 @@ fn apply_settings_item(
             )?;
             format!("setting warnings.anthropicExtraUsage: {}", on_off(next))
         }
-        "followUpMode" => {
-            let next = if follow_up_mode(config) == "one-at-a-time" {
-                "all"
-            } else {
-                "one-at-a-time"
-            };
-            config.settings.follow_up_mode = Some(next.to_string());
-            write_user_setting(&config.paths.settings_path, &["followUpMode"], next.into())?;
-            format!("setting followUpMode: {next}")
-        }
+        // followUpMode/steeringMode removed: queued bursts always dispatch
+        // as one combined message (one turn), so there is no mode to toggle.
         _ => return Err(anyhow!("unknown setting: {key}")),
     };
     let next_generation = runtime.systems().config_generation + 1;
@@ -5164,7 +6577,7 @@ async fn handle_tui_submission(
         "/help" => app.push(TuiEntryKind::System, terminal_renderer(config).help()),
         "/clear" => {
             app.clear_visible();
-            clear_terminal_screen(surface.terminal)?;
+            clear_terminal_screen(surface.terminal, app.owned_screen)?;
         }
         "/image-models" => app.push(TuiEntryKind::System, format_image_models(config, "")),
         "/thinking" => app.push(
@@ -5198,7 +6611,17 @@ async fn handle_tui_submission(
                 });
             }
         }
-        "/accounts" => {
+        "/accounts" | "/usage" => {
+            if line == "/usage" {
+                app.push(TuiEntryKind::System, format_session_usage(runtime));
+            }
+            if offline || runtime.systems().offline {
+                app.push(
+                    TuiEntryKind::System,
+                    "account quotas unavailable in offline mode",
+                );
+                return Ok(false);
+            }
             let checking = app.push_placeholder(
                 TuiEntryKind::System,
                 "checking account status...".to_string(),
@@ -5252,13 +6675,24 @@ async fn handle_tui_submission(
             format_session_tree(&config.paths.session_dir)?,
         ),
         "/summaries" => app.push(TuiEntryKind::System, format_summaries(runtime)),
+        "/undo" => undo_tui_turn(app, runtime)?,
         _ if line.split_whitespace().next() == Some("/compact") => {
             let focus = line.strip_prefix("/compact").unwrap_or_default().trim();
             if compact_tui_context(app, surface, runtime, config, focus, offline).await? {
                 return Ok(true);
             }
         }
-        "/copy" => app.push(TuiEntryKind::System, copy_last_assistant_message(runtime)?),
+        "/copy" => {
+            if app.transcript_view.borrow().has_selection() {
+                app.transcript_view.get_mut().request_copy();
+                copy_pending_selection(app).await;
+            } else {
+                app.push(
+                    TuiEntryKind::System,
+                    copy_last_assistant_message(runtime).await?,
+                );
+            }
+        }
         "/theme" => open_tui_selector(app, config, runtime, "theme", "")?,
         "/multiline" => {
             app.multiline = Some(Vec::new());
@@ -5360,6 +6794,7 @@ async fn handle_tui_submission(
                         )
                         .await);
                     }
+                    app.input_media.push(media);
                 }
                 Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
             }
@@ -5369,8 +6804,56 @@ async fn handle_tui_submission(
             app.push(TuiEntryKind::System, format_image_models(config, search));
         }
         _ if line.starts_with("/models ") => {
-            let query = line.trim_start_matches("/models ").trim();
-            open_tui_selector(app, config, runtime, "model", query)?;
+            let arg = line.trim_start_matches("/models ").trim();
+            match arg {
+                "refresh" => {
+                    if offline {
+                        app.push(
+                            TuiEntryKind::Error,
+                            "model refresh is disabled in offline mode",
+                        );
+                    } else if !model_refresh_enabled(&config.settings) {
+                        app.push(
+                            TuiEntryKind::Error,
+                            "model refresh is disabled by modelRefresh.enabled",
+                        );
+                    } else {
+                        let report =
+                            refresh_model_cache(config.paths.clone(), config.auth.clone()).await?;
+                        *config = load_config(config.paths.clone())?;
+                        let next_generation = runtime.systems().config_generation + 1;
+                        let reload_report = runtime
+                            .reload(ReloadableSystems::from_config(config, next_generation))?;
+                        app.push(
+                            TuiEntryKind::System,
+                            format_model_refresh_after_reload(&report, config, &reload_report),
+                        );
+                    }
+                }
+                "reset" => {
+                    let message = reset_model_cache(&config.paths.model_cache_path)?;
+                    *config = load_config(config.paths.clone())?;
+                    let next_generation = runtime.systems().config_generation + 1;
+                    let reload_report =
+                        runtime.reload(ReloadableSystems::from_config(config, next_generation))?;
+                    let mut output = message;
+                    if !reload_report.active_model_valid {
+                        output.push_str(
+                            "\nactive model is no longer available; use /model <provider/model>",
+                        );
+                    }
+                    output.push_str(&format!(
+                        "\n{} models available; run /models refresh to repopulate",
+                        config.models.len()
+                    ));
+                    app.push(TuiEntryKind::System, output);
+                }
+                "help" | "usage" => app.push(
+                    TuiEntryKind::System,
+                    "usage: /models [refresh|reset|<query>]",
+                ),
+                query => open_tui_selector(app, config, runtime, "model", query)?,
+            }
         }
         _ if line.starts_with("/scoped-models ") => {
             let query = line.trim_start_matches("/scoped-models ").trim();
@@ -5413,10 +6896,18 @@ async fn handle_tui_submission(
             open_tui_selector(app, config, runtime, kind, "")?;
         }
         _ if line.starts_with("/select ") => {
+            let (kind, _) = split_once_text(line.trim_start_matches("/select ").trim());
+            let resuming = matches!(kind, "session" | "sessions" | "resume" | "tree");
             app.push(
                 TuiEntryKind::System,
                 select_from_selector_message(config, runtime, &line)?,
             );
+            if resuming {
+                app.resume_pending = runtime.session().has_unfinished_turn();
+                if let Some(hint) = resume_hint(runtime) {
+                    app.push(TuiEntryKind::System, hint);
+                }
+            }
         }
         _ if line.starts_with("/model ") => {
             let reference = line.trim_start_matches("/model ").trim();
@@ -5444,11 +6935,8 @@ async fn handle_tui_submission(
                     ));
                 }
             }
-            runtime.set_active_thinking_level(if level == "off" {
-                None
-            } else {
-                Some(level.to_string())
-            })?;
+            // None means inherit defaults, not an explicit off selection.
+            runtime.set_active_thinking_level(Some(level.to_string()))?;
             app.push(TuiEntryKind::System, format!("thinking: {level}"));
         }
         _ if line.starts_with("/skill:") => {
@@ -5533,9 +7021,7 @@ async fn handle_tui_submission(
             app.push(TuiEntryKind::System, format!("theme: {name}"));
         }
         _ if line.starts_with("/new") => {
-            let (store, state) =
-                SessionStore::create(&config.paths.session_dir, runtime.session().cwd.clone())?;
-            runtime.replace_session(state, Some(store));
+            start_new_session(runtime, config)?;
             app.push(TuiEntryKind::System, format_session(runtime));
         }
         _ if line.starts_with("/resume") => {
@@ -5549,6 +7035,10 @@ async fn handle_tui_submission(
                 let path = resolve_session_reference(&config.paths.session_dir, reference)?;
                 let (store, state) = SessionStore::open(path)?;
                 runtime.replace_session(state, Some(store));
+                app.resume_pending = runtime.session().has_unfinished_turn();
+                if let Some(hint) = resume_hint(runtime) {
+                    app.push(TuiEntryKind::System, hint);
+                }
                 app.push(TuiEntryKind::System, format_session(runtime));
             }
         }
@@ -5670,13 +7160,15 @@ async fn handle_tui_submission(
     Ok(false)
 }
 
-fn clear_terminal_screen(terminal: &mut TuiTerminal) -> Result<()> {
+fn clear_terminal_screen(terminal: &mut TuiTerminal, owned_screen: bool) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         MoveTo(0, 0),
-        TerminalClear(ClearType::All),
-        TerminalClear(ClearType::Purge)
+        TerminalClear(ClearType::All)
     )?;
+    if !owned_screen {
+        execute!(terminal.backend_mut(), TerminalClear(ClearType::Purge))?;
+    }
     terminal.clear()?;
     Ok(())
 }
@@ -5699,6 +7191,7 @@ async fn handle_tui_bang(
     let Some(command) = resolve_bang_command(line, &app.last_shell_command) else {
         return Ok(false);
     };
+    app.previews_expanded = false;
     let entry_index = if terminal_progress_enabled(config) {
         let index = app.push_placeholder(TuiEntryKind::Tool, format_bash_running(&command));
         redraw_tui(surface.terminal, app, config)?;
@@ -5706,10 +7199,19 @@ async fn handle_tui_bang(
     } else {
         None
     };
-    match run_excluded_bash(runtime, command.clone()).await {
-        Ok(output) => {
+    match run_excluded_bash_result(runtime, command.clone()).await {
+        Ok(result) => {
+            let output = result.output;
             if let Some(index) = entry_index {
-                app.replace_entry(index, format_bash_completed(&command, &output));
+                let text = format_bash_completed(&command, &output);
+                app.replace_entry(
+                    index,
+                    if result.is_error {
+                        text.replacen("completed", "failed", 1)
+                    } else {
+                        text
+                    },
+                );
                 app.finish_live_entry();
             } else {
                 app.push(TuiEntryKind::Tool, output);
@@ -5718,7 +7220,7 @@ async fn handle_tui_bang(
         }
         Err(error) => {
             if let Some(index) = entry_index {
-                app.replace_entry(index, format!("failed bash\n{error}"));
+                app.replace_entry(index, format!("failed bash\n$ {command}\n{error}"));
                 app.finish_live_entry();
             } else {
                 app.push(TuiEntryKind::Error, format!("{error}"));
@@ -5737,6 +7239,18 @@ async fn submit_tui_prompt(
     media: Vec<MediaInput>,
     offline: bool,
 ) -> bool {
+    if images_blocked(config) && (!media.is_empty() || !app.input_media.is_empty()) {
+        app.push(
+            TuiEntryKind::Error,
+            "images are blocked by settings; clear the image draft before submitting",
+        );
+        return false;
+    }
+    let mut media = media;
+    media.append(&mut app.input_media);
+    for attachment in &media {
+        app.push(TuiEntryKind::System, format_media_fallback(attachment));
+    }
     app.editor_state.record_history(prompt.clone());
     app.push(TuiEntryKind::User, prompt.clone());
     let control = match run_prompt_with_queue_tui(
@@ -5801,6 +7315,8 @@ async fn compact_tui_context(
     let steering = steering_mailbox(config);
     let queue_store = runtime.store().cloned();
     let mut saved_queue = followups.list();
+    app.turn_running = true;
+    app.turn_saw_tools = false;
     let mut quit = false;
     let result = {
         let compact = runtime.compact_messages(provider.as_ref(), CompactionKind::Manual, focus);
@@ -5812,7 +7328,7 @@ async fn compact_tui_context(
                 _ = tick.tick() => {
                     app.status = activity_status(started, &Activity::Compacting, followups.pending());
                     if let Err(error) = redraw_tui(surface.terminal, app, config) { break Err(error); }
-                    let control = match drain_streaming_tui_events(surface, app, &followups, &steering, config) {
+                    let control = match drain_streaming_tui_events(surface, app, &followups, &steering, config).await {
                         Ok((_, control)) => control,
                         Err(error) => break Err(error),
                     };
@@ -5831,6 +7347,7 @@ async fn compact_tui_context(
             }
         }
     };
+    app.turn_running = false;
     runtime.replace_queued_messages(
         steering
             .drain()
@@ -5838,6 +7355,7 @@ async fn compact_tui_context(
             .chain(followups.drain())
             .collect(),
     )?;
+    app.queued_messages = runtime.session().queued_messages.clone();
     app.status = footer_status(config, runtime, &app.editor_state);
     match result? {
         Some(Ok(record)) => app.push(
@@ -5870,43 +7388,63 @@ async fn run_prompt_with_queue_tui(
         TurnControl::Completed => {}
         control => return Ok(control),
     }
-    while let Some(prompt) = runtime.session().queued_messages.first().cloned() {
-        let remaining = runtime
-            .session()
-            .queued_messages
-            .iter()
-            .skip(1)
-            .cloned()
-            .collect();
+    drain_followups_tui(app, surface, runtime, config, offline).await
+}
+
+async fn resume_turn_with_queue_tui(
+    app: &mut TuiApp,
+    surface: &mut TuiSurface<'_>,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    offline: bool,
+) -> Result<TurnControl> {
+    match run_turn_tui(app, surface, runtime, config, None, offline).await? {
+        TurnControl::Completed => drain_followups_tui(app, surface, runtime, config, offline).await,
+        control => Ok(control),
+    }
+}
+
+async fn drain_followups_tui(
+    app: &mut TuiApp,
+    surface: &mut TuiSurface<'_>,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    offline: bool,
+) -> Result<TurnControl> {
+    while !runtime.session().queued_messages.is_empty() {
+        // Tool-command entries (for example `/read path`) are positional and
+        // dispatch one at a time; prose follow-ups batch into a single
+        // combined turn so a queued burst reads as one instruction.
+        let queue: Vec<String> = runtime.session().queued_messages.to_vec();
+        let batch: Vec<String> = if response_kind_for_prompt(&queue[0]) == TuiEntryKind::Tool {
+            vec![queue[0].clone()]
+        } else {
+            queue
+                .iter()
+                .take_while(|message| response_kind_for_prompt(message) != TuiEntryKind::Tool)
+                .cloned()
+                .collect()
+        };
+        let prompt = batch.join(STEERING_JOIN);
+        let remaining = queue[batch.len()..].to_vec();
         runtime.replace_queued_messages(remaining)?;
-        app.push(TuiEntryKind::System, format!("queued> {prompt}"));
+        for queued in &batch {
+            app.push(TuiEntryKind::User, format!("queued> {queued}"));
+        }
         match run_prompt_once_tui(app, surface, runtime, config, prompt, Vec::new(), offline)
             .await?
         {
             TurnControl::Completed => {}
             control => return Ok(control),
         }
-        if follow_up_mode(config) == "one-at-a-time" {
-            break;
-        }
+        // Batching describes delivery, not a cap on the chain. Each completed
+        // follow-up turn may have queued more work, drained the same way.
     }
     Ok(TurnControl::Completed)
 }
 
-fn follow_up_mode(config: &LoadedConfig) -> &str {
-    config
-        .settings
-        .follow_up_mode
-        .as_deref()
-        .unwrap_or("one-at-a-time")
-}
-
-fn steering_mailbox(config: &LoadedConfig) -> SteeringMailbox {
-    let mode = match config.settings.steering_mode.as_deref() {
-        Some("all") => SteeringMode::All,
-        _ => SteeringMode::OneAtATime,
-    };
-    SteeringMailbox::new(mode)
+fn steering_mailbox(_config: &LoadedConfig) -> SteeringMailbox {
+    SteeringMailbox::new()
 }
 
 async fn run_prompt_once_tui(
@@ -5918,10 +7456,36 @@ async fn run_prompt_once_tui(
     media: Vec<MediaInput>,
     offline: bool,
 ) -> Result<TurnControl> {
-    let kind = response_kind_for_prompt(&prompt);
+    run_turn_tui(
+        app,
+        surface,
+        runtime,
+        config,
+        Some((prompt, media)),
+        offline,
+    )
+    .await
+}
+
+/// None continues existing context without a synthetic user message.
+async fn run_turn_tui(
+    app: &mut TuiApp,
+    surface: &mut TuiSurface<'_>,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    submission: Option<(String, Vec<MediaInput>)>,
+    offline: bool,
+) -> Result<TurnControl> {
+    let kind = submission
+        .as_ref()
+        .map(|(prompt, _)| response_kind_for_prompt(prompt))
+        .unwrap_or(TuiEntryKind::Assistant);
     let progress_enabled = terminal_progress_enabled(config);
     let thinking_index = app.entries.len();
+    app.turn_running = true;
+    app.turn_saw_tools = false;
     if kind != TuiEntryKind::Tool {
+        app.live_thinking_index = Some(thinking_index);
         app.entries.push(TuiEntry {
             kind: TuiEntryKind::Thinking,
             text: String::new(),
@@ -5930,7 +7494,7 @@ async fn run_prompt_once_tui(
     let entry_index = app.push_placeholder(
         kind.clone(),
         if kind == TuiEntryKind::Tool && progress_enabled {
-            format_tool_running(&prompt)
+            format_tool_running(&submission.as_ref().expect("tool prompt").0)
         } else if kind == TuiEntryKind::Tool {
             "running...".to_string()
         } else {
@@ -5942,6 +7506,7 @@ async fn run_prompt_once_tui(
     let tool_start = runtime.session().tool_history.len();
     let steering = steering_mailbox(config);
     if kind == TuiEntryKind::Tool {
+        let (prompt, media) = submission.expect("tool prompt");
         let tool_prompt = prompt.clone();
         let response = run_user_turn_streaming_with_media(
             runtime,
@@ -5953,7 +7518,18 @@ async fn run_prompt_once_tui(
         )
         .await?;
         if progress_enabled {
-            app.replace_entry(entry_index, format_tool_completed(&tool_prompt, &response));
+            let text = format_tool_completed(&tool_prompt, &response);
+            let text = if runtime
+                .session()
+                .tool_history
+                .last()
+                .is_some_and(|event| event.is_error)
+            {
+                text.replacen("completed", "failed", 1)
+            } else {
+                text
+            };
+            app.replace_entry(entry_index, text);
         } else {
             app.replace_entry(entry_index, response);
         }
@@ -5964,20 +7540,37 @@ async fn run_prompt_once_tui(
 
     let mut saw_delta = false;
     let followups = FollowUpQueue::default();
+    for message in runtime.session().queued_messages.clone() {
+        followups.push(message);
+    }
+    let queue_store = runtime.store().cloned();
+    let mut saved_queue = followups.list();
     let activity_started = Instant::now();
     let mut activity = Activity::Waiting;
     let (delta_tx, delta_rx) = std::sync::mpsc::channel::<TurnEvent>();
     let stream_end = {
-        let turn = run_user_turn_streaming_events_with_media(
-            runtime,
-            provider.as_ref(),
-            prompt,
-            media,
-            &steering,
-            move |event| {
+        let turn = async {
+            let on_event = move |event: &TurnEvent| {
                 let _ = delta_tx.send(event.clone());
-            },
-        );
+            };
+            match submission {
+                Some((prompt, media)) => {
+                    run_user_turn_streaming_events_with_media(
+                        runtime,
+                        provider.as_ref(),
+                        prompt,
+                        media,
+                        &steering,
+                        on_event,
+                    )
+                    .await
+                }
+                None => {
+                    continue_turn_streaming_events(runtime, provider.as_ref(), &steering, on_event)
+                        .await
+                }
+            }
+        };
         tokio::pin!(turn);
         let mut tick = tokio::time::interval(Duration::from_millis(STREAM_RENDER_INTERVAL_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5988,38 +7581,60 @@ async fn run_prompt_once_tui(
                     while let Ok(event) = delta_rx.try_recv() {
                         apply_turn_event(app, entry_index, thinking_index, &mut saw_delta, &mut activity, &event);
                     }
+                    // Consume input already pending at completion while it
+                    // still belongs to this turn (Enter queues, Ctrl+S steers).
+                    let (_, control) =
+                        drain_streaming_tui_events(surface, app, &followups, &steering, config).await?;
+                    app.queued_messages = followups.list();
                     app.status = activity_status(activity_started, &activity, followups.pending());
                     redraw_tui(surface.terminal, app, config)?;
-                    break StreamEnd::Finished(result);
+                    break match control {
+                        Some(TurnControl::Quit) => StreamEnd::Quit,
+                        Some(TurnControl::Interrupted) => StreamEnd::Interrupted,
+                        _ => StreamEnd::Finished(result),
+                    };
                 }
                 _ = tick.tick() => {
                     while let Ok(event) = delta_rx.try_recv() {
                         apply_turn_event(app, entry_index, thinking_index, &mut saw_delta, &mut activity, &event);
                     }
                     let (_, control) =
-                        drain_streaming_tui_events(surface, app, &followups, &steering, config)?;
+                        drain_streaming_tui_events(surface, app, &followups, &steering, config).await?;
+                    let pending = steering.list().into_iter().chain(followups.list()).collect::<Vec<_>>();
+                    if pending != saved_queue {
+                        if let Some(store) = &queue_store { store.record_queued_messages_snapshot(pending.clone())?; }
+                        saved_queue = pending;
+                    }
                     if let Some(control) = control {
                         break match control {
                             TurnControl::Quit => StreamEnd::Quit,
                             _ => StreamEnd::Interrupted,
                         };
                     }
+                    app.queued_messages = followups.list();
                     app.status = activity_status(activity_started, &activity, followups.pending());
                     redraw_tui(surface.terminal, app, config)?;
                 }
             }
         }
     };
+    app.turn_running = false;
+    app.live_thinking_index = None;
+    for index in std::mem::take(&mut app.live_tool_indices).into_iter().rev() {
+        app.remove_entry(index);
+    }
     app.status = footer_status(config, runtime, &app.editor_state);
-    for followup in followups.drain() {
-        runtime.queue_message(followup)?;
-    }
-    // Steering input that arrived after the turn's last injection point
-    // becomes a regular follow-up instead of being dropped.
-    for leftover in steering.drain() {
-        runtime.queue_message(leftover)?;
-    }
+    // Steering input that arrived after the last injection point becomes a
+    // regular follow-up rather than being dropped, ahead of newer follow-ups.
+    runtime.replace_queued_messages(
+        steering
+            .drain()
+            .into_iter()
+            .chain(followups.drain())
+            .collect(),
+    )?;
 
+    app.refresh_chrome(config, runtime);
     // Interrupt and quit drop the in-flight turn future, which cancels the
     // provider request; whatever already streamed stays visible.
     let turn_result = match stream_end {
@@ -6085,7 +7700,7 @@ fn insert_new_tool_messages(
                 message.role == MessageRole::Tool
                     && message.tool_call_id.as_deref() == Some(event.id.as_str())
             }) {
-                format_model_tool_message(message)
+                format_session_tool_message(message, runtime)
             } else {
                 format!(
                     "{} {}\n\n{}",
@@ -6105,12 +7720,53 @@ fn insert_new_tool_messages(
     }
 }
 
-fn format_model_tool_message(message: &ConversationMessage) -> String {
-    let tool_name = message.tool_name.as_deref().unwrap_or("tool");
-    if message.content.trim().is_empty() {
-        return format!("completed {tool_name}");
+fn tool_call_detail(call: &pi_ai::ChatToolCall) -> String {
+    let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+    if let Some(command) = args["command"].as_str() {
+        return format!("$ {command}");
     }
-    format!("completed {tool_name}\n{}", message.content)
+    let detail = ["path", "url", "query", "pattern"]
+        .iter()
+        .find_map(|key| args[*key].as_str())
+        .unwrap_or("");
+    if call.name == "edit" {
+        if let Some(edits) = args["edits"].as_array() {
+            let added: usize = edits
+                .iter()
+                .filter_map(|edit| edit["newText"].as_str())
+                .map(|text| text.lines().count())
+                .sum();
+            let removed: usize = edits
+                .iter()
+                .filter_map(|edit| edit["oldText"].as_str())
+                .map(|text| text.lines().count())
+                .sum();
+            return format!("{detail} · +{added} -{removed}");
+        }
+    }
+    detail.to_string()
+}
+
+fn format_session_tool_message(message: &ConversationMessage, runtime: &Runtime) -> String {
+    let name = message.tool_name.as_deref().unwrap_or("tool");
+    let call = runtime
+        .session()
+        .messages
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .find(|call| Some(call.id.as_str()) == message.tool_call_id.as_deref());
+    let detail = call.map(tool_call_detail).unwrap_or_default();
+    let failed = runtime
+        .session()
+        .tool_history
+        .iter()
+        .find(|event| Some(event.id.as_str()) == message.tool_call_id.as_deref())
+        .is_some_and(|event| event.is_error);
+    format!(
+        "{} {name}\n{detail}\n{}",
+        if failed { "failed" } else { "completed" },
+        message.content
+    )
 }
 
 fn collect_diff_file_entries(cwd: &Path, paths: &[String]) -> Vec<DiffFileEntry> {
@@ -6214,7 +7870,17 @@ fn build_diff_detail(cwd: &Path, entry: &DiffFileEntry) -> DiffDetail {
 fn response_kind_for_prompt(prompt: &str) -> TuiEntryKind {
     if matches!(
         prompt.split_whitespace().next(),
-        Some("/read" | "/write" | "/edit" | "/grep" | "/find" | "/ls" | "/bash")
+        Some(
+            "/read"
+                | "/write"
+                | "/edit"
+                | "/grep"
+                | "/find"
+                | "/ls"
+                | "/bash"
+                | "/web-search"
+                | "/web-fetch"
+        )
     ) {
         TuiEntryKind::Tool
     } else {
@@ -6236,15 +7902,24 @@ fn format_tool_running(prompt: &str) -> String {
     if detail.is_empty() {
         return format!("running {command}");
     }
-    format!("running {command}\n{detail}")
+    format!(
+        "running {}\n{detail}",
+        command.trim_start_matches('/').replace('-', "_")
+    )
 }
 
 fn format_tool_completed(prompt: &str, output: &str) -> String {
     let (command, detail) = split_once_text(prompt.trim());
     if detail.is_empty() {
-        return format!("completed {command}\n{output}");
+        return format!(
+            "completed {}\n\n{output}",
+            command.trim_start_matches('/').replace('-', "_")
+        );
     }
-    format!("completed {command}\n{detail}\n{output}")
+    format!(
+        "completed {}\n{detail}\n{output}",
+        command.trim_start_matches('/').replace('-', "_")
+    )
 }
 
 fn format_bash_running(command: &str) -> String {
@@ -6702,6 +8377,60 @@ fn format_session_tree(session_dir: &Path) -> Result<String> {
     })
 }
 
+fn format_session_usage(runtime: &Runtime) -> String {
+    let usage = &runtime.session().usage;
+    if usage.requests == 0 {
+        return "session usage: no provider token usage reported yet".into();
+    }
+    format!("session usage: {} input tokens, {} output tokens, {} total · {} reported request(s)\ncosts are not available", usage.input_tokens, usage.output_tokens, usage.input_tokens.saturating_add(usage.output_tokens), usage.requests)
+}
+
+fn undo_tui_turn(app: &mut TuiApp, runtime: &mut Runtime) -> Result<()> {
+    if !app.input_media.is_empty() {
+        app.push(TuiEntryKind::System, "clear the image draft before /undo");
+        return Ok(());
+    }
+    match runtime.undo_last_turn()? {
+        Some(prompt) => {
+            let visible_prompt = app
+                .entries
+                .iter()
+                .rposition(|entry| entry.kind == TuiEntryKind::User);
+            if let Some(index) = visible_prompt.filter(|index| {
+                app.entries[*index].text == prompt.content
+                    || app.entries[*index].text == format!("queued> {}", prompt.content)
+            }) {
+                app.transcript_view.get_mut().reset();
+                app.entries.truncate(index);
+                app.transcript_scrollback.truncate(index);
+            } else {
+                // Steering messages and resumed sessions may not have a matching
+                // visible user row. Rebuild from actual context, not an unrelated
+                // earlier turn, while keeping diagnostics and command output.
+                app.transcript_view.get_mut().reset();
+                app.entries.retain(|entry| {
+                    matches!(entry.kind, TuiEntryKind::System | TuiEntryKind::Error)
+                });
+                app.transcript_scrollback = TranscriptScrollback::default();
+                app.restore_session_messages(runtime);
+            }
+            app.clear_input();
+            app.multiline = None;
+            app.live_entry_index = None;
+            app.live_thinking_index = None;
+            app.live_tool_indices.clear();
+            app.insert_input_str(&prompt.content);
+            app.input_media = prompt.media;
+            app.push(
+                TuiEntryKind::System,
+                "undid last conversation turn; prompt restored (files unchanged)",
+            );
+        }
+        None => app.push(TuiEntryKind::System, "nothing to undo"),
+    }
+    Ok(())
+}
+
 fn format_summaries(runtime: &Runtime) -> String {
     if runtime.session().compactions.is_empty() && runtime.session().branch_summaries.is_empty() {
         return "no summaries".to_string();
@@ -6749,7 +8478,7 @@ fn format_hotkeys(config: &LoadedConfig) -> String {
     if !output.is_empty() {
         output.push('\n');
     }
-    output.push_str("scrollback\tmouse wheel, terminal selection");
+    output.push_str("transcript\tmouse wheel, PageUp/PageDown; Esc returns to bottom\nselection\tdrag to select/copy; ctrl+c or /copy copies selection; Esc clears; --no-alt-screen for native scrollback");
     output
 }
 
@@ -6866,6 +8595,12 @@ fn command_completions(config: &LoadedConfig, prefix: &str) -> Vec<String> {
         theme_names(config)
             .into_iter()
             .map(|name| format!("/theme {name}"))
+            .filter(|command| command.starts_with(prefix)),
+    );
+    completions.extend(
+        ["refresh", "reset"]
+            .into_iter()
+            .map(|sub| format!("/models {sub}"))
             .filter(|command| command.starts_with(prefix)),
     );
     completions.extend(
@@ -7203,11 +8938,8 @@ fn settings_selector_items(config: &LoadedConfig) -> Vec<SelectorItem> {
                 .and_then(|warnings| warnings.anthropic_extra_usage)
                 .unwrap_or(true),
         ),
-        SelectorItem {
-            label: format!("follow-up mode: {}", follow_up_mode(config)),
-            value: "followUpMode".to_string(),
-            active: follow_up_mode(config) == "one-at-a-time",
-        },
+        // follow-up mode selector removed: queued bursts always dispatch as
+        // one combined turn; there is no mode to choose anymore.
     ]
 }
 
@@ -7570,7 +9302,20 @@ fn delete_session_message(
     Ok(output)
 }
 
-fn copy_last_assistant_message(runtime: &Runtime) -> Result<String> {
+async fn copy_pending_selection(app: &mut TuiApp) {
+    let Some(text) = app.transcript_view.get_mut().take_pending_copy() else {
+        return;
+    };
+    let status = match clipboard::copy_text(&text).await {
+        Ok(status) if status.starts_with("copied") => "copied selection".into(),
+        Ok(_) => "clipboard requested (OSC 52)".into(),
+        Err(error) => format!("copy failed: {error}"),
+    };
+    // Copy feedback is chrome, not a new transcript entry that changes reading.
+    app.transcript_view.get_mut().set_copy_status(status);
+}
+
+async fn copy_last_assistant_message(runtime: &Runtime) -> Result<String> {
     let Some(message) = runtime
         .session()
         .messages
@@ -7580,62 +9325,8 @@ fn copy_last_assistant_message(runtime: &Runtime) -> Result<String> {
     else {
         return Ok("no assistant message".to_string());
     };
-    let mut output = message.content.clone();
-    if let Some(command) = copy_to_clipboard(&message.content)? {
-        output.push_str(&format!("\ncopied to clipboard via {command}"));
-    } else {
-        output.push_str("\nclipboard unavailable");
-    }
-    Ok(output)
-}
-
-fn copy_to_clipboard(text: &str) -> Result<Option<String>> {
-    if let Ok(command) = std::env::var("PI_CLIPBOARD_COMMAND") {
-        run_clipboard_command(&command, text)?;
-        return Ok(Some(command));
-    }
-    for command in clipboard_commands() {
-        if run_clipboard_command(&command, text).is_ok() {
-            return Ok(Some(command));
-        }
-    }
-    Ok(None)
-}
-
-fn clipboard_commands() -> Vec<String> {
-    let mut commands = Vec::new();
-    if cfg!(target_os = "macos") {
-        commands.push("pbcopy".to_string());
-    }
-    if cfg!(target_os = "windows") {
-        commands.push("clip.exe".to_string());
-    }
-    commands.extend([
-        "wl-copy".to_string(),
-        "xclip -selection clipboard".to_string(),
-        "xsel --clipboard --input".to_string(),
-    ]);
-    commands
-}
-
-fn run_clipboard_command(command: &str, text: &str) -> Result<()> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let Some(stdin) = child.stdin.as_mut() else {
-        return Err(anyhow!("clipboard command did not open stdin"));
-    };
-    stdin.write_all(text.as_bytes())?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("clipboard command failed: {command}"))
-    }
+    let status = clipboard::copy_text(&message.content).await?;
+    Ok(format!("{}\n{status}", message.content))
 }
 
 fn write_auth_file(config: &LoadedConfig) -> Result<()> {
@@ -7652,6 +9343,136 @@ fn write_auth_file(config: &LoadedConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn clipboard_test_png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::DynamicImage::new_rgba8(width, height);
+        let mut output = Cursor::new(Vec::new());
+        image
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+        output.into_inner()
+    }
+
+    #[test]
+    fn clipboard_images_validate_resize_and_honor_block_setting() {
+        let mut config = minimal_test_config();
+        let png = clipboard_test_png(2100, 10);
+        let media = clipboard_media(png.clone(), &config).unwrap();
+        assert_eq!(media.width, Some(2000));
+        assert!(media.path.is_none());
+        assert_eq!(media.mime_type, "image/png");
+        assert!(!media.data_base64.is_empty());
+        config.settings.images = Some(ImageSettings {
+            auto_resize: Some(false),
+            block_images: Some(false),
+        });
+        assert_eq!(
+            clipboard_media(png.clone(), &config).unwrap().width,
+            Some(2100)
+        );
+        config.settings.images.as_mut().unwrap().block_images = Some(true);
+        assert!(clipboard_media(png, &config)
+            .unwrap_err()
+            .to_string()
+            .contains("blocked"));
+        assert!(clipboard_media(b"not an image".to_vec(), &minimal_test_config()).is_err());
+    }
+
+    #[test]
+    fn image_draft_is_visible_cleared_and_never_discarded_by_stream_submission() {
+        let config = minimal_test_config();
+        let mut app = TuiApp::default();
+        app.input_media
+            .push(clipboard_media(clipboard_test_png(1, 1), &config).unwrap());
+        app.set_input("describe");
+        assert_eq!(input_desired_height(&app, 80), 4);
+        let lines = render_input_lines(
+            &app,
+            Rect::new(0, 0, 76, 2),
+            Style::default(),
+            Style::default(),
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("1 image attached")));
+        let followups = FollowUpQueue::default();
+        let steering = SteeringMailbox::default();
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        ] {
+            assert!(matches!(
+                handle_streaming_tui_key(key, &mut app, &followups, &steering, &config),
+                StreamingKeyOutcome::Changed
+            ));
+            assert_eq!(app.input, "describe");
+            assert_eq!(app.input_media.len(), 1);
+            assert_eq!(followups.pending(), 0);
+            assert_eq!(steering.pending(), 0);
+        }
+        assert!(keybinding_map(&config).matches("paste-image", "ctrl+v"));
+        app.clear_input();
+        assert!(app.input_media.is_empty());
+    }
+
+    #[test]
+    fn undo_restores_text_and_images_and_usage_has_no_invented_estimates() {
+        let config = minimal_test_config();
+        let mut runtime = account_test_runtime("faux", None);
+        let media = clipboard_media(clipboard_test_png(1, 1), &config).unwrap();
+        runtime
+            .push_message(ConversationMessage {
+                role: MessageRole::User,
+                content: "image question".into(),
+                thinking: String::new(),
+                media: vec![media.clone()],
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            })
+            .unwrap();
+        let mut app = TuiApp::new(&config, &runtime);
+        undo_tui_turn(&mut app, &mut runtime).unwrap();
+        assert_eq!(app.input, "image question");
+        assert_eq!(app.input_media, [media]);
+        assert!(runtime.session().messages.is_empty());
+        assert!(app
+            .entries
+            .iter()
+            .any(|entry| entry.text.contains("files unchanged")));
+        assert!(format_session_usage(&runtime).contains("no provider token usage reported"));
+        runtime.session_mut().usage = pi_core::SessionUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            requests: 1,
+        };
+        assert!(format_session_usage(&runtime).contains("15 total"));
+    }
+
+    #[test]
+    fn undo_of_nonvisible_steering_prompt_keeps_the_earlier_turn_visible() {
+        let config = minimal_test_config();
+        let mut runtime = account_test_runtime("faux", None);
+        let message = |content: &str| ConversationMessage {
+            role: MessageRole::User,
+            content: content.into(),
+            thinking: String::new(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        };
+        runtime.push_message(message("first prompt")).unwrap();
+        let mut app = TuiApp::new(&config, &runtime);
+        runtime.push_message(message("steering prompt")).unwrap();
+        undo_tui_turn(&mut app, &mut runtime).unwrap();
+        assert_eq!(app.input, "steering prompt");
+        assert!(app
+            .entries
+            .iter()
+            .any(|entry| entry.kind == TuiEntryKind::User && entry.text == "first prompt"));
+        assert_eq!(runtime.session().messages.len(), 1);
+    }
 
     #[test]
     fn auto_resize_downscales_large_png() {
@@ -7956,7 +9777,7 @@ mod tests {
                         .map(|x| buffer[(x, y)].symbol())
                         .collect::<String>();
                     if let Some(x) = row.find(text) {
-                        return &buffer[(x as u16, y)];
+                        return &buffer[(row[..x].width() as u16, y)];
                     }
                 }
                 panic!("missing rendered text {text}");
@@ -7965,7 +9786,7 @@ mod tests {
             assert_eq!(cell_for("secondary-thinking").fg, palette.muted);
             assert_eq!(cell_for("secondary-output").fg, palette.muted);
             assert_eq!(cell_for("error-output").fg, palette.error);
-            assert_eq!(cell_for("pi> ").fg, palette.accent);
+            assert_eq!(cell_for("> draft").fg, palette.accent);
             assert_eq!(cell_for("draft").fg, palette.foreground);
             assert_eq!(cell_for("draft").bg, palette.surface);
             assert_eq!(cell_for("faux/echo").fg, palette.muted);
@@ -8062,15 +9883,15 @@ mod tests {
                 ],
                 ..TuiApp::default()
             };
-            let mut terminal = Terminal::new(TestBackend::new(30, 3)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(30, 6)).unwrap();
             terminal
                 .draw(|frame| draw_todo_panel(frame, frame.area(), &app, &palette))
                 .unwrap();
             let buffer = terminal.backend().buffer();
-            assert_eq!(buffer[(0, 0)].fg, palette.success);
-            assert_eq!(buffer[(0, 1)].fg, palette.accent);
-            assert_eq!(buffer[(0, 2)].fg, palette.muted);
-            assert_eq!(buffer[(2, 2)].fg, Color::Reset);
+            assert_eq!(buffer[(2, 2)].fg, palette.success);
+            assert_eq!(buffer[(2, 3)].fg, palette.accent);
+            assert_eq!(buffer[(2, 4)].fg, palette.muted);
+            assert_eq!(buffer[(4, 4)].fg, Color::Reset);
         }
     }
 
@@ -8281,6 +10102,129 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn new_session_keeps_persisted_selections_but_starts_fresh_history() {
+        let root = std::env::temp_dir().join(format!("pi-cli-new-{}", unique_temp_suffix()));
+        let mut config = minimal_test_config();
+        config.paths.session_dir = root.join("sessions");
+        config.settings.default_thinking_level = Some("medium".into());
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut viewport_height = 24;
+        for level in [Some("high"), Some("off"), None] {
+            let (store, state) =
+                SessionStore::create(&config.paths.session_dir, root.clone()).unwrap();
+            let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
+            runtime
+                .set_active_model(Some(ModelRef {
+                    provider: "anthropic".into(),
+                    id: "claude-sonnet-4-6".into(),
+                }))
+                .unwrap();
+            runtime.set_active_account(Some("work".into())).unwrap();
+            runtime
+                .rename_session(Some("old conversation".into()))
+                .unwrap();
+            runtime.set_labels(["old".into()].into()).unwrap();
+            runtime.queue_message("old queue".into()).unwrap();
+            runtime
+                .push_message(ConversationMessage {
+                    role: MessageRole::User,
+                    content: "old prompt".into(),
+                    thinking: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                })
+                .unwrap();
+            runtime
+                .push_tool_event(pi_core::ToolEvent {
+                    id: "old-tool".into(),
+                    name: "read".into(),
+                    result: "old result".into(),
+                    is_error: false,
+                })
+                .unwrap();
+            runtime.note_edited_files(vec!["old.txt".into()]).unwrap();
+            runtime
+                .set_todos(vec![TodoItem {
+                    content: "old task".into(),
+                    status: TodoStatus::Completed,
+                }])
+                .unwrap();
+            let usage = pi_core::SessionUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                requests: 1,
+            };
+            runtime
+                .store()
+                .unwrap()
+                .record_usage(usage.clone())
+                .unwrap();
+            runtime.session_mut().usage = usage;
+            let mut app = TuiApp::new(&config, &runtime);
+            let mut surface = TuiSurface {
+                terminal: &mut terminal,
+                viewport_height: &mut viewport_height,
+            };
+            if let Some(level) = level {
+                handle_tui_submission(
+                    &mut app,
+                    &mut surface,
+                    &mut runtime,
+                    &mut config,
+                    true,
+                    format!("/thinking {level}"),
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(runtime.session().active_thinking_level.as_deref(), level);
+            let thinking_before = active_thinking_label(&runtime, &config);
+            if level == Some("off") {
+                assert_eq!(thinking_before, None); // Must not inherit medium.
+            }
+            let before = runtime.session().clone();
+            let old_store = runtime.store().unwrap().clone();
+            let systems = runtime.systems().clone();
+            handle_tui_submission(
+                &mut app,
+                &mut surface,
+                &mut runtime,
+                &mut config,
+                true,
+                "/new".into(),
+            )
+            .await
+            .unwrap();
+            assert_ne!(runtime.session().session_id, before.session_id);
+            let mut expected = SessionState::new(&runtime.session().session_id, root.clone());
+            expected.active_model = before.active_model.clone();
+            expected.active_thinking_level = before.active_thinking_level.clone();
+            expected.active_account = before.active_account.clone();
+            assert_eq!(runtime.session(), &expected);
+            assert_eq!(runtime.systems(), &systems);
+            assert_eq!(active_thinking_label(&runtime, &config), thinking_before);
+            assert_eq!(
+                SessionStore::open(old_store.path().to_path_buf())
+                    .unwrap()
+                    .1,
+                before
+            );
+            let (_, reopened) =
+                SessionStore::open(runtime.store().unwrap().path().to_path_buf()).unwrap();
+            assert_eq!(reopened, expected);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn anthropic_thinking_levels_follow_model_version() {
         let opus_5 = ModelRef {
@@ -8406,6 +10350,197 @@ mod tests {
         }
 
         assert_eq!(lines.last().map(Line::width), Some(6));
+    }
+
+    fn scrollback_test_terminal(
+        width: u16,
+        height: u16,
+    ) -> Terminal<ratatui::backend::TestBackend> {
+        Terminal::with_options(
+            ratatui::backend::TestBackend::new(width, height),
+            TerminalOptions {
+                viewport: Viewport::Inline(height.saturating_sub(2).max(1)),
+            },
+        )
+        .unwrap()
+    }
+
+    fn painted_transcript(terminal: &Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        buffer_rows(terminal.backend().scrollback())
+            .into_iter()
+            .chain(buffer_rows(terminal.backend().buffer()))
+            .map(|line| line.trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn long_resumed_transcript_is_in_native_scrollback_without_a_dump() {
+        let config = minimal_test_config();
+        let mut app = TuiApp::default();
+        let answer = (0..80)
+            .map(|index| format!("answer-{index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.push(TuiEntryKind::Assistant, answer.clone());
+        let mut terminal = scrollback_test_terminal(40, 20);
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        let rows = painted_transcript(&terminal);
+        for index in 0..80 {
+            let marker = format!("answer-{index:03}");
+            assert_eq!(
+                rows.iter().filter(|line| line.contains(&marker)).count(),
+                1,
+                "{marker}"
+            );
+        }
+        assert_eq!(app.entries[0].text, answer);
+        let scrollback = terminal.backend().scrollback().clone();
+        for _ in 0..5 {
+            redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        }
+        assert_eq!(terminal.backend().scrollback(), &scrollback);
+        // Entry indices remain aligned after /undo-style truncation and tool insertion/removal.
+        app.insert_entry(0, TuiEntryKind::Tool, "completed read\nfile\ncontents");
+        app.remove_entry(0);
+        assert_eq!(app.transcript_scrollback.entries.len(), 1);
+        app.clear_visible();
+        assert!(app.transcript_scrollback.entries.is_empty());
+    }
+
+    #[test]
+    fn streamed_screenfuls_preserve_every_row_once_and_leave_the_draft_intact() {
+        let config = minimal_test_config();
+        let mut app = TuiApp {
+            turn_running: true,
+            ..Default::default()
+        };
+        let entry = app.push_placeholder(TuiEntryKind::Assistant, "");
+        app.set_input("my draft");
+        let mut terminal = scrollback_test_terminal(40, 18);
+        // Include a single event larger than the viewport and several follow-on paints.
+        for range in [0..70, 70..85, 85..100] {
+            let delta = range
+                .map(|index| format!("stream-{index:03}\n"))
+                .collect::<String>();
+            app.append_entry(entry, &delta);
+            redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        }
+        app.finish_live_entry();
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        let rows = painted_transcript(&terminal);
+        for index in 0..100 {
+            let marker = format!("stream-{index:03}");
+            assert_eq!(
+                rows.iter().filter(|line| line.contains(&marker)).count(),
+                1,
+                "{marker}"
+            );
+        }
+        assert_eq!(app.input, "my draft");
+        assert_eq!(app.input_cursor, 8);
+        assert!(rows.iter().any(|line| line.contains("│ > my draft")));
+    }
+
+    #[test]
+    fn scrollback_watermarks_survive_rewrap_and_appending_to_a_partial_line() {
+        let config = minimal_test_config();
+        let mut app = TuiApp {
+            turn_running: true,
+            ..Default::default()
+        };
+        let entry = app.push_placeholder(
+            TuiEntryKind::Assistant,
+            "abcdefghijklmnopqrstuvwxyz0123456789".repeat(8),
+        );
+        let mut terminal = scrollback_test_terminal(20, 10);
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        let before = app.transcript_scrollback.entries[entry].position;
+        assert!(before.byte > 0);
+        let previous = buffer_rows(terminal.backend().scrollback())
+            .into_iter()
+            .map(|row| row.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(!previous.is_empty());
+        for (width, height) in [(33, 16), (17, 8), (50, 25)] {
+            terminal.backend_mut().resize(width, height);
+            terminal.resize(Rect::new(0, 0, width, height)).unwrap();
+            app.append_entry(entry, "-next-界e\u{301}-");
+            redraw_tui(&mut terminal, &mut app, &config).unwrap();
+            // Native history is terminal-owned and may reflow differently. Check
+            // logical painted text using the watermark rather than row counts.
+            let watermark = app.transcript_scrollback.entries[entry].position;
+            assert!(watermark >= before);
+            let all = render_entry_lines(&app.entries, &ThemePalette::default());
+            let pending = pending_entry_rows(
+                &app.entries[entry],
+                entry,
+                width as usize,
+                &ThemePalette::default(),
+                &PreviewState::default(),
+                app.transcript_scrollback.entries[entry],
+            );
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|row| line_text(&row.line))
+                    .collect::<String>(),
+                all[0]
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()[watermark.byte..]
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_wrap_uses_terminal_cells_and_keeps_graphemes_and_styles() {
+        use ratatui::style::Color;
+        let style = Style::default().fg(Color::Cyan);
+        let line = Line::from(vec![
+            Span::raw("● "),
+            Span::styled("界界e\u{301}👩‍💻\tend", style),
+        ]);
+        let rows = wrap_positioned_line(line, 0, 8);
+        let text = rows
+            .iter()
+            .map(|row| line_text(&row.line))
+            .collect::<String>();
+        assert_eq!(text, "● 界界e\u{301}👩‍💻    end");
+        assert!(rows.iter().all(|row| row.line.width() <= 8));
+        assert!(rows
+            .iter()
+            .flat_map(|row| &row.line.spans)
+            .filter(|span| !span.content.contains('●'))
+            .all(|span| span.style == style));
+    }
+
+    #[test]
+    fn temporary_panels_do_not_commit_hidden_transcript_rows() {
+        let config = minimal_test_config();
+        let mut app = TuiApp::default();
+        app.push(TuiEntryKind::Assistant, "long answer\n".repeat(50));
+        let mut terminal = scrollback_test_terminal(40, 20);
+        app.selector = Some(TuiSelectorState::new(
+            "model",
+            Selector::new("model", vec![]),
+            "",
+            None,
+        ));
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        terminal.backend().assert_scrollback_empty();
+        app.selector = None;
+        app.diff_panel = Some(DiffPanelState {
+            files: vec![],
+            selected: 0,
+            detail: None,
+        });
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        terminal.backend().assert_scrollback_empty();
+        app.diff_panel = None;
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        assert!(terminal.backend().scrollback().area.height > 0);
     }
 
     #[test]
@@ -8643,12 +10778,101 @@ mod tests {
         let hint = resume_hint(&Runtime::new(session.clone(), ReloadableSystems::default()))
             .expect("mid-turn hint");
         assert!(hint.contains("mid-turn"));
+        assert!(hint.contains("continuing automatically"));
 
         session.queued_messages = vec!["follow up".to_string()];
         let hint = resume_hint(&Runtime::new(session, ReloadableSystems::default()))
             .expect("mid-turn and queue hint");
         assert!(hint.contains("mid-turn"));
         assert!(hint.contains("1 queued"));
+    }
+
+    #[test]
+    fn resume_hint_distinguishes_model_work_from_completed_direct_tools() {
+        let mut session = SessionState::new("resume", PathBuf::from("."));
+        let mut message = ConversationMessage {
+            thinking: String::new(),
+            role: MessageRole::User,
+            content: "prompt".into(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        };
+        for (role, call_id, calls, unfinished) in [
+            (MessageRole::User, None, Vec::new(), true),
+            (MessageRole::Assistant, None, Vec::new(), false),
+            (
+                MessageRole::Assistant,
+                None,
+                vec![pi_ai::ChatToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"fixture.txt"}"#.into(),
+                }],
+                true,
+            ),
+            (MessageRole::Tool, Some("call-1".into()), Vec::new(), true),
+            (MessageRole::Tool, None, Vec::new(), false),
+            (MessageRole::System, None, Vec::new(), false),
+        ] {
+            message.role = role;
+            message.tool_call_id = call_id;
+            message.tool_calls = calls;
+            session.messages = vec![message.clone()];
+            let runtime = Runtime::new(session.clone(), ReloadableSystems::default());
+            let hint = resume_hint(&runtime);
+            assert_eq!(hint.is_some(), unfinished);
+            let config = minimal_test_config();
+            let mut app = TuiApp::new(&config, &runtime);
+            assert_eq!(app.resume_pending, unfinished);
+            app.resume_pending = false;
+            app.refresh_chrome(&config, &runtime);
+            assert!(!app.resume_pending); // Idle refresh must never re-arm a stopped run.
+        }
+        session.messages[0].role = MessageRole::Tool;
+        session.queued_messages = vec!["pending".into()];
+        let hint = resume_hint(&Runtime::new(session, ReloadableSystems::default())).unwrap();
+        assert!(hint.contains("1 queued"));
+        assert!(!hint.contains("mid-turn"));
+    }
+
+    #[tokio::test]
+    async fn completed_slash_read_reopens_without_mid_turn_warning() {
+        let root = std::env::temp_dir().join(format!("pi-direct-resume-{}", unique_temp_suffix()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("fixture.txt"), "complete output").unwrap();
+        let (store, state) = SessionStore::create(&root.join("sessions"), root.clone()).unwrap();
+        let path = store.path().to_path_buf();
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
+        let provider = create_provider(ProviderConfig {
+            model: ModelRef {
+                provider: "faux".into(),
+                id: "echo".into(),
+            },
+            api: AiProviderApi::Faux,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        });
+        let output = run_user_turn(&mut runtime, provider.as_ref(), "/read fixture.txt".into())
+            .await
+            .unwrap();
+        assert_eq!(output, "complete output");
+        assert_eq!(
+            runtime.session().messages.last().unwrap().role,
+            MessageRole::Tool
+        );
+        let (store, state) = SessionStore::open(path).unwrap();
+        assert!(resume_hint(&Runtime::with_store(
+            state,
+            ReloadableSystems::default(),
+            store
+        ))
+        .is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8893,7 +11117,7 @@ mod tests {
 
         app.paste_text(" pasted");
         assert_eq!(app.input, "old prompt pasted");
-        assert_eq!(input_area_height(&app, 20, 0), 3);
+        assert_eq!(input_area_height(&app, Rect::new(0, 0, 80, 20), 0), 3);
         app.history_next();
         assert_eq!(app.input, "old prompt pasted");
     }
@@ -8919,22 +11143,138 @@ mod tests {
         assert_eq!(app.input, "first\nsecond");
     }
 
-    #[test]
-    fn single_line_input_stays_vertically_centered() {
-        let mut app = TuiApp::default();
-        app.set_input("draft");
-
-        let metrics = input_metrics(&app, 3);
-        let lines = render_input_lines(&app, 3, Style::default(), Style::default());
-
-        assert_eq!(metrics.top_padding, 1);
-        assert_eq!(metrics.visible_index, 0);
-        assert_eq!(line_text(&lines[0]), "");
-        assert_eq!(line_text(&lines[1]), "pi> draft");
+    #[tokio::test]
+    async fn idle_newline_keys_insert_at_cursor_without_submitting_or_opening_diff() {
+        let mut config = minimal_test_config();
+        let mut runtime = account_test_runtime("faux", None);
+        let before = runtime.session().clone();
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut viewport_height = 24;
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            for draft in ["", "firstsecond"] {
+                let mut app = TuiApp {
+                    diff_panel: Some(DiffPanelState {
+                        files: vec![DiffFileEntry {
+                            path: "unused.rs".into(),
+                            added: None,
+                            removed: None,
+                            untracked: true,
+                        }],
+                        selected: 0,
+                        detail: None,
+                    }),
+                    quit_armed_since: Some(Instant::now()),
+                    ..Default::default()
+                };
+                app.set_input(draft);
+                app.input_cursor = draft.len().min(5);
+                let quit = handle_tui_key(
+                    key,
+                    &mut TuiSurface {
+                        terminal: &mut terminal,
+                        viewport_height: &mut viewport_height,
+                    },
+                    &mut app,
+                    &mut runtime,
+                    &mut config,
+                    true,
+                )
+                .await
+                .unwrap();
+                assert!(!quit);
+                assert_eq!(
+                    app.input,
+                    if draft.is_empty() {
+                        "\n"
+                    } else {
+                        "first\nsecond"
+                    }
+                );
+                assert_eq!(app.input_cursor, if draft.is_empty() { 1 } else { 6 });
+                assert_eq!(input_desired_height(&app, 80), 4);
+                assert!(app.quit_armed_since.is_none());
+                assert!(app.diff_panel.as_ref().unwrap().detail.is_none());
+                assert!(app.entries.is_empty());
+                assert!(app.editor_state.history().is_empty());
+                assert_eq!(runtime.session(), &before);
+            }
+        }
     }
 
     #[test]
-    fn typed_newlines_expand_input_area_but_paste_newlines_do_not() {
+    fn streaming_shift_enter_and_ctrl_j_add_newlines_without_queueing() {
+        let config = minimal_test_config();
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = TuiApp::default();
+            app.push_placeholder(TuiEntryKind::Assistant, "streaming answer");
+            app.set_input("firstsecond");
+            app.input_cursor = 5;
+            let followups = FollowUpQueue::default();
+            let steering = SteeringMailbox::default();
+            assert_eq!(
+                handle_streaming_tui_key(key, &mut app, &followups, &steering, &config),
+                StreamingKeyOutcome::Changed
+            );
+            assert_eq!(app.input, "first\nsecond");
+            assert_eq!(app.input_cursor, 6);
+            assert_eq!(input_desired_height(&app, 80), 4);
+            assert_eq!(followups.pending(), 0);
+            assert_eq!(steering.pending(), 0);
+            assert!(app.editor_state.history().is_empty());
+            assert_eq!(app.entries[0].text, "streaming answer");
+            assert_eq!(app.live_entry_index, Some(0));
+            handle_streaming_tui_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut app,
+                &followups,
+                &steering,
+                &config,
+            );
+            assert!(app.input.is_empty());
+            assert_eq!(followups.list(), ["first\nsecond"]);
+        }
+    }
+
+    #[test]
+    fn single_line_input_is_centered_between_rounded_borders() {
+        use ratatui::backend::TestBackend;
+        let mut app = TuiApp {
+            show_hardware_cursor: true,
+            ..Default::default()
+        };
+        app.set_input("draft");
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_input(frame, frame.area(), &app, &ThemePalette::default());
+                set_tui_cursor(frame, frame.area(), &app);
+            })
+            .unwrap();
+        assert_eq!(
+            buffer_rows(terminal.backend().buffer()),
+            [
+                "╭──────────────────╮",
+                "│ > draft          │",
+                "╰──────────────────╯",
+            ]
+        );
+        terminal.backend_mut().assert_cursor_position((9, 1));
+    }
+
+    #[test]
+    fn typed_newlines_expand_input_area_and_pastes_show_numbered_markers() {
         let mut app = TuiApp::default();
         app.set_input("one");
         for line in ["two", "three", "four"] {
@@ -8943,22 +11283,293 @@ mod tests {
                 app.push_input_char(ch);
             }
         }
-
-        assert_eq!(app.typed_input_rows(), 4);
-        assert_eq!(input_area_height(&app, 20, 0), 5);
-        let metrics = input_metrics(&app, 5);
-        let lines = render_input_lines(&app, 5, Style::default(), Style::default());
-        assert_eq!(metrics.top_padding, 1);
-        assert_eq!(line_text(&lines[0]), "");
-        assert_eq!(line_text(&lines[1]), "pi> one");
-        assert_eq!(line_text(&lines[2]), "    two");
-        assert_eq!(line_text(&lines[3]), "    three");
-        assert_eq!(line_text(&lines[4]), "    four");
+        assert_eq!(input_layout(&app, 76).rows.len(), 4);
+        assert_eq!(input_area_height(&app, Rect::new(0, 0, 80, 20), 0), 6);
+        let layout = input_layout(&app, 76);
+        let lines = render_input_lines(
+            &app,
+            Rect::new(0, 0, 76, 4),
+            Style::default(),
+            Style::default(),
+        );
+        assert_eq!(layout.cursor_row, 3);
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>(),
+            ["> one", "  two", "  three", "  four",]
+        );
 
         let mut pasted = TuiApp::default();
         pasted.paste_text("one\ntwo\nthree\nfour");
-        assert_eq!(pasted.typed_input_rows(), 1);
-        assert_eq!(input_area_height(&pasted, 20, 0), 3);
+        assert_eq!(input_layout(&pasted, 76).rows.len(), 1);
+        assert_eq!(input_area_height(&pasted, Rect::new(0, 0, 80, 20), 0), 3);
+        let lines = render_input_lines(
+            &pasted,
+            Rect::new(0, 0, 76, 1),
+            Style::default(),
+            Style::default(),
+        );
+        assert_eq!(line_text(&lines[0]), "> [paste #1 +4 lines]");
+        assert_eq!(pasted.input, "one\ntwo\nthree\nfour");
+    }
+
+    #[test]
+    fn boxed_editor_wraps_and_grows_upward_then_shrinks_on_resize() {
+        use ratatui::backend::TestBackend;
+        let mut app = TuiApp {
+            show_hardware_cursor: true,
+            ..Default::default()
+        };
+        app.set_input("abcdefghijklmnop");
+        let config = minimal_test_config();
+        for (width, height, expected_rows, cursor) in [
+            (
+                12,
+                5,
+                vec!["│ > abcdef │", "│   ghijkl │", "│   mnop   │"],
+                (8, 7),
+            ),
+            (24, 3, vec!["│ > abcdefghijklmnop   │"], (20, 7)),
+        ] {
+            assert_eq!(input_desired_height(&app, width), height);
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal
+                .draw(|frame| draw_tui(frame, &app, &config))
+                .unwrap();
+            let rows = buffer_rows(terminal.backend().buffer());
+            assert_eq!(&rows[(10 - height) as usize..8], expected_rows.as_slice());
+            assert!(rows[(9 - height) as usize].starts_with('╭'));
+            assert!(rows[8].starts_with('╰'));
+            terminal.backend_mut().assert_cursor_position(cursor);
+        }
+        app.cursor_to_line_start();
+        let lines = render_input_lines(
+            &app,
+            Rect::new(0, 0, 8, 1),
+            Style::default(),
+            Style::default(),
+        );
+        assert_eq!(line_text(&lines[0]), "> abcdef");
+        app.set_input("abc界界界e\u{301}");
+        let mut terminal = Terminal::new(TestBackend::new(12, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_input(frame, frame.area(), &app, &ThemePalette::default());
+                set_tui_cursor(frame, frame.area(), &app);
+            })
+            .unwrap();
+        assert_eq!(
+            buffer_rows(terminal.backend().buffer()),
+            [
+                "╭──────────╮",
+                "│ > abc界  │",
+                "│   界界e\u{301}  │",
+                "╰──────────╯"
+            ]
+        );
+        terminal.backend_mut().assert_cursor_position((9, 2));
+    }
+
+    #[test]
+    fn editor_wrap_reserves_an_insertion_cell_and_preserves_graphemes() {
+        let mut app = TuiApp::default();
+        app.set_input("abcdef");
+        let layout = input_layout(&app, 8);
+        assert_eq!(layout.rows, ["abcdef", ""]);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
+        app.move_cursor_left();
+        let layout = input_layout(&app, 8);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (0, 5));
+        app.set_input("ab界e\u{301}界\u{301}xy");
+        let layout = input_layout(&app, 8);
+        assert_eq!(layout.rows, ["ab界e\u{301}", "界\u{301}xy"]);
+        app.move_cursor_left();
+        app.move_cursor_left();
+        app.move_cursor_left();
+        assert_eq!(&app.input[app.input_cursor..], "界\u{301}xy");
+        app.move_cursor_right();
+        app.pop_input_char();
+        assert_eq!(app.input, "ab界e\u{301}xy");
+        assert_eq!(input_layout(&app, 8).rows, ["ab界e\u{301}x", "y"]);
+    }
+
+    #[test]
+    fn tall_drafts_are_bounded_and_scroll_to_the_cursor() {
+        let mut app = TuiApp::default();
+        app.set_input(
+            (0..50)
+                .map(|index| format!("row {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert_eq!(input_desired_height(&app, 80), MAX_INPUT_ROWS as u16 + 2);
+        assert_eq!(input_area_height(&app, Rect::new(0, 0, 80, 6), 0), 4);
+        let visible = |app: &TuiApp| {
+            render_input_lines(
+                app,
+                Rect::new(0, 0, 76, 2),
+                Style::default(),
+                Style::default(),
+            )
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(visible(&app), ["> row 48", "  row 49"]);
+        app.input_cursor = 0;
+        assert_eq!(visible(&app), ["> row 0", "  row 1"]);
+        assert_eq!(app.input.lines().count(), 50);
+    }
+
+    #[test]
+    fn large_paste_markers_keep_full_text_and_allow_surrounding_edits() {
+        let mut app = TuiApp::default();
+        let paste = (0..500)
+            .map(|index| format!("line {index}\n"))
+            .collect::<String>();
+        app.insert_input_str("before  after");
+        app.input_cursor = 7;
+        app.paste_text(&paste);
+        assert_eq!(app.input, format!("before {paste} after"));
+        assert_eq!(app.display_input().0, "before [paste #1 +500 lines] after");
+        assert_eq!(input_desired_height(&app, 80), 3);
+        app.insert_input_str("!");
+        app.move_cursor_left();
+        app.move_cursor_left();
+        assert_eq!(app.input_cursor, 7);
+        assert_eq!(app.display_input().1, 7);
+        app.insert_input_str("prefix ");
+        assert_eq!(
+            app.display_input().0,
+            "before prefix [paste #1 +500 lines]! after"
+        );
+        app.cursor_to_line_end();
+        assert_eq!(app.input_cursor, app.input.len());
+        app.cursor_to_line_start();
+        assert_eq!(app.input_cursor, 0);
+        app.input_cursor = app.input_pastes[0].start;
+        app.move_cursor_right();
+        app.pop_input_char();
+        assert_eq!(app.input, "before prefix ! after");
+        assert!(app.input_pastes.is_empty());
+    }
+
+    #[test]
+    fn multiple_pastes_keep_ids_and_ranges_when_deleted_or_cleared() {
+        let mut app = TuiApp::default();
+        app.paste_text("one\ntwo");
+        app.insert_input_str(" / ");
+        app.paste_text("three\nfour\nfive");
+        app.cursor_to_line_start();
+        app.paste_text("first\nsecond");
+        assert_eq!(
+            app.display_input().0,
+            "[paste #3 +2 lines][paste #1 +2 lines] / [paste #2 +3 lines]"
+        );
+        app.delete_input_char();
+        assert_eq!(
+            app.display_input().0,
+            "[paste #3 +2 lines] / [paste #2 +3 lines]"
+        );
+        app.move_cursor_left();
+        app.delete_input_char();
+        assert_eq!(app.display_input().0, " / [paste #2 +3 lines]");
+        app.clear_input();
+        app.paste_text("new\npaste");
+        assert_eq!(app.display_input().0, "[paste #4 +2 lines]");
+        app.clear_input();
+        assert_eq!(app.display_input(), (String::new(), 0));
+    }
+
+    #[test]
+    fn paste_normalizes_terminal_newlines_and_compacts_long_single_lines() {
+        let mut app = TuiApp::default();
+        app.paste_text("first\r\nsecond\rthird");
+        assert_eq!(app.input, "first\nsecond\nthird");
+        assert_eq!(app.display_input().0, "[paste #1 +3 lines]");
+        app.clear_input();
+        let text = "界".repeat(LARGE_PASTE_CHARS + 1);
+        app.paste_text(&text);
+        assert_eq!(app.input, text);
+        assert_eq!(app.display_input().0, "[paste #2 +1 line]");
+        app.clear_input();
+        app.paste_text("");
+        app.paste_text("short paste");
+        assert!(app.input_pastes.is_empty());
+        assert_eq!(app.display_input().0, "short paste");
+    }
+
+    #[test]
+    fn history_navigation_restores_paste_markers_and_the_draft_cursor() {
+        let mut app = TuiApp::default();
+        app.editor_state.record_history("old prompt");
+        app.insert_input_str("draft ");
+        app.paste_text("one\ntwo");
+        app.move_cursor_left();
+        let before = app.display_input();
+        let cursor = app.input_cursor;
+        app.history_previous();
+        assert_eq!(app.display_input().0, "old prompt");
+        app.history_next();
+        assert_eq!(app.display_input(), before);
+        assert_eq!(app.input_cursor, cursor);
+        assert_eq!(app.input, "draft one\ntwo");
+    }
+
+    #[test]
+    fn streaming_paste_submissions_and_queue_recall_use_full_text() {
+        let config = minimal_test_config();
+        for key in [KeyCode::Enter, KeyCode::Char('s')] {
+            let mut app = TuiApp::default();
+            let followups = FollowUpQueue::default();
+            let steering = SteeringMailbox::default();
+            let paste = "full pasted text\n".repeat(500);
+            app.insert_input_str("prefix ");
+            app.paste_text(&paste);
+            app.insert_input_str(" suffix");
+            let expected = app.input.trim().to_string();
+            let modifiers = if key == KeyCode::Enter {
+                KeyModifiers::NONE
+            } else {
+                KeyModifiers::CONTROL
+            };
+            handle_streaming_tui_key(
+                KeyEvent::new(key, modifiers),
+                &mut app,
+                &followups,
+                &steering,
+                &config,
+            );
+            let submitted = if key == KeyCode::Enter {
+                followups.list()
+            } else {
+                steering.list()
+            };
+            assert_eq!(submitted.as_slice(), std::slice::from_ref(&expected));
+            assert!(app.input.is_empty());
+            assert!(app.input_pastes.is_empty());
+            recall_queued_message(&mut app, submitted[0].clone());
+            assert_eq!(app.input, expected);
+            assert!(!app.display_input().0.contains("[paste"));
+        }
+    }
+
+    fn buffer_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .filter_map(|x| {
+                        // Wide graphemes own the following cell, which is a blank
+                        // placeholder in ratatui's buffer, not an extra character.
+                        let cell = &buffer[(x, y)];
+                        if x > 0 && buffer[(x - 1, y)].symbol().width() > 1 {
+                            None
+                        } else {
+                            Some(cell.symbol())
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -8980,7 +11591,7 @@ mod tests {
         assert!(app.multiline.is_none());
         assert!(app.selector.is_none());
         assert!(app.live_entry_index.is_none());
-        assert_eq!(app.typed_input_rows(), 1);
+        assert_eq!(input_layout(&app, 76).rows.len(), 1);
         assert_eq!(app.editor_state.history(), ["old prompt"]);
     }
 
@@ -9063,7 +11674,7 @@ mod tests {
         insert_new_tool_messages(&mut app, &runtime, 0, assistant_index);
 
         assert_eq!(app.entries[1].kind, TuiEntryKind::Tool);
-        assert_eq!(app.entries[1].text, "completed read\nfile contents");
+        assert_eq!(app.entries[1].text, "completed read\n\nfile contents");
         assert_eq!(app.entries[2].kind, TuiEntryKind::Assistant);
         assert_eq!(app.entries[2].text, "done");
     }
@@ -9106,7 +11717,7 @@ mod tests {
         }
     }
 
-    fn minimal_test_config() -> LoadedConfig {
+    pub(super) fn minimal_test_config() -> LoadedConfig {
         LoadedConfig {
             paths: test_config_paths(),
             settings: Settings::default(),
@@ -9268,7 +11879,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn line_text(line: &Line<'_>) -> String {
+    pub(super) fn line_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -9416,6 +12027,144 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn refresh_test_model(provider: &str, id: &str) -> ModelDefinition {
+        ModelDefinition {
+            context_window: None,
+            provider: provider.to_string(),
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            api: ConfigProviderApi::OpenAi,
+            base_url: None,
+        }
+    }
+
+    fn refresh_test_cache(models: Vec<ModelDefinition>) -> ModelCache {
+        ModelCache {
+            refreshed_at: 100,
+            version: MODEL_CACHE_VERSION,
+            models,
+            diagnostics: Vec::new(),
+            claude_code_version: None,
+        }
+    }
+
+    #[test]
+    fn model_refresh_replaces_provider_but_keeps_other_providers() {
+        let existing = refresh_test_cache(vec![
+            refresh_test_model("zai-coding", "glm-5.3"),
+            refresh_test_model("openai", "gpt-5"),
+        ]);
+        let mut report = ModelRefreshReport::default();
+        report.record(
+            "openai",
+            Some(&existing),
+            Ok(vec![refresh_test_model("openai", "gpt-6")]),
+        );
+        let next = next_model_cache(Some(&existing), &report, Some(200)).unwrap();
+        assert_eq!(next.refreshed_at, 200);
+        assert_eq!(next.version, MODEL_CACHE_VERSION);
+        let ids: Vec<&str> = next.models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, ["glm-5.3", "gpt-6"]);
+        assert!(next.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn model_refresh_empty_fetch_keeps_cached_models_and_reports() {
+        let existing = refresh_test_cache(vec![refresh_test_model("zai-coding", "glm-5.3")]);
+        let mut report = ModelRefreshReport::default();
+        report.record("zai-coding", Some(&existing), Ok(Vec::new()));
+        let next = next_model_cache(Some(&existing), &report, Some(200)).unwrap();
+        // The cache contents are untouched; only diagnostics record the event.
+        assert_eq!(next.models, existing.models);
+        assert_eq!(next.refreshed_at, existing.refreshed_at);
+        assert_eq!(
+            next.diagnostics,
+            ["zai-coding model refresh returned an empty list; kept cached models".to_string()]
+        );
+        assert_eq!(report.diagnostics(), next.diagnostics);
+        assert_eq!(report.kept_cached, ["zai-coding".to_string()]);
+        assert_eq!(report.refreshed.len(), 0);
+        // The formatted report explains the outcome.
+        let config = account_test_config(AuthData::default());
+        let output = format_model_refresh_report(&report, &config);
+        assert!(output.contains("kept cached models after empty response: zai-coding"));
+    }
+
+    #[test]
+    fn model_refresh_failure_keeps_cache_stale_and_persists_diagnostics() {
+        // Cache is old enough that the TTL already expired, then refresh fails.
+        let mut existing = refresh_test_cache(vec![refresh_test_model("zai-coding", "glm-5.3")]);
+        existing.refreshed_at = 0;
+        let mut report = ModelRefreshReport::default();
+        report.record("zai-coding", Some(&existing), Err(anyhow!("status 503")));
+        let next = next_model_cache(Some(&existing), &report, Some(200)).unwrap();
+        // TTL is not reset: next startup (past the original TTL) retries
+        // instead of waiting out another full TTL.
+        assert_eq!(next.refreshed_at, existing.refreshed_at);
+        assert!(model_cache_is_stale(&next, Some(90_000), 24));
+        assert_eq!(next.models, existing.models);
+        assert_eq!(
+            next.diagnostics,
+            ["zai-coding model refresh failed: status 503".to_string()]
+        );
+    }
+
+    #[test]
+    fn model_refresh_all_failures_without_cache_still_writes_diagnostics() {
+        let mut report = ModelRefreshReport::default();
+        report.record("openai", None, Err(anyhow!("network down")));
+        let next = next_model_cache(None, &report, Some(200)).unwrap();
+        assert_eq!(next.refreshed_at, 0);
+        assert!(next.models.is_empty());
+        assert_eq!(
+            next.diagnostics,
+            ["openai model refresh failed: network down".to_string()]
+        );
+    }
+
+    #[test]
+    fn model_refresh_without_auth_writes_nothing() {
+        let report = ModelRefreshReport::default();
+        assert!(next_model_cache(None, &report, Some(200)).is_none());
+        assert!(next_model_cache(None, &report, None).is_none());
+    }
+
+    #[test]
+    fn claude_code_version_from_refresh_survives_merge() {
+        let existing = refresh_test_cache(vec![]);
+        let report = ModelRefreshReport {
+            claude_code_version: Some("2.1.280".to_string()),
+            ..Default::default()
+        };
+        let next = next_model_cache(Some(&existing), &report, Some(200)).unwrap();
+        assert_eq!(next.claude_code_version.as_deref(), Some("2.1.280"));
+
+        // Version-check-only refresh keeps the previously cached version.
+        let kept = refresh_test_cache(vec![]);
+        let version_only = ModelRefreshReport {
+            claude_code_version: Some("9.9.9".to_string()),
+            ..Default::default()
+        };
+        let next = next_model_cache(Some(&kept), &version_only, Some(200)).unwrap();
+        assert_eq!(next.claude_code_version.as_deref(), Some("9.9.9"));
+    }
+
+    #[test]
+    fn model_cache_reset_removes_file_and_tolerates_missing_file() {
+        let root =
+            std::env::temp_dir().join(format!("pi-cli-model-cache-reset-{}", unique_temp_suffix()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("model-cache.json");
+        assert_eq!(
+            reset_model_cache(&path).unwrap(),
+            "model cache already clear"
+        );
+        write_model_cache(&path, &refresh_test_cache(vec![])).expect("write cache");
+        assert_eq!(reset_model_cache(&path).unwrap(), "model cache cleared");
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn claude_code_version_validation_rejects_header_unsafe_values() {
         assert!(is_valid_claude_code_version("2.1.280"));
@@ -9434,6 +12183,781 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_todos_select_active_upcoming_and_recent_done_in_original_order() {
+        let mut app = TuiApp {
+            todos: [
+                TodoStatus::Completed,
+                TodoStatus::Completed,
+                TodoStatus::Completed,
+                TodoStatus::Completed,
+                TodoStatus::Pending,
+                TodoStatus::InProgress,
+                TodoStatus::Pending,
+                TodoStatus::Pending,
+                TodoStatus::Pending,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, status)| TodoItem {
+                content: format!("task {index}"),
+                status,
+            })
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(selected_todos(&app.todos, false), [3, 4, 5, 6, 7]);
+        let lines = todo_panel_lines(&app, &ThemePalette::default());
+        assert_eq!(
+            line_text(lines.last().unwrap()),
+            "  … +4 more (1 pending, 3 done) · ctrl+t to expand"
+        );
+        assert!(lines[1].spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT));
+        assert!(lines[3].spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        app.todos_expanded = true;
+        let config = minimal_test_config();
+        let mut runtime = account_test_runtime("faux", None);
+        runtime.set_todos(app.todos.clone()).unwrap();
+        app.refresh_chrome(&config, &runtime);
+        assert!(app.todos_expanded);
+        assert!(line_text(
+            todo_panel_lines(&app, &ThemePalette::default())
+                .last()
+                .unwrap()
+        )
+        .contains("collapse"));
+    }
+
+    #[test]
+    fn thinking_previews_wrap_and_switch_between_streaming_tail_and_finished_head() {
+        let entry = TuiEntry {
+            kind: TuiEntryKind::Thinking,
+            text: "first thought\nsecond thought\nthird thought\nlast thought".into(),
+        };
+        let palette = ThemePalette::default();
+        let head = preview_entry(&entry, 0, 80, &palette, &PreviewState::default());
+        assert_eq!(head.len(), 4); // two content rows, one hint, spacer
+        assert!(head
+            .iter()
+            .take(2)
+            .map(line_text)
+            .collect::<String>()
+            .contains("thinking"));
+        assert!(head
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("ctrl+o"));
+        let tail = preview_entry(
+            &entry,
+            0,
+            80,
+            &palette,
+            &PreviewState {
+                live_thinking: Some(0),
+                expanded_from: None,
+            },
+        );
+        assert!(tail
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("last thought"));
+        assert!(!tail
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("ctrl+o"));
+        assert_eq!(tail.len(), 3);
+        let expanded = preview_entry(
+            &entry,
+            0,
+            8,
+            &palette,
+            &PreviewState {
+                expanded_from: Some(0),
+                live_thinking: None,
+            },
+        );
+        assert!(expanded.len() > tail.len());
+        assert!(!expanded
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("more lines"));
+        assert_eq!(
+            entry.text,
+            "first thought\nsecond thought\nthird thought\nlast thought"
+        );
+    }
+
+    #[test]
+    fn collapsed_blocks_never_exceed_three_rows_even_on_narrow_screens() {
+        let palette = ThemePalette::default();
+        for kind in [TuiEntryKind::Thinking, TuiEntryKind::Tool] {
+            let entry = TuiEntry {
+                text: if kind == TuiEntryKind::Tool {
+                    format!(
+                        "completed bash\n$ {}\n{}",
+                        "long command 👩‍💻界 ".repeat(30),
+                        "output 界e\u{301}\t".repeat(100)
+                    )
+                } else {
+                    "thought 界e\u{301}👩‍💻\t".repeat(100)
+                },
+                kind,
+            };
+            for width in [1, 2, 4, 8, 20, 80] {
+                let rows = preview_entry(&entry, 0, width, &palette, &PreviewState::default());
+                assert!(rows.len() <= 4, "three content rows plus spacer: {width}");
+                assert!(rows.iter().all(|row| row.width() <= width), "width {width}");
+                let expanded = preview_entry(
+                    &entry,
+                    0,
+                    width,
+                    &palette,
+                    &PreviewState {
+                        expanded_from: Some(0),
+                        live_thinking: None,
+                    },
+                );
+                assert!(expanded.len() > rows.len());
+            }
+        }
+    }
+
+    #[test]
+    fn compact_command_header_keeps_line_count_and_full_command_is_expandable() {
+        let command = format!(
+            "git status --short; echo ---; git diff --stat {} end-of-command",
+            "README.md crates/pi-tui/src/lib.rs ".repeat(20)
+        );
+        let entry = TuiEntry {
+            kind: TuiEntryKind::Tool,
+            text: format!("completed bash\n$ {command}\nfirst\nsecond\nthird\nfinal result"),
+        };
+        let palette = ThemePalette::default();
+        let collapsed = preview_entry(&entry, 0, 80, &palette, &PreviewState::default());
+        assert_eq!(collapsed.len(), 3);
+        let header = line_text(&collapsed[0]);
+        assert!(header.starts_with("● Ran a command · $ git status --short"));
+        assert!(header.ends_with("… · 3 more lines"));
+        assert_eq!(line_text(&collapsed[1]), "  … final result");
+        let expanded = preview_entry(
+            &entry,
+            0,
+            80,
+            &palette,
+            &PreviewState {
+                expanded_from: Some(0),
+                live_thinking: None,
+            },
+        );
+        assert!(expanded
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("end-of-command"));
+        assert!(expanded
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("first"));
+        // A watermark inside a folded range must not reconstruct hidden output.
+        let pending = pending_entry_rows(
+            &entry,
+            0,
+            80,
+            &palette,
+            &PreviewState::default(),
+            EntryScrollback {
+                position: TranscriptPosition { line: 2, byte: 1 },
+                complete: false,
+            },
+        );
+        assert_eq!(line_text(&pending[0].line), "  … final result");
+    }
+
+    #[test]
+    fn short_tool_results_stay_visible_without_an_expansion_count() {
+        let entry = TuiEntry {
+            kind: TuiEntryKind::Tool,
+            text: "completed todo\n\none\ntwo".into(),
+        };
+        let rows = preview_entry(
+            &entry,
+            0,
+            80,
+            &ThemePalette::default(),
+            &PreviewState::default(),
+        );
+        assert_eq!(rows.len(), 4);
+        assert_eq!(line_text(&rows[0]), "● Used Todo");
+        assert_eq!(line_text(&rows[1]), "  one");
+        assert_eq!(line_text(&rows[2]), "  two");
+        assert!(!rows
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("more lines"));
+    }
+
+    #[test]
+    fn ctrl_o_expands_only_the_recent_three_turns_and_works_mid_turn() {
+        let mut app = TuiApp::default();
+        for _ in 0..4 {
+            app.push(TuiEntryKind::User, "question");
+            app.push(TuiEntryKind::Thinking, "one\ntwo\nthree\nfour");
+            app.push(TuiEntryKind::Assistant, "answer");
+        }
+        assert_eq!(recent_turn_start(&app.entries), 3);
+        let followups = FollowUpQueue::default();
+        let steering = SteeringMailbox::default();
+        let config = minimal_test_config();
+        handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert!(app.previews_expanded);
+        let state = PreviewState {
+            expanded_from: Some(recent_turn_start(&app.entries)),
+            live_thinking: None,
+        };
+        let palette = ThemePalette::default();
+        assert!(preview_entry(&app.entries[1], 1, 100, &palette, &state)
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("more lines"));
+        assert!(preview_entry(&app.entries[4], 4, 100, &palette, &state)
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("four"));
+    }
+
+    #[test]
+    fn tool_output_previews_bound_large_results_and_ctrl_o_round_trips() {
+        let output = (0..5_000)
+            .map(|line| format!("file-line-{line:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = minimal_test_config();
+        let palette = ThemePalette::default();
+        for text in [
+            format!("completed read\nsrc/large.rs\n{output}"),
+            format!("failed bash\n$ command\n{output}"),
+            output.clone(), // terminal progress disabled
+        ] {
+            let mut app = TuiApp::default();
+            app.push(TuiEntryKind::User, "read the file");
+            app.push(TuiEntryKind::Tool, text.clone());
+            let render = |app: &TuiApp| {
+                preview_entry(
+                    &app.entries[1],
+                    1,
+                    80,
+                    &palette,
+                    &transcript_preview_state(app),
+                )
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+            };
+            let collapsed = render(&app);
+            assert_eq!(collapsed.len(), 3); // header, final output row, spacer
+            assert!(collapsed.join("\n").contains("more lines"));
+            assert!(collapsed.join("\n").contains("… file-line-4999"));
+            assert!(!collapsed.join("\n").contains("file-line-1000"));
+            for expanded in [true, false] {
+                assert_eq!(
+                    handle_streaming_tui_key(
+                        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                        &mut app,
+                        &FollowUpQueue::default(),
+                        &SteeringMailbox::default(),
+                        &config,
+                    ),
+                    StreamingKeyOutcome::Changed
+                );
+                assert_eq!(app.previews_expanded, expanded);
+                let rows = render(&app);
+                if expanded {
+                    assert!(rows.join("\n").contains("file-line-1000"));
+                    assert!(!rows.join("\n").contains("more lines"));
+                } else {
+                    assert_eq!(rows, collapsed);
+                }
+                assert_eq!(app.entries[1].text, text);
+            }
+        }
+    }
+
+    #[test]
+    fn owned_tool_output_is_collapsed_live_and_after_completion() {
+        use ratatui::backend::TestBackend;
+        let mut app = TuiApp {
+            owned_screen: true,
+            turn_running: true,
+            ..Default::default()
+        };
+        app.push(TuiEntryKind::User, "read the file");
+        let thinking_index = app.push_placeholder(TuiEntryKind::Thinking, "");
+        let assistant_index = app.push_placeholder(TuiEntryKind::Assistant, "Working...");
+        let output = (0..12)
+            .map(|line| format!("live-file-line-{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut saw_delta = false;
+        let mut activity = Activity::Waiting;
+        for event in [
+            TurnEvent::ToolStarted {
+                name: "read".into(),
+            },
+            TurnEvent::ToolOutput {
+                call: pi_ai::ChatToolCall {
+                    id: "large-read".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"large.rs"}"#.into(),
+                },
+                output: output.clone(),
+                is_error: false,
+            },
+        ] {
+            apply_turn_event(
+                &mut app,
+                assistant_index,
+                thinking_index,
+                &mut saw_delta,
+                &mut activity,
+                &event,
+            );
+        }
+        let config = minimal_test_config();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        for live in [true, false] {
+            if !live {
+                app.live_tool_indices.clear();
+                app.finish_live_entry();
+            }
+            for expanded in [false, true, false] {
+                if app.previews_expanded != expanded {
+                    handle_streaming_tui_key(
+                        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                        &mut app,
+                        &FollowUpQueue::default(),
+                        &SteeringMailbox::default(),
+                        &config,
+                    );
+                }
+                redraw_tui(&mut terminal, &mut app, &config).unwrap();
+                let screen = buffer_rows(terminal.backend().buffer()).join("\n");
+                assert!(screen.contains("Used Read · large.rs · 12 lines"));
+                assert!(screen.contains("live-file-line-11"));
+                assert_eq!(screen.contains("live-file-line-00"), expanded);
+                assert_eq!(screen.contains("11 more lines"), !expanded);
+                assert_eq!(
+                    app.entries[3].text,
+                    format!("completed read\nlarge.rs\n{output}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restored_tool_output_is_collapsed_without_changing_context() {
+        let mut session = SessionState::new("collapsed-read", PathBuf::from("."));
+        session.messages.push(ConversationMessage {
+            role: MessageRole::Tool,
+            content: "restored-file-line\n".repeat(5_000),
+            thinking: String::new(),
+            media: Vec::new(),
+            tool_call_id: Some("read-1".into()),
+            tool_name: Some("read".into()),
+            tool_calls: Vec::new(),
+        });
+        let runtime = Runtime::new(session.clone(), ReloadableSystems::default());
+        let mut app = TuiApp::default();
+        app.restore_session_messages(&runtime);
+        let rows = preview_entry(
+            &app.entries[0],
+            0,
+            80,
+            &ThemePalette::default(),
+            &transcript_preview_state(&app),
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(rows
+            .iter()
+            .map(line_text)
+            .collect::<String>()
+            .contains("4999 more lines"));
+        assert!(app.entries[0].text.ends_with(&session.messages[0].content));
+        assert_eq!(runtime.session(), &session);
+    }
+
+    #[test]
+    fn new_prompts_and_clear_restore_collapsed_previews() {
+        let mut app = TuiApp::default();
+        app.push(TuiEntryKind::User, "first prompt");
+        app.previews_expanded = true;
+        app.push(TuiEntryKind::Tool, "first result");
+        app.push(TuiEntryKind::System, "reloaded");
+        assert!(app.previews_expanded);
+        app.push(TuiEntryKind::User, "next prompt");
+        assert!(!app.previews_expanded);
+        app.previews_expanded = true;
+        app.clear_visible();
+        assert!(!app.previews_expanded);
+    }
+
+    #[test]
+    fn tool_label_styles_are_segmented_and_previews_keep_final_output_line() {
+        let palette = ThemePalette::default();
+        let entry = TuiEntry {
+            kind: TuiEntryKind::Tool,
+            text: "completed read\nsrc/main.rs\nfirst\nsecond\nthird\nfourth\nfifth".into(),
+        };
+        let lines = render_entry_lines(std::slice::from_ref(&entry), &palette);
+        let spans = &lines[0].spans;
+        assert_eq!(spans[0].style.fg, Some(palette.success));
+        assert_eq!(spans[1].content, "Used ");
+        assert_eq!(spans[1].style.fg, None);
+        assert_eq!(spans[2].content, "Read");
+        assert_eq!(spans[2].style.fg, Some(palette.accent));
+        assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[3].style.fg, Some(palette.muted));
+        let preview = preview_entry(&entry, 0, 100, &palette, &PreviewState::default());
+        let text = preview.iter().map(line_text).collect::<String>();
+        assert!(!text.contains("first"));
+        assert!(text.contains("4 more lines"));
+        assert!(text.contains("… fifth"));
+        let mut failed = Vec::new();
+        push_tool_lines(
+            &mut failed,
+            "failed bash\n$ false\nexit status: 1",
+            &palette,
+        );
+        assert_eq!(failed[0].spans[0].content, "✗ ");
+        assert_eq!(failed[0].spans[0].style.fg, Some(palette.error));
+    }
+
+    #[test]
+    fn live_tool_events_show_results_and_todo_updates_without_waiting_for_final_answer() {
+        let mut app = TuiApp::default();
+        let thinking_index = app.push_placeholder(TuiEntryKind::Thinking, "");
+        let index = app.push_placeholder(TuiEntryKind::Assistant, "");
+        let call = pi_ai::ChatToolCall {
+            id: "call-1".into(),
+            name: "web_fetch".into(),
+            arguments: r#"{"url":"https://example.org"}"#.into(),
+        };
+        let mut activity = Activity::Waiting;
+        let mut saw_delta = false;
+        apply_turn_event(
+            &mut app,
+            index,
+            thinking_index,
+            &mut saw_delta,
+            &mut activity,
+            &TurnEvent::ToolStarted {
+                name: call.name.clone(),
+            },
+        );
+        apply_turn_event(
+            &mut app,
+            index,
+            thinking_index,
+            &mut saw_delta,
+            &mut activity,
+            &TurnEvent::ToolOutput {
+                call,
+                output: "HTTP 403".into(),
+                is_error: true,
+            },
+        );
+        assert_eq!(
+            app.entries[2].text,
+            "failed web_fetch\nhttps://example.org\nHTTP 403"
+        );
+        let todos = vec![TodoItem {
+            content: "verify source".into(),
+            status: TodoStatus::InProgress,
+        }];
+        apply_turn_event(
+            &mut app,
+            index,
+            thinking_index,
+            &mut saw_delta,
+            &mut activity,
+            &TurnEvent::TodosUpdated(todos.clone()),
+        );
+        assert_eq!(app.todos, todos);
+    }
+
+    #[test]
+    fn queue_up_recalls_newest_and_ctrl_s_steers_queue_then_draft() {
+        let mut app = TuiApp::default();
+        let followups = FollowUpQueue::default();
+        followups.push("first".into());
+        followups.push("second\nline".into());
+        let steering = SteeringMailbox::default();
+        let config = minimal_test_config();
+        handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert_eq!(app.input, "second\nline");
+        assert_eq!(input_layout(&app, 76).rows.len(), 2);
+        assert_eq!(followups.list(), ["first"]);
+        handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert_eq!(steering.drain(), ["first", "second\nline"]);
+        assert_eq!(followups.pending(), 0);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn queue_pane_is_bounded_and_keeps_one_row_per_message() {
+        use ratatui::backend::TestBackend;
+        let app = TuiApp {
+            queued_messages: vec!["queued\nmessage".into(); 7],
+            turn_running: true,
+            ..Default::default()
+        };
+        assert_eq!(queue_panel_height(&app), 6);
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        terminal
+            .draw(|frame| draw_queue_panel(frame, frame.area(), &app, &ThemePalette::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(text.matches("queued message").count(), 4);
+        assert!(text.contains("+3 more"));
+        assert!(text.contains("ctrl+s"));
+    }
+
+    #[test]
+    fn queue_hint_distinguishes_prose_only_turns_from_tool_rounds() {
+        use ratatui::backend::TestBackend;
+        let render = |saw_tools: bool| {
+            let app = TuiApp {
+                queued_messages: vec!["queued".into()],
+                turn_running: true,
+                turn_saw_tools: saw_tools,
+                ..Default::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+            terminal
+                .draw(|frame| draw_queue_panel(frame, frame.area(), &app, &ThemePalette::default()))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        // With tool rounds in the turn, steering lands at the next boundary.
+        assert!(render(true).contains("ctrl+s to steer at next boundary"));
+        // A prose-only response has no boundary: promise post-response
+        // delivery instead.
+        assert!(render(false).contains("ctrl+s queues after this response"));
+    }
+
+    #[test]
+    fn harness_frame_matches_todo_queue_and_boxed_prompt_example() {
+        use ratatui::backend::TestBackend;
+        let config = minimal_test_config();
+        let mut app = TuiApp {
+            todos: (0..6)
+                .map(|index| TodoItem {
+                    content: format!("task {index}"),
+                    status: if index == 0 {
+                        TodoStatus::InProgress
+                    } else {
+                        TodoStatus::Pending
+                    },
+                })
+                .collect(),
+            queued_messages: vec!["make the harness standard".into()],
+            turn_running: true,
+            turn_saw_tools: true,
+            show_hardware_cursor: true,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|frame| draw_tui(frame, &app, &config))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        let expected = [
+            "─".repeat(80),
+            "  Todo".into(),
+            "  ● task 0".into(),
+            "  ○ task 1".into(),
+            "  ○ task 2".into(),
+            "  ○ task 3".into(),
+            "  ○ task 4".into(),
+            "  … +1 more (1 pending) · ctrl+t to expand".into(),
+            "─".repeat(80),
+            "  ❯ make the harness standard".into(),
+            "  ↑ to edit · ctrl+s to steer at next boundary".into(),
+            format!("╭{}╮", "─".repeat(78)),
+            format!("│ > {}│", " ".repeat(75)),
+            format!("╰{}╯", "─".repeat(78)),
+        ];
+        assert_eq!(
+            rows[15..29]
+                .iter()
+                .map(|row| row.trim_end())
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        terminal.backend_mut().assert_cursor_position((4, 27));
+        // The queue owns the shared separator, with no duplicate rule or
+        // blank row between the hints and editor. Both sections can vanish.
+        app.todos.clear();
+        app.queued_messages.clear();
+        terminal
+            .draw(|frame| draw_tui(frame, &app, &config))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        assert!(rows[..26].iter().all(|row| row.trim().is_empty()));
+        assert!(rows[27].starts_with("│ > "));
+    }
+
+    #[test]
+    fn height_limited_todos_report_actual_hidden_counts_and_keep_active_task() {
+        use ratatui::backend::TestBackend;
+        let mut app = TuiApp {
+            todos: (0..8)
+                .map(|index| TodoItem {
+                    content: format!("task {index}"),
+                    status: if index == 6 {
+                        TodoStatus::InProgress
+                    } else {
+                        TodoStatus::Pending
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 7)).unwrap();
+        terminal
+            .draw(|frame| draw_todo_panel(frame, frame.area(), &app, &ThemePalette::default()))
+            .unwrap();
+        let text = buffer_rows(terminal.backend().buffer()).join("\n");
+        assert!(text.contains("● task 6"));
+        assert!(text.contains("+5 more (5 pending) · ctrl+t to expand"));
+        assert!(!text.contains("task 2"));
+        app.todos_expanded = true;
+        terminal
+            .draw(|frame| draw_todo_panel(frame, frame.area(), &app, &ThemePalette::default()))
+            .unwrap();
+        let text = buffer_rows(terminal.backend().buffer()).join("\n");
+        assert!(text.contains("+5 more (4 pending, 1 active) · ctrl+t to collapse"));
+        assert!(text.contains("task 2"));
+        assert!(!text.contains("task 3"));
+    }
+
+    #[test]
+    fn queue_overflow_shows_newest_editable_message_and_cell_width_truncation() {
+        use ratatui::backend::TestBackend;
+        let mut app = TuiApp {
+            queued_messages: (0..7).map(|index| format!("queued {index}")).collect(),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        terminal
+            .draw(|frame| draw_queue_panel(frame, frame.area(), &app, &ThemePalette::default()))
+            .unwrap();
+        let text = buffer_rows(terminal.backend().buffer()).join("\n");
+        assert!(text.contains("❯ queued 5"));
+        assert!(text.contains("❯ queued 6"));
+        assert!(!text.contains("queued 4"));
+        assert!(text.contains("+5 more · ↑ to edit · runs after next turn"));
+        app.queued_messages = vec!["界界界界界界界界界界".into()];
+        let mut terminal = Terminal::new(TestBackend::new(16, 3)).unwrap();
+        terminal
+            .draw(|frame| draw_queue_panel(frame, frame.area(), &app, &ThemePalette::default()))
+            .unwrap();
+        assert_eq!(
+            buffer_rows(terminal.backend().buffer())[1].trim_end(),
+            "  ❯ 界界界界界…"
+        );
+        assert_eq!(truncate_width("e\u{301}xy", 2), "e\u{301}…");
+    }
+
+    #[test]
+    fn tiny_frames_and_multiline_drafts_never_place_cursor_on_editor_border() {
+        use ratatui::backend::TestBackend;
+        let config = minimal_test_config();
+        let mut app = TuiApp {
+            show_hardware_cursor: true,
+            queued_messages: vec!["pending".into()],
+            todos: vec![TodoItem {
+                content: "active".into(),
+                status: TodoStatus::InProgress,
+            }],
+            ..Default::default()
+        };
+        app.set_input("/help");
+        for width in [1, 4, 8, 20, 80] {
+            for height in 1..=12 {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| draw_tui(frame, &app, &config))
+                    .unwrap();
+            }
+        }
+        app.set_input("first\nsecond\nthird");
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_input(frame, frame.area(), &app, &ThemePalette::default());
+                set_tui_cursor(frame, frame.area(), &app);
+            })
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        assert!(rows[1].starts_with("│ > first"));
+        assert!(rows[2].starts_with("│   second"));
+        assert!(rows[3].starts_with("│   third"));
+        terminal.backend_mut().assert_cursor_position((9, 3));
+        app.multiline = Some(Vec::new());
+        app.clear_input();
+        assert_eq!(input_desired_height(&app, 40), 4);
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        terminal
+            .draw(|frame| draw_input(frame, frame.area(), &app, &ThemePalette::default()))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        assert!(rows[1].starts_with("│ multi> "));
+        assert!(rows[2].contains("submit with . on its own line"));
+    }
+
+    #[test]
     fn todo_panel_height_collapses_and_expands() {
         let mut app = TuiApp::default();
         assert_eq!(todo_panel_height(&app), 0);
@@ -9443,16 +12967,16 @@ mod tests {
                 status: TodoStatus::Pending,
             })
             .collect();
-        assert_eq!(todo_panel_height(&app), 6);
+        assert_eq!(todo_panel_height(&app), 9);
         app.todos_expanded = true;
-        assert_eq!(todo_panel_height(&app), 8);
+        assert_eq!(todo_panel_height(&app), 12);
         app.todos = (0..3)
             .map(|index| TodoItem {
                 content: format!("task {index}"),
                 status: TodoStatus::Pending,
             })
             .collect();
-        assert_eq!(todo_panel_height(&app), 3);
+        assert_eq!(todo_panel_height(&app), 7);
     }
 
     #[test]
