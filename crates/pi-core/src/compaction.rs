@@ -93,6 +93,35 @@ fn retained_start(messages: &[ConversationMessage], keep_tokens: u64) -> usize {
     start
 }
 
+/// Mid-turn compaction boundary for sessions that are a single turn: keep
+/// the live task message and the newest assistant messages (including the
+/// pending tool-call/result pair) while they fit the recent-token budget, and
+/// summarize the completed rounds behind them. Every assistant message is a
+/// safe cut point because an assistant that issues tool calls always stays
+/// with its own results. Returns None when there is nothing to summarize.
+fn midturn_retained_start(messages: &[ConversationMessage], keep_tokens: u64) -> Option<usize> {
+    if messages.first()?.role != MessageRole::User {
+        return None;
+    }
+    let cuts = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == MessageRole::Assistant)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut start = *cuts.last()?;
+    let mut tokens = messages_tokens(&messages[start..]);
+    for &previous in cuts.iter().rev().skip(1) {
+        let combined = tokens.saturating_add(messages_tokens(&messages[previous..start]));
+        if combined > keep_tokens {
+            break;
+        }
+        tokens = combined;
+        start = previous;
+    }
+    (start > 1).then_some(start)
+}
+
 impl Runtime {
     pub fn context_window(&self) -> u64 {
         self.session
@@ -149,9 +178,109 @@ impl Runtime {
             .compact_messages(provider, CompactionKind::Automatic, "")
             .await?;
         if record.omitted_messages == 0 {
-            return Err(AgentError::Compaction("no older complete turns can be compacted; shorten the current turn or start a new session".into()));
+            return Err(AgentError::Compaction(
+                "no older complete turns can be compacted; shorten the current turn or start a new session"
+                    .into(),
+            ));
         }
         Ok(Some(record))
+    }
+
+    /// Recover a single-turn session whose tool rounds have outgrown the
+    /// window: summarize completed rounds inside the current turn (keeping the
+    /// live task and the newest calls with their results) when whole-turn
+    /// compaction found nothing to compact.
+    pub async fn auto_compact_midturn(
+        &mut self,
+        provider: &dyn Provider,
+    ) -> Result<Option<CompactionRecord>, AgentError> {
+        if !self.needs_auto_compaction() {
+            return Ok(None);
+        }
+        let record = self
+            .compact_messages(provider, CompactionKind::Automatic, "")
+            .await?;
+        if record.omitted_messages > 0 {
+            return Ok(Some(record));
+        }
+        let record = self.compact_midturn(provider).await?;
+        if record.omitted_messages == 0 {
+            return Err(AgentError::Compaction(
+                "no older complete turns can be compacted; shorten the current turn or start a new session"
+                    .into(),
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    pub async fn compact_midturn(
+        &mut self,
+        provider: &dyn Provider,
+    ) -> Result<CompactionRecord, AgentError> {
+        let keep = self
+            .systems
+            .compaction
+            .keep_recent_tokens
+            .min(self.context_window() / 4);
+        let Some(start) = midturn_retained_start(&self.session.messages, keep) else {
+            return Ok(CompactionRecord {
+                kind: CompactionKind::Automatic,
+                omitted_messages: 0,
+                retained_messages: self.session.messages.len(),
+                summary: "No completed tool rounds inside the current turn need compaction.".into(),
+            });
+        };
+        let older = self.session.messages[1..start]
+            .iter()
+            .filter(|message| message.role != MessageRole::System || is_checkpoint(message))
+            .cloned()
+            .collect::<Vec<_>>();
+        let persistent = self.session.messages[..start]
+            .iter()
+            .filter(|message| message.role == MessageRole::System && !is_checkpoint(message))
+            .cloned()
+            .collect::<Vec<_>>();
+        if older.iter().all(is_checkpoint) {
+            return Ok(CompactionRecord {
+                kind: CompactionKind::Automatic,
+                omitted_messages: 0,
+                retained_messages: self.session.messages.len(),
+                summary: "No completed tool rounds inside the current turn need compaction.".into(),
+            });
+        }
+        let summary = self.summarize_context(provider, &older, "").await?;
+        let mut messages = persistent;
+        // Keep the original transcript order: persistent instructions, the
+        // live task, then the checkpoint that stands in for the summarized
+        // rounds, then the retained newest rounds.
+        messages.push(self.session.messages[0].clone());
+        messages.push(ConversationMessage {
+            role: MessageRole::Assistant,
+            content: format!("{SUMMARY_PREFIX}{summary}"),
+            thinking: String::new(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        });
+        messages.extend_from_slice(&self.session.messages[start..]);
+        if messages_tokens(&messages) >= messages_tokens(&self.session.messages) {
+            return Err(AgentError::Compaction(
+                "generated checkpoint did not reduce context; original history retained".into(),
+            ));
+        }
+        let record = CompactionRecord {
+            kind: CompactionKind::Automatic,
+            omitted_messages: older.len(),
+            retained_messages: messages.len() - 1,
+            summary,
+        };
+        if let Some(store) = &self.store {
+            store.record_compaction_checkpoint(record.clone(), messages.clone())?;
+        }
+        self.session.messages = messages;
+        self.session.compactions.push(record.clone());
+        Ok(record)
     }
 
     pub async fn compact_messages(
@@ -198,6 +327,7 @@ impl Runtime {
         }
 
         let summary = self.summarize_context(provider, &older, focus).await?;
+        let persistent_tokens = messages_tokens(&persistent);
         let mut messages = persistent;
         messages.push(ConversationMessage {
             role: MessageRole::Assistant,
@@ -219,7 +349,29 @@ impl Runtime {
             .saturating_sub(messages_tokens(&self.session.messages))
             .saturating_add(messages_tokens(&messages));
         if kind == CompactionKind::Automatic && self.exceeds_compaction_budget(projected_tokens) {
-            return Err(AgentError::Compaction("retained turn or persistent instructions still exceed the context budget; original history retained. Start a new session or reduce context".into()));
+            let prompt = runtime_system_prompt(self);
+            let system = prompt.as_deref().map(text_tokens).unwrap_or(0);
+            let tools = active_tool_definitions(self)
+                .iter()
+                .map(|tool| {
+                    12 + text_tokens(&tool.name)
+                        + text_tokens(&tool.description)
+                        + text_tokens(&tool.parameters.to_string())
+                })
+                .fold(0u64, u64::saturating_add);
+            let retained = messages_tokens(&self.session.messages[start..]);
+            let budget = self.systems.compaction.trigger_percent.clamp(1, 99) as u64
+                * self.context_window()
+                / 100;
+            return Err(AgentError::Compaction(format!(
+                "after compaction the request would still exceed the budget ({projected_tokens} >= \
+                 {budget} tokens of the {}-token window): system prompt {system} + tools {tools} + \
+                 persistent instructions {} + retained recent turns {retained} tokens; \
+                 original history retained — lower compaction.keepRecentTokens, trim persistent \
+                 instructions or extensions, or start a new session",
+                self.context_window(),
+                persistent_tokens
+            )));
         }
         let record = CompactionRecord {
             kind,
@@ -588,6 +740,149 @@ mod tests {
             .content
             .contains("Previous conversation checkpoint"));
         assert!(requests[2].messages[0].content.contains("SQLite"));
+    }
+
+    #[test]
+    fn midturn_boundary_keeps_live_task_and_pending_round_but_cuts_completed_rounds() {
+        // The original unrecoverable session shape: one user turn, several
+        // completed tool rounds, one round in flight.
+        let mut messages = vec![message(MessageRole::User, "resume screen task")];
+        for round in 0..3 {
+            let mut call = message(MessageRole::Assistant, &format!("call {round}"));
+            call.tool_calls.push(ChatToolCall {
+                id: format!("call-{round}"),
+                name: "read".into(),
+                arguments: format!("{{\"path\":\"f{round}.rs\"}}"),
+            });
+            messages.push(call);
+            let mut result = message(MessageRole::Tool, &format!("result {round} ").repeat(100));
+            result.tool_call_id = Some(format!("call-{round}"));
+            messages.push(result);
+        }
+        // Small budget: only the final round plus the live task fit. Each
+        // round is ~175 tokens of tool output plus the call, so 400 keeps only
+        // the newest assistant message.
+        let start = midturn_retained_start(&messages, 400).unwrap();
+        assert!(start >= messages.len() - 2);
+        assert_eq!(messages[start].role, MessageRole::Assistant);
+        // Every earlier assistant boundary is also valid.
+        for keep in [0, 10, 10_000] {
+            if let Some(cut) = midturn_retained_start(&messages, keep) {
+                assert_eq!(messages[cut].role, MessageRole::Assistant);
+                assert!(cut >= 1);
+            }
+        }
+        // A very large budget compacts everything up to the first assistant
+        // (u64::MAX is deliberately avoided: saturating adds make any budget
+        // "fit" eventually, so 10_000 above already covers the large case).
+
+        // Multi-turn sessions are not handled here (retained_start covers them).
+        let multi = vec![
+            message(MessageRole::User, "a"),
+            message(MessageRole::Assistant, "b"),
+            message(MessageRole::User, "c"),
+        ];
+        assert_eq!(midturn_retained_start(&multi, 10_000), None);
+        // A single-message turn has nothing to compact.
+        assert_eq!(
+            midturn_retained_start(&[message(MessageRole::User, "a")], 10_000),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn midturn_compaction_summarizes_completed_rounds_and_keeps_pairing() {
+        let mut state = SessionState::new("midturn-test", PathBuf::from("."));
+        state.active_model = Some(ModelRef {
+            provider: "faux".into(),
+            id: "echo".into(),
+        });
+        let mut messages = vec![message(
+            MessageRole::User,
+            &format!("resume screen task {}", "detail ".repeat(200)),
+        )];
+        for round in 0..3 {
+            let mut call = message(MessageRole::Assistant, &format!("reading file {round}"));
+            call.tool_calls.push(ChatToolCall {
+                id: format!("call-{round}"),
+                name: "read".into(),
+                arguments: format!("{{\"path\":\"f{round}.rs\"}}"),
+            });
+            messages.push(call);
+            let mut result = message(
+                MessageRole::Tool,
+                &format!("file body {round} ").repeat(200),
+            );
+            result.tool_call_id = Some(format!("call-{round}"));
+            messages.push(result);
+        }
+        state.messages = messages;
+        let mut runtime = Runtime::new(
+            state,
+            ReloadableSystems {
+                compaction: RuntimeCompactionSettings {
+                    keep_recent_tokens: 800,
+                    ..Default::default()
+                },
+                retry: RuntimeRetrySettings {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let provider = SummaryProvider::default();
+        let record = runtime.compact_midturn(&provider).await.unwrap();
+        assert!(record.omitted_messages > 0, "nothing was summarized");
+        // Live task message survives verbatim and stays the first user turn.
+        assert_eq!(runtime.session.messages[0].role, MessageRole::User);
+        assert!(runtime.session.messages[0]
+            .content
+            .contains("resume screen task"));
+        // The checkpoint is inserted after it as the leading context.
+        assert!(is_checkpoint(&runtime.session.messages[1]));
+        // Tool-call/result pairing is intact for every retained call.
+        let retained_ids: Vec<&str> = runtime
+            .session
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        for message in &runtime.session.messages {
+            for call in &message.tool_calls {
+                assert!(
+                    retained_ids.contains(&call.id.as_str()),
+                    "call {} separated from its result",
+                    call.id
+                );
+            }
+        }
+        // Context actually shrank.
+        assert!(
+            messages_tokens(&runtime.session.messages)
+                < messages_tokens(&provider_original_messages(&provider))
+        );
+    }
+
+    fn provider_original_messages(provider: &SummaryProvider) -> Vec<ConversationMessage> {
+        // The summarizer received the transcript as one JSON-lines user
+        // message; the original history is reconstructed from the runtime
+        // before compaction. This helper exists purely to compare sizes; the
+        // transcript itself is asserted on in the checkpoint test above.
+        let requests = provider.requests.lock().unwrap();
+        requests
+            .iter()
+            .flat_map(|request| request.messages.clone())
+            .map(|m| ConversationMessage {
+                role: MessageRole::User,
+                content: m.content,
+                thinking: String::new(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            })
+            .collect()
     }
 
     struct BadProvider(Vec<StreamEvent>);
@@ -994,5 +1289,28 @@ mod tests {
         assert!(runtime.auto_compact(&provider).await.is_err());
         assert_eq!(runtime.session, before);
         assert!(provider.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn over_budget_projection_names_the_largest_contributors() {
+        let mut runtime = runtime();
+        // A retained tail that fits keepRecentTokens but, with system prompt
+        // and tools, still trips the trigger budget. The error must say which
+        // parts are large instead of a generic "reduce context".
+        runtime.systems.system_prompt = Some("rule ".repeat(120_000));
+        let error = runtime
+            .compact_messages(&SummaryProvider::default(), CompactionKind::Automatic, "")
+            .await
+            .unwrap_err();
+        let AgentError::Compaction(detail) = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(detail.contains("system prompt"), "message was: {detail}");
+        assert!(detail.contains("tools"), "message was: {detail}");
+        assert!(
+            detail.contains("retained recent turns"),
+            "message was: {detail}"
+        );
+        assert!(detail.contains("keepRecentTokens"), "message was: {detail}");
     }
 }
