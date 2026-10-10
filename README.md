@@ -15,7 +15,7 @@ Current Rust implementation:
 - Context-safe `/reload`
 - Config/auth/model loading from `~/.pi/agent`
 - `AGENTS.md` and `CLAUDE.md` context discovery
-- Built-in local tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
+- Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `todo`, `web_search`, `web_fetch`
 - Providers: faux test provider, OpenAI chat/responses/Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini/Vertex, OpenRouter, GitHub Copilot, Amazon Bedrock bearer-token Converse, Mistral, Cloudflare Workers AI/AI Gateway, OpenAI-compatible aliases for DeepSeek, Groq, Cerebras, xAI, Z.AI, Hugging Face, Together, Moonshot AI, and OpenCode, plus Anthropic-compatible aliases for Vercel AI Gateway, Fireworks, MiniMax, Kimi Coding, and Xiaomi MiMo
 
 Intentionally removed:
@@ -210,7 +210,7 @@ Environment overrides:
   "defaultModel": "echo",
   "defaultThinkingLevel": "xhigh",
   "enabledModels": ["faux/echo"],
-  "enabledTools": ["read", "bash", "edit", "write", "grep", "find", "ls", "todo"],
+  "enabledTools": ["read", "bash", "edit", "write", "grep", "find", "ls", "todo", "web_search", "web_fetch"],
   "sessionDir": "sessions",
   "modelRefresh": {
     "enabled": true,
@@ -218,6 +218,29 @@ Environment overrides:
   }
 }
 ```
+
+### Web tools
+
+`web_search` returns numbered titles, URLs, and snippets; `web_fetch` retrieves
+readable HTML/text/JSON/XML, retaining source URLs and links. They are enabled
+by default unless `enabledTools`, `--tools`, `--exclude-tools`, or `--no-tools`
+restricts them. `--offline` / `PI_OFFLINE=1` blocks both, including after reload.
+
+Search uses DuckDuckGo HTML without an API key by default. For a more reliable
+backend, set `BRAVE_SEARCH_API_KEY`, or set `PI_SEARXNG_URL` to the complete
+search endpoint (for example `https://search.example/search`), with JSON output
+enabled on that SearXNG instance. SearXNG takes precedence over Brave; keys are
+only sent in the Brave request header and never included in results/errors.
+
+Fetch limits: 30 seconds overall, at most five redirects, a 1 MiB response, and
+20,000 output characters by default (`max_chars`: 1–50,000). Search accepts
+`limit`: 1–10 (default 5). No JavaScript execution, browser sessions, or PDF/image
+extraction. HTTP errors, CAPTCHAs, and oversized responses are surfaced, not
+reported as successful empty results. Web content is labeled untrusted: treat
+it as evidence, never instructions. HTTP(S) fetch permits local/private hosts
+for development; this is a local harness, not a sandbox for untrusted users.
+
+Manual commands: `/web-search <query>` and `/web-fetch <url>`.
 
 ### Terminal themes
 
@@ -404,14 +427,32 @@ are available after `/reload` or the next startup. Refresh covers `anthropic`,
 OpenAI-compatible `zai`, `zai-coding`, `moonshotai`, and `kimi-coding-openai`
 endpoints via their API keys. Anthropic refresh paginates the official Models
 API; OAuth refresh is best-effort against the same provider auth paths used
-for model requests. Refresh failures are ignored unless verbose logging is
-enabled.
+for model requests.
+
+Refresh is defensive about partial failures. A provider that returns an empty
+list keeps its cached models instead of wiping them, an exhausted pagination
+budget or failed fetch records a diagnostic in the cache instead of silently
+stopping, and a pass where every fetch fails leaves `refreshedAt` untouched so
+the next startup retries instead of waiting out the full TTL. Diagnostics
+surface in `/diagnostics` output.
+
+Two slash commands manage the cache directly:
+
+- `/models refresh` — refetch now (skipped in offline mode or when
+  `modelRefresh.enabled` is false), reload config, and print a per-provider
+  report (`refreshed: zai-coding (11 models)`, `failed: ...`).
+- `/models reset` — delete `model-cache.json` and reload. The next refresh
+  starts from built-in models plus explicit `models.json` entries only; run
+  `/models refresh` to repopulate.
 
 Thinking levels can be set with `--thinking <level>` or `/thinking <level>`.
 Supported levels are model-specific. Opus exposes `high`, `xhigh`, and `max`;
 OpenAI/Codex reasoning models expose `minimal` through `xhigh`. While the
 `/model` selector is open, left/right adjusts the pending thinking level and
-Enter applies both the model and thinking level to the session.
+Enter applies both the model and thinking level to the session. `/new` starts
+fresh conversation history while retaining the current model, thinking level,
+and account selection; these selections are persisted in the new session.
+`/thinking off` remains explicitly off rather than inheriting a default.
 
 `keybindings.json` may be either an array:
 
@@ -544,6 +585,8 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/copy`
 - `/share [file]`
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
+- `/undo` (remove the latest conversation turn and restore its prompt; files unchanged)
+- `/usage` (recorded session token totals and account quotas)
 - `/login [provider]`
 - `/logout <provider>`
 - `/account [name]`
@@ -551,6 +594,8 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/todos`
 - `/diff`
 - `/reload`
+- `/web-search <query>`
+- `/web-fetch <url>`
 - `/read <path>`
 - `/write <path> <text>`
 - `/edit <path> <find> <replace>`
@@ -564,9 +609,74 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 
 `/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
 
-The model can track multi-step work with the built-in `todo` tool: it maintains a checklist (`pending`/`in_progress`/`completed`) that is journaled with the session and survives resume. The list renders as a widget above the prompt (`ctrl+t` expands it); `/todos` reprints it in the transcript. Files the model changes with the `edit`/`write` tools are tracked per session; `/diff` toggles a right-side panel listing them with git change stats, and Enter on a file shows its uncommitted diff (new files show their content).
+The editor uses a rounded box with a `>` prompt. A labeled Todo section and
+queued-message previews sit above it, separated by muted rules. Drafts wrap
+and the box grows upward with newlines or wrapping, up to ten visible input
+rows; longer drafts scroll vertically to keep the cursor visible. Shift+Enter
+inserts a newline without submitting (also while streaming); Enter submits or
+queues the complete draft. Ctrl+J is an alternative when the terminal does not
+report Shift+Enter distinctly. Multiline pastes (or single-line pastes over
+1,000 characters) collapse to numbered markers such as
+`[paste #1 +500 lines]`. Left/Right skip a marker and
+Backspace/Delete remove the whole paste. Submission, queueing, history, and
+external editors retain the full text, not the marker. Narrow/short terminals
+reduce panel rows and report the actual hidden counts.
 
-Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, esc or ctrl+c interrupts the turn, Enter queues the draft as a follow-up, and ctrl+s steers the running turn: the draft joins the conversation before the next provider request (`steeringMode` selects `one-at-a-time` or `all` per round). Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history. The TUI runs in an inline terminal viewport: finalized transcript rows are written to normal terminal scrollback, so native mouse selection and mouse-wheel scrollback remain terminal-owned while Up/Down navigate prompt history. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
+The model can track multi-step work with the built-in `todo` tool: it maintains a checklist (`pending`/`in_progress`/`completed`) that is journaled with the session and survives resume. The list renders above the prompt: collapsed lists select active tasks, upcoming tasks, and the most recent completed item while preserving task order. Completed titles are muted and struck through; hidden counts describe only hidden tasks. `ctrl+t` expands/collapses the list and survives updates; `/todos` reprints it in the transcript. Files the model changes with the `edit`/`write` tools are tracked per session; `/diff` toggles a right-side panel listing them with git change stats, and Enter on a file shows its uncommitted diff (new files show their content).
+
+Collapsed thinking and tool blocks use at most three terminal rows (excluding the blank separator). Thinking shows the latest two wrapped lines while streaming, then the first two lines plus a clipped hidden-line/`ctrl+o` hint when finished. Tool headers stay on one row with long commands/paths clipped; short results remain visible, while longer results show a hidden-line count in the header and an ellipsis-prefixed preview of the final output line. `ctrl+o` expands/collapses thinking and tool/command output for the latest three user turns, including while a turn is running; a new prompt or shell command restores collapsed previews. Expansion restores full commands and output. This only changes display, not stored content or model context usage; `expand` is configurable in `keybindings.json`. Tool headers highlight only tool names (or the command phrase), with muted paths/counts and success/failure markers.
+
+Queued follow-ups are visible immediately above the editor, one truncated line per message (the newest four when the queue overflows). Up with an empty editor recalls the newest queued message for editing (otherwise prompt-history navigation is unchanged). Mid-turn `ctrl+s` steers queued messages followed by the draft at the next provider boundary (a prose-only response has no interior boundary, so steering is delivered after it finishes and the queue hint says so); the existing steering mode still controls batch size. Queue edits are journaled during streaming and survive reload/resume.
+
+Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
+
+The TUI defaults to an owned alternate-screen transcript with a fixed composer. Mouse wheel and PageUp/PageDown scroll only the conversation; Up/Down retain prompt-history/queue navigation. At the bottom, new output follows automatically. Scrolling up anchors the reader to logical text: streaming, resizing, panel changes, and reload do not steal the reading position. `↓ Scroll to bottom · Esc` appears while reading (with `new output` when text arrives); click it, press Esc, or scroll down to resume following. Live thinking-tail previews are frozen while reading; returning to latest refreshes them. Esc dismisses an open selector/diff panel first, otherwise returns to latest without clearing the draft/attachments or interrupting generation. At latest it retains the existing clear/interrupt behavior. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
+
+In owned mode, drag with the left mouse button to select transcript text;
+release copies it to the clipboard. Selection stays attached to logical text
+while scrolling, resizing, and receiving streamed output. Drag past the transcript
+edge to scroll, or use the wheel/PageUp/PageDown. Soft wraps copy as one line;
+folded blocks copy only their visible preview (expand with Ctrl+O first to copy
+all output; preview selection clears if the preview changes). Ctrl+C or `/copy`
+copies the selection again without clearing the draft or interrupting generation. Esc clears selection and returns to latest;
+clicking the composer clears selection without changing the draft.
+
+Clipboard writes use `pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux, or
+`clip.exe` on Windows. `PI_CLIPBOARD_COMMAND` overrides the helper. If local
+helpers are unavailable, Pi requests the terminal clipboard via OSC 52 (useful
+over SSH; terminal/tmux clipboard permissions must allow it). An OSC 52 request
+cannot confirm delivery. Copy errors appear in the transcript hint; selection
+remains available for retry. Without a selection, `/copy` copies the last assistant
+message. Terminal-native selection via Shift+drag (sometimes Option on macOS)
+remains available; `/export <file>` exports the conversation.
+
+Run `pi --no-alt-screen` for native inline compatibility: overflow is written
+once to terminal scrollback, mouse selection/wheel remain terminal-owned, and
+the composer scrolls with the terminal. Print/JSON/RPC modes are unchanged.
+Owned mode restores the previous screen, mouse reporting, paste, and raw mode
+on exit. This viewport is an intentional Rust UI divergence; upstream parity
+fixtures are not rewritten.
+
+Ctrl+V reads a clipboard **image** into the current draft; type a prompt and
+press Enter to send it. Image-only drafts use “Describe this image.” Esc or
+Ctrl+C clears the draft when idle unless transcript text is selected (Esc first
+clears selection/returns to bottom if scrolled up). Multiple images are supported. `/image <path>`
+without a prompt also stages an attachment. Bracketed text paste is unchanged.
+Images respect `images.blockImages` and `images.autoResize`. While a turn runs,
+image drafts are kept for submission after it finishes (not sent as text-only
+steering/follow-ups). Linux needs `wl-paste` (Wayland) or `xclip` (X11); macOS
+uses AppKit via Swift (Xcode command-line tools), and Windows uses PowerShell.
+For remote/headless sessions, `PI_CLIPBOARD_IMAGE_COMMAND` can supply encoded
+PNG/JPEG/GIF/WebP bytes on stdout; otherwise use `/image <path>`.
+
+`/undo` changes only conversation context and restores the prompt, including
+images. It does **not** revert file edits, shell effects, tool audit history,
+queued messages, or token usage. `/usage` persists provider-reported token totals
+for completed requests across resume/reload/compaction/undo; old sessions and
+providers without usage report “no provider token usage reported yet” rather
+than estimated totals. Account quota checks use the same cache as `/accounts`
+and are skipped offline. Dollar costs are not calculated.
+
 
 ## Context Compaction
 
@@ -599,9 +709,31 @@ needed. `triggerPercent` is clamped to 1–99; the reserve is capped at half the
 window. The recent-token budget is capped at a quarter-window and applies to
 older complete turns; the latest turn is always retained intact. Oversized
 histories are summarized in bounded rolling fragments without dropping text.
+If automatic compaction cannot get under the budget (for example a very large
+system prompt, tool set, or persistent instructions, or a single turn larger
+than the window), the turn continues with the original history instead of
+failing: the failure is reported in the transcript with a token breakdown
+(`system prompt`/`tools`/`persistent instructions`/`retained recent turns`),
+and re-attempts are skipped until history changes. The provider still returns
+a real error if the request genuinely exceeds its window.
 Known model windows come from the catalog/provider metadata; custom `models.json`
 entries can specify `contextWindow`. Unknown windows fall back to 128,000 tokens.
 Token counts are heuristics, not exact provider tokenization.
+
+The agent per-run round cap is configurable alongside compaction and retry:
+
+```json
+{
+  "agent": {
+    "maxToolRounds": 120
+  }
+}
+```
+
+`agent.maxToolRounds` bounds provider rounds per user run, including steering
+rounds. The default is 200; values are clamped to at least 1. When the cap is
+reached the turn stops with a round-limit error, all work stays saved, and
+sending any prompt (or restarting, which auto-continues) gets a fresh budget.
 
 The original transcript remains in the session journal. A validated, smaller
 checkpoint and its replacement context are committed together through an atomic
@@ -609,7 +741,7 @@ file replacement. Empty/truncated/oversized/tool-bearing summaries, provider
 failures, or cancellation leave active history intact; no silent truncation
 fallback is used. If the latest turn or persistent instructions still cannot fit,
 pi reports an error instead of repeatedly compacting. Completed summarization
-requests count toward recorded session usage. `/export` exports the current checkpoint and
+requests count toward `/usage`. `/export` exports the current checkpoint and
 retained context, not the pre-compaction journal transcript.
 
 
@@ -763,13 +895,26 @@ make test-smoke
 `make dogfood` runs the development TUI with `--continue --model faux/echo`.
 It also starts a quiet background `cargo build -p pi-cli` watcher; successful
 rebuilds restart the running TUI process, and the continued session restores
-conversation messages from disk. Watcher output is written to
+conversation messages from disk. Restarts wait until the active turn and its
+follow-ups finish. Interactive startup and `/resume` automatically continue
+unfinished model turns from saved context, then drain queued follow-ups. No
+synthetic user prompt is added and saved tool calls are not replayed; missing
+results are reported to the provider as interrupted calls. Completed direct
+slash tools do not trigger continuation. Ctrl+C/Esc, `/quit`, and errors still
+stop the active run; rebuild restarts wait for a completed boundary so a stop
+cannot turn into an automatic restart/retry loop. The agent safety limit is
+200 provider rounds per run by default, including steering; raise or lower it
+with `agent.maxToolRounds` in `settings.json`. Hitting the limit reports the
+cap and saves all work; a resumed run gets a fresh
+budget without discarding the saved work.
+Watcher output is written to
 `target/dogfood-dev/watch.log`. `make dogfood-release` builds
 `target/release/pi` and runs the binary in tmux with an isolated agent/session
 directory under `target/`. It uses the faux provider, so it does not require
 provider credentials or network access. `make dogfood-long` uses the same
-release binary and faux provider, but creates a long transcript, checks
-terminal scrollback output, resizes the tmux pane, and verifies the
+release binary and faux provider in `--no-alt-screen` compatibility mode: it
+creates a long transcript, checks terminal scrollback, resizes the tmux pane,
+and verifies the
 exported session still contains the full transcript. `make dogfood-real` is
 opt-in and runs real Claude and Codex TTY smoke tests when local credentials are
 available. It asks each provider for a tiny Rust program and checks that a real
