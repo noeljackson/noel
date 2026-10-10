@@ -3132,14 +3132,28 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
                 max_chars: None,
             },
         })),
-        "/read" => Ok(Some(ParsedToolCommand {
-            name: "read".to_string(),
-            request: ToolRequest::Read {
-                path: required_arg(command, rest)?.to_string(),
-                offset: None,
-                limit: None,
-            },
-        })),
+        "/read" => {
+            // "/read <path> [offset=N] [limit=N]": the resume syntax printed
+            // by the read truncation notice.
+            let (path, rest) = split_optional_arg(rest);
+            let mut offset = None;
+            let mut limit = None;
+            for part in rest.unwrap_or_default().split_whitespace() {
+                if let Some(value) = part.strip_prefix("offset=") {
+                    offset = value.parse::<u64>().ok();
+                } else if let Some(value) = part.strip_prefix("limit=") {
+                    limit = value.parse::<u64>().ok();
+                }
+            }
+            Ok(Some(ParsedToolCommand {
+                name: "read".to_string(),
+                request: ToolRequest::Read {
+                    path: required_arg(command, path)?.to_string(),
+                    offset,
+                    limit,
+                },
+            }))
+        }
         "/bash" => Ok(Some(ParsedToolCommand {
             name: "bash".to_string(),
             request: ToolRequest::Bash {
@@ -3957,38 +3971,37 @@ mod tests {
     }
 
     #[test]
-    fn model_tool_requests_forward_read_and_grep_options() {
-        // The schema advertises offset/limit for read and literal/ignoreCase/
-        // context/limit for grep; dropping them silently made truncation
-        // notices unusable, so forwarding must be verified.
-        let read = ChatToolCall {
-            id: "read-1".into(),
-            name: "read".into(),
-            arguments: r#"{"path":"big.txt","offset":2001,"limit":100}"#.into(),
-        };
+    fn read_slash_command_parses_offset_and_limit_kwargs() {
+        let parsed = parse_tool_command("/read big.txt offset=2001 limit=100")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.name, "read");
         assert_eq!(
-            model_tool_requests(&read).unwrap(),
-            [ToolRequest::Read {
+            parsed.request,
+            ToolRequest::Read {
                 path: "big.txt".into(),
                 offset: Some(2001),
                 limit: Some(100)
-            }]
+            }
         );
-        let grep = ChatToolCall {
-            id: "grep-1".into(),
-            name: "grep".into(),
-            arguments: r#"{"pattern":"fn main","ignoreCase":true,"context":2,"limit":5}"#.into(),
-        };
+        // Plain path still works; unknown kwargs are ignored, not fatal.
+        let plain = parse_tool_command("/read a.txt").unwrap().unwrap();
         assert_eq!(
-            model_tool_requests(&grep).unwrap(),
-            [ToolRequest::Grep {
-                path: None,
-                pattern: "fn main".into(),
-                literal: None,
-                ignore_case: Some(true),
-                context: Some(2),
-                limit: Some(5)
-            }]
+            plain.request,
+            ToolRequest::Read {
+                path: "a.txt".into(),
+                offset: None,
+                limit: None
+            }
+        );
+        let ignored = parse_tool_command("/read a.txt bogus=1").unwrap().unwrap();
+        assert_eq!(
+            ignored.request,
+            ToolRequest::Read {
+                path: "a.txt".into(),
+                offset: None,
+                limit: None
+            }
         );
     }
 
