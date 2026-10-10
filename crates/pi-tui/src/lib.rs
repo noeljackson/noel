@@ -175,8 +175,8 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "override or restore theme accent",
     },
     CommandHelp {
-        command: "/models",
-        description: "list configured models",
+        command: "/models [refresh|reset|<query>]",
+        description: "list models; refresh cache or reset it",
     },
     CommandHelp {
         command: "/scoped-models",
@@ -256,11 +256,19 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     },
     CommandHelp {
         command: "/copy",
-        description: "copy last assistant message",
+        description: "copy selected text or last assistant message",
     },
     CommandHelp {
         command: "/share [file]",
         description: "export a local HTML session share",
+    },
+    CommandHelp {
+        command: "/undo",
+        description: "undo last conversation turn; restore prompt (files unchanged)",
+    },
+    CommandHelp {
+        command: "/usage",
+        description: "show session token totals and account quotas",
     },
     CommandHelp {
         command: "/compact",
@@ -297,6 +305,14 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
     CommandHelp {
         command: "/trust",
         description: "save project trust decision for future sessions",
+    },
+    CommandHelp {
+        command: "/web-search <query>",
+        description: "search the web for sources",
+    },
+    CommandHelp {
+        command: "/web-fetch <url>",
+        description: "fetch a web page as readable text",
     },
     CommandHelp {
         command: "/read <path>",
@@ -618,6 +634,10 @@ pub fn default_keybindings() -> KeybindingMap {
                 keys: vec!["shift+enter".to_string(), "ctrl+j".to_string()],
             },
             Keybinding {
+                action: "paste-image".to_string(),
+                keys: vec!["ctrl+v".to_string()],
+            },
+            Keybinding {
                 action: "editor".to_string(),
                 keys: vec!["ctrl+g".to_string()],
             },
@@ -658,6 +678,10 @@ pub fn default_keybindings() -> KeybindingMap {
                 keys: vec!["ctrl+s".to_string()],
             },
             Keybinding {
+                action: "expand".to_string(),
+                keys: vec!["ctrl+o".to_string()],
+            },
+            Keybinding {
                 action: "todos".to_string(),
                 keys: vec!["ctrl+t".to_string()],
             },
@@ -669,6 +693,15 @@ pub fn default_keybindings() -> KeybindingMap {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn image_paste_and_session_commands_are_discoverable() {
+        assert!(default_keybindings().matches("paste-image", "ctrl+v"));
+        for command in ["/compact", "/undo", "/usage"] {
+            assert!(COMMAND_HELP.iter().any(|help| help.command == command));
+            assert!(EditorState::command_completions(command).contains(&command));
+        }
+    }
 
     #[test]
     fn keybinding_overrides_replace_defaults() {
@@ -698,6 +731,8 @@ mod tests {
         assert!(bindings.matches("newline", "ctrl+j"));
         assert!(bindings.matches("editor", "ctrl+g"));
         assert!(bindings.matches("steer", "ctrl+s"));
+        assert!(bindings.matches("expand", "ctrl+o"));
+        assert!(bindings.matches("todos", "ctrl+t"));
         if cfg!(target_os = "macos") {
             assert!(bindings.matches("line-start", "super+left"));
             assert!(bindings.matches("line-end", "super+right"));

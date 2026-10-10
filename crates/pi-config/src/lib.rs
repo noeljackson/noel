@@ -183,6 +183,8 @@ pub struct Settings {
     #[serde(default)]
     pub retry: Option<RetrySettings>,
     #[serde(default)]
+    pub agent: Option<AgentSettings>,
+    #[serde(default)]
     pub terminal: Option<TerminalSettings>,
     #[serde(default)]
     pub images: Option<ImageSettings>,
@@ -259,6 +261,7 @@ impl Settings {
             compaction: merge_optional_settings(self.compaction, overrides.compaction),
             branch_summary: merge_optional_settings(self.branch_summary, overrides.branch_summary),
             retry: merge_optional_settings(self.retry, overrides.retry),
+            agent: merge_optional_settings(self.agent, overrides.agent),
             terminal: merge_optional_settings(self.terminal, overrides.terminal),
             images: merge_optional_settings(self.images, overrides.images),
             double_escape_action: overrides.double_escape_action.or(self.double_escape_action),
@@ -420,6 +423,22 @@ impl MergeSettings for ProviderRetrySettings {
             timeout_ms: overrides.timeout_ms.or(self.timeout_ms),
             max_retries: overrides.max_retries.or(self.max_retries),
             max_retry_delay_ms: overrides.max_retry_delay_ms.or(self.max_retry_delay_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSettings {
+    /// Safety cap on provider rounds per run, including steering. `None`
+    /// keeps the compiled default.
+    pub max_tool_rounds: Option<usize>,
+}
+
+impl MergeSettings for AgentSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            max_tool_rounds: overrides.max_tool_rounds.or(self.max_tool_rounds),
         }
     }
 }
