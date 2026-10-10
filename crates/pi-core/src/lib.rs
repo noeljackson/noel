@@ -2187,7 +2187,7 @@ async fn run_model_turn_streaming_events(
         );
         if runtime.needs_auto_compaction() && failed_compaction_fingerprint != Some(fingerprint) {
             on_event(&TurnEvent::CompactionStarted);
-            match runtime.auto_compact(provider).await {
+            match runtime.auto_compact_midturn(provider).await {
                 Ok(Some(record)) => {
                     failed_compaction_fingerprint = None;
                     on_event(&TurnEvent::CompactionFinished(record));
@@ -4400,6 +4400,122 @@ mod tests {
         assert_eq!(deltas, ["[faux/echo] ", "hello"]);
         assert_eq!(response, "[faux/echo] hello");
         assert_eq!(runtime.session().messages[1].content, response);
+    }
+
+    #[tokio::test]
+    async fn midturn_compaction_recovers_a_single_turn_that_outgrows_the_window() {
+        // Reproduces the original failure: one user turn, many tool rounds,
+        // context over budget. Whole-turn compaction has nothing older to
+        // summarize, so the mid-turn path summarizes completed rounds and the
+        // turn continues instead of failing every round.
+        let cwd = std::env::temp_dir().join(format!("pi-midturn-loop-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        fs::write(cwd.join("a.txt"), "file contents").expect("write fixture");
+        let mut session = SessionState::new("midturn-loop", cwd.clone());
+        session.active_model = Some(ModelRef {
+            provider: "faux".to_string(),
+            id: "echo".to_string(),
+        });
+        let mut runtime = Runtime::new(
+            session,
+            ReloadableSystems {
+                compaction: RuntimeCompactionSettings {
+                    keep_recent_tokens: 500,
+                    ..Default::default()
+                },
+                model_context_windows: BTreeMap::from([("faux/echo".to_string(), 3_000)]),
+                ..Default::default()
+            },
+        );
+        // Provider: 6 read rounds with ~1k-token outputs, then a final answer.
+        use std::sync::atomic::AtomicUsize;
+        #[derive(Default)]
+        struct BigLoopProvider {
+            rounds: AtomicUsize,
+            summaries: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Provider for BigLoopProvider {
+            async fn complete(
+                &self,
+                request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                // Summarizer requests carry no tools and a single transcript
+                // message; count them separately.
+                let is_summary = request.tools.is_empty()
+                    && request.messages.len() == 1
+                    && request.messages[0].content.contains("transcript fragment");
+                if is_summary {
+                    self.summaries.fetch_add(1, Ordering::SeqCst);
+                    return Ok(vec![
+                        StreamEvent::Text("checkpoint: files read so far".into()),
+                        StreamEvent::Stop {
+                            reason: "stop".into(),
+                        },
+                    ]);
+                }
+                let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+                if round < 6 {
+                    return Ok(vec![
+                        StreamEvent::ToolCall {
+                            id: format!("call_read_{round}"),
+                            name: "read".to_string(),
+                            arguments: format!(
+                                "{{\"path\":\"a.txt\",\"padding\":\"{}\"}}",
+                                "x".repeat(4_000)
+                            ),
+                        },
+                        StreamEvent::Stop {
+                            reason: "toolUse".into(),
+                        },
+                    ]);
+                }
+                Ok(vec![
+                    StreamEvent::Text("all done".into()),
+                    StreamEvent::Stop {
+                        reason: "stop".into(),
+                    },
+                ])
+            }
+        }
+        let provider = BigLoopProvider::default();
+        let mut events = Vec::new();
+        let answer = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "read everything".to_string(),
+            Vec::new(),
+            &SteeringMailbox::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .expect("turn must not strand");
+        assert_eq!(answer, "all done");
+        assert!(provider.summaries.load(Ordering::SeqCst) >= 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::CompactionFinished(_))));
+        // The session ended with a checkpoint and intact tool pairing.
+        assert!(runtime
+            .session()
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Assistant
+                && message.content.contains("Previous conversation checkpoint")));
+        for message in &runtime.session().messages {
+            for call in &message.tool_calls {
+                assert!(
+                    runtime
+                        .session()
+                        .messages
+                        .iter()
+                        .any(|m| m.tool_call_id.as_deref() == Some(call.id.as_str())),
+                    "call {} separated from its result",
+                    call.id
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(cwd);
     }
 
     #[tokio::test]
