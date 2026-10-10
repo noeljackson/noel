@@ -1,3 +1,5 @@
+mod web;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,6 +19,8 @@ pub struct ToolDefinition {
 pub enum ToolRequest {
     Read {
         path: String,
+        offset: Option<u64>,
+        limit: Option<u64>,
     },
     Bash {
         command: String,
@@ -34,6 +38,10 @@ pub enum ToolRequest {
     Grep {
         path: Option<String>,
         pattern: String,
+        literal: Option<bool>,
+        ignore_case: Option<bool>,
+        context: Option<u64>,
+        limit: Option<u64>,
     },
     Find {
         pattern: String,
@@ -41,15 +49,27 @@ pub enum ToolRequest {
     Ls {
         path: Option<String>,
     },
+    WebSearch {
+        query: String,
+        limit: Option<u64>,
+    },
+    WebFetch {
+        url: String,
+        max_chars: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub output: String,
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 #[derive(Debug, Error)]
 pub enum ToolError {
+    #[error("web tool: {0}")]
+    Web(String),
     #[error("unknown tool: {0}")]
     Unknown(String),
     #[error("path escapes cwd: {0}")]
@@ -69,16 +89,29 @@ pub enum ToolError {
 pub struct ToolRuntimeOptions {
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
+    pub offline: bool,
 }
 
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     [
-        "read", "bash", "edit", "write", "grep", "find", "ls", "todo",
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls",
+        "todo",
+        "web_search",
+        "web_fetch",
     ]
     .into_iter()
     .map(|name| ToolDefinition {
         name: name.to_string(),
-        read_only: matches!(name, "read" | "grep" | "find" | "ls" | "todo"),
+        read_only: matches!(
+            name,
+            "read" | "grep" | "find" | "ls" | "todo" | "web_search" | "web_fetch"
+        ),
     })
     .collect()
 }
@@ -88,8 +121,22 @@ pub async fn execute_tool(
     request: ToolRequest,
     options: &ToolRuntimeOptions,
 ) -> Result<ToolResult, ToolError> {
+    if options.offline
+        && matches!(
+            &request,
+            ToolRequest::WebFetch { .. } | ToolRequest::WebSearch { .. }
+        )
+    {
+        return Err(ToolError::Web(
+            "network tools are disabled in offline mode".to_string(),
+        ));
+    }
     match request {
-        ToolRequest::Read { path } => read_tool(cwd, &path),
+        ToolRequest::Read {
+            path,
+            offset,
+            limit,
+        } => read_tool(cwd, &path, offset, limit),
         ToolRequest::Bash {
             command,
             timeout_ms,
@@ -100,19 +147,206 @@ pub async fn execute_tool(
             replace,
         } => edit_tool(cwd, &path, &find, &replace),
         ToolRequest::Write { path, content } => write_tool(cwd, &path, &content),
-        ToolRequest::Grep { path, pattern } => grep_tool(cwd, path.as_deref(), &pattern),
+        ToolRequest::Grep {
+            path,
+            pattern,
+            literal,
+            ignore_case,
+            context,
+            limit,
+        } => grep_tool(
+            cwd,
+            path.as_deref(),
+            &pattern,
+            literal.unwrap_or(false),
+            ignore_case.unwrap_or(false),
+            context.unwrap_or(0),
+            limit,
+        ),
         ToolRequest::Find { pattern } => find_tool(cwd, &pattern),
         ToolRequest::Ls { path } => ls_tool(cwd, path.as_deref()),
+        ToolRequest::WebSearch { query, limit } => {
+            tokio::time::timeout(Duration::from_secs(30), web::search(&query, limit))
+                .await
+                .map_err(|_| ToolError::Timeout(30_000))?
+        }
+        ToolRequest::WebFetch { url, max_chars } => {
+            tokio::time::timeout(Duration::from_secs(30), web::fetch(&url, max_chars))
+                .await
+                .map_err(|_| ToolError::Timeout(30_000))?
+        }
     }
 }
 
-fn read_tool(cwd: &Path, path: &str) -> Result<ToolResult, ToolError> {
+/// Default caps on tool outputs entering the model context. Large results
+/// are truncated with instructions for narrowing the next request instead of
+/// silently consuming the whole window (Claude Code: 2,000-line reads, 30k-char
+/// bash output; pi keeps the same order of magnitude).
+pub const MAX_READ_LINES: usize = 2_000;
+pub const MAX_TOOL_OUTPUT_CHARS: usize = 30_000;
+pub const MAX_GREP_MATCHES: usize = 200;
+
+/// Truncation notice appended to oversized outputs so the model retries with
+/// narrower parameters instead of assuming it saw everything.
+fn truncation_notice(omitted: &str, hint: &str) -> String {
+    format!("\n[output truncated: {omitted}. {hint}]")
+}
+
+fn truncate_chars(text: &str, max: usize, hint: &str) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut end = text.len();
+    for (count, (byte, _)) in text.char_indices().enumerate() {
+        if count == max {
+            end = byte;
+            break;
+        }
+    }
+    let mut cut = text[..end].to_string();
+    cut.push_str(&truncation_notice(
+        &format!("showing first {max} of {} characters", text.chars().count()),
+        hint,
+    ));
+    cut
+}
+
+fn read_tool(
+    cwd: &Path,
+    path: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<ToolResult, ToolError> {
     let path = resolve_under_cwd(cwd, path)?;
-    let output = fs::read_to_string(&path).map_err(|source| ToolError::Io {
+    let content = fs::read_to_string(&path).map_err(|source| ToolError::Io {
         path: path.clone(),
         source,
     })?;
-    Ok(ToolResult { output })
+    let total_lines = content.lines().count();
+    // offset is 1-based to match the schema advertised to models. An offset
+    // past EOF yields an empty read rather than silently restarting at 1.
+    let start = match offset {
+        Some(offset) => (offset.saturating_sub(1) as usize).min(total_lines),
+        None => 0,
+    };
+    let effective_limit = limit.map(|limit| limit as usize).unwrap_or(MAX_READ_LINES);
+    let mut output = String::new();
+    let mut shown = 0usize;
+    for line in content.lines().skip(start).take(effective_limit) {
+        output.push_str(line);
+        output.push('\n');
+        shown += 1;
+    }
+    // `lines()` drops the file's own trailing newline; preserve the file's
+    // ending verbatim when nothing was truncated so unchanged files round-trip.
+    let truncated = start + shown < total_lines;
+    if !truncated && !content.ends_with('\n') {
+        output.pop();
+    }
+    if truncated {
+        output.push_str(&truncation_notice(
+            &format!(
+                "showing lines {}-{} of {total_lines}",
+                start + 1,
+                start + shown
+            ),
+            &format!(
+                "read the rest with offset={}, or narrow with grep/limit",
+                start + shown + 1
+            ),
+        ));
+    }
+    Ok(ToolResult {
+        output,
+        is_error: false,
+    })
+}
+
+/// Head-limited, truncation-noted listing for grep/find-style outputs.
+fn truncate_matches(matches: &[String], limit: Option<u64>, max: usize, hint: &str) -> String {
+    let shown = limit
+        .map(|limit| limit as usize)
+        .unwrap_or(max)
+        .min(max)
+        .max(1);
+    let mut output = matches
+        .iter()
+        .take(shown)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if matches.len() > shown {
+        output.push_str(&truncation_notice(
+            &format!("showing {shown} of {} matches", matches.len()),
+            hint,
+        ));
+    }
+    output
+}
+
+fn grep_tool(
+    cwd: &Path,
+    path: Option<&str>,
+    pattern: &str,
+    literal: bool,
+    ignore_case: bool,
+    context: u64,
+    limit: Option<u64>,
+) -> Result<ToolResult, ToolError> {
+    let root = match path {
+        Some(path) => resolve_under_cwd(cwd, path)?,
+        None => cwd.to_path_buf(),
+    };
+    let pattern = if literal {
+        regex::escape(pattern)
+    } else {
+        pattern.to_string()
+    };
+    let matcher = if ignore_case {
+        regex::RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+    } else {
+        regex::Regex::new(&pattern)
+    }
+    .map_err(|source| ToolError::Web(format!("invalid regex: {source}")))?;
+    let mut matches = Vec::new();
+    visit_files(&root, &mut |file| {
+        if let Ok(content) = fs::read_to_string(file) {
+            let lines: Vec<&str> = content.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if matcher.is_match(line) {
+                    let mut formatted =
+                        format!("{}:{}:{line}", display_relative(cwd, file), index + 1);
+                    // context lines are additive around the match; cap each
+                    // line's output so a context-heavy request cannot exceed
+                    // the shared output budget either.
+                    for delta in 1..=context {
+                        if let Some(before) =
+                            lines.get(index.checked_sub(delta as usize).unwrap_or(usize::MAX))
+                        {
+                            formatted =
+                                format!("{}-{}:{before}\n", formatted, index + 1 - delta as usize);
+                        }
+                        if let Some(after) = lines.get(index + delta as usize) {
+                            formatted =
+                                format!("{}+{}:{after}\n", formatted, index + delta as usize + 1);
+                        }
+                    }
+                    matches.push(formatted);
+                }
+            }
+        }
+    })?;
+    Ok(ToolResult {
+        output: truncate_matches(
+            &matches,
+            limit,
+            MAX_GREP_MATCHES,
+            "narrow the path or pattern, or set limit",
+        ),
+        is_error: false,
+    })
 }
 
 async fn bash_tool(
@@ -165,7 +399,14 @@ async fn bash_tool(
     if !output.status.success() {
         text.push_str(&format!("\nexit status: {}", output.status));
     }
-    Ok(ToolResult { output: text })
+    Ok(ToolResult {
+        output: truncate_chars(
+            &text,
+            MAX_TOOL_OUTPUT_CHARS,
+            "redirect large output to a file and read a slice, or filter with grep/head",
+        ),
+        is_error: !output.status.success(),
+    })
 }
 
 fn edit_tool(cwd: &Path, path: &str, find: &str, replace: &str) -> Result<ToolResult, ToolError> {
@@ -183,6 +424,7 @@ fn edit_tool(cwd: &Path, path: &str, find: &str, replace: &str) -> Result<ToolRe
         source,
     })?;
     Ok(ToolResult {
+        is_error: false,
         output: format!("edited {}", path.display()),
     })
 }
@@ -200,31 +442,8 @@ fn write_tool(cwd: &Path, path: &str, content: &str) -> Result<ToolResult, ToolE
         source,
     })?;
     Ok(ToolResult {
+        is_error: false,
         output: format!("wrote {}", path.display()),
-    })
-}
-
-fn grep_tool(cwd: &Path, path: Option<&str>, pattern: &str) -> Result<ToolResult, ToolError> {
-    let root = match path {
-        Some(path) => resolve_under_cwd(cwd, path)?,
-        None => cwd.to_path_buf(),
-    };
-    let mut matches = Vec::new();
-    visit_files(&root, &mut |file| {
-        if let Ok(content) = fs::read_to_string(file) {
-            for (index, line) in content.lines().enumerate() {
-                if line.contains(pattern) {
-                    matches.push(format!(
-                        "{}:{}:{line}",
-                        display_relative(cwd, file),
-                        index + 1
-                    ));
-                }
-            }
-        }
-    })?;
-    Ok(ToolResult {
-        output: matches.join("\n"),
     })
 }
 
@@ -237,7 +456,13 @@ fn find_tool(cwd: &Path, pattern: &str) -> Result<ToolResult, ToolError> {
         }
     })?;
     Ok(ToolResult {
-        output: matches.join("\n"),
+        is_error: false,
+        output: truncate_matches(
+            &matches,
+            None,
+            MAX_GREP_MATCHES,
+            "narrow the pattern, or search a subdirectory",
+        ),
     })
 }
 
@@ -267,6 +492,7 @@ fn ls_tool(cwd: &Path, path: Option<&str>) -> Result<ToolResult, ToolError> {
         })?;
     entries.sort();
     Ok(ToolResult {
+        is_error: false,
         output: entries.join("\n"),
     })
 }
@@ -376,6 +602,271 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[tokio::test]
+    async fn web_tools_are_read_only_and_offline_rejects_network_before_connecting() {
+        let definitions = builtin_tool_definitions();
+        for name in ["web_search", "web_fetch"] {
+            assert!(
+                definitions
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .unwrap()
+                    .read_only
+            );
+        }
+        let options = ToolRuntimeOptions {
+            offline: true,
+            ..Default::default()
+        };
+        for request in [
+            ToolRequest::WebFetch {
+                url: "http://127.0.0.1:1/".into(),
+                max_chars: None,
+            },
+            ToolRequest::WebSearch {
+                query: "rust".into(),
+                limit: None,
+            },
+        ] {
+            assert!(execute_tool(Path::new("."), request, &options)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("offline"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_is_preserved_as_a_tool_failure() {
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command: "printf failed-output; exit 7".into(),
+                timeout_ms: Some(1000),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(result.output.contains("failed-output"));
+        assert!(result.output.contains("exit status"));
+    }
+
+    #[tokio::test]
+    async fn read_caps_lines_honors_offset_and_limit_and_notes_truncation() {
+        let cwd = std::env::temp_dir().join(format!("pi-read-cap-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let content = (1..=3_000)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(cwd.join("big.txt"), content).expect("write big file");
+
+        // Default cap: first 2000 lines plus a truncation notice with the
+        // exact resume offset.
+        let capped = execute_tool(
+            &cwd,
+            ToolRequest::Read {
+                path: "big.txt".to_string(),
+                offset: None,
+                limit: None,
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("capped read");
+        assert!(capped.output.contains("line-2000\n"));
+        assert!(!capped.output.contains("line-2001\n"));
+        assert!(capped.output.contains("showing lines 1-2000 of 3000"));
+        assert!(capped.output.contains("offset=2001"));
+
+        // Explicit offset resumes exactly where the notice said.
+        let resumed = execute_tool(
+            &cwd,
+            ToolRequest::Read {
+                path: "big.txt".to_string(),
+                offset: Some(2001),
+                limit: Some(5),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("resumed read");
+        assert!(resumed.output.starts_with("line-2001\n"));
+        assert!(resumed.output.contains("line-2005\n"));
+        assert!(!resumed.output.contains("line-2006"));
+        assert!(resumed.output.contains("showing lines 2001-2005 of 3000"));
+
+        // offset past the end yields an empty result, not an error.
+        let past = execute_tool(
+            &cwd,
+            ToolRequest::Read {
+                path: "big.txt".to_string(),
+                offset: Some(9_999),
+                limit: None,
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("past-end read");
+        assert_eq!(past.output, "");
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn bash_output_is_capped_with_guidance() {
+        let cwd = std::env::temp_dir().join(format!("pi-bash-cap-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let result = execute_tool(
+            &cwd,
+            ToolRequest::Bash {
+                command: "seq 1 20000".to_string(),
+                timeout_ms: Some(10_000),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("bash");
+        assert!(result.output.chars().count() <= 30_000 + 300);
+        assert!(result
+            .output
+            .contains("[output truncated: showing first 30000 of"));
+        assert!(result.output.contains("redirect large output"));
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn grep_supports_regex_case_and_context_and_limits_matches() {
+        let cwd = std::env::temp_dir().join(format!("pi-grep-opts-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        fs::write(cwd.join("a.txt"), "alpha\nBETA\ngamma\nAlpha\ndelta\n").expect("write a");
+
+        // Regex, case-insensitive.
+        let insensitive = execute_tool(
+            &cwd,
+            ToolRequest::Grep {
+                path: None,
+                pattern: "^al".to_string(),
+                literal: None,
+                ignore_case: Some(true),
+                context: None,
+                limit: None,
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("case-insensitive grep");
+        assert!(insensitive.output.contains("a.txt:1:alpha"));
+        assert!(insensitive.output.contains("a.txt:4:Alpha"));
+
+        // Literal escapes regex metacharacters.
+        let literal = execute_tool(
+            &cwd,
+            ToolRequest::Grep {
+                path: None,
+                pattern: "al.*a".to_string(),
+                literal: Some(true),
+                ignore_case: None,
+                context: None,
+                limit: None,
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("literal grep");
+        assert_eq!(literal.output, "");
+
+        // Context lines surround the match.
+        let with_context = execute_tool(
+            &cwd,
+            ToolRequest::Grep {
+                path: None,
+                pattern: "BETA".to_string(),
+                literal: None,
+                ignore_case: None,
+                context: Some(1),
+                limit: None,
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("context grep");
+        assert!(with_context.output.contains("a.txt:2:BETA"));
+        assert!(with_context.output.contains("-1:alpha"));
+        assert!(with_context.output.contains("+3:gamma"));
+
+        // Match cap with notice.
+        fs::write(
+            cwd.join("many.txt"),
+            (0..500)
+                .map(|i| format!("needle-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write many");
+        let capped = execute_tool(
+            &cwd,
+            ToolRequest::Grep {
+                path: Some("many.txt".to_string()),
+                pattern: "needle-".to_string(),
+                literal: Some(true),
+                ignore_case: None,
+                context: None,
+                limit: None,
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("capped grep");
+        assert!(capped.output.contains("showing 200 of 500 matches"));
+        assert!(!capped.output.contains("needle-499"));
+
+        // limit lowers the cap.
+        let limited = execute_tool(
+            &cwd,
+            ToolRequest::Grep {
+                path: Some("many.txt".to_string()),
+                pattern: "needle-".to_string(),
+                literal: Some(true),
+                ignore_case: None,
+                context: None,
+                limit: Some(10),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("limited grep");
+        assert!(limited.output.contains("needle-9\n"));
+        assert!(limited.output.contains("showing 10 of 500 matches"));
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn find_output_is_capped_with_notice() {
+        let cwd = std::env::temp_dir().join(format!("pi-find-cap-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        for i in 0..250 {
+            fs::write(cwd.join(format!("file-{i:03}.txt")), "x").expect("write file");
+        }
+        let result = execute_tool(
+            &cwd,
+            ToolRequest::Find {
+                pattern: "file-".to_string(),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("find");
+        assert!(result.output.contains("showing 200 of 250 matches"));
+        // file names are returned in directory order; only assert that some
+        // files were omitted rather than any specific name.
+        assert_eq!(result.output.lines().count(), 201);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
     #[test]
     fn builtin_tools_cover_upstream_ts_names() {
         let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
@@ -456,6 +947,8 @@ mod tests {
             &cwd,
             ToolRequest::Read {
                 path: "a.txt".to_string(),
+                offset: None,
+                limit: None,
             },
             &ToolRuntimeOptions::default(),
         )
@@ -478,6 +971,10 @@ mod tests {
             ToolRequest::Grep {
                 path: Some("src".to_string()),
                 pattern: "alpha".to_string(),
+                literal: None,
+                ignore_case: None,
+                context: None,
+                limit: None,
             },
             &ToolRuntimeOptions::default(),
         )
@@ -545,6 +1042,10 @@ mod tests {
             ToolRequest::Grep {
                 path: Some(".".to_string()),
                 pattern: "alpha".to_string(),
+                literal: None,
+                ignore_case: None,
+                context: None,
+                limit: None,
             },
             &ToolRuntimeOptions::default(),
         )
@@ -611,6 +1112,8 @@ mod tests {
             &cwd,
             ToolRequest::Read {
                 path: "../outside.txt".to_string(),
+                offset: None,
+                limit: None,
             },
             &ToolRuntimeOptions::default(),
         )

@@ -4,10 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+rustls-tls = ["reqwest/rustls-tls"]
+
 [dependencies]
+reqwest.workspace = true
+regex = "1"
+serde_json.workspace = true
+scraper = { version = "0.24", default-features = false }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
