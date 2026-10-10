@@ -48,7 +48,7 @@ tmux send-keys -t "${session_name}" \
   Enter
 
 for _ in $(seq 1 80); do
-  if tmux capture-pane -t "${session_name}" -p -S -2000 | grep -q "pi>"; then
+  if tmux capture-pane -t "${session_name}" -p -S -2000 | grep -q "│ >"; then
     touch "${prompt_file}"
     break
   fi
@@ -63,7 +63,7 @@ fi
 
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/initial-pane.txt"
 grep -Fq "pi rust cli" "${work_dir}/initial-pane.txt"
-grep -Fq "pi>" "${work_dir}/initial-pane.txt"
+grep -Fq "│ >" "${work_dir}/initial-pane.txt"
 grep -Fq "faux/echo" "${work_dir}/initial-pane.txt"
 
 send_line() {

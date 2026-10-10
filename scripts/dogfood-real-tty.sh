@@ -90,7 +90,7 @@ JSON
     Enter
 
   for _ in $(seq 1 120); do
-    if tmux capture-pane -t "${session_name}" -p -S -2000 | grep -q "pi>"; then
+    if tmux capture-pane -t "${session_name}" -p -S -2000 | grep -q "│ >"; then
       touch "${prompt_file}"
       break
     fi

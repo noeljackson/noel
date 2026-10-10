@@ -22,6 +22,8 @@ cleanup() {
   tmux kill-session -t "pi-e2e-one-follow-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-disabled-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-stream-${$}" >/dev/null 2>&1 || true
+  tmux kill-session -t "pi-e2e-modern-${$}" >/dev/null 2>&1 || true
+  tmux kill-session -t "pi-e2e-input-${$}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -49,7 +51,7 @@ printf '{"output":"json-ext saw %s"}\n' "${input}"
 SH
 chmod +x "${agent_dir}/extensions/json-ext"
 printf '{"protocol":"json"}\n' > "${agent_dir}/extensions/json-ext.pi-extension.json"
-printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=' | base64 -d > "${work_dir}/pixel.png"
+printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=' | base64 -d > "${work_dir}/pixel.png"
 
 (cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config disable extension assist) > "${work_dir}/config-disable.txt"
 (cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config show) > "${work_dir}/config-disabled.txt"
@@ -60,11 +62,11 @@ grep -Fq "disabled extensions: -" "${work_dir}/config-enabled.txt"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${cwd_dir}' && env -u NO_COLOR PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && env -u NO_COLOR PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
-  if tmux capture-pane -t "${session_name}" -p -S -2000 | grep -q "pi>"; then
+  if tmux capture-pane -t "${session_name}" -p -S -2000 | grep -q "│ >"; then
     touch "${prompt_file}"
     break
   fi
@@ -83,7 +85,7 @@ if ! grep -Fq "pi rust cli" "${work_dir}/live-pane.txt"; then
   echo "TUI transcript did not appear" >&2
   exit 1
 fi
-if ! grep -Fq "pi>" "${work_dir}/live-pane.txt"; then
+if ! grep -Fq "│ >" "${work_dir}/live-pane.txt"; then
   cat "${work_dir}/live-pane.txt" >&2
   echo "TUI input prompt did not appear" >&2
   exit 1
@@ -97,6 +99,13 @@ send_line() {
 send_enter() {
   tmux send-keys -t "${session_name}" Enter
   sleep 0.35
+}
+
+# The idle footer shows the active model and no queue/activity suffix; while
+# a turn runs, the footer ends with "queue:" plus pending counts.
+last_line_is_idle_footer() {
+  tail -n 1 "$1" | grep -Eq '^[a-z0-9/._@-]+ .*(≡|↺|queue: 0)' \
+    && ! tail -n 1 "$1" | grep -Fq 'esc to interrupt'
 }
 
 # The main test process unsets NO_COLOR inherited from a shared tmux server.
@@ -160,17 +169,74 @@ sleep 0.1
 tmux send-keys -t "${session_name}" "shift enter four"
 sleep 0.2
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/expanded-input-pane.txt"
-for expected in "shift enter one" "shift enter two" "shift enter three" "shift enter four"; do
+for expected in "│ > shift enter one" "│   shift enter two" "│   shift enter three" "│   shift enter four"; do
   if ! grep -Fq "${expected}" "${work_dir}/expanded-input-pane.txt"; then
     cat "${work_dir}/expanded-input-pane.txt" >&2
     echo "expanded input did not show: ${expected}" >&2
     exit 1
   fi
 done
+if grep -Fq '"content":"shift enter one' "${session_dir}"/*.jsonl; then
+  echo "Shift+Enter submitted the draft before plain Enter" >&2
+  exit 1
+fi
 tmux send-keys -t "${session_name}" Enter
 sleep 0.35
+if ! grep -Fq '"content":"shift enter one\nshift enter two\nshift enter three\nshift enter four"' "${session_dir}"/*.jsonl; then
+  echo "plain Enter did not submit the complete Shift+Enter draft" >&2
+  exit 1
+fi
 send_line "/image ${work_dir}/pixel.png describe image"
+# Ctrl+V stages an image in the draft (not sent before Enter), and /undo
+# restores both prompt and attachment without changing workspace files.
+clipboard_session="$(ls -t "${session_dir}"/*.jsonl | head -n 1)"
+before_paste="$(wc -l < "${clipboard_session}")"
+tmux send-keys -t "${session_name}" C-v
+sleep 0.35
+tmux capture-pane -t "${session_name}" -p > "${work_dir}/clipboard-draft.txt"
+grep -Fq "1 image attached" "${work_dir}/clipboard-draft.txt"
+[ "$(wc -l < "${clipboard_session}")" = "${before_paste}" ]
+send_line "clipboard image question"
+send_line "/undo"
+tmux capture-pane -t "${session_name}" -p > "${work_dir}/undo-draft.txt"
+grep -Fq "clipboard image question" "${work_dir}/undo-draft.txt"
+grep -Fq "1 image attached" "${work_dir}/undo-draft.txt"
+grep -Fq '"type":"messages_snapshot"' "${clipboard_session}"
+send_enter
+send_line "/usage"
+grep -Fq '"content":"clipboard image question","media":[{"mime_type":"image/png"' "${clipboard_session}"
+# Empty image-only submission uses a default prompt; Ctrl+C clears attachments.
+tmux send-keys -t "${session_name}" C-v
+sleep 0.2
+send_enter
+tmux send-keys -t "${session_name}" C-v
+sleep 0.2
+tmux send-keys -t "${session_name}" C-c
+sleep 0.2
+tmux capture-pane -t "${session_name}" -p > "${work_dir}/clipboard-cleared.txt"
+if grep -Fq "1 image attached" "${work_dir}/clipboard-cleared.txt"; then
+  echo "Ctrl+C did not clear the image draft" >&2
+  exit 1
+fi
+send_line "/image ${work_dir}/pixel.png"
+for _ in $(seq 1 40); do
+  tmux capture-pane -t "${session_name}" -p > "${work_dir}/clipboard-staged-path.txt"
+  if grep -Fq "1 image attached" "${work_dir}/clipboard-staged-path.txt"; then break; fi
+  sleep 0.1
+done
+grep -Fq "1 image attached" "${work_dir}/clipboard-staged-path.txt"
+tmux send-keys -t "${session_name}" C-v
+for _ in $(seq 1 40); do
+  tmux capture-pane -t "${session_name}" -p > "${work_dir}/clipboard-multiple.txt"
+  if grep -Fq "2 images attached" "${work_dir}/clipboard-multiple.txt"; then break; fi
+  sleep 0.1
+done
+grep -Fq "2 images attached" "${work_dir}/clipboard-multiple.txt"
+send_line "multiple clipboard images"
 send_line "/write ${cwd_dir}/file.txt e2e-ok"
+send_line "/undo"
+grep -Fxq "e2e-ok" "${cwd_dir}/file.txt"
+send_enter
 send_line "/read ${cwd_dir}/file.txt"
 send_line "/todos"
 send_line "/diff"
@@ -196,7 +262,7 @@ send_line "!!"
 tmux send-keys -t "${session_name}" "! sleep 1; printf delayed-shell-ok" Enter
 sleep 0.25
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/progress-pane.txt"
-if ! grep -Fq "Running bash" "${work_dir}/progress-pane.txt"; then
+if ! grep -Fq "Running a command" "${work_dir}/progress-pane.txt"; then
   cat "${work_dir}/progress-pane.txt" >&2
   echo "shell progress was not visible while command was running" >&2
   exit 1
@@ -276,6 +342,15 @@ require_output() {
   fi
 }
 
+require_output_regex() {
+  local pattern="$1"
+  if ! grep -Eq "${pattern}" "${work_dir}/pane.txt"; then
+    cat "${work_dir}/pane.txt" >&2
+    echo "missing expected pane output matching: ${pattern}" >&2
+    exit 1
+  fi
+}
+
 require_output "pi rust cli"
 require_output "assistant>"
 require_output "user>"
@@ -302,7 +377,9 @@ require_output "queued: 1"
 require_output "[faux/echo] after reload"
 require_output "queued> queued followup"
 require_output "[faux/echo] queued followup"
-require_output "queue is empty"
+# Empty-queue text differs by path (mid-turn lists in-memory follow-ups,
+# idle lists the durable session queue); either proves the queue drained.
+require_output_regex '(queue is empty|no pending follow-ups)'
 require_output "queued cancel"
 require_output "interrupted; cleared 1 queued message(s)"
 require_output "shell-ok"
@@ -345,6 +422,8 @@ require_output "exported ${work_dir}/session-export.html"
 require_output "share exported ${work_dir}/session-share.html"
 require_output "parent:"
 require_output "Branched from"
+require_output "session usage: no provider token usage reported yet"
+require_output "Describe this image."
 require_output "compacted:"
 require_output "compaction Manual"
 require_output "enter multiline prompt"
@@ -470,9 +549,8 @@ tmux new-session -d -s "${one_follow_session}" -x 100 -y 20
 tmux send-keys -t "${one_follow_session}" \
   "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
-
 for _ in $(seq 1 80); do
-  if tmux capture-pane -t "${one_follow_session}" -p -S -2000 | grep -q "pi>"; then
+  if tmux capture-pane -t "${one_follow_session}" -p -S -2000 | grep -q "│ >"; then
     break
   fi
   sleep 0.25
@@ -494,17 +572,19 @@ tmux kill-session -t "${one_follow_session}" >/dev/null 2>&1 || true
 
 if ! grep -Fq "[faux/echo] first-one-at-a-time" "${work_dir}/one-follow-pane.txt"; then
   cat "${work_dir}/one-follow-pane.txt" >&2
-  echo "one-at-a-time follow-up did not process the first queued message" >&2
+  echo "queued follow-ups did not batch into one combined turn (first missing)" >&2
   exit 1
 fi
-if ! grep -Fq "second-one-at-a-time" "${work_dir}/one-follow-pane.txt"; then
+# The combined turn echoes the joined prompt; the separator line sits between
+# the two prompts in the echoed response, so match across lines.
+if ! grep -A 2 -F "[faux/echo] first-one-at-a-time" "${work_dir}/one-follow-pane.txt" | grep -Fq "second-one-at-a-time"; then
   cat "${work_dir}/one-follow-pane.txt" >&2
-  echo "one-at-a-time follow-up did not leave the second queued message visible" >&2
+  echo "queued follow-ups did not batch into one combined turn (second missing)" >&2
   exit 1
 fi
-if grep -Fq "[faux/echo] second-one-at-a-time" "${work_dir}/one-follow-pane.txt"; then
+if ! grep -Eq "(queue is empty|no pending follow-ups)" "${work_dir}/one-follow-pane.txt"; then
   cat "${work_dir}/one-follow-pane.txt" >&2
-  echo "one-at-a-time follow-up drained more than one queued message" >&2
+  echo "completed follow-ups remained queued" >&2
   exit 1
 fi
 
@@ -515,7 +595,7 @@ tmux send-keys -t "${disabled_session}" \
   Enter
 
 for _ in $(seq 1 80); do
-  if tmux capture-pane -t "${disabled_session}" -p -S -2000 | grep -q "pi>"; then
+  if tmux capture-pane -t "${disabled_session}" -p -S -2000 | grep -q "│ >"; then
     break
   fi
   sleep 0.25
@@ -545,11 +625,11 @@ stream_done="${work_dir}/stream-done"
 stream_prompt="$(printf 'stream%.0s' $(seq 1 120))"
 tmux new-session -d -s "${stream_session}" -x 100 -y 24
 tmux send-keys -t "${stream_session}" \
-  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_FAUX_STREAM_DELAY_MS=4 PI_FAUX_STREAM_CHARS=1 '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_FAUX_STREAM_DELAY_MS=4 PI_FAUX_STREAM_CHARS=1 PI_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
-  if tmux capture-pane -t "${stream_session}" -p -S -2000 | grep -q "pi>"; then
+  if tmux capture-pane -t "${stream_session}" -p -S -2000 | grep -q "│ >"; then
     touch "${stream_ready}"
     break
   fi
@@ -570,7 +650,7 @@ stream_draft_seen=""
 for _ in $(seq 1 40); do
   sleep 0.1
   tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-draft-pane.txt"
-  if grep -Fq "pi> draft while streaming" "${work_dir}/stream-draft-pane.txt"; then
+  if grep -Fq "│ > draft while streaming" "${work_dir}/stream-draft-pane.txt"; then
     stream_draft_seen=1
     break
   fi
@@ -581,10 +661,53 @@ if [ -z "${stream_draft_seen}" ]; then
   exit 1
 fi
 
+# Shift+Enter edits the live draft instead of enqueuing a follow-up.
+tmux send-keys -t "${stream_session}" Escape "[13;2u"
+tmux send-keys -t "${stream_session}" -l "shift enter streaming second"
+sleep 0.15
+tmux capture-pane -t "${stream_session}" -p > "${work_dir}/stream-newline-pane.txt"
+for expected in "│ > draft while streaming" "│   shift enter streaming second" "esc to interrupt"; do
+  if ! grep -Fq "${expected}" "${work_dir}/stream-newline-pane.txt"; then
+    cat "${work_dir}/stream-newline-pane.txt" >&2
+    echo "Shift+Enter during streaming did not show: ${expected}" >&2
+    exit 1
+  fi
+done
+if grep -Fq "❯ draft while streaming" "${work_dir}/stream-newline-pane.txt"; then
+  echo "Shift+Enter during streaming queued the draft" >&2
+  exit 1
+fi
+tmux send-keys -t "${stream_session}" Enter
+for _ in $(seq 1 40); do
+  tmux capture-pane -t "${stream_session}" -p > "${work_dir}/stream-queue-visible.txt"
+  if grep -Fq "❯ draft while streaming" "${work_dir}/stream-queue-visible.txt"; then break; fi
+  sleep 0.1
+done
+if ! grep -Fq "❯ draft while streaming" "${work_dir}/stream-queue-visible.txt" \
+  || ! grep -Fq "ctrl+s queues after this response" "${work_dir}/stream-queue-visible.txt" \
+  || ! grep -Fq "╭" "${work_dir}/stream-queue-visible.txt"; then
+  cat "${work_dir}/stream-queue-visible.txt" >&2
+  echo "queued draft pane did not render while streaming" >&2
+  exit 1
+fi
+tmux send-keys -t "${stream_session}" Up
+for _ in $(seq 1 40); do
+  tmux capture-pane -t "${stream_session}" -p > "${work_dir}/stream-queue-recall.txt"
+  if grep -Fq "│ > draft while streaming" "${work_dir}/stream-queue-recall.txt"; then break; fi
+  sleep 0.1
+done
+if ! grep -Fq "│ > draft while streaming" "${work_dir}/stream-queue-recall.txt" \
+  || ! grep -Fq "│   shift enter streaming second" "${work_dir}/stream-queue-recall.txt"; then
+  cat "${work_dir}/stream-queue-recall.txt" >&2
+  echo "Up did not recall newest queued draft while streaming" >&2
+  exit 1
+fi
 tmux send-keys -t "${stream_session}" Enter
 for _ in $(seq 1 120); do
-  tmux capture-pane -t "${stream_session}" -p -S -2000 > "${work_dir}/stream-queued-pane.txt"
-  if grep -Fq "[faux/echo] draft while streaming" "${work_dir}/stream-queued-pane.txt"; then
+  tmux capture-pane -t "${stream_session}" -p > "${work_dir}/stream-queued-pane.txt"
+  if grep -Fq "[faux/echo] draft while streaming" "${work_dir}/stream-queued-pane.txt" \
+    && grep -Fq "shift enter streaming second" "${work_dir}/stream-queued-pane.txt" \
+    && ! grep -Fq "esc to interrupt" "${work_dir}/stream-queued-pane.txt"; then
     touch "${stream_done}"
     break
   fi
@@ -671,6 +794,36 @@ for _ in $(seq 1 60); do
     break
   fi
 done
+# Image drafts typed mid-turn stay attached until the active response ends.
+tmux send-keys -t "${stream_session}" -l "${stream_prompt}"
+tmux send-keys -t "${stream_session}" Enter
+sleep 0.1
+tmux send-keys -t "${stream_session}" C-v
+sleep 0.1
+tmux send-keys -t "${stream_session}" -l "clipboard followup image"
+tmux send-keys -t "${stream_session}" Enter
+for _ in $(seq 1 200); do
+  tmux capture-pane -t "${stream_session}" -p > "${work_dir}/stream-image-draft.txt"
+  # Require the idle footer (model name, no activity hint): a redraw window
+  # at turn end can briefly drop "esc to interrupt" while the input handler
+  # still treats the turn as running, which would swallow the submit Enter.
+  if grep -Fq "1 image attached" "${work_dir}/stream-image-draft.txt" \
+    && last_line_is_idle_footer "${work_dir}/stream-image-draft.txt"; then break; fi
+  sleep 0.1
+done
+grep -Fq "1 image attached" "${work_dir}/stream-image-draft.txt"
+grep -Fq "clipboard followup image" "${work_dir}/stream-image-draft.txt"
+tmux send-keys -t "${stream_session}" Enter
+stream_image_sent=""
+for _ in $(seq 1 80); do
+  if grep -Fq '"content":"clipboard followup image","media":[{"mime_type":"image/png"' "${session_dir}"/*.jsonl; then stream_image_sent=1; break; fi
+  sleep 0.1
+done
+if [ -z "${stream_image_sent}" ]; then
+  tmux capture-pane -t "${stream_session}" -p >&2
+  echo "image follow-up was not persisted after submission" >&2
+  exit 1
+fi
 tmux send-keys -t "${stream_session}" "/quit" Enter
 sleep 0.5
 tmux kill-session -t "${stream_session}" >/dev/null 2>&1 || true
@@ -700,7 +853,7 @@ tmux send-keys -t "${clear_session}" \
   Enter
 
 for _ in $(seq 1 80); do
-  if tmux capture-pane -t "${clear_session}" -p -S -2000 | grep -q "pi>"; then
+  if tmux capture-pane -t "${clear_session}" -p -S -2000 | grep -q "│ >"; then
     break
   fi
   sleep 0.25
@@ -734,10 +887,193 @@ if printf '%s\n' "${clear_output}" | grep -Fq "clear-screen-marker"; then
   echo "/clear did not remove prior pane output" >&2
   exit 1
 fi
-if ! printf '%s\n' "${clear_output}" | grep -Fq "pi>"; then
+if ! printf '%s\n' "${clear_output}" | grep -Fq "│ >"; then
   cat "${work_dir}/clear-pane.txt" >&2
   echo "/clear did not redraw the input prompt" >&2
   exit 1
 fi
+
+# Exercise wrapping, paste placeholders, deletion, and exact full-text
+# submission in a separate local-provider session without transcript dumps.
+input_session="pi-e2e-input-${$}"
+input_log="${session_dir}/growing-input.jsonl"
+tmux new-session -d -s "${input_session}" -x 40 -y 20
+tmux send-keys -t "${input_session}" \
+  "cd '${cwd_dir}' && PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-id growing-input --session-dir '${session_dir}' --model faux/echo --offline" Enter
+for _ in $(seq 1 80); do
+  if tmux capture-pane -t "${input_session}" -p | grep -Fq "│ >"; then break; fi
+  sleep 0.25
+done
+input_capture() { tmux capture-pane -t "${input_session}" -p > "${work_dir}/input-pane.txt"; }
+input_require() {
+  if ! grep -Fq "$1" "${work_dir}/input-pane.txt"; then
+    cat "${work_dir}/input-pane.txt" >&2
+    echo "missing growing input marker: $1" >&2
+    exit 1
+  fi
+}
+# Seed real history so Up/Down below exercises folded-draft restoration.
+tmux send-keys -t "${input_session}" "input history seed" Enter
+for _ in $(seq 1 80); do
+  if tmux capture-pane -t "${input_session}" -p | grep -Fq "[faux/echo] input history seed"; then break; fi
+  sleep 0.1
+done
+tmux send-keys -t "${input_session}" -l "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"
+sleep 0.2
+input_capture
+input_require "│ > abcdefghijklmnopqrstuvwxyz01234567"
+input_require "│   89ABCDEFGHIJ"
+if [ "$(tmux display-message -p -t "${input_session}" '#{cursor_x},#{cursor_y}')" != "16,17" ]; then
+  cat "${work_dir}/input-pane.txt" >&2
+  echo "wrapped input cursor did not follow the second row" >&2
+  exit 1
+fi
+tmux resize-window -t "${input_session}" -x 80 -y 20
+sleep 0.2
+input_capture
+input_require "│ > abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"
+if [ "$(tmux display-message -p -t "${input_session}" '#{cursor_x},#{cursor_y}')" != "50,17" ]; then
+  echo "resized input did not shrink to one row" >&2
+  exit 1
+fi
+tmux send-keys -t "${input_session}" C-c
+sleep 0.1
+# tmux -p wraps the buffer in the bracketed-paste protocol; -r preserves LF.
+awk 'BEGIN { for (i = 1; i <= 500; i++) printf "paste-line-%03d\n", i }' > "${work_dir}/input-paste.txt"
+input_paste() {
+  tmux load-buffer -b "${input_session}" "$1"
+  tmux paste-buffer -r -p -d -b "${input_session}" -t "${input_session}"
+  sleep 0.2
+}
+tmux send-keys -t "${input_session}" -l "prefix "
+input_paste "${work_dir}/input-paste.txt"
+tmux send-keys -t "${input_session}" -l " suffix"
+sleep 0.2
+input_capture
+input_require "│ > prefix [paste #1 +500 lines] suffix"
+if grep -Fq "paste-line-" "${work_dir}/input-pane.txt"; then
+  echo "collapsed paste leaked full contents into the editor" >&2
+  exit 1
+fi
+# The folded draft and cursor survive a round-trip through prompt history.
+tmux send-keys -t "${input_session}" Up Down
+sleep 0.2
+input_capture
+input_require "[paste #1 +500 lines] suffix"
+tmux send-keys -t "${input_session}" Enter
+# Check the exact persisted content, not only the first/last pasted lines.
+expected_paste="$(awk 'BEGIN { printf "prefix "; for (i = 1; i <= 500; i++) printf "paste-line-%03d\\n", i; printf " suffix" }')"
+submitted=""
+for _ in $(seq 1 100); do
+  if grep -Fq "\"content\":\"[faux/echo] ${expected_paste}\"" "${input_log}"; then submitted=1; break; fi
+  sleep 0.1
+done
+if [ -z "${submitted}" ]; then
+  input_capture
+  cat "${work_dir}/input-pane.txt" >&2
+  echo "full pasted prompt was not submitted to faux provider" >&2
+  exit 1
+fi
+grep -Fq "\"content\":\"${expected_paste}\"" "${input_log}"
+grep -Fq "\"content\":\"[faux/echo] ${expected_paste}\"" "${input_log}"
+if grep -Fq "[paste" "${input_log}"; then
+  echo "paste placeholder was stored instead of full text" >&2
+  exit 1
+fi
+# Delete a folded paste in one keypress, then paste again with a fresh ID.
+tmux send-keys -t "${input_session}" -l "keep "
+input_paste "${work_dir}/input-paste.txt"
+tmux send-keys -t "${input_session}" BSpace
+sleep 0.2
+input_capture
+input_require "│ > keep"
+if grep -Fq "[paste" "${work_dir}/input-pane.txt"; then
+  echo "Backspace did not remove the entire folded paste" >&2
+  exit 1
+fi
+input_paste "${work_dir}/input-paste.txt"
+input_capture
+input_require "[paste #3 +500 lines]"
+tmux send-keys -t "${input_session}" C-c
+sleep 0.1
+printf 'second\npaste' > "${work_dir}/input-paste-small.txt"
+input_paste "${work_dir}/input-paste-small.txt"
+input_capture
+input_require "[paste #4 +2 lines]"
+tmux send-keys -t "${input_session}" C-c
+sleep 0.1
+tmux send-keys -t "${input_session}" "/quit" Enter
+sleep 0.3
+tmux kill-session -t "${input_session}" >/dev/null 2>&1 || true
+
+# Resume a local fixture to exercise thinking/tool previews, task selection,
+# key toggles, and idle queue recall without real-provider requests.
+modern_session="pi-e2e-modern-${$}"
+modern_log="${session_dir}/modern-harness.jsonl"
+cat > "${modern_log}" <<'JSONL'
+{"type":"started","session_id":"modern-harness","cwd":"."}
+{"type":"message","message":{"role":"user","content":"modern harness fixture","tool_calls":[],"media":[]}}
+{"type":"message","message":{"role":"assistant","content":"fixture answer","thinking":"reason-first\nreason-second\nreason-third\nreason-fourth\nreason-fifth\nreason-last","tool_calls":[{"id":"read-fixture","name":"read","arguments":"{\"path\":\"fixture.rs\"}"}],"media":[]}}
+{"type":"message","message":{"role":"tool","content":"output-first\noutput-second\noutput-third\noutput-fourth\noutput-fifth\noutput-sixth\noutput-seventh\noutput-last","tool_call_id":"read-fixture","tool_name":"read","tool_calls":[],"media":[]}}
+{"type":"message","message":{"role":"assistant","content":"fixture completed","tool_calls":[],"media":[]}}
+{"type":"tool","event":{"id":"read-fixture","name":"read","result":"fixture contents","is_error":false}}
+{"type":"todos","todos":[{"content":"done-oldest","status":"completed"},{"content":"done-older","status":"completed"},{"content":"done-old","status":"completed"},{"content":"done-recent","status":"completed"},{"content":"active-task","status":"in_progress"},{"content":"pending-one","status":"pending"},{"content":"pending-two","status":"pending"},{"content":"pending-three","status":"pending"}]}
+{"type":"queued_message","message":"recall queued fixture"}
+JSONL
+tmux new-session -d -s "${modern_session}" -x 100 -y 40
+tmux send-keys -t "${modern_session}" \
+  "cd '${cwd_dir}' && env -u NO_COLOR PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session '${modern_log}' --session-dir '${session_dir}' --model faux/echo --offline" Enter
+for _ in $(seq 1 80); do
+  if tmux capture-pane -t "${modern_session}" -p | grep -Fq "│ >"; then break; fi
+  sleep 0.25
+done
+modern_capture() { tmux capture-pane -t "${modern_session}" -p > "${work_dir}/modern-pane.txt"; }
+modern_require() {
+  if ! grep -Fq "$1" "${work_dir}/modern-pane.txt"; then
+    cat "${work_dir}/modern-pane.txt" >&2
+    echo "missing modern harness marker: $1" >&2
+    exit 1
+  fi
+}
+modern_capture
+for marker in "  Todo" "╭" "│ >" "╰" "↑ to edit · runs after next turn" "reason-first" "4 more lines, ctrl+o to expand" "Used Read" "fixture.rs" "… output-last" "7 more lines" "done-recent" "active-task" "+3 more (3 done)" "❯ recall queued fixture"; do modern_require "${marker}"; done
+if grep -Eq 'reason-last|output-first|output-seventh|done-oldest' "${work_dir}/modern-pane.txt"; then
+  cat "${work_dir}/modern-pane.txt" >&2
+  echo "collapsed previews/tasks leaked hidden rows" >&2
+  exit 1
+fi
+tmux send-keys -t "${modern_session}" C-o C-t
+sleep 0.3
+modern_capture
+for marker in "reason-last" "output-first" "output-last" "done-oldest" "ctrl+t to collapse"; do modern_require "${marker}"; done
+# Resize with both task and queue panels visible. The hint describes rows
+# actually hidden by the shorter viewport, not only the collapsed limit.
+tmux send-keys -t "${modern_session}" C-o C-t
+tmux resize-window -t "${modern_session}" -x 72 -y 18
+sleep 0.3
+modern_capture
+for marker in "Todo" "+6 more (3 pending, 3 done)" "active-task" "❯ recall queued fixture" "│ >" "╭" "╰"; do modern_require "${marker}"; done
+tmux resize-window -t "${modern_session}" -x 100 -y 40
+sleep 0.3
+tmux send-keys -t "${modern_session}" Up
+sleep 0.3
+modern_capture
+modern_require "│ > recall queued fixture"
+if grep -Fq "❯ recall queued fixture" "${work_dir}/modern-pane.txt"; then
+  echo "recalled queue message was not removed from pane" >&2
+  exit 1
+fi
+grep -Fq '"type":"queued_messages_snapshot","messages":[]' "${modern_log}"
+tmux send-keys -t "${modern_session}" C-c
+sleep 0.15
+tmux send-keys -t "${modern_session}" "/quit" Enter
+sleep 0.3
+
+"${repo_root}/scripts/e2e-scrollback.sh"
+"${repo_root}/scripts/e2e-transcript.sh"
+"${repo_root}/scripts/e2e-selection.sh"
+"${repo_root}/scripts/e2e-tool-output.sh"
+"${repo_root}/scripts/e2e-queue.sh"
+"${repo_root}/scripts/e2e-models.sh"
 
 echo "tmux e2e passed: ${first_session}"

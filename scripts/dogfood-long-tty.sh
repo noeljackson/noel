@@ -41,11 +41,11 @@ JSON
 
 tmux new-session -d -s "${session_name}" -x 92 -y 24
 tmux send-keys -t "${session_name}" \
-  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${pi_bin}' --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${pi_bin}' --session-dir '${session_dir}' --model faux/echo --no-alt-screen" \
   Enter
 
 for _ in $(seq 1 80); do
-  if tmux capture-pane -t "${session_name}" -p -S -2000 | grep -q "pi>"; then
+  if tmux capture-pane -t "${session_name}" -p -S -2000 | grep -q "│ >"; then
     touch "${prompt_file}"
     break
   fi
@@ -61,7 +61,7 @@ fi
 send_line() {
   tmux send-keys -t "${session_name}" -l "$1"
   tmux send-keys -t "${session_name}" Enter
-  sleep "${2:-0.18}"
+  sleep "${2:-${PI_DOGFOOD_LINE_DELAY:-0.18}}"
 }
 
 capture() {
@@ -90,7 +90,7 @@ tmux send-keys -t "${session_name}" Escape
 sleep 0.3
 
 capture "${work_dir}/tail-pane.txt"
-grep -Fq "pi>" "${work_dir}/tail-pane.txt"
+grep -Fq "│ >" "${work_dir}/tail-pane.txt"
 grep -Fq "paint-tool-output" "${work_dir}/tail-pane.txt"
 if grep -Fq "paint-line-01" "${work_dir}/tail-pane.txt"; then
   cat "${work_dir}/tail-pane.txt" >&2
@@ -101,12 +101,12 @@ fi
 capture_scrollback "${work_dir}/scrollback-pane.txt"
 grep -Fq "paint-line-01" "${work_dir}/scrollback-pane.txt"
 grep -Fq "pi rust cli" "${work_dir}/scrollback-pane.txt"
-grep -Fq "pi>" "${work_dir}/scrollback-pane.txt"
+grep -Fq "│ >" "${work_dir}/scrollback-pane.txt"
 
 tmux resize-window -t "${session_name}" -x 72 -y 18
 sleep 0.4
 capture "${work_dir}/small-pane.txt"
-grep -Fq "pi>" "${work_dir}/small-pane.txt"
+grep -Fq "│ >" "${work_dir}/small-pane.txt"
 grep -Fq "faux/echo" "${work_dir}/small-pane.txt"
 
 tmux resize-window -t "${session_name}" -x 132 -y 38
