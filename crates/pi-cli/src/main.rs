@@ -6046,7 +6046,8 @@ fn activity_status(started: Instant, activity: &Activity, pending_followups: usi
 
 fn apply_turn_event(
     app: &mut TuiApp,
-    entry_index: usize,
+    live_text_index: &mut usize,
+    text_after_tool: &mut bool,
     thinking_index: usize,
     saw_delta: &mut bool,
     activity: &mut Activity,
@@ -6056,7 +6057,17 @@ fn apply_turn_event(
         TurnEvent::Provider(StreamEvent::Text(text)) => {
             *activity = Activity::Writing;
             app.live_thinking_index = None;
-            apply_stream_delta(app, entry_index, saw_delta, text);
+            // Text that follows a tool round starts a new assistant entry at
+            // the bottom of the transcript instead of growing the first one
+            // above the tool calls, so the newest text stays in view while
+            // earlier rounds scroll up past it.
+            if *text_after_tool {
+                let index = app.push_placeholder(TuiEntryKind::Assistant, "");
+                *live_text_index = index;
+                *text_after_tool = false;
+                *saw_delta = true;
+            }
+            apply_stream_delta(app, *live_text_index, saw_delta, text);
         }
         TurnEvent::Provider(StreamEvent::Thinking(text)) => {
             *activity = Activity::Thinking;
@@ -6067,6 +6078,9 @@ fn apply_turn_event(
             *activity = Activity::Tool(name.clone());
             app.live_thinking_index = None;
             app.turn_saw_tools = true;
+            // Close the current text entry: the next delta opens a fresh one
+            // below this tool call.
+            *text_after_tool = true;
             app.live_tool_indices.push(app.entries.len());
             app.push(TuiEntryKind::Tool, format!("running {name}\n\n"));
         }
@@ -7539,6 +7553,10 @@ async fn run_turn_tui(
     }
 
     let mut saw_delta = false;
+    // Index of the entry currently receiving text deltas; advances as tool
+    // rounds split the response into interleaved assistant entries.
+    let mut live_text_index = entry_index;
+    let mut text_after_tool = false;
     let followups = FollowUpQueue::default();
     for message in runtime.session().queued_messages.clone() {
         followups.push(message);
@@ -7579,7 +7597,7 @@ async fn run_turn_tui(
             tokio::select! {
                 result = &mut turn => {
                     while let Ok(event) = delta_rx.try_recv() {
-                        apply_turn_event(app, entry_index, thinking_index, &mut saw_delta, &mut activity, &event);
+                        apply_turn_event(app, &mut live_text_index, &mut text_after_tool, thinking_index, &mut saw_delta, &mut activity, &event);
                     }
                     // Consume input already pending at completion while it
                     // still belongs to this turn (Enter queues, Ctrl+S steers).
@@ -7596,7 +7614,7 @@ async fn run_turn_tui(
                 }
                 _ = tick.tick() => {
                     while let Ok(event) = delta_rx.try_recv() {
-                        apply_turn_event(app, entry_index, thinking_index, &mut saw_delta, &mut activity, &event);
+                        apply_turn_event(app, &mut live_text_index, &mut text_after_tool, thinking_index, &mut saw_delta, &mut activity, &event);
                     }
                     let (_, control) =
                         drain_streaming_tui_events(surface, app, &followups, &steering, config).await?;
@@ -7620,9 +7638,7 @@ async fn run_turn_tui(
     };
     app.turn_running = false;
     app.live_thinking_index = None;
-    for index in std::mem::take(&mut app.live_tool_indices).into_iter().rev() {
-        app.remove_entry(index);
-    }
+    settle_tool_entries(app, runtime, tool_start, entry_index);
     app.status = footer_status(config, runtime, &app.editor_state);
     // Steering input that arrived after the last injection point becomes a
     // regular follow-up rather than being dropped, ahead of newer follow-ups.
@@ -7676,7 +7692,7 @@ async fn run_turn_tui(
     };
 
     if !saw_delta {
-        app.replace_entry(entry_index, response);
+        app.replace_entry(live_text_index, response);
     }
     insert_new_tool_messages(app, runtime, tool_start, entry_index);
     app.finish_live_entry();
@@ -7684,13 +7700,39 @@ async fn run_turn_tui(
     Ok(TurnControl::Completed)
 }
 
-fn insert_new_tool_messages(
+/// Finalize live tool previews once the turn ends. Previews are already
+/// interleaved between the per-round assistant text entries, so each is
+/// replaced in place with its durable transcript text instead of being
+/// re-inserted above the response (which would bury the newest text under
+/// the tool history). Previews without a durable record (a tool dropped by
+/// an interrupt) are removed; durable records without a preview fall back
+/// to insertion above the first text entry.
+fn settle_tool_entries(
     app: &mut TuiApp,
     runtime: &Runtime,
     tool_start: usize,
     assistant_entry_index: usize,
 ) {
-    let tool_messages = runtime
+    let durable = durable_tool_texts(runtime, tool_start);
+    let live = std::mem::take(&mut app.live_tool_indices);
+    let pairs = live.len().min(durable.len());
+    for (index, text) in live[..pairs].iter().zip(durable[..pairs].iter()) {
+        app.replace_entry(*index, text.clone());
+    }
+    for index in live[pairs..].iter().rev() {
+        app.remove_entry(*index);
+    }
+    for (offset, text) in durable[pairs..].iter().enumerate() {
+        app.insert_entry(
+            assistant_entry_index + offset,
+            TuiEntryKind::Tool,
+            text.clone(),
+        );
+    }
+}
+
+fn durable_tool_texts(runtime: &Runtime, tool_start: usize) -> Vec<String> {
+    runtime
         .session()
         .tool_history
         .iter()
@@ -7714,7 +7756,16 @@ fn insert_new_tool_messages(
                 )
             }
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn insert_new_tool_messages(
+    app: &mut TuiApp,
+    runtime: &Runtime,
+    tool_start: usize,
+    assistant_entry_index: usize,
+) {
+    let tool_messages = durable_tool_texts(runtime, tool_start);
     for (offset, text) in tool_messages.into_iter().enumerate() {
         app.insert_entry(assistant_entry_index + offset, TuiEntryKind::Tool, text);
     }
@@ -10981,9 +11032,12 @@ mod tests {
         let entry = app.push_placeholder(TuiEntryKind::Assistant, "Working...");
         let mut activity = Activity::Waiting;
         let mut saw_delta = false;
+        let mut live_text_index = entry;
+        let mut text_after_tool = false;
         apply_turn_event(
             &mut app,
-            entry,
+            &mut live_text_index,
+            &mut text_after_tool,
             thinking,
             &mut saw_delta,
             &mut activity,
@@ -10992,7 +11046,8 @@ mod tests {
         assert!(activity_status(Instant::now(), &activity, 0).contains("compacting"));
         apply_turn_event(
             &mut app,
-            entry,
+            &mut live_text_index,
+            &mut text_after_tool,
             thinking,
             &mut saw_delta,
             &mut activity,
@@ -11005,7 +11060,8 @@ mod tests {
         );
         apply_turn_event(
             &mut app,
-            entry,
+            &mut live_text_index,
+            &mut text_after_tool,
             thinking,
             &mut saw_delta,
             &mut activity,
@@ -12532,9 +12588,12 @@ mod tests {
                 is_error: false,
             },
         ] {
+            let mut live_text_index = assistant_index;
+            let mut text_after_tool = false;
             apply_turn_event(
                 &mut app,
-                assistant_index,
+                &mut live_text_index,
+                &mut text_after_tool,
                 thinking_index,
                 &mut saw_delta,
                 &mut activity,
@@ -12662,9 +12721,12 @@ mod tests {
         };
         let mut activity = Activity::Waiting;
         let mut saw_delta = false;
+        let mut live_text_index = index;
+        let mut text_after_tool = false;
         apply_turn_event(
             &mut app,
-            index,
+            &mut live_text_index,
+            &mut text_after_tool,
             thinking_index,
             &mut saw_delta,
             &mut activity,
@@ -12672,9 +12734,12 @@ mod tests {
                 name: call.name.clone(),
             },
         );
+        let mut live_text_index = index;
+        let mut text_after_tool = false;
         apply_turn_event(
             &mut app,
-            index,
+            &mut live_text_index,
+            &mut text_after_tool,
             thinking_index,
             &mut saw_delta,
             &mut activity,
@@ -12692,9 +12757,12 @@ mod tests {
             content: "verify source".into(),
             status: TodoStatus::InProgress,
         }];
+        let mut live_text_index = index;
+        let mut text_after_tool = false;
         apply_turn_event(
             &mut app,
-            index,
+            &mut live_text_index,
+            &mut text_after_tool,
             thinking_index,
             &mut saw_delta,
             &mut activity,
@@ -12755,6 +12823,113 @@ mod tests {
         assert_eq!(text.matches("queued message").count(), 4);
         assert!(text.contains("+3 more"));
         assert!(text.contains("ctrl+s"));
+    }
+
+    #[test]
+    fn text_after_tool_rounds_opens_new_interleaved_entries() {
+        // A tool round must split the streamed response: text before the
+        // tool stays in the first entry, text after it lands in a new entry
+        // below the tool preview, so the newest text is always at the
+        // bottom instead of growing above the tool calls.
+        let mut app = TuiApp::default();
+        let thinking = app.entries.len();
+        app.entries.push(TuiEntry {
+            kind: TuiEntryKind::Thinking,
+            text: String::new(),
+        });
+        let entry = app.push_placeholder(TuiEntryKind::Assistant, "Working...");
+        let mut saw_delta = false;
+        let mut live_text_index = entry;
+        let mut text_after_tool = false;
+        let mut send = |app: &mut TuiApp,
+                        live_text_index: &mut usize,
+                        text_after_tool: &mut bool,
+                        saw_delta: &mut bool,
+                        event: &TurnEvent| {
+            apply_turn_event(
+                app,
+                live_text_index,
+                text_after_tool,
+                thinking,
+                saw_delta,
+                &mut Activity::Waiting,
+                event,
+            );
+        };
+        send(
+            &mut app,
+            &mut live_text_index,
+            &mut text_after_tool,
+            &mut saw_delta,
+            &TurnEvent::Provider(StreamEvent::Text("before tool".into())),
+        );
+        send(
+            &mut app,
+            &mut live_text_index,
+            &mut text_after_tool,
+            &mut saw_delta,
+            &TurnEvent::ToolStarted { name: "read".into() },
+        );
+        send(
+            &mut app,
+            &mut live_text_index,
+            &mut text_after_tool,
+            &mut saw_delta,
+            &TurnEvent::ToolOutput {
+                call: pi_ai::ChatToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+                output: "file body".into(),
+                is_error: false,
+            },
+        );
+        send(
+            &mut app,
+            &mut live_text_index,
+            &mut text_after_tool,
+            &mut saw_delta,
+            &TurnEvent::Provider(StreamEvent::Text("after tool".into())),
+        );
+        send(
+            &mut app,
+            &mut live_text_index,
+            &mut text_after_tool,
+            &mut saw_delta,
+            &TurnEvent::ToolStarted { name: "bash".into() },
+        );
+        send(
+            &mut app,
+            &mut live_text_index,
+            &mut text_after_tool,
+            &mut saw_delta,
+            &TurnEvent::Provider(StreamEvent::Text("final".into())),
+        );
+        assert!(saw_delta);
+        let layout: Vec<(TuiEntryKind, &str)> = app
+            .entries
+            .iter()
+            .map(|entry| (entry.kind.clone(), entry.text.as_str()))
+            .collect();
+        assert_eq!(
+            layout,
+            vec![
+                (TuiEntryKind::Thinking, ""),
+                (TuiEntryKind::Assistant, "before tool"),
+                (
+                    TuiEntryKind::Tool,
+                    "completed read\na.txt\nfile body"
+                ),
+                (TuiEntryKind::Assistant, "after tool"),
+                (TuiEntryKind::Tool, "running bash\n\n"),
+                (TuiEntryKind::Assistant, "final"),
+            ],
+            "tool rounds must interleave with per-round assistant entries"
+        );
+        // The live pointer tracks the newest text entry, not the original.
+        assert_eq!(live_text_index, app.entries.len() - 1);
+        assert_eq!(app.live_entry_index, Some(app.entries.len() - 1));
     }
 
     #[test]
