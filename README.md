@@ -937,9 +937,11 @@ The parity harness captures sanitized fixtures from upstream TypeScript code
 under `tests/fixtures/ts-parity/`. Provider fixtures record request shape:
 URL, method, selected headers, request body, or payload. Contract fixtures cover
 CLI flags, slash commands, settings normalization, and session/export shape
-where Rust intentionally supports compatibility or analogous behavior. Secrets
-are redacted. Rust tests compare covered behavior against those fixtures, so
-upstream changes become visible as fixture diffs and test failures.
+where Rust intentionally supports compatibility or analogous behavior. The RPC
+protocol fixture records every stdout record of upstream `pi --mode rpc` for
+scripted runs against a local stub model. Secrets are redacted. Rust tests
+compare covered behavior against those fixtures, so upstream changes become
+visible as fixture diffs and test failures.
 
 Generate fixtures from the configured reference:
 

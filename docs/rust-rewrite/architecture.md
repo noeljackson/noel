@@ -405,7 +405,10 @@ present. `make ts-parity-agent` uses the same harness and pipes the brief to
 
 The parity fixtures are sanitized provider request captures. They cover request
 shape for URLs, selected headers, request bodies, and provider payloads. The
-Rust `pi-ai` tests compare local builders against those captures. When upstream
+Rust `pi-ai` tests compare local builders against those captures.
+`rpc-protocol.json` is a protocol transcript instead: upstream `pi --mode rpc`
+driven against a local stub model, with every stdout record in order and
+volatile values replaced by placeholders. When upstream
 changes, the drift harness produces both a raw diff and an agent-oriented brief
 that states the constraints: no host npm, TypeScript only in Docker, keep Rust
 changes scoped to parity behavior, and rerun Rust validation before committing.
