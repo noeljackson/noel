@@ -22,6 +22,10 @@ mkdir -p "${fresh_fixtures_dir}" "${fixtures_dir}"
   TS_REFERENCE_REPO="${reference_repo}" \
   TS_REFERENCE_REF="${tracking_ref}"
 
+"${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
+  git -C /ts-reference rev-parse HEAD > "${out_dir}/reference-sha"
+reference_sha="$(cat "${out_dir}/reference-sha")"
+
 "${docker_bin}" run --rm \
   -v "${repo_root}/${fresh_fixtures_dir}:/fixtures" \
   "${TS_PARITY_IMAGE:-pi-ts-parity}"
@@ -33,6 +37,7 @@ if ! diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}"; then
     printf '## Reference\n\n'
     printf -- '- Repository: `%s`\n' "${reference_repo}"
     printf -- '- Ref: `%s`\n' "${tracking_ref}"
+    printf -- '- Commit: `%s`\n' "${reference_sha}"
     printf -- '- Fixtures: `%s`\n' "${fixtures_dir}"
     printf -- '- Diff: `%s`\n\n' "${diff_file}"
     printf '## Constraints\n\n'
