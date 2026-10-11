@@ -297,7 +297,11 @@ pub fn ratatui_style(style: SpanStyle, accent: ratatui::style::Color) -> Style {
         SpanStyle::Link => Style::default()
             .fg(accent)
             .add_modifier(Modifier::UNDERLINED),
+        // Some terminals (kitty among them) don't visually combine SGR 1+3
+        // distinctly on all fonts; tinting with the accent keeps bold-italic
+        // recognizable even when the font renders both weights identically.
         SpanStyle::BoldItalic => Style::default()
+            .fg(accent)
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::ITALIC),
     }
