@@ -388,10 +388,19 @@ cache).
 
 For scripts, `pi auth check --provider <p>` (or `--model <ref>`) reports whether
 credentials are ready (exit 0 ready, 1 not ready, 2 invalid; `--json`,
-`--no-refresh`, `--account <name>`). `pi auth print-api-key` and
+`--no-refresh`, `--account <name>`). As upstream, an unknown subcommand or
+option exits 1, while other argument errors exit 2 for `check`. A ready OAuth
+token that expires within five minutes gets `"expiresSoon": true` with
+`--json`, or a warning on stderr in text output. `pi auth print-api-key` and
 `pi auth print-bearer-token` write a usable credential to stdout; the bearer
 form first refreshes OAuth tokens that expire within `--min-expiry` (default
-30m). pi has no MCP support, so `--no-mcp` is accepted and does
+30m). With `--account`, `--model` resolves to the providers that have that
+account. Logins read from `~/.claude` or `~/.codex` are the exception to early
+refresh: refreshing one spends that CLI's single-use refresh token and signs it
+out, so `pi auth` refreshes them only once they expire, as requests do, and
+prints or reports a token that expires sooner with a warning on stderr. pi's
+own accounts, including saved `claude-import`/`codex-import` copies, refresh
+early. pi has no MCP support, so `--no-mcp` is accepted and does
 nothing, and `pi mcp` exits with an error.
 
 Provider-specific environment:
@@ -606,8 +615,9 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/todos`
 - `/diff`
 - `/bug [description]` (writes a local `pi-bug-report-<id>.md` with environment,
-  model, auth type, redacted settings and session errors, never the transcript,
-  and prints a link for filing it; nothing is uploaded)
+  model, auth type, redacted settings and session errors (URL secrets, `Bearer`
+  and `Basic` credentials, and API-key-shaped tokens redacted), never the
+  transcript, and prints a link for filing it; nothing is uploaded)
 - `/reload`
 - `/web-search <query>`
 - `/web-fetch <url>`
@@ -669,7 +679,8 @@ Run `pi --no-alt-screen` (or upstream's `--tui-mode regular`) for native inline
 compatibility: overflow is written once to terminal scrollback, mouse
 selection/wheel remain terminal-owned, and the composer scrolls with the
 terminal. `--tui-mode fullscreen` selects the owned screen explicitly.
-`--use-theme <name>` applies a theme for one run without saving it.
+`--use-theme <name>` applies a theme for one run without saving it; it cannot
+be combined with `--theme` or `--no-themes`.
 Print/JSON/RPC modes are unchanged.
 Owned mode restores the previous screen, mouse reporting, paste, and raw mode
 on exit. This viewport is an intentional Rust UI divergence; upstream parity

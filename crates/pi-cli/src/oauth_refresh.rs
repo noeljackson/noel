@@ -14,7 +14,8 @@ pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 pub const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-const REFRESH_WINDOW_SECONDS: u64 = 60;
+/// The request path refreshes OAuth tokens this close to expiry.
+pub const REFRESH_WINDOW_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshedTokens {

@@ -181,7 +181,7 @@ struct Cli {
     theme: Option<String>,
 
     /// Select the initial interactive theme for this run without saving it.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["theme", "no_themes"])]
     use_theme: Option<String>,
 
     #[arg(long)]
@@ -1602,25 +1602,19 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
         config.settings.theme = None;
         config.settings.accent_color = None;
         config.themes.clear();
-    } else if let Some(theme) = &cli.theme {
+    } else if let Some(theme) = cli.theme.as_ref().or(cli.use_theme.as_ref()) {
+        // Either flag selects the theme for this run only (clap rejects both
+        // together); --use-theme takes one name, not upstream's light/dark pair.
+        if cli.use_theme.is_some() && theme.contains('/') {
+            return Err(anyhow!(
+                "--use-theme {theme}: light/dark theme pairs are not supported; pass one theme name"
+            ));
+        }
         let resolved = resolve_terminal_theme(config, theme)?;
         config.settings.theme = Some(resolved.name.clone());
         resolved
             .with_accent(config.settings.accent_color.as_deref())
             .map_err(|error| anyhow!(error))?;
-    }
-    if let Some(name) = &cli.use_theme {
-        if name.contains('/') {
-            return Err(anyhow!(
-                "--use-theme {name}: light/dark theme pairs are not supported; pass one theme name"
-            ));
-        }
-        let resolved = resolve_terminal_theme(config, name)?;
-        resolved
-            .clone()
-            .with_accent(config.settings.accent_color.as_deref())
-            .map_err(|error| anyhow!(error))?;
-        config.settings.theme = Some(resolved.name);
     }
     if let Some(thinking) = &cli.thinking {
         config.settings.default_thinking_level = Some(thinking.clone());
@@ -14162,6 +14156,36 @@ mod tests {
         assert!(parse(&["--tui-mode", "fullscreen", "--no-alt-screen"]).is_err());
         assert!(parse(&["--tui-mode", "split"]).is_err());
         assert!(parse(&["--no-mcp"]).expect("parse cli").no_mcp);
+    }
+
+    #[test]
+    fn use_theme_conflicts_with_other_theme_flags_and_applies_for_one_run() {
+        let parse = |args: &[&str]| Cli::try_parse_from([&["pi"][..], args].concat());
+        for args in [
+            &["--use-theme", "light", "--no-themes"][..],
+            &["--use-theme", "light", "--theme", "dark"],
+        ] {
+            let error = parse(args).expect_err("conflicting theme flags");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+        }
+
+        let mut config = minimal_test_config();
+        let no_themes = parse(&["--theme", "missing", "--no-themes"]).expect("parse cli");
+        apply_cli_overrides(&no_themes, Path::new("."), &mut config).expect("no themes");
+        assert_eq!(config.settings.theme, None);
+        let use_theme = parse(&["--use-theme", "light"]).expect("parse cli");
+        apply_cli_overrides(&use_theme, Path::new("."), &mut config).expect("use theme");
+        assert_eq!(config.settings.theme.as_deref(), Some("light"));
+        let pair = parse(&["--use-theme", "light/dark"]).expect("parse cli");
+        let error = apply_cli_overrides(&pair, Path::new("."), &mut config).expect_err("pair");
+        assert!(
+            error.to_string().contains("theme pairs are not supported"),
+            "{error}"
+        );
     }
 
     fn rust_cli_option_contract() -> BTreeSet<String> {
