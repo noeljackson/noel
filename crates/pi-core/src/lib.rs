@@ -193,6 +193,16 @@ pub struct SessionSummary {
     pub parent_session_id: Option<String>,
     pub branch_summary: Option<String>,
     pub modified: Option<SystemTime>,
+    /// Number of conversation messages (user/assistant/tool) in the journal,
+    /// shown in the resume picker like Kimi/Claude's message counts.
+    pub message_count: usize,
+    /// First user prompt (truncated) — the picker's one-line topic preview.
+    pub first_prompt: Option<String>,
+    /// Last active model, shown like Claude's model badge per row.
+    pub active_model: Option<String>,
+    /// A turn was mid-flight when the session ended: the picker marks it so
+    /// resuming offers the one-shot continuation.
+    pub has_unfinished_turn: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -862,6 +872,16 @@ impl SessionStore {
                 .rev()
                 .find(|summary| summary.to_session_id == state.session_id)
                 .map(|summary| summary.summary.clone());
+            let first_prompt = state
+                .messages
+                .iter()
+                .find(|message| message.role == MessageRole::User)
+                .map(|message| message.content.clone());
+            let active_model = state
+                .active_model
+                .as_ref()
+                .map(|model| format!("{}/{}", model.provider, model.id));
+            let has_unfinished_turn = state.has_unfinished_turn();
             summaries.push(SessionSummary {
                 path,
                 session_id: state.session_id,
@@ -871,6 +891,10 @@ impl SessionStore {
                 parent_session_id: state.parent_session_id,
                 branch_summary,
                 modified,
+                message_count: state.messages.len(),
+                first_prompt,
+                active_model,
+                has_unfinished_turn,
             });
         }
         summaries.sort_by_key(|summary| summary.modified.unwrap_or(UNIX_EPOCH));
