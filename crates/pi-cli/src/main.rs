@@ -3749,8 +3749,7 @@ impl TuiApp {
     fn cursor_to_line_start(&mut self) {
         self.input_cursor = self.input[..self.input_cursor]
             .match_indices('\n')
-            .filter(|(offset, _)| self.input_newline_is_visible(*offset))
-            .next_back()
+            .rfind(|(offset, _)| self.input_newline_is_visible(*offset))
             .map(|(index, _)| index + 1)
             .unwrap_or(0);
     }
