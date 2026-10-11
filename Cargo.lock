@@ -1768,6 +1768,7 @@ dependencies = [
 name = "pi-tools"
 version = "0.2.1"
 dependencies = [
+ "nix",
  "regex",
  "reqwest",
  "scraper",

@@ -16,4 +16,5 @@ serde_json.workspace = true
 scraper = { version = "0.24", default-features = false }
 serde.workspace = true
 thiserror.workspace = true
+nix.workspace = true
 tokio.workspace = true

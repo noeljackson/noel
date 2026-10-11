@@ -371,12 +371,18 @@ async fn bash_tool(
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Run the shell in its own process group so a timeout can kill the
+        // whole tree (shell + children), not just the shell pid. Killing only
+        // the shell orphaned children like a long preflight script, which
+        // kept running and consuming resources after the tool call failed.
+        .process_group(0)
         .kill_on_drop(true);
     let child = process.spawn().map_err(|source| ToolError::Io {
         path: cwd.to_path_buf(),
         source,
     })?;
 
+    let child_pid = child.id().unwrap_or_default();
     let wait = child.wait_with_output();
     let output = if let Some(timeout_ms) = timeout_ms {
         match tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await {
@@ -384,7 +390,16 @@ async fn bash_tool(
                 path: cwd.to_path_buf(),
                 source,
             })?,
-            Err(_) => return Err(ToolError::Timeout(timeout_ms)),
+            Err(_) => {
+                // wait_with_output() consumed the child; kill the process
+                // group the shell led (process_group(0) above) so children
+                // die with the shell instead of orphaning.
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(child_pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                return Err(ToolError::Timeout(timeout_ms));
+            }
         }
     } else {
         wait.await.map_err(|source| ToolError::Io {
@@ -651,6 +666,53 @@ mod tests {
         assert!(result.is_error);
         assert!(result.output.contains("failed-output"));
         assert!(result.output.contains("exit status"));
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_kills_the_whole_process_group() {
+        // A timed-out bash call must not orphan its children: the shell runs
+        // in its own process group and the timeout kills the group, so a
+        // long-running child script dies with the tool call.
+        let marker = std::env::temp_dir().join(format!(
+            "pi-bash-orphan-{}-{}",
+            std::process::id(),
+            new_marker_nonce()
+        ));
+        let marker_str = marker.to_string_lossy().to_string();
+        let command = format!("sh -c 'sleep 30; touch {marker_str}' & sleep 30");
+        let started = std::time::Instant::now();
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command,
+                timeout_ms: Some(750),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(ToolError::Timeout(750))));
+        // Give the group kill a moment to land, then verify no orphan lives on
+        // to create the marker file later.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let orphaned = tokio::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(format!("touch {marker_str}"))
+            .output()
+            .await
+            .expect("pgrep");
+        assert!(
+            !orphaned.status.success(),
+            "timed-out bash must kill its process group, not just the shell"
+        );
+        assert!(!marker.exists(), "orphaned child outlived the timeout");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    fn new_marker_nonce() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+        NONCE.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     #[tokio::test]
