@@ -820,29 +820,73 @@ fn openrouter_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// Output caps the TS reference sends for the parity-fixture models. Upstream
-/// `clampMaxTokensToContext` (`packages/ai/src/api/simple-options.ts`) sends
-/// `min(maxTokens, contextWindow - estimate - 4096)` from its model catalog,
-/// where the estimate is `ceil(chars / 3.5)` per message, system prompt and
-/// tool JSON (`packages/ai/src/utils/estimate.ts`); these are its results for
-/// the fixtures' requests.
+/// Upstream catalog limits `(maxTokens, contextWindow)` for the models whose
+/// requests carry an explicit output cap (TS `packages/ai/src/providers/data`).
+fn catalog_output_limits(provider: &str, id: &str) -> Option<(u64, u64)> {
+    match (provider, id) {
+        ("openai", "gpt-5.4") => Some((128_000, 272_000)),
+        ("github-copilot", "gpt-5.4") => Some((128_000, 1_000_000)),
+        ("google", "gemini-2.5-pro") => Some((65_536, 1_048_576)),
+        ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1") => Some((128_000, 1_000_000)),
+        ("mistral", "devstral-medium-latest") => Some((262_144, 262_144)),
+        ("openrouter", "moonshotai/kimi-k2.6") => Some((235_929, 262_144)),
+        ("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") => {
+            Some((256_000, 262_144))
+        }
+        _ => None,
+    }
+}
+
+/// Tokens upstream keeps free for the request beyond its estimate
+/// (`CONTEXT_SAFETY_TOKENS`).
+const CONTEXT_SAFETY_TOKENS: u64 = 4_096;
+
+/// Upstream `clampMaxTokensToContext` (`packages/ai/src/api/simple-options.ts`):
+/// the catalog `maxTokens`, lowered so the estimated input plus the answer fit
+/// the context window.
 fn provider_max_tokens(config: &ProviderConfig, request: &ProviderRequest) -> Option<u64> {
     if let Some(limit) = request.max_output_tokens {
         return Some(limit.max(1));
     }
-    match (config.model.provider.as_str(), config.model.id.as_str()) {
-        ("openai", "gpt-5.4") | ("github-copilot", "gpt-5.4") => Some(128_000),
-        ("google", "gemini-2.5-pro") => Some(65_536),
-        ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1") => Some(128_000),
-        ("mistral", "devstral-medium-latest") => Some(if request.tools.is_empty() {
-            258_042
-        } else {
-            257_994
-        }),
-        ("openrouter", "moonshotai/kimi-k2.6") => Some(235_929),
-        ("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") => Some(256_000),
-        _ => None,
+    let (max_tokens, context_window) =
+        catalog_output_limits(config.model.provider.as_str(), config.model.id.as_str())?;
+    let available = context_window
+        .saturating_sub(estimate_request_tokens(request))
+        .saturating_sub(CONTEXT_SAFETY_TOKENS)
+        .max(1);
+    Some(max_tokens.min(available))
+}
+
+/// Upstream `estimateContextTokens` (`packages/ai/src/utils/estimate.ts`)
+/// without its usage shortcut: `ceil(chars / 3.5)` per message, where the
+/// leading system message carries the prompt and the tool definitions' JSON
+/// and each image counts as 4800 characters.
+fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
+    const ESTIMATED_IMAGE_CHARS: usize = 4_800;
+    fn tokens(chars: usize) -> u64 {
+        (chars as u64 * 2).div_ceil(7)
     }
+    let mut total = 0;
+    if let Some(system_prompt) = &request.system_prompt {
+        total += tokens(system_prompt.chars().count());
+    }
+    if !request.tools.is_empty() {
+        let tools = serde_json::to_string(&request.tools).unwrap_or_default();
+        total += tokens(tools.chars().count());
+    }
+    for message in &request.messages {
+        let tool_call_chars: usize = message
+            .tool_calls
+            .iter()
+            .map(|call| call.name.chars().count() + call.arguments.chars().count())
+            .sum();
+        total += tokens(
+            message.content.chars().count()
+                + message.media.len() * ESTIMATED_IMAGE_CHARS
+                + tool_call_chars,
+        );
+    }
+    total
 }
 
 fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
@@ -2473,8 +2517,8 @@ fn node_arch(arch: &str) -> &str {
 }
 
 /// Node's `os.release()`: the kernel release `uname -r` reports, limited to
-/// header-safe characters.
-fn os_release() -> String {
+/// header-safe characters, or "unknown".
+pub fn os_release() -> String {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .ok()
         .or_else(|| {
@@ -3870,6 +3914,47 @@ mod tests {
             ..request
         };
         assert_eq!(provider_max_tokens(&config, &regular), Some(128_000));
+    }
+
+    #[test]
+    fn provider_max_tokens_leaves_room_for_the_input() {
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "cloudflare-ai-gateway".to_string(),
+                id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
+            },
+            api: ProviderApi::OpenAi,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        let request = |content: &str| ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: content.to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+        };
+        // Small input: the catalog cap.
+        assert_eq!(
+            provider_max_tokens(&config, &request("hello")),
+            Some(256_000)
+        );
+        // 300k characters estimate as 85_715 tokens; with the 4 for the system
+        // prompt and the 4096 safety margin, 172_329 remain for the answer.
+        let long = "x".repeat(300_000);
+        assert_eq!(provider_max_tokens(&config, &request(&long)), Some(172_329));
+        // An input past the window still asks for one token, as upstream does.
+        let huge = "x".repeat(1_000_000);
+        assert_eq!(provider_max_tokens(&config, &request(&huge)), Some(1));
     }
 
     #[test]
