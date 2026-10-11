@@ -20,6 +20,7 @@ pub enum SpanStyle {
     Code,
     Strike,
     Link,
+    BoldItalic,
 }
 
 /// One styled run over assistant markdown text.
@@ -28,8 +29,9 @@ pub struct StyledSpan {
     /// Byte range in the source entry text this span renders.
     pub source: Range<usize>,
     pub style: SpanStyle,
-    /// Displayed text. Equals the source slice for inline emphasis; block
-    /// transforms (heading markers, fences) may replace it.
+    /// Displayed text. For emphasis spans this is the *content* without
+    /// markers (`**bold**` displays `bold`); `source` still covers the full
+    /// marked range so selection copies the raw markdown.
     pub display: String,
 }
 
@@ -70,9 +72,22 @@ pub fn parse_inline_line(line: &str) -> Vec<StyledSpan> {
                 spans.push(StyledSpan {
                     source: index..close + 1,
                     style: SpanStyle::Code,
-                    display: line[index..close + 1].to_string(),
+                    display: line[index + 1..close].to_string(),
                 });
                 index = close + 1;
+                plain_start = index;
+                continue;
+            }
+        }
+        if rest.starts_with("***") {
+            if let Some(content_end) = find_triple_marker(line, index + 3, b'*') {
+                flush_plain(&mut spans, plain_start, index);
+                spans.push(StyledSpan {
+                    source: index..content_end + 3,
+                    style: SpanStyle::BoldItalic,
+                    display: line[index + 3..content_end].to_string(),
+                });
+                index = content_end + 3;
                 plain_start = index;
                 continue;
             }
@@ -83,7 +98,7 @@ pub fn parse_inline_line(line: &str) -> Vec<StyledSpan> {
                 spans.push(StyledSpan {
                     source: index..content_end + 2,
                     style: SpanStyle::Bold,
-                    display: line[index..content_end + 2].to_string(),
+                    display: line[index + 2..content_end].to_string(),
                 });
                 index = content_end + 2;
                 plain_start = index;
@@ -96,7 +111,7 @@ pub fn parse_inline_line(line: &str) -> Vec<StyledSpan> {
                 spans.push(StyledSpan {
                     source: index..content_end + 2,
                     style: SpanStyle::Strike,
-                    display: line[index..content_end + 2].to_string(),
+                    display: line[index + 2..content_end].to_string(),
                 });
                 index = content_end + 2;
                 plain_start = index;
@@ -129,7 +144,7 @@ pub fn parse_inline_line(line: &str) -> Vec<StyledSpan> {
                 spans.push(StyledSpan {
                     source: index..content_end + 1,
                     style: SpanStyle::Italic,
-                    display: line[index..content_end + 1].to_string(),
+                    display: line[index + 1..content_end].to_string(),
                 });
                 index = content_end + 1;
                 plain_start = index;
@@ -154,6 +169,26 @@ fn find_code_close(line: &str, open: usize) -> Option<usize> {
     while index < bytes.len() {
         if bytes[index] == b'`' {
             // Avoid `` ` `` empty or whitespace-adjacent closings.
+            if index > content_start && !bytes[index - 1].is_ascii_whitespace() {
+                return Some(index);
+            }
+            return None;
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Closing `***` for a triple-delimiter run opened at `open`.
+fn find_triple_marker(line: &str, search_start: usize, marker: u8) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let content_start = search_start;
+    if content_start >= bytes.len() || bytes[content_start].is_ascii_whitespace() {
+        return None;
+    }
+    let mut index = content_start;
+    while index + 2 < bytes.len() {
+        if bytes[index] == marker && bytes[index + 1] == marker && bytes[index + 2] == marker {
             if index > content_start && !bytes[index - 1].is_ascii_whitespace() {
                 return Some(index);
             }
@@ -262,6 +297,9 @@ pub fn ratatui_style(style: SpanStyle, accent: ratatui::style::Color) -> Style {
         SpanStyle::Link => Style::default()
             .fg(accent)
             .add_modifier(Modifier::UNDERLINED),
+        SpanStyle::BoldItalic => Style::default()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::ITALIC),
     }
 }
 
@@ -399,26 +437,27 @@ mod tests {
         assert_eq!(
             styles("**bold** rest"),
             vec![
-                (SpanStyle::Bold, "**bold**".into()),
+                (SpanStyle::Bold, "bold".into()),
                 (SpanStyle::Plain, " rest".into()),
             ]
+        );
+        assert_eq!(
+            styles("***both***"),
+            vec![(SpanStyle::BoldItalic, "both".into())]
         );
         assert_eq!(
             styles("a *it* b"),
             vec![
                 (SpanStyle::Plain, "a ".into()),
-                (SpanStyle::Italic, "*it*".into()),
+                (SpanStyle::Italic, "it".into()),
                 (SpanStyle::Plain, " b".into()),
             ]
         );
         assert_eq!(
             styles("`cargo build`"),
-            vec![(SpanStyle::Code, "`cargo build`".into())]
+            vec![(SpanStyle::Code, "cargo build".into())]
         );
-        assert_eq!(
-            styles("~~gone~~"),
-            vec![(SpanStyle::Strike, "~~gone~~".into())]
-        );
+        assert_eq!(styles("~~gone~~"), vec![(SpanStyle::Strike, "gone".into())]);
         assert_eq!(
             styles("[docs](https://example.org)"),
             vec![(SpanStyle::Link, "docs".into())]
@@ -447,10 +486,18 @@ mod tests {
         for pair in spans.windows(2) {
             assert_eq!(pair[0].source.end, pair[1].source.start);
         }
-        // Every display text equals its source slice (inline-only phase).
+        // Emphasis spans display content only; their source range still
+        // covers the raw markers so selection copies the original markdown.
         for span in &spans {
-            if span.style != SpanStyle::Link {
-                assert_eq!(span.display, &line[span.source.clone()]);
+            if matches!(
+                span.style,
+                SpanStyle::Bold
+                    | SpanStyle::Italic
+                    | SpanStyle::Code
+                    | SpanStyle::Strike
+                    | SpanStyle::BoldItalic
+            ) {
+                assert!(span.display.len() < span.source.len());
             }
         }
     }
