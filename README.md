@@ -127,10 +127,11 @@ Print mode:
 cargo run -p pi-cli -- -p --model faux/echo "hello"
 ```
 
-JSON-line RPC mode:
+RPC mode (see [RPC Mode](#rpc-mode)). `faux/echo` answers at once; with a real
+model, keep stdin open until `agent_settled`, since closing it stops the run:
 
 ```bash
-printf '{"jsonrpc":"2.0","id":1,"method":"prompt","params":{"prompt":"hello"}}\n' \
+printf '%s\n' '{"id":"1","type":"prompt","message":"hello"}' \
   | cargo run -p pi-cli -- --mode rpc --model faux/echo
 ```
 
@@ -729,7 +730,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `!!`
 - `/quit`
 
-`/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state. It keeps the session's project trust decision and command-line overrides (such as `--system-prompt`, `-e`, `--tools`, and `--api-key`), as do `/models refresh`, `/models reset`, and RPC `reload`.
+`/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state. It keeps the session's project trust decision and command-line overrides (such as `--system-prompt`, `-e`, `--tools`, and `--api-key`), as do `/models refresh` and `/models reset`. RPC mode has no reload: it keeps the config startup built.
 
 The editor uses a rounded box with a `>` prompt. A labeled Todo section and
 queued-message previews sit above it, separated by muted rules. Drafts wrap
@@ -887,15 +888,54 @@ requests count toward `/usage`. `/export` exports the current checkpoint and
 retained context, not the pre-compaction journal transcript.
 
 
-## RPC Methods
+## RPC Mode
 
-`--mode rpc` reads one JSON object per line from stdin and writes one JSON object per line to stdout.
+`pi --mode rpc` speaks upstream pi's RPC protocol (upstream's `docs/rpc.md`,
+`docs/rpc-commands.md` and `docs/json.md`): one JSON command per line on
+stdin, and responses and session events as one JSON object per line on stdout.
+Lines split on LF only: a trailing CR is dropped, and U+2028 or U+2029 inside a
+string is not a line break. stdout carries only protocol records; diagnostics
+go to stderr. RPC mode starts when stdin is not a terminal and takes no prompt
+arguments.
 
-- `prompt` with `{ "prompt": "..." }`
-- `compact` with optional `{ "focus": "..." }`
-- `reload`
-- `session`
-- `model` with `{ "model": "provider/id" }`
+Commands: `prompt` (with `images` and `streamingBehavior`), `steer`,
+`follow_up`, `abort`, `clear_queue`, `get_state`, `get_messages`,
+`get_last_assistant_text`, `new_session`, `switch_session`, `set_model`,
+`set_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, and
+`set_session_name`. Other upstream commands answer
+`Unsupported command: <type>`, and unknown types `Unknown command: <type>`.
+
+A `prompt` that starts a run answers `{"disposition":"started","runId":"…"}`,
+then the run reports `agent_start`, its turns (`turn_start` … `turn_end`),
+`agent_end`, and exactly one `agent_settled` with `aborted` and the `runId`,
+after an abort or a failure too; a failed request ends with an assistant
+message whose `stopReason` is `error`. Follow-ups queued during a run are
+delivered in it, after the turn that would otherwise end it. `abort` answers
+once the run has settled, or at once when no run is active, and leaves queued
+messages for the next prompt. While a run is active, a `prompt` needs
+`streamingBehavior` (`steer` or `followUp`); `set_model`,
+`set_thinking_level`, `compact`, `new_session`, `switch_session`, and
+`set_session_name` are refused; and `get_state`, `get_messages`, and
+`get_last_assistant_text` answer from the run's current state. `set_model`
+changes the session's model, not the default model in `settings.json`.
+
+pi adds two extensions, listed in `get_state.rpcExtensions`:
+
+- `run-id`: every run has a `runId` (a UUID), given in the `prompt` response,
+  `agent_start`, `agent_settled`, and `get_state` while the run is active.
+- `expected-run-id`: `steer`, `follow_up`, and `abort` take an optional
+  `expectedRunId`. Unless it names the active run, the command fails and
+  changes nothing.
+
+Closing stdin while no run is active exits with status 0. Closing it during a
+run stops the run where it is, kills its tool processes, and exits with status
+0 without `agent_settled`.
+
+Differences from upstream are listed under "RPC Mode" in
+`docs/rust-rewrite/non-parity-register.md`.
+`crates/pi-cli/tests/rpc_parity.rs` runs every scenario of
+`tests/fixtures/ts-parity/rpc-protocol.json` and compares the records with
+upstream's, allowing exactly those differences.
 
 ## Validation
 
@@ -940,7 +980,8 @@ URL, method, selected headers, request body, or payload. Contract fixtures cover
 CLI flags, slash commands, settings normalization, and session/export shape
 where Rust intentionally supports compatibility or analogous behavior. The RPC
 protocol fixture records every stdout record of upstream `pi --mode rpc` for
-scripted runs against a local stub model. Secrets are redacted. Rust tests
+scripted runs against a local stub model, and pi's RPC mode is compared with it
+record by record. Secrets are redacted. Rust tests
 compare covered behavior against those fixtures, so upstream changes become
 visible as fixture diffs and test failures.
 

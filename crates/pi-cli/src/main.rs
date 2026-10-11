@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead, Cursor, IsTerminal, Read, Write};
+use std::io::{self, Cursor, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -17,6 +17,8 @@ mod clipboard;
 mod markdown;
 mod oauth_login;
 mod oauth_refresh;
+mod rpc;
+mod rpc_wire;
 mod signals;
 mod transcript_view;
 mod usage;
@@ -1305,6 +1307,11 @@ async fn main() -> Result<()> {
     }
     let cli = Cli::parse_from(normalized_cli_args(std::env::args()));
     validate_session_id_flags(&cli)?;
+    if matches!(cli.mode, OutputMode::Rpc) && (cli.print || !cli.messages.is_empty()) {
+        return Err(anyhow!(
+            "--mode rpc reads its prompts from stdin and takes no prompt arguments"
+        ));
+    }
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd.clone(), cli.session_dir.clone())?;
     let project_trusted = if cli.approve {
@@ -1383,12 +1390,8 @@ async fn main() -> Result<()> {
     }
 
     let stdin_is_terminal = io::stdin().is_terminal();
-    if matches!(cli.mode, OutputMode::Rpc)
-        && !stdin_is_terminal
-        && !cli.print
-        && cli.messages.is_empty()
-    {
-        return run_rpc(runtime, config, offline).await;
+    if matches!(cli.mode, OutputMode::Rpc) && !stdin_is_terminal {
+        return rpc::run(runtime, config, offline).await;
     }
 
     let mut initial_prompt = expand_message_inputs(&cwd, &cli.messages)?;
@@ -1425,147 +1428,12 @@ async fn main() -> Result<()> {
     run_interactive(runtime, config, offline, cli.owned_screen()).await
 }
 
-async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) -> Result<()> {
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request = match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                println!(
-                    "{}",
-                    rpc_error(serde_json::Value::Null, -32700, &error.to_string())
-                );
-                continue;
-            }
-        };
-        let id = request
-            .get("id")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let Some(method) = request.get("method").and_then(serde_json::Value::as_str) else {
-            println!("{}", rpc_error(id, -32600, "missing method"));
-            continue;
-        };
-        let result = match method {
-            "prompt" => match rpc_prompt(&request) {
-                Ok(prompt) => match run_prompt(&mut runtime, &config, prompt, offline).await {
-                    Ok(message) => Ok(serde_json::json!({ "message": message })),
-                    Err(error) => Err((1, error.to_string())),
-                },
-                Err(error) => Err((-32602, error)),
-            },
-            "compact" => {
-                let focus = request
-                    .pointer("/params/focus")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                match provider_for_runtime(&runtime, &config, offline).await {
-                    Ok(provider) => runtime
-                        .compact_messages(provider.as_ref(), CompactionKind::Manual, focus)
-                        .await
-                        .map(|record| serde_json::json!(record))
-                        .map_err(|error| (1, error.to_string())),
-                    Err(error) => Err((1, error.to_string())),
-                }
-            }
-            "reload" => {
-                config = reload_config(&config)?;
-                start_model_refresh(&config, offline, false);
-                let next_generation = runtime.systems().config_generation + 1;
-                match runtime.reload(ReloadableSystems::from_config(&config, next_generation)) {
-                    Ok(report) => Ok(serde_json::json!({
-                        "activeModelValid": report.active_model_valid,
-                        "activeAccountValid": report.active_account_valid,
-                        "removedActiveTools": report.removed_active_tools,
-                    })),
-                    Err(error) => Err((1, error.to_string())),
-                }
-            }
-            "session" => Ok(serde_json::json!({
-                "id": runtime.session().session_id,
-                "cwd": runtime.session().cwd.display().to_string(),
-                "file": runtime.store().map(|store| store.path().display().to_string()),
-            })),
-            "model" => match rpc_model(&request) {
-                Ok(reference) => match resolve_model_reference(&config, &reference) {
-                    Some(model) => {
-                        runtime.set_active_model(Some(model.clone()))?;
-                        persist_default_model(&mut config, &model)?;
-                        Ok(serde_json::json!({
-                            "provider": model.provider,
-                            "id": model.id,
-                        }))
-                    }
-                    None => Err((1, format!("model not found: {reference}"))),
-                },
-                Err(error) => Err((-32602, error)),
-            },
-            _ => Err((-32601, format!("method not found: {method}"))),
-        };
-        match result {
-            Ok(result) => println!("{}", rpc_result(id, result)),
-            Err((code, message)) => println!("{}", rpc_error(id, code, &message)),
-        }
-    }
-    Ok(())
-}
-
-fn rpc_prompt(request: &serde_json::Value) -> std::result::Result<String, String> {
-    let params = request
-        .get("params")
-        .ok_or_else(|| "missing params".to_string())?;
-    if let Some(prompt) = params.as_str() {
-        return Ok(prompt.to_string());
-    }
-    params
-        .get("prompt")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| "missing prompt".to_string())
-}
-
-fn rpc_model(request: &serde_json::Value) -> std::result::Result<String, String> {
-    let params = request
-        .get("params")
-        .ok_or_else(|| "missing params".to_string())?;
-    if let Some(model) = params.as_str() {
-        return Ok(model.to_string());
-    }
-    params
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| "missing model".to_string())
-}
-
-fn rpc_result(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result,
-    })
-}
-
-fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    })
-}
-
 /// How startup built this process's config: the project trust decision and
-/// the command line. `/reload`, `/models refresh|reset`, and RPC `reload`
-/// rebuild the config the same way, so a reload neither trusts a project the
-/// session did not trust nor drops `--system-prompt`, `-e`, `--api-key`, and
-/// the other command-line overrides.
+/// the command line. `/reload` and `/models refresh|reset` rebuild the config
+/// the same way, so a reload neither trusts a project the session did not
+/// trust nor drops `--system-prompt`, `-e`, `--api-key`, and the other
+/// command-line overrides. RPC mode never reloads: it keeps the config
+/// startup built.
 #[derive(Debug, Clone)]
 struct ConfigSource {
     cli: Cli,
@@ -8823,15 +8691,6 @@ fn resolve_bang_command(line: &str, last_shell_command: &Option<String>) -> Opti
     Some(command.to_string())
 }
 
-async fn run_prompt(
-    runtime: &mut Runtime,
-    config: &LoadedConfig,
-    prompt: String,
-    offline: bool,
-) -> Result<String> {
-    run_prompt_media(runtime, config, prompt, Vec::new(), offline).await
-}
-
 async fn run_prompt_media(
     runtime: &mut Runtime,
     config: &LoadedConfig,
@@ -9105,10 +8964,8 @@ fn map_provider_api(api: &ConfigProviderApi) -> AiProviderApi {
 
 fn print_response(mode: &OutputMode, response: &str) {
     match mode {
-        OutputMode::Text => println!("{response}"),
-        OutputMode::Json | OutputMode::Rpc => {
-            println!("{}", serde_json::json!({ "message": response }))
-        }
+        OutputMode::Json => println!("{}", serde_json::json!({ "message": response })),
+        OutputMode::Text | OutputMode::Rpc => println!("{response}"),
     }
 }
 
@@ -10384,6 +10241,7 @@ fn remove_stored_auth(config: &mut LoadedConfig, provider: &str, account: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
 
     #[test]
     fn diff_panel_lists_files_under_cwd_relative_to_it() {

@@ -261,7 +261,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("openai-responses-tool-id.json", "crates/pi-ai/src/lib.rs"),
         ("openai-responses-tools.json", "crates/pi-ai/src/lib.rs"),
         ("openrouter-kimi.json", "crates/pi-ai/src/lib.rs"),
-        ("rpc-protocol.json", "crates/pi-parity/tests/ts_fixtures.rs"),
+        ("rpc-protocol.json", "crates/pi-cli/tests/rpc_parity.rs"),
         ("session-export.json", "crates/pi-core/src/lib.rs"),
         ("settings.json", "crates/pi-config/src/lib.rs"),
         ("slash-commands.json", "crates/pi-tui/src/lib.rs"),
@@ -303,7 +303,7 @@ fn parity_docs_track_every_fixture_and_non_parity_decisions() {
 }
 
 /// Light sanity check of the upstream RPC goldens. The record-by-record
-/// comparison with Rust RPC mode belongs with that implementation.
+/// comparison with pi's RPC mode is `crates/pi-cli/tests/rpc_parity.rs`.
 #[test]
 fn rpc_protocol_fixture_parses_and_every_run_settles() {
     let fixture = load_fixture("rpc-protocol.json");
