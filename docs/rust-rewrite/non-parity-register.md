@@ -367,3 +367,88 @@ refreshed tokens back to their files, so an early refresh from `pi auth` would
 sign the user out of Claude Code or Codex. After pi refreshes such a login it
 keeps its own `claude-import`/`codex-import` account, which refreshes early
 like any stored account.
+
+### RPC Mode
+
+`pi --mode rpc` speaks upstream's RPC protocol, with two additions listed in
+`get_state.rpcExtensions`: `run-id` (every run has a `runId`) and
+`expected-run-id` (`steer`, `follow_up`, and `abort` change nothing unless
+their `expectedRunId` names the active run). `crates/pi-cli/tests/rpc_parity.rs`
+compares every scenario of `rpc-protocol.json` with pi's records and allows
+exactly the differences in the first list; its `normalize` and `expected`
+functions name them, so the two lists change together.
+
+Differences in the golden records:
+
+- No system messages: upstream's transcript starts with a system message
+  (upstream #9548, which pi has not ported), reported by `message_start` and
+  `message_end` and kept in `agent_end` and `get_messages`. pi reports none.
+- `messageCount` counts the messages pi keeps: not upstream's system message,
+  and not an aborted reply (see below).
+- Queue modes: pi delivers everything queued at once (see Batched Queue and
+  Steering Dispatch). `steeringMode` and `followUpMode` are always `all`, and
+  setting `one-at-a-time` fails.
+- Model object: pi has no `input`, `cost`, or `maxTokens`, and `baseUrl` only
+  when one is configured. `reasoning` says whether pi offers thinking levels
+  for the model.
+- Assistant messages have no `responseId`. Usage holds the input and output
+  tokens providers report to pi; cache tokens and costs are zero, and there is
+  no `reasoning` count.
+- Tool results are text: no `structuredContent` or `details`.
+- `get_messages` returns what the session saves: no timestamps, and assistant
+  messages with their content and `stopReason` (`toolUse` or `stop`) but no
+  model, usage, raw stop reason, or timings.
+
+Other differences:
+
+- While a run is active, `set_model`, `set_thinking_level`, `compact`,
+  `new_session`, `switch_session`, and `set_session_name` are refused.
+- An aborted reply, and the `Operation aborted` result of a tool call the
+  abort interrupted, are reported but not saved, so `get_messages` and later
+  model requests leave them out. Upstream keeps the aborted reply in the
+  session but also leaves it out of model requests.
+- Closing stdin during a run stops it where it is, kills its tool processes,
+  and exits without `agent_end` or `agent_settled`; what the run saved stays
+  in the session. Upstream disposes the runtime first.
+- Retries happen inside the request, before the reply's first record:
+  `auto_retry_start` comes before the reply's `message_start`, and
+  `auto_retry_end` after its `message_end`. Upstream ends the turn with an
+  error reply and retries in a new low-level run.
+- Steering queued together arrives as one user message, its parts joined by
+  `---`, and so do follow-ups. Queued messages are text only: `steer`,
+  `follow_up`, and a queued `prompt` with images fail.
+- Tool calls arrive whole, so `toolcall_delta` carries all of the arguments
+  at once. A tool call that fails before its tool runs (unknown tool, invalid
+  arguments) still has a `durationMs`.
+- Stop reasons: a reply with tool calls is `toolUse`, a token limit `length`,
+  and anything else `stop`, with the provider's reason in `rawStopReason`.
+  A reply cut off at a token limit that has tool calls is `toolUse` too (its
+  calls get error results instead of running); upstream reports `length`.
+  Upstream treats content-filter and refusal reasons as errors.
+- During a run, `get_messages` and `messageCount` show an automatic
+  compaction only once the engine call that ran it returns.
+- `compact` runs to completion: commands sent meanwhile wait, and `abort` does
+  not cancel it. Its result is `{summary, details: {omittedMessages,
+  retainedMessages}}`, not upstream's entry ids and token estimates.
+- `set_thinking_level` refuses a level the model does not support; upstream
+  clamps it.
+- `new_session` refuses `parentSession`. With `--no-session` the session id
+  stays `ephemeral`.
+- A prompt that is a pi tool command (`/bash ls`, `/read path`) runs the tool
+  without the model; the run reports its user message and tool result, but no
+  turn.
+- Upstream commands pi does not implement answer `Unsupported command:
+  <type>`: `bash`, `abort_bash`, `abort_retry`, `set_auto_retry`,
+  `set_auto_compaction`, `cycle_model`, `get_available_models`,
+  `cycle_thinking_level`, `get_available_thinking_levels`,
+  `get_session_stats`, `export_html`, `fork`, `clone`, `get_fork_messages`,
+  `get_entries`, `get_tree`, and `get_commands`. pi has no extension UI
+  requests.
+- `--mode rpc` takes no prompt arguments; upstream ignores them.
+
+Reason: pi's run engine, session journal, and queue are its own (see Batched
+Queue and Steering Dispatch). The protocol keeps upstream's records and
+command contract, so a client written for upstream works; where pi lacks data
+it leaves the field out rather than inventing it. Runs are not yet durable
+across a pi restart; the journal format that needs will close some of these
+gaps.

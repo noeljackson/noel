@@ -149,10 +149,39 @@ There is no file-watch hot module reload.
 - `interactive`: default when stdin is a TTY.
 - `print`: `--print` or piped stdin.
 - `json`: `--mode json`.
-- `rpc`: `--mode rpc`.
+- `rpc`: `--mode rpc` with stdin not a TTY.
 
 All modes use the same config, model resolution, auth, session, and provider
 machinery where applicable.
+
+## RPC Mode
+
+`--mode rpc` speaks upstream pi's RPC protocol over stdin and stdout, plus the
+`run-id` and `expected-run-id` extensions (see the README's RPC Mode and the
+non-parity register). It lives in two modules of `pi-cli`:
+
+- `rpc_wire.rs` holds the protocol: serde types for commands, responses,
+  events, and messages in upstream's field order, and `Recorder`, which turns
+  one run's `TurnEvent`s into upstream's records. A run is one upstream run
+  (one `agent_start`, one `agent_end`, one `agent_settled`) however many
+  engine calls it takes; the recorder closes whatever an abort or a failure
+  left open, ending the run's last turn with an aborted or error reply.
+- `rpc.rs` holds the mode: a reader thread that splits stdin on LF only, one
+  writer that prints each record as one line, and the command loop. While a
+  run is active one task polls the engine call and handles commands that
+  arrive meanwhile (`tokio::select!`), so records keep the order things
+  happen in. The engine reports events through a callback; the command loop
+  and the callback share the queue and the active run behind a lock that is
+  never contended.
+
+Each run builds its provider at the prompt (so `set_model` applies to the next
+run) and gets a `RunControl`: the shared steering mailbox and its own
+cancellation token, which `abort` cancels. Follow-ups need no engine support:
+when an engine call returns with follow-ups queued, the run makes another
+engine call with them as its prompt. While the engine holds the runtime,
+reads answer from a copy of the session that the run's events keep current,
+refreshed after each engine call; commands that would change the session are
+refused.
 
 ## Config Model
 
@@ -408,7 +437,8 @@ shape for URLs, selected headers, request bodies, and provider payloads. The
 Rust `pi-ai` tests compare local builders against those captures.
 `rpc-protocol.json` is a protocol transcript instead: upstream `pi --mode rpc`
 driven against a local stub model, with every stdout record in order and
-volatile values replaced by placeholders. When upstream
+volatile values replaced by placeholders. `pi-cli`'s `rpc_parity` test replays
+each scenario against `faux/script` and compares the records. When upstream
 changes, the drift harness produces both a raw diff and an agent-oriented brief
 that states the constraints: no host npm, TypeScript only in Docker, keep Rust
 changes scoped to parity behavior, and rerun Rust validation before committing.

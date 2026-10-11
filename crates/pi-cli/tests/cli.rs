@@ -839,45 +839,9 @@ fn settings_session_dir_is_honored_when_no_override_is_passed() {
 }
 
 #[test]
-fn rpc_mode_accepts_json_line_requests_from_stdin() {
-    let mut command = pi_command();
-    command
-        .args(["--no-session", "--mode", "rpc", "--model", "faux/echo"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn pi");
-    let stdin = child.stdin.as_mut().expect("child stdin");
-    writeln!(
-        stdin,
-        r#"{{"jsonrpc":"2.0","id":1,"method":"prompt","params":{{"prompt":"rpc hello"}}}}"#
-    )
-    .expect("write prompt request");
-    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"session"}}"#)
-        .expect("write session request");
-    drop(child.stdin.take());
-
-    let output = child.wait_with_output().expect("wait for pi");
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 2);
-    let first = serde_json::from_str::<serde_json::Value>(lines[0]).expect("parse first");
-    let second = serde_json::from_str::<serde_json::Value>(lines[1]).expect("parse second");
-    assert_eq!(first["id"], 1);
-    assert_eq!(first["result"]["message"], "[faux/echo] rpc hello");
-    assert_eq!(second["id"], 2);
-    assert_eq!(second["result"]["id"], "ephemeral");
-}
-
-#[test]
-fn rpc_reload_keeps_an_untrusted_project_untrusted() {
-    let root = test_dir("pi-cli-rpc-reload-trust");
+fn rpc_mode_keeps_an_untrusted_project_untrusted() {
+    use std::io::BufRead;
+    let root = test_dir("pi-cli-rpc-trust");
     let agent = root.join("agent");
     let project = root.join("project");
     fs::create_dir_all(&agent).expect("create agent dir");
@@ -887,60 +851,66 @@ fn rpc_reload_keeps_an_untrusted_project_untrusted() {
         r#"{"modelRefresh":{"enabled":false}}"#,
     )
     .expect("write settings");
-    // An untrusted repository's settings must not take effect, before or
-    // after a reload.
     fs::write(
         project.join(".pi/settings.json"),
-        r#"{"shellCommandPrefix":"echo untrusted-prefix"}"#,
+        r#"{"shellCommandPrefix":"echo project-prefix"}"#,
     )
     .expect("write project settings");
 
-    let mut child = pi_command()
-        .current_dir(&project)
-        .env("HOME", &root)
-        .env("PI_CODING_AGENT_DIR", &agent)
-        .args([
-            "--mode",
-            "rpc",
-            "--no-session",
-            "--model",
-            "faux/echo",
-            "--no-approve",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn pi");
-    let mut stdin = child.stdin.take().expect("child stdin");
-    for request in [
-        r#"{"jsonrpc":"2.0","id":1,"method":"prompt","params":{"prompt":"/bash echo hi"}}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"reload"}"#,
-        r#"{"jsonrpc":"2.0","id":3,"method":"prompt","params":{"prompt":"/bash echo hi"}}"#,
-    ] {
-        writeln!(stdin, "{request}").expect("write request");
-    }
-    drop(stdin);
-    let output = child.wait_with_output().expect("wait for pi");
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let responses = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json response"))
-        .collect::<Vec<_>>();
-    assert_eq!(responses.len(), 3, "{responses:?}");
-    assert!(responses[1].get("result").is_some(), "{}", responses[1]);
-    for response in [&responses[0], &responses[2]] {
-        assert_eq!(
-            response["result"]["message"].as_str().map(str::trim),
-            Some("hi"),
-            "{response}"
+    // The output of `/bash echo hi`, run without the model. RPC mode has no
+    // reload: every command uses the config startup built.
+    let bash_output = |trust: &str| {
+        let mut child = pi_command()
+            .current_dir(&project)
+            .env("HOME", &root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .args(["--mode", "rpc", "--no-session", "--model", "faux/echo"])
+            .arg(trust)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pi");
+        let mut stdin = child.stdin.take().expect("child stdin");
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("child stdout"));
+        let mut until = |done: &dyn Fn(&serde_json::Value) -> bool| loop {
+            let mut line = String::new();
+            assert!(
+                stdout.read_line(&mut line).expect("read record") > 0,
+                "pi exited early"
+            );
+            let record = serde_json::from_str::<serde_json::Value>(&line).expect("json record");
+            if done(&record) {
+                return record;
+            }
+        };
+        writeln!(stdin, r#"{{"type":"prompt","message":"/bash echo hi"}}"#).expect("write prompt");
+        until(&|record| record["type"] == "agent_settled");
+        writeln!(stdin, r#"{{"id":"messages","type":"get_messages"}}"#).expect("write request");
+        let reply = until(&|record| record["id"] == "messages");
+        drop(stdin);
+        let output = child.wait_with_output().expect("wait for pi");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
-    }
+        let messages = reply["data"]["messages"].as_array().expect("messages");
+        let result = messages
+            .iter()
+            .find(|message| message["role"] == "toolResult")
+            .unwrap_or_else(|| panic!("no tool result in {reply}"));
+        result["content"][0]["text"]
+            .as_str()
+            .expect("tool output")
+            .trim()
+            .to_string()
+    };
+
+    // An untrusted repository's settings must not take effect; a trusted
+    // one's do, so the prefix would show.
+    assert_eq!(bash_output("--no-approve"), "hi");
+    assert_eq!(bash_output("--approve"), "project-prefix\nhi");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1340,7 +1310,7 @@ fn unique_suffix() -> u128 {
 
 #[test]
 fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_original_transcript() {
-    use std::io::Read;
+    use std::io::{BufRead, Read};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     let root = test_dir("pi-cli-semantic-rpc");
@@ -1441,27 +1411,38 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
         .stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    for (id, prompt) in [
-        (
-            1,
-            format!("use SQLite transactions {}", "reference ".repeat(300)),
-        ),
-        (2, "current migration".into()),
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    // Each command waits for the previous run to settle.
+    let mut until = |done: &dyn Fn(&serde_json::Value) -> bool| loop {
+        let mut line = String::new();
+        assert!(stdout.read_line(&mut line).unwrap() > 0, "pi exited early");
+        let record = serde_json::from_str::<serde_json::Value>(&line).unwrap();
+        if done(&record) {
+            return record;
+        }
+    };
+    let settled = |record: &serde_json::Value| record["type"] == "agent_settled";
+    for prompt in [
+        format!("use SQLite transactions {}", "reference ".repeat(300)),
+        "current migration".into(),
     ] {
         writeln!(
             stdin,
             "{}",
-            serde_json::json!({"id":id,"method":"prompt","params":{"prompt":prompt}})
+            serde_json::json!({"type":"prompt","message":prompt})
         )
         .unwrap();
+        assert_eq!(until(&settled)["aborted"], false);
     }
-    writeln!(stdin, "{}", serde_json::json!({"id":3,"method":"compact","params":{"focus":"preserve database decisions"}})).unwrap();
+    writeln!(stdin, "{}", serde_json::json!({"id":"compact","type":"compact","customInstructions":"preserve database decisions"})).unwrap();
+    let compacted = until(&|record| record["id"] == "compact");
     writeln!(
         stdin,
         "{}",
-        serde_json::json!({"id":4,"method":"prompt","params":{"prompt":"continue"}})
+        serde_json::json!({"type":"prompt","message":"continue"})
     )
     .unwrap();
+    until(&settled);
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -1470,13 +1451,9 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
         String::from_utf8_lossy(&output.stderr)
     );
     server.join().unwrap();
-    let responses = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(responses.len(), 4);
-    assert_eq!(responses[2]["result"]["omitted_messages"], 2);
-    assert!(responses[2]["result"]["summary"]
+    assert_eq!(compacted["success"], true, "{compacted}");
+    assert_eq!(compacted["data"]["details"]["omittedMessages"], 2);
+    assert!(compacted["data"]["summary"]
         .as_str()
         .unwrap()
         .contains("SQLite"));

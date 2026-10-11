@@ -85,6 +85,9 @@ Current Rust parity coverage includes:
   selected TUI markers, local tool inventory/schema keys, session export shape,
   and model catalog targets.
 - TypeScript full-tree session JSONL active-branch loading.
+- RPC mode: every `rpc-protocol.json` scenario, record by record and model
+  request by model request, allowing the differences listed under "RPC Mode"
+  in the non-parity register (`crates/pi-cli/tests/rpc_parity.rs`).
 
 ## Validation Commands
 
@@ -95,6 +98,7 @@ make ts-parity-update
 cargo test -p pi-parity
 cargo test -p pi-ai --lib matches_ts
 cargo test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
+cargo test -p pi-cli --test rpc_parity
 make check
 make ts-parity-drift
 ```
