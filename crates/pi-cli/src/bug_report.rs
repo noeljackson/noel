@@ -9,7 +9,6 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -143,7 +142,7 @@ impl BugReport {
             config_diagnostics: format_diagnostics(config),
             errors: errors[skipped..]
                 .iter()
-                .map(|error| truncate_chars(error, MAX_ERROR_CHARS))
+                .map(|error| truncate_chars(&redact_text(error), MAX_ERROR_CHARS))
                 .collect(),
         }
     }
@@ -280,7 +279,8 @@ impl BugReport {
             String::new(),
             fenced("text", &self.config_diagnostics),
             String::new(),
-            "Errors shown in this session (newest last):".to_string(),
+            "Errors shown in this session (newest last; URL secrets and credentials redacted):"
+                .to_string(),
             String::new(),
         ]);
         if self.errors.is_empty() {
@@ -348,7 +348,7 @@ impl Environment {
             version: env!("CARGO_PKG_VERSION"),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
-            os_release: os_release(),
+            os_release: Some(pi_ai::os_release()).filter(|release| release != "unknown"),
             shell: var("SHELL").map(|shell| {
                 shell
                     .rsplit(['/', '\\'])
@@ -368,21 +368,6 @@ impl Environment {
             pi_variables,
         }
     }
-}
-
-fn os_release() -> Option<String> {
-    fs::read_to_string("/proc/sys/kernel/osrelease")
-        .ok()
-        .or_else(|| {
-            Command::new("uname")
-                .arg("-r")
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| String::from_utf8(output.stdout).ok())
-        })
-        .map(|release| release.trim().to_string())
-        .filter(|release| !release.is_empty())
 }
 
 /// A UUIDv7 like upstream's report ids: millisecond time, then randomness.
@@ -488,9 +473,22 @@ fn is_sensitive_key(key: &str) -> bool {
     })
 }
 
+/// Query parameters whose values a report hides: upstream's settings key rule
+/// plus `auth`, `sig`, `signature`, and any name containing key, token,
+/// secret, or password (Google-style `key=`, `X-Amz-Security-Token`, ...).
+fn is_sensitive_param(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    is_sensitive_key(name)
+        || ["key", "token", "secret", "password"]
+            .iter()
+            .any(|part| lower.contains(part))
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|word| matches!(word, "auth" | "sig" | "signature"))
+}
+
 /// Strip URL user info and credential-like query values; other text passes
-/// through unchanged. `git:https://…`-style prefixes are preserved. Besides
-/// upstream's key rule, a bare `key` parameter (Google-style API keys) counts.
+/// through unchanged. `git:https://…`-style prefixes are preserved.
 fn redact_url(value: &str) -> String {
     if let Some((prefix, rest)) = value.split_once(':') {
         if is_scheme(prefix)
@@ -512,20 +510,20 @@ fn redact_url(value: &str) -> String {
     }
     let pairs = url
         .query_pairs()
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .map(|(key, value)| {
+            // A nested URL (an unencoded redirect target) gets the same treatment.
+            let redacted = if is_sensitive_param(&key) {
+                REDACTED.to_string()
+            } else {
+                redact_url(&value)
+            };
+            (redacted != value, key.into_owned(), redacted)
+        })
         .collect::<Vec<_>>();
-    let sensitive = |key: &str| key.eq_ignore_ascii_case("key") || is_sensitive_key(key);
-    if pairs.iter().any(|(key, _)| sensitive(key)) {
+    if pairs.iter().any(|(redacted, ..)| *redacted) {
         url.query_pairs_mut()
             .clear()
-            .extend_pairs(pairs.iter().map(|(key, value)| {
-                let value = if sensitive(key) {
-                    REDACTED
-                } else {
-                    value.as_str()
-                };
-                (key.as_str(), value)
-            }));
+            .extend_pairs(pairs.iter().map(|(_, key, value)| (key, value)));
         changed = true;
     }
     if changed {
@@ -533,6 +531,126 @@ fn redact_url(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Error text with credentials replaced: secrets in any URL it mentions
+/// (see [`redact_url`]), `Bearer`/`Basic` credentials, and well-known API key
+/// and token formats. Other text passes through unchanged.
+fn redact_text(text: &str) -> String {
+    redact_credentials(&redact_urls(text))
+}
+
+/// Applies [`redact_url`] to each `scheme://…` URL inside `text`.
+fn redact_urls(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(separator) = rest.find("://") {
+        let scheme_start = rest[..separator]
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+            .last()
+            .map_or(separator, |(index, _)| index);
+        let end = rest[separator..]
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | '`'))
+            .map_or(rest.len(), |offset| separator + offset);
+        // Sentence punctuation and closing brackets after a URL are not part of it.
+        let url =
+            rest[scheme_start..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}']);
+        if is_scheme(&rest[scheme_start..separator]) && url.len() > separator - scheme_start + 3 {
+            redacted.push_str(&rest[..scheme_start]);
+            redacted.push_str(&redact_url(url));
+            rest = &rest[scheme_start + url.len()..];
+        } else {
+            redacted.push_str(&rest[..separator + 3]);
+            rest = &rest[separator + 3..];
+        }
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
+/// Well-known credential prefixes and the fewest characters that must follow.
+const CREDENTIAL_PREFIXES: &[(&str, usize)] = &[
+    // OpenAI and Anthropic (`sk-ant-…`) API keys.
+    ("sk-", 16),
+    // Google API keys.
+    ("AIza", 30),
+    // GitHub tokens.
+    ("github_pat_", 20),
+    ("ghp_", 20),
+    ("gho_", 20),
+    ("ghs_", 20),
+    ("ghu_", 20),
+    ("ghr_", 20),
+    // Slack tokens.
+    ("xoxa-", 10),
+    ("xoxb-", 10),
+    ("xoxe-", 10),
+    ("xoxp-", 10),
+    ("xoxr-", 10),
+    ("xoxs-", 10),
+    // AWS access key ids (long-term and temporary).
+    ("AKIA", 16),
+    ("ASIA", 16),
+];
+
+/// Replaces `Bearer`/`Basic` credentials and words that start with a
+/// [`CREDENTIAL_PREFIXES`] entry.
+fn redact_credentials(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(ch) = text[index..].chars().next() {
+        if !text[..index].ends_with(is_word_char) {
+            if let Some((kept, secret)) = credential_at(&text[index..]) {
+                redacted.push_str(&text[index..index + kept]);
+                redacted.push_str(REDACTED);
+                index += kept + secret;
+                continue;
+            }
+        }
+        redacted.push(ch);
+        index += ch.len_utf8();
+    }
+    redacted
+}
+
+/// A credential at the start of `text`, as (bytes kept, secret bytes): the
+/// value after a `Bearer` or `Basic` scheme, or a prefixed key or token.
+fn credential_at(text: &str) -> Option<(usize, usize)> {
+    for scheme in ["bearer", "basic"] {
+        let Some(after) = text
+            .get(..scheme.len())
+            .filter(|word| word.eq_ignore_ascii_case(scheme))
+            .map(|_| &text[scheme.len()..])
+        else {
+            continue;
+        };
+        let value = after.trim_start_matches([' ', '\t']);
+        let gap = after.len() - value.len();
+        let length = value
+            .find(|ch: char| !(ch.is_ascii_alphanumeric() || "-._~+/=".contains(ch)))
+            .unwrap_or(value.len());
+        if gap > 0 && looks_like_credential(&value[..length]) {
+            return Some((scheme.len() + gap, length));
+        }
+    }
+    CREDENTIAL_PREFIXES.iter().find_map(|(prefix, min_length)| {
+        let body = text.strip_prefix(prefix)?;
+        let length = body.find(|ch| !is_word_char(ch)).unwrap_or(body.len());
+        (length >= *min_length).then_some((0, prefix.len() + length))
+    })
+}
+
+/// Whether the word after `Bearer`/`Basic` is a credential rather than prose
+/// such as "bearer token" or "Basic authentication": credentials carry digits
+/// or symbols, or are long.
+fn looks_like_credential(value: &str) -> bool {
+    value.len() >= 8 && (value.len() >= 24 || value.chars().any(|ch| !ch.is_ascii_alphabetic()))
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
 }
 
 fn is_scheme(value: &str) -> bool {
@@ -623,13 +741,88 @@ mod tests {
             redact_url("https://generativelanguage.test/v1?key=AIza123"),
             "https://generativelanguage.test/v1?key=%3Credacted%3E"
         );
+        assert_eq!(
+            redact_url(
+                "https://s3.test/o?X-Amz-Signature=f00&sig=1&auth=2&client_secret=3&apikey=4&passwordHash=5&alt=sse"
+            ),
+            "https://s3.test/o?X-Amz-Signature=%3Credacted%3E&sig=%3Credacted%3E&auth=%3Credacted%3E\
+             &client_secret=%3Credacted%3E&apikey=%3Credacted%3E&passwordHash=%3Credacted%3E&alt=sse"
+        );
+        // An unencoded redirect target is a URL of its own.
+        assert_eq!(
+            redact_url("https://a.test/cb?redirect=https://b.test/?token=t1"),
+            "https://a.test/cb?redirect=https%3A%2F%2Fb.test%2F%3Ftoken%3D%253Credacted%253E"
+        );
         for unchanged in [
-            "https://example.com/v1?region=eu",
+            "https://example.com/v1?region=eu&authuser=0",
             "/home/user/project",
             "not a url",
             "dark",
         ] {
             assert_eq!(redact_url(unchanged), unchanged);
+        }
+    }
+
+    #[test]
+    fn error_text_redaction_covers_urls_auth_schemes_and_key_formats() {
+        let secret = |prefix: &str| format!("{prefix}AbCdEf0123456789xYz_AbCdEf0123456789");
+        for (input, expected) in [
+            (
+                "request to https://api.test/v1/models?key=abc&region=eu failed: 403",
+                "request to https://api.test/v1/models?key=%3Credacted%3E&region=eu failed: 403",
+            ),
+            (
+                "error sending request for url (https://u:pw@api.test/v1?access_token=t1&page=2).",
+                "error sending request for url (https://api.test/v1?access_token=%3Credacted%3E&page=2).",
+            ),
+            (
+                "Authorization: Bearer abc.def-123_456 rejected",
+                "Authorization: Bearer <redacted> rejected",
+            ),
+            (
+                "header \"authorization\": \"bearer eyJhbGciOiJIUzI1NiJ9.e30.sig\"",
+                "header \"authorization\": \"bearer <redacted>\"",
+            ),
+            (
+                "proxy wants Basic dXNlcjpwYXNzd29yZA==",
+                "proxy wants Basic <redacted>",
+            ),
+        ] {
+            assert_eq!(redact_text(input), expected);
+        }
+        for prefix in [
+            "sk-",
+            "sk-ant-api03-",
+            "sk-proj-",
+            "AIza",
+            "ghp_",
+            "gho_",
+            "ghs_",
+            "ghu_",
+            "github_pat_",
+            "xoxb-",
+            "xoxp-",
+        ] {
+            assert_eq!(
+                redact_text(&format!("invalid x-api-key: {} (401)", secret(prefix))),
+                "invalid x-api-key: <redacted> (401)",
+                "{prefix}"
+            );
+        }
+        assert_eq!(
+            redact_text("aws key AKIAIOSFODNN7EXAMPLE was denied"),
+            "aws key <redacted> was denied"
+        );
+
+        for ordinary in [
+            "provider returned 529: overloaded",
+            "invalid bearer token; Basic authentication is not supported",
+            "max_tokens=4096 exceeds the limit for task-1234567890abcdefghij",
+            "sk-learn and risk-assessment are not keys",
+            "see https://docs.test/errors#rate-limits?retry=later or https://example.com/v1?region=eu",
+            "unicode é :// stays put",
+        ] {
+            assert_eq!(redact_text(ordinary), ordinary);
         }
     }
 
@@ -707,6 +900,10 @@ mod tests {
         let mut app = TuiApp::default();
         app.push(TuiEntryKind::User, "private prompt text");
         app.push(TuiEntryKind::Error, "provider returned 529: overloaded");
+        app.push(
+            TuiEntryKind::Error,
+            "GET https://faux.test/v1?token=url-secret-1 failed; sent Bearer sk-ant-oat01-headersecret2",
+        );
 
         report_into(
             &mut app,
@@ -743,6 +940,7 @@ mod tests {
             "- assist (/agent/extensions/assist.md)",
             "\"theme\": \"dark\"",
             "provider returned 529: overloaded",
+            "GET https://faux.test/v1?token=%3Credacted%3E failed; sent Bearer <redacted>",
             "Transcript: not included",
         ] {
             assert!(
@@ -750,7 +948,13 @@ mod tests {
                 "missing {expected:?} in\n{report}"
             );
         }
-        for leaked in ["hunter2", "private prompt text", "never in reports"] {
+        for leaked in [
+            "hunter2",
+            "private prompt text",
+            "never in reports",
+            "url-secret-1",
+            "headersecret2",
+        ] {
             assert!(!report.contains(leaked), "report leaked {leaked:?}");
         }
 

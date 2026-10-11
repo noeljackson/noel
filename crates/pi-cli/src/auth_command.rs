@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use pi_config::{
-    auth_for_provider, expires_within, listed_accounts_for_provider,
-    load_config_with_project_trust, project_is_trusted, ConfigPaths, LoadedConfig, ResolvedAuth,
+    auth_for_provider, expires_within, is_expired, listed_accounts_for_provider,
+    load_config_with_project_trust, project_is_trusted, AuthData, ConfigPaths, LoadedConfig,
+    ResolvedAuth,
 };
 use serde::Serialize;
 
@@ -19,9 +20,11 @@ const USAGE: &str = "Usage:
   pi auth print-bearer-token [--provider <provider>] [--model <model>] [--account <name>] [--min-expiry <duration>]
   pi auth check [--provider <provider>] [--model <model>] [--account <name>] [--json] [--credentials] [--no-refresh]
 
-Auth commands require at least one of --provider or --model. Checks refresh expired OAuth credentials by default; --no-refresh prevents this. --credentials emits the credential, or includes it in JSON output. print-bearer-token refreshes tokens that expire within --min-expiry (ms, s, m, or h; default 30m). --account selects a named account (see pi accounts status). Credential-printing commands write secrets to stdout.";
+Auth commands require at least one of --provider or --model. Checks refresh expired OAuth credentials by default; --no-refresh prevents this. --credentials emits the credential, or includes it in JSON output. print-bearer-token refreshes tokens that expire within --min-expiry (ms, s, m, or h; default 30m). Logins read from Claude Code or Codex files refresh only once they expire, which keeps that CLI signed in; one that expires sooner prints with a warning. --account selects a named account (see pi accounts status). Credential-printing commands write secrets to stdout.";
 
-/// OAuth tokens closer than this to expiry are refreshed before use.
+/// pi's own OAuth tokens closer than this to expiry are refreshed before use
+/// (imported logins wait until they expire); a check reports a ready token
+/// this close to expiry as expiring soon.
 const MIN_OAUTH_VALIDITY_SECONDS: u64 = 5 * 60;
 /// Remaining lifetime `print-bearer-token` requires without `--min-expiry`.
 const DEFAULT_BEARER_MIN_EXPIRY_SECONDS: u64 = 30 * 60;
@@ -44,7 +47,10 @@ impl Kind {
         }
     }
 
-    /// Checks reserve exit status 1 for "not ready", so their errors use 2.
+    /// Exit status for an error once the arguments parse: checks reserve 1
+    /// for "not ready", so theirs use 2. Like upstream (whose tests pin
+    /// `auth check --credentails` to 1), an unknown command or option exits 1
+    /// for every kind; see `run`.
     fn error_status(self) -> i32 {
         if self == Kind::Check {
             2
@@ -77,6 +83,7 @@ pub(crate) async fn run(args: &[String]) -> i32 {
     let command = match parse(args) {
         Ok(command) => command,
         Err(message) => {
+            // Upstream exits 1 here for every kind, `auth check` included.
             eprintln!("Error: {message}");
             eprintln!("Use \"pi auth --help\" for usage.");
             return 1;
@@ -92,9 +99,12 @@ pub(crate) async fn run(args: &[String]) -> i32 {
         now: unix_seconds().unwrap_or(0),
     };
     let status = match execute(&command, &refresher).await {
-        Ok((output, status)) => {
-            println!("{output}");
-            status
+        Ok(outcome) => {
+            if let Some(warning) = &outcome.warning {
+                eprintln!("Warning: {warning}");
+            }
+            println!("{}", outcome.stdout);
+            outcome.status
         }
         Err(message) => {
             eprintln!("Error: {message}");
@@ -105,19 +115,33 @@ pub(crate) async fn run(args: &[String]) -> i32 {
     status
 }
 
-async fn execute(
-    command: &AuthCommand,
-    refresher: &Refresher<'_>,
-) -> Result<(String, i32), String> {
+/// What a `pi auth` command prints and its exit status.
+struct Outcome {
+    stdout: String,
+    /// For stderr; JSON checks carry it as `expiresSoon` instead.
+    warning: Option<String>,
+    status: i32,
+}
+
+async fn execute(command: &AuthCommand, refresher: &Refresher<'_>) -> Result<Outcome, String> {
     validate(command)?;
     let config = load_auth_config().map_err(|error| format!("{error:#}"))?;
     match command.kind {
         Kind::Check => {
             let result = check(&config, command, refresher).await?;
-            Ok((result.render(command.json), result.status.exit_status()))
+            Ok(Outcome {
+                stdout: result.render(command.json),
+                warning: result.warning.filter(|_| !command.json),
+                status: result.status.exit_status(),
+            })
         }
         Kind::ApiKey | Kind::BearerToken => {
-            Ok((print_credential(&config, command, refresher).await?, 0))
+            let printed = print_credential(&config, command, refresher).await?;
+            Ok(Outcome {
+                stdout: printed.value,
+                warning: printed.warning,
+                status: 0,
+            })
         }
     }
 }
@@ -235,6 +259,9 @@ struct Refresher<'a> {
 }
 
 impl Refresher<'_> {
+    /// The credential, first refreshed when it expires within
+    /// `window_seconds`. An imported login (see [`imported_login`]) refreshes
+    /// only on the request path's schedule, once it expires.
     async fn auth(
         &self,
         config: &LoadedConfig,
@@ -242,6 +269,11 @@ impl Refresher<'_> {
         account: Option<&str>,
         window_seconds: u64,
     ) -> Result<Option<ResolvedAuth>> {
+        let window_seconds = if imported_login(&config.auth, provider, account).is_some() {
+            oauth_refresh::REFRESH_WINDOW_SECONDS
+        } else {
+            window_seconds
+        };
         oauth_refresh::refresh_auth_expiring_within(
             self.client,
             &config.paths.auth_path,
@@ -253,6 +285,68 @@ impl Refresher<'_> {
             window_seconds,
         )
         .await
+    }
+}
+
+/// The CLI whose own login file supplies this credential (Claude Code for
+/// anthropic, Codex for openai and openai-codex): pi reads it when no stored
+/// account answers the request. Refreshing it spends that CLI's single-use
+/// refresh token and signs the CLI out. Stored accounts, including the
+/// `claude-import`/`codex-import` copy pi saves once it has refreshed such a
+/// login, hold pi's own refresh token. (An environment token can resolve the
+/// same way, but it never expires or refreshes.)
+fn imported_login(auth: &AuthData, provider: &str, account: Option<&str>) -> Option<&'static str> {
+    let cli = match provider {
+        "anthropic" => "Claude Code",
+        "openai" | "openai-codex" => "Codex",
+        _ => return None,
+    };
+    let stored = match account {
+        Some(account) => auth.credential(provider, account).is_some(),
+        None => auth.account_for_resolution(provider).is_some(),
+    };
+    (!stored).then_some(cli)
+}
+
+/// Seconds left on an unexpired OAuth token that expires within
+/// `window_seconds`.
+fn expires_soon(auth: &ResolvedAuth, now: u64, window_seconds: u64) -> Option<u64> {
+    let expires = auth.expires();
+    (is_oauth(auth) && expires_within(expires, now, window_seconds) && !is_expired(expires, now))
+        .then(|| expires - now)
+}
+
+/// Stderr text for a token with `remaining` seconds left, short of the
+/// `requested` lifetime when one was asked for.
+fn expiry_warning(
+    provider: &str,
+    remaining: u64,
+    requested: Option<u64>,
+    imported: Option<&str>,
+) -> String {
+    let source = imported
+        .map(|cli| format!(" from {cli}"))
+        .unwrap_or_default();
+    let shortfall = requested
+        .map(|seconds| format!(", sooner than the requested {}", format_remaining(seconds)))
+        .unwrap_or_default();
+    let reason = imported
+        .map(|cli| {
+            format!("; pi refreshes {cli}'s login only once it expires, so {cli} stays signed in")
+        })
+        .unwrap_or_default();
+    format!(
+        "the {provider} OAuth token{source} expires in {}{shortfall}{reason}",
+        format_remaining(remaining)
+    )
+}
+
+/// `45s`, `12m`, or `2h 5m`.
+fn format_remaining(seconds: u64) -> String {
+    match (seconds / 3600, seconds % 3600 / 60) {
+        (0, 0) => format!("{seconds}s"),
+        (0, minutes) => format!("{minutes}m"),
+        (hours, minutes) => format!("{hours}h {minutes}m"),
     }
 }
 
@@ -288,6 +382,9 @@ struct CheckResult {
     reason: Option<&'static str>,
     auth_type: Option<&'static str>,
     credential: Option<String>,
+    /// Set when a ready OAuth token expires within the check's refresh
+    /// window: JSON reports `expiresSoon`, text output warns on stderr.
+    warning: Option<String>,
 }
 
 impl CheckResult {
@@ -298,6 +395,7 @@ impl CheckResult {
             reason: Some(reason),
             auth_type: None,
             credential: None,
+            warning: None,
         }
     }
 
@@ -308,6 +406,7 @@ impl CheckResult {
             reason: Some("invalid_state"),
             auth_type: None,
             credential: None,
+            warning: None,
         }
     }
 
@@ -321,6 +420,8 @@ impl CheckResult {
             reason: Option<&'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             auth_type: Option<&'a str>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            expires_soon: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             credentials: Option<&'a str>,
         }
@@ -335,6 +436,7 @@ impl CheckResult {
             provider: &self.provider,
             reason: self.reason,
             auth_type: self.auth_type,
+            expires_soon: self.warning.is_some(),
             credentials: self.credential.as_deref(),
         })
         .unwrap_or_default()
@@ -347,17 +449,24 @@ async fn check(
     refresher: &Refresher<'_>,
 ) -> Result<CheckResult, String> {
     let account = command.account.as_deref();
-    let provider = match resolve_providers(config, command) {
-        Ok(providers) => preferred_provider(config, providers, account),
+    let providers = match resolve_providers(config, command) {
+        Ok(providers) => providers,
         Err(_) => {
             let label = command.provider.as_deref().or(command.model.as_deref());
             return Ok(CheckResult::invalid(label.unwrap_or_default()));
         }
     };
-    if !provider_is_known(config, &provider) {
-        return Ok(CheckResult::not_ready(&provider, "provider_not_found"));
+    // Only a lone --provider can be unknown: --model resolves known ones.
+    if let [provider] = providers.as_slice() {
+        if !provider_is_known(config, provider) {
+            return Ok(CheckResult::not_ready(provider, "provider_not_found"));
+        }
     }
-    validate_account(config, &provider, account)?;
+    let provider = preferred_provider(
+        config,
+        providers_with_account(config, providers, account)?,
+        account,
+    );
     let Some(stored) = auth_for_provider(&config.auth, &provider, account)
         .filter(|auth| !credential_value(auth).trim().is_empty())
     else {
@@ -395,20 +504,33 @@ async fn check(
     } else {
         None
     };
+    let warning = expires_soon(&auth, refresher.now, MIN_OAUTH_VALIDITY_SECONDS).map(|remaining| {
+        let imported = imported_login(&config.auth, &provider, account);
+        expiry_warning(&provider, remaining, None, imported)
+    });
     Ok(CheckResult {
         status: CheckStatus::Ready,
         provider,
         reason: None,
         auth_type: Some(auth_type(&auth)),
         credential,
+        warning,
     })
+}
+
+/// A credential to print, with a stderr warning when an imported login
+/// expires sooner than the requested lifetime.
+#[derive(Debug, PartialEq, Eq)]
+struct Printed {
+    value: String,
+    warning: Option<String>,
 }
 
 async fn print_credential(
     config: &LoadedConfig,
     command: &AuthCommand,
     refresher: &Refresher<'_>,
-) -> Result<String, String> {
+) -> Result<Printed, String> {
     let account = command.account.as_deref();
     let providers = resolve_providers(config, command)?;
     if command.model.is_none() && !provider_is_known(config, &providers[0]) {
@@ -417,15 +539,15 @@ async fn print_credential(
             providers[0]
         ));
     }
+    let providers = providers_with_account(config, providers, account)?;
     let bearer = command.kind == Kind::BearerToken;
-    let window = command
+    let requested = command
         .min_expiry_seconds
-        .unwrap_or(DEFAULT_BEARER_MIN_EXPIRY_SECONDS)
-        .max(MIN_OAUTH_VALIDITY_SECONDS);
+        .unwrap_or(DEFAULT_BEARER_MIN_EXPIRY_SECONDS);
+    let window = requested.max(MIN_OAUTH_VALIDITY_SECONDS);
     let mut first_is_oauth = None;
-    let mut found = Vec::<(String, String)>::new();
+    let mut found = Vec::<(String, Printed)>::new();
     for provider in &providers {
-        validate_account(config, provider, account)?;
         let Some(stored) = auth_for_provider(&config.auth, provider, account) else {
             continue;
         };
@@ -434,6 +556,7 @@ async fn print_credential(
         if oauth != bearer {
             continue;
         }
+        let mut warning = None;
         let value = if bearer {
             let Some(auth) = refresher
                 .auth(config, provider, account, window)
@@ -443,10 +566,21 @@ async fn print_credential(
                 continue;
             };
             if expires_within(auth.expires(), refresher.now, window) {
-                return Err(if credential_value(&auth) == credential_value(&stored) {
-                    format!("OAuth token for {provider} expires within the required lifetime and could not be refreshed")
-                } else {
-                    format!("OAuth refresh returned a token that expires too soon for {provider}")
+                // An imported login is left unrefreshed on purpose: print it,
+                // warning when it falls short of the requested lifetime.
+                let imported = imported_login(&config.auth, provider, account)
+                    .filter(|_| !is_expired(auth.expires(), refresher.now));
+                if imported.is_none() {
+                    return Err(if credential_value(&auth) == credential_value(&stored) {
+                        format!("OAuth token for {provider} expires within the required lifetime and could not be refreshed")
+                    } else {
+                        format!(
+                            "OAuth refresh returned a token that expires too soon for {provider}"
+                        )
+                    });
+                }
+                warning = expires_soon(&auth, refresher.now, requested).map(|remaining| {
+                    expiry_warning(provider, remaining, Some(requested), imported)
                 });
             }
             credential_value(&auth).to_string()
@@ -454,7 +588,7 @@ async fn print_credential(
             credential_value(&stored).to_string()
         };
         if !value.trim().is_empty() {
-            found.push((provider.clone(), value));
+            found.push((provider.clone(), Printed { value, warning }));
         }
     }
     match found.len() {
@@ -543,24 +677,34 @@ fn provider_is_known(config: &LoadedConfig, provider: &str) -> bool {
         || !config.auth.accounts_for_provider(provider).is_empty()
 }
 
-fn validate_account(
+/// With `--account`, the providers that have that account (as `pi accounts
+/// status` lists them), so a `--model` several providers serve resolves to
+/// the one holding it. It is an error only when none does.
+fn providers_with_account(
     config: &LoadedConfig,
-    provider: &str,
+    providers: Vec<String>,
     account: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let Some(account) = account else {
-        return Ok(());
+        return Ok(providers);
     };
-    if listed_accounts_for_provider(&config.auth, provider)
-        .iter()
-        .any(|(name, _)| name == account)
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "No account \"{account}\" for provider \"{provider}\"; run pi accounts status to list accounts"
-        ))
+    let (with_account, without): (Vec<_>, Vec<_>) = providers.into_iter().partition(|provider| {
+        listed_accounts_for_provider(&config.auth, provider)
+            .iter()
+            .any(|(name, _)| name == account)
+    });
+    if !with_account.is_empty() {
+        return Ok(with_account);
     }
+    let providers = without
+        .iter()
+        .map(|provider| format!("\"{provider}\""))
+        .collect::<Vec<_>>();
+    Err(format!(
+        "No account \"{account}\" for provider{} {}; run pi accounts status to list accounts",
+        if providers.len() == 1 { "" } else { "s" },
+        providers.join(", ")
+    ))
 }
 
 fn is_oauth(auth: &ResolvedAuth) -> bool {
@@ -590,6 +734,8 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -652,12 +798,23 @@ mod tests {
         command
     }
 
-    /// One-shot token endpoint that answers every request with `body`.
-    fn token_stub(body: &'static str) -> String {
+    fn printed(value: &str) -> Printed {
+        Printed {
+            value: value.to_string(),
+            warning: None,
+        }
+    }
+
+    /// Token endpoint that answers every request with `body`; returns its URL
+    /// and a request count.
+    fn token_stub(body: &'static str) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
         std::thread::spawn(move || {
             while let Ok((stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
                 let mut reader = BufReader::new(stream);
                 let mut content_length = 0;
                 let mut line = String::new();
@@ -681,7 +838,7 @@ mod tests {
                 );
             }
         });
-        url
+        (url, hits)
     }
 
     #[test]
@@ -902,15 +1059,15 @@ mod tests {
 
         assert_eq!(
             print(&["print-api-key", "--provider", "acme"]).await,
-            Ok("acme-secret".to_string())
+            Ok(printed("acme-secret"))
         );
         assert_eq!(
             print(&["print-api-key", "--model", "acme-large"]).await,
-            Ok("acme-secret".to_string())
+            Ok(printed("acme-secret"))
         );
         assert_eq!(
             print(&["print-api-key", "--provider", "zeta", "--model", "shared"]).await,
-            Ok("zeta-secret".to_string())
+            Ok(printed("zeta-secret"))
         );
         let ambiguous = print(&["print-api-key", "--model", "shared"])
             .await
@@ -955,7 +1112,7 @@ mod tests {
                 &refresher,
             )
             .await,
-            Ok("long-access".to_string())
+            Ok(printed("long-access"))
         );
         let too_short = print_credential(
             &long_lived,
@@ -980,7 +1137,7 @@ mod tests {
             )],
             &root,
         );
-        let url = token_stub(
+        let (url, hits) = token_stub(
             r#"{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":7200}"#,
         );
         let refresher = Refresher {
@@ -995,11 +1152,253 @@ mod tests {
                 &refresher,
             )
             .await,
-            Ok("fresh-access".to_string())
+            Ok(printed("fresh-access"))
         );
         let persisted = std::fs::read_to_string(root.join("auth.json")).expect("persisted auth");
         assert!(persisted.contains("fresh-access"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // The claude-import copy pi saved after refreshing a Claude Code login
+        // holds pi's own refresh token, so it refreshes early like any account.
+        let copy_root = temp_dir("bearer-import-copy");
+        let saved_copy = config_with(
+            &[(
+                "anthropic",
+                "claude-import",
+                oauth("ten-minutes-left", Some("pi-refresh"), 1_600),
+            )],
+            &copy_root,
+        );
+        assert_eq!(
+            print_credential(
+                &saved_copy,
+                &command(&["print-bearer-token", "--provider", "anthropic"]),
+                &refresher,
+            )
+            .await,
+            Ok(printed("fresh-access"))
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
 
         let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(copy_root);
+    }
+
+    #[tokio::test]
+    async fn account_narrows_model_matches_to_providers_with_that_account() {
+        let root = temp_dir("account");
+        let mut auth = vec![
+            ("acme", "default", api_key("acme-secret")),
+            ("zeta", "default", api_key("zeta-secret")),
+            ("zeta", "work", api_key("zeta-work")),
+        ];
+        let config = config_with(&auth, &root);
+        let client = reqwest::Client::new();
+        let refresher = Refresher {
+            client: &client,
+            endpoint: None,
+            now: 1_000,
+        };
+
+        // Only zeta has "work", so the model both providers serve resolves to it.
+        assert_eq!(
+            print_credential(
+                &config,
+                &command(&["print-api-key", "--model", "shared", "--account", "work"]),
+                &refresher,
+            )
+            .await,
+            Ok(printed("zeta-work"))
+        );
+        let checked = check(
+            &config,
+            &command(&[
+                "check",
+                "--model",
+                "shared",
+                "--account",
+                "work",
+                "--credentials",
+            ]),
+            &refresher,
+        )
+        .await
+        .expect("check");
+        assert_eq!(checked.provider, "zeta");
+        assert_eq!(checked.render(false), "zeta-work");
+
+        // An account no matching provider has is an error for both commands.
+        let missing = print_credential(
+            &config,
+            &command(&["print-api-key", "--model", "shared", "--account", "home"]),
+            &refresher,
+        )
+        .await
+        .expect_err("no provider has the account");
+        assert_eq!(
+            missing,
+            "No account \"home\" for providers \"acme\", \"zeta\"; run pi accounts status to list accounts"
+        );
+        let missing = check(
+            &config,
+            &command(&["check", "--model", "shared", "--account", "home"]),
+            &refresher,
+        )
+        .await
+        .expect_err("no provider has the account");
+        assert!(missing.starts_with("No account \"home\""), "{missing}");
+
+        // When several have it, printing stays ambiguous.
+        auth.push(("acme", "work", api_key("acme-work")));
+        let both = config_with(&auth, &root);
+        let ambiguous = print_credential(
+            &both,
+            &command(&["print-api-key", "--model", "shared", "--account", "work"]),
+            &refresher,
+        )
+        .await
+        .expect_err("ambiguous account");
+        assert!(
+            ambiguous.contains("Multiple configured providers matched (acme, zeta)"),
+            "{ambiguous}"
+        );
+    }
+
+    #[test]
+    fn imported_logins_are_the_ones_pi_has_no_stored_account_for() {
+        let mut auth = AuthData::default();
+        // With nothing stored, pi reads Claude Code's or Codex's own login.
+        assert_eq!(
+            imported_login(&auth, "anthropic", None),
+            Some("Claude Code")
+        );
+        assert_eq!(imported_login(&auth, "openai-codex", None), Some("Codex"));
+        assert_eq!(
+            imported_login(&auth, "openai", Some("codex-import")),
+            Some("Codex")
+        );
+        // Other providers have no login file to import.
+        assert_eq!(imported_login(&auth, "acme", None), None);
+
+        // pi's own accounts, including the copy it saves after a refresh.
+        auth.insert(
+            "anthropic",
+            "claude-import",
+            oauth("copy", Some("pi-refresh"), 0),
+        );
+        assert_eq!(imported_login(&auth, "anthropic", None), None);
+        assert_eq!(
+            imported_login(&auth, "anthropic", Some("claude-import")),
+            None
+        );
+        assert_eq!(
+            imported_login(&auth, "anthropic", Some("work")),
+            Some("Claude Code")
+        );
+        // Several accounts without a default leave the login file in use.
+        auth.insert("anthropic", "work", api_key("work-key"));
+        assert_eq!(
+            imported_login(&auth, "anthropic", None),
+            Some("Claude Code")
+        );
+        assert_eq!(imported_login(&auth, "anthropic", Some("work")), None);
+        auth.insert("anthropic", "default", api_key("default-key"));
+        assert_eq!(imported_login(&auth, "anthropic", None), None);
+    }
+
+    #[tokio::test]
+    async fn check_refreshes_pi_tokens_early_and_reports_ones_expiring_soon() {
+        let root = temp_dir("check-expiry");
+        let client = reqwest::Client::new();
+        let (url, hits) = token_stub(
+            r#"{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":7200}"#,
+        );
+        let refresher = Refresher {
+            client: &client,
+            endpoint: Some((url.as_str(), "test-client")),
+            now: 1_000,
+        };
+        // pi's own token, three minutes from expiry: inside the check window.
+        let expiring = config_with(
+            &[(
+                "anthropic",
+                "default",
+                oauth("three-minutes-left", Some("refresh"), 1_180),
+            )],
+            &root,
+        );
+
+        let refreshed = check(
+            &expiring,
+            &command(&["check", "--provider", "anthropic", "--credentials"]),
+            &refresher,
+        )
+        .await
+        .expect("check");
+        assert_eq!(refreshed.render(false), "fresh-access");
+        assert_eq!(refreshed.warning, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Unrefreshed, it stays ready but expires soon.
+        let kept = check(
+            &expiring,
+            &command(&["check", "--provider", "anthropic", "--no-refresh", "--json"]),
+            &refresher,
+        )
+        .await
+        .expect("check");
+        assert_eq!(kept.status.exit_status(), 0);
+        assert_eq!(
+            kept.render(true),
+            r#"{"status":"ready","provider":"anthropic","authType":"oauth","expiresSoon":true}"#
+        );
+        assert_eq!(
+            kept.warning.as_deref(),
+            Some("the anthropic OAuth token expires in 3m")
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // So does a token pi has no refresh token for.
+        let unrefreshable = config_with(
+            &[(
+                "anthropic",
+                "default",
+                oauth("no-refresh-token", None, 1_180),
+            )],
+            &root,
+        );
+        let result = check(
+            &unrefreshable,
+            &command(&["check", "--provider", "anthropic"]),
+            &refresher,
+        )
+        .await
+        .expect("check");
+        assert_eq!(result.render(false), "ready");
+        assert!(result.warning.is_some());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expiry_warnings_name_the_imported_login_and_requested_lifetime() {
+        assert_eq!(
+            expiry_warning("anthropic", 12 * 60 + 30, Some(30 * 60), Some("Claude Code")),
+            "the anthropic OAuth token from Claude Code expires in 12m, sooner than the requested 30m; pi refreshes Claude Code's login only once it expires, so Claude Code stays signed in"
+        );
+        assert_eq!(
+            expiry_warning("openai-codex", 45, None, None),
+            "the openai-codex OAuth token expires in 45s"
+        );
+        assert_eq!(format_remaining(2 * 3600 + 5 * 60 + 9), "2h 5m");
+        assert_eq!(
+            expires_soon(
+                &ResolvedAuth::ApiKey("key".to_string()),
+                1_000,
+                MIN_OAUTH_VALIDITY_SECONDS
+            ),
+            None
+        );
     }
 }

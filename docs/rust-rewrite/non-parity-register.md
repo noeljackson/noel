@@ -275,7 +275,10 @@ https://github.com/noeljackson/pi/issues. Upstream uploads the report to its
 Radius gateway or exports a zip, can attach the transcript or a model-written
 summary, records a `pi.bug-report` session entry, attaches its crash log, and
 suggests `/bug` after unexplained errors. Rust does none of these; the
-transcript is shared only through an explicit `/export`.
+transcript is shared only through an explicit `/export`. Error text is
+redacted before it is written: secret query values in any URL it mentions,
+`Bearer`/`Basic` credentials, and API-key-shaped tokens (`sk-…`, `AIza…`,
+GitHub, Slack, and AWS access key ids).
 
 Reason: upstream reports go to the upstream developers' service, while this
 port's bugs belong in its own tracker. A local file that the user reviews and
@@ -289,6 +292,10 @@ as Rust's `--theme` does. Upstream also accepts a `light/dark` pair and picks
 a half from the terminal's reported background. Rust has no terminal
 appearance detection, so it rejects pairs with an error, and a `light/dark`
 `theme` setting still falls back to the system theme with a diagnostic.
+`--use-theme` also conflicts with `--theme` and `--no-themes`: upstream
+combines them because its `--theme` loads theme files and `--no-themes` only
+skips discovery, while Rust's `--theme` selects the run's theme and
+`--no-themes` clears it, so one flag would silently override the other.
 
 Reason: choosing a half without asking the terminal would silently guess.
 
@@ -299,7 +306,24 @@ output, and exit codes, and add `--account <name>` to choose one of pi's named
 accounts. Credentials resolve in pi's usual order (stored account,
 environment, imported CLI logins), so environment keys and imported logins
 count as configured; upstream's `--model` lookup and bearer-token printing
-consider only stored credentials.
+consider only stored credentials. With `--account`, a `--model` several
+providers serve resolves to the providers that have that account.
 
 Reason: pi stores several accounts per provider (see Named Multi-Account
 auth.json), and `pi auth` should report the credential a session would use.
+
+### `pi auth` Refreshes Imported Logins Only Once They Expire
+
+`print-bearer-token` and `check` refresh pi's own OAuth tokens that expire
+within `--min-expiry` (default 30m) or five minutes, as upstream does. A login
+pi reads from Claude Code's `~/.claude/.credentials.json` or Codex's
+`~/.codex/auth.json` refreshes only once it expires, as on the request path;
+a sooner expiry is printed, or reported ready, with a warning on stderr.
+`check --json` adds `"expiresSoon": true` to a ready OAuth token that expires
+within five minutes, a field upstream's output lacks.
+
+Reason: those CLIs rotate single-use refresh tokens and pi never writes
+refreshed tokens back to their files, so an early refresh from `pi auth` would
+sign the user out of Claude Code or Codex. After pi refreshes such a login it
+keeps its own `claude-import`/`codex-import` account, which refreshes early
+like any stored account.
