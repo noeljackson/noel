@@ -620,7 +620,10 @@ Executable extensions can opt into the JSON protocol with an adjacent
 `.pi-extension.json` manifest. A manifest `tools` array registers model-callable
 tools; Pi sends `kind: "tool"` JSON requests on stdin and expects a JSON
 response with `output` or `error`. Like `bash`, a tool process has no
-controlling terminal, and an interrupted call kills its process group:
+controlling terminal, and an interrupted call kills its process group. A
+call that a stop cut off never runs again when its turn continues unless the
+tool declares `"replaySafe": true` (it only reads, so running it twice is
+harmless):
 
 ```json
 {
@@ -633,7 +636,8 @@ controlling terminal, and an interrupted call kills its process group:
         "type": "object",
         "properties": { "text": { "type": "string" } },
         "required": ["text"]
-      }
+      },
+      "replaySafe": true
     }
   ]
 }
@@ -898,11 +902,11 @@ string is not a line break. stdout carries only protocol records; diagnostics
 go to stderr. RPC mode starts when stdin is not a terminal and takes no prompt
 arguments.
 
-Commands: `prompt` (with `images` and `streamingBehavior`), `steer`,
-`follow_up`, `abort`, `clear_queue`, `get_state`, `get_messages`,
-`get_last_assistant_text`, `new_session`, `switch_session`, `set_model`,
-`set_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`, and
-`set_session_name`. Other upstream commands answer
+Commands: `prompt` (with `images`, `streamingBehavior`, and `requestId`),
+`steer`, `follow_up`, `abort`, `resume_run`, `clear_queue`, `get_state`,
+`get_messages`, `get_last_assistant_text`, `new_session`, `switch_session`,
+`set_model`, `set_thinking_level`, `set_steering_mode`, `set_follow_up_mode`,
+`compact`, and `set_session_name`. Other upstream commands answer
 `Unsupported command: <type>`, and unknown types `Unknown command: <type>`.
 
 A `prompt` that starts a run answers `{"disposition":"started","runId":"…"}`,
@@ -914,22 +918,68 @@ delivered in it, after the turn that would otherwise end it. `abort` answers
 once the run has settled, or at once when no run is active, and leaves queued
 messages for the next prompt. While a run is active, a `prompt` needs
 `streamingBehavior` (`steer` or `followUp`); `set_model`,
-`set_thinking_level`, `compact`, `new_session`, `switch_session`, and
-`set_session_name` are refused; and `get_state`, `get_messages`, and
-`get_last_assistant_text` answer from the run's current state. `set_model`
-changes the session's model, not the default model in `settings.json`.
+`set_thinking_level`, `compact`, `new_session`, `switch_session`,
+`set_session_name`, and `resume_run` are refused; and `get_state`,
+`get_messages`, and `get_last_assistant_text` answer from the run's current
+state. `set_model` changes the session's model, not the default model in
+`settings.json`.
 
-pi adds two extensions, listed in `get_state.rpcExtensions`:
+pi adds four extensions, listed in `get_state.rpcExtensions`:
 
 - `run-id`: every run has a `runId` (a UUID), given in the `prompt` response,
   `agent_start`, `agent_settled`, and `get_state` while the run is active.
 - `expected-run-id`: `steer`, `follow_up`, and `abort` take an optional
   `expectedRunId`. Unless it names the active run, the command fails and
   changes nothing.
+- `request-id`: `prompt` takes an optional `requestId`. A prompt that repeats
+  one the session knows starts nothing and answers with that run's `runId`:
+  `{"disposition":"started"}` while the run is running or interrupted, and
+  `{"disposition":"handled"}` once it completed, failed, or was aborted. A
+  queued prompt (`streamingBehavior` during a run) cannot have one.
+- `resume-run`: `get_state.lastRun` describes the session's last run, and
+  `resume_run` continues it after a stop interrupted it.
+
+Runs are saved in the session journal: a run's start together with its
+prompt before `prompt` answers, and how it ended before `agent_settled`. A run
+that started and never ended is `interrupted`: pi crashed, was killed or
+ended by a signal, or saw stdin close mid-run. pi never resumes a run by
+itself.
+
+`get_state.lastRun` is `{runId, requestId, status, phase, pendingTools}`,
+without the fields that do not apply, and absent while the session has no run.
+`status` is `running`, `interrupted`, `completed`, `failed`, or `aborted`. For
+an interrupted run, `phase` is `model` when the saved context needs a model
+request and `tools` when the last reply has tool calls without results, which
+`pendingTools` lists as `{id, name, replaySafe}`. Without a `phase`, the run
+stopped after its last reply was saved, and resuming it just completes it.
+
+`resume_run {expectedRunId}` fails unless `expectedRunId` names the last run
+and that run is interrupted. It answers `{"disposition":"started","runId":…}`,
+and the run reports `agent_start` through `agent_settled` under the same
+`runId`. A tool call without a result runs again only if it is replay-safe:
+`read`, `grep`, `find`, `ls`, and extension tools whose manifest declares
+`"replaySafe": true`. Those run first, in the turn of the reply that called
+them, which is reported again as saved. Every other call (`bash`, `edit`,
+`write`, `todo`, the web tools, other extension tools) never runs again, and
+the model is told it was interrupted. A model request the stop cut off is sent
+again, and billed again. So a prompt is applied once, a call that is not
+replay-safe runs at most once, and a replay-safe one at least once.
+
+With no run active, `abort` ends an interrupted last run as `aborted` (with
+`expectedRunId`, only the run it names), and a new `prompt` ends it the same
+way before it starts. So a supervisor that restarts reads `lastRun`, then
+resumes the run it started, aborts it, or reads how it ended.
+
+The queue is saved with the session. `steer`, `follow_up`, and queued
+prompts are saved before they are acknowledged; a delivered message leaves
+the saved queue once its user message is saved; `clear_queue` saves the empty
+queue. RPC mode loads the saved queue at startup and on `switch_session`, so
+`pendingMessageCount` counts it; `new_session` starts empty. The TUI shares
+the saved queue and delivers saved steering as follow-ups.
 
 Closing stdin while no run is active exits with status 0. Closing it during a
 run stops the run where it is, kills its tool processes, and exits with status
-0 without `agent_settled`.
+0 without `agent_settled`; the run stays interrupted.
 
 Differences from upstream are listed under "RPC Mode" in
 `docs/rust-rewrite/non-parity-register.md`.
@@ -1087,8 +1137,11 @@ follow-ups finish — or until you are idle between prompts with nothing
 streaming — so a rebuild never interrupts work or lands under your fingers
 while typing. Interactive startup and `/resume` automatically continue
 unfinished model turns from saved context, then drain queued follow-ups. No
-synthetic user prompt is added and saved tool calls are not replayed; missing
-results are reported to the provider as interrupted calls. Completed direct
+synthetic user prompt is added, and saved results are reused. A tool call
+without a result runs again only if it is replay-safe (`read`, `grep`, `find`,
+`ls`, and extension tools whose manifest declares `"replaySafe": true`); any
+other call never runs again and is reported to the provider as interrupted.
+Completed direct
 slash tools do not trigger continuation. Ctrl+C/Esc, `/quit`, and errors still
 stop the active run; rebuild restarts wait for a completed boundary so a stop
 cannot turn into an automatic restart/retry loop. The agent safety limit is

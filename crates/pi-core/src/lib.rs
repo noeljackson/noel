@@ -108,6 +108,45 @@ pub struct SessionUsage {
     pub requests: u64,
 }
 
+/// A run's identity, saved on the record of the prompt that starts it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStart {
+    pub id: String,
+    /// The client's id for the prompt; a prompt that repeats it gets this
+    /// run instead of starting another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+/// A run: a prompt and the work it caused, until it settled. RPC mode
+/// starts runs; the journal keeps their identity apart from the messages,
+/// which compaction and `/undo` rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Run {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub status: RunStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    /// Started by this process, which has not finished it yet.
+    Running,
+    /// Started by a process that stopped before finishing it.
+    Interrupted,
+    Completed,
+    Failed,
+    Aborted,
+}
+
+impl RunStatus {
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Aborted)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
     pub session_id: String,
@@ -118,6 +157,11 @@ pub struct SessionState {
     pub messages: Vec<ConversationMessage>,
     pub tool_history: Vec<ToolEvent>,
     pub queued_messages: Vec<String>,
+    /// How many of `queued_messages`, from the front, are steering for a
+    /// run's next provider round; the rest are follow-ups. Only RPC mode
+    /// queues steering: the TUI turns leftover steering into follow-ups.
+    #[serde(default)]
+    pub queued_steering: usize,
     #[serde(default)]
     pub compactions: Vec<CompactionRecord>,
     #[serde(default)]
@@ -136,9 +180,62 @@ pub struct SessionState {
     pub edited_files: Vec<String>,
     #[serde(default)]
     pub usage: SessionUsage,
+    /// The session's runs, oldest first.
+    #[serde(default)]
+    pub runs: Vec<Run>,
 }
 
 impl SessionState {
+    /// The saved queue: its steering, then its follow-ups.
+    pub fn saved_queue(&self) -> (&[String], &[String]) {
+        let steering = self.queued_steering.min(self.queued_messages.len());
+        self.queued_messages.split_at(steering)
+    }
+
+    /// The run a prompt with `request_id` started, if one did.
+    pub fn run_for_request(&self, request_id: &str) -> Option<&Run> {
+        self.runs
+            .iter()
+            .rev()
+            .find(|run| run.request_id.as_deref() == Some(request_id))
+    }
+
+    fn set_run_status(&mut self, run_id: &str, status: RunStatus) {
+        if let Some(run) = self.runs.iter_mut().rev().find(|run| run.id == run_id) {
+            run.status = status;
+        }
+    }
+
+    /// The tool calls of the last reply that have no saved result, with
+    /// that reply, when only tool results follow it: what a turn stopped
+    /// during its tool calls still owes.
+    pub fn pending_tool_calls(&self) -> Option<(&ConversationMessage, Vec<&ChatToolCall>)> {
+        let results = self
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| message.role == MessageRole::Tool)
+            .count();
+        let reply_index = self.messages.len().checked_sub(results + 1)?;
+        let (reply, results) = (
+            &self.messages[reply_index],
+            &self.messages[reply_index + 1..],
+        );
+        if reply.role != MessageRole::Assistant {
+            return None;
+        }
+        let pending = reply
+            .tool_calls
+            .iter()
+            .filter(|call| {
+                !results
+                    .iter()
+                    .any(|result| result.tool_call_id.as_deref() == Some(call.id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        (!pending.is_empty()).then_some((reply, pending))
+    }
+
     /// Model work awaiting a reply. Direct slash-tool results complete their
     /// turn without an assistant reply and have no model tool-call id.
     pub fn has_unfinished_turn(&self) -> bool {
@@ -162,6 +259,7 @@ impl SessionState {
             messages: Vec::new(),
             tool_history: Vec::new(),
             queued_messages: Vec::new(),
+            queued_steering: 0,
             compactions: Vec::new(),
             branch_summaries: Vec::new(),
             active_model: None,
@@ -172,6 +270,7 @@ impl SessionState {
             todos: Vec::new(),
             edited_files: Vec::new(),
             usage: SessionUsage::default(),
+            runs: Vec::new(),
         }
     }
 }
@@ -275,7 +374,9 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         parent_session_id: export.parent_session_id,
         messages: export.messages,
         tool_history: export.tool_history,
+        // An imported session has no run for steering to join.
         queued_messages: export.queued_messages,
+        queued_steering: 0,
         compactions: export.compactions,
         branch_summaries: export.branch_summaries,
         active_model: export.active_model,
@@ -286,6 +387,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         todos: export.todos,
         edited_files: export.edited_files,
         usage: export.usage,
+        // Runs belong to the session that ran them.
+        runs: Vec::new(),
     }
 }
 
@@ -370,6 +473,9 @@ pub struct ExtensionTool {
     pub extension_name: String,
     pub extension_path: PathBuf,
     pub protocol: String,
+    /// The manifest's `replaySafe`: a call cut off by a stop may run again
+    /// when the turn continues.
+    pub replay_safe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,6 +724,10 @@ enum SessionRecord {
     },
     Message {
         message: ConversationMessage,
+        /// Set on the prompt that starts a run: one record, so a run is
+        /// never saved without its prompt. Older versions ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<RunStart>,
     },
     MessagesSnapshot {
         messages: Vec<ConversationMessage>,
@@ -649,8 +759,12 @@ enum SessionRecord {
     QueuedMessage {
         message: String,
     },
+    /// The whole queue. The first `steering` messages are steering; older
+    /// versions read them all as follow-ups, as the TUI does.
     QueuedMessagesSnapshot {
         messages: Vec<String>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        steering: usize,
     },
     Compaction {
         record: CompactionRecord,
@@ -662,9 +776,19 @@ enum SessionRecord {
     BranchSummary {
         summary: BranchSummary,
     },
+    /// How a run ended: completed, failed, or aborted. A run that started
+    /// without one was interrupted.
+    RunFinished {
+        run_id: String,
+        status: RunStatus,
+    },
     /// Records written by other binary versions are ignored on load.
     #[serde(other)]
     Unknown,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// A session journal opened for writing. Every constructor takes the session
@@ -713,6 +837,8 @@ impl SessionStore {
         let store = Self::writer(path)?;
         let mut state = source.clone();
         state.session_id = session_id.clone();
+        // A fork is a new session: the source's runs stay with the source.
+        state.runs.clear();
         state.parent_session_id = if clone_parent {
             source.parent_session_id.clone()
         } else {
@@ -807,7 +933,7 @@ impl SessionStore {
     }
 
     pub fn record_message(&self, message: ConversationMessage) -> Result<(), SessionError> {
-        self.append(&SessionRecord::Message { message })
+        self.append(&SessionRecord::Message { message, run: None })
     }
 
     pub fn record_messages_snapshot(
@@ -857,11 +983,22 @@ impl SessionStore {
         self.append(&SessionRecord::QueuedMessage { message })
     }
 
+    /// Saves the whole queue as follow-ups.
     pub fn record_queued_messages_snapshot(
         &self,
         messages: Vec<String>,
     ) -> Result<(), SessionError> {
-        self.append(&SessionRecord::QueuedMessagesSnapshot { messages })
+        self.record_queue(Vec::new(), messages)
+    }
+
+    /// Saves the whole queue: steering for a run's next provider round,
+    /// then follow-ups.
+    pub fn record_queue(
+        &self,
+        steering: Vec<String>,
+        follow_ups: Vec<String>,
+    ) -> Result<(), SessionError> {
+        self.append(&queue_record(steering, follow_ups))
     }
 
     pub fn record_compaction(&self, record: CompactionRecord) -> Result<(), SessionError> {
@@ -1067,12 +1204,13 @@ impl SessionStore {
                 usage: state.usage.clone(),
             },
         ];
+        // Fork and import start new sessions, which have no runs yet.
         records.extend(
             state
                 .messages
                 .iter()
                 .cloned()
-                .map(|message| SessionRecord::Message { message }),
+                .map(|message| SessionRecord::Message { message, run: None }),
         );
         records.extend(
             state
@@ -1081,13 +1219,10 @@ impl SessionStore {
                 .cloned()
                 .map(|event| SessionRecord::Tool { event }),
         );
-        records.extend(
-            state
-                .queued_messages
-                .iter()
-                .cloned()
-                .map(|message| SessionRecord::QueuedMessage { message }),
-        );
+        if !state.queued_messages.is_empty() {
+            let (steering, follow_ups) = state.saved_queue();
+            records.push(queue_record(steering.to_vec(), follow_ups.to_vec()));
+        }
         records.extend(
             state
                 .compactions
@@ -1127,6 +1262,16 @@ fn metadata_record(state: &SessionState) -> SessionRecord {
         name: state.name.clone(),
         labels: state.labels.iter().cloned().collect(),
         parent_session_id: state.parent_session_id.clone(),
+    }
+}
+
+fn queue_record(steering: Vec<String>, follow_ups: Vec<String>) -> SessionRecord {
+    let count = steering.len();
+    let mut messages = steering;
+    messages.extend(follow_ups);
+    SessionRecord::QueuedMessagesSnapshot {
+        messages,
+        steering: count,
     }
 }
 
@@ -1199,7 +1344,16 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             state.labels = labels.into_iter().collect();
             state.parent_session_id = parent_session_id;
         }
-        SessionRecord::Message { message } => state.messages.push(message),
+        SessionRecord::Message { message, run } => {
+            state.messages.push(message);
+            // Whatever started a run, a load did not: it was interrupted
+            // unless a `run_finished` record follows.
+            state.runs.extend(run.map(|run| Run {
+                id: run.id,
+                request_id: run.request_id,
+                status: RunStatus::Interrupted,
+            }));
+        }
         SessionRecord::MessagesSnapshot { messages } => state.messages = messages,
         SessionRecord::Tool { event } => state.tool_history.push(event),
         SessionRecord::ActiveModel { model } => state.active_model = model,
@@ -1212,7 +1366,10 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         SessionRecord::Todos { todos } => state.todos = todos,
         SessionRecord::EditedFiles { paths } => state.edited_files = paths,
         SessionRecord::QueuedMessage { message } => state.queued_messages.push(message),
-        SessionRecord::QueuedMessagesSnapshot { messages } => state.queued_messages = messages,
+        SessionRecord::QueuedMessagesSnapshot { messages, steering } => {
+            state.queued_messages = messages;
+            state.queued_steering = steering;
+        }
         SessionRecord::Compaction { record } => state.compactions.push(record),
         SessionRecord::CompactionCheckpoint { record, messages } => {
             state.messages = messages;
@@ -1220,6 +1377,7 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         }
         SessionRecord::BranchSummary { summary } => state.branch_summaries.push(summary),
         SessionRecord::Usage { usage } => state.usage = usage,
+        SessionRecord::RunFinished { run_id, status } => state.set_run_status(&run_id, status),
     }
 }
 
@@ -1975,11 +2133,13 @@ impl Runtime {
         Ok(())
     }
 
+    /// Replaces the queue with `messages`, all follow-ups.
     pub fn replace_queued_messages(&mut self, messages: Vec<String>) -> Result<(), SessionError> {
         if let Some(store) = &self.store {
             store.record_queued_messages_snapshot(messages.clone())?;
         }
         self.session.queued_messages = messages;
+        self.session.queued_steering = 0;
         Ok(())
     }
 
@@ -1987,6 +2147,70 @@ impl Runtime {
         let count = self.session.queued_messages.len();
         self.replace_queued_messages(Vec::new())?;
         Ok(count)
+    }
+
+    /// Starts run `start`: saves its prompt as a user message, together
+    /// with the run's start, and returns the message for
+    /// [`run_saved_prompt_streaming_events`]. An interrupted last run is
+    /// recorded as aborted first.
+    pub fn start_run(
+        &mut self,
+        start: RunStart,
+        prompt: String,
+        media: Vec<MediaInput>,
+    ) -> Result<ConversationMessage, SessionError> {
+        let interrupted = self
+            .session
+            .runs
+            .last()
+            .filter(|run| run.status == RunStatus::Interrupted)
+            .map(|run| run.id.clone());
+        if let Some(run_id) = interrupted {
+            self.finish_run(&run_id, RunStatus::Aborted)?;
+        }
+        let message = user_message(prompt, media);
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::Message {
+                message: message.clone(),
+                run: Some(start.clone()),
+            })?;
+        }
+        self.session.messages.push(message.clone());
+        self.session.runs.push(Run {
+            id: start.id,
+            request_id: start.request_id,
+            status: RunStatus::Running,
+        });
+        Ok(message)
+    }
+
+    /// This process continues the interrupted run `run_id`. Nothing is
+    /// saved: if this process stops too, the run is interrupted again.
+    pub fn resume_run(&mut self, run_id: &str) {
+        self.session.set_run_status(run_id, RunStatus::Running);
+    }
+
+    /// Records how run `run_id` ended. The status changes even if saving
+    /// it fails, since this process is no longer running the run.
+    pub fn finish_run(&mut self, run_id: &str, status: RunStatus) -> Result<(), SessionError> {
+        self.session.set_run_status(run_id, status);
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::RunFinished {
+                run_id: run_id.to_owned(),
+                status,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Whether a tool call cut off by a stop may run again when its turn
+    /// continues: `read`, `grep`, `find`, `ls`, and extension tools whose
+    /// manifest declares `"replaySafe": true`.
+    pub fn replay_safe(&self, tool: &str) -> bool {
+        match self.systems.extension_tools.get(tool) {
+            Some(extension) => extension.replay_safe,
+            None => matches!(tool, "read" | "grep" | "find" | "ls"),
+        }
     }
 
     /// Removes the latest user message and everything following it. Files,
@@ -2209,11 +2433,16 @@ pub async fn run_user_turn_streaming_with_media(
 /// (the prompt or steering), any compaction, retries and the reply's
 /// `Provider` deltas, the reply, then `ToolStarted`, `ToolOutput` and
 /// `ToolFinished` for each tool call, and `RoundFinished`. A turn that fails
-/// or is cancelled stops mid-round without further events.
+/// or is cancelled stops mid-round without further events. A continued turn
+/// whose saved reply has replay-safe calls without results first finishes
+/// that round: `RoundResumed`, those calls, `RoundFinished`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
     /// A provider round started: one reply and the tool calls it asks for.
     RoundStarted,
+    /// A continued turn finishes the round a stop cut off: this is the
+    /// round's saved reply, whose replay-safe calls run next.
+    RoundResumed(ConversationMessage),
     /// A message was saved: the prompt or steering that opens a round, or
     /// the round's reply after its deltas. Tool results are `ToolOutput`.
     MessageAdded(ConversationMessage),
@@ -2295,17 +2524,22 @@ pub async fn run_user_turn_streaming_events_with_media(
     run: &RunControl,
     on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
-    let message = ConversationMessage {
-        thinking: String::new(),
-        role: MessageRole::User,
-        content: prompt,
-        media,
-        tool_call_id: None,
-        tool_name: None,
-        tool_calls: Vec::new(),
-    };
+    let message = user_message(prompt, media);
     runtime.push_message(message.clone())?;
+    run_saved_prompt_streaming_events(runtime, provider, message, run, on_event).await
+}
 
+/// Runs `message`, a user prompt the caller has just saved (as
+/// [`Runtime::start_run`] does): a tool command runs its tool without the
+/// model, and any other prompt runs provider rounds until a reply calls no
+/// tools.
+pub async fn run_saved_prompt_streaming_events(
+    runtime: &mut Runtime,
+    provider: &dyn Provider,
+    message: ConversationMessage,
+    run: &RunControl,
+    on_event: impl FnMut(&TurnEvent) + Send,
+) -> Result<String, AgentError> {
     if let Some(command) = parse_tool_command(&message.content)? {
         if !model_tool_enabled(runtime, &command.name) {
             return Err(AgentError::DisabledTool(command.name));
@@ -2349,20 +2583,52 @@ pub async fn run_user_turn_streaming_events_with_media(
     run_model_turn_streaming_events(runtime, provider, run, Some(message), on_event).await
 }
 
-/// Continue saved model context without adding a user prompt or replaying
-/// saved tool calls. Completed results are sent back to the provider; missing
-/// results use the existing interrupted-call placeholders so uncertain file
-/// edits/commands are never silently executed twice.
+/// Continues an unfinished turn from its saved context, without adding a
+/// user prompt. Saved results go back to the provider. A tool call without
+/// a result runs again only if it is replay-safe ([`Runtime::replay_safe`]);
+/// any other call never runs again and is reported to the provider as
+/// interrupted, so an uncertain edit or command never runs twice. A request
+/// the stop cut off is simply sent again.
 pub async fn continue_turn_streaming_events(
     runtime: &mut Runtime,
     provider: &dyn Provider,
     run: &RunControl,
-    on_event: impl FnMut(&TurnEvent) + Send,
+    mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     if !runtime.session().has_unfinished_turn() {
         return Ok(String::new());
     }
+    rerun_replay_safe_calls(runtime, run, &mut on_event).await?;
     run_model_turn_streaming_events(runtime, provider, run, None, on_event).await
+}
+
+/// Runs the replay-safe calls the last reply still owes results for, as the
+/// end of that reply's round.
+async fn rerun_replay_safe_calls(
+    runtime: &mut Runtime,
+    run: &RunControl,
+    on_event: &mut (impl FnMut(&TurnEvent) + Send),
+) -> Result<(), AgentError> {
+    let Some((reply, pending)) = runtime.session.pending_tool_calls() else {
+        return Ok(());
+    };
+    let calls = pending
+        .into_iter()
+        .filter(|call| runtime.replay_safe(&call.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if calls.is_empty() {
+        return Ok(());
+    }
+    on_event(&TurnEvent::RoundResumed(reply.clone()));
+    for call in calls {
+        // The journal does not record how the reply stopped. A reply cut
+        // off at the output limit gets its calls' error results right after
+        // it is saved, so its calls are not left for here; these only read.
+        run_tool_call(runtime, run, call, false, on_event).await?;
+    }
+    on_event(&TurnEvent::RoundFinished);
+    Ok(())
 }
 
 /// Runs provider rounds until a reply calls no tools. `prompt` is the user
@@ -2494,44 +2760,7 @@ async fn run_model_turn_streaming_events(
         }
 
         for tool_call in tool_calls {
-            if run.cancellation.is_cancelled() {
-                return Err(AgentError::Cancelled);
-            }
-            on_event(&TurnEvent::ToolStarted {
-                call: tool_call.clone(),
-            });
-            let started = Instant::now();
-            // A reply cut off at the output limit runs none of its calls:
-            // each is saved and reported with the error asking to re-issue it.
-            let result = if truncated {
-                fail_truncated_tool_call(runtime, &tool_call)
-            } else {
-                run.until_cancelled(execute_model_tool_call(runtime, &tool_call))
-                    .await?
-            };
-            let duration = started.elapsed();
-            let event = runtime
-                .session
-                .tool_history
-                .last()
-                .filter(|event| event.id == tool_call.id);
-            let is_error = result.is_err() || event.is_some_and(|event| event.is_error);
-            if let Some(event) = event {
-                on_event(&TurnEvent::ToolOutput {
-                    call: tool_call.clone(),
-                    output: event.result.clone(),
-                    is_error,
-                    duration,
-                });
-            }
-            if tool_call.name == "todo" {
-                on_event(&TurnEvent::TodosUpdated(runtime.session.todos.clone()));
-            }
-            on_event(&TurnEvent::ToolFinished {
-                name: tool_call.name.clone(),
-                is_error,
-            });
-            result?;
+            run_tool_call(runtime, run, tool_call, truncated, &mut on_event).await?;
         }
         on_event(&TurnEvent::RoundFinished);
     }
@@ -2541,19 +2770,71 @@ async fn run_model_turn_streaming_events(
     })
 }
 
+/// Runs one tool call of a reply, saving and reporting its result. A call
+/// of a reply cut off at the output limit (`truncated`) is not run: its
+/// saved and reported result is the error asking to re-issue it.
+async fn run_tool_call(
+    runtime: &mut Runtime,
+    run: &RunControl,
+    tool_call: ChatToolCall,
+    truncated: bool,
+    on_event: &mut (impl FnMut(&TurnEvent) + Send),
+) -> Result<(), AgentError> {
+    if run.cancellation.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    on_event(&TurnEvent::ToolStarted {
+        call: tool_call.clone(),
+    });
+    let started = Instant::now();
+    let result = if truncated {
+        fail_truncated_tool_call(runtime, &tool_call)
+    } else {
+        run.until_cancelled(execute_model_tool_call(runtime, &tool_call))
+            .await?
+    };
+    let duration = started.elapsed();
+    let event = runtime
+        .session
+        .tool_history
+        .last()
+        .filter(|event| event.id == tool_call.id);
+    let is_error = result.is_err() || event.is_some_and(|event| event.is_error);
+    if let Some(event) = event {
+        on_event(&TurnEvent::ToolOutput {
+            call: tool_call.clone(),
+            output: event.result.clone(),
+            is_error,
+            duration,
+        });
+    }
+    if tool_call.name == "todo" {
+        on_event(&TurnEvent::TodosUpdated(runtime.session.todos.clone()));
+    }
+    on_event(&TurnEvent::ToolFinished {
+        name: tool_call.name,
+        is_error,
+    });
+    result
+}
+
+fn user_message(prompt: String, media: Vec<MediaInput>) -> ConversationMessage {
+    ConversationMessage {
+        thinking: String::new(),
+        role: MessageRole::User,
+        content: prompt,
+        media,
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+    }
+}
+
 /// Pending steering as one user message: a burst reads as one instruction
 /// (joined with [`STEERING_JOIN`]), not several interruptions.
 fn steering_message(steering: &SteeringMailbox) -> Option<ConversationMessage> {
     let messages = steering.take_batch();
-    (!messages.is_empty()).then(|| ConversationMessage {
-        thinking: String::new(),
-        role: MessageRole::User,
-        content: messages.join(STEERING_JOIN),
-        media: Vec::new(),
-        tool_call_id: None,
-        tool_name: None,
-        tool_calls: Vec::new(),
-    })
+    (!messages.is_empty()).then(|| user_message(messages.join(STEERING_JOIN), Vec::new()))
 }
 
 /// Saves `message` to the session and reports it.
@@ -2941,6 +3222,8 @@ struct ExtensionToolManifest {
     name: String,
     description: Option<String>,
     parameters: Option<Value>,
+    #[serde(default)]
+    replay_safe: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2993,6 +3276,7 @@ fn extension_tools_from_resources(extensions: &[ResourceFile]) -> BTreeMap<Strin
                     extension_name: extension.name.clone(),
                     extension_path: extension.path.clone(),
                     protocol: protocol.clone(),
+                    replay_safe: tool.replay_safe,
                 },
             );
         }
@@ -6089,7 +6373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuation_uses_saved_results_and_missing_call_placeholders_without_replay() {
+    async fn continuation_reruns_replay_safe_calls_and_reports_the_rest_as_interrupted() {
         struct ContinuationProvider {
             requests: Arc<Mutex<Vec<ProviderRequest>>>,
         }
@@ -6115,6 +6399,7 @@ mod tests {
         let cwd = std::env::temp_dir().join(format!("pi-continuation-{}", new_session_id()));
         fs::create_dir_all(&cwd).unwrap();
         fs::write(cwd.join("new.txt"), "new result").unwrap();
+        fs::write(cwd.join("again.txt"), "read again").unwrap();
         let (store, state) = SessionStore::create(&cwd.join("sessions"), cwd.clone()).unwrap();
         let path = store.path().to_path_buf();
         let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
@@ -6127,17 +6412,23 @@ mod tests {
             tool_name: None,
             tool_calls,
         };
+        let call = |id: &str, name: &str, arguments: &str| ChatToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        };
         let calls = vec![
-            ChatToolCall {
-                id: "saved".into(),
-                name: "write".into(),
-                arguments: r#"{"path":"saved.txt","content":"must not replay"}"#.into(),
-            },
-            ChatToolCall {
-                id: "missing".into(),
-                name: "write".into(),
-                arguments: r#"{"path":"missing.txt","content":"uncertain side effect"}"#.into(),
-            },
+            call(
+                "saved",
+                "write",
+                r#"{"path":"saved.txt","content":"must not replay"}"#,
+            ),
+            call(
+                "missing",
+                "write",
+                r#"{"path":"missing.txt","content":"uncertain side effect"}"#,
+            ),
+            call("again", "read", r#"{"path":"again.txt"}"#),
         ];
         let mut user = message(MessageRole::User, "finish the work", None, vec![]);
         user.media.push(MediaInput {
@@ -6181,6 +6472,11 @@ mod tests {
         let before = runtime.session().clone();
         let (store, state) = SessionStore::open(path.clone()).unwrap();
         let mut reopened = Runtime::with_store(state, ReloadableSystems::default(), store);
+        let pending = reopened.session().pending_tool_calls().unwrap().1;
+        assert_eq!(
+            pending.iter().map(|call| &call.id).collect::<Vec<_>>(),
+            ["missing", "again"]
+        );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = ContinuationProvider {
             requests: requests.clone(),
@@ -6215,16 +6511,28 @@ mod tests {
             reopened.session().active_thinking_level,
             before.active_thinking_level
         );
+        // The interrupted writes never run again; the read does, in the
+        // round its saved reply started.
         assert!(!cwd.join("saved.txt").exists());
         assert!(!cwd.join("missing.txt").exists());
-        assert_eq!(reopened.session().tool_history.len(), 2);
+        assert_eq!(
+            trace(&events[..5]),
+            [
+                r#"round resumed: assistant "working" -> saved -> missing -> again"#,
+                r#"tool again read {"path":"again.txt"}"#,
+                r#"output again "read again""#,
+                "finished read",
+                "round finished",
+            ]
+        );
         assert_eq!(
             events
                 .iter()
                 .filter(|event| matches!(event, TurnEvent::ToolStarted { .. }))
                 .count(),
-            1
+            2
         );
+        assert_eq!(reopened.session().tool_history.len(), 3);
         let captured = requests.lock().unwrap().clone();
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0].messages[0].media, before.messages[0].media);
@@ -6234,6 +6542,11 @@ mod tests {
             Some("missing")
         );
         assert!(captured[0].messages[3].content.contains("did not complete"));
+        assert_eq!(
+            captured[0].messages[4].tool_call_id.as_deref(),
+            Some("again")
+        );
+        assert_eq!(captured[0].messages[4].content, "read again");
         assert_eq!(captured[1].messages.last().unwrap().content, "new result");
         assert!(!reopened.session().has_unfinished_turn());
         assert_eq!(SessionStore::open(path).unwrap().1, *reopened.session());
@@ -7331,6 +7644,182 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn the_saved_queue_keeps_steering_ahead_of_follow_ups() {
+        let base = durable_test_dir("queue-kinds");
+        let (store, _) = SessionStore::create(&base, base.clone()).unwrap();
+        let path = store.path().to_path_buf();
+        store
+            .record_queue(vec!["steer".into()], vec!["follow".into()])
+            .unwrap();
+        let last_line = |path: &Path| {
+            let journal = fs::read_to_string(path).unwrap();
+            journal.lines().last().unwrap().to_owned()
+        };
+        // An older pi reads the same record as two follow-ups.
+        assert_eq!(
+            last_line(&path),
+            r#"{"type":"queued_messages_snapshot","messages":["steer","follow"],"steering":1}"#
+        );
+        let loaded = SessionStore::read(&path).unwrap();
+        let queue = (vec!["steer".to_owned()], vec!["follow".to_owned()]);
+        let saved = |state: &SessionState| {
+            let (steering, follow_ups) = state.saved_queue();
+            (steering.to_vec(), follow_ups.to_vec())
+        };
+        assert_eq!(saved(&loaded), queue);
+        let (fork, _) = SessionStore::fork(&base, &loaded, false).unwrap();
+        assert_eq!(saved(&SessionStore::read(fork.path()).unwrap()), queue);
+
+        // The TUI queues everything as follow-ups, in the same record.
+        let mut runtime = Runtime::with_store(loaded, ReloadableSystems::default(), store);
+        runtime
+            .replace_queued_messages(vec!["steer".into(), "follow".into()])
+            .unwrap();
+        assert_eq!(
+            last_line(&path),
+            r#"{"type":"queued_messages_snapshot","messages":["steer","follow"]}"#
+        );
+        assert_eq!(
+            saved(&SessionStore::read(&path).unwrap()),
+            (vec![], vec!["steer".to_owned(), "follow".to_owned()])
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn runs_are_saved_with_their_prompts_and_outlive_compaction_undo_and_restarts() {
+        let base = durable_test_dir("runs");
+        let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+        let path = store.path().to_path_buf();
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store.clone());
+        let start = |id: &str, request_id: &str| RunStart {
+            id: id.into(),
+            request_id: Some(request_id.into()),
+        };
+        let run = |id: &str, request_id: &str, status| Run {
+            id: id.into(),
+            request_id: Some(request_id.into()),
+            status,
+        };
+        let runs = || SessionStore::read(&path).unwrap().runs;
+
+        // The prompt and the run's start are one record: a load that sees
+        // the run sees its prompt, and the run is interrupted until it ends.
+        let prompt = runtime
+            .start_run(start("run-1", "m-1"), "first".into(), Vec::new())
+            .unwrap();
+        assert_eq!(prompt, test_message(MessageRole::User, "first"));
+        assert_eq!(
+            runtime.session().runs,
+            [run("run-1", "m-1", RunStatus::Running)]
+        );
+        let loaded = SessionStore::read(&path).unwrap();
+        assert_eq!(message_texts(&loaded), ["first"]);
+        assert_eq!(loaded.runs, [run("run-1", "m-1", RunStatus::Interrupted)]);
+        runtime.finish_run("run-1", RunStatus::Completed).unwrap();
+        assert_eq!(runs(), [run("run-1", "m-1", RunStatus::Completed)]);
+
+        // A mid-turn compaction checkpoint and an undo snapshot rewrite the
+        // messages, not the runs.
+        runtime
+            .start_run(start("run-2", "m-2"), "second".into(), Vec::new())
+            .unwrap();
+        let checkpoint = CompactionRecord {
+            kind: CompactionKind::Automatic,
+            omitted_messages: 1,
+            retained_messages: 1,
+            summary: "earlier".into(),
+        };
+        store
+            .record_compaction_checkpoint(
+                checkpoint,
+                vec![
+                    test_message(MessageRole::Assistant, "summary"),
+                    test_message(MessageRole::User, "second"),
+                ],
+            )
+            .unwrap();
+        runtime.undo_last_turn().unwrap();
+        assert_eq!(
+            runs(),
+            [
+                run("run-1", "m-1", RunStatus::Completed),
+                run("run-2", "m-2", RunStatus::Interrupted)
+            ]
+        );
+
+        // After a restart, a new run first ends the interrupted one.
+        let (store, state) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(state.run_for_request("m-2").unwrap().id, "run-2");
+        let mut restarted = Runtime::with_store(state, ReloadableSystems::default(), store);
+        restarted
+            .start_run(start("run-3", "m-3"), "third".into(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            runs(),
+            [
+                run("run-1", "m-1", RunStatus::Completed),
+                run("run-2", "m-2", RunStatus::Aborted),
+                run("run-3", "m-3", RunStatus::Interrupted)
+            ]
+        );
+
+        // Runs stay with the session that ran them: forks and imports, new
+        // sessions, start without any.
+        let source = SessionStore::read(&path).unwrap();
+        let (fork, forked) = SessionStore::fork(&base, &source, false).unwrap();
+        assert!(forked.runs.is_empty());
+        assert!(SessionStore::read(fork.path()).unwrap().runs.is_empty());
+        let (_, imported) =
+            SessionStore::import(&base.join("imported"), SessionExport::from(&source)).unwrap();
+        assert!(imported.runs.is_empty());
+
+        // Journals from before runs load without any.
+        let old = base.join("old.jsonl");
+        fs::write(&old, format!("{STARTED_LINE}{}\n", user_line("old prompt"))).unwrap();
+        let loaded = SessionStore::read(&old).unwrap();
+        assert_eq!(message_texts(&loaded), ["old prompt"]);
+        assert!(loaded.runs.is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn replay_safe_tools_are_the_read_only_file_tools_and_marked_extension_tools() {
+        let base = durable_test_dir("replay-safe");
+        let extension = base.join("tools");
+        fs::write(&extension, "").unwrap();
+        fs::write(
+            base.join("tools.pi-extension.json"),
+            r#"{"protocol":"json","tools":[{"name":"lookup","replaySafe":true},{"name":"deploy"}]}"#,
+        )
+        .unwrap();
+        let mut runtime = Runtime::new(
+            SessionState::new("replay", base.clone()),
+            ReloadableSystems::default(),
+        );
+        runtime.systems.extension_tools = extension_tools_from_resources(&[ResourceFile {
+            name: "tools".into(),
+            path: extension,
+            content: String::new(),
+        }]);
+        for tool in ["read", "grep", "find", "ls", "lookup"] {
+            assert!(runtime.replay_safe(tool), "{tool}");
+        }
+        for tool in [
+            "bash",
+            "edit",
+            "write",
+            "todo",
+            "web_search",
+            "web_fetch",
+            "deploy",
+        ] {
+            assert!(!runtime.replay_safe(tool), "{tool}");
+        }
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[tokio::test]
     async fn excluded_bash_does_not_enter_context() {
         let cwd = std::env::temp_dir().join(format!("pi-excluded-bash-test-{}", new_session_id()));
@@ -7396,19 +7885,21 @@ mod tests {
     /// so they are left out.
     fn trace(events: &[TurnEvent]) -> Vec<String> {
         let flag = |is_error: bool| if is_error { " error" } else { "" };
+        let message = |message: &ConversationMessage| {
+            let role = format!("{:?}", message.role).to_lowercase();
+            let calls = message
+                .tool_calls
+                .iter()
+                .map(|call| format!(" -> {}", call.id))
+                .collect::<String>();
+            format!("{role} {:?}{calls}", message.content)
+        };
         events
             .iter()
             .map(|event| match event {
                 TurnEvent::RoundStarted => "round started".to_string(),
-                TurnEvent::MessageAdded(message) => {
-                    let role = format!("{:?}", message.role).to_lowercase();
-                    let calls = message
-                        .tool_calls
-                        .iter()
-                        .map(|call| format!(" -> {}", call.id))
-                        .collect::<String>();
-                    format!("{role} {:?}{calls}", message.content)
-                }
+                TurnEvent::RoundResumed(reply) => format!("round resumed: {}", message(reply)),
+                TurnEvent::MessageAdded(saved) => message(saved),
                 TurnEvent::Provider(StreamEvent::Text(text)) => format!("text {text:?}"),
                 TurnEvent::Provider(StreamEvent::Thinking(text)) => format!("thinking {text:?}"),
                 TurnEvent::Provider(StreamEvent::ToolCall { id, name, .. }) => {

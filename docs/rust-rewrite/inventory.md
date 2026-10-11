@@ -37,7 +37,7 @@ Primary modes:
 - Print mode via `--print`/`-p` or piped stdin.
 - JSON output via `--mode json`.
 - Upstream's RPC protocol via `--mode rpc` (stdin not a TTY), with the
-  `run-id` and `expected-run-id` extensions.
+  `run-id`, `expected-run-id`, `request-id`, and `resume-run` extensions.
 
 Implemented CLI flags include:
 

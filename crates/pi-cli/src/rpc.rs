@@ -3,12 +3,19 @@
 //! has a `runId`, given in the prompt reply, `agent_start`, `agent_settled`
 //! and `get_state` while it runs. `expected-run-id`: `steer`, `follow_up`
 //! and `abort` take an `expectedRunId` and change nothing unless it names
-//! the active run.
+//! the active run. `request-id`: a `prompt` that repeats a `requestId` gets
+//! the run the first one started. `resume-run`: `get_state.lastRun` says
+//! how the session's last run ended, and `resume_run` continues it if a
+//! stop interrupted it.
 //!
 //! One task reads commands and drives the active run, so records keep the
 //! order things happen in. While a run is active, commands that change the
 //! session are refused and reads answer from a copy of the session that the
 //! run's events keep current. stdout carries only protocol records.
+//!
+//! The session journal saves each run's start with its prompt, before the
+//! prompt is answered, and its end before `agent_settled`. It saves the
+//! queue too, before acknowledging what joins it.
 
 use std::future::Future;
 use std::io::{self, BufRead, Write};
@@ -16,33 +23,37 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::Result;
 use base64::Engine;
-use pi_ai::{MediaInput, ModelRef};
+use pi_ai::ModelRef;
 use pi_config::LoadedConfig;
 use pi_core::{
+    continue_turn_streaming_events, run_saved_prompt_streaming_events,
     run_user_turn_streaming_events_with_media, AgentError, CancellationToken, CompactionKind,
-    ConversationMessage, MessageRole, RunControl, Runtime, SessionState, SessionStore, ToolEvent,
-    TurnEvent,
+    ConversationMessage, MessageRole, RunControl, RunStart, RunStatus, Runtime, SessionState,
+    SessionStore, ToolEvent, TurnEvent,
 };
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::rpc_wire::{
-    Command, Data, Event, Input, Model, Outcome, Prompt, Queue, Recorder, Reply, Request, Response,
-    Source, State, StreamingBehavior, BUSY, RPC_EXTENSIONS,
+    Command, Contents, Data, Event, Input, LastRun, Model, Outcome, Prompt, Queue, Recorder, Reply,
+    Request, Response, Source, State, StreamingBehavior, BUSY, QUEUED_REQUEST, RPC_EXTENSIONS,
 };
 
 type Lines = mpsc::UnboundedReceiver<String>;
 
 /// Serves the protocol until stdin closes. EOF while idle exits; EOF during
-/// a run stops it where it is, without settling it, and exits.
+/// a run stops it where it is, without settling it, and exits: the run
+/// stays interrupted, for `resume_run`.
 pub(crate) async fn run(runtime: Runtime, config: LoadedConfig, offline: bool) -> Result<()> {
     let mut lines = read_lines();
+    let mut shared = Shared::default();
+    shared.open_queue(&runtime);
     let mut rpc = Rpc {
         runtime,
         config,
         offline,
-        shared: Mutex::new(Shared::default()),
+        shared: Mutex::new(shared),
     };
     while let Some(line) = lines.recv().await {
         if let Some(start) = rpc.command(&line).await {
@@ -92,6 +103,15 @@ fn send(record: &impl Serialize) {
     let _ = stdout.write_all(&line).and_then(|()| stdout.flush());
 }
 
+/// Answers the command that starts `start`, before the run's records.
+fn started(request: &Request, start: Start) -> Start {
+    send(&Response::to(
+        request,
+        Ok(Some(Data::started(&start.run_id))),
+    ));
+    start
+}
+
 /// RPC mode between commands: the session runtime and what runs share.
 struct Rpc {
     runtime: Runtime,
@@ -105,7 +125,12 @@ struct Rpc {
 /// both, so the lock is never contended.
 #[derive(Default)]
 struct Shared {
+    /// The queue lives here; the session's copy is read when it opens.
     queue: Queue,
+    /// Where the queue is saved (none with `--no-session`), and what was
+    /// saved last.
+    store: Option<SessionStore>,
+    saved: Contents,
     run: Option<Run>,
 }
 
@@ -121,13 +146,32 @@ struct Run {
     aborts: Vec<Option<Value>>,
 }
 
-/// A prompt accepted to start a run.
+/// A run accepted to start, or to continue.
 struct Start {
     run_id: String,
     provider: Box<dyn pi_ai::Provider>,
     source: Source,
-    prompt: String,
-    media: Vec<MediaInput>,
+    call: Call,
+}
+
+/// What an engine call of a run starts from.
+enum Call {
+    /// The prompt that started the run, saved with its start.
+    Prompt(ConversationMessage),
+    /// Follow-ups taken from the queue.
+    FollowUps(String),
+    /// The saved context of an interrupted run.
+    Resume,
+}
+
+impl Call {
+    fn prompt(&self) -> Option<Prompt> {
+        match self {
+            Call::Prompt(_) => Some(Prompt::Initial),
+            Call::FollowUps(_) => Some(Prompt::FollowUps),
+            Call::Resume => None,
+        }
+    }
 }
 
 impl Rpc {
@@ -135,8 +179,8 @@ impl Rpc {
         self.shared.get_mut().expect("rpc state")
     }
 
-    /// Handles a command while no run is active; a prompt that starts one
-    /// is returned to run.
+    /// Handles a command while no run is active; a prompt that starts a
+    /// run, or a `resume_run`, is returned to run.
     async fn command(&mut self, line: &str) -> Option<Start> {
         let request = match Request::parse(line) {
             Ok(request) => request,
@@ -147,24 +191,25 @@ impl Rpc {
         };
         let reply = match &request.command {
             Err(error) => Err(error.clone()),
-            Ok(Command::Prompt(input)) => match self.start(input).await {
-                Ok(start) => {
-                    send(&Response::to(
-                        &request,
-                        Ok(Some(Data::started(&start.run_id))),
-                    ));
-                    return Some(start);
-                }
-                Err(error) => Err(error),
+            Ok(Command::Prompt(input)) => match self.repeated(input) {
+                Some(data) => Ok(Some(data)),
+                None => match self.start(input).await {
+                    Ok(start) => return Some(started(&request, start)),
+                    Err(error) => Err(error),
+                },
             },
+            Ok(Command::ResumeRun { expected_run_id }) => {
+                match self.resume(expected_run_id).await {
+                    Ok(start) => return Some(started(&request, start)),
+                    Err(error) => Err(error),
+                }
+            }
             Ok(Command::Steer(input)) => self.shared().enqueue(StreamingBehavior::Steer, input),
             Ok(Command::FollowUp(input)) => {
                 self.shared().enqueue(StreamingBehavior::FollowUp, input)
             }
-            Ok(Command::Abort { expected_run_id }) => {
-                self.shared().fence(expected_run_id).map(|()| None)
-            }
-            Ok(Command::ClearQueue) => Ok(Some(self.shared().clear_queue())),
+            Ok(Command::Abort { expected_run_id }) => self.abort(expected_run_id),
+            Ok(Command::ClearQueue) => self.shared().clear_queue(),
             Ok(Command::NewSession { parent_session }) => {
                 self.new_session(parent_session.as_deref())
             }
@@ -189,10 +234,17 @@ impl Rpc {
         None
     }
 
-    /// Checks a prompt before accepting it: its images, and a provider for
-    /// the active model with a usable credential. Each run gets its own, so
-    /// `set_model` applies to the next run.
-    async fn start(&self, input: &Input) -> Result<Start, String> {
+    /// The reply to a prompt whose `requestId` already started a run.
+    fn repeated(&self, input: &Input) -> Option<Data> {
+        let request_id = input.request_id.as_deref()?;
+        let run = self.runtime.session().run_for_request(request_id)?;
+        Some(Data::repeated(run))
+    }
+
+    /// Checks a prompt (its images, and a provider for the active model
+    /// with a usable credential), then saves it with its run's start. Each
+    /// run gets its own provider, so `set_model` applies to the next run.
+    async fn start(&mut self, input: &Input) -> Result<Start, String> {
         if !input.images.is_empty() && crate::images_blocked(&self.config) {
             return Err("images are blocked by settings".into());
         }
@@ -207,34 +259,78 @@ impl Rpc {
                     .map_err(|error| error.to_string())
             })
             .collect::<Result<_, _>>()?;
+        let (provider, source) = self.provider().await?;
+        let run = RunStart {
+            id: run_id(),
+            request_id: input.request_id.clone(),
+        };
+        let run_id = run.id.clone();
+        let prompt = self
+            .runtime
+            .start_run(run, input.message.clone(), media)
+            .map_err(|error| error.to_string())?;
+        Ok(Start {
+            run_id,
+            provider,
+            source,
+            call: Call::Prompt(prompt),
+        })
+    }
+
+    /// Accepts `resume_run` for the session's last run, if a stop
+    /// interrupted it.
+    async fn resume(&mut self, expected_run_id: &str) -> Result<Start, String> {
+        let Some(run) = self.runtime.session().runs.last() else {
+            return Err(format!(
+                "expectedRunId {expected_run_id} does not match: the session has no run"
+            ));
+        };
+        if run.id != expected_run_id {
+            return Err(format!(
+                "expectedRunId {expected_run_id} does not match the last run {}",
+                run.id
+            ));
+        }
+        if run.status != RunStatus::Interrupted {
+            return Err(format!("run {expected_run_id} is not interrupted"));
+        }
+        let (provider, source) = self.provider().await?;
+        self.runtime.resume_run(expected_run_id);
+        Ok(Start {
+            run_id: expected_run_id.to_owned(),
+            provider,
+            source,
+            call: Call::Resume,
+        })
+    }
+
+    /// A provider for the active model with a usable credential, and what
+    /// the run's replies name.
+    async fn provider(&self) -> Result<(Box<dyn pi_ai::Provider>, Source), String> {
         let provider = crate::provider_for_runtime(&self.runtime, &self.config, self.offline)
             .await
             .map_err(|error| error.to_string())?;
         // The provider exists, so the active model is configured.
         let model = self.model().ok_or("the active model is not configured")?;
-        Ok(Start {
-            run_id: run_id(),
-            provider,
-            source: Source {
-                api: model.api,
-                provider: model.provider,
-                model: model.id,
-                thinking_level: self.thinking_level(),
-            },
-            prompt: input.message.clone(),
-            media,
-        })
+        let source = Source {
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            thinking_level: self.thinking_level(),
+        };
+        Ok((provider, source))
     }
 
-    /// Runs a prompt, and the follow-ups queued meanwhile, as one run until
-    /// it settles. Returns `false` if stdin closed during the run.
+    /// Drives a run until it settles: its first engine call, then one per
+    /// batch of follow-ups queued meanwhile. How it ended is saved before
+    /// `agent_settled`. Returns `false` if stdin closed during the run, which
+    /// leaves it interrupted.
     async fn run(&mut self, start: Start, lines: &mut Lines) -> bool {
         let Start {
             run_id,
             provider,
             source,
-            prompt,
-            media,
+            call,
         } = start;
         let control = RunControl {
             steering: self.shared().queue.steering.clone(),
@@ -242,10 +338,15 @@ impl Rpc {
         };
         let mut state = self.state();
         state.is_streaming = true;
+        let mut session = self.runtime.session().clone();
+        if matches!(call, Call::Prompt(_)) {
+            // The engine reports the saved prompt, and the copy takes it then.
+            session.messages.pop();
+        }
         let run = Run {
-            recorder: Recorder::start(run_id, source, &mut |record| send(&record)),
+            recorder: Recorder::start(run_id.clone(), source, &mut |record| send(&record)),
             cancellation: control.cancellation.clone(),
-            session: self.runtime.session().clone(),
+            session,
             state,
             aborts: Vec::new(),
         };
@@ -255,37 +356,56 @@ impl Rpc {
             runtime, shared, ..
         } = self;
         let shared = &*shared;
-        let mut call = Some((prompt, media, Prompt::Initial));
+        let mut next = Some(call);
         let outcome = loop {
-            let Some((prompt, media, kind)) = call.take() else {
+            let Some(call) = next.take() else {
                 break Outcome::Completed;
             };
-            lock(shared).next_call(kind);
-            let before = runtime.session().messages.len();
-            let turn = run_user_turn_streaming_events_with_media(
-                runtime,
-                provider.as_ref(),
-                prompt,
-                media,
-                &control,
-                |event| lock(shared).record(event),
-            );
+            lock(shared).next_call(call.prompt());
+            // Where the messages this call saves start, for the records of
+            // those it does not report; a saved prompt is one of them.
+            let before =
+                runtime.session().messages.len() - usize::from(matches!(call, Call::Prompt(_)));
+            let on_event = |event: &TurnEvent| lock(shared).record(event);
+            let turn = async {
+                let provider = provider.as_ref();
+                match call {
+                    Call::Prompt(prompt) => {
+                        run_saved_prompt_streaming_events(
+                            runtime, provider, prompt, &control, on_event,
+                        )
+                        .await
+                    }
+                    Call::FollowUps(prompt) => {
+                        run_user_turn_streaming_events_with_media(
+                            runtime,
+                            provider,
+                            prompt,
+                            Vec::new(),
+                            &control,
+                            on_event,
+                        )
+                        .await
+                    }
+                    Call::Resume => {
+                        continue_turn_streaming_events(runtime, provider, &control, on_event).await
+                    }
+                }
+            };
             let Some(result) = drive(turn, lines, shared).await else {
                 return false;
             };
             let mut guard = lock(shared);
             guard.call_returned(runtime.session(), before);
             match result {
-                Ok(_) => {
-                    call = guard
-                        .queue
-                        .take_follow_ups()
-                        .map(|prompt| (prompt, Vec::new(), Prompt::FollowUps));
-                }
+                Ok(_) => next = guard.queue.take_follow_ups().map(Call::FollowUps),
                 Err(AgentError::Cancelled) => break Outcome::Aborted,
                 Err(error) => break Outcome::Failed(error.to_string()),
             }
         };
+        if let Err(error) = runtime.finish_run(&run_id, outcome.status()) {
+            eprintln!("pi: {error}");
+        }
         self.shared().settle(outcome);
         true
     }
@@ -314,6 +434,38 @@ impl Rpc {
             pending_message_count,
             rpc_extensions: RPC_EXTENSIONS,
             run_id: None,
+            last_run: LastRun::of(&self.runtime),
+        }
+    }
+
+    /// `abort` while no run is active ends an interrupted last run, so it
+    /// is never resumed.
+    fn abort(&mut self, expected_run_id: &Option<String>) -> Reply {
+        let interrupted = self
+            .runtime
+            .session()
+            .runs
+            .last()
+            .filter(|run| run.status == RunStatus::Interrupted)
+            .map(|run| run.id.clone());
+        match (interrupted, expected_run_id) {
+            (Some(run_id), Some(expected)) if run_id != *expected => Err(format!(
+                "expectedRunId {expected} does not match the interrupted run {run_id}"
+            )),
+            (Some(run_id), _) => self
+                .runtime
+                .finish_run(&run_id, RunStatus::Aborted)
+                .map(|()| None)
+                .map_err(|error| error.to_string()),
+            (None, _) => self.shared().fence(expected_run_id).map(|()| None),
+        }
+    }
+
+    /// Another session is open: its saved queue becomes the queue.
+    fn reopen_queue(&mut self) {
+        let shared = self.shared.get_mut().expect("rpc state");
+        if shared.open_queue(&self.runtime) {
+            send(&shared.queue.update());
         }
     }
 
@@ -347,7 +499,7 @@ impl Rpc {
             session.active_account = current.active_account.clone();
             self.runtime.replace_session(session, None);
         }
-        self.shared().forget_queue();
+        self.reopen_queue();
         Ok(Some(Data::Cancelled { cancelled: false }))
     }
 
@@ -356,7 +508,7 @@ impl Rpc {
             .map_err(|error| error.to_string())?;
         let (store, session) = SessionStore::open(path).map_err(|error| error.to_string())?;
         self.runtime.replace_session(session, Some(store));
-        self.shared().forget_queue();
+        self.reopen_queue();
         Ok(Some(Data::Cancelled { cancelled: false }))
     }
 
@@ -471,10 +623,18 @@ impl Shared {
         };
         let reply = match &request.command {
             Err(error) => Err(error.clone()),
-            Ok(Command::Prompt(input)) => match input.streaming_behavior {
-                Some(behavior) => self.enqueue(behavior, input),
-                None => Err(BUSY.into()),
-            },
+            Ok(Command::Prompt(input)) => {
+                let request_id = input.request_id.as_deref();
+                let repeated = request_id
+                    .and_then(|request_id| self.active().session.run_for_request(request_id))
+                    .map(Data::repeated);
+                match (repeated, input.streaming_behavior) {
+                    (Some(data), _) => Ok(Some(data)),
+                    (None, None) => Err(BUSY.into()),
+                    (None, Some(_)) if request_id.is_some() => Err(QUEUED_REQUEST.into()),
+                    (None, Some(behavior)) => self.enqueue(behavior, input),
+                }
+            }
             Ok(Command::Steer(input)) => self.enqueue(StreamingBehavior::Steer, input),
             Ok(Command::FollowUp(input)) => self.enqueue(StreamingBehavior::FollowUp, input),
             Ok(Command::Abort { expected_run_id }) => match self.fence(expected_run_id) {
@@ -487,7 +647,7 @@ impl Shared {
                 }
                 Err(error) => Err(error),
             },
-            Ok(Command::ClearQueue) => Ok(Some(self.clear_queue())),
+            Ok(Command::ClearQueue) => self.clear_queue(),
             Ok(Command::GetState) => {
                 let pending_message_count = self.queue.pending();
                 let run = self.active();
@@ -507,7 +667,8 @@ impl Shared {
                 mode.reply()
             }
             Ok(
-                Command::NewSession { .. }
+                Command::ResumeRun { .. }
+                | Command::NewSession { .. }
                 | Command::SwitchSession { .. }
                 | Command::SetModel { .. }
                 | Command::SetThinkingLevel { .. }
@@ -539,7 +700,7 @@ impl Shared {
         }
     }
 
-    /// Queues a message, as steering or a follow-up.
+    /// Queues a message, as steering or a follow-up, once it is saved.
     fn enqueue(&mut self, behavior: StreamingBehavior, input: &Input) -> Reply {
         self.fence(&input.expected_run_id)?;
         if !input.images.is_empty() {
@@ -547,48 +708,91 @@ impl Shared {
                 "queued messages are text only; send images with a prompt that starts a run".into(),
             );
         }
-        let message = input.message.clone();
+        let (mut steering, mut follow_ups) = self.queue.contents();
         match behavior {
-            StreamingBehavior::Steer => self.queue.steering.send(message),
-            StreamingBehavior::FollowUp => self.queue.follow_ups.push(message),
+            StreamingBehavior::Steer => steering.push(input.message.clone()),
+            StreamingBehavior::FollowUp => follow_ups.push(input.message.clone()),
         }
-        send(&self.queue.update());
+        self.set_queue((steering, follow_ups))?;
         Ok(Some(Data::queued()))
     }
 
-    fn clear_queue(&mut self) -> Data {
-        let cleared = self.queue.clear();
-        send(&self.queue.update());
-        cleared
+    fn clear_queue(&mut self) -> Reply {
+        let (steering, follow_up) = self.queue.contents();
+        self.set_queue(Contents::default())?;
+        Ok(Some(Data::Queue {
+            steering,
+            follow_up,
+        }))
     }
 
-    /// A new or switched-to session starts with an empty queue.
-    fn forget_queue(&mut self) {
-        if self.queue.pending() > 0 {
-            self.clear_queue();
+    /// Saves `contents`, then makes it the queue and reports it. A save
+    /// that fails changes nothing.
+    fn set_queue(&mut self, contents: Contents) -> Result<(), String> {
+        self.save_queue(&contents)
+            .map_err(|error| error.to_string())?;
+        self.queue.replace(contents);
+        send(&self.queue.update());
+        Ok(())
+    }
+
+    /// Saves the queue with the session unless it is saved already.
+    fn save_queue(&mut self, contents: &Contents) -> Result<(), pi_core::SessionError> {
+        if *contents == self.saved {
+            return Ok(());
+        }
+        if let Some(store) = &self.store {
+            store.record_queue(contents.0.clone(), contents.1.clone())?;
+        }
+        self.saved = contents.clone();
+        Ok(())
+    }
+
+    /// Delivered messages leave the saved queue once they are saved as
+    /// user messages. Should this fail, a restart restores them.
+    fn save_delivered(&mut self) {
+        let contents = self.queue.contents();
+        if let Err(error) = self.save_queue(&contents) {
+            eprintln!("pi: {error}");
         }
     }
 
-    /// The next engine call of the active run starts with `prompt`.
-    fn next_call(&mut self, prompt: Prompt) {
+    /// Takes the queue saved with the session `runtime` has open, and
+    /// whether that changed the queue.
+    fn open_queue(&mut self, runtime: &Runtime) -> bool {
+        let (steering, follow_ups) = runtime.session().saved_queue();
+        let saved = (steering.to_vec(), follow_ups.to_vec());
+        let changed = self.queue.contents() != saved;
+        self.queue.replace(saved.clone());
+        self.saved = saved;
+        self.store = runtime.store().cloned();
+        changed
+    }
+
+    /// The next engine call of the active run starts with `prompt`, or
+    /// continues the run.
+    fn next_call(&mut self, prompt: Option<Prompt>) {
         self.active().recorder.call(prompt);
     }
 
     /// An event from the active run's engine call.
     fn record(&mut self, event: &TurnEvent) {
-        let Self { queue, run } = self;
+        let Self { queue, run, .. } = self;
         let Some(run) = run else {
             return;
         };
         run.mirror(event);
         run.recorder
             .record(event, queue, &mut |record| send(&record));
+        if matches!(event, TurnEvent::MessageAdded(message) if message.role == MessageRole::User) {
+            self.save_delivered();
+        }
     }
 
     /// An engine call returned: report what it saved unreported and read
     /// the session afresh (a compaction rewrites it).
     fn call_returned(&mut self, session: &SessionState, before: usize) {
-        let Self { queue, run } = self;
+        let Self { queue, run, .. } = self;
         let Some(run) = run else {
             return;
         };
@@ -596,6 +800,7 @@ impl Shared {
         run.recorder
             .unreported(added, session, queue, &mut |record| send(&record));
         run.session = session.clone();
+        self.save_delivered();
     }
 
     /// Ends the active run's records and answers the aborts it waited for.

@@ -8,17 +8,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pi_ai::{ChatToolCall, ModelRef, StreamEvent};
 use pi_config::{model_context_window, LoadedConfig, ProviderApi};
 use pi_core::{
-    CompactionRecord, ConversationMessage, MessageRole, SessionState, SteeringMailbox, ToolEvent,
-    TurnEvent, STEERING_JOIN,
+    CompactionRecord, ConversationMessage, MessageRole, Run, RunStatus, Runtime, SessionState,
+    SteeringMailbox, ToolEvent, TurnEvent, STEERING_JOIN,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The upstream additions this RPC mode speaks, in `get_state`.
-pub(crate) const RPC_EXTENSIONS: [&str; 2] = ["run-id", "expected-run-id"];
+pub(crate) const RPC_EXTENSIONS: [&str; 4] =
+    ["run-id", "expected-run-id", "request-id", "resume-run"];
 
 /// Upstream's reply to a prompt while a run is active.
 pub(crate) const BUSY: &str = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+
+/// The reply to a queued prompt with a `requestId`, which only names runs.
+pub(crate) const QUEUED_REQUEST: &str =
+    "a prompt with requestId starts a run; send it when no run is active";
 
 /// Upstream's error text for an aborted model request.
 const ABORTED: &str = "Request was aborted";
@@ -94,6 +99,9 @@ pub(crate) enum Command {
     Abort {
         expected_run_id: Option<String>,
     },
+    ResumeRun {
+        expected_run_id: String,
+    },
     ClearQueue,
     NewSession {
         parent_session: Option<String>,
@@ -138,6 +146,9 @@ pub(crate) struct Input {
     pub streaming_behavior: Option<StreamingBehavior>,
     /// The run a queued message is meant for.
     pub expected_run_id: Option<String>,
+    /// The client's id for a prompt: a prompt that repeats it gets the run
+    /// the first one started.
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +273,20 @@ impl Data {
         }
     }
 
+    /// The reply to a prompt that repeats the `requestId` of `run`, which
+    /// starts nothing: `started` until the run has finished, `handled`
+    /// after.
+    pub fn repeated(run: &Run) -> Self {
+        Data::Disposition {
+            disposition: if run.status.is_finished() {
+                "handled"
+            } else {
+                "started"
+            },
+            run_id: Some(run.id.clone()),
+        }
+    }
+
     /// `get_messages`: the conversation as saved.
     pub fn messages(session: &SessionState) -> Self {
         Data::Messages {
@@ -306,9 +331,68 @@ pub(crate) struct State {
     pub auto_compaction_enabled: bool,
     pub message_count: usize,
     pub pending_message_count: usize,
-    pub rpc_extensions: [&'static str; 2],
+    pub rpc_extensions: [&'static str; 4],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<LastRun>,
+}
+
+/// `get_state.lastRun`: the session's last run, and for an interrupted run
+/// what continuing it starts with.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LastRun {
+    run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    status: RunStatus,
+    /// `model` when the saved context needs a model request, `tools` when
+    /// the last reply has tool calls without results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_tools: Vec<PendingTool>,
+}
+
+/// A tool call an interrupted run has no result for. Continuing the run
+/// runs it again only if it is `replaySafe`.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingTool {
+    id: String,
+    name: String,
+    replay_safe: bool,
+}
+
+impl LastRun {
+    pub fn of(runtime: &Runtime) -> Option<Self> {
+        let session = runtime.session();
+        let run = session.runs.last()?;
+        let mut last = Self {
+            run_id: run.id.clone(),
+            request_id: run.request_id.clone(),
+            status: run.status,
+            phase: None,
+            pending_tools: Vec::new(),
+        };
+        if run.status == RunStatus::Interrupted {
+            if let Some((_, calls)) = session.pending_tool_calls() {
+                last.phase = Some("tools");
+                last.pending_tools = calls
+                    .into_iter()
+                    .map(|call| PendingTool {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        replay_safe: runtime.replay_safe(&call.name),
+                    })
+                    .collect();
+            } else if session.has_unfinished_turn() {
+                last.phase = Some("model");
+            }
+        }
+        Some(last)
+    }
 }
 
 /// Upstream's model object, with the fields pi's model config has.
@@ -415,6 +499,25 @@ impl Message {
         Message::User { content, timestamp }
     }
 
+    /// A saved reply: its thinking, text and tool calls, and how it stopped.
+    fn reply(message: &ConversationMessage) -> Self {
+        let mut content = Vec::new();
+        if !message.thinking.is_empty() {
+            content.push(Content::Thinking {
+                thinking: message.thinking.clone(),
+            });
+        }
+        if !message.content.is_empty() {
+            content.push(Content::text(&message.content));
+        }
+        content.extend(message.tool_calls.iter().map(Content::tool_call));
+        Message::Assistant(Assistant {
+            content,
+            stop_reason: stop_reason(None, !message.tool_calls.is_empty()),
+            ..Assistant::default()
+        })
+    }
+
     /// A message as the session saved it. The journal keeps no timestamps,
     /// usage, model or timings, so those fields are left out.
     pub fn saved(message: &ConversationMessage, session: &SessionState) -> Self {
@@ -423,23 +526,7 @@ impl Message {
                 content: message.content.clone(),
             },
             MessageRole::User => Message::user(message, None),
-            MessageRole::Assistant => {
-                let mut content = Vec::new();
-                if !message.thinking.is_empty() {
-                    content.push(Content::Thinking {
-                        thinking: message.thinking.clone(),
-                    });
-                }
-                if !message.content.is_empty() {
-                    content.push(Content::text(&message.content));
-                }
-                content.extend(message.tool_calls.iter().map(Content::tool_call));
-                Message::Assistant(Assistant {
-                    content,
-                    stop_reason: stop_reason(None, !message.tool_calls.is_empty()),
-                    ..Assistant::default()
-                })
-            }
+            MessageRole::Assistant => Message::reply(message),
             MessageRole::Tool => {
                 let event = tool_event(session, message);
                 Message::ToolResult {
@@ -788,6 +875,9 @@ pub(crate) struct Queue {
     pub follow_ups: Vec<String>,
 }
 
+/// A queue's steering and follow-ups.
+pub(crate) type Contents = (Vec<String>, Vec<String>);
+
 impl Queue {
     pub fn pending(&self) -> usize {
         self.steering.pending() + self.follow_ups.len()
@@ -800,12 +890,18 @@ impl Queue {
         }
     }
 
-    /// Empties the queue, returning what it held.
-    pub fn clear(&mut self) -> Data {
-        Data::Queue {
-            steering: self.steering.drain(),
-            follow_up: std::mem::take(&mut self.follow_ups),
+    pub fn contents(&self) -> Contents {
+        (self.steering.list(), self.follow_ups.clone())
+    }
+
+    /// Makes `contents` the queue. The steering mailbox stays the one the
+    /// active run reads.
+    pub fn replace(&mut self, (steering, follow_ups): Contents) {
+        self.steering.drain();
+        for message in steering {
+            self.steering.send(message);
         }
+        self.follow_ups = follow_ups;
     }
 
     /// The queued follow-ups as one prompt.
@@ -839,6 +935,16 @@ pub(crate) enum Outcome {
     Completed,
     Aborted,
     Failed(String),
+}
+
+impl Outcome {
+    pub fn status(&self) -> RunStatus {
+        match self {
+            Outcome::Completed => RunStatus::Completed,
+            Outcome::Aborted => RunStatus::Aborted,
+            Outcome::Failed(_) => RunStatus::Failed,
+        }
+    }
 }
 
 /// Writes one run's records from the engine's events. A run is one upstream
@@ -897,9 +1003,9 @@ impl Recorder {
         self.compacting
     }
 
-    /// An engine call starts with `prompt`.
-    pub fn call(&mut self, prompt: Prompt) {
-        self.prompt = Some(prompt);
+    /// An engine call starts with `prompt`, or continues a stopped run.
+    pub fn call(&mut self, prompt: Option<Prompt>) {
+        self.prompt = prompt;
         self.reported_round = false;
     }
 
@@ -908,6 +1014,16 @@ impl Recorder {
             TurnEvent::RoundStarted => {
                 self.reported_round = true;
                 self.start_round(sink);
+            }
+            // The saved reply is reported again, as saved, so the turn's
+            // records end with messages they reported.
+            TurnEvent::RoundResumed(reply) => {
+                self.reported_round = true;
+                self.start_round(sink);
+                self.add(Message::reply(reply), sink);
+                if let Some(round) = &mut self.round {
+                    round.reply = Some(self.messages.len() - 1);
+                }
             }
             TurnEvent::MessageAdded(message) if message.role == MessageRole::Assistant => {
                 let raw = self
