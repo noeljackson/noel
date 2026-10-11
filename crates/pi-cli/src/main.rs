@@ -2918,13 +2918,16 @@ async fn run_interactive(
             continue;
         }
         // An error/interruption must not become an automatic retry loop just
-        // because a rebuild is pending. Restart at a completed boundary —
-        // either the model turn fully finished, or nothing is streaming and
-        // the user is idle between prompts (marathon tool-loop sessions keep
-        // `has_unfinished_turn` true for hours, which previously parked the
-        // restart forever).
-        let idle_between_prompts = !app.turn_running && !runtime.session().has_unfinished_turn();
-        if idle_between_prompts && auto_restart.should_restart()? {
+        // because a rebuild is pending. Restart only when the session has no
+        // unfinished turn AND the TUI is not streaming: app.turn_running is
+        // the live signal, and has_unfinished_turn distinguishes "stopped by
+        // the user this process" (keep waiting) from "between user prompts"
+        // (safe to restart). A resume-driven restart re-enters the same
+        // session and would otherwise re-dispatch a stopped turn.
+        if !app.turn_running
+            && !runtime.session().has_unfinished_turn()
+            && auto_restart.should_restart()?
+        {
             app.push(TuiEntryKind::System, "rebuilt; restarting");
             redraw_tui(&mut terminal, &mut app, &config)?;
             restart = true;
@@ -5005,6 +5008,10 @@ fn restyle_rows_with_markdown(
     if entry.kind != TuiEntryKind::Assistant {
         return;
     }
+    // Fence state walks rows in display order: emphasis is suppressed and
+    // rows are dimmed between opening and closing fences. The fence marker
+    // lines themselves collapse to a dim language label.
+    let mut in_fence = false;
     for row in rows.iter_mut() {
         if row.synthetic {
             continue;
@@ -5012,6 +5019,9 @@ fn restyle_rows_with_markdown(
         let Some(source_line) = logical_source_line(row.start.line) else {
             continue;
         };
+        // Only the first row of a logical line applies block transforms;
+        // wrapped continuations render as plain content of that line.
+        let starts_line = row.start.byte == 0;
         let end = if row.end.line == row.start.line {
             row.end.byte
         } else {
@@ -5020,8 +5030,87 @@ fn restyle_rows_with_markdown(
         let Some(row_text) = source_line.get(row.start.byte..end) else {
             continue;
         };
-        let spans = styled_spans(row_text, base, accent);
-        row.line = Line::from(spans);
+        if in_fence {
+            // Inside a code block: no emphasis, dim accent bar, indent.
+            if source_line.trim_start().starts_with("```") && starts_line {
+                in_fence = false;
+                row.line = Line::from(Span::styled(String::new(), base));
+                continue;
+            }
+            row.line = Line::from(vec![
+                Span::styled("  ┆ ", Style::default().fg(accent)),
+                Span::styled(row_text.to_string(), base),
+            ]);
+            continue;
+        }
+        // The first logical line carries the "[provider/model] " echo
+        // prefix (and the bullet marker before that); classify on the
+        // markdown content only.
+        let classify_target: &str = if row.start.line == 0 {
+            source_line
+                .strip_prefix("● ")
+                .and_then(|rest| rest.find("] ").map(|i| &rest[i + 2..]))
+                .unwrap_or(&source_line)
+        } else {
+            &source_line
+        };
+        let kind = if starts_line {
+            markdown::classify_line(classify_target)
+        } else {
+            markdown::BlockKind::Plain
+        };
+        // Headings render their content after the markers; compute from the
+        // classification target, not the raw source line.
+        let heading_content = |kind: &markdown::BlockKind, target: &str| -> String {
+            match kind {
+                markdown::BlockKind::Heading(level) => {
+                    let hashes = *level as usize + 1;
+                    target
+                        .get(hashes..)
+                        .unwrap_or(target)
+                        .trim_start()
+                        .to_string()
+                }
+                _ => String::new(),
+            }
+        };
+        match &kind {
+            markdown::BlockKind::Fence { language, .. } => {
+                in_fence = true;
+                let label = if language.is_empty() {
+                    "  ┆ code".to_string()
+                } else {
+                    format!("  ┆ {language}")
+                };
+                row.line = Line::from(vec![Span::styled(label, Style::default().fg(accent))]);
+            }
+            markdown::BlockKind::Heading(level) => {
+                let content = heading_content(&kind, classify_target);
+                let style = base.add_modifier(Modifier::BOLD).fg(accent);
+                row.line = Line::from(vec![Span::styled(
+                    format!("{}{content}", " ".repeat(*level as usize)),
+                    style,
+                )]);
+            }
+            markdown::BlockKind::ListItem { .. } | markdown::BlockKind::Blockquote => {
+                let render = markdown::block_render(&kind, classify_target);
+                let content = classify_target
+                    .get(render.content_byte..)
+                    .unwrap_or(row_text);
+                let marker_style = if matches!(kind, markdown::BlockKind::Blockquote) {
+                    base.add_modifier(Modifier::DIM)
+                } else {
+                    base
+                };
+                let mut spans = vec![Span::styled(render.prefix.clone(), marker_style)];
+                spans.extend(styled_spans(content.trim_start(), marker_style, accent));
+                row.line = Line::from(spans);
+            }
+            markdown::BlockKind::Plain => {
+                let spans = styled_spans(row_text, base, accent);
+                row.line = Line::from(spans);
+            }
+        }
     }
 }
 
