@@ -8389,17 +8389,29 @@ fn format_session_tool_message(message: &ConversationMessage, runtime: &Runtime)
 }
 
 fn collect_diff_file_entries(cwd: &Path, paths: &[String]) -> Vec<DiffFileEntry> {
-    let stats = git_numstat(cwd, paths);
+    // git reports paths relative to cwd, so files under it are listed (and
+    // looked up in git's output) the same way; that also keeps names visible
+    // in the narrow panel.
+    let paths = paths
+        .iter()
+        .map(|path| match Path::new(path).strip_prefix(cwd) {
+            Ok(relative) if !relative.as_os_str().is_empty() => {
+                relative.to_string_lossy().into_owned()
+            }
+            _ => path.clone(),
+        })
+        .collect::<Vec<_>>();
+    let stats = git_numstat(cwd, &paths);
     let untracked = git_untracked_paths(cwd);
     paths
-        .iter()
+        .into_iter()
         .map(|path| {
             let (added, removed) = stats.get(path.as_str()).copied().unwrap_or((None, None));
             DiffFileEntry {
-                path: path.clone(),
                 added,
                 removed,
-                untracked: untracked.contains(path),
+                untracked: untracked.contains(&path),
+                path,
             }
         })
         .collect()
@@ -10054,6 +10066,26 @@ fn write_auth_file(config: &LoadedConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_panel_lists_files_under_cwd_relative_to_it() {
+        let entries = collect_diff_file_entries(
+            Path::new("/no-such-dir/work/cwd"),
+            &[
+                "/no-such-dir/work/cwd/src/file.txt".to_string(),
+                "/elsewhere/notes.md".to_string(),
+                "already/relative.rs".to_string(),
+            ],
+        );
+        let paths = entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec!["src/file.txt", "/elsewhere/notes.md", "already/relative.rs"]
+        );
+    }
 
     fn picker_summary(first_prompt: Option<&str>, unfinished: bool) -> pi_core::SessionSummary {
         pi_core::SessionSummary {

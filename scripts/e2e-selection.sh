@@ -2,10 +2,12 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/e2e-isolate.sh
+source "${repo_root}/scripts/e2e-isolate.sh"
 pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
-work_dir="$(mktemp -d "${repo_root}/target/e2e-selection.XXXXXX")"
+work_dir="$(mktemp -d "${e2e_root}/e2e-selection.XXXXXX")"
 session="pi-e2e-selection-${$}"
-trap 'tmux kill-session -t "${session}" >/dev/null 2>&1 || true' EXIT
+trap 'e2e_status=$?; tmux kill-session -t "${session}" >/dev/null 2>&1 || true; e2e_isolation_cleanup "${e2e_status}"' EXIT
 mkdir -p "${work_dir}/agent"
 printf '{"modelRefresh":{"enabled":false},"compaction":{"enabled":false}}\n' > "${work_dir}/agent/settings.json"
 awk 'BEGIN {
