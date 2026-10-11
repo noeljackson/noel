@@ -188,6 +188,62 @@ Prompt arguments starting with `@` are expanded from files:
 cargo run -p pi-cli -- -p --model faux/echo @prompt.txt
 ```
 
+### Faux models
+
+The `faux` provider needs no credentials and is the only provider `--offline`
+allows.
+
+`faux/echo` answers `[faux/echo] ` followed by the last user message.
+`PI_FAUX_STREAM_DELAY_MS` sleeps before each streamed event, and
+`PI_FAUX_STREAM_CHARS=1` streams its text one character at a time.
+
+`faux/script` replays scripted responses for tests. `PI_FAUX_SCRIPT` names a
+JSON file that holds an array of responses. Each response is an array of steps,
+and each step is an object with one key:
+
+```json
+[
+  [
+    {"thinking": "Check the notes first."},
+    {"tool_call": {"name": "read", "arguments": {"path": "notes.txt"}}}
+  ],
+  [{"error": "overloaded"}],
+  [
+    {"delay_ms": 200},
+    {"text": "The notes list alpha and beta."},
+    {"usage": {"input": 120, "output": 9}}
+  ]
+]
+```
+
+- `{"text": "..."}` and `{"thinking": "..."}` stream text or thinking.
+- `{"tool_call": {"id": "...", "name": "...", "arguments": {...}}}` calls a
+  tool. `id` defaults to `call_<response>_<n>` and `arguments` to `{}`.
+- `{"usage": {"input": 120, "output": 9}}` reports token usage.
+- `{"stop": "..."}` sets the stop reason. Without it, a response ends with
+  `tool_use` after a tool call and `stop` otherwise.
+- `{"error": "..."}` fails the request with a provider error (status 503).
+  Before any output the agent retries it, and the retry gets the next response.
+- `{"delay_ms": 200}` pauses the response.
+- `{"wait_for_file": "path"}` holds the response until the file exists, for
+  example while a test steers or kills pi. Relative paths resolve against the
+  script's directory.
+
+If `PI_FAUX_SCRIPT_LOG` names a file, every request is appended to it as one
+JSON line and fsynced before the response starts. A line holds the
+`system_prompt`, the `messages` (`role`, `content`, and when present
+`tool_calls`, `tool_call_id`, `tool_name`, and a `media` count), and the names
+of the offered `tools`. The number of requests already in the log selects the
+response, so a restarted pi continues the script where the previous process
+stopped. Without a log, a counter in the process selects it. A request past the
+end of the script fails with a provider error, which is retried like any other;
+set `"retry": {"enabled": false}` in `settings.json` to fail at once.
+
+```bash
+PI_FAUX_SCRIPT=script.json PI_FAUX_SCRIPT_LOG=requests.jsonl \
+  cargo run -p pi-cli -- --offline --no-session -p --model faux/script "read notes.txt"
+```
+
 ## Configuration
 
 Default config root:

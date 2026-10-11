@@ -2524,6 +2524,14 @@ fn default_models() -> Vec<ModelDefinition> {
         },
         ModelDefinition {
             context_window: None,
+            provider: "faux".to_string(),
+            id: "script".to_string(),
+            name: Some("Faux Script".to_string()),
+            api: ProviderApi::Faux,
+            base_url: None,
+        },
+        ModelDefinition {
+            context_window: None,
             provider: "openai".to_string(),
             id: "gpt-5.4".to_string(),
             name: Some("OpenAI GPT 5.4".to_string()),
@@ -3617,6 +3625,7 @@ mod tests {
             .map(|model| format!("{}/{}", model.provider, model.id))
             .collect::<Vec<_>>();
         assert!(model_ids.contains(&"faux/echo".to_string()));
+        assert!(model_ids.contains(&"faux/script".to_string()));
         assert!(model_ids.contains(&"anthropic/claude-opus-4-1-20250805".to_string()));
         assert!(model_ids.contains(&"anthropic/claude-custom".to_string()));
         assert_eq!(config.diagnostics, ["model refresh warning"]);
