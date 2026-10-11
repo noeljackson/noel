@@ -18,8 +18,11 @@ use pi_ai::{
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
 };
 use pi_config::{has_auth_for_provider, listed_accounts_for_provider, LoadedConfig, ResourceFile};
+/// Kills every running tool subprocess tree; for pi's fatal-signal handling.
+pub use pi_tools::kill_running_tool_groups;
 use pi_tools::{
-    builtin_tool_definitions, execute_tool, ToolError, ToolRequest, ToolRuntimeOptions,
+    builtin_tool_definitions, execute_tool, spawn_tool_process, ToolError, ToolRequest,
+    ToolRuntimeOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2331,13 +2334,19 @@ async fn run_model_turn_streaming_events(
             }
         }
         let request = provider_request(runtime, system_prompt.clone());
-        let events =
-            complete_with_retry_streaming(provider, request, &runtime.systems.retry, |event| {
+        // Interrupts drop this future; no caller cancels the token yet.
+        let events = complete_with_retry_streaming(
+            provider,
+            request,
+            &runtime.systems.retry,
+            &CancellationToken::default(),
+            |event| {
                 if matches!(event, StreamEvent::Text(_) | StreamEvent::Thinking(_)) {
                     on_event(&TurnEvent::Provider(event.clone()));
                 }
-            })
-            .await?;
+            },
+        )
+        .await?;
         let mut text = String::new();
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
@@ -2574,6 +2583,7 @@ async fn complete_with_retry_streaming(
     provider: &dyn Provider,
     request: ProviderRequest,
     retry: &RuntimeRetrySettings,
+    cancellation: &CancellationToken,
     mut on_event: impl FnMut(&StreamEvent) + Send,
 ) -> Result<Vec<StreamEvent>, ProviderError> {
     let retry = RetryPolicy {
@@ -2581,13 +2591,9 @@ async fn complete_with_retry_streaming(
         base_delay_ms: retry.base_delay_ms,
         max_delay_ms: retry.max_agent_delay_ms,
     };
-    pi_agent::complete_with_retry(
-        provider,
-        request,
-        &retry,
-        &CancellationToken::default(),
-        |event| on_event(event),
-    )
+    pi_agent::complete_with_retry(provider, request, &retry, cancellation, |event| {
+        on_event(event)
+    })
     .await
     .map_err(|error| match error {
         pi_agent::AgentError::Provider(error) => error,
@@ -3026,7 +3032,8 @@ async fn execute_extension_tool(
         cwd: &cwd_string,
         tool_call_id: Some(&tool_call.id),
     };
-    let mut child = Command::new(&extension.extension_path)
+    let mut command = Command::new(&extension.extension_path);
+    command
         .current_dir(cwd)
         .env("PI_EXTENSION_NAME", &extension.extension_name)
         .env("PI_EXTENSION_PATH", &extension.extension_path)
@@ -3034,15 +3041,15 @@ async fn execute_extension_tool(
         .env("PI_EXTENSION_TOOL", &extension.name)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|source| {
-            AgentError::Tool(ToolError::Io {
-                path: extension.extension_path.clone(),
-                source,
-            })
-        })?;
+        .stderr(Stdio::piped());
+    // Like bash: no controlling terminal, and an interrupted call (this
+    // future dropped) kills the extension's whole process group.
+    let (mut child, group) = spawn_tool_process(&mut command).map_err(|source| {
+        AgentError::Tool(ToolError::Io {
+            path: extension.extension_path.clone(),
+            source,
+        })
+    })?;
     if let Some(mut stdin) = child.stdin.take() {
         let input = format!(
             "{}\n",
@@ -3066,6 +3073,7 @@ async fn execute_extension_tool(
             source,
         })
     })?;
+    group.finish();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -4303,6 +4311,79 @@ mod tests {
         )));
         assert!(!runtime.session.tool_history[0].is_error);
         thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_an_in_flight_turn_kills_the_model_bash_process_group() {
+        // The TUI interrupts a turn (Esc, ctrl+c, /interrupt) by dropping its
+        // future; a model bash call running at that moment must take its
+        // whole process group with it, including background children.
+        struct BashProvider(String);
+        #[async_trait::async_trait]
+        impl Provider for BashProvider {
+            async fn complete(
+                &self,
+                _request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                Ok(vec![StreamEvent::ToolCall {
+                    id: "bash-1".into(),
+                    name: "bash".into(),
+                    arguments: json!({ "command": self.0 }).to_string(),
+                }])
+            }
+        }
+        let pid_file = std::env::temp_dir().join(format!("pi-turn-drop-{}.pid", new_session_id()));
+        let provider = BashProvider(format!(
+            "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; wait",
+            pid_file.display()
+        ));
+        let mut runtime = Runtime::new(
+            SessionState::new("turn-drop", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        runtime.systems.shell_path = Some("/bin/sh".into());
+        let steering = SteeringMailbox::default();
+        let mut turn = Box::pin(run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "run it".into(),
+            Vec::new(),
+            &steering,
+            |_| {},
+        ));
+        let published_pid = async {
+            loop {
+                if let Ok(pid) = fs::read_to_string(&pid_file) {
+                    return pid.trim().parse::<i32>().unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut turn => panic!("turn ended before the interrupt: {result:?}"),
+                pid = published_pid => pid,
+            }
+        })
+        .await
+        .expect("bash published its background pid");
+        drop(turn);
+        let _ = fs::remove_file(&pid_file);
+        // A killed process stays a zombie (state Z) until reaped.
+        let running = || {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, fields)| !fields.trim_start().starts_with('Z'))
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cfg!(target_os = "linux") && running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background child {pid} outlived the interrupted turn"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]

@@ -1,12 +1,16 @@
+mod process;
 mod web;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::process::Command;
+
+pub use process::{kill_running_tool_groups, spawn_tool_process, ToolProcessGroup};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -372,44 +376,33 @@ async fn bash_tool(
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // Run the shell in its own process group so a timeout can kill the
-        // whole tree (shell + children), not just the shell pid. Killing only
-        // the shell orphaned children like a long preflight script, which
-        // kept running and consuming resources after the tool call failed.
-        .process_group(0)
-        .kill_on_drop(true);
-    let child = process.spawn().map_err(|source| ToolError::Io {
+        // Commands are non-interactive: stdin is empty and the shell gets no
+        // controlling terminal, so nothing can read pi's input (the RPC
+        // request stream or the TUI's terminal).
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The shell leads its own process group, so a timeout or an interrupt
+    // (dropping this future) kills the whole tree, not just the shell pid:
+    // killing only the shell orphaned children like a long preflight script.
+    let (child, group) = spawn_tool_process(&mut process).map_err(|source| ToolError::Io {
         path: cwd.to_path_buf(),
         source,
     })?;
 
-    let child_pid = child.id().unwrap_or_default();
     let wait = child.wait_with_output();
-    let output = if let Some(timeout_ms) = timeout_ms {
-        match tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await {
-            Ok(output) => output.map_err(|source| ToolError::Io {
-                path: cwd.to_path_buf(),
-                source,
-            })?,
-            Err(_) => {
-                // wait_with_output() consumed the child; kill the process
-                // group the shell led (process_group(0) above) so children
-                // die with the shell instead of orphaning.
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(child_pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                return Err(ToolError::Timeout(timeout_ms));
-            }
-        }
-    } else {
-        wait.await.map_err(|source| ToolError::Io {
-            path: cwd.to_path_buf(),
-            source,
-        })?
-    };
+    let output = match timeout_ms {
+        // Returning on timeout drops `group`, which kills the tree.
+        Some(timeout_ms) => tokio::time::timeout(Duration::from_millis(timeout_ms), wait)
+            .await
+            .map_err(|_| ToolError::Timeout(timeout_ms))?,
+        None => wait.await,
+    }
+    .map_err(|source| ToolError::Io {
+        path: cwd.to_path_buf(),
+        source,
+    })?;
+    group.finish();
 
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -785,6 +778,180 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NONCE: AtomicU64 = AtomicU64::new(0);
         NONCE.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn sh_options() -> ToolRuntimeOptions {
+        ToolRuntimeOptions {
+            shell_path: Some("/bin/sh".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A pid file path and a command that publishes the pid of a background
+    /// `sleep 30` there before waiting on it.
+    fn background_sleep_command(name: &str) -> (PathBuf, String) {
+        let pid_file = std::env::temp_dir().join(format!(
+            "pi-bash-{name}-{}-{}.pid",
+            std::process::id(),
+            new_marker_nonce()
+        ));
+        let path = pid_file.display();
+        let command =
+            format!("sleep 30 & echo $! > '{path}.tmp' && mv '{path}.tmp' '{path}'; wait");
+        (pid_file, command)
+    }
+
+    async fn read_pid_file(pid_file: &Path) -> i32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(pid) = fs::read_to_string(pid_file) {
+                let _ = fs::remove_file(pid_file);
+                return pid.trim().parse().expect("pid file holds a pid");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command never wrote {}",
+                pid_file.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Whether `pid` still runs. A killed process stays a zombie (state Z)
+    /// until it is reaped, which counts as exited.
+    fn process_is_running(pid: i32) -> bool {
+        if cfg!(target_os = "linux") {
+            return fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, fields)| !fields.trim_start().starts_with('Z'))
+            });
+        }
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    async fn assert_exits(pid: i32, context: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_running(pid) {
+            if std::time::Instant::now() >= deadline {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                panic!("background child {pid} outlived the bash tool: {context}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_is_non_interactive_in_its_own_session() {
+        // `cat` sees end of input at once instead of reading pi's stdin, and
+        // the shell leads a new session with no controlling terminal.
+        let linux = cfg!(target_os = "linux");
+        let started = std::time::Instant::now();
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command: if linux {
+                    "cat; echo cat-done; cut -d' ' -f1,5,6,7 /proc/$$/stat"
+                } else {
+                    "cat; echo cat-done"
+                }
+                .into(),
+                timeout_ms: Some(10_000),
+            },
+            &sh_options(),
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!result.is_error, "{}", result.output);
+        // Skip anything a login profile printed.
+        let mut lines = result.output.lines().skip_while(|line| *line != "cat-done");
+        assert_eq!(lines.next(), Some("cat-done"), "{}", result.output);
+        if linux {
+            let fields = lines
+                .next()
+                .unwrap()
+                .split(' ')
+                .map(|field| field.parse::<i64>().unwrap())
+                .collect::<Vec<_>>();
+            let [pid, pgrp, session, tty] = fields[..] else {
+                panic!("unexpected stat fields: {fields:?}");
+            };
+            assert_eq!((pgrp, session, tty), (pid, pid, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_kills_background_children() {
+        let (pid_file, command) = background_sleep_command("timeout");
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command,
+                timeout_ms: Some(2_000),
+            },
+            &sh_options(),
+        )
+        .await;
+        assert!(matches!(result, Err(ToolError::Timeout(2_000))));
+        let pid = read_pid_file(&pid_file).await;
+        assert_exits(pid, "timeout").await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_bash_future_kills_background_children() {
+        // An interrupt drops the in-flight tool future; that alone must take
+        // the whole process group down.
+        let (pid_file, command) = background_sleep_command("drop");
+        let tool = tokio::spawn(async move {
+            execute_tool(
+                Path::new("."),
+                ToolRequest::Bash {
+                    command,
+                    timeout_ms: None,
+                },
+                &sh_options(),
+            )
+            .await
+        });
+        let pid = read_pid_file(&pid_file).await;
+        assert!(process_is_running(pid));
+        tool.abort();
+        assert!(tool.await.unwrap_err().is_cancelled());
+        assert_exits(pid, "dropped future").await;
+    }
+
+    #[tokio::test]
+    async fn finished_bash_leaves_deliberate_background_jobs_running() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "pi-bash-detached-{}-{}.pid",
+            std::process::id(),
+            new_marker_nonce()
+        ));
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command: format!(
+                    "sleep 5 >/dev/null 2>&1 & echo $! > '{}'",
+                    pid_file.display()
+                ),
+                timeout_ms: Some(10_000),
+            },
+            &sh_options(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result.output);
+        let pid = read_pid_file(&pid_file).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let running = process_is_running(pid);
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(running, "a normal finish must not kill background jobs");
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ mod clipboard;
 mod markdown;
 mod oauth_login;
 mod oauth_refresh;
+mod signals;
 mod transcript_view;
 mod usage;
 use transcript_view::TranscriptView;
@@ -1291,6 +1292,7 @@ fn print_auth_help(command: &str) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    signals::install();
     if try_run_image_command().await? {
         return Ok(());
     }
@@ -3030,9 +3032,10 @@ async fn run_interactive(
         app.push(TuiEntryKind::System, hint);
     }
     let mut auto_restart = AutoRestart::from_env();
+    // Install restoration before any fallible terminal setup; a fatal signal
+    // restores through the same claim.
+    let _restore = TerminalRestore::claim(owned_screen);
     enable_raw_mode()?;
-    // Install restoration before any fallible terminal setup.
-    let _restore = TerminalRestore { owned_screen };
     if owned_screen {
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     }
@@ -3339,19 +3342,33 @@ fn without_session_short_flags(cluster: &str) -> Option<String> {
     (kept != cluster).then_some(kept)
 }
 
-struct TerminalRestore {
-    owned_screen: bool,
+/// The TUI's hold on the terminal. Dropping it restores the terminal unless a
+/// fatal signal already did (see `signals`).
+struct TerminalRestore;
+
+impl TerminalRestore {
+    fn claim(owned_screen: bool) -> Self {
+        signals::claim_tui_terminal(owned_screen);
+        Self
+    }
 }
 
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
-        if self.owned_screen {
-            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-        }
-        let _ = disable_raw_mode();
+        signals::release_tui_terminal();
     }
+}
+
+/// Leaves every terminal mode the TUI enabled. The cursor is shown too: on a
+/// signal exit ratatui's own drop, which normally does it, never runs.
+fn restore_terminal_modes(out: &mut impl Write, owned_screen: bool) {
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
+    let _ = execute!(out, DisableBracketedPaste);
+    if owned_screen {
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+    }
+    let _ = execute!(out, crossterm::cursor::Show);
+    let _ = disable_raw_mode();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

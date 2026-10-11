@@ -456,12 +456,17 @@ impl Runtime {
                     media: Vec::new(), tool_call_id: None, tool_name: None, tool_calls: Vec::new(),
                 }],
             };
-            let events =
-                complete_with_retry_streaming(provider, request, &self.systems.retry, |_| {})
-                    .await
-                    .map_err(|error| {
-                        AgentError::Compaction(format!("{error}; original history retained"))
-                    })?;
+            let events = complete_with_retry_streaming(
+                provider,
+                request,
+                &self.systems.retry,
+                &CancellationToken::default(),
+                |_| {},
+            )
+            .await
+            .map_err(|error| {
+                AgentError::Compaction(format!("{error}; original history retained"))
+            })?;
             let usage = events.iter().rev().find_map(|event| match event {
                 StreamEvent::Usage {
                     input_tokens,
