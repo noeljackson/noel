@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { Type } from "/ts-reference/packages/ai/src/index.ts";
 import { getModel, streamSimple } from "/ts-reference/packages/ai/src/compat.ts";
 import { convertMessages } from "/ts-reference/packages/ai/src/api/google-shared.ts";
+import { stableUserAgent } from "./user-agent.ts";
 
 type CapturedRequest = {
 	url: string;
@@ -101,12 +102,7 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 		sanitized["x-goog-api-key"] = "<redacted>";
 	}
 	if (sanitized["user-agent"]) {
-		// The TS client embeds the host kernel release, which makes fixtures
-		// drift on every kernel upgrade; pin it to a stable placeholder.
-		sanitized["user-agent"] = sanitized["user-agent"].replace(
-			/(linux )[^;]+(;)/,
-			"$1<kernel>$2",
-		);
+		sanitized["user-agent"] = stableUserAgent(sanitized["user-agent"]);
 	}
 	return sanitized;
 }

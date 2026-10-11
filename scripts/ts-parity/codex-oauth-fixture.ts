@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
+import { stableUserAgent } from "./user-agent.ts";
 
 type CapturedRequest = {
 	url: string;
@@ -113,12 +114,7 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 		sanitized.authorization = "Bearer <redacted>";
 	}
 	if (sanitized["user-agent"]) {
-		// The TS client embeds the host kernel release, which makes fixtures
-		// drift on every kernel upgrade; pin it to a stable placeholder.
-		sanitized["user-agent"] = sanitized["user-agent"].replace(
-			/(linux )[^;]+(;)/,
-			"$1<kernel>$2",
-		);
+		sanitized["user-agent"] = stableUserAgent(sanitized["user-agent"]);
 	}
 	return sanitized;
 }
