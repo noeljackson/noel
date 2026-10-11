@@ -3106,6 +3106,12 @@ struct TuiSelectorState {
     selected: usize,
     query: String,
     thinking_level: Option<String>,
+    /// Codex-style two-layer model picker: selecting a provider pushes this
+    /// selector here and shows the provider's models; leaving the model layer
+    /// (esc) pops back instead of closing the whole selector.
+    parent: Option<Box<TuiSelectorState>>,
+    /// Provider filter for the model layer (e.g. "zai-coding").
+    provider_filter: Option<String>,
 }
 
 impl TuiSelectorState {
@@ -3123,6 +3129,8 @@ impl TuiSelectorState {
             selected: 0,
             query: query.into(),
             thinking_level,
+            parent: None,
+            provider_filter: None,
         };
         state.refresh_filter();
         state
@@ -6167,7 +6175,20 @@ fn handle_tui_selector_key(
 ) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
-            app.selector = None;
+            // In a two-layer picker, esc leaves the model layer back to the
+            // provider layer instead of closing the selector (Codex-style).
+            let pop_parent = app
+                .selector
+                .as_ref()
+                .map(|selector| selector.parent.is_some())
+                .unwrap_or(false);
+            if pop_parent {
+                let mut selector = app.selector.take().expect("selector");
+                let parent = *selector.parent.take().expect("parent selector");
+                app.selector = Some(parent);
+            } else {
+                app.selector = None;
+            }
         }
         KeyCode::Up => {
             if let Some(selector) = app.selector.as_mut() {
@@ -6220,7 +6241,58 @@ fn handle_tui_selector_key(
                 .as_ref()
                 .map(|selector| selector.kind == "settings")
                 .unwrap_or(false);
-            if is_settings {
+            let is_provider = app
+                .selector
+                .as_ref()
+                .map(|selector| selector.kind == "provider")
+                .unwrap_or(false);
+            if is_provider {
+                // First layer of the model picker: drill into the selected
+                // provider's models, keeping this selector as the parent so
+                // esc returns here.
+                let selector = app.selector.take().expect("provider selector");
+                let provider = selector
+                    .selected_item()
+                    .map(|item| item.value.clone())
+                    .unwrap_or_default();
+                let models: Vec<SelectorItem> = sorted_models(&config.models)
+                    .into_iter()
+                    .filter(|model| model.provider == provider)
+                    .map(|model| {
+                        let value = format!("{}/{}", model.provider, model.id);
+                        SelectorItem {
+                            label: value.clone(),
+                            value,
+                            active: runtime
+                                .session()
+                                .active_model
+                                .as_ref()
+                                .map(|active| {
+                                    active.provider == model.provider && active.id == model.id
+                                })
+                                .unwrap_or(false),
+                        }
+                    })
+                    .collect();
+                if models.is_empty() {
+                    app.push(TuiEntryKind::System, format!("no models for {provider}"));
+                    return Ok(());
+                }
+                let mut model_selector = TuiSelectorState::new(
+                    "model",
+                    Selector::new(format!("model · {provider}"), models),
+                    "",
+                    runtime
+                        .session()
+                        .active_thinking_level
+                        .clone()
+                        .or_else(|| config.settings.default_thinking_level.clone()),
+                );
+                model_selector.provider_filter = Some(provider);
+                let mut model_state = model_selector;
+                model_state.parent = Some(Box::new(selector));
+                app.selector = Some(model_state);
+            } else if is_settings {
                 apply_tui_settings_selection(app, runtime, config)?;
             } else if let Some(selector) = app.selector.take() {
                 apply_tui_selector_selection(app, runtime, config, selector)?;
@@ -6633,7 +6705,8 @@ async fn handle_tui_submission(
             ),
         ),
         "/model" | "/models" | "/scoped-models" => {
-            open_tui_selector(app, config, runtime, "model", "")?
+            // Codex-style two-layer picker: provider first, then its models.
+            open_tui_selector(app, config, runtime, "provider", "")?
         }
         "/account" => open_tui_selector(app, config, runtime, "account", "")?,
         "/todos" => {
@@ -8921,6 +8994,11 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
                 })
                 .collect(),
         )),
+        // Codex-style first layer: pick the provider, then its models.
+        "provider" => Ok(Selector::new(
+            "provider",
+            provider_selector_items(&config.models, runtime),
+        )),
         "theme" | "themes" => Ok(Selector::new(
             "theme",
             theme_names(config)
@@ -8984,6 +9062,35 @@ fn sorted_models(models: &[ModelDefinition]) -> Vec<&ModelDefinition> {
             .then_with(|| left.id.cmp(&right.id))
     });
     models
+}
+
+/// Provider rows for the first layer of the model picker: provider name,
+/// model count, and whether the active model belongs to it.
+fn provider_selector_items(models: &[ModelDefinition], runtime: &Runtime) -> Vec<SelectorItem> {
+    let mut providers: BTreeMap<String, usize> = BTreeMap::new();
+    for model in models {
+        *providers.entry(model.provider.clone()).or_default() += 1;
+    }
+    providers
+        .into_iter()
+        .map(|(provider, count)| {
+            let active_provider = runtime
+                .session()
+                .active_model
+                .as_ref()
+                .map(|active| active.provider == provider)
+                .unwrap_or(false);
+            SelectorItem {
+                label: format!(
+                    "{provider} · {count} model{}{}",
+                    if count == 1 { "" } else { "s" },
+                    if active_provider { " · active" } else { "" }
+                ),
+                value: provider,
+                active: active_provider,
+            }
+        })
+        .collect()
 }
 
 fn account_selector_items(config: &LoadedConfig, runtime: &Runtime) -> Vec<SelectorItem> {

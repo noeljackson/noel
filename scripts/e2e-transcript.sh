@@ -93,7 +93,7 @@ tmux send-keys -t "${session}" C-c PPage
 wait_for 'Scroll to bottom'
 selector_anchor="$(first_row)"
 tmux send-keys -t "${session}" '/models' Enter
-wait_for 'model selector'
+wait_for 'provider selector'
 tmux send-keys -t "${session}" Escape
 wait_for 'Scroll to bottom'
 wait_for '│ >'

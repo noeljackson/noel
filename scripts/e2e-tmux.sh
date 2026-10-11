@@ -298,6 +298,9 @@ send_enter
 send_line "/select model 1"
 send_line "/model"
 send_enter
+# Two-layer picker: first Enter drills into the provider's models (faux is
+# the first provider in the test config), second Enter selects its model.
+send_enter
 send_line "/model 1"
 send_line "/hotkeys"
 send_line "/copy"
@@ -317,7 +320,9 @@ send_line "/fork"
 send_line "/session"
 send_line "/summaries"
 send_line "/tree"
+# /resume opens the interactive picker; esc closes it back to the prompt.
 send_line "/resume"
+tmux send-keys -t "${session_name}" Escape
 send_line "/compact"
 send_line "/compact preserve architecture decisions and test failures"
 send_line "/summaries"
@@ -410,7 +415,7 @@ require_output "theme: system"
 require_output "accent: magenta"
 require_output "accent: auto"
 require_output "theme selector"
-require_output "model selector"
+require_output "provider selector"
 require_output "faux/echo"
 require_output "submit"
 require_output "reload"
