@@ -101,11 +101,12 @@ send_enter() {
   sleep 0.35
 }
 
-# The idle footer shows the active model. While a turn runs, the footer
-# gains "esc to interrupt". (≡ is the durable queue count and ↺ is prompt
-# history — neither gates submission.)
+# The idle footer shows the active model with a drained durable queue
+# ("≡ 0" — queued messages count) and no "esc to interrupt". ↺ is prompt
+# history and never gates submission; ≡ N > 0 means Enter will queue the
+# draft behind pending work instead of submitting it.
 last_line_is_idle_footer() {
-  tail -n 1 "$1" | grep -Eq '^[a-z0-9/._@-]+ ' \
+  tail -n 1 "$1" | grep -Eq '^[a-z0-9/._@-]+ .*(≡ 0|≡ -)' \
     && ! tail -n 1 "$1" | grep -Fq 'esc to interrupt'
 }
 

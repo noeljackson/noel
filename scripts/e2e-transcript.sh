@@ -229,7 +229,8 @@ done
 long_resume="resume-interruption-$(printf 'x%.0s' $(seq 1 250))"
 for stop in interrupt quit; do
   printf '{"type":"started","session_id":"%s","cwd":"."}\n{"type":"message","message":{"role":"user","content":"%s","tool_calls":[],"media":[]}}\n{"type":"queued_messages_snapshot","messages":["retained-after-resume-stop"]}\n' "${stop}" "${long_resume}" > "${work_dir}/${stop}.jsonl"
-  printf 'watched binary\n' > "${work_dir}/watched-restart"
+  printf '#!/bin/sh\nexec sleep infinity\n' > "${work_dir}/watched-restart"
+  chmod +x "${work_dir}/watched-restart"
   restart_fixture "${work_dir}/${stop}.jsonl" 20 1
   wait_for 'esc to interrupt'
   if [ "${stop}" = interrupt ]; then

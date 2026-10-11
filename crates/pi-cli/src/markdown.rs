@@ -265,6 +265,116 @@ pub fn ratatui_style(style: SpanStyle, accent: ratatui::style::Color) -> Style {
     }
 }
 
+/// A block-level construct detected on a single markdown source line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockKind {
+    /// `#{1,6} text` heading. Level 1–6; display drops the hashes.
+    Heading(u8),
+    /// ``` or ~~~ fence open/close. Content lines are opaque (no inline
+    /// emphasis) until the matching fence.
+    Fence {
+        language: String,
+        closing: bool,
+    },
+    /// `- ` or `* ` bullet, or `1. ` ordered.
+    ListItem {
+        ordered: bool,
+    },
+    /// `> text` blockquote.
+    Blockquote,
+    Plain,
+}
+
+/// Classify one source line for block rendering.
+pub fn classify_line(line: &str) -> BlockKind {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        return BlockKind::Fence {
+            language: rest.trim().to_string(),
+            closing: false,
+        };
+    }
+    // Heading: 1-6 '#' followed by a space.
+    if let Some(after_hashes) = trimmed.strip_prefix('#') {
+        let hashes = after_hashes.len() - after_hashes.trim_start_matches('#').len();
+        let total = hashes + 1;
+        let rest = &after_hashes[hashes..];
+        if (1..=6).contains(&total) && (rest.starts_with(' ') || rest.is_empty()) {
+            return BlockKind::Heading(total as u8);
+        }
+    }
+    if trimmed == ">" || trimmed.starts_with("> ") {
+        return BlockKind::Blockquote;
+    }
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        return BlockKind::ListItem { ordered: false };
+    }
+    // Ordered list: digits followed by `. ` — but not decimals in prose
+    // ("3.14") because those have no space after the dot.
+    let digits: String = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if !digits.is_empty() && trimmed[digits.len()..].starts_with(". ") {
+        return BlockKind::ListItem { ordered: true };
+    }
+    BlockKind::Plain
+}
+
+/// How a source line should render at block level: display prefix and base
+/// style hint, plus whether inline emphasis applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRender {
+    /// Prefix replacing the source's leading markers (e.g. "  • ").
+    pub prefix: String,
+    /// Bytes of source text after the marker to render as content.
+    pub content_byte: usize,
+    /// Bold for headings, dim for quotes, plain otherwise.
+    pub emphasis_blocks: bool,
+    /// Inline emphasis (bold/code/links) applies to the content.
+    pub inline: bool,
+}
+
+/// Render instructions for a classified line inside an assistant entry.
+pub fn block_render(kind: &BlockKind, line: &str) -> BlockRender {
+    match kind {
+        BlockKind::Heading(level) => BlockRender {
+            prefix: "".to_string(),
+            content_byte: line.len() - line.trim_start().len() + (1 + *level as usize),
+            emphasis_blocks: true,
+            inline: true,
+        },
+        BlockKind::Fence { closing, .. } => BlockRender {
+            prefix: "  ┆ ".to_string(),
+            content_byte: if *closing { line.len() } else { 0 },
+            emphasis_blocks: false,
+            inline: false,
+        },
+        BlockKind::ListItem { ordered } => BlockRender {
+            prefix: if *ordered {
+                "  1. ".to_string()
+            } else {
+                "  • ".to_string()
+            },
+            content_byte: line.len() - line.trim_start().len() + 2,
+            emphasis_blocks: false,
+            inline: true,
+        },
+        BlockKind::Blockquote => BlockRender {
+            prefix: "  │ ".to_string(),
+            content_byte: line.find('>').map(|i| i + 1).unwrap_or(0),
+            emphasis_blocks: false,
+            inline: true,
+        },
+        BlockKind::Plain => BlockRender {
+            prefix: "  ".to_string(),
+            content_byte: 0,
+            inline: true,
+            emphasis_blocks: false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +453,64 @@ mod tests {
                 assert_eq!(span.display, &line[span.source.clone()]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_common_blocks() {
+        assert_eq!(classify_line("## Title"), BlockKind::Heading(2));
+        assert_eq!(classify_line("###### Deep"), BlockKind::Heading(6));
+        assert_eq!(classify_line("#NotHeading"), BlockKind::Plain);
+        assert_eq!(
+            classify_line("```rust"),
+            BlockKind::Fence {
+                language: "rust".into(),
+                closing: false
+            }
+        );
+        assert_eq!(
+            classify_line("```"),
+            BlockKind::Fence {
+                language: String::new(),
+                closing: false
+            }
+        );
+        assert_eq!(
+            classify_line("- item"),
+            BlockKind::ListItem { ordered: false }
+        );
+        assert_eq!(
+            classify_line("1. step"),
+            BlockKind::ListItem { ordered: true }
+        );
+        assert_eq!(classify_line("> quoted"), BlockKind::Blockquote);
+        assert_eq!(classify_line("plain text"), BlockKind::Plain);
+    }
+
+    #[test]
+    fn ordered_list_requires_two_digits() {
+        // 1. is one digit — treat as plain per our subset (avoid matching
+        // decimals like 3.14 in prose).
+        assert_eq!(
+            classify_line("1. single"),
+            BlockKind::ListItem { ordered: true }
+        );
+        assert_eq!(classify_line("3.14 pi"), BlockKind::Plain);
+    }
+
+    #[test]
+    fn block_render_prefixes_and_content() {
+        let heading = block_render(&BlockKind::Heading(2), "## Title");
+        assert_eq!(heading.content_byte, 3);
+        let item = block_render(&BlockKind::ListItem { ordered: false }, "- thing");
+        assert_eq!(item.prefix, "  • ");
+        assert_eq!(item.content_byte, 2);
+        let quote = block_render(&BlockKind::Blockquote, "> wisdom");
+        assert_eq!(quote.prefix, "  │ ");
+        assert_eq!(quote.content_byte, 1);
     }
 }
