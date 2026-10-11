@@ -2877,6 +2877,9 @@ async fn run_interactive(
                 }
             }
             app.refresh_diff_panel(&runtime);
+            if let Some(session_id) = app.pending_session_resume.take() {
+                apply_midturn_session_resume(&mut app, &mut runtime, &config, &session_id)?;
+            }
             continue;
         }
         // Input wins over a pending restart so quit keys are honored even
@@ -3343,6 +3346,14 @@ struct TuiApp {
     /// has no interior round boundary, so ctrl+s steering only lands after
     /// the response finishes and the hint must not promise a boundary.
     turn_saw_tools: bool,
+    /// Provider name of the active model, kept in sync for pickers that open
+    /// while the runtime is borrowed by a streaming turn.
+    active_model_provider: Option<String>,
+    /// A mid-turn /model <ref> resolved; apply when the turn ends.
+    pending_model_switch: Option<String>,
+    /// A mid-turn /resume selection; swap sessions once the turn is torn
+    /// down (the picker already closed).
+    pending_session_resume: Option<String>,
     resume_pending: bool,
     diff_panel: Option<DiffPanelState>,
 }
@@ -3400,6 +3411,12 @@ struct DiffDetail {
 }
 
 impl TuiApp {
+    /// Provider of the session's active model, for picker highlights when
+    /// the runtime itself is borrowed by a streaming turn.
+    fn active_provider(&self) -> Option<&str> {
+        self.active_model_provider.as_deref()
+    }
+
     fn new(config: &LoadedConfig, runtime: &Runtime) -> Self {
         let mut app = Self {
             resume_pending: runtime.session().has_unfinished_turn(),
@@ -3423,6 +3440,11 @@ impl TuiApp {
     }
 
     fn refresh_chrome(&mut self, config: &LoadedConfig, runtime: &Runtime) {
+        self.active_model_provider = runtime
+            .session()
+            .active_model
+            .as_ref()
+            .map(|model| model.provider.clone());
         let model = runtime
             .session()
             .active_model
@@ -5942,12 +5964,16 @@ fn handle_diff_panel_key(key: &KeyEvent, app: &mut TuiApp, runtime: &Runtime) ->
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamingKeyOutcome {
     Ignored,
     Changed,
     Interrupt,
     Quit,
+    /// A mid-turn /model <ref> resolved; apply after the turn ends.
+    SwitchModel(String),
+    /// A mid-turn /resume selection: kill the turn and swap sessions.
+    ResumeSession(String),
 }
 
 /// How a streaming turn ended: the provider finished, the user interrupted,
@@ -5993,6 +6019,11 @@ fn handle_streaming_tui_key(
     if let Some(name) = key_event_name(&key) {
         let bindings = keybinding_map(config);
         if bindings.matches("interrupt", &name) {
+            // A selector open mid-turn still honors the interrupt binding.
+            if app.selector.is_some() {
+                app.selector = None;
+                return StreamingKeyOutcome::Changed;
+            }
             return StreamingKeyOutcome::Interrupt;
         }
         if bindings.matches("steer", &name) {
@@ -6046,12 +6077,48 @@ fn handle_streaming_tui_key(
     }
     match key.code {
         KeyCode::Up if app.input.is_empty() => {
+            if app.selector.is_some() {
+                if let Some(selector) = app.selector.as_mut() {
+                    selector.move_selection(-1);
+                }
+                return StreamingKeyOutcome::Changed;
+            }
             if let Some(message) = followups.pop() {
                 recall_queued_message(app, message);
             }
             StreamingKeyOutcome::Changed
         }
-        KeyCode::Esc => StreamingKeyOutcome::Interrupt,
+        KeyCode::Down if app.selector.is_some() => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.move_selection(1);
+            }
+            StreamingKeyOutcome::Changed
+        }
+        KeyCode::PageUp if app.selector.is_some() => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.move_selection(-(SELECTOR_PAGE_STEP as isize));
+            }
+            StreamingKeyOutcome::Changed
+        }
+        KeyCode::PageDown if app.selector.is_some() => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.move_selection(SELECTOR_PAGE_STEP as isize);
+            }
+            StreamingKeyOutcome::Changed
+        }
+        KeyCode::Backspace if app.selector.is_some() => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.pop_query_char();
+            }
+            StreamingKeyOutcome::Changed
+        }
+        KeyCode::Esc => {
+            if app.selector.is_some() {
+                app.selector = None;
+                return StreamingKeyOutcome::Changed;
+            }
+            StreamingKeyOutcome::Interrupt
+        }
         KeyCode::Backspace => {
             app.pop_input_char();
             StreamingKeyOutcome::Changed
@@ -6061,6 +6128,59 @@ fn handle_streaming_tui_key(
             StreamingKeyOutcome::Changed
         }
         KeyCode::Enter => {
+            if app.selector.is_some() {
+                // Selecting from a mid-turn picker: session picks kill the
+                // turn and swap; model picks switch at turn end; provider
+                // picks drill in (two-layer) without touching the turn.
+                let selector = app.selector.take().expect("selector");
+                match selector.kind.as_str() {
+                    "session" => {
+                        if let Some(item) = selector.selected_item() {
+                            return StreamingKeyOutcome::ResumeSession(item.value.clone());
+                        }
+                        return StreamingKeyOutcome::Changed;
+                    }
+                    "provider" => {
+                        // Drill into the provider's models; keep streaming.
+                        let provider = selector
+                            .selected_item()
+                            .map(|item| item.value.clone())
+                            .unwrap_or_default();
+                        let models: Vec<SelectorItem> = sorted_models(&config.models)
+                            .into_iter()
+                            .filter(|model| model.provider == provider)
+                            .map(|model| {
+                                let value = format!("{}/{}", model.provider, model.id);
+                                SelectorItem {
+                                    label: value.clone(),
+                                    value,
+                                    active: false,
+                                }
+                            })
+                            .collect();
+                        if models.is_empty() {
+                            app.push(TuiEntryKind::System, format!("no models for {provider}"));
+                            return StreamingKeyOutcome::Changed;
+                        }
+                        let mut state = TuiSelectorState::new(
+                            "model",
+                            Selector::new(format!("model · {provider}"), models),
+                            "",
+                            None,
+                        );
+                        state.provider_filter = Some(provider);
+                        app.selector = Some(state);
+                        return StreamingKeyOutcome::Changed;
+                    }
+                    "model" => {
+                        if let Some(item) = selector.selected_item() {
+                            return StreamingKeyOutcome::SwitchModel(item.value.clone());
+                        }
+                        return StreamingKeyOutcome::Changed;
+                    }
+                    _ => return StreamingKeyOutcome::Changed,
+                }
+            }
             if !app.input_media.is_empty() {
                 app.push(
                     TuiEntryKind::System,
@@ -6140,6 +6260,59 @@ fn handle_streaming_command(
         }
         "interrupt" => StreamingKeyOutcome::Interrupt,
         "quit" | "exit" | "q" => StreamingKeyOutcome::Quit,
+        // Mid-turn model switching: a reference resolves against the static
+        // model list (no runtime borrow) and applies at the next turn; a bare
+        // /model opens the two-layer picker over the running turn.
+        command if command == "model" || command == "models" || command == "scoped-models" => {
+            let selector = Selector::new(
+                "provider",
+                provider_selector_items(&config.models, app.active_provider()),
+            );
+            if selector.items.is_empty() {
+                app.push(TuiEntryKind::System, "no models".to_string());
+            } else {
+                app.push(TuiEntryKind::System, "model selector".to_string());
+                app.selector = Some(TuiSelectorState::new("provider", selector, "", None));
+            }
+            StreamingKeyOutcome::Changed
+        }
+        command
+            if command.starts_with("model ")
+                || command.starts_with("models ")
+                || command.starts_with("scoped-models ") =>
+        {
+            let reference = command.split_once(' ').map(|x| x.1).unwrap_or("").trim();
+            if resolve_model_reference(config, reference).is_some() {
+                app.push(
+                    TuiEntryKind::System,
+                    format!("model switch queued: {reference} (applies after this turn)"),
+                );
+                StreamingKeyOutcome::SwitchModel(reference.to_string())
+            } else {
+                app.push(TuiEntryKind::Error, format!("model not found: {reference}"));
+                StreamingKeyOutcome::Changed
+            }
+        }
+        // Mid-turn resume opens the session picker; picking kills the turn.
+        "resume" => {
+            match session_selector_items(config) {
+                Ok(items) if items.is_empty() => {
+                    app.push(TuiEntryKind::System, "no sessions".to_string());
+                }
+                Ok(items) => {
+                    let selector = Selector::new("session", items);
+                    app.push(
+                        TuiEntryKind::System,
+                        "resume session: enter to resume · type to filter · esc cancel",
+                    );
+                    app.selector = Some(TuiSelectorState::new("session", selector, "", None));
+                }
+                Err(error) => {
+                    app.push(TuiEntryKind::Error, format!("{error:#}"));
+                }
+            }
+            StreamingKeyOutcome::Changed
+        }
         _ => {
             app.push(
                 TuiEntryKind::System,
@@ -6187,6 +6360,14 @@ async fn drain_streaming_tui_events(
                     StreamingKeyOutcome::Interrupt => control = Some(TurnControl::Interrupted),
                     StreamingKeyOutcome::Quit => {
                         control = Some(TurnControl::Quit);
+                    }
+                    StreamingKeyOutcome::SwitchModel(reference) => {
+                        app.pending_model_switch = Some(reference);
+                        changed = true;
+                    }
+                    StreamingKeyOutcome::ResumeSession(session_id) => {
+                        app.pending_session_resume = Some(session_id);
+                        control = Some(TurnControl::Interrupted);
                     }
                 }
             }
@@ -7512,6 +7693,29 @@ async fn handle_tui_bang(
     Ok(true)
 }
 
+/// Swap to the session picked mid-turn. The turn that was running has been
+/// interrupted and torn down by the time this runs; replace the session,
+/// reset the transcript, and surface the same resume hint the idle picker
+/// produces.
+fn apply_midturn_session_resume(
+    app: &mut TuiApp,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    session_id: &str,
+) -> Result<()> {
+    let path = resolve_session_reference(&config.paths.session_dir, session_id)?;
+    let (store, state) = SessionStore::open(path)?;
+    runtime.replace_session(state, Some(store));
+    app.clear_visible();
+    app.resume_pending = runtime.session().has_unfinished_turn();
+    if let Some(hint) = resume_hint(runtime) {
+        app.push(TuiEntryKind::System, hint);
+    }
+    app.push(TuiEntryKind::System, format_session(runtime));
+    app.refresh_chrome(config, runtime);
+    Ok(())
+}
+
 async fn submit_tui_prompt(
     app: &mut TuiApp,
     surface: &mut TuiSurface<'_>,
@@ -7550,6 +7754,13 @@ async fn submit_tui_prompt(
             TurnControl::Completed
         }
     };
+    // A mid-turn /resume selection swaps the session once the turn is torn
+    // down; submit_tui_prompt runs where the runtime is free again.
+    if let Some(session_id) = app.pending_session_resume.take() {
+        if let Err(error) = apply_midturn_session_resume(app, runtime, config, &session_id) {
+            app.push(TuiEntryKind::Error, format!("{error:#}"));
+        }
+    }
     app.refresh_diff_panel(runtime);
     matches!(control, TurnControl::Quit)
 }
@@ -7977,6 +8188,20 @@ async fn run_turn_tui(
     }
     insert_new_tool_messages(app, runtime, tool_start, entry_index);
     app.finish_live_entry();
+    // A mid-turn /model <ref> applies now, before the next turn starts.
+    // Persistence as default happens on the next explicit /model; here we
+    // only switch the session's active model.
+    if let Some(reference) = app.pending_model_switch.take() {
+        if let Some(model) = resolve_model_reference(config, &reference) {
+            let thinking = active_thinking_level(runtime, config, &model);
+            runtime.set_active_model(Some(model.clone()))?;
+            runtime.set_active_thinking_level(thinking.clone())?;
+            app.push(
+                TuiEntryKind::System,
+                format_model_selection(&model, thinking.as_deref()),
+            );
+        }
+    }
     redraw_tui(surface.terminal, app, config)?;
     Ok(TurnControl::Completed)
 }
@@ -9136,6 +9361,19 @@ fn relative_time_label(modified: std::time::SystemTime) -> String {
     }
 }
 
+/// Session picker rows, shared by the idle and mid-turn resume paths.
+fn session_selector_items(config: &LoadedConfig) -> Result<Vec<SelectorItem>> {
+    Ok(SessionStore::list(&config.paths.session_dir)?
+        .into_iter()
+        .rev()
+        .map(|session| SelectorItem {
+            label: format_session_picker_label(&session),
+            value: session.session_id.clone(),
+            active: false,
+        })
+        .collect())
+}
+
 fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Result<Selector> {
     match kind {
         "model" | "models" | "scoped-models" => Ok(Selector::new(
@@ -9162,7 +9400,14 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
         // Codex-style first layer: pick the provider, then its models.
         "provider" => Ok(Selector::new(
             "provider",
-            provider_selector_items(&config.models, runtime),
+            provider_selector_items(
+                &config.models,
+                runtime
+                    .session()
+                    .active_model
+                    .as_ref()
+                    .map(|model| model.provider.as_str()),
+            ),
         )),
         "theme" | "themes" => Ok(Selector::new(
             "theme",
@@ -9231,7 +9476,10 @@ fn sorted_models(models: &[ModelDefinition]) -> Vec<&ModelDefinition> {
 
 /// Provider rows for the first layer of the model picker: provider name,
 /// model count, and whether the active model belongs to it.
-fn provider_selector_items(models: &[ModelDefinition], runtime: &Runtime) -> Vec<SelectorItem> {
+fn provider_selector_items(
+    models: &[ModelDefinition],
+    active_provider: Option<&str>,
+) -> Vec<SelectorItem> {
     let mut providers: BTreeMap<String, usize> = BTreeMap::new();
     for model in models {
         *providers.entry(model.provider.clone()).or_default() += 1;
@@ -9239,12 +9487,7 @@ fn provider_selector_items(models: &[ModelDefinition], runtime: &Runtime) -> Vec
     providers
         .into_iter()
         .map(|(provider, count)| {
-            let active_provider = runtime
-                .session()
-                .active_model
-                .as_ref()
-                .map(|active| active.provider == provider)
-                .unwrap_or(false);
+            let active_provider = active_provider == Some(provider.as_str());
             SelectorItem {
                 label: format!(
                     "{provider} · {count} model{}{}",
@@ -11440,7 +11683,15 @@ mod tests {
         app.push_placeholder(TuiEntryKind::Assistant, "streaming");
         let followups = FollowUpQueue::default();
         let steering = SteeringMailbox::default();
-        let config = minimal_test_config();
+        let mut config = minimal_test_config();
+        config.models.push(ModelDefinition {
+            provider: "faux".into(),
+            id: "echo".into(),
+            name: None,
+            api: pi_config::ProviderApi::Faux,
+            base_url: None,
+            context_window: None,
+        });
         followups.push("first follow-up".to_string());
 
         let outcome = handle_streaming_tui_key(
@@ -11484,10 +11735,26 @@ mod tests {
             &steering,
             &config,
         );
+        // /model now opens the two-layer provider picker over the running
+        // turn instead of being rejected.
         assert_eq!(outcome, StreamingKeyOutcome::Changed);
-        assert!(app.entries.iter().any(|entry| entry
-            .text
-            .contains("/model is not available while a turn is running")));
+        assert!(app.selector.is_some());
+        assert_eq!(app.selector.as_ref().unwrap().kind, "provider");
+
+        // A direct reference queues a switch that applies after the turn.
+        app.selector = None;
+        app.set_input("/model faux/echo");
+        let outcome = handle_streaming_tui_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &followups,
+            &steering,
+            &config,
+        );
+        assert_eq!(
+            outcome,
+            StreamingKeyOutcome::SwitchModel("faux/echo".into())
+        );
 
         app.set_input("/interrupt");
         let outcome = handle_streaming_tui_key(
