@@ -1,8 +1,13 @@
 //! Versioned, append-only JSONL journals shared by interactive agents.
+//!
+//! Every append writes its record and newline in one `write_all`, so a crash
+//! leaves at most a torn final segment. Readers ignore such a segment, and
+//! writers repair it ([`repair_jsonl_tail`]) before appending, so no record is
+//! ever glued onto a partial line.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -154,24 +159,7 @@ impl JsonlJournal {
             timestamp_ms: unix_timestamp_ms(),
             event,
         };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|source| JournalError::Open {
-                path: self.path.clone(),
-                source,
-            })?;
-        serde_json::to_writer(&mut file, &envelope).map_err(|source| JournalError::Serialize {
-            path: self.path.clone(),
-            source,
-        })?;
-        file.write_all(b"\n")
-            .and_then(|_| file.sync_data())
-            .map_err(|source| JournalError::Write {
-                path: self.path.clone(),
-                source,
-            })?;
+        append_jsonl_record(&self.path, &envelope)?;
         self.next_sequence = self.next_sequence.saturating_add(1);
         Ok(envelope)
     }
@@ -180,7 +168,18 @@ impl JsonlJournal {
 /// Durably appends an application-specific legacy record. This lets existing
 /// Pi sessions adopt the shared write guarantees without changing their wire
 /// format in place.
+///
+/// The record and its newline reach the file in one `write_all` followed by
+/// `sync_data`. A failed write is truncated back to the previous length (best
+/// effort), and a torn tail left by an earlier failure is repaired first, so
+/// the new record always starts on its own line. Callers serialize appends to
+/// one journal.
 pub fn append_jsonl_record<T: Serialize>(path: &Path, record: &T) -> Result<(), JournalError> {
+    let mut line = serde_json::to_vec(record).map_err(|source| JournalError::Serialize {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    line.push(b'\n');
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| JournalError::CreateDir {
             path: parent.to_path_buf(),
@@ -189,22 +188,140 @@ pub fn append_jsonl_record<T: Serialize>(path: &Path, record: &T) -> Result<(), 
     }
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|source| JournalError::Open {
             path: path.to_path_buf(),
             source,
         })?;
-    serde_json::to_writer(&mut file, record).map_err(|source| JournalError::Serialize {
+    let write_error = |source| JournalError::Write {
         path: path.to_path_buf(),
         source,
-    })?;
-    file.write_all(b"\n")
-        .and_then(|_| file.sync_data())
+    };
+    let mut length = file.metadata().map_err(write_error)?.len();
+    if repair_tail(&mut file, length).map_err(write_error)? != TailRepair::Clean {
+        length = file.metadata().map_err(write_error)?.len();
+    }
+    if let Err(source) = file.write_all(&line).and_then(|()| file.sync_data()) {
+        // A partial record must not survive: the next append would glue onto it.
+        let _ = file.set_len(length).and_then(|()| file.sync_data());
+        return Err(write_error(source));
+    }
+    Ok(())
+}
+
+/// What [`repair_jsonl_tail`] changed so a journal ends on a record boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailRepair {
+    /// Empty, or already newline-terminated; nothing changed.
+    Clean,
+    /// A complete final record only lacked its newline, which was appended.
+    Terminated,
+    /// A torn final segment of this many bytes was truncated away.
+    Truncated(u64),
+}
+
+/// Prepares a journal for appending: a complete final record that lacks its
+/// newline is terminated, and a torn final segment (an interrupted write) is
+/// truncated back to the last newline. A missing journal needs no repair.
+/// Only a journal's writer may call this; readers ignore torn tails instead.
+pub fn repair_jsonl_tail(path: &Path) -> Result<TailRepair, JournalError> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(TailRepair::Clean),
+        Err(source) => {
+            return Err(JournalError::Open {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    file.metadata()
+        .and_then(|metadata| repair_tail(&mut file, metadata.len()))
         .map_err(|source| JournalError::Write {
             path: path.to_path_buf(),
             source,
         })
+}
+
+/// In-memory form of [`repair_jsonl_tail`] for callers that rewrite a whole
+/// journal: the torn final segment is dropped, never patched with a newline.
+pub fn repair_jsonl_tail_bytes(content: &mut Vec<u8>) -> TailRepair {
+    let (records, tail) = split_jsonl_tail(content);
+    if tail.is_empty() {
+        TailRepair::Clean
+    } else if is_complete_jsonl_record(tail) {
+        content.push(b'\n');
+        TailRepair::Terminated
+    } else {
+        let torn = tail.len() as u64;
+        content.truncate(records.len());
+        TailRepair::Truncated(torn)
+    }
+}
+
+/// Splits a journal into its newline-terminated part and the bytes after its
+/// last newline, which are empty when the journal ends with a newline.
+pub fn split_jsonl_tail(content: &[u8]) -> (&[u8], &[u8]) {
+    let start = content
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    content.split_at(start)
+}
+
+/// Whether an unterminated final segment is a whole record that only lost its
+/// newline. Records are JSON objects and every proper prefix of a JSON object
+/// is invalid JSON, so this never mistakes a torn write for a record and never
+/// discards a complete one.
+pub fn is_complete_jsonl_record(segment: &[u8]) -> bool {
+    serde_json::from_slice::<serde::de::IgnoredAny>(segment).is_ok()
+}
+
+fn repair_tail(file: &mut File, length: u64) -> io::Result<TailRepair> {
+    if length == 0 {
+        return Ok(TailRepair::Clean);
+    }
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::Start(length - 1))?;
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(TailRepair::Clean);
+    }
+    let start = final_segment_start(file, length)?;
+    let mut segment = vec![0u8; usize::try_from(length - start).map_err(io::Error::other)?];
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut segment)?;
+    let repair = if is_complete_jsonl_record(&segment) {
+        file.seek(SeekFrom::Start(length))?;
+        file.write_all(b"\n")?;
+        TailRepair::Terminated
+    } else {
+        file.set_len(start)?;
+        TailRepair::Truncated(length - start)
+    };
+    file.sync_data()?;
+    Ok(repair)
+}
+
+/// Offset just past the last newline, scanning backwards so a large journal is
+/// not read in full.
+fn final_segment_start(file: &mut File, length: u64) -> io::Result<u64> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut end = length;
+    let mut buffer = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        buffer.resize((end - start) as usize, 0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer)?;
+        if let Some(index) = buffer.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + index as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 pub fn load(path: &Path) -> Result<LoadReport, JournalError> {
@@ -399,5 +516,103 @@ mod tests {
             SessionEvent::Legacy { .. }
         ));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn appends_land_as_whole_lines_even_after_a_torn_tail() {
+        let path = temp_path("append-lines");
+        let _ = fs::remove_file(&path);
+        append_jsonl_record(&path, &serde_json::json!({ "type": "a" })).unwrap();
+        append_jsonl_record(&path, &serde_json::json!({ "type": "b" })).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"type\":\"a\"}\n{\"type\":\"b\"}\n"
+        );
+
+        // An interrupted earlier write is dropped instead of glued onto.
+        fs::write(&path, "{\"type\":\"a\"}\n{\"type\":\"b\",\"par").unwrap();
+        append_jsonl_record(&path, &serde_json::json!({ "type": "c" })).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"type\":\"a\"}\n{\"type\":\"c\"}\n"
+        );
+
+        // A complete record that only lost its newline is kept.
+        fs::write(&path, "{\"type\":\"a\"}").unwrap();
+        append_jsonl_record(&path, &serde_json::json!({ "type": "c" })).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"type\":\"a\"}\n{\"type\":\"c\"}\n"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn repair_terminates_complete_records_and_truncates_torn_ones() {
+        let path = temp_path("repair");
+        let _ = fs::remove_file(&path);
+        assert_eq!(repair_jsonl_tail(&path).unwrap(), TailRepair::Clean);
+        assert!(
+            !path.exists(),
+            "repairing a missing journal must not create it"
+        );
+
+        let cases: [(&str, TailRepair, &str); 6] = [
+            ("", TailRepair::Clean, ""),
+            ("{\"a\":1}\n", TailRepair::Clean, "{\"a\":1}\n"),
+            (
+                "{\"a\":1}\n{\"b\":2}",
+                TailRepair::Terminated,
+                "{\"a\":1}\n{\"b\":2}\n",
+            ),
+            (
+                "{\"a\":1}\n{\"b\":",
+                TailRepair::Truncated(5),
+                "{\"a\":1}\n",
+            ),
+            ("{\"b\":", TailRepair::Truncated(5), ""),
+            // Two records glued without a newline are corrupt, not complete.
+            (
+                "{\"a\":1}\n{\"b\":2}{\"c\"",
+                TailRepair::Truncated(11),
+                "{\"a\":1}\n",
+            ),
+        ];
+        for (content, repair, repaired) in cases {
+            fs::write(&path, content).unwrap();
+            assert_eq!(repair_jsonl_tail(&path).unwrap(), repair, "{content:?}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), repaired, "{content:?}");
+        }
+
+        // The backwards newline scan crosses its 64 KiB chunk boundary.
+        let long = "x".repeat(200_000);
+        let torn = format!("{{\"a\":1}}\n{{\"b\":\"{long}");
+        fs::write(&path, &torn).unwrap();
+        assert_eq!(
+            repair_jsonl_tail(&path).unwrap(),
+            TailRepair::Truncated(torn.len() as u64 - 8)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"a\":1}\n");
+        let complete = format!("{{\"a\":1}}\n{{\"b\":\"{long}\"}}");
+        fs::write(&path, &complete).unwrap();
+        assert_eq!(repair_jsonl_tail(&path).unwrap(), TailRepair::Terminated);
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{complete}\n"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn in_memory_repair_drops_torn_segments_instead_of_patching_them() {
+        let mut torn = b"{\"a\":1}\n{\"b\":".to_vec();
+        assert_eq!(repair_jsonl_tail_bytes(&mut torn), TailRepair::Truncated(5));
+        assert_eq!(torn, b"{\"a\":1}\n");
+        let mut unterminated = b"{\"a\":1}\n{\"b\":2}".to_vec();
+        assert_eq!(
+            repair_jsonl_tail_bytes(&mut unterminated),
+            TailRepair::Terminated
+        );
+        assert_eq!(unterminated, b"{\"a\":1}\n{\"b\":2}\n");
+        let mut clean = b"{\"a\":1}\n".to_vec();
+        assert_eq!(repair_jsonl_tail_bytes(&mut clean), TailRepair::Clean);
+        assert_eq!(clean, b"{\"a\":1}\n");
     }
 }

@@ -265,4 +265,52 @@ capture
 wait_for '❯ after-offline-error'
 tmux send-keys -t "${session}" '/quit' Enter
 wait_for resume-fixture-shell
+# A session another pi process holds is refused in place: an error line, and
+# the TUI keeps working.
+printf '{"type":"started","session_id":"held","cwd":"."}\n' > "${work_dir}/held.jsonl"
+mkfifo "${work_dir}/holder.in"
+env PI_CODING_AGENT_DIR="${work_dir}/agent" "${pi_bin}" --mode rpc --session "${work_dir}/held.jsonl" --model faux/echo --offline < "${work_dir}/holder.in" > /dev/null 2>&1 &
+holder_pid=$!
+exec 9> "${work_dir}/holder.in"
+for _ in $(seq 1 100); do
+  if grep -Fq '"type":"active_model"' "${work_dir}/held.jsonl"; then break; fi
+  sleep 0.1
+done
+grep -Fq '"type":"active_model"' "${work_dir}/held.jsonl" || fail 'rpc holder did not open its session'
+restart_fixture "${work_dir}/direct.jsonl"
+# Wide enough that the error, which names the full journal path, fits a row.
+tmux resize-window -t "${session}" -x 240 -y 24
+tmux send-keys -t "${session}" "/resume ${work_dir}/held.jsonl" Enter
+wait_for "held.jsonl is in use by another pi process (pid ${holder_pid})"
+tmux send-keys -t "${session}" 'after-locked-resume' Enter
+wait_for '[faux/echo] after-locked-resume'
+grep -Fq '"content":"[faux/echo] after-locked-resume"' "${work_dir}/direct.jsonl" || fail 'refused resume changed the open session'
+tmux send-keys -t "${session}" '/quit' Enter
+wait_for resume-fixture-shell
+kill "${holder_pid}" 2>/dev/null || true
+exec 9>&-
+wait "${holder_pid}" 2>/dev/null || true
+# The dogfood exec-restart reopens the session it had open with --session: the
+# lock is close-on-exec, so the new image is not refused by its predecessor.
+printf '#!/bin/sh\nexec %s "$@"\n' "'${pi_bin}'" > "${work_dir}/watched-restart"
+chmod +x "${work_dir}/watched-restart"
+restart_fixture "${work_dir}/direct.jsonl" 0 1
+# /todos prints a line that is not journaled, so only a new image clears it.
+tmux send-keys -t "${session}" '/todos' Enter
+wait_for 'no todos'
+touch "${work_dir}/watched-restart"
+restarted=''
+for _ in $(seq 1 150); do
+  capture
+  if ! grep -Fq 'no todos' "${work_dir}/pane.txt" && grep -Fq '│ >' "${work_dir}/pane.txt"; then restarted=1; break; fi
+  sleep 0.1
+done
+[ -n "${restarted}" ] || fail 'touching the watched binary did not restart pi'
+absent 'resume-fixture-shell'
+tmux send-keys -t "${session}" 'after-exec-restart' Enter
+wait_for '[faux/echo] after-exec-restart'
+grep -Fq '"content":"[faux/echo] after-exec-restart"' "${work_dir}/direct.jsonl" || fail 'exec-restart did not reopen its session'
+absent 'in use by another pi process'
+tmux send-keys -t "${session}" '/quit' Enter
+wait_for resume-fixture-shell
 echo "owned transcript e2e passed (artifacts: ${work_dir})"

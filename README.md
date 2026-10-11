@@ -161,6 +161,15 @@ cargo run -p pi-cli -- --session <id-prefix|name|path>
 cargo run -p pi-cli -- --fork <id-prefix|name|path>
 ```
 
+A session has one writer at a time: opening it for writing takes a lock on
+`<session>.jsonl.lock` beside the journal. Startup waits up to 5 seconds for
+another pi process to release the session, then exits with status 75, naming
+the session path and the holder's pid. In the TUI, `/resume`, the picker,
+`/import` onto that session id, and `/delete` report the conflict and keep
+running. Listing, `--fork`, `/fork`, and `/clone` only read. A crash during an
+append leaves at most a torn final line, which readers ignore and the next
+writer drops; a journal that fails to load is left out of listings.
+
 Useful CLI scope flags:
 
 ```bash
@@ -962,8 +971,10 @@ make test-smoke
 
 `make dogfood` runs the development TUI with `--continue --model faux/echo`.
 It also starts a quiet background `cargo build -p pi-cli` watcher; successful
-rebuilds restart the running TUI process, and the continued session restores
-conversation messages from disk. Restarts wait until the active turn and its
+rebuilds restart the running TUI process into the session it had open
+(`--session <file>` replaces the original session flags, so a restart never
+jumps to a newer session or forks again), which restores conversation
+messages from disk. Restarts wait until the active turn and its
 follow-ups finish — or until you are idle between prompts with nothing
 streaming — so a rebuild never interrupts work or lands under your fingers
 while typing. Interactive startup and `/resume` automatically continue
