@@ -200,9 +200,15 @@ applicable, with a `session` header and entry `id`/`parentId` chain.
 Required properties:
 
 - Durable across process restarts.
+- One writer per session: writers hold an exclusive lock on a separate
+  `<journal>.lock` file (compaction replaces the journal by rename), shared by
+  every handle in the owning process; another process gets
+  `SessionError::Locked`. Listing and fork/clone/import sources only read.
 - Supports fork/clone operations and TS-shaped JSONL open/export/import.
 - Full in-place active-leaf session-tree editing remains parity work.
-- Can recover partial sessions after process interruption.
+- Can recover partial sessions after process interruption: each append writes
+  its record and newline in one write, readers ignore a torn final segment,
+  and writers drop it (or terminate a complete record) before appending.
 - Can be tested with in-memory and temp-dir storage.
 - Persists active model and active thinking level.
 - Supports JSON, JSONL, and local HTML export/import where applicable.

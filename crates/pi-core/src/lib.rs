@@ -1,5 +1,7 @@
 mod compaction;
+mod session_lock;
 pub use compaction::RuntimeCompactionSettings;
+use session_lock::SessionLock;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
@@ -548,6 +550,19 @@ pub enum SessionError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    /// Another process holds the session for writing; `pid` names the holder
+    /// when its lock file says so.
+    #[error("session {path} is in use by another pi process{}", lock_holder(.pid))]
+    Locked { path: PathBuf, pid: Option<u32> },
+    #[error("failed to lock session {path}: {source}")]
+    Lock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+fn lock_holder(pid: &Option<u32>) -> String {
+    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
 }
 
 #[derive(Debug, Error)]
@@ -635,9 +650,14 @@ enum SessionRecord {
     Unknown,
 }
 
+/// A session journal opened for writing. Every constructor takes the session
+/// lock (see [`SessionError::Locked`]) and repairs a torn tail before the
+/// first append; clones share the lock and serialize their writes. Read-only
+/// access goes through [`SessionStore::read`], which never locks or repairs.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     path: PathBuf,
+    lock: Arc<SessionLock>,
 }
 
 impl SessionStore {
@@ -656,7 +676,7 @@ impl SessionStore {
         })?;
         let session_id = session_id.into();
         let path = session_dir.join(format!("{session_id}.jsonl"));
-        let store = Self { path };
+        let store = Self::writer(path)?;
         let state = SessionState::new(session_id.clone(), cwd.clone());
         store.append(&SessionRecord::Started { session_id, cwd })?;
         Ok((store, state))
@@ -673,7 +693,7 @@ impl SessionStore {
         })?;
         let session_id = new_session_id();
         let path = session_dir.join(format!("{session_id}.jsonl"));
-        let store = Self { path };
+        let store = Self::writer(path)?;
         let mut state = source.clone();
         state.session_id = session_id.clone();
         state.parent_session_id = if clone_parent {
@@ -704,16 +724,65 @@ impl SessionStore {
             export.session_id.clone()
         };
         let path = session_dir.join(format!("{session_id}.jsonl"));
-        let store = Self { path };
+        // Importing over an existing id rewrites that journal, so it takes the
+        // lock first and refuses while another process holds the session.
+        let store = Self::writer(path)?;
         let state = session_state_from_export(export, session_id);
         store.write_full_state(&state)?;
         Ok((store, state))
     }
 
+    /// Opens an existing session for writing: takes the session lock, repairs
+    /// a torn tail, then loads it.
     pub fn open(path: PathBuf) -> Result<(Self, SessionState), SessionError> {
-        let store = Self { path };
+        fs::metadata(&path).map_err(|source| SessionError::Open {
+            path: path.clone(),
+            source,
+        })?;
+        let store = Self::writer(path)?;
         let state = store.load()?;
         Ok((store, state))
+    }
+
+    /// Loads a session without locking or repairing it, for listing, pickers,
+    /// fork and clone sources, and import sources. A torn final segment left
+    /// by an interrupted append is ignored; a bad line before it is an error.
+    pub fn read(path: &Path) -> Result<SessionState, SessionError> {
+        let content = read_journal_bytes(path)?;
+        if jsonl_is_ts_session_export(&content) {
+            let export = read_ts_jsonl_export(path, &content)?;
+            let session_id = if export.session_id.trim().is_empty() {
+                "recovered".to_string()
+            } else {
+                export.session_id.clone()
+            };
+            return Ok(session_state_from_export(export, session_id));
+        }
+        read_rust_journal(path, &content)
+    }
+
+    /// Deletes a session journal. Refuses with [`SessionError::Locked`] while
+    /// another process holds the session; this process may delete a session
+    /// it holds itself, whose lock file goes away with its last handle.
+    pub fn delete(path: &Path) -> Result<(), SessionError> {
+        let lock = session_lock::acquire(path)?;
+        let _writer = lock.writer();
+        fs::remove_file(path).map_err(|source| SessionError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn writer(path: PathBuf) -> Result<Self, SessionError> {
+        let store = Self {
+            lock: session_lock::acquire(&path)?,
+            path,
+        };
+        {
+            let _writer = store.lock.writer();
+            pi_session::repair_jsonl_tail(&store.path)?;
+        }
+        Ok(store)
     }
 
     pub fn path(&self) -> &Path {
@@ -764,11 +833,7 @@ impl SessionStore {
     }
 
     pub fn record_metadata(&self, state: &SessionState) -> Result<(), SessionError> {
-        self.append(&SessionRecord::Metadata {
-            name: state.name.clone(),
-            labels: state.labels.iter().cloned().collect(),
-            parent_session_id: state.parent_session_id.clone(),
-        })
+        self.append(&metadata_record(state))
     }
 
     pub fn record_queued_message(&self, message: String) -> Result<(), SessionError> {
@@ -791,10 +856,6 @@ impl SessionStore {
         record: CompactionRecord,
         messages: Vec<ConversationMessage>,
     ) -> Result<(), SessionError> {
-        let mut journal = fs::read(&self.path).map_err(|source| SessionError::Read {
-            path: self.path.clone(),
-            source,
-        })?;
         let checkpoint =
             serde_json::to_vec(&SessionRecord::CompactionCheckpoint { record, messages }).map_err(
                 |source| SessionError::Parse {
@@ -802,13 +863,22 @@ impl SessionStore {
                     source,
                 },
             )?;
-        if !journal.ends_with(b"\n") {
-            journal.push(b'\n');
-        }
+        // No append from another handle may land between the read and the
+        // rename, or the rewrite would drop it.
+        let _writer = self.lock.writer();
+        let mut journal = fs::read(&self.path).map_err(|source| SessionError::Read {
+            path: self.path.clone(),
+            source,
+        })?;
+        // A torn final segment is dropped, never patched with a newline into
+        // a corrupt interior line; a complete record that only lost its
+        // newline is terminated.
+        pi_session::repair_jsonl_tail_bytes(&mut journal);
         journal.extend(checkpoint);
         journal.push(b'\n');
         // Rename a synced temporary file: a failed write leaves the old
         // journal and active context unchanged, with no partial checkpoint.
+        // The session lock lives in a separate file, so the rename keeps it.
         pi_config::write_file_atomic(&self.path, &journal)?;
         Ok(())
     }
@@ -826,15 +896,12 @@ impl SessionStore {
         path: &Path,
     ) -> Result<(Self, SessionState), SessionError> {
         let export = if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
-            let content = fs::read_to_string(path).map_err(|source| SessionError::Read {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            // The source is only read: importing never locks or repairs it.
+            let content = read_journal_bytes(path)?;
             if jsonl_is_ts_session_export(&content) {
                 read_ts_jsonl_export(path, &content)?
             } else {
-                let (_store, state) = Self::open(path.to_path_buf())?;
-                SessionExport::from(&state)
+                SessionExport::from(&read_rust_journal(path, &content)?)
             }
         } else {
             let content = fs::read_to_string(path).map_err(|source| SessionError::Read {
@@ -851,6 +918,9 @@ impl SessionStore {
         Self::import(session_dir, export)
     }
 
+    /// Summarizes every readable session, oldest first. A journal that fails
+    /// to load is skipped, so one damaged file never hides the others from
+    /// the resume picker, `--continue`, `--resume`, `/tree`, or `resolve`.
     pub fn list(session_dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
         if !session_dir.exists() {
             return Ok(Vec::new());
@@ -860,10 +930,9 @@ impl SessionStore {
             path: session_dir.to_path_buf(),
             source,
         })? {
-            let entry = entry.map_err(|source| SessionError::Read {
-                path: session_dir.to_path_buf(),
-                source,
-            })?;
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
@@ -872,8 +941,9 @@ impl SessionStore {
                 .metadata()
                 .ok()
                 .and_then(|metadata| metadata.modified().ok());
-            let store = Self { path: path.clone() };
-            let state = store.load()?;
+            let Ok(state) = Self::read(&path) else {
+                continue;
+            };
             let branch_summary = state
                 .branch_summaries
                 .iter()
@@ -946,174 +1016,193 @@ impl SessionStore {
     }
 
     fn load(&self) -> Result<SessionState, SessionError> {
-        let mut file = File::open(&self.path).map_err(|source| SessionError::Open {
-            path: self.path.clone(),
-            source,
-        })?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)
-            .map_err(|source| SessionError::Read {
+        Self::read(&self.path)
+    }
+
+    /// Replaces the journal with the full state in one atomic rename, so a
+    /// crash leaves either the previous journal or the complete new one.
+    fn write_full_state(&self, state: &SessionState) -> Result<(), SessionError> {
+        let mut records = vec![
+            SessionRecord::Started {
+                session_id: state.session_id.clone(),
+                cwd: state.cwd.clone(),
+            },
+            metadata_record(state),
+            SessionRecord::ActiveModel {
+                model: state.active_model.clone(),
+            },
+            SessionRecord::ActiveAccount {
+                account: state.active_account.clone(),
+            },
+            SessionRecord::ActiveThinkingLevel {
+                level: state.active_thinking_level.clone(),
+            },
+            SessionRecord::DisabledTools {
+                tools: state.disabled_tools.iter().cloned().collect(),
+            },
+            SessionRecord::Todos {
+                todos: state.todos.clone(),
+            },
+            SessionRecord::EditedFiles {
+                paths: state.edited_files.clone(),
+            },
+            SessionRecord::Usage {
+                usage: state.usage.clone(),
+            },
+        ];
+        records.extend(
+            state
+                .messages
+                .iter()
+                .cloned()
+                .map(|message| SessionRecord::Message { message }),
+        );
+        records.extend(
+            state
+                .tool_history
+                .iter()
+                .cloned()
+                .map(|event| SessionRecord::Tool { event }),
+        );
+        records.extend(
+            state
+                .queued_messages
+                .iter()
+                .cloned()
+                .map(|message| SessionRecord::QueuedMessage { message }),
+        );
+        records.extend(
+            state
+                .compactions
+                .iter()
+                .cloned()
+                .map(|record| SessionRecord::Compaction { record }),
+        );
+        records.extend(
+            state
+                .branch_summaries
+                .iter()
+                .cloned()
+                .map(|summary| SessionRecord::BranchSummary { summary }),
+        );
+        let mut journal = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut journal, record).map_err(|source| SessionError::Parse {
                 path: self.path.clone(),
                 source,
             })?;
-        if jsonl_is_ts_session_export(&content) {
-            let export = read_ts_jsonl_export(&self.path, &content)?;
-            let session_id = if export.session_id.trim().is_empty() {
-                "recovered".to_string()
-            } else {
-                export.session_id.clone()
-            };
-            return Ok(session_state_from_export(export, session_id));
+            journal.push(b'\n');
         }
-        let mut state: Option<SessionState> = None;
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record = serde_json::from_str::<SessionRecord>(line).map_err(|source| {
-                SessionError::Parse {
-                    path: self.path.clone(),
-                    source,
-                }
-            })?;
-            match record {
-                SessionRecord::Started { session_id, cwd } => {
-                    state = Some(SessionState::new(session_id, cwd));
-                }
-                SessionRecord::Metadata {
-                    name,
-                    labels,
-                    parent_session_id,
-                } => {
-                    if let Some(state) = &mut state {
-                        state.name = name;
-                        state.labels = labels.into_iter().collect();
-                        state.parent_session_id = parent_session_id;
-                    }
-                }
-                SessionRecord::Message { message } => {
-                    if let Some(state) = &mut state {
-                        state.messages.push(message);
-                    }
-                }
-                SessionRecord::MessagesSnapshot { messages } => {
-                    if let Some(state) = &mut state {
-                        state.messages = messages;
-                    }
-                }
-                SessionRecord::Tool { event } => {
-                    if let Some(state) = &mut state {
-                        state.tool_history.push(event);
-                    }
-                }
-                SessionRecord::ActiveModel { model } => {
-                    if let Some(state) = &mut state {
-                        state.active_model = model;
-                    }
-                }
-                SessionRecord::ActiveAccount { account } => {
-                    if let Some(state) = &mut state {
-                        state.active_account = account;
-                    }
-                }
-                SessionRecord::ActiveThinkingLevel { level } => {
-                    if let Some(state) = &mut state {
-                        state.active_thinking_level = level;
-                    }
-                }
-                SessionRecord::DisabledTools { tools } => {
-                    if let Some(state) = &mut state {
-                        state.disabled_tools = tools.into_iter().collect();
-                        state.active_tool_names = active_tools_with(&state.disabled_tools);
-                    }
-                }
-                SessionRecord::Todos { todos } => {
-                    if let Some(state) = &mut state {
-                        state.todos = todos;
-                    }
-                }
-                SessionRecord::EditedFiles { paths } => {
-                    if let Some(state) = &mut state {
-                        state.edited_files = paths;
-                    }
-                }
-                SessionRecord::QueuedMessage { message } => {
-                    if let Some(state) = &mut state {
-                        state.queued_messages.push(message);
-                    }
-                }
-                SessionRecord::QueuedMessagesSnapshot { messages } => {
-                    if let Some(state) = &mut state {
-                        state.queued_messages = messages;
-                    }
-                }
-                SessionRecord::Compaction { record } => {
-                    if let Some(state) = &mut state {
-                        state.compactions.push(record);
-                    }
-                }
-                SessionRecord::CompactionCheckpoint { record, messages } => {
-                    if let Some(state) = &mut state {
-                        state.messages = messages;
-                        state.compactions.push(record);
-                    }
-                }
-                SessionRecord::BranchSummary { summary } => {
-                    if let Some(state) = &mut state {
-                        state.branch_summaries.push(summary);
-                    }
-                }
-                SessionRecord::Usage { usage } => {
-                    if let Some(state) = &mut state {
-                        state.usage = usage;
-                    }
-                }
-                SessionRecord::Unknown => {}
-            }
-        }
-        Ok(state.unwrap_or_else(|| SessionState::new("recovered", PathBuf::from("."))))
-    }
-
-    fn write_full_state(&self, state: &SessionState) -> Result<(), SessionError> {
-        File::create(&self.path).map_err(|source| SessionError::Write {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.append(&SessionRecord::Started {
-            session_id: state.session_id.clone(),
-            cwd: state.cwd.clone(),
-        })?;
-        self.record_metadata(state)?;
-        self.record_active_model(state.active_model.clone())?;
-        self.record_active_account(state.active_account.clone())?;
-        self.record_active_thinking_level(state.active_thinking_level.clone())?;
-        self.record_disabled_tools(state.disabled_tools.iter().cloned().collect())?;
-        self.record_todos(state.todos.clone())?;
-        self.record_edited_files(state.edited_files.clone())?;
-        self.record_usage(state.usage.clone())?;
-        for message in &state.messages {
-            self.record_message(message.clone())?;
-        }
-        for event in &state.tool_history {
-            self.record_tool(event.clone())?;
-        }
-        for message in &state.queued_messages {
-            self.append(&SessionRecord::QueuedMessage {
-                message: message.clone(),
-            })?;
-        }
-        for record in &state.compactions {
-            self.record_compaction(record.clone())?;
-        }
-        for summary in &state.branch_summaries {
-            self.record_branch_summary(summary.clone())?;
-        }
+        let _writer = self.lock.writer();
+        pi_config::write_file_atomic(&self.path, &journal)?;
         Ok(())
     }
 
     fn append(&self, record: &SessionRecord) -> Result<(), SessionError> {
+        let _writer = self.lock.writer();
         pi_session::append_jsonl_record(&self.path, record)?;
         Ok(())
+    }
+}
+
+fn metadata_record(state: &SessionState) -> SessionRecord {
+    SessionRecord::Metadata {
+        name: state.name.clone(),
+        labels: state.labels.iter().cloned().collect(),
+        parent_session_id: state.parent_session_id.clone(),
+    }
+}
+
+fn read_journal_bytes(path: &Path) -> Result<Vec<u8>, SessionError> {
+    let mut file = File::open(path).map_err(|source| SessionError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)
+        .map_err(|source| SessionError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(content)
+}
+
+fn is_blank_line(line: &[u8]) -> bool {
+    std::str::from_utf8(line).is_ok_and(|line| line.trim().is_empty())
+}
+
+/// Replays a Rust session journal. Only an unterminated final segment that is
+/// not a whole JSON value counts as an interrupted append and is ignored; any
+/// other unreadable line, including a corrupt line in the middle, is an error.
+fn read_rust_journal(path: &Path, content: &[u8]) -> Result<SessionState, SessionError> {
+    let parse_error = |source| SessionError::Parse {
+        path: path.to_path_buf(),
+        source,
+    };
+    let (records, tail) = pi_session::split_jsonl_tail(content);
+    let records = std::str::from_utf8(records).map_err(|error| SessionError::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+    })?;
+    let mut state = None;
+    for line in records.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<SessionRecord>(line).map_err(parse_error)?;
+        apply_session_record(&mut state, record);
+    }
+    if !is_blank_line(tail) {
+        match serde_json::from_slice::<SessionRecord>(tail) {
+            Ok(record) => apply_session_record(&mut state, record),
+            Err(_) if !pi_session::is_complete_jsonl_record(tail) => {}
+            Err(source) => return Err(parse_error(source)),
+        }
+    }
+    Ok(state.unwrap_or_else(|| SessionState::new("recovered", PathBuf::from("."))))
+}
+
+fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord) {
+    if let SessionRecord::Started { session_id, cwd } = record {
+        *state = Some(SessionState::new(session_id, cwd));
+        return;
+    }
+    // Records before the first `started` have no session to apply to.
+    let Some(state) = state else {
+        return;
+    };
+    match record {
+        SessionRecord::Started { .. } | SessionRecord::Unknown => {}
+        SessionRecord::Metadata {
+            name,
+            labels,
+            parent_session_id,
+        } => {
+            state.name = name;
+            state.labels = labels.into_iter().collect();
+            state.parent_session_id = parent_session_id;
+        }
+        SessionRecord::Message { message } => state.messages.push(message),
+        SessionRecord::MessagesSnapshot { messages } => state.messages = messages,
+        SessionRecord::Tool { event } => state.tool_history.push(event),
+        SessionRecord::ActiveModel { model } => state.active_model = model,
+        SessionRecord::ActiveAccount { account } => state.active_account = account,
+        SessionRecord::ActiveThinkingLevel { level } => state.active_thinking_level = level,
+        SessionRecord::DisabledTools { tools } => {
+            state.disabled_tools = tools.into_iter().collect();
+            state.active_tool_names = active_tools_with(&state.disabled_tools);
+        }
+        SessionRecord::Todos { todos } => state.todos = todos,
+        SessionRecord::EditedFiles { paths } => state.edited_files = paths,
+        SessionRecord::QueuedMessage { message } => state.queued_messages.push(message),
+        SessionRecord::QueuedMessagesSnapshot { messages } => state.queued_messages = messages,
+        SessionRecord::Compaction { record } => state.compactions.push(record),
+        SessionRecord::CompactionCheckpoint { record, messages } => {
+            state.messages = messages;
+            state.compactions.push(record);
+        }
+        SessionRecord::BranchSummary { summary } => state.branch_summaries.push(summary),
+        SessionRecord::Usage { usage } => state.usage = usage,
     }
 }
 
@@ -1285,11 +1374,11 @@ fn ts_jsonl_message(message: &ConversationMessage) -> Value {
     })
 }
 
-fn jsonl_is_ts_session_export(content: &str) -> bool {
+fn jsonl_is_ts_session_export(content: &[u8]) -> bool {
     content
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .split(|byte| *byte == b'\n')
+        .find(|line| !is_blank_line(line))
+        .and_then(|line| serde_json::from_slice::<Value>(line).ok())
         .and_then(|value| {
             value
                 .get("type")
@@ -1300,17 +1389,23 @@ fn jsonl_is_ts_session_export(content: &str) -> bool {
         == Some("session")
 }
 
-fn read_ts_jsonl_export(path: &Path, content: &str) -> Result<SessionExport, SessionError> {
-    let records = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
+/// Reads a TS-style JSONL session. As for Rust journals, an unterminated final
+/// segment that does not parse is an interrupted write and is ignored.
+fn read_ts_jsonl_export(path: &Path, content: &[u8]) -> Result<SessionExport, SessionError> {
+    let (complete, tail) = pi_session::split_jsonl_tail(content);
+    let mut records = complete
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !is_blank_line(line))
         .map(|line| {
-            serde_json::from_str::<Value>(line).map_err(|source| SessionError::Parse {
+            serde_json::from_slice::<Value>(line).map_err(|source| SessionError::Parse {
                 path: path.to_path_buf(),
                 source,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if let Ok(record) = serde_json::from_slice::<Value>(tail) {
+        records.push(record);
+    }
     let header = records.first().ok_or_else(|| SessionError::Open {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, "missing session header"),
@@ -4458,6 +4553,411 @@ mod tests {
         assert_eq!(loaded.messages[0].content, "summary");
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    const STARTED_LINE: &str =
+        "{\"type\":\"started\",\"session_id\":\"durable\",\"cwd\":\"/repo\"}\n";
+    const TORN_RECORD: &str = "{\"type\":\"message\",\"message\":{\"role\":\"us";
+
+    fn durable_test_dir(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("pi-{name}-{}", new_session_id()));
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn user_line(content: &str) -> String {
+        format!(
+            "{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{content}\"}}}}"
+        )
+    }
+
+    fn message_texts(state: &SessionState) -> Vec<&str> {
+        state
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect()
+    }
+
+    fn assert_every_line_is_a_record(path: &Path) -> usize {
+        let content = fs::read_to_string(path).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "journal ends mid-record: {content:?}"
+        );
+        for line in content.lines() {
+            serde_json::from_str::<SessionRecord>(line)
+                .unwrap_or_else(|error| panic!("corrupt journal line {line:?}: {error}"));
+        }
+        content.lines().count()
+    }
+
+    /// Takes a session's lock file the way a second pi process would: through
+    /// its own open file description, outside this process's registry.
+    fn hold_lock_elsewhere(journal: &Path, pid: u32) -> File {
+        let lock_path = journal.with_file_name(format!(
+            "{}.lock",
+            journal.file_name().unwrap().to_string_lossy()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        file.try_lock().unwrap();
+        file.set_len(0).unwrap();
+        writeln!(file, "{pid}").unwrap();
+        file
+    }
+
+    #[test]
+    fn readers_ignore_a_torn_final_segment_without_touching_the_journal() {
+        let base = durable_test_dir("torn-read");
+        let path = base.join("torn.jsonl");
+        let content = format!("{STARTED_LINE}{}\n{TORN_RECORD}", user_line("kept"));
+        fs::write(&path, &content).unwrap();
+
+        let state = SessionStore::read(&path).unwrap();
+        assert_eq!(state.session_id, "durable");
+        assert_eq!(message_texts(&state), ["kept"]);
+        let listed = SessionStore::list(&base).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        assert!(!base.join("torn.jsonl.lock").exists());
+
+        // A complete final record that only lost its newline still counts.
+        let unterminated = format!("{STARTED_LINE}{}\n{}", user_line("one"), user_line("two"));
+        fs::write(&path, &unterminated).unwrap();
+        assert_eq!(
+            message_texts(&SessionStore::read(&path).unwrap()),
+            ["one", "two"]
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), unterminated);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_line_before_the_end_stays_a_hard_error() {
+        let base = durable_test_dir("corrupt-middle");
+        let path = base.join("corrupt.jsonl");
+        fs::write(
+            &path,
+            format!("{STARTED_LINE}{TORN_RECORD}\n{}\n", user_line("after")),
+        )
+        .unwrap();
+        assert!(matches!(
+            SessionStore::read(&path),
+            Err(SessionError::Parse { .. })
+        ));
+        assert!(matches!(
+            SessionStore::open(path.clone()),
+            Err(SessionError::Parse { .. })
+        ));
+        // A whole JSON value that is not a valid record is not a torn write.
+        fs::write(
+            &path,
+            format!("{STARTED_LINE}{{\"type\":\"message\",\"message\":7}}"),
+        )
+        .unwrap();
+        assert!(matches!(
+            SessionStore::read(&path),
+            Err(SessionError::Parse { .. })
+        ));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn writers_repair_torn_and_unterminated_tails_before_appending() {
+        let base = durable_test_dir("tail-repair");
+        let path = base.join("durable.jsonl");
+        let kept = format!("{STARTED_LINE}{}\n", user_line("kept"));
+        fs::write(&path, format!("{kept}{TORN_RECORD}")).unwrap();
+        let (store, state) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(message_texts(&state), ["kept"]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), kept);
+        store
+            .record_message(test_message(MessageRole::User, "next"))
+            .unwrap();
+        assert_eq!(assert_every_line_is_a_record(&path), 3);
+        assert_eq!(
+            message_texts(&SessionStore::read(&path).unwrap()),
+            ["kept", "next"]
+        );
+        drop(store);
+
+        fs::write(&path, format!("{STARTED_LINE}{}", user_line("last"))).unwrap();
+        let (store, state) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(message_texts(&state), ["last"]);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{STARTED_LINE}{}\n", user_line("last"))
+        );
+        drop(store);
+
+        // Creating over an existing torn journal repairs it the same way.
+        fs::write(&path, format!("{kept}{TORN_RECORD}")).unwrap();
+        let (store, _) =
+            SessionStore::create_with_id(&base, PathBuf::from("/repo"), "durable").unwrap();
+        assert_eq!(assert_every_line_is_a_record(store.path()), 3);
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn listing_skips_a_session_that_fails_to_load() {
+        let base = durable_test_dir("list-skip");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let good = store.path().to_path_buf();
+        drop(store);
+        fs::write(
+            base.join("broken.jsonl"),
+            format!("{STARTED_LINE}{TORN_RECORD}\n{STARTED_LINE}"),
+        )
+        .unwrap();
+        let listed = SessionStore::list(&base).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, good);
+        assert_eq!(SessionStore::resolve(&base, "1").unwrap(), Some(good));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_session_held_by_another_process_is_refused_with_its_pid() {
+        let base = durable_test_dir("locked");
+        let (store, state) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let path = store.path().to_path_buf();
+        drop(store);
+        let journal = fs::read_to_string(&path).unwrap();
+        let other = hold_lock_elsewhere(&path, 4242);
+
+        match SessionStore::open(path.clone()) {
+            Err(SessionError::Locked {
+                path: locked,
+                pid: Some(4242),
+            }) => assert!(locked.ends_with(path.file_name().unwrap())),
+            other => panic!("expected the session to be locked, got {other:?}"),
+        }
+        let message = SessionStore::open(path.clone()).unwrap_err().to_string();
+        assert!(message.contains("in use by another pi process (pid 4242)"));
+        assert!(message.contains(&state.session_id));
+        assert!(matches!(
+            SessionStore::delete(&path),
+            Err(SessionError::Locked { .. })
+        ));
+        assert!(matches!(
+            SessionStore::import(&base, SessionExport::from(&state)),
+            Err(SessionError::Locked { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), journal);
+
+        // Like a crashed holder, `other` leaves its lock file behind.
+        drop(other);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (store, reopened) = loop {
+            match SessionStore::open(path.clone()) {
+                // A fork on another test thread holds a copy of every open
+                // descriptor until its exec; wait that out.
+                Err(SessionError::Locked { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => break result.unwrap(),
+            }
+        };
+        assert_eq!(reopened.session_id, state.session_id);
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn this_process_can_reopen_a_session_it_holds() {
+        let base = durable_test_dir("same-process");
+        let (store, state) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let (again, _) = SessionStore::open(store.path().to_path_buf()).unwrap();
+        assert!(Arc::ptr_eq(&store.lock, &again.lock));
+        let spelled = base.join(".").join(store.path().file_name().unwrap());
+        let (spelled, _) = SessionStore::open(spelled).unwrap();
+        assert!(Arc::ptr_eq(&store.lock, &spelled.lock));
+        // Importing onto the id this process holds rewrites it in place.
+        let (imported, _) = SessionStore::import(&base, SessionExport::from(&state)).unwrap();
+        assert!(Arc::ptr_eq(&store.lock, &imported.lock));
+
+        let lock_path = store.lock.lock_path().to_path_buf();
+        assert!(lock_path.exists());
+        drop((store, again, spelled));
+        assert!(lock_path.exists(), "a live handle keeps the lock");
+        drop(imported);
+        assert!(!lock_path.exists(), "the last handle removes the lock file");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn the_lock_survives_a_compaction_checkpoint_rename() {
+        let base = durable_test_dir("checkpoint-lock");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        store
+            .record_message(test_message(MessageRole::User, "before"))
+            .unwrap();
+        #[cfg(unix)]
+        let inode = || std::os::unix::fs::MetadataExt::ino(&fs::metadata(store.path()).unwrap());
+        #[cfg(unix)]
+        let before = inode();
+        store
+            .record_compaction_checkpoint(
+                CompactionRecord {
+                    kind: CompactionKind::Manual,
+                    omitted_messages: 1,
+                    retained_messages: 1,
+                    summary: "summary".into(),
+                },
+                vec![test_message(MessageRole::Assistant, "checkpoint")],
+            )
+            .unwrap();
+        #[cfg(unix)]
+        assert_ne!(inode(), before, "the checkpoint replaces the journal");
+
+        let probe = File::open(store.lock.lock_path()).unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        store
+            .record_message(test_message(MessageRole::User, "after"))
+            .unwrap();
+        assert_eq!(
+            message_texts(&SessionStore::read(store.path()).unwrap()),
+            ["checkpoint", "after"]
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_checkpoint_drops_a_torn_tail_instead_of_patching_it() {
+        let base = durable_test_dir("checkpoint-torn");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        store
+            .record_message(test_message(MessageRole::User, "kept"))
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.path())
+            .unwrap()
+            .write_all(TORN_RECORD.as_bytes())
+            .unwrap();
+        store
+            .record_compaction_checkpoint(
+                CompactionRecord {
+                    kind: CompactionKind::Manual,
+                    omitted_messages: 1,
+                    retained_messages: 0,
+                    summary: "summary".into(),
+                },
+                vec![test_message(MessageRole::Assistant, "checkpoint")],
+            )
+            .unwrap();
+        assert_eq!(assert_every_line_is_a_record(store.path()), 3);
+        assert_eq!(
+            message_texts(&SessionStore::read(store.path()).unwrap()),
+            ["checkpoint"]
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn appends_from_store_clones_never_interleave() {
+        let base = durable_test_dir("concurrent-appends");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let writers = (0..2)
+            .map(|writer| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for index in 0..200 {
+                        let content = format!("{writer}-{index}-{}", "x".repeat(8192));
+                        store
+                            .record_message(test_message(MessageRole::User, &content))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(assert_every_line_is_a_record(store.path()), 401);
+        assert_eq!(
+            SessionStore::read(store.path()).unwrap().messages.len(),
+            400
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_closes_the_lock_so_children_never_keep_a_session() {
+        let base = durable_test_dir("cloexec");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        // A second description of the same lock inode, to observe the OS lock
+        // after the store unlinks the path on drop.
+        let probe = File::open(store.lock.lock_path()).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(store);
+        // A fork on another test thread copies every descriptor until its
+        // exec, so allow a moment; an inherited lock would last 30 s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let released = loop {
+            match probe.try_lock() {
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => break result,
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            released.is_ok(),
+            "an exec'd child inherited the session lock: {released:?}"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_session_takes_its_lock_and_cleans_up() {
+        let base = durable_test_dir("delete");
+        let missing = base.join("missing.jsonl");
+        assert!(matches!(
+            SessionStore::open(missing),
+            Err(SessionError::Open { .. })
+        ));
+        assert!(!base.join("missing.jsonl.lock").exists());
+
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let path = store.path().to_path_buf();
+        let lock_path = store.lock.lock_path().to_path_buf();
+        drop(store);
+        SessionStore::delete(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!lock_path.exists());
+
+        // The session this process holds can be deleted; its lock file goes
+        // away with the last handle.
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let lock_path = store.lock.lock_path().to_path_buf();
+        SessionStore::delete(store.path()).unwrap();
+        assert!(!store.path().exists());
+        assert!(lock_path.exists());
+        drop(store);
+        assert!(!lock_path.exists());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]

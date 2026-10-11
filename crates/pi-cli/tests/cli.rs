@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Every `pi` a test runs is isolated: a cleared environment (no provider
 /// keys or PI_* variables leak in), PI_TEST_ISOLATION (pi refuses the default
@@ -1040,6 +1040,157 @@ fn session_reference_and_fork_flags_preserve_parent_context() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// A pi command for one isolated home, agent dir, and session dir.
+fn isolated_pi(root: &Path, args: &[&str]) -> Command {
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"modelRefresh":{"enabled":false}}"#,
+    )
+    .expect("write settings");
+    let mut command = pi_command();
+    command
+        .current_dir(root)
+        .env("HOME", root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["--offline", "--model", "faux/echo", "--session-dir"])
+        .arg(root.join("sessions"))
+        .args(args);
+    command
+}
+
+#[test]
+fn a_session_open_in_another_process_makes_startup_wait_then_exit_75() {
+    let root = test_dir("pi-cli-session-lock");
+    let mut holder = isolated_pi(&root, &["--mode", "rpc", "--session-id", "shared"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rpc holder");
+    // The journal's first record is written only after the lock is taken.
+    let journal = root.join("sessions/shared.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fs::metadata(&journal).map_or(true, |metadata| metadata.len() == 0) {
+        assert!(holder.try_wait().unwrap().is_none(), "rpc holder exited");
+        assert!(
+            Instant::now() < deadline,
+            "rpc holder never opened its session"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let started = Instant::now();
+    let blocked = isolated_pi(&root, &["-p", "--session-id", "shared", "hi"])
+        .output()
+        .expect("run blocked print");
+    let waited = started.elapsed();
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert_eq!(blocked.status.code(), Some(75), "{stderr}");
+    assert!(
+        waited >= Duration::from_millis(4_500) && waited < Duration::from_secs(20),
+        "waited {waited:?}"
+    );
+    assert!(stderr.contains("shared.jsonl"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "in use by another pi process (pid {})",
+            holder.id()
+        )),
+        "{stderr}"
+    );
+    assert!(blocked.stdout.is_empty());
+
+    // SIGKILL runs no cleanup and leaves the lock file behind; the kernel
+    // still releases the lock, so the session opens right away.
+    holder.kill().expect("kill rpc holder");
+    holder.wait().expect("reap rpc holder");
+    let after = isolated_pi(&root, &["-p", "--session-id", "shared", "hi"])
+        .output()
+        .expect("run print after holder exit");
+    assert!(
+        after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&after.stdout), "[faux/echo] hi\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn continue_skips_a_damaged_session_and_writers_repair_torn_tails() {
+    let root = test_dir("pi-cli-damaged-sessions");
+    let first = isolated_pi(&root, &["-p", "first"]).output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let sessions = root.join("sessions");
+    let good = fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .expect("first session journal");
+    let cwd = serde_json::to_string(&root).unwrap();
+    fs::write(
+        sessions.join("damaged.jsonl"),
+        format!(
+            "{{\"type\":\"started\",\"session_id\":\"damaged\",\"cwd\":{cwd}}}\n{{\"type\":\"mess\n"
+        ),
+    )
+    .unwrap();
+
+    // One unreadable journal must not break listing for --continue.
+    let second = isolated_pi(&root, &["-p", "--continue", "second"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let log = fs::read_to_string(&good).unwrap();
+    assert!(log.contains("first") && log.contains("second"), "{log}");
+
+    // A writer drops a torn tail left by an interrupted append, then appends.
+    let torn = sessions.join("torn.jsonl");
+    fs::write(
+        &torn,
+        format!(
+            "{{\"type\":\"started\",\"session_id\":\"torn\",\"cwd\":{cwd}}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"us"
+        ),
+    )
+    .unwrap();
+    let resumed = isolated_pi(
+        &root,
+        &["-p", "--session", torn.to_str().unwrap(), "after torn"],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&resumed.stdout),
+        "[faux/echo] after torn\n"
+    );
+    let log = fs::read_to_string(&torn).unwrap();
+    assert!(log.ends_with('\n'));
+    for line in log.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|error| panic!("corrupt line {line:?}: {error}"));
+    }
+    assert!(log.contains("after torn"));
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -1218,7 +1369,7 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
     let journal = fs::read_to_string(&journal_path).unwrap();
     assert!(journal.contains("use SQLite transactions reference"));
     assert!(journal.contains("compaction_checkpoint"));
-    let (_, loaded) = pi_core::SessionStore::open(journal_path).unwrap();
+    let loaded = pi_core::SessionStore::read(&journal_path).unwrap();
     assert_eq!(loaded.compactions.len(), 1);
     assert_eq!(loaded.usage.requests, 4);
     fs::remove_dir_all(root).unwrap();

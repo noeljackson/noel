@@ -1242,7 +1242,10 @@ mod tests {
         }
         // A directory cannot be replaced by the checkpoint file.
         let mut runtime = self::runtime();
-        runtime.set_store(SessionStore { path: base.clone() });
+        runtime.set_store(SessionStore {
+            lock: crate::session_lock::acquire(&base).unwrap(),
+            path: base.clone(),
+        });
         let before = runtime.session.clone();
         assert!(runtime
             .compact_messages(

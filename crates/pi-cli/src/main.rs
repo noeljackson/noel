@@ -61,8 +61,8 @@ use pi_core::{
     run_excluded_bash_result, run_user_turn, run_user_turn_streaming,
     run_user_turn_streaming_events_with_media, run_user_turn_streaming_with_media,
     write_session_export, AgentError, CompactionKind, ConversationMessage, FollowUpQueue,
-    MessageRole, ReloadReport, ReloadableSystems, Runtime, SessionState, SessionStore,
-    SteeringMailbox, TodoItem, TodoStatus, TurnEvent, STEERING_JOIN,
+    MessageRole, ReloadReport, ReloadableSystems, Runtime, SessionError, SessionState,
+    SessionStore, SteeringMailbox, TodoItem, TodoStatus, TurnEvent, STEERING_JOIN,
 };
 use pi_tui::{
     parse_theme_color, EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector,
@@ -1354,7 +1354,7 @@ async fn main() -> Result<()> {
 
     let mut systems = ReloadableSystems::from_config(&config, 1);
     systems.offline = offline;
-    let mut runtime = create_runtime(&cli, &cwd, &config, systems)?;
+    let mut runtime = create_runtime_when_unlocked(&cli, &cwd, &config, systems).await?;
     select_initial_model(&mut runtime, &config, &cli, offline)?;
     if cli.no_tools || cli.no_builtin_tools {
         runtime.set_disabled_tools(default_active_tool_names())?;
@@ -2731,6 +2731,45 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
+/// How long startup waits for another pi process to release its session.
+const SESSION_LOCK_WAIT: Duration = Duration::from_secs(5);
+const SESSION_LOCK_POLL: Duration = Duration::from_millis(100);
+/// `EX_TEMPFAIL`: the session is busy, so running again later can succeed.
+const EXIT_SESSION_LOCKED: i32 = 75;
+
+/// Opens the startup session, waiting up to [`SESSION_LOCK_WAIT`] while
+/// another pi process holds it. Print, json, rpc, and interactive modes all
+/// start here, before any terminal setup. A session that stays locked exits
+/// with [`EXIT_SESSION_LOCKED`] and a message naming the path and holder pid.
+async fn create_runtime_when_unlocked(
+    cli: &Cli,
+    cwd: &Path,
+    config: &LoadedConfig,
+    systems: ReloadableSystems,
+) -> Result<Runtime> {
+    let deadline = Instant::now() + SESSION_LOCK_WAIT;
+    loop {
+        let error = match create_runtime(cli, cwd, config, systems.clone()) {
+            Ok(runtime) => return Ok(runtime),
+            Err(error) => error,
+        };
+        if !matches!(
+            error.downcast_ref::<SessionError>(),
+            Some(SessionError::Locked { .. })
+        ) {
+            return Err(error);
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "pi: {error}; gave up after waiting {}s",
+                SESSION_LOCK_WAIT.as_secs()
+            );
+            std::process::exit(EXIT_SESSION_LOCKED);
+        }
+        tokio::time::sleep(SESSION_LOCK_POLL).await;
+    }
+}
+
 fn create_runtime(
     cli: &Cli,
     cwd: &Path,
@@ -2746,7 +2785,7 @@ fn create_runtime(
 
     if let Some(reference) = &cli.fork {
         let path = resolve_session_reference(&config.paths.session_dir, reference)?;
-        let (_store, source_state) = SessionStore::open(path)?;
+        let source_state = SessionStore::read(&path)?;
         let (store, state) = SessionStore::fork(&config.paths.session_dir, &source_state, false)?;
         return Ok(Runtime::with_store(state, systems, store));
     }
@@ -3037,7 +3076,12 @@ async fn run_interactive(
             }
             app.refresh_diff_panel(&runtime);
             if let Some(session_id) = app.pending_session_resume.take() {
-                apply_midturn_session_resume(&mut app, &mut runtime, &config, &session_id)?;
+                // A locked or unreadable pick is reported; the TUI stays up.
+                if let Err(error) =
+                    apply_midturn_session_resume(&mut app, &mut runtime, &config, &session_id)
+                {
+                    app.push(TuiEntryKind::Error, format!("{error:#}"));
+                }
             }
             continue;
         }
@@ -3107,7 +3151,9 @@ async fn run_interactive(
         println!("{}", app.transcript_text());
     }
     if restart {
-        restart_current_process()?;
+        // The session lock is close-on-exec: the new image reopens this
+        // session as soon as it starts.
+        restart_current_process(runtime.store().map(SessionStore::path))?;
     }
     Ok(())
 }
@@ -3195,41 +3241,102 @@ impl AutoRestart {
 }
 
 #[cfg(unix)]
-fn restart_current_process() -> Result<()> {
+fn restart_current_process(session_file: Option<&Path>) -> Result<()> {
     let executable = std::env::var_os("PI_DOGFOOD_RESTART_EXE")
         .map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok())
         .ok_or_else(|| anyhow!("failed to resolve restart executable"))?;
+    let session_file =
+        session_file.map(|path| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
     let error = Command::new(executable)
-        .args(restart_args_preserving_session_model())
+        .args(restart_args(
+            std::env::args_os().skip(1),
+            session_file.as_deref(),
+        ))
         .exec();
     Err(error.into())
 }
 
 #[cfg(not(unix))]
-fn restart_current_process() -> Result<()> {
+fn restart_current_process(_session_file: Option<&Path>) -> Result<()> {
     Err(anyhow!("dogfood auto-restart is only supported on Unix"))
 }
 
-fn restart_args_preserving_session_model() -> Vec<OsString> {
-    strip_restart_model_args(std::env::args_os().skip(1))
-}
-
-fn strip_restart_model_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+/// Arguments for the dogfood exec-restart. The model selection is dropped,
+/// since the session remembers its model. With a session file, the original
+/// session selection (`--continue`, `--resume`, `--fork`, `--session`,
+/// `--session-id`, `--no-session`) is replaced by `--session <file>`: running
+/// `--continue` again could open a newer session, and `--fork` would fork
+/// again. Other arguments are kept as given.
+fn restart_args(
+    args: impl IntoIterator<Item = OsString>,
+    session_file: Option<&Path>,
+) -> Vec<OsString> {
+    const MODEL_OPTIONS: [&str; 2] = ["--model", "--provider"];
+    const SESSION_OPTIONS: [&str; 3] = ["--fork", "--session", "--session-id"];
+    const SESSION_FLAGS: [&str; 3] = ["--continue", "--resume", "--no-session"];
+    let replace_session = session_file.is_some();
     let mut output = Vec::new();
+    let mut positional = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == "--model" || arg == "--provider" {
-            let _ = args.next();
+        let Some(text) = arg.to_str() else {
+            output.push(arg);
+            continue;
+        };
+        if text == "--" {
+            positional.push(arg);
+            positional.extend(args.by_ref());
+            break;
+        }
+        let (name, inline_value) = match text.split_once('=') {
+            Some((name, _)) if name.starts_with("--") => (name, true),
+            _ => (text, false),
+        };
+        if MODEL_OPTIONS.contains(&name) || (replace_session && SESSION_OPTIONS.contains(&name)) {
+            if !inline_value {
+                let _ = args.next();
+            }
             continue;
         }
-        let text = arg.to_string_lossy();
-        if text.starts_with("--model=") || text.starts_with("--provider=") {
+        if replace_session && SESSION_FLAGS.contains(&text) {
+            continue;
+        }
+        if replace_session && text.len() > 1 && text.starts_with('-') && !text.starts_with("--") {
+            match without_session_short_flags(text) {
+                Some(cluster) if cluster == "-" => {}
+                Some(cluster) => output.push(cluster.into()),
+                None => output.push(arg),
+            }
             continue;
         }
         output.push(arg);
     }
+    if let Some(path) = session_file {
+        output.push("--session".into());
+        output.push(path.into());
+    }
+    output.extend(positional);
     output
+}
+
+/// Removes `-c` and `-r` from a short-flag cluster such as `-cp`; `None` when
+/// the cluster has neither. A short option that takes a value (`-t`, `-e`,
+/// `-n`) consumes the rest of its cluster, which is kept verbatim.
+fn without_session_short_flags(cluster: &str) -> Option<String> {
+    let flags = cluster.strip_prefix('-')?;
+    let mut kept = String::from("-");
+    for (index, flag) in flags.char_indices() {
+        match flag {
+            'c' | 'r' => {}
+            't' | 'e' | 'n' => {
+                kept.push_str(&flags[index..]);
+                break;
+            }
+            _ => kept.push(flag),
+        }
+    }
+    (kept != cluster).then_some(kept)
 }
 
 struct TerminalRestore {
@@ -5878,7 +5985,14 @@ async fn handle_tui_key(
     offline: bool,
 ) -> Result<bool> {
     if app.selector.is_some() {
-        handle_tui_selector_key(key, app, runtime, config)?;
+        // A failed pick (for example a session locked by another process) is
+        // an error line, never a reason to leave the TUI.
+        if let Err(error) = handle_tui_selector_key(key, app, runtime, config) {
+            app.push(
+                TuiEntryKind::Error,
+                format_tui_error(&error, runtime, config),
+            );
+        }
         app.status = footer_status(config, runtime, &app.editor_state);
         return Ok(false);
     }
@@ -10089,7 +10203,8 @@ fn resolve_source_session(
         return Ok(runtime.session().clone());
     }
     let path = resolve_session_reference(session_dir, reference)?;
-    Ok(SessionStore::open(path)?.1)
+    // A fork or clone source is only read, so it may be open elsewhere.
+    Ok(SessionStore::read(&path)?)
 }
 
 fn export_session(runtime: &Runtime, path: &Path) -> Result<()> {
@@ -10125,7 +10240,8 @@ fn delete_session_message(
         .store()
         .map(|store| store.path() == target)
         .unwrap_or(false);
-    fs::remove_file(&target)?;
+    // Refuses while another pi process has the session open.
+    SessionStore::delete(&target)?;
     let mut output = format!("deleted {}", target.display());
     if deleting_current {
         let (store, state) =
@@ -13004,7 +13120,7 @@ mod tests {
         .into_iter()
         .map(OsString::from);
 
-        let filtered = strip_restart_model_args(args);
+        let filtered = restart_args(args, None);
 
         assert_eq!(
             filtered,
@@ -13012,6 +13128,73 @@ mod tests {
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dogfood_restart_reopens_the_session_it_had_open() {
+        let rewrite = |args: &[&str]| {
+            restart_args(
+                args.iter().map(OsString::from),
+                Some(Path::new("/sessions/current.jsonl")),
+            )
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect::<Vec<_>>()
+        };
+        let reopen = ["--session", "/sessions/current.jsonl"];
+
+        // `make dogfood` runs `--continue --model faux/echo`.
+        assert_eq!(rewrite(&["--continue", "--model", "faux/echo"]), reopen);
+        for selection in [
+            &["-c"][..],
+            &["-r"],
+            &["--resume"],
+            &["--fork", "abc"],
+            &["--fork=abc"],
+            &["--session", "older.jsonl"],
+            &["--session=older.jsonl"],
+            &["--session-id", "named"],
+            &["--session-id=named"],
+            &["--no-session"],
+        ] {
+            assert_eq!(rewrite(selection), reopen, "{selection:?}");
+        }
+        assert_eq!(
+            rewrite(&[
+                "-cpn",
+                "label",
+                "--session-dir",
+                "sessions",
+                "--theme",
+                "dark",
+                "-rt",
+                "read",
+                "--",
+                "-c",
+            ]),
+            [
+                "-pn",
+                "label",
+                "--session-dir",
+                "sessions",
+                "--theme",
+                "dark",
+                "-t",
+                "read",
+                "--session",
+                "/sessions/current.jsonl",
+                "--",
+                "-c",
+            ]
+        );
+        // Without a session file (`--no-session`) the selection stays.
+        assert_eq!(
+            restart_args(
+                ["--no-session", "--model", "faux/echo"].map(OsString::from),
+                None
+            ),
+            [OsString::from("--no-session")]
         );
     }
 
