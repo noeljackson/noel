@@ -459,7 +459,8 @@ pi login anthropic --account work
 `openai-codex` (mirroring the codex import mapping); `pi login anthropic`
 stores it for `anthropic`. Expiry and `account_id` come from the issued token
 (JWT `exp` for Codex, `expires_in` for Claude), and the stored credentials
-refresh automatically when they expire. Importing credentials from
+refresh automatically when they expire, also in the middle of a turn: every
+model request resolves them anew. Importing credentials from
 `~/.codex/auth.json` and `~/.claude/.credentials.json` still works as a
 fallback when no stored account exists. Re-running login for an existing
 account replaces it.

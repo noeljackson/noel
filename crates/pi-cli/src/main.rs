@@ -42,10 +42,11 @@ use crossterm::{
     },
 };
 use pi_ai::{
-    anthropic_supports_adaptive_thinking, create_provider, generate_images,
+    anthropic_supports_adaptive_thinking, create_provider_with_client, generate_images,
     set_claude_code_version, ImageGenerationInput, ImageGenerationOutput,
     ImageProviderApi as AiImageProviderApi, ImageProviderConfig, MediaInput, ModelRef,
-    ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig, StreamEvent,
+    ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig, ProviderError, ProviderRequest,
+    StreamEvent,
 };
 use pi_config::{
     auth_for_provider, codex_client_version, has_auth_for_provider, listed_accounts_for_provider,
@@ -8936,28 +8937,95 @@ async fn provider_for_runtime(
             )
         })?;
     let thinking_level = active_thinking_level(runtime, config, &model);
-    let resolved_auth = oauth_refresh::refresh_expiring_auth(
-        &reqwest::Client::builder()
+    let provider = FreshAuthProvider {
+        config: ProviderConfig {
+            thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
+            thinking_level,
+            model,
+            api: map_provider_api(&definition.api),
+            base_url: definition.base_url.clone(),
+            auth: ProviderAuth::None,
+            session_id: Some(runtime.session().session_id.clone()),
+        },
+        // The client `pi_ai::create_provider` uses: its idle timeout ends a
+        // stalled request instead of hanging the turn.
+        client: pi_ai::provider_http_client(),
+        refresh_client: reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
-        &config.paths.auth_path,
-        &config.auth,
-        &definition.provider,
-        runtime.session().active_account.as_deref(),
-        None,
-        unix_seconds().unwrap_or(0),
-    )
-    .await?;
-    Ok(create_provider(ProviderConfig {
-        thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
-        thinking_level,
-        model,
-        api: map_provider_api(&definition.api),
-        base_url: definition.base_url.clone(),
-        auth: map_provider_auth(resolved_auth),
-        session_id: Some(runtime.session().session_id.clone()),
-    }))
+        auth_path: config.paths.auth_path.clone(),
+        auth: config.auth.clone(),
+        account: runtime.session().active_account.clone(),
+    };
+    // Fail before the turn starts when there is no usable credential.
+    provider.auth().await?;
+    Ok(Box::new(provider))
+}
+
+/// A provider that resolves its credentials for every request, so a turn
+/// that outlives an OAuth access token refreshes it instead of sending the
+/// token the turn started with.
+struct FreshAuthProvider {
+    /// The config of every request; `auth` is resolved per request.
+    config: ProviderConfig,
+    client: reqwest::Client,
+    refresh_client: reqwest::Client,
+    auth_path: PathBuf,
+    auth: AuthData,
+    account: Option<String>,
+}
+
+impl FreshAuthProvider {
+    async fn auth(&self) -> Result<ProviderAuth> {
+        let resolved = oauth_refresh::refresh_expiring_auth(
+            &self.refresh_client,
+            &self.auth_path,
+            &self.auth,
+            &self.config.model.provider,
+            self.account.as_deref(),
+            None,
+            unix_seconds().unwrap_or(0),
+        )
+        .await?;
+        Ok(map_provider_auth(resolved))
+    }
+
+    /// The provider for one request, with the credentials valid now.
+    async fn provider(&self) -> std::result::Result<Box<dyn pi_ai::Provider>, ProviderError> {
+        let auth = self
+            .auth()
+            .await
+            .map_err(|error| ProviderError::Config(error.to_string()))?;
+        Ok(create_provider_with_client(
+            ProviderConfig {
+                auth,
+                ..self.config.clone()
+            },
+            self.client.clone(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl pi_ai::Provider for FreshAuthProvider {
+    async fn complete(
+        &self,
+        request: ProviderRequest,
+    ) -> std::result::Result<Vec<StreamEvent>, ProviderError> {
+        self.provider().await?.complete(request).await
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> std::result::Result<(), ProviderError> + Send),
+    ) -> std::result::Result<(), ProviderError> {
+        self.provider()
+            .await?
+            .complete_streaming(request, on_event)
+            .await
+    }
 }
 
 fn active_thinking_level(
@@ -11422,6 +11490,94 @@ mod tests {
             .expect("faux provider builds regardless of account binding");
     }
 
+    #[tokio::test]
+    async fn every_model_request_sends_the_credential_current_when_it_is_sent() {
+        use std::io::BufReader;
+        let root = std::env::temp_dir().join(format!("pi-cli-fresh-auth-{}", unique_temp_suffix()));
+        fs::create_dir_all(&root).unwrap();
+        let auth_path = root.join("auth.json");
+        let credential = |access_token: &str, expires| AuthCredential::OAuth {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+            expires,
+            account_id: Some("account".to_string()),
+        };
+        let save = |access_token: &str| {
+            let mut auth = AuthData::default();
+            auth.insert("openai", "default", credential(access_token, 4_000_000_000));
+            fs::write(&auth_path, serde_json::to_string(&auth).unwrap()).unwrap();
+        };
+        // The model endpoint records the bearer token of each request.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            (0..2)
+                .map(|_| {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let (mut authorization, mut length) = (String::new(), 0);
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let Some((name, value)) = line.trim_end().split_once(": ") else {
+                            if line.trim_end().is_empty() {
+                                break;
+                            }
+                            continue;
+                        };
+                        match name.to_ascii_lowercase().as_str() {
+                            "authorization" => authorization = value.to_string(),
+                            "content-length" => length = value.parse().unwrap(),
+                            _ => {}
+                        }
+                    }
+                    reader.read_exact(&mut vec![0; length]).unwrap();
+                    let body = r#"{"output_text":"ok"}"#;
+                    write!(
+                        reader.into_inner(),
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                    authorization
+                })
+                .collect::<Vec<_>>()
+        });
+        // The startup snapshot predates a refresh: its token long expired.
+        let mut snapshot = AuthData::default();
+        snapshot.insert("openai", "default", credential("startup-access", 1));
+        let mut config = account_test_config(snapshot);
+        config.paths.auth_path = auth_path.clone();
+        config.models.push(ModelDefinition {
+            context_window: None,
+            provider: "openai".to_string(),
+            id: "echo".to_string(),
+            name: None,
+            api: ConfigProviderApi::OpenAi,
+            base_url: Some(url),
+        });
+        let runtime = account_test_runtime("openai", None);
+        let request = || ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+
+        save("first-access");
+        let provider = provider_for_runtime(&runtime, &config, false)
+            .await
+            .unwrap();
+        provider.complete(request()).await.unwrap();
+        save("second-access");
+        provider.complete(request()).await.unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            ["Bearer first-access", "Bearer second-access"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn model_selection_format_is_compact_and_unlabeled() {
         let model = ModelRef {
@@ -12266,7 +12422,7 @@ mod tests {
         let (store, state) = SessionStore::create(&root.join("sessions"), root.clone()).unwrap();
         let path = store.path().to_path_buf();
         let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
-        let provider = create_provider(ProviderConfig {
+        let provider = pi_ai::create_provider(ProviderConfig {
             model: ModelRef {
                 provider: "faux".into(),
                 id: "echo".into(),
