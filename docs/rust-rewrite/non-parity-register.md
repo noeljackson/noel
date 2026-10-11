@@ -370,13 +370,17 @@ like any stored account.
 
 ### RPC Mode
 
-`pi --mode rpc` speaks upstream's RPC protocol, with two additions listed in
-`get_state.rpcExtensions`: `run-id` (every run has a `runId`) and
+`pi --mode rpc` speaks upstream's RPC protocol, with four additions listed in
+`get_state.rpcExtensions`: `run-id` (every run has a `runId`),
 `expected-run-id` (`steer`, `follow_up`, and `abort` change nothing unless
-their `expectedRunId` names the active run). `crates/pi-cli/tests/rpc_parity.rs`
-compares every scenario of `rpc-protocol.json` with pi's records and allows
-exactly the differences in the first list; its `normalize` and `expected`
-functions name them, so the two lists change together.
+their `expectedRunId` names the active run), `request-id` (a `prompt` that
+repeats a `requestId` gets the run the first one started), and `resume-run`
+(`get_state.lastRun`, and `resume_run` to continue an interrupted run).
+`crates/pi-cli/tests/rpc_parity.rs` compares every scenario of
+`rpc-protocol.json` with pi's records and allows exactly the differences in
+the first list; its `normalize`, `expected`, and `without_extensions`
+functions name them, so the two lists change together. The extensions' keys
+(`runId`, `requestId`, `lastRun`, `rpcExtensions`) are the allowed extras.
 
 Differences in the golden records:
 
@@ -409,7 +413,23 @@ Other differences:
   session but also leaves it out of model requests.
 - Closing stdin during a run stops it where it is, kills its tool processes,
   and exits without `agent_end` or `agent_settled`; what the run saved stays
-  in the session. Upstream disposes the runtime first.
+  in the session, and the run stays interrupted for `resume_run`. A signal
+  that ends pi does the same. Upstream disposes the runtime first.
+- Runs outlive pi: the journal saves each run's start and end, a restarted pi
+  reports a run that never ended as interrupted, and `resume_run` continues
+  it under its `runId`. Upstream keeps runs in memory, and its agent cannot
+  continue from a reply whose tool calls have no results.
+- A resumed run reports the turn it finishes: the saved reply again, as
+  `get_messages` shows it (no model, usage, or timings), then the replay-safe
+  calls it runs again, then `turn_end`. Calls that are not replay-safe get no
+  `tool_execution_*` records; the model is told they were interrupted.
+- `abort` with no run active ends an interrupted run as `aborted`; upstream's
+  does nothing. A new `prompt` ends an interrupted run the same way.
+- The queue is saved with the session: an enqueue is saved before it is
+  acknowledged, startup and `switch_session` load the saved queue, and
+  `new_session` starts empty. Upstream's queue lives in memory.
+- A queued prompt (`streamingBehavior` during a run) cannot have a
+  `requestId`, which names runs.
 - Retries happen inside the request, before the reply's first record:
   `auto_retry_start` comes before the reply's `message_start`, and
   `auto_retry_end` after its `message_end`. Upstream ends the turn with an
@@ -449,6 +469,9 @@ Other differences:
 Reason: pi's run engine, session journal, and queue are its own (see Batched
 Queue and Steering Dispatch). The protocol keeps upstream's records and
 command contract, so a client written for upstream works; where pi lacks data
-it leaves the field out rather than inventing it. Runs are not yet durable
-across a pi restart; the journal format that needs will close some of these
-gaps.
+it leaves the field out rather than inventing it. Durable runs serve a
+supervisor (Codewire) that must learn, after its own restart or pi's, what
+became of the run it started, and have it finished when that is safe: a
+prompt is applied once, a call that is not replay-safe runs at most once, a
+replay-safe one at least once, and a model request cut off by a stop is sent
+(and billed) again.

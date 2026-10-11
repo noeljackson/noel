@@ -80,7 +80,8 @@ The Rust implementation separates durable session state from reloadable systems.
 - Session cwd.
 - Conversation messages.
 - Tool calls and tool results.
-- Queued follow-up messages.
+- Queued messages: steering and follow-ups.
+- Runs: id, request id, and status.
 - Active model selection.
 - Active thinking level.
 - Active tool names.
@@ -157,8 +158,9 @@ machinery where applicable.
 ## RPC Mode
 
 `--mode rpc` speaks upstream pi's RPC protocol over stdin and stdout, plus the
-`run-id` and `expected-run-id` extensions (see the README's RPC Mode and the
-non-parity register). It lives in two modules of `pi-cli`:
+`run-id`, `expected-run-id`, `request-id`, and `resume-run` extensions (see the
+README's RPC Mode and the non-parity register). It lives in two modules of
+`pi-cli`:
 
 - `rpc_wire.rs` holds the protocol: serde types for commands, responses,
   events, and messages in upstream's field order, and `Recorder`, which turns
@@ -182,6 +184,28 @@ engine call with them as its prompt. While the engine holds the runtime,
 reads answer from a copy of the session that the run's events keep current,
 refreshed after each engine call; commands that would change the session are
 refused.
+
+Runs are durable. `SessionState.runs` holds each run's id, request id, and
+status, apart from the messages, because the messages are what compaction
+checkpoints and `/undo` snapshots rewrite: a mid-turn compaction can summarize
+a run's prompt away, but not its identity. The journal saves a run's start on
+the record of its prompt (`message` with a `run` field, which older versions
+ignore), so the two are one write: no run without its prompt, no prompt
+applied twice. `Runtime::start_run` makes that write before `prompt` answers;
+`run_finished` records how a run ended before `agent_settled`. A load reports
+a started run without `run_finished` as interrupted. Compaction checkpoints
+copy the journal, so the records survive them; fork and import start new
+sessions without runs. `resume_run` continues an interrupted run with the
+engine's continue path, the same one the TUI uses to finish a turn on reopen:
+it runs again the replay-safe calls the last reply has no results for (as a
+`RoundResumed` round), then asks the model.
+
+The queue lives in RPC mode's `Queue` and is saved, whole, in the session's
+`queued_messages_snapshot` record: steering first, with a `steering` count
+that older versions and the TUI ignore, reading every message as a follow-up.
+An enqueue or `clear_queue` is saved before it is applied and acknowledged; a
+delivered message leaves the saved queue once its user message is saved, so a
+crash between the two delivers it again unless the queue is cleared.
 
 ## Config Model
 
@@ -238,6 +262,8 @@ Required properties:
 - Can recover partial sessions after process interruption: each append writes
   its record and newline in one write, readers ignore a torn final segment,
   and writers drop it (or terminate a complete record) before appending.
+- Records RPC runs and the queue (steering and follow-ups) so a restarted pi
+  can report an interrupted run and continue it (see RPC Mode).
 - Can be tested with in-memory and temp-dir storage.
 - Persists active model and active thinking level.
 - Supports JSON, JSONL, and local HTML export/import where applicable.

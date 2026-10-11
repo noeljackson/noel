@@ -1,6 +1,7 @@
 //! `pi --mode rpc` against upstream's RPC goldens
 //! (`tests/fixtures/ts-parity/rpc-protocol.json`), and the protocol's own
-//! contract: framing, errors, run fencing, abort, shutdown and settling.
+//! contract: framing, errors, run fencing, abort, shutdown and settling, and
+//! runs that outlive the process that started them.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -21,6 +22,7 @@ struct Pi {
     lines: Receiver<String>,
     records: Vec<Value>,
     root: PathBuf,
+    args: Vec<String>,
 }
 
 /// A new directory for one pi, with `cwd`, `agent` and `home` inside.
@@ -48,36 +50,69 @@ impl Pi {
         settings["modelRefresh"] = json!({ "enabled": false });
         fs::write(root.join("agent/settings.json"), settings.to_string()).unwrap();
         fs::write(root.join("script.json"), script.to_string()).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
-            .current_dir(root.join("cwd"))
-            .env("HOME", root.join("home"))
-            .env("PI_CODING_AGENT_DIR", root.join("agent"))
-            .env("PI_FAUX_SCRIPT", root.join("script.json"))
-            .env("PI_FAUX_SCRIPT_LOG", root.join("requests.jsonl"))
-            .args(["--offline", "--mode", "rpc", "--model", "faux/script"])
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn pi");
-        let stdout = child.stdout.take().unwrap();
-        let (sender, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if sender.send(line).is_err() {
-                    break;
-                }
-            }
-        });
+        let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let (child, stdin, lines) = launch(&root, &args);
         Self {
-            stdin: child.stdin.take(),
             child,
+            stdin,
             lines,
             records: Vec::new(),
             root,
+            args,
         }
+    }
+
+    /// pi on `script` in the session `durable`, which starts as `journal`
+    /// when one is given, with retries off so a scripted error fails at
+    /// once. [`Pi::restart`] starts a new pi in the same session.
+    fn session(name: &str, script: Value, journal: Option<&[Value]>) -> Self {
+        let root = test_root(name);
+        let sessions = root.join("sessions");
+        if let Some(records) = journal {
+            fs::create_dir_all(&sessions).unwrap();
+            let started =
+                json!({"type": "started", "session_id": SESSION, "cwd": root.join("cwd")});
+            let lines = std::iter::once(&started).chain(records);
+            let journal = lines
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(sessions.join(format!("{SESSION}.jsonl")), journal).unwrap();
+        }
+        let sessions = sessions.display().to_string();
+        let args = [
+            "--no-context-files",
+            "--session-dir",
+            &sessions,
+            "--session-id",
+            SESSION,
+        ];
+        Self::spawn(root, script, &args, json!({"retry": {"enabled": false}}))
+    }
+
+    /// Kills pi at once (SIGKILL), as a crash or a lost host would, and
+    /// starts a new one on the same files. Records start over.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        self.child.wait().unwrap();
+        let (child, stdin, lines) = launch(&self.root, &self.args);
+        (self.child, self.stdin, self.lines) = (child, stdin, lines);
+        self.records.clear();
+    }
+
+    /// The session's journal, one record per line.
+    fn journal(&self) -> Vec<Value> {
+        let path = self.root.join(format!("sessions/{SESSION}.jsonl"));
+        let journal = fs::read_to_string(path).unwrap();
+        journal
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// `get_state.lastRun`, asked as `id`.
+    fn last_run(&mut self, id: &str) -> Value {
+        self.command(json!({"id": id, "type": "get_state"}));
+        self.response(id)["data"]["lastRun"].clone()
     }
 
     /// Writes `bytes` to stdin as they are.
@@ -184,6 +219,35 @@ impl Drop for Pi {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+}
+
+/// Starts pi under `root`, and a thread that reads its stdout lines.
+fn launch(root: &Path, args: &[String]) -> (Child, Option<ChildStdin>, Receiver<String>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pi"))
+        .current_dir(root.join("cwd"))
+        .env("HOME", root.join("home"))
+        .env("PI_CODING_AGENT_DIR", root.join("agent"))
+        .env("PI_FAUX_SCRIPT", root.join("script.json"))
+        .env("PI_FAUX_SCRIPT_LOG", root.join("requests.jsonl"))
+        .args(["--offline", "--mode", "rpc", "--model", "faux/script"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn pi");
+    let stdout = child.stdout.take().unwrap();
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let stdin = child.stdin.take();
+    (child, stdin, lines)
 }
 
 /// A faux script step holding its response until `release-<index>` exists.
@@ -489,8 +553,9 @@ fn visit(value: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {
 /// Pi's records without the extensions upstream lacks.
 fn without_extensions(mut record: Value) -> Value {
     visit(&mut record, &mut |object| {
-        object.remove("runId");
-        object.remove("rpcExtensions");
+        for key in ["runId", "requestId", "lastRun", "rpcExtensions"] {
+            object.remove(key);
+        }
     });
     record
 }
@@ -781,8 +846,15 @@ fn a_run_refuses_commands_that_change_the_session() {
     let run_id = pi.response("run")["data"]["runId"].clone();
     assert_eq!(state["isStreaming"], true);
     assert_eq!(state["runId"], run_id);
+    assert_eq!(
+        state["lastRun"],
+        json!({"runId": run_id, "status": "running"})
+    );
     assert_eq!(state["messageCount"], 1);
-    assert_eq!(state["rpcExtensions"], json!(["run-id", "expected-run-id"]));
+    assert_eq!(
+        state["rpcExtensions"],
+        json!(["run-id", "expected-run-id", "request-id", "resume-run"])
+    );
     pi.release("release-1");
     pi.wait_for("agent_settled", 1);
     pi.command(json!({"id": "idle", "type": "get_state"}));
@@ -1077,4 +1149,536 @@ fn process_ended(pid: i32) -> bool {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+// Runs that outlive the process that started them.
+
+const SESSION: &str = "durable";
+
+/// The prompt that started run `run-1` for request `m-1`, as the journal
+/// saves it: one record.
+fn started_run(prompt: &str) -> Value {
+    json!({
+        "type": "message",
+        "message": {"role": "user", "content": prompt},
+        "run": {"id": "run-1", "request_id": "m-1"}
+    })
+}
+
+/// A saved reply that calls `calls`: (id, tool, arguments).
+fn saved_reply(text: &str, calls: &[(&str, &str, Value)]) -> Value {
+    let calls = calls.iter().map(
+        |(id, name, arguments)| json!({"id": id, "name": name, "arguments": arguments.to_string()}),
+    );
+    json!({
+        "type": "message",
+        "message": {"role": "assistant", "content": text, "tool_calls": calls.collect::<Vec<_>>()}
+    })
+}
+
+/// `run-1`'s `lastRun`, with `more` fields.
+fn run_1(status: &str, more: Value) -> Value {
+    let mut run = json!({"runId": "run-1", "requestId": "m-1", "status": status});
+    run.as_object_mut()
+        .unwrap()
+        .extend(more.as_object().unwrap().clone());
+    run
+}
+
+/// The placeholder result the model gets for a call that did not finish.
+fn interrupted(id: &str, tool: &str) -> Value {
+    let text = format!("tool call {tool} did not complete before the session continued");
+    json!({"role": "tool", "text": text, "toolCallId": id})
+}
+
+fn resume(pi: &mut Pi, run_id: &Value) -> Value {
+    pi.command(json!({"id": "resume", "type": "resume_run", "expectedRunId": run_id}));
+    pi.response("resume")
+}
+
+/// The session's queue as last saved, without the record's type.
+fn saved_queue(pi: &Pi) -> Value {
+    let mut journal = pi.journal();
+    journal.retain(|record| record["type"] == "queued_messages_snapshot");
+    let mut queue = journal.pop().unwrap();
+    queue.as_object_mut().unwrap().remove("type");
+    queue
+}
+
+/// Waits until `path` holds `count` lines.
+fn wait_for_lines(path: &Path, count: usize) {
+    let deadline = Instant::now() + TIMEOUT;
+    while fs::read_to_string(path).map_or(0, |text| text.lines().count()) < count {
+        assert!(
+            Instant::now() < deadline,
+            "{} lines in {}",
+            count,
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_interrupted_run_says_where_it_stopped_and_resumes_under_its_run_id() {
+    let bash = ("b1", "bash", json!({"command": "echo ran >> ../ran.txt"}));
+    let write = (
+        "w1",
+        "write",
+        json!({"path": "written.txt", "content": "x"}),
+    );
+    let read = ("r1", "read", json!({"path": "notes.txt"}));
+    let ls = ("l1", "ls", json!({}));
+    let pending = |calls: &[(&str, &str, bool)]| {
+        let calls = calls.iter().map(
+            |(id, name, replay_safe)| json!({"id": id, "name": name, "replaySafe": replay_safe}),
+        );
+        json!({"phase": "tools", "pendingTools": calls.collect::<Vec<_>>()})
+    };
+    let result = |id: &str, text: &str| json!({"role": "tool", "text": text, "toolCallId": id});
+    let user = json!({"role": "user", "text": "work"});
+    let reply = |calls: &[&str]| json!({"role": "assistant", "toolCalls": calls});
+    let cases = [
+        (
+            "model",
+            vec![],
+            json!({"phase": "model"}),
+            vec![],
+            vec![user.clone()],
+        ),
+        (
+            "safe",
+            vec![read.clone(), ls],
+            pending(&[("r1", "read", true), ("l1", "ls", true)]),
+            vec!["read", "ls"],
+            vec![
+                user.clone(),
+                reply(&["r1 read", "l1 ls"]),
+                result("r1", "alpha\n"),
+                result("l1", "notes.txt"),
+            ],
+        ),
+        (
+            "unsafe",
+            vec![bash.clone(), write],
+            pending(&[("b1", "bash", false), ("w1", "write", false)]),
+            vec![],
+            vec![
+                user.clone(),
+                reply(&["b1 bash", "w1 write"]),
+                interrupted("b1", "bash"),
+                interrupted("w1", "write"),
+            ],
+        ),
+        (
+            "mixed",
+            vec![bash, read],
+            pending(&[("b1", "bash", false), ("r1", "read", true)]),
+            vec!["read"],
+            vec![
+                user,
+                reply(&["b1 bash", "r1 read"]),
+                interrupted("b1", "bash"),
+                result("r1", "alpha\n"),
+            ],
+        ),
+    ];
+    for (name, calls, stopped, rerun, told) in cases {
+        let mut journal = vec![started_run("work")];
+        if !calls.is_empty() {
+            journal.push(saved_reply("", &calls));
+        }
+        let script = json!([[text("done")]]);
+        let mut pi = Pi::session(&format!("resume-{name}"), script, Some(&journal));
+        fs::write(pi.root.join("cwd/notes.txt"), "alpha\n").unwrap();
+        assert_eq!(
+            pi.last_run("before"),
+            run_1("interrupted", stopped),
+            "{name}"
+        );
+        assert_eq!(
+            resume(&mut pi, &json!("run-1"))["data"],
+            json!({"disposition": "started", "runId": "run-1"})
+        );
+        pi.wait_for("agent_settled", 1);
+        assert_eq!(
+            pi.last_run("after"),
+            run_1("completed", json!({})),
+            "{name}"
+        );
+        assert!(pi.close().success());
+
+        let starts = of_type(&pi.records, "agent_start").collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["runId"], "run-1");
+        assert_eq!(settled(&pi.records)[0]["runId"], "run-1");
+        let ran = of_type(&pi.records, "tool_execution_start")
+            .map(|record| record["toolName"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ran, rerun, "{name}");
+        if !rerun.is_empty() {
+            // The calls run again in the turn of the saved reply they
+            // belong to, which the run's records announce again.
+            let ends = of_type(&pi.records, "turn_end").collect::<Vec<_>>();
+            let message = &ends[0]["message"];
+            assert_eq!(message["stopReason"], "toolUse", "{name}");
+            assert_eq!(message["content"].as_array().unwrap().len(), calls.len());
+            let results = ends[0]["toolResults"].as_array().unwrap();
+            assert_eq!(results.len(), rerun.len(), "{name}");
+        }
+        assert_eq!(pi.model_requests(), [Value::Array(told)], "{name}");
+        assert!(!pi.root.join("ran.txt").exists(), "{name}: bash ran again");
+        assert!(
+            !pi.root.join("cwd/written.txt").exists(),
+            "{name}: write ran again"
+        );
+        let ends = pi
+            .journal()
+            .into_iter()
+            .filter(|record| record["type"] == "run_finished")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ends,
+            [json!({"type": "run_finished", "run_id": "run-1", "status": "completed"})]
+        );
+    }
+}
+
+#[test]
+fn a_finished_run_reports_how_it_ended_and_cannot_resume() {
+    for status in ["completed", "failed", "aborted"] {
+        let ended = json!({"type": "run_finished", "run_id": "run-1", "status": status});
+        let journal = [started_run("work"), saved_reply("answer", &[]), ended];
+        let mut pi = Pi::session(&format!("finished-{status}"), json!([]), Some(&journal));
+        // The settle was missed: the driver reads how the run ended.
+        assert_eq!(pi.last_run("state"), run_1(status, json!({})));
+        assert_eq!(
+            resume(&mut pi, &json!("run-1"))["error"],
+            "run run-1 is not interrupted"
+        );
+        pi.command(json!({"id": "again", "type": "prompt", "message": "work", "requestId": "m-1"}));
+        assert_eq!(
+            pi.response("again")["data"],
+            json!({"disposition": "handled", "runId": "run-1"})
+        );
+        pi.command(json!({"id": "text", "type": "get_last_assistant_text"}));
+        assert_eq!(pi.response("text")["data"]["text"], "answer");
+        assert!(pi.close().success());
+        assert_eq!(of_type(&pi.records, "agent_start").count(), 0);
+    }
+}
+
+#[test]
+fn a_repeated_request_id_starts_nothing_and_a_new_prompt_ends_an_interrupted_run() {
+    let journal = [started_run("work")];
+    let mut pi = Pi::session("repeat", json!([[text("done")]]), Some(&journal));
+    pi.command(json!({"id": "again", "type": "prompt", "message": "work", "requestId": "m-1"}));
+    assert_eq!(
+        pi.response("again")["data"],
+        json!({"disposition": "started", "runId": "run-1"})
+    );
+    pi.command(json!({"id": "new", "type": "prompt", "message": "other", "requestId": "m-2"}));
+    let run_id = pi.response("new")["data"]["runId"].clone();
+    assert_ne!(run_id, "run-1");
+    pi.wait_for("agent_settled", 1);
+    // The new prompt ended the interrupted run, so its request is handled.
+    pi.command(json!({"id": "first", "type": "prompt", "message": "work", "requestId": "m-1"}));
+    assert_eq!(
+        pi.response("first")["data"],
+        json!({"disposition": "handled", "runId": "run-1"})
+    );
+    assert!(pi.close().success());
+    assert_eq!(of_type(&pi.records, "agent_start").count(), 1);
+    assert_eq!(pi.model_requests().len(), 1);
+    let ends = pi
+        .journal()
+        .into_iter()
+        .filter(|record| record["type"] == "run_finished")
+        .map(|record| (record["run_id"].clone(), record["status"].clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ends,
+        [
+            (json!("run-1"), json!("aborted")),
+            (run_id, json!("completed"))
+        ]
+    );
+}
+
+#[test]
+fn abort_ends_an_interrupted_run_while_none_is_active() {
+    let journal = [started_run("work")];
+    let mut pi = Pi::session("abort-interrupted", json!([]), Some(&journal));
+    pi.command(json!({"id": "other", "type": "abort", "expectedRunId": "other"}));
+    assert_eq!(
+        pi.response("other")["error"],
+        "expectedRunId other does not match the interrupted run run-1"
+    );
+    pi.command(json!({"id": "abort", "type": "abort", "expectedRunId": "run-1"}));
+    assert_eq!(pi.response("abort")["success"], true);
+    assert_eq!(pi.last_run("state"), run_1("aborted", json!({})));
+    assert_eq!(
+        resume(&mut pi, &json!("run-1"))["error"],
+        "run run-1 is not interrupted"
+    );
+    assert!(pi.close().success());
+    let journal = pi.journal();
+    assert_eq!(
+        journal.last().unwrap(),
+        &json!({"type": "run_finished", "run_id": "run-1", "status": "aborted"})
+    );
+}
+
+#[test]
+fn a_journal_from_before_runs_has_no_last_run() {
+    let old_prompt = json!({"type": "message", "message": {"role": "user", "content": "old"}});
+    let journal = [old_prompt, saved_reply("answer", &[])];
+    let mut pi = Pi::session("old-journal", json!([[text("new")]]), Some(&journal));
+    pi.command(json!({"id": "state", "type": "get_state"}));
+    let state = pi.response("state")["data"].clone();
+    assert_eq!(state["messageCount"], 2);
+    assert!(state.get("lastRun").is_none(), "{state}");
+    pi.command(json!({"id": "bare", "type": "resume_run"}));
+    assert!(
+        pi.response("bare")["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing field `expectedRunId`"),
+        "{}",
+        pi.response("bare")
+    );
+    assert_eq!(
+        resume(&mut pi, &json!("run-1"))["error"],
+        "expectedRunId run-1 does not match: the session has no run"
+    );
+    pi.command(json!({"id": "abort", "type": "abort"}));
+    assert_eq!(pi.response("abort")["success"], true);
+    pi.command(json!({"id": "run", "type": "prompt", "message": "next"}));
+    let run_id = pi.response("run")["data"]["runId"].clone();
+    pi.wait_for("agent_settled", 1);
+    assert_eq!(
+        pi.last_run("after"),
+        json!({"runId": run_id, "status": "completed"})
+    );
+    assert!(pi.close().success());
+}
+
+#[test]
+fn a_model_request_cut_off_by_a_crash_is_sent_again_on_resume() {
+    let mut pi = Pi::session("crash-model", json!([[held()], [text("done")]]), None);
+    pi.command(json!({"id": "run", "type": "prompt", "message": "work", "requestId": "m-1"}));
+    let run_id = pi.response("run")["data"]["runId"].clone();
+    wait_for_lines(&pi.root.join("requests.jsonl"), 1);
+    pi.restart();
+
+    // The driver's recovery: check the run, clear the queue, resume.
+    let stopped =
+        json!({"runId": run_id, "requestId": "m-1", "status": "interrupted", "phase": "model"});
+    assert_eq!(pi.last_run("state"), stopped);
+    pi.command(json!({"id": "clear", "type": "clear_queue"}));
+    pi.response("clear");
+    assert_eq!(resume(&mut pi, &run_id)["success"], true);
+    pi.wait_for("agent_settled", 1);
+    assert_eq!(pi.last_run("after")["status"], "completed");
+    pi.command(json!({"id": "text", "type": "get_last_assistant_text"}));
+    assert_eq!(pi.response("text")["data"]["text"], "done");
+    assert!(pi.close().success());
+    let log = fs::read_to_string(pi.root.join("requests.jsonl")).unwrap();
+    let requests = log.lines().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1], "the resumed request differs");
+}
+
+#[test]
+fn a_command_cut_off_by_a_crash_never_runs_again() {
+    let command = "echo once >> ../counter.txt; echo $$ > ../sleeper.pid; exec sleep 600";
+    let call =
+        json!({"tool_call": {"id": "b1", "name": "bash", "arguments": {"command": command}}});
+    let mut pi = Pi::session("crash-bash", json!([[call], [text("done")]]), None);
+    pi.command(json!({"id": "run", "type": "prompt", "message": "count", "requestId": "m-1"}));
+    let run_id = pi.response("run")["data"]["runId"].clone();
+    let sleeper = wait_for_pid(&pi.root.join("sleeper.pid"));
+    pi.restart();
+    // SIGKILL left pi no chance to stop the command; stop it here.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(sleeper),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+
+    let bash = json!({"id": "b1", "name": "bash", "replaySafe": false});
+    let stopped = json!({"runId": run_id, "requestId": "m-1", "status": "interrupted", "phase": "tools", "pendingTools": [bash]});
+    assert_eq!(pi.last_run("state"), stopped);
+    assert_eq!(resume(&mut pi, &run_id)["success"], true);
+    pi.wait_for("agent_settled", 1);
+    assert_eq!(pi.last_run("after")["status"], "completed");
+    assert!(pi.close().success());
+    assert_eq!(
+        fs::read_to_string(pi.root.join("counter.txt")).unwrap(),
+        "once\n"
+    );
+    assert_eq!(of_type(&pi.records, "tool_execution_start").count(), 0);
+    assert_eq!(pi.model_requests()[1][2], interrupted("b1", "bash"));
+}
+
+#[test]
+fn a_read_cut_off_by_a_crash_runs_again() {
+    let call =
+        json!({"tool_call": {"id": "r1", "name": "read", "arguments": {"path": "notes.txt"}}});
+    let mut pi = Pi::session("crash-read", json!([[call], [text("done")]]), None);
+    // Reading a FIFO waits for a writer, so the read is still running when
+    // pi dies.
+    let notes = pi.root.join("cwd/notes.txt");
+    let fifo = Command::new("mkfifo").arg(&notes).status().unwrap();
+    assert!(fifo.success());
+    pi.command(json!({"id": "run", "type": "prompt", "message": "read", "requestId": "m-1"}));
+    let run_id = pi.response("run")["data"]["runId"].clone();
+    pi.wait_for("tool_execution_start", 1);
+    pi.restart();
+    fs::remove_file(&notes).unwrap();
+    fs::write(&notes, "alpha\n").unwrap();
+
+    let read = json!({"id": "r1", "name": "read", "replaySafe": true});
+    let stopped = json!({"runId": run_id, "requestId": "m-1", "status": "interrupted", "phase": "tools", "pendingTools": [read]});
+    assert_eq!(pi.last_run("state"), stopped);
+    assert_eq!(resume(&mut pi, &run_id)["success"], true);
+    pi.wait_for("agent_settled", 1);
+    assert_eq!(pi.last_run("after")["status"], "completed");
+    assert!(pi.close().success());
+    let end = of_type(&pi.records, "tool_execution_end").next().unwrap();
+    assert_eq!(end["result"]["content"][0]["text"], "alpha\n");
+    assert_eq!(
+        pi.model_requests()[1][2],
+        json!({"role": "tool", "text": "alpha\n", "toolCallId": "r1"})
+    );
+}
+
+#[test]
+fn a_request_id_names_its_run_after_a_restart() {
+    let mut pi = Pi::session("request-id", json!([[text("done")]]), None);
+    pi.command(json!({"id": "run", "type": "prompt", "message": "work", "requestId": "m-1"}));
+    let run_id = pi.response("run")["data"]["runId"].clone();
+    pi.wait_for("agent_settled", 1);
+    pi.restart();
+    pi.command(json!({"id": "again", "type": "prompt", "message": "work", "requestId": "m-1"}));
+    assert_eq!(
+        pi.response("again")["data"],
+        json!({"disposition": "handled", "runId": run_id})
+    );
+    pi.command(json!({"id": "messages", "type": "get_messages"}));
+    let messages = pi.response("messages")["data"]["messages"].clone();
+    assert_eq!(messages.as_array().unwrap().len(), 2);
+    assert!(pi.close().success());
+    assert_eq!(of_type(&pi.records, "agent_start").count(), 0);
+    assert_eq!(pi.model_requests().len(), 1);
+}
+
+#[test]
+fn how_a_run_ends_is_saved_and_a_closed_stdin_leaves_it_interrupted() {
+    let script = json!([
+        [text("Once"), held()],
+        [{"error": "overloaded"}],
+        [held()]
+    ]);
+    let mut pi = Pi::session("run-ends", script, None);
+    // An abort.
+    pi.command(json!({"id": "1", "type": "prompt", "message": "one", "requestId": "m-1"}));
+    let aborted = pi.response("1")["data"]["runId"].clone();
+    pi.wait_for("message_update", 1);
+    pi.command(json!({"id": "abort", "type": "abort", "expectedRunId": aborted}));
+    pi.response("abort");
+    assert_eq!(pi.last_run("state-1")["status"], "aborted");
+    // A failure.
+    pi.command(json!({"id": "2", "type": "prompt", "message": "two", "requestId": "m-2"}));
+    let failed = pi.response("2")["data"]["runId"].clone();
+    pi.wait_for("agent_settled", 2);
+    assert_eq!(pi.last_run("state-2")["status"], "failed");
+    // A driver that goes away mid-run.
+    pi.command(json!({"id": "3", "type": "prompt", "message": "three", "requestId": "m-3"}));
+    let lost = pi.response("3")["data"]["runId"].clone();
+    wait_for_lines(&pi.root.join("requests.jsonl"), 3);
+    assert!(pi.close().success());
+    assert_eq!(settled(&pi.records).len(), 2);
+
+    pi.restart();
+    let stopped =
+        json!({"runId": lost, "requestId": "m-3", "status": "interrupted", "phase": "model"});
+    assert_eq!(pi.last_run("state"), stopped);
+    for (id, run_id, disposition) in [
+        ("m-1", aborted, "handled"),
+        ("m-2", failed, "handled"),
+        ("m-3", lost, "started"),
+    ] {
+        pi.command(json!({"id": id, "type": "prompt", "message": "again", "requestId": id}));
+        assert_eq!(
+            pi.response(id)["data"],
+            json!({"disposition": disposition, "runId": run_id})
+        );
+    }
+    assert!(pi.close().success());
+}
+
+#[test]
+fn sigterm_ends_pi_and_leaves_its_run_interrupted() {
+    let mut pi = Pi::session("sigterm", json!([[held()]]), None);
+    pi.command(json!({"id": "run", "type": "prompt", "message": "work", "requestId": "m-1"}));
+    let run_id = pi.response("run")["data"]["runId"].clone();
+    wait_for_lines(&pi.root.join("requests.jsonl"), 1);
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(pi.child.id()).unwrap());
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).unwrap();
+    assert_eq!(pi.child.wait().unwrap().code(), Some(143));
+    pi.restart();
+    let stopped =
+        json!({"runId": run_id, "requestId": "m-1", "status": "interrupted", "phase": "model"});
+    assert_eq!(pi.last_run("state"), stopped);
+    assert!(pi.close().success());
+}
+
+#[test]
+fn the_queue_is_saved_with_the_session_before_it_is_acknowledged() {
+    // An older pi saved queued messages as plain strings: follow-ups.
+    let journal = [json!({"type": "queued_messages_snapshot", "messages": ["old"]})];
+    let script = json!([[{"wait_for_file": "release"}, text("first")], [text("second")]]);
+    let mut pi = Pi::session("queue", script, Some(&journal));
+    pi.command(json!({"id": "steer", "type": "steer", "message": "look"}));
+    assert_eq!(
+        pi.response("steer")["data"],
+        json!({"disposition": "queued"})
+    );
+    assert_eq!(
+        saved_queue(&pi),
+        json!({"messages": ["look", "old"], "steering": 1})
+    );
+
+    pi.restart();
+    pi.command(json!({"id": "state", "type": "get_state"}));
+    assert_eq!(pi.response("state")["data"]["pendingMessageCount"], 2);
+    pi.command(json!({"id": "clear", "type": "clear_queue"}));
+    assert_eq!(
+        pi.response("clear")["data"],
+        json!({"steering": ["look"], "followUp": ["old"]})
+    );
+    assert_eq!(saved_queue(&pi), json!({"messages": []}));
+
+    // Steering queued during a run leaves the saved queue once delivered.
+    pi.command(json!({"id": "run", "type": "prompt", "message": "work"}));
+    pi.wait_for("turn_start", 1);
+    pi.command(json!({"id": "more", "type": "steer", "message": "more"}));
+    pi.response("more");
+    assert_eq!(
+        saved_queue(&pi),
+        json!({"messages": ["more"], "steering": 1})
+    );
+    pi.release("release");
+    pi.wait_for("agent_settled", 1);
+    assert_eq!(saved_queue(&pi), json!({"messages": []}));
+    assert!(pi.close().success());
+    assert_eq!(
+        pi.model_requests()[1].as_array().unwrap().last().unwrap(),
+        &json!({"role": "user", "text": "more"})
+    );
+
+    pi.restart();
+    pi.command(json!({"id": "state", "type": "get_state"}));
+    assert_eq!(pi.response("state")["data"]["pendingMessageCount"], 0);
+    assert!(pi.close().success());
 }
