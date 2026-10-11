@@ -66,6 +66,138 @@ fn print_mode_uses_faux_model_without_session() {
     );
 }
 
+/// A pi command answering from `root/script.json` and logging each request.
+fn faux_script_pi(root: &Path, args: &[&str]) -> Command {
+    let mut command = pi_command();
+    command
+        .current_dir(root)
+        .env("HOME", root)
+        .env("PI_CODING_AGENT_DIR", root.join("agent"))
+        .env("PI_FAUX_SCRIPT", root.join("script.json"))
+        .env("PI_FAUX_SCRIPT_LOG", root.join("requests.jsonl"))
+        .args(["--offline", "--no-session", "--model", "faux/script"])
+        .args(args);
+    command
+}
+
+fn faux_script_log(root: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(root.join("requests.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line"))
+        .collect()
+}
+
+#[test]
+fn print_mode_runs_a_faux_script_tool_round_and_logs_each_request() {
+    let root = test_dir("pi-cli-faux-script");
+    fs::create_dir_all(root.join("agent")).unwrap();
+    fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+    fs::write(
+        root.join("script.json"),
+        r#"[
+            [{"tool_call": {"name": "read", "arguments": {"path": "notes.txt"}}}],
+            [{"text": "notes.txt lists alpha and beta"}]
+        ]"#,
+    )
+    .unwrap();
+
+    let output = faux_script_pi(
+        &root,
+        &[
+            "--no-context-files",
+            "--system-prompt",
+            "Be brief.",
+            "-p",
+            "read notes.txt",
+        ],
+    )
+    .output()
+    .expect("run pi");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "notes.txt lists alpha and beta\n"
+    );
+    let log = faux_script_log(&root);
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[1]["system_prompt"], "Be brief.");
+    assert!(log[1]["tools"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("read")));
+    let messages = log[1]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3, "{messages:?}");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "read notes.txt");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(
+        messages[1]["tool_calls"],
+        serde_json::json!([{"id": "call_1_1", "name": "read", "arguments": {"path": "notes.txt"}}])
+    );
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_1_1");
+    assert_eq!(messages[2]["tool_name"], "read");
+    assert!(
+        messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("alpha\nbeta"),
+        "{}",
+        messages[2]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn faux_script_log_resumes_the_script_in_a_new_process() {
+    let root = test_dir("pi-cli-faux-script-restart");
+    fs::create_dir_all(root.join("agent")).unwrap();
+    fs::write(
+        root.join("script.json"),
+        r#"[
+            [{"text": "partial"}, {"wait_for_file": "never"}],
+            [{"text": "resumed"}]
+        ]"#,
+    )
+    .unwrap();
+
+    // The first process logs its request, then holds the reply open until killed.
+    let mut first = faux_script_pi(&root, &["-p", "first"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pi");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fs::read_to_string(root.join("requests.jsonl")).is_ok_and(|log| log.ends_with('\n')) {
+        assert!(first.try_wait().unwrap().is_none(), "first pi exited");
+        assert!(Instant::now() < deadline, "first request was never logged");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    first.kill().expect("kill first pi");
+    first.wait().expect("reap first pi");
+
+    let output = faux_script_pi(&root, &["-p", "second"])
+        .output()
+        .expect("run pi");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "resumed\n");
+    let log = faux_script_log(&root);
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0]["messages"][0]["content"], "first");
+    assert_eq!(log[1]["messages"][0]["content"], "second");
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn theme_flag_accepts_presets_paths_and_no_themes_fallback() {
     let root = test_dir("pi-cli-theme-flags");

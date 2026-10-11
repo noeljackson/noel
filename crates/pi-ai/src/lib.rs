@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, env, time::Duration};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -448,9 +455,25 @@ fn sanitize_surrogates(value: &str) -> String {
         .collect()
 }
 
+impl FauxProvider {
+    fn is_script(&self) -> bool {
+        self.config.model.id == "script"
+    }
+}
+
 #[async_trait]
 impl Provider for FauxProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
+        if self.is_script() {
+            let mut events = Vec::new();
+            FauxScript::from_env()?
+                .respond(&request, &mut |event| {
+                    events.push(event);
+                    Ok(())
+                })
+                .await?;
+            return Ok(events);
+        }
         let last_user = request
             .messages
             .iter()
@@ -481,6 +504,9 @@ impl Provider for FauxProvider {
         request: ProviderRequest,
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
     ) -> Result<(), ProviderError> {
+        if self.is_script() {
+            return FauxScript::from_env()?.respond(&request, on_event).await;
+        }
         let delay_ms = env::var("PI_FAUX_STREAM_DELAY_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -505,6 +531,218 @@ impl Provider for FauxProvider {
         }
         Ok(())
     }
+}
+
+/// `faux/script`: replays the responses in the JSON file named by
+/// `PI_FAUX_SCRIPT`, an array of responses that are each an array of steps.
+/// With `PI_FAUX_SCRIPT_LOG`, every request is appended to that file as one
+/// JSON line and fsynced before the response starts. The number of requests
+/// already logged selects the response, so a restarted process resumes the
+/// script where the previous one stopped. Without a log, an in-process counter
+/// per script file selects it.
+#[derive(Debug, Clone)]
+struct FauxScript {
+    path: PathBuf,
+    log: Option<PathBuf>,
+}
+
+/// One step of a scripted response, written as a single-key JSON object.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum FauxScriptStep {
+    Text(String),
+    Thinking(String),
+    ToolCall(FauxScriptToolCall),
+    Usage {
+        input: u64,
+        output: u64,
+    },
+    Stop(String),
+    /// Fails the request; before any output, the agent retries it.
+    Error(String),
+    DelayMs(u64),
+    /// Holds the response until the file exists; relative to the script.
+    WaitForFile(PathBuf),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FauxScriptToolCall {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    arguments: serde_json::Map<String, Value>,
+}
+
+/// Next response per script file, for scripts run without a request log.
+static FAUX_SCRIPT_POSITIONS: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
+
+impl FauxScript {
+    fn from_env() -> Result<Self, ProviderError> {
+        let path = env::var_os("PI_FAUX_SCRIPT")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ProviderError::Config("faux/script needs PI_FAUX_SCRIPT to name a script".into())
+            })?;
+        Ok(Self {
+            path: PathBuf::from(path),
+            log: env::var_os("PI_FAUX_SCRIPT_LOG")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        })
+    }
+
+    async fn respond(
+        &self,
+        request: &ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+    ) -> Result<(), ProviderError> {
+        let responses = self.load()?;
+        let position = self.next_position(request)?;
+        let steps = responses.get(position).ok_or_else(|| {
+            ProviderError::Config(format!(
+                "faux script {} is exhausted: request {} has no response (the script has {})",
+                self.path.display(),
+                position + 1,
+                responses.len()
+            ))
+        })?;
+        let mut tool_calls = 0;
+        let mut stopped = false;
+        for step in steps {
+            match step {
+                FauxScriptStep::Text(text) => on_event(StreamEvent::Text(text.clone()))?,
+                FauxScriptStep::Thinking(text) => on_event(StreamEvent::Thinking(text.clone()))?,
+                FauxScriptStep::ToolCall(call) => {
+                    tool_calls += 1;
+                    on_event(StreamEvent::ToolCall {
+                        id: call
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("call_{}_{tool_calls}", position + 1)),
+                        name: call.name.clone(),
+                        arguments: Value::Object(call.arguments.clone()).to_string(),
+                    })?;
+                }
+                FauxScriptStep::Usage { input, output } => on_event(StreamEvent::Usage {
+                    input_tokens: *input,
+                    output_tokens: *output,
+                })?,
+                FauxScriptStep::Stop(reason) => {
+                    stopped = true;
+                    on_event(StreamEvent::Stop {
+                        reason: reason.clone(),
+                    })?;
+                }
+                FauxScriptStep::Error(message) => {
+                    return Err(ProviderError::Status {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        body: message.clone(),
+                    });
+                }
+                FauxScriptStep::DelayMs(delay) => {
+                    tokio::time::sleep(Duration::from_millis(*delay)).await;
+                }
+                FauxScriptStep::WaitForFile(file) => {
+                    let file = self.path.parent().unwrap_or(Path::new("")).join(file);
+                    while !file.exists() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        }
+        if !stopped {
+            let reason = if tool_calls > 0 { "tool_use" } else { "stop" };
+            on_event(StreamEvent::Stop {
+                reason: reason.to_string(),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn load(&self) -> Result<Vec<Vec<FauxScriptStep>>, ProviderError> {
+        let text = fs::read_to_string(&self.path).map_err(|error| {
+            ProviderError::Config(format!("faux script {}: {error}", self.path.display()))
+        })?;
+        serde_json::from_str(&text).map_err(|error| {
+            ProviderError::Config(format!(
+                "invalid faux script {}: {error}",
+                self.path.display()
+            ))
+        })
+    }
+
+    /// Index of the response for this request: the number of requests logged
+    /// before it (it is appended and fsynced first), or the in-process count.
+    fn next_position(&self, request: &ProviderRequest) -> Result<usize, ProviderError> {
+        let Some(log) = &self.log else {
+            let mut positions = FAUX_SCRIPT_POSITIONS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let next = positions.entry(self.path.clone()).or_default();
+            *next += 1;
+            return Ok(*next - 1);
+        };
+        let log_error = |error: std::io::Error| {
+            ProviderError::Config(format!("faux script log {}: {error}", log.display()))
+        };
+        let position = match fs::read(log) {
+            Ok(bytes) => bytes.iter().filter(|byte| **byte == b'\n').count(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(log_error(error)),
+        };
+        let mut line = faux_script_log_entry(request).to_string();
+        line.push('\n');
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .map_err(log_error)?;
+        file.write_all(line.as_bytes()).map_err(log_error)?;
+        file.sync_all().map_err(log_error)?;
+        Ok(position)
+    }
+}
+
+/// What one request sent to the model, as a `PI_FAUX_SCRIPT_LOG` line.
+fn faux_script_log_entry(request: &ProviderRequest) -> Value {
+    let messages = request
+        .messages
+        .iter()
+        .map(|message| {
+            let mut entry = json!({ "role": message.role, "content": message.content });
+            if !message.tool_calls.is_empty() {
+                entry["tool_calls"] = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.id,
+                            "name": call.name,
+                            "arguments": serde_json::from_str::<Value>(&call.arguments)
+                                .unwrap_or_else(|_| Value::String(call.arguments.clone())),
+                        })
+                    })
+                    .collect();
+            }
+            if let Some(id) = &message.tool_call_id {
+                entry["tool_call_id"] = json!(id);
+            }
+            if let Some(name) = &message.tool_name {
+                entry["tool_name"] = json!(name);
+            }
+            if !message.media.is_empty() {
+                entry["media"] = json!(message.media.len());
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "system_prompt": request.system_prompt,
+        "messages": messages,
+        "tools": request.tools.iter().map(|tool| &tool.name).collect::<Vec<_>>(),
+    })
 }
 
 struct OpenAiProvider {
@@ -4257,6 +4495,323 @@ mod tests {
 
         assert_eq!(events[0], StreamEvent::Text("[faux/echo] ".to_string()));
         assert_eq!(events[1], StreamEvent::Text("hello".to_string()));
+    }
+
+    fn faux_script_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "pi-faux-script-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn user_request(text: &str) -> ProviderRequest {
+        ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: Some("system".into()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: text.into(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: vec![ToolDefinition {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: json!({"type": "object"}),
+            }],
+        }
+    }
+
+    async fn run_faux_script(
+        script: &FauxScript,
+        request: &ProviderRequest,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        let mut events = Vec::new();
+        script
+            .respond(request, &mut |event| {
+                events.push(event);
+                Ok(())
+            })
+            .await
+            .map(|()| events)
+    }
+
+    #[tokio::test]
+    async fn faux_script_replays_responses_and_logs_each_request() {
+        let dir = faux_script_dir("replay");
+        fs::write(
+            dir.join("script.json"),
+            r#"[
+                [{"thinking": "plan"}, {"tool_call": {"name": "read", "arguments": {"path": "a.txt"}}}],
+                [{"text": "done"}, {"usage": {"input": 3, "output": 2}}, {"stop": "end_turn"}]
+            ]"#,
+        )
+        .unwrap();
+        let script = FauxScript {
+            path: dir.join("script.json"),
+            log: Some(dir.join("requests.jsonl")),
+        };
+
+        let first = run_faux_script(&script, &user_request("read a.txt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            [
+                StreamEvent::Thinking("plan".into()),
+                StreamEvent::ToolCall {
+                    id: "call_1_1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+                StreamEvent::Stop {
+                    reason: "tool_use".into()
+                },
+            ]
+        );
+
+        let mut second_request = user_request("read a.txt");
+        second_request.messages.extend([
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: String::new(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: vec![ChatToolCall {
+                    id: "call_1_1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                }],
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: "alpha".into(),
+                media: Vec::new(),
+                tool_call_id: Some("call_1_1".into()),
+                tool_name: Some("read".into()),
+                tool_calls: Vec::new(),
+            },
+        ]);
+        let second = run_faux_script(&script, &second_request).await.unwrap();
+        assert_eq!(
+            second,
+            [
+                StreamEvent::Text("done".into()),
+                StreamEvent::Usage {
+                    input_tokens: 3,
+                    output_tokens: 2
+                },
+                StreamEvent::Stop {
+                    reason: "end_turn".into()
+                },
+            ]
+        );
+
+        let log = fs::read_to_string(dir.join("requests.jsonl")).unwrap();
+        let entries = log
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[1],
+            json!({
+                "system_prompt": "system",
+                "messages": [
+                    {"role": "user", "content": "read a.txt"},
+                    {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "call_1_1", "name": "read", "arguments": {"path": "a.txt"}}
+                    ]},
+                    {"role": "tool", "content": "alpha", "tool_call_id": "call_1_1", "tool_name": "read"}
+                ],
+                "tools": ["read"]
+            })
+        );
+
+        let exhausted = run_faux_script(&script, &user_request("more"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            exhausted.contains("is exhausted: request 3 has no response (the script has 2)"),
+            "{exhausted}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn faux_script_log_position_survives_a_new_provider() {
+        let dir = faux_script_dir("resume");
+        fs::write(
+            dir.join("script.json"),
+            r#"[[{"text": "one"}], [{"text": "two"}], [{"text": "three"}]]"#,
+        )
+        .unwrap();
+        let script = FauxScript {
+            path: dir.join("script.json"),
+            log: Some(dir.join("requests.jsonl")),
+        };
+        run_faux_script(&script, &user_request("a")).await.unwrap();
+        run_faux_script(&script, &user_request("b")).await.unwrap();
+
+        // A restarted process holds no state beyond the log.
+        let restarted = script.clone();
+        let events = run_faux_script(&restarted, &user_request("c"))
+            .await
+            .unwrap();
+        assert_eq!(events[0], StreamEvent::Text("three".into()));
+        assert_eq!(
+            fs::read_to_string(dir.join("requests.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn faux_script_without_log_counts_requests_per_script() {
+        let dir = faux_script_dir("counter");
+        for name in ["a.json", "b.json"] {
+            fs::write(
+                dir.join(name),
+                format!(r#"[[{{"text": "{name} 1"}}], [{{"text": "{name} 2"}}]]"#),
+            )
+            .unwrap();
+        }
+        let a = FauxScript {
+            path: dir.join("a.json"),
+            log: None,
+        };
+        let b = FauxScript {
+            path: dir.join("b.json"),
+            log: None,
+        };
+        let request = user_request("hi");
+        assert_eq!(
+            run_faux_script(&a, &request).await.unwrap()[0],
+            StreamEvent::Text("a.json 1".into())
+        );
+        assert_eq!(
+            run_faux_script(&b, &request).await.unwrap()[0],
+            StreamEvent::Text("b.json 1".into())
+        );
+        assert_eq!(
+            run_faux_script(&a, &request).await.unwrap()[0],
+            StreamEvent::Text("a.json 2".into())
+        );
+        assert!(run_faux_script(&a, &request).await.is_err());
+        assert!(!dir.join("requests.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn faux_script_error_fails_before_output_and_the_retry_gets_the_next_response() {
+        let dir = faux_script_dir("error");
+        fs::write(
+            dir.join("script.json"),
+            r#"[[{"error": "overloaded"}], [{"text": "recovered"}]]"#,
+        )
+        .unwrap();
+        let script = FauxScript {
+            path: dir.join("script.json"),
+            log: Some(dir.join("requests.jsonl")),
+        };
+        let mut events = Vec::new();
+        let error = script
+            .respond(&user_request("hi"), &mut |event| {
+                events.push(event);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(events.is_empty());
+        assert!(error.to_string().contains("overloaded"), "{error}");
+        assert_eq!(
+            run_faux_script(&script, &user_request("hi")).await.unwrap()[0],
+            StreamEvent::Text("recovered".into())
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn faux_script_delays_and_holds_a_response_until_a_file_exists() {
+        let dir = faux_script_dir("wait");
+        fs::write(
+            dir.join("script.json"),
+            r#"[[{"delay_ms": 50}, {"text": "before"}, {"wait_for_file": "go"}, {"text": "after"}]]"#,
+        )
+        .unwrap();
+        let script = FauxScript {
+            path: dir.join("script.json"),
+            log: None,
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let request = user_request("hi");
+        let started = std::time::Instant::now();
+        let run = async {
+            script
+                .respond(&request, &mut |event| {
+                    sender.send(event).unwrap();
+                    Ok(())
+                })
+                .await
+        };
+        let release = async {
+            assert_eq!(
+                receiver.recv().await,
+                Some(StreamEvent::Text("before".into()))
+            );
+            assert!(started.elapsed() >= Duration::from_millis(50));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(receiver.try_recv().is_err(), "response ran past the wait");
+            fs::write(dir.join("go"), "").unwrap();
+        };
+        let (result, ()) = tokio::join!(run, release);
+        result.unwrap();
+        assert_eq!(
+            receiver.recv().await,
+            Some(StreamEvent::Text("after".into()))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn faux_script_reports_unreadable_and_invalid_scripts() {
+        let dir = faux_script_dir("invalid");
+        let missing = FauxScript {
+            path: dir.join("missing.json"),
+            log: None,
+        };
+        let error = run_faux_script(&missing, &user_request("hi"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing.json"), "{error}");
+
+        fs::write(dir.join("script.json"), r#"[[{"txt": "typo"}]]"#).unwrap();
+        let invalid = FauxScript {
+            path: dir.join("script.json"),
+            log: Some(dir.join("requests.jsonl")),
+        };
+        let error = run_faux_script(&invalid, &user_request("hi"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid faux script"), "{error}");
+        assert!(error.contains("txt"), "{error}");
+        assert!(!dir.join("requests.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
