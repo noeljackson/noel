@@ -9,14 +9,17 @@ fi
 cargo_bin="$(command -v cargo)"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/e2e-isolate.sh
+source "${repo_root}/scripts/e2e-isolate.sh"
 session_name="pi-e2e-${$}"
-session_dir="${repo_root}/target/e2e-tmux-sessions"
-work_dir="${repo_root}/target/e2e-tmux-work"
+session_dir="${e2e_root}/e2e-tmux-sessions"
+work_dir="${e2e_root}/e2e-tmux-work"
 cwd_dir="${work_dir}/cwd"
 agent_dir="${work_dir}/agent"
 prompt_file="${work_dir}/prompt-ready"
 
 cleanup() {
+  local status=$?
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-clear-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-one-follow-${$}" >/dev/null 2>&1 || true
@@ -24,6 +27,7 @@ cleanup() {
   tmux kill-session -t "pi-e2e-stream-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-modern-${$}" >/dev/null 2>&1 || true
   tmux kill-session -t "pi-e2e-input-${$}" >/dev/null 2>&1 || true
+  e2e_isolation_cleanup "${status}"
 }
 trap cleanup EXIT
 
@@ -135,7 +139,7 @@ send_line "/reload"
 require_live_color "38;5;5m" "theme-reload"
 # Markdown emphasis in assistant entries paints real SGR: bold runs emit
 # the bold modifier transition around **marked** text.
-send_line "show **bold** and *italic* and `code`"
+send_line 'show **bold** and *italic* and `code`'
 sleep 0.6
 require_live_color "[1m" "markdown-bold"
 grep -Fq '"theme": "kimi"' "${agent_dir}/settings.json"
