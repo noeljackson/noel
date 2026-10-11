@@ -30,10 +30,15 @@ if [ -z "${PI_E2E_ROOT:-}" ]; then
     "PI_E2E_ROOT=${e2e_new_root}"
     "PI_E2E_OWNER_PID=$$"
   )
-  for e2e_var in CARGO_TARGET_DIR PI_BIN TMPDIR; do
-    if [ -n "${!e2e_var:-}" ]; then
-      e2e_env+=("${e2e_var}=${!e2e_var}")
-    fi
+  # Keep the build configuration (CARGO_INCREMENTAL, RUSTFLAGS, linker and
+  # target settings) so panes reuse the outer build instead of recompiling;
+  # names that look like credentials never pass.
+  for e2e_var in $(compgen -e); do
+    case "${e2e_var}" in
+      *TOKEN* | *SECRET* | *PASSWORD* | *KEY*) ;;
+      CARGO_HOME | RUSTUP_HOME) ;;
+      CARGO_* | RUST* | PI_BIN | TMPDIR) e2e_env+=("${e2e_var}=${!e2e_var}") ;;
+    esac
   done
   exec env -i "${e2e_env[@]}" bash "$0" "$@"
 fi
