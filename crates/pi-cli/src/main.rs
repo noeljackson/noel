@@ -9828,11 +9828,13 @@ mod tests {
             .collect();
         // Bold span carries the modifier; link row displays only "docs".
         let bold = rows[0].line.spans.iter().any(|span| {
-            span.content.contains("**commit**") && span.style.add_modifier.contains(Modifier::BOLD)
+            span.content.contains("commit")
+                && !span.content.contains("**")
+                && span.style.add_modifier.contains(Modifier::BOLD)
         });
         assert!(bold, "bold marker not styled: {display:?}");
         let code = rows[0].line.spans.iter().any(|span| {
-            span.content.contains("`cargo build`") && span.style.fg == Some(palette.accent)
+            span.content.contains("cargo build") && span.style.fg == Some(palette.accent)
         });
         assert!(code, "code span not accented: {display:?}");
         assert_eq!(display[1], "  see docs");
