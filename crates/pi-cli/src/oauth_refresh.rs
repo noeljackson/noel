@@ -675,6 +675,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_spends_the_auth_files_rotated_token_not_the_snapshots() {
+        // A long-running pi refreshed once: its startup snapshot still holds
+        // the spent tokens, the auth file the rotated ones, expiring now.
+        let root = test_dir("pi-cli-oauth-rotated");
+        let auth_path = root.join("agent").join("auth.json");
+        let stub = spawn_stub(
+            200,
+            r#"{"access_token":"third-access","refresh_token":"third-refresh","expires_in":3600}"#,
+        );
+        let snapshot = expired_stored_auth("openai-codex", "default");
+        let mut stored = AuthData::default();
+        stored.insert(
+            "openai-codex",
+            "default",
+            AuthCredential::OAuth {
+                access_token: "second-access".to_string(),
+                refresh_token: Some("second-refresh".to_string()),
+                expires: 5_030,
+                account_id: Some("account-id".to_string()),
+            },
+        );
+        std::fs::create_dir_all(auth_path.parent().expect("auth dir")).expect("create auth dir");
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string(&stored).expect("auth json"),
+        )
+        .expect("write auth");
+        let client = reqwest::Client::new();
+        let refresh = |now| {
+            refresh_expiring_auth(
+                &client,
+                &auth_path,
+                &snapshot,
+                "openai-codex",
+                None,
+                Some((&stub.url, "test-client")),
+                now,
+            )
+        };
+
+        let resolved = refresh(5_000).await.expect("refresh").expect("auth");
+        assert_eq!(resolved.refresh_token(), Some("third-refresh"));
+        let request = stub.requests.lock().expect("requests lock")[0].clone();
+        assert!(
+            request.contains("refresh_token=second-refresh"),
+            "{request}"
+        );
+
+        // The next request from the same snapshot reuses the saved tokens.
+        let resolved = refresh(5_100).await.expect("resolve").expect("auth");
+        assert_eq!(resolved.expires(), 5_000 + 3600);
+        assert_eq!(resolved.refresh_token(), Some("third-refresh"));
+        assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn refresh_expiring_auth_keeps_valid_tokens() {
         let root = test_dir("pi-cli-oauth-valid");
         let auth_path = root.join("agent").join("auth.json");

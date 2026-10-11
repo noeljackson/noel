@@ -1685,6 +1685,7 @@ name = "pi-cli"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "clap",
  "crossterm",
