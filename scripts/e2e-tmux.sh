@@ -101,10 +101,11 @@ send_enter() {
   sleep 0.35
 }
 
-# The idle footer shows the active model and no queue/activity suffix; while
-# a turn runs, the footer ends with "queue:" plus pending counts.
+# The idle footer shows the active model. While a turn runs, the footer
+# gains "esc to interrupt". (≡ is the durable queue count and ↺ is prompt
+# history — neither gates submission.)
 last_line_is_idle_footer() {
-  tail -n 1 "$1" | grep -Eq '^[a-z0-9/._@-]+ .*(≡|↺|queue: 0)' \
+  tail -n 1 "$1" | grep -Eq '^[a-z0-9/._@-]+ ' \
     && ! tail -n 1 "$1" | grep -Fq 'esc to interrupt'
 }
 
@@ -131,6 +132,11 @@ send_line "/accent magenta"
 require_live_color "38;5;5m" "theme-accent"
 send_line "/reload"
 require_live_color "38;5;5m" "theme-reload"
+# Markdown emphasis in assistant entries paints real SGR: bold runs emit
+# the bold modifier transition around **marked** text.
+send_line "show **bold** and *italic* and `code`"
+sleep 0.6
+require_live_color "[1m" "markdown-bold"
 grep -Fq '"theme": "kimi"' "${agent_dir}/settings.json"
 grep -Fq '"accentColor": "magenta"' "${agent_dir}/settings.json"
 send_line "/accent auto"
