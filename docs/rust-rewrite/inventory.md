@@ -138,6 +138,9 @@ Project-local files:
   and `.agents/skills` above. A linked worktree nested in its main checkout
   replaces the main checkout's same-named file.
 
+A project without a `.noel/` directory is read from its `.pi/` instead, for
+every `.noel/` entry above (`noel_config::project_config_dir`).
+
 Outside both, `~/.agents/skills` holds user skills, as upstream reads it.
 
 Rust behavior:
@@ -362,7 +365,9 @@ Rust behavior:
   `promptGuidelines` in their manifest.
 - The model's `bash` commands get `NOEL_SESSION_ID`, `NOEL_SESSION_FILE`,
   `NOEL_PROVIDER`, `NOEL_MODEL`, and `NOEL_REASONING_LEVEL`, and the prompt's bash
-  rule says so. The process carries `AI_AGENT` and `NOEL_CODING_AGENT`.
+  rule says so. The process carries `AI_AGENT` and `NOEL_CODING_AGENT`. Each
+  `NOEL_*` name here is also set as `PI_*`, for skills and scripts written
+  for pi.
 - The skills listing is upstream's `formatSkillsForPrompt` text, present
   while `read` or `bash` is active and without the skills that set
   `disable-model-invocation`.
@@ -379,7 +384,8 @@ input in its session (`core/agent-session.ts`).
 Rust behavior, compared with upstream's results in `skills.json`:
 
 - Discovery: `skills/` in the agent dir and a trusted project's `.noel/skills`
-  (every `SKILL.md` below, and described Markdown files directly in them);
+  (`.pi/skills` when the project has no `.noel/`; every `SKILL.md` below,
+  and described Markdown files directly in them);
   `~/.agents/skills` and a trusted project's `.agents/skills` from the cwd up
   to the repository root; the `skills` and `prompts` settings; packages;
   `--skill` and `--prompt-template`, each a file or a directory. Templates

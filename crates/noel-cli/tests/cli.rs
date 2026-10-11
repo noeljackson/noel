@@ -9,8 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// keys or NOEL_* variables leak in), NOEL_TEST_ISOLATION (noel refuses the default
 /// ~/.noel, imports no login from $HOME, and starts no background model
 /// refresh), and its own agent dir and HOME under the target dir (paths
-/// only; nothing exists there unless noel writes). A test that needs a
-/// particular agent dir or HOME sets its own.
+/// only; nothing exists there unless noel writes). So no test touches the
+/// developer's ~/.noel or imports their ~/.pi on a first run. A test that
+/// needs a particular agent dir or HOME sets its own.
 fn noel_command() -> Command {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let isolated = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -301,6 +302,62 @@ fn print_mode_sends_the_default_system_prompt_and_the_prompt_files() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// A project written for pi keeps working: noel reads its `.pi/` (here a
+/// skill and `APPEND_SYSTEM.md`) while the project has no `.noel/`, and only
+/// `.noel/` once it has one.
+#[test]
+fn a_project_written_for_pi_is_read_from_pi_until_it_has_a_noel_dir() {
+    let root = fs::canonicalize({
+        let root = test_dir("noel-cli-pi-project");
+        fs::create_dir_all(root.join("agent")).unwrap();
+        fs::create_dir_all(root.join(".pi/skills/release")).unwrap();
+        root
+    })
+    .unwrap();
+    let skill = |description: &str| format!("---\ndescription: {description}\n---\nDo it.\n");
+    fs::write(
+        root.join(".pi/skills/release/SKILL.md"),
+        skill("Cut a release."),
+    )
+    .unwrap();
+    fs::write(root.join(".pi/APPEND_SYSTEM.md"), "From pi's directory.\n").unwrap();
+    let location = |dir: &str| {
+        format!(
+            "<location>{}</location>",
+            root.join(dir).join("SKILL.md").display()
+        )
+    };
+    let addendum = "<addendum>\nFrom pi's directory.\n\n</addendum>";
+
+    let prompt = system_prompt_sent(&root, &["--approve", "--no-context-files"]);
+    assert!(prompt.contains(&location(".pi/skills/release")), "{prompt}");
+    assert!(prompt.contains(addendum), "{prompt}");
+
+    // Trust gates pi's directory as it gates noel's.
+    let prompt = system_prompt_sent(&root, &["--no-approve", "--no-context-files"]);
+    assert!(
+        !prompt.contains("<skills>") && !prompt.contains(addendum),
+        "{prompt}"
+    );
+
+    fs::create_dir_all(root.join(".noel/skills/deploy")).unwrap();
+    fs::write(
+        root.join(".noel/skills/deploy/SKILL.md"),
+        skill("Deploy the app."),
+    )
+    .unwrap();
+    let prompt = system_prompt_sent(&root, &["--approve", "--no-context-files"]);
+    assert!(
+        prompt.contains(&location(".noel/skills/deploy")),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains(".pi/") && !prompt.contains(addendum),
+        "{prompt}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Print mode expands a skill command and a prompt template before the
 /// model sees the prompt, and lists the skill in the system prompt.
 /// `--no-skills` and `--no-prompt-templates` keep what `--skill` and
@@ -392,17 +449,22 @@ fn print_mode_expands_skills_and_templates_and_honors_the_resource_flags() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// Prints what a bash command sees of its session and of noel, a line each.
-const SESSION_ENV: &str = r#"printf '%s\n' "${NOEL_SESSION_ID-unset}" "${NOEL_SESSION_FILE-unset}" "${NOEL_PROVIDER-unset}" "${NOEL_MODEL-unset}" "${NOEL_REASONING_LEVEL-unset}" "${AI_AGENT-unset}" "${NOEL_CODING_AGENT-unset}""#;
+/// Prints what a bash command sees of its session and of noel, a line each:
+/// the session under noel's names, then under pi's, then the process markers.
+const SESSION_ENV: &str = r#"printf '%s\n' "${NOEL_SESSION_ID-unset}" "${NOEL_SESSION_FILE-unset}" "${NOEL_PROVIDER-unset}" "${NOEL_MODEL-unset}" "${NOEL_REASONING_LEVEL-unset}" "${PI_SESSION_ID-unset}" "${PI_SESSION_FILE-unset}" "${PI_PROVIDER-unset}" "${PI_MODEL-unset}" "${PI_REASONING_LEVEL-unset}" "${AI_AGENT-unset}" "${NOEL_CODING_AGENT-unset}" "${PI_CODING_AGENT-unset}""#;
 
-/// Variables a noel started by another noel's bash command inherits.
+/// Variables a noel started by another noel's bash command inherits, under
+/// noel's names and pi's.
 fn inside_another_noel(command: &mut Command) -> &mut Command {
+    for prefix in ["NOEL", "PI"] {
+        command
+            .env(format!("{prefix}_SESSION_ID"), "parent")
+            .env(format!("{prefix}_SESSION_FILE"), "/parent.jsonl")
+            .env(format!("{prefix}_PROVIDER"), "parent-provider")
+            .env(format!("{prefix}_MODEL"), "parent-model")
+            .env(format!("{prefix}_REASONING_LEVEL"), "max");
+    }
     command
-        .env("NOEL_SESSION_ID", "parent")
-        .env("NOEL_SESSION_FILE", "/parent.jsonl")
-        .env("NOEL_PROVIDER", "parent-provider")
-        .env("NOEL_MODEL", "parent-model")
-        .env("NOEL_REASONING_LEVEL", "max")
 }
 
 #[test]
@@ -449,7 +511,13 @@ fn model_bash_commands_see_their_session_and_the_process_markers() {
             "faux",
             "script",
             "off",
+            "ephemeral",
+            "unset",
+            "faux",
+            "script",
+            "off",
             noel_core::PRODUCT_NAME,
+            "true",
             "true"
         ]
     );
@@ -474,7 +542,13 @@ fn model_bash_commands_see_their_session_and_the_process_markers() {
             "faux",
             "script",
             "off",
+            "saved",
+            &path_text(&sessions.join("saved.jsonl")),
+            "faux",
+            "script",
+            "off",
             noel_core::PRODUCT_NAME,
+            "true",
             "true"
         ]
     );
@@ -512,7 +586,13 @@ fn user_bash_commands_are_not_given_session_variables() {
             "parent-provider",
             "parent-model",
             "max",
+            "parent",
+            "/parent.jsonl",
+            "parent-provider",
+            "parent-model",
+            "max",
             noel_core::PRODUCT_NAME,
+            "true",
             "true"
         ]
     );
@@ -1712,6 +1792,312 @@ fn continue_skips_a_damaged_session_and_writers_repair_torn_tails() {
     }
     assert!(log.contains("after torn"));
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn first_run_imports_pi_state_once_and_continues_its_session() {
+    let root = test_dir("noel-cli-pi-import");
+    let home = root.join("home");
+    let pi_agent = home.join(".pi/agent");
+    fs::create_dir_all(&pi_agent).expect("create pi agent dir");
+    fs::write(
+        pi_agent.join("settings.json"),
+        r#"{"modelRefresh":{"enabled":false}}"#,
+    )
+    .expect("write settings");
+    fs::write(
+        pi_agent.join("models.json"),
+        r#"[{"provider":"faux","id":"imported","api":"faux"}]"#,
+    )
+    .expect("write models");
+    fs::write(
+        pi_agent.join("auth.json"),
+        r#"{"openai":{"default":{"type":"api_key","key":"dummy-pi-key"}}}"#,
+    )
+    .expect("write auth");
+    let print = |noel_dir: Option<&Path>, args: &[&str]| {
+        let mut command = noel_command();
+        command.current_dir(&root).env("HOME", &home);
+        match noel_dir {
+            Some(dir) => command.env("NOEL_DIR", dir),
+            // The default directory, in this test's own HOME; the harness
+            // marker would refuse it.
+            None => command
+                .env_remove("NOEL_DIR")
+                .env_remove("NOEL_TEST_ISOLATION"),
+        };
+        command
+            .args(["-p", "--offline", "--model", "faux/echo"])
+            .args(args)
+            .output()
+            .expect("run noel")
+    };
+    // A session in pi's current format, written into pi's directory.
+    let first = print(Some(&pi_agent), &["before the import"]);
+    assert!(first.status.success(), "{first:?}");
+    let pi_files = files_under(&home.join(".pi"));
+
+    let second = print(None, &["--continue", "after the import"]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(second.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("noel: imported settings.json, models.json, auth.json, sessions from"),
+        "{stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&second.stdout),
+        "[faux/echo] after the import\n"
+    );
+    let journals = files_under(&home.join(".noel/sessions"))
+        .into_iter()
+        .filter(|(path, _)| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(journals.len(), 1);
+    let log = String::from_utf8_lossy(&journals[0].1);
+    assert!(
+        log.contains("before the import") && log.contains("after the import"),
+        "{log}"
+    );
+    assert_eq!(
+        fs::read(home.join(".noel/auth.json")).expect("noel auth"),
+        fs::read(pi_agent.join("auth.json")).expect("pi auth")
+    );
+    assert_eq!(files_under(&home.join(".pi")), pi_files);
+
+    let third = print(None, &["--continue", "once more"]);
+    assert!(third.status.success(), "{third:?}");
+    assert!(!String::from_utf8_lossy(&third.stderr).contains("imported"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pi_import_skips_files_noel_cannot_load_and_never_runs_with_noel_dir() {
+    let root = test_dir("noel-cli-pi-import-skips");
+    let home = root.join("home");
+    let pi_agent = home.join(".pi/agent");
+    fs::create_dir_all(&pi_agent).expect("create pi agent dir");
+    fs::write(
+        pi_agent.join("settings.json"),
+        r#"{"modelRefresh":{"enabled":false}}"#,
+    )
+    .expect("write settings");
+    fs::write(pi_agent.join("models.json"), "{ not json").expect("write models");
+    let print = |command: &mut Command| {
+        command
+            .current_dir(&root)
+            .env("HOME", &home)
+            .args([
+                "-p",
+                "--offline",
+                "--no-session",
+                "--model",
+                "faux/echo",
+                "hi",
+            ])
+            .output()
+            .expect("run noel")
+    };
+
+    let overridden = print(noel_command().env("NOEL_DIR", root.join("custom")));
+    assert!(overridden.status.success(), "{overridden:?}");
+    assert!(!home.join(".noel").exists());
+
+    // Under the test harness noel refuses its default directory before it
+    // imports anything.
+    let refused = print(noel_command().env_remove("NOEL_DIR"));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("refusing the default agent dir"),
+        "{stderr}"
+    );
+    assert!(!home.join(".noel").exists());
+
+    let imported = print(
+        noel_command()
+            .env_remove("NOEL_DIR")
+            .env_remove("NOEL_TEST_ISOLATION"),
+    );
+    let stderr = String::from_utf8_lossy(&imported.stderr);
+    assert!(imported.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("noel: imported settings.json from"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("noel: did not import models.json: failed to parse"),
+        "{stderr}"
+    );
+    assert!(home.join(".noel/settings.json").exists());
+    assert!(!home.join(".noel/models.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A home that has only pi's state, and a noel on its default directory
+/// there: no `NOEL_DIR`, and no harness marker, which would refuse it.
+fn home_with_pi_state(name: &str) -> (PathBuf, PathBuf) {
+    let root = test_dir(name);
+    let home = root.join("home");
+    let pi_agent = home.join(".pi/agent");
+    fs::create_dir_all(pi_agent.join("sessions")).expect("create pi agent dir");
+    fs::write(
+        pi_agent.join("settings.json"),
+        r#"{"modelRefresh":{"enabled":false}}"#,
+    )
+    .expect("write settings");
+    fs::write(
+        pi_agent.join("auth.json"),
+        r#"{"openai":{"default":{"type":"api_key","key":"dummy-pi-key"}}}"#,
+    )
+    .expect("write auth");
+    (root, home)
+}
+
+fn noel_on_default_dir(root: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    noel_command()
+        .current_dir(root)
+        .env("HOME", home)
+        .env_remove("NOEL_DIR")
+        .env_remove("NOEL_TEST_ISOLATION")
+        .args(args)
+        .output()
+        .expect("run noel")
+}
+
+/// Fails unless `home` still holds pi's state, unchanged, and nothing else:
+/// no `~/.noel`, and no directory an import was staged in.
+fn assert_nothing_imported(what: &str, home: &Path, pi_files: &[(PathBuf, Vec<u8>)]) {
+    let entries = fs::read_dir(home)
+        .expect("read home")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, [".pi"], "{what} wrote to the home directory");
+    assert_eq!(files_under(&home.join(".pi")), pi_files, "{what}");
+}
+
+/// A version probe writes nothing: scripts and supervisors ask for the
+/// version, and asking must not import pi's state.
+#[test]
+fn version_probe_imports_nothing() {
+    let (root, home) = home_with_pi_state("noel-cli-pi-import-version");
+    let pi_files = files_under(&home.join(".pi"));
+    for flag in ["--version", "-v"] {
+        let output = noel_on_default_dir(&root, &home, &[flag]);
+        assert!(output.status.success(), "{flag}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("noel {}\n", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{flag}");
+        assert_nothing_imported(flag, &home, &pi_files);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Help writes nothing, for noel and for each of its commands.
+#[test]
+fn help_imports_nothing() {
+    let (root, home) = home_with_pi_state("noel-cli-pi-import-help");
+    let pi_files = files_under(&home.join(".pi"));
+    for args in [
+        &["--help"][..],
+        &["-h"],
+        &["login", "--help"],
+        &["logout", "-h"],
+        &["accounts", "--help"],
+        &["auth", "--help"],
+        &["auth"],
+        &["install", "--help"],
+        &["remove", "--help"],
+        &["update", "--help"],
+        &["list", "--help"],
+        &["config", "--help"],
+        &["images", "--help"],
+        &["generate-image", "--help"],
+    ] {
+        let output = noel_on_default_dir(&root, &home, args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .to_lowercase()
+                .contains("usage"),
+            "{args:?}: {output:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{args:?}");
+        assert_nothing_imported(&format!("{args:?}"), &home, &pi_files);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A usage error writes nothing: arguments are checked before any command
+/// asks for its directories. The first command that does ask imports.
+#[test]
+fn usage_errors_import_nothing_and_the_first_command_that_loads_configuration_imports() {
+    let (root, home) = home_with_pi_state("noel-cli-pi-import-usage");
+    let pi_files = files_under(&home.join(".pi"));
+    for args in [
+        &["--no-such-flag"][..],
+        &["--mode", "bogus"],
+        &["--mode", "rpc", "a prompt"],
+        &["--session-id", "a", "--continue", "-p", "hi"],
+        &["login"],
+        &["login", "openai"],
+        &["login", "openai-codex", "--api-key", "dummy"],
+        &["login", "--no-such-option"],
+        &["logout"],
+        &["accounts"],
+        &["accounts", "bogus"],
+        &["auth", "bogus"],
+        &["auth", "check"],
+        &["install"],
+        &["remove"],
+        &["update", "one", "two"],
+        &["list", "bogus"],
+        &["config", "disable"],
+        &["config", "disable", "bogus-kind", "name"],
+        &["generate-image", "a prompt without an output"],
+        &["mcp", "list"],
+    ] {
+        let output = noel_on_default_dir(&root, &home, args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("imported"), "{args:?}: {stderr}");
+        assert_nothing_imported(&format!("{args:?}"), &home, &pi_files);
+    }
+
+    // `noel list` reads the settings, so it is the first to need ~/.noel.
+    let output = noel_on_default_dir(&root, &home, &["list"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("noel: imported settings.json, auth.json, sessions from"),
+        "{stderr}"
+    );
+    assert!(home.join(".noel/auth.json").exists());
+    assert_eq!(files_under(&home.join(".pi")), pi_files);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Every file under `dir` with its contents.
+fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let content = fs::read(&path).expect("read file");
+                files.push((path, content));
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 fn path_text(path: &Path) -> String {

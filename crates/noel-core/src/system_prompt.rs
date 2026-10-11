@@ -1,7 +1,9 @@
 //! The system prompt every model request starts with: upstream's
 //! `buildSystemPrompt` (`packages/coding-agent/src/core/system-prompt.ts`),
-//! section by section and word for word. `system-prompt.json` holds
-//! upstream's text for fixed inputs, and the tests below compare against it.
+//! section by section and word for word, under noel's names: the product in
+//! the first sentence, and the `NOEL_*` variables of bash's rule.
+//! `system-prompt.json` holds upstream's text for fixed inputs, and the tests
+//! below compare against it through `noel_config::with_noel_names`.
 //!
 //! The prompt is a preamble followed by tagged sections, joined by blank
 //! lines: `tools`, `rules`, `addendum` (appended text), `project_context`
@@ -212,7 +214,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use noel_config::{ResourceFile, SourceInfo, SourceScope};
+    use noel_config::{with_noel_names, ResourceFile, SourceInfo, SourceScope};
     use noel_tools::builtin_tool_definitions;
     use serde_json::{json, Value};
 
@@ -233,10 +235,10 @@ mod tests {
     /// in docs/rust-rewrite/non-parity-register.md.
     const OMITTED_UPSTREAM_SECTIONS: &[(&str, &str)] = &[("docs", "### Default System Prompt")];
 
+    /// A fixture string with noel's names and the case's directory.
     fn text(value: &Value, tmp: &Path) -> String {
-        let text = value.as_str().expect("fixture string");
+        let text = with_noel_names(value.as_str().expect("fixture string"));
         text.replace("<tmp>", &tmp.display().to_string())
-            .replace("<product>", PRODUCT_NAME)
     }
 
     /// The skill a fixture describes; where it came from is not in the prompt.
@@ -304,8 +306,9 @@ mod tests {
     }
 
     /// For every case of `system-prompt.json`, a runtime with upstream's
-    /// inputs sends upstream's prompt, to the byte, apart from the product
-    /// name and the sections noel leaves out.
+    /// inputs sends upstream's prompt, to the byte, apart from the names
+    /// noel changed (`noel_config::UPSTREAM_NAMES`) and the sections noel
+    /// leaves out.
     #[test]
     fn system_prompt_matches_ts_builder() {
         let fixture = fixture();

@@ -192,13 +192,16 @@ Current Rust parity coverage includes:
   acts on a verdict is covered by the RPC scenarios above and by
   `crates/noel-core/src/recovery_tests.rs`.
 - The system prompt: for every `system-prompt.json` case, a runtime with
-  upstream's inputs sends upstream's text to the byte, apart from the product
-  name and the `docs` section
+  upstream's inputs sends upstream's text to the byte, apart from noel's
+  names (`noel_config::UPSTREAM_NAMES`: the product, and the `NOEL_*`
+  variables of bash's rule) and the `docs` section
   (`system_prompt_matches_ts_builder` in `crates/noel-core/src/system_prompt.rs`).
 - Prompt and context file discovery: for every `system-prompt.json` discovery
   case, startup resolves the custom prompt, appended text, and context files
   upstream's resource loader resolves
   (`prompt_and_context_files_match_ts_discovery` in `crates/noel-cli/src/main.rs`).
+  Each case runs on the tree as upstream wrote it (a project's `.pi/`, which
+  noel reads when there is no `.noel/`) and again under noel's names.
 
 Only those two tests cover the system prompt. The provider request fixtures
 pass an explicit prompt, and the RPC goldens record messages without it.
@@ -208,7 +211,8 @@ pass an explicit prompt, and the RPC goldens record messages without it.
     (`frontmatter_matches_ts_parser` in `crates/noel-config/src/frontmatter.rs`);
   - what loads, in what order, from where, with which diagnostics
     (`discovery_matches_ts_resource_loader` in
-    `crates/noel-config/src/resources.rs`);
+    `crates/noel-config/src/resources.rs`), on the tree as upstream wrote it
+    (`.pi/`) and again under noel's names (`.noel/`);
   - the listing text (`skills_listing_matches_ts_formatter` in
     `crates/noel-config/src/skills.rs`), and inside the whole prompt the
     `skills` cases of `system_prompt_matches_ts_builder`;
@@ -216,7 +220,8 @@ pass an explicit prompt, and the RPC goldens record messages without it.
     `crates/noel-config/src/prompt_templates.rs`);
   - `/skill:name` and `/template` expansion, and the input left as it is
     (`input_expansion_matches_ts_session` in `crates/noel-core/src/input.rs`);
-  - `get_commands` and the resource flags, through the binary
+  - `get_commands` and the resource flags, through the binary and in both
+    of those layouts
     (`get_commands_matches_upstream` in `crates/noel-cli/tests/rpc_parity.rs`).
 
   Expansion in each mode is covered by Rust's own tests: RPC `prompt`,
