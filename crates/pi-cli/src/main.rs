@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod clipboard;
+mod markdown;
 mod oauth_login;
 mod oauth_refresh;
 mod transcript_view;
@@ -4060,6 +4061,28 @@ fn pending_entry_rows(
     if collapsed && entry.kind == TuiEntryKind::Tool {
         rows = collapsed_tool_rows(&logical, rows, width, palette);
     }
+    // Markdown emphasis restyles wrapped assistant rows in place. Selection
+    // geometry stays anchored to the plain logical lines; only span styles
+    // (and link display text) differ.
+    {
+        let logical_lines: Vec<String> = logical
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let base = Style::default().fg(palette.foreground);
+        restyle_rows_with_markdown(
+            &mut rows,
+            entry,
+            |line| logical_lines.get(line).cloned(),
+            base,
+            palette.accent,
+        );
+    }
     let limit = if entry.kind == TuiEntryKind::Thinking {
         2
     } else {
@@ -4964,6 +4987,59 @@ fn push_marked_lines(
     for line in text_lines {
         lines.push(Line::from(Span::styled(format!("  {line}"), text_style)));
     }
+}
+
+/// Restyle wrapped assistant rows with inline markdown emphasis. Runs after
+/// wrapping so selection geometry (built from the plain logical lines) is
+/// untouched: the same graphemes keep the same byte positions, only span
+/// styles change. Links are the exception — their display text is the link
+/// label only — so a link row's display differs from its source slice and
+/// selection copies the raw markdown, like folded tool previews.
+fn restyle_rows_with_markdown(
+    rows: &mut [TranscriptRow],
+    entry: &TuiEntry,
+    logical_source_line: impl Fn(usize) -> Option<String>,
+    base: Style,
+    accent: ratatui::style::Color,
+) {
+    if entry.kind != TuiEntryKind::Assistant {
+        return;
+    }
+    for row in rows.iter_mut() {
+        if row.synthetic {
+            continue;
+        }
+        let Some(source_line) = logical_source_line(row.start.line) else {
+            continue;
+        };
+        let end = if row.end.line == row.start.line {
+            row.end.byte
+        } else {
+            source_line.len()
+        };
+        let Some(row_text) = source_line.get(row.start.byte..end) else {
+            continue;
+        };
+        let spans = styled_spans(row_text, base, accent);
+        row.line = Line::from(spans);
+    }
+}
+
+/// Convert one markdown line to styled spans over its plain base style.
+fn styled_spans(line: &str, base: Style, accent: ratatui::style::Color) -> Vec<Span<'static>> {
+    markdown::parse_inline_line(line)
+        .into_iter()
+        .map(|span| {
+            let style = match span.style {
+                markdown::SpanStyle::Plain => base,
+                // base first: the markdown style's fg/modifiers must win over
+                // the plain base (base.fg is Some(Reset) and would otherwise
+                // mask the accent color via patch).
+                other => base.patch(markdown::ratatui_style(other, accent)),
+            };
+            Span::styled(span.display, style)
+        })
+        .collect()
 }
 
 fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palette: &ThemePalette) {
@@ -9600,6 +9676,84 @@ mod tests {
             active_model: Some("zai-coding/glm-5.3".into()),
             has_unfinished_turn: unfinished,
         }
+    }
+
+    #[test]
+    fn assistant_markdown_renders_styled_spans_but_plain_logical_lines() {
+        let entry = TuiEntry {
+            kind: TuiEntryKind::Assistant,
+            text: "run `cargo build` then **commit**\nsee [docs](https://example.org)".to_string(),
+        };
+        let palette = ThemePalette::default();
+        // Logical lines (selection/copy source) stay plain and complete,
+        // including the markdown syntax and link URL.
+        let logical = render_entry_lines(std::slice::from_ref(&entry), &palette);
+        let logical_text: Vec<String> = logical
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(
+            logical_text,
+            vec![
+                format!("{BULLET} run `cargo build` then **commit**"),
+                "  see [docs](https://example.org)".to_string(),
+                "".to_string()
+            ]
+        );
+        // Display rows get styles after wrapping; anchors unchanged.
+        let mut rows = pending_entry_rows(
+            &entry,
+            0,
+            80,
+            &palette,
+            &PreviewState::default(),
+            EntryScrollback::default(),
+        );
+        let anchor_starts: Vec<TranscriptPosition> = rows.iter().map(|row| row.start).collect();
+        restyle_rows_with_markdown(
+            &mut rows,
+            &entry,
+            |line| logical_text.get(line).cloned(),
+            Style::default().fg(palette.foreground),
+            palette.accent,
+        );
+        // Anchors identical after restyling.
+        assert_eq!(
+            anchor_starts,
+            rows.iter().map(|row| row.start).collect::<Vec<_>>()
+        );
+        let display: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row.line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        // Bold span carries the modifier; link row displays only "docs".
+        let bold = rows[0].line.spans.iter().any(|span| {
+            span.content.contains("**commit**") && span.style.add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(bold, "bold marker not styled: {display:?}");
+        let code = rows[0].line.spans.iter().any(|span| {
+            span.content.contains("`cargo build`") && span.style.fg == Some(palette.accent)
+        });
+        assert!(code, "code span not accented: {display:?}");
+        assert_eq!(display[1], "  see docs");
+        let link = rows[1]
+            .line
+            .spans
+            .iter()
+            .find(|span| span.content == "docs")
+            .expect("link span");
+        assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]
