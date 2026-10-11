@@ -13,13 +13,11 @@
       "accept": "text/event-stream",
       "authorization": "Bearer <redacted>",
       "content-type": "application/json",
-      "cookie": "",
-      "user-agent": "mistral-client-typescript/2.2.6",
+      "user-agent": "pi (linux <kernel>; x64)",
       "x-affinity": "session_ts_parity"
     },
     "body": {
       "model": "devstral-medium-latest",
-      "max_tokens": 258001,
       "stream": true,
       "messages": [
         {
@@ -37,7 +35,6 @@
           "function": {
             "name": "fixture_echo",
             "description": "Echo text for the parity fixture.",
-            "strict": false,
             "parameters": {
               "type": "object",
               "required": [
@@ -48,10 +45,12 @@
                   "type": "string"
                 }
               }
-            }
+            },
+            "strict": false
           }
         }
       ],
+      "max_tokens": 257994,
       "prompt_cache_key": "session_ts_parity"
     }
   }
