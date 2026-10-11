@@ -462,7 +462,9 @@ including a Codewire command such as `cw exec --name ts-parity-agent -- claude`.
 
 Parity fixtures are sanitized upstream provider request captures. They document
 URL, method, selected headers, body, and payload shape for covered providers.
-Rust tests compare local provider request builders against those captures. Drift
+Rust tests compare local provider request builders against those captures.
+`rpc-protocol.json` records upstream RPC mode instead: every stdout record, in
+order, for scripted runs against a local stub model. Drift
 is handled by updating Rust behavior and committed fixtures together, then
 running `make parity-check` and `make check`.
 
