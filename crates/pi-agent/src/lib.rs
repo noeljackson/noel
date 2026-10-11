@@ -11,6 +11,7 @@ use pi_ai::{
 };
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::Notify;
 use tokio::time::sleep;
 
 /// Default cap for one backoff delay, as upstream's `DEFAULT_MAX_AGENT_RETRY_DELAY_MS`.
@@ -79,17 +80,51 @@ pub struct AgentState {
     pub messages: Vec<ChatMessage>,
 }
 
+/// Cooperative cancellation shared by every clone. Cancelling is permanent:
+/// the flag stays set and every current or later `cancelled()` wait finishes.
 #[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<CancellationState>);
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
 
 impl CancellationToken {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.cancelled.store(true, Ordering::SeqCst);
+        self.0.notify.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst)
     }
+
+    /// Completes once the token is cancelled, immediately if it already is.
+    pub async fn cancelled(&self) {
+        // A `Notified` receives `notify_waiters` from the moment it is
+        // created, so a cancel between this check and the await is not lost.
+        let notified = self.0.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Reported by [`complete_with_retry_observed`] before each backoff, with the
+/// fields of upstream's `auto_retry_start` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryNotice {
+    /// The retry about to run, starting at 1.
+    pub attempt: u64,
+    /// The configured retry limit (`RetryPolicy::max_retries`).
+    pub max_attempts: u64,
+    /// The backoff before the retry, already capped by the policy.
+    pub delay_ms: u64,
+    /// The provider error that caused the retry.
+    pub error_message: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -285,33 +320,64 @@ pub async fn complete_with_retry(
     request: ProviderRequest,
     retry: &RetryPolicy,
     cancellation: &CancellationToken,
-    mut on_event: impl FnMut(&StreamEvent) + Send,
+    on_event: impl FnMut(&StreamEvent) + Send,
 ) -> Result<Vec<StreamEvent>, AgentError> {
-    let max_attempts = retry.max_retries.saturating_add(1);
+    complete_with_retry_observed(provider, request, retry, cancellation, on_event, |_| {}).await
+}
+
+/// [`complete_with_retry`] that also reports each retry before its backoff.
+/// Cancellation interrupts an in-flight request or a backoff sleep at once.
+pub async fn complete_with_retry_observed(
+    provider: &dyn Provider,
+    request: ProviderRequest,
+    retry: &RetryPolicy,
+    cancellation: &CancellationToken,
+    mut on_event: impl FnMut(&StreamEvent) + Send,
+    mut on_retry: impl FnMut(RetryNotice) + Send,
+) -> Result<Vec<StreamEvent>, AgentError> {
+    let total_attempts = retry.max_retries.saturating_add(1);
     let mut attempt = 0u64;
     loop {
         if cancellation.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let mut events = Vec::new();
-        let result = provider
-            .complete_streaming(request.clone(), &mut |event| {
-                on_event(&event);
-                events.push(event);
-                Ok(())
-            })
-            .await;
+        let request_attempt = async {
+            let mut events = Vec::new();
+            let result = provider
+                .complete_streaming(request.clone(), &mut |event| {
+                    on_event(&event);
+                    events.push(event);
+                    Ok(())
+                })
+                .await;
+            (result, events)
+        };
+        let (result, events) = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(AgentError::Cancelled),
+            outcome = request_attempt => outcome,
+        };
         match result {
             Ok(()) => return Ok(events),
             Err(error) if !events.is_empty() => return Err(error.into()),
             Err(error) if is_context_overflow(&error) => return Err(error.into()),
-            Err(error) if attempt + 1 >= max_attempts => return Err(error.into()),
-            Err(_) => {
+            Err(error) if attempt + 1 >= total_attempts => return Err(error.into()),
+            Err(error) => {
                 let delay = retry_delay_ms(retry, attempt);
-                if delay > 0 {
-                    sleep(Duration::from_millis(delay)).await;
-                }
                 attempt += 1;
+                on_retry(RetryNotice {
+                    attempt,
+                    max_attempts: retry.max_retries,
+                    delay_ms: delay,
+                    error_message: error.to_string(),
+                });
+                if delay > 0 {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return Err(AgentError::Cancelled),
+                        () = sleep(Duration::from_millis(delay)) => {}
+                    }
+                }
             }
         }
     }
@@ -441,6 +507,161 @@ mod tests {
                 name: "submit_review".to_string(),
                 arguments: serde_json::json!({"decision": "deny"}),
             }
+        );
+    }
+
+    fn empty_request() -> ProviderRequest {
+        ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+
+    /// Cancels `cancellation` after `after` and returns when that happened.
+    fn cancel_later(
+        cancellation: &CancellationToken,
+        after: Duration,
+    ) -> tokio::task::JoinHandle<std::time::Instant> {
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            sleep(after).await;
+            cancellation.cancel();
+            std::time::Instant::now()
+        })
+    }
+
+    struct PendingProvider;
+
+    #[async_trait]
+    impl Provider for PendingProvider {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            std::future::pending().await
+        }
+    }
+
+    /// Fails before producing output, so every failure is retryable.
+    struct FailingProvider(std::sync::atomic::AtomicU64);
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            Err(ProviderError::InvalidResponse(format!("transient {call}")))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_returns_immediately_once_cancelled() {
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_millis(100), cancellation.cancelled())
+            .await
+            .expect("an already-cancelled token must not wait");
+        assert!(cancellation.clone().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_request_that_never_completes() {
+        let cancellation = CancellationToken::default();
+        let cancelled_at = cancel_later(&cancellation, Duration::from_millis(20));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            complete_with_retry(
+                &PendingProvider,
+                empty_request(),
+                &RetryPolicy::default(),
+                &cancellation,
+                |_| {},
+            ),
+        )
+        .await
+        .expect("cancellation must end the in-flight request");
+        let latency = cancelled_at.await.unwrap().elapsed();
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(
+            latency < Duration::from_millis(100),
+            "cancellation took {latency:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_backoff_returns_promptly() {
+        let provider = FailingProvider(Default::default());
+        let cancellation = CancellationToken::default();
+        // A one-minute backoff would hold the turn without cancellation.
+        let retry = RetryPolicy {
+            max_retries: 3,
+            base_delay_ms: 60_000,
+            max_delay_ms: 60_000,
+        };
+        let mut notices = Vec::new();
+        let cancelled_at = cancel_later(&cancellation, Duration::from_millis(20));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            complete_with_retry_observed(
+                &provider,
+                empty_request(),
+                &retry,
+                &cancellation,
+                |_| {},
+                |notice| notices.push(notice),
+            ),
+        )
+        .await
+        .expect("cancellation must end the backoff");
+        let latency = cancelled_at.await.unwrap().elapsed();
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(
+            latency < Duration::from_millis(100),
+            "cancellation took {latency:?}"
+        );
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].delay_ms, 60_000);
+    }
+
+    #[tokio::test]
+    async fn retry_notices_report_attempts_and_capped_delays() {
+        let provider = FailingProvider(Default::default());
+        let retry = RetryPolicy {
+            max_retries: 3,
+            base_delay_ms: 10,
+            max_delay_ms: 25,
+        };
+        let mut notices = Vec::new();
+        let error = complete_with_retry_observed(
+            &provider,
+            empty_request(),
+            &retry,
+            &CancellationToken::default(),
+            |_| {},
+            |notice| notices.push(notice),
+        )
+        .await
+        .unwrap_err();
+        // The final attempt's error is returned, not followed by a notice.
+        assert_eq!(
+            error.to_string(),
+            "provider returned an invalid response: transient 4"
+        );
+        assert_eq!(provider.0.load(Ordering::SeqCst), 4);
+        let notice = |attempt, delay_ms, call: u64| RetryNotice {
+            attempt,
+            max_attempts: 3,
+            delay_ms,
+            error_message: format!("provider returned an invalid response: transient {call}"),
+        };
+        assert_eq!(
+            notices,
+            vec![notice(1, 10, 1), notice(2, 20, 2), notice(3, 25, 3)]
         );
     }
 

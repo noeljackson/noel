@@ -1636,3 +1636,208 @@ fn auth_commands_leave_imported_logins_unrefreshed_until_they_expire() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Whether `pid` still runs. A killed process stays a zombie (state Z) until
+/// it is reaped, which counts as exited.
+#[cfg(unix)]
+fn process_is_running(pid: &str) -> bool {
+    if cfg!(target_os = "linux") {
+        return fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, fields)| !fields.trim_start().starts_with('Z'))
+        });
+    }
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Serves `responses` OpenAI chat-completions bodies, one per connection.
+#[cfg(unix)]
+fn serve_chat_completions(responses: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for body in responses {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "local provider timed out");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("local server: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let body_start = loop {
+                let mut chunk = [0u8; 4096];
+                let read = socket.read(&mut chunk).unwrap();
+                assert!(read > 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let length = String::from_utf8_lossy(&request[..body_start])
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < body_start + length {
+                let mut chunk = [0u8; 4096];
+                let read = socket.read(&mut chunk).unwrap();
+                assert!(read > 0, "request ended before its body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    (url, server)
+}
+
+#[cfg(unix)]
+#[test]
+fn fatal_signals_during_a_print_mode_bash_tool_kill_its_tree_and_end_pi_like_upstream() {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+    let root = test_dir("pi-cli-signal-bash");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"modelRefresh":{"enabled":false},"retry":{"enabled":false},"compaction":{"enabled":false}}"#,
+    )
+    .unwrap();
+    fs::write(
+        agent.join("auth.json"),
+        r#"{"local":{"type":"api_key","key":"fake-local-key"}}"#,
+    )
+    .unwrap();
+
+    // Upstream exits 143/129 on SIGTERM/SIGHUP and dies of SIGINT.
+    for (signal, expected) in [
+        ("TERM", (Some(143), None)),
+        ("INT", (None, Some(2))),
+        ("HUP", (Some(129), None)),
+    ] {
+        // The model calls bash; the shell and a background child publish
+        // their pids, then wait on the child. Each case has its own
+        // one-response provider, so a dying pi cannot take the next reply.
+        let pid_file = root.join(format!("{signal}.pids"));
+        let command = format!(
+            "echo $$ > '{0}.tmp'; sleep 30 & echo $! >> '{0}.tmp'; mv '{0}.tmp' '{0}'; wait",
+            pid_file.display()
+        );
+        let (url, server) = serve_chat_completions(vec![serde_json::json!({
+            "choices":[{"message":{"content":null,"tool_calls":[{
+                "id":"call-1","type":"function",
+                "function":{"name":"bash","arguments":serde_json::json!({"command":command}).to_string()}
+            }]},"finish_reason":"tool_calls"}]
+        })
+        .to_string()]);
+        fs::write(
+            agent.join("models.json"),
+            serde_json::json!([{
+                "provider":"local","id":"test","api":"openai-completions","baseUrl":url,"contextWindow":8192
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut pi = pi_command()
+            .current_dir(&root)
+            .env("HOME", &root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .env("SHELL", "/bin/sh")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .args(["--no-session", "--no-context-files", "-p"])
+            .args(["--model", "local/test", "run the tool"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let pids = loop {
+            if let Ok(pids) = fs::read_to_string(&pid_file) {
+                break pids
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+            }
+            if Instant::now() >= deadline || pi.try_wait().unwrap().is_some() {
+                let _ = pi.kill();
+                let output = pi.wait_with_output().unwrap();
+                panic!(
+                    "the bash tool never started: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(pids.len(), 2, "{pids:?}");
+        assert!(Command::new("kill")
+            .args([&format!("-{signal}"), &pi.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = pi.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = pi.kill();
+                panic!("pi ignored SIG{signal}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pids.iter().any(|pid| process_is_running(pid)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survivors = pids
+            .iter()
+            .filter(|pid| process_is_running(pid))
+            .collect::<Vec<_>>();
+        for pid in &survivors {
+            let _ = Command::new("kill").args(["-KILL", pid.as_str()]).status();
+        }
+        let mut stderr = String::new();
+        pi.stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(
+            (status.code(), status.signal()),
+            expected,
+            "SIG{signal}: {stderr}"
+        );
+        assert!(
+            survivors.is_empty(),
+            "SIG{signal} left tool processes running: {survivors:?}"
+        );
+        server.join().unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+}
