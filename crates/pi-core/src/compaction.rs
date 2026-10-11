@@ -1013,7 +1013,7 @@ mod tests {
             &provider,
             "continue".into(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await

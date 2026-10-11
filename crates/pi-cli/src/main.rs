@@ -62,7 +62,7 @@ use pi_core::{
     run_excluded_bash_result, run_user_turn, run_user_turn_streaming,
     run_user_turn_streaming_events_with_media, run_user_turn_streaming_with_media,
     write_session_export, AgentError, CompactionKind, ConversationMessage, FollowUpQueue,
-    MessageRole, ReloadReport, ReloadableSystems, Runtime, SessionError, SessionState,
+    MessageRole, ReloadReport, ReloadableSystems, RunControl, Runtime, SessionError, SessionState,
     SessionStore, SteeringMailbox, TodoItem, TodoStatus, TurnEvent, STEERING_JOIN,
 };
 use pi_tui::{
@@ -6748,20 +6748,21 @@ fn apply_turn_event(
             app.live_thinking_index = Some(thinking_index);
             app.append_entry(thinking_index, text);
         }
-        TurnEvent::ToolStarted { name } => {
-            *activity = Activity::Tool(name.clone());
+        TurnEvent::ToolStarted { call } => {
+            *activity = Activity::Tool(call.name.clone());
             app.live_thinking_index = None;
             app.turn_saw_tools = true;
             // Close the current text entry: the next delta opens a fresh one
             // below this tool call.
             *text_after_tool = true;
             app.live_tool_indices.push(app.entries.len());
-            app.push(TuiEntryKind::Tool, format!("running {name}\n\n"));
+            app.push(TuiEntryKind::Tool, format!("running {}\n\n", call.name));
         }
         TurnEvent::ToolOutput {
             call,
             output,
             is_error,
+            ..
         } => {
             if let Some(index) = app.live_tool_indices.last().copied() {
                 app.replace_entry(
@@ -8368,6 +8369,11 @@ async fn run_turn_tui(
     let activity_started = Instant::now();
     let mut activity = Activity::Waiting;
     let (delta_tx, delta_rx) = std::sync::mpsc::channel::<TurnEvent>();
+    // An interrupt drops the turn future below; the run is never cancelled.
+    let run = RunControl {
+        steering: steering.clone(),
+        ..RunControl::default()
+    };
     let stream_end = {
         let turn = async {
             let on_event = move |event: &TurnEvent| {
@@ -8380,14 +8386,13 @@ async fn run_turn_tui(
                         provider.as_ref(),
                         prompt,
                         media,
-                        &steering,
+                        &run,
                         on_event,
                     )
                     .await
                 }
                 None => {
-                    continue_turn_streaming_events(runtime, provider.as_ref(), &steering, on_event)
-                        .await
+                    continue_turn_streaming_events(runtime, provider.as_ref(), &run, on_event).await
                 }
             }
         };
@@ -14043,18 +14048,18 @@ mod tests {
             .join("\n");
         let mut saw_delta = false;
         let mut activity = Activity::Waiting;
+        let call = pi_ai::ChatToolCall {
+            id: "large-read".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"large.rs"}"#.into(),
+        };
         for event in [
-            TurnEvent::ToolStarted {
-                name: "read".into(),
-            },
+            TurnEvent::ToolStarted { call: call.clone() },
             TurnEvent::ToolOutput {
-                call: pi_ai::ChatToolCall {
-                    id: "large-read".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"large.rs"}"#.into(),
-                },
+                call,
                 output: output.clone(),
                 is_error: false,
+                duration: Duration::ZERO,
             },
         ] {
             let mut live_text_index = assistant_index;
@@ -14199,9 +14204,7 @@ mod tests {
             thinking_index,
             &mut saw_delta,
             &mut activity,
-            &TurnEvent::ToolStarted {
-                name: call.name.clone(),
-            },
+            &TurnEvent::ToolStarted { call: call.clone() },
         );
         let mut live_text_index = index;
         let mut text_after_tool = false;
@@ -14216,6 +14219,7 @@ mod tests {
                 call,
                 output: "HTTP 403".into(),
                 is_error: true,
+                duration: Duration::ZERO,
             },
         );
         assert_eq!(
@@ -14310,6 +14314,11 @@ mod tests {
         let mut saw_delta = false;
         let mut live_text_index = entry;
         let mut text_after_tool = false;
+        let read = pi_ai::ChatToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"a.txt"}"#.into(),
+        };
         let send = |app: &mut TuiApp,
                     live_text_index: &mut usize,
                     text_after_tool: &mut bool,
@@ -14337,9 +14346,7 @@ mod tests {
             &mut live_text_index,
             &mut text_after_tool,
             &mut saw_delta,
-            &TurnEvent::ToolStarted {
-                name: "read".into(),
-            },
+            &TurnEvent::ToolStarted { call: read.clone() },
         );
         send(
             &mut app,
@@ -14347,13 +14354,10 @@ mod tests {
             &mut text_after_tool,
             &mut saw_delta,
             &TurnEvent::ToolOutput {
-                call: pi_ai::ChatToolCall {
-                    id: "call-1".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"a.txt"}"#.into(),
-                },
+                call: read,
                 output: "file body".into(),
                 is_error: false,
+                duration: Duration::ZERO,
             },
         );
         send(
@@ -14369,7 +14373,11 @@ mod tests {
             &mut text_after_tool,
             &mut saw_delta,
             &TurnEvent::ToolStarted {
-                name: "bash".into(),
+                call: pi_ai::ChatToolCall {
+                    id: "call-2".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
             },
         );
         send(

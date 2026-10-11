@@ -5,14 +5,16 @@ use session_lock::SessionLock;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pi_agent::{CancellationToken, RetryPolicy};
+use pi_agent::RetryPolicy;
+pub use pi_agent::{CancellationToken, RetryNotice};
 use pi_ai::{
     ChatMessage, ChatRole, ChatToolCall, MediaInput, ModelRef, Provider, ProviderError,
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
@@ -588,6 +590,18 @@ pub enum AgentError {
     InvalidToolCall { tool: String, message: String },
     #[error("turn reached the {max_rounds} provider-round limit (including steering); work is saved; send a prompt to continue, or set agent.maxToolRounds in settings.json to raise the limit")]
     RoundLimitReached { max_rounds: usize },
+    #[error("turn cancelled")]
+    Cancelled,
+}
+
+impl From<pi_agent::AgentError> for AgentError {
+    fn from(error: pi_agent::AgentError) -> Self {
+        match error {
+            pi_agent::AgentError::Provider(error) => Self::Provider(error),
+            pi_agent::AgentError::Cancelled => Self::Cancelled,
+            other => Self::Provider(ProviderError::Config(other.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2142,6 +2156,30 @@ impl SteeringMailbox {
 /// separate interruptions.
 pub const STEERING_JOIN: &str = "\n---\n";
 
+/// A caller's handles on a running turn: steering for its next provider
+/// round, and cancellation. Cancelling ends the turn with
+/// [`AgentError::Cancelled`] at once, dropping an in-flight request, backoff,
+/// compaction or tool call (a dropped tool takes its process group with it).
+/// What the turn saved stays saved: a reply whose tool calls have no results
+/// continues with the interrupted-call placeholders. Clones share both.
+#[derive(Debug, Clone, Default)]
+pub struct RunControl {
+    pub steering: SteeringMailbox,
+    pub cancellation: CancellationToken,
+}
+
+impl RunControl {
+    /// Runs `step` unless the turn is cancelled first; cancelling drops it.
+    async fn until_cancelled<T>(&self, step: impl Future<Output = T>) -> Result<T, AgentError> {
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(AgentError::Cancelled),
+            output = step => Ok(output),
+        }
+    }
+}
+
+/// A turn that reports only text deltas; it can be steered, not cancelled.
 pub async fn run_user_turn_streaming_with_media(
     runtime: &mut Runtime,
     provider: &dyn Provider,
@@ -2150,7 +2188,11 @@ pub async fn run_user_turn_streaming_with_media(
     steering: &SteeringMailbox,
     mut on_text: impl FnMut(&str) + Send,
 ) -> Result<String, AgentError> {
-    run_user_turn_streaming_events_with_media(runtime, provider, prompt, media, steering, |event| {
+    let run = RunControl {
+        steering: steering.clone(),
+        ..RunControl::default()
+    };
+    run_user_turn_streaming_events_with_media(runtime, provider, prompt, media, &run, |event| {
         if let TurnEvent::Provider(StreamEvent::Text(delta)) = event {
             on_text(delta);
         }
@@ -2162,20 +2204,42 @@ pub async fn run_user_turn_streaming_with_media(
 /// persisted separately and never added to the next provider request.
 /// Live progress of a streaming turn: provider deltas plus tool lifecycle,
 /// so a UI can show what the agent is doing between text blocks.
+///
+/// Each provider round of a turn reports `RoundStarted`, its user messages
+/// (the prompt or steering), any compaction, retries and the reply's
+/// `Provider` deltas, the reply, then `ToolStarted`, `ToolOutput` and
+/// `ToolFinished` for each tool call, and `RoundFinished`. A turn that fails
+/// or is cancelled stops mid-round without further events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
+    /// A provider round started: one reply and the tool calls it asks for.
+    RoundStarted,
+    /// A message was saved: the prompt or steering that opens a round, or
+    /// the round's reply after its deltas. Tool results are `ToolOutput`.
+    MessageAdded(ConversationMessage),
+    /// Everything the provider streams for the round's reply.
     Provider(StreamEvent),
+    /// A request failed before any output; it is retried after the delay.
+    RetryStarted(RetryNotice),
+    /// A retried request ended after `attempt` retries: with its reply
+    /// (reported after the reply), or with the `error` that ends the turn.
+    RetryFinished {
+        attempt: u64,
+        error: Option<String>,
+    },
     ToolStarted {
-        name: String,
+        call: ChatToolCall,
     },
     ToolFinished {
         name: String,
         is_error: bool,
     },
+    /// A tool call's result as saved, and how long the tool ran.
     ToolOutput {
         call: ChatToolCall,
         output: String,
         is_error: bool,
+        duration: Duration,
     },
     TodosUpdated(Vec<TodoItem>),
     CompactionStarted,
@@ -2185,6 +2249,8 @@ pub enum TurnEvent {
     /// original history so the session stays usable; the provider surfaces
     /// a real error only if the request genuinely exceeds its window.
     CompactionFailed(String),
+    /// The round's reply and its tool calls' results are saved.
+    RoundFinished,
 }
 
 /// Follow-up prompts typed while a turn streams. Shared between the key
@@ -2226,20 +2292,21 @@ pub async fn run_user_turn_streaming_events_with_media(
     provider: &dyn Provider,
     prompt: String,
     media: Vec<MediaInput>,
-    steering: &SteeringMailbox,
+    run: &RunControl,
     on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
-    runtime.push_message(ConversationMessage {
+    let message = ConversationMessage {
         thinking: String::new(),
         role: MessageRole::User,
-        content: prompt.clone(),
+        content: prompt,
         media,
         tool_call_id: None,
         tool_name: None,
         tool_calls: Vec::new(),
-    })?;
+    };
+    runtime.push_message(message.clone())?;
 
-    if let Some(command) = parse_tool_command(&prompt)? {
+    if let Some(command) = parse_tool_command(&message.content)? {
         if !model_tool_enabled(runtime, &command.name) {
             return Err(AgentError::DisabledTool(command.name));
         }
@@ -2247,16 +2314,17 @@ pub async fn run_user_turn_streaming_events_with_media(
             ToolRequest::Edit { path, .. } | ToolRequest::Write { path, .. } => Some(path.clone()),
             _ => None,
         };
-        let result = execute_tool(
-            &runtime.session.cwd,
-            command.request,
-            &ToolRuntimeOptions {
-                shell_path: runtime.systems.shell_path.clone(),
-                shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
-                offline: runtime.systems.offline,
-            },
-        )
-        .await?;
+        let result = run
+            .until_cancelled(execute_tool(
+                &runtime.session.cwd,
+                command.request,
+                &ToolRuntimeOptions {
+                    shell_path: runtime.systems.shell_path.clone(),
+                    shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
+                    offline: runtime.systems.offline,
+                },
+            ))
+            .await??;
         if let Some(path) = edited_path {
             runtime.note_edited_files(vec![path])?;
         }
@@ -2278,7 +2346,7 @@ pub async fn run_user_turn_streaming_events_with_media(
         return Ok(result.output);
     }
 
-    run_model_turn_streaming_events(runtime, provider, steering, on_event).await
+    run_model_turn_streaming_events(runtime, provider, run, Some(message), on_event).await
 }
 
 /// Continue saved model context without adding a user prompt or replaying
@@ -2288,19 +2356,22 @@ pub async fn run_user_turn_streaming_events_with_media(
 pub async fn continue_turn_streaming_events(
     runtime: &mut Runtime,
     provider: &dyn Provider,
-    steering: &SteeringMailbox,
+    run: &RunControl,
     on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     if !runtime.session().has_unfinished_turn() {
         return Ok(String::new());
     }
-    run_model_turn_streaming_events(runtime, provider, steering, on_event).await
+    run_model_turn_streaming_events(runtime, provider, run, None, on_event).await
 }
 
+/// Runs provider rounds until a reply calls no tools. `prompt` is the user
+/// message the caller just saved; it is reported as the first round's.
 async fn run_model_turn_streaming_events(
     runtime: &mut Runtime,
     provider: &dyn Provider,
-    steering: &SteeringMailbox,
+    run: &RunControl,
+    mut prompt: Option<ConversationMessage>,
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     let system_prompt = runtime_system_prompt(runtime);
@@ -2309,15 +2380,30 @@ async fn run_model_turn_streaming_events(
     // Auto-compaction that failed on unchanged history will fail again; skip
     // re-attempts (and repeated summarizer calls) until history changes.
     let mut failed_compaction_fingerprint: Option<(usize, Option<usize>)> = None;
+    // Steering that arrived during a final reply has opened the next round.
+    let mut round_open = false;
     for _ in 0..max_tool_rounds {
-        inject_steering_messages(runtime, steering)?;
+        if !std::mem::take(&mut round_open) {
+            on_event(&TurnEvent::RoundStarted);
+        }
+        if let Some(prompt) = prompt.take() {
+            on_event(&TurnEvent::MessageAdded(prompt));
+        }
+        if let Some(message) = steering_message(&run.steering) {
+            add_message(runtime, message, &mut on_event)?;
+        }
         let fingerprint = (
             runtime.session.messages.len(),
             runtime.session.messages.last().map(|m| m.content.len()),
         );
         if runtime.needs_auto_compaction() && failed_compaction_fingerprint != Some(fingerprint) {
             on_event(&TurnEvent::CompactionStarted);
-            match runtime.auto_compact_midturn(provider).await {
+            // Compaction saves its checkpoint only once complete, so a
+            // cancelled one leaves the history untouched.
+            match run
+                .until_cancelled(runtime.auto_compact_midturn(provider))
+                .await?
+            {
                 Ok(Some(record)) => {
                     failed_compaction_fingerprint = None;
                     on_event(&TurnEvent::CompactionFinished(record));
@@ -2334,17 +2420,12 @@ async fn run_model_turn_streaming_events(
             }
         }
         let request = provider_request(runtime, system_prompt.clone());
-        // Interrupts drop this future; no caller cancels the token yet.
-        let events = complete_with_retry_streaming(
+        let (events, retries) = request_reply(
             provider,
             request,
             &runtime.systems.retry,
-            &CancellationToken::default(),
-            |event| {
-                if matches!(event, StreamEvent::Text(_) | StreamEvent::Thinking(_)) {
-                    on_event(&TurnEvent::Provider(event.clone()));
-                }
-            },
+            &run.cancellation,
+            &mut on_event,
         )
         .await?;
         let mut text = String::new();
@@ -2379,34 +2460,56 @@ async fn run_model_turn_streaming_events(
             runtime.record_usage(input, output)?;
         }
         final_text.push_str(&text);
-        runtime.push_message(ConversationMessage {
-            thinking,
-            role: MessageRole::Assistant,
-            content: text,
-            media: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: tool_calls.clone(),
-        })?;
+        add_message(
+            runtime,
+            ConversationMessage {
+                thinking,
+                role: MessageRole::Assistant,
+                content: text,
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: tool_calls.clone(),
+            },
+            &mut on_event,
+        )?;
+        if retries > 0 {
+            on_event(&TurnEvent::RetryFinished {
+                attempt: retries,
+                error: None,
+            });
+        }
 
         if tool_calls.is_empty() {
+            on_event(&TurnEvent::RoundFinished);
             // A steering message that arrived while the final response was
             // streaming keeps the turn going instead of being dropped.
-            if inject_steering_messages(runtime, steering)? == 0 {
+            let Some(message) = steering_message(&run.steering) else {
                 return Ok(final_text);
-            }
+            };
+            on_event(&TurnEvent::RoundStarted);
+            add_message(runtime, message, &mut on_event)?;
+            round_open = true;
             continue;
         }
 
         for tool_call in tool_calls {
+            if run.cancellation.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
             on_event(&TurnEvent::ToolStarted {
-                name: tool_call.name.clone(),
+                call: tool_call.clone(),
             });
+            let started = Instant::now();
+            // A reply cut off at the output limit runs none of its calls:
+            // each is saved and reported with the error asking to re-issue it.
             let result = if truncated {
                 fail_truncated_tool_call(runtime, &tool_call)
             } else {
-                execute_model_tool_call(runtime, &tool_call).await
+                run.until_cancelled(execute_model_tool_call(runtime, &tool_call))
+                    .await?
             };
+            let duration = started.elapsed();
             let event = runtime
                 .session
                 .tool_history
@@ -2418,6 +2521,7 @@ async fn run_model_turn_streaming_events(
                     call: tool_call.clone(),
                     output: event.result.clone(),
                     is_error,
+                    duration,
                 });
             }
             if tool_call.name == "todo" {
@@ -2429,6 +2533,7 @@ async fn run_model_turn_streaming_events(
             });
             result?;
         }
+        on_event(&TurnEvent::RoundFinished);
     }
 
     Err(AgentError::RoundLimitReached {
@@ -2436,39 +2541,70 @@ async fn run_model_turn_streaming_events(
     })
 }
 
-fn inject_steering_messages(
-    runtime: &mut Runtime,
-    steering: &SteeringMailbox,
-) -> Result<usize, AgentError> {
+/// Pending steering as one user message: a burst reads as one instruction
+/// (joined with [`STEERING_JOIN`]), not several interruptions.
+fn steering_message(steering: &SteeringMailbox) -> Option<ConversationMessage> {
     let messages = steering.take_batch();
-    let count = messages.len();
-    if count > 1 {
-        // A burst of queued steering reads as one instruction, not N
-        // separate interruptions: combine into a single user message.
-        let combined = messages.join(STEERING_JOIN);
-        runtime.push_message(ConversationMessage {
-            thinking: String::new(),
-            role: MessageRole::User,
-            content: combined,
-            media: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: Vec::new(),
-        })?;
-        return Ok(count);
-    }
-    for message in messages {
-        runtime.push_message(ConversationMessage {
-            thinking: String::new(),
-            role: MessageRole::User,
-            content: message,
-            media: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: Vec::new(),
-        })?;
-    }
-    Ok(count)
+    (!messages.is_empty()).then(|| ConversationMessage {
+        thinking: String::new(),
+        role: MessageRole::User,
+        content: messages.join(STEERING_JOIN),
+        media: Vec::new(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+    })
+}
+
+/// Saves `message` to the session and reports it.
+fn add_message(
+    runtime: &mut Runtime,
+    message: ConversationMessage,
+    on_event: &mut impl FnMut(&TurnEvent),
+) -> Result<(), AgentError> {
+    runtime.push_message(message.clone())?;
+    on_event(&TurnEvent::MessageAdded(message));
+    Ok(())
+}
+
+/// Requests one reply, reporting its stream events and any retries as they
+/// happen. Returns the events and how many retries the reply took; when the
+/// request still fails after retries, [`TurnEvent::RetryFinished`] reports
+/// the error first.
+async fn request_reply(
+    provider: &dyn Provider,
+    request: ProviderRequest,
+    retry: &RuntimeRetrySettings,
+    cancellation: &CancellationToken,
+    on_event: &mut (impl FnMut(&TurnEvent) + Send),
+) -> Result<(Vec<StreamEvent>, u64), AgentError> {
+    let mut retries = 0;
+    let reply = {
+        // Both callbacks report through `on_event`; they never run at once.
+        let report = Mutex::new(&mut *on_event);
+        pi_agent::complete_with_retry_observed(
+            provider,
+            request,
+            &retry_policy(retry),
+            cancellation,
+            |event| (*report.lock().expect("turn events"))(&TurnEvent::Provider(event.clone())),
+            |notice| {
+                retries = notice.attempt;
+                (*report.lock().expect("turn events"))(&TurnEvent::RetryStarted(notice));
+            },
+        )
+        .await
+    };
+    reply.map(|events| (events, retries)).map_err(|error| {
+        let error = AgentError::from(error);
+        if retries > 0 {
+            on_event(&TurnEvent::RetryFinished {
+                attempt: retries,
+                error: Some(error.to_string()),
+            });
+        }
+        error
+    })
 }
 
 fn runtime_system_prompt(runtime: &Runtime) -> Option<String> {
@@ -2586,19 +2722,26 @@ async fn complete_with_retry_streaming(
     cancellation: &CancellationToken,
     mut on_event: impl FnMut(&StreamEvent) + Send,
 ) -> Result<Vec<StreamEvent>, ProviderError> {
-    let retry = RetryPolicy {
-        max_retries: if retry.enabled { retry.max_retries } else { 0 },
-        base_delay_ms: retry.base_delay_ms,
-        max_delay_ms: retry.max_agent_delay_ms,
-    };
-    pi_agent::complete_with_retry(provider, request, &retry, cancellation, |event| {
-        on_event(event)
-    })
+    pi_agent::complete_with_retry(
+        provider,
+        request,
+        &retry_policy(retry),
+        cancellation,
+        |event| on_event(event),
+    )
     .await
     .map_err(|error| match error {
         pi_agent::AgentError::Provider(error) => error,
         other => ProviderError::Config(other.to_string()),
     })
+}
+
+fn retry_policy(retry: &RuntimeRetrySettings) -> RetryPolicy {
+    RetryPolicy {
+        max_retries: if retry.enabled { retry.max_retries } else { 0 },
+        base_delay_ms: retry.base_delay_ms,
+        max_delay_ms: retry.max_agent_delay_ms,
+    }
 }
 
 fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
@@ -4296,7 +4439,7 @@ mod tests {
             &WebProvider { url },
             "verify source".into(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
@@ -4342,13 +4485,13 @@ mod tests {
             ReloadableSystems::default(),
         );
         runtime.systems.shell_path = Some("/bin/sh".into());
-        let steering = SteeringMailbox::default();
+        let run = RunControl::default();
         let mut turn = Box::pin(run_user_turn_streaming_events_with_media(
             &mut runtime,
             &provider,
             "run it".into(),
             Vec::new(),
-            &steering,
+            &run,
             |_| {},
         ));
         let published_pid = async {
@@ -4411,7 +4554,7 @@ mod tests {
             &EchoProvider,
             "huge ".repeat(120_000),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
@@ -5187,7 +5330,7 @@ mod tests {
             &provider,
             "read everything".to_string(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
@@ -5240,37 +5383,629 @@ mod tests {
             &provider,
             "read the file".to_string(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
         .expect("run tool loop");
 
         assert_eq!(answer, "done");
+        // Upstream's order: tool_execution_end, then the tool-result
+        // message, then turn_end.
         assert_eq!(
-            events,
-            vec![
-                TurnEvent::ToolStarted {
-                    name: "read".to_string()
+            trace(&events),
+            [
+                "round started",
+                r#"user "read the file""#,
+                "call call_read_1 read",
+                "stop toolUse",
+                r#"assistant "" -> call_read_1"#,
+                r#"tool call_read_1 read {"path":"a.txt"}"#,
+                r#"output call_read_1 "file contents""#,
+                "finished read",
+                "round finished",
+                "round started",
+                r#"text "done""#,
+                "stop stop",
+                r#"assistant "done""#,
+                "round finished",
+            ]
+        );
+        assert!(events.contains(&TurnEvent::MessageAdded(
+            runtime.session.messages[1].clone()
+        )));
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn a_text_reply_is_one_round_reporting_its_saved_messages() {
+        let mut runtime = Runtime::new(
+            SessionState::new("text-round", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let provider = Script::new([reply(vec![
+            StreamEvent::Thinking("plan".into()),
+            StreamEvent::Text("hel".into()),
+            StreamEvent::Text("lo".into()),
+            StreamEvent::Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            },
+            stop("stop"),
+        ])]);
+        let mut events = Vec::new();
+        let answer = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "hi".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "hello");
+        // Upstream's turn_start comes before the prompt's message events and
+        // the reply's message_end after its last delta.
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "hi""#,
+                r#"thinking "plan""#,
+                r#"text "hel""#,
+                r#"text "lo""#,
+                "usage 3/2",
+                "stop stop",
+                r#"assistant "hello""#,
+                "round finished",
+            ]
+        );
+        let added = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::MessageAdded(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(added, runtime.session.messages);
+        assert_eq!(added[1].thinking, "plan");
+    }
+
+    #[tokio::test]
+    async fn steering_is_reported_after_the_start_of_the_round_it_joins() {
+        let cwd = std::env::temp_dir().join(format!("pi-steering-events-{}", new_session_id()));
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(cwd.join("a.txt"), "file contents").unwrap();
+        let mut runtime = Runtime::new(
+            SessionState::new("steering-events", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let run = RunControl::default();
+        let (during_tools, during_reply) = (run.steering.clone(), run.steering.clone());
+        let provider = Script::new([
+            Box::new(move || {
+                during_tools.send("also b.txt".into());
+                Ok(vec![tool_call("read-a", "read", json!({"path": "a.txt"}))])
+            }) as Reply,
+            // Steering that arrives during a final reply keeps the turn going.
+            Box::new(move || {
+                during_reply.send("one more".into());
+                Ok(vec![StreamEvent::Text("read".into())])
+            }),
+            reply(vec![StreamEvent::Text("done".into())]),
+        ]);
+        let mut events = Vec::new();
+        let answer = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "read a.txt".into(),
+            Vec::new(),
+            &run,
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "readdone");
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "read a.txt""#,
+                "call read-a read",
+                r#"assistant "" -> read-a"#,
+                r#"tool read-a read {"path":"a.txt"}"#,
+                r#"output read-a "file contents""#,
+                "finished read",
+                "round finished",
+                "round started",
+                r#"user "also b.txt""#,
+                r#"text "read""#,
+                r#"assistant "read""#,
+                "round finished",
+                "round started",
+                r#"user "one more""#,
+                r#"text "done""#,
+                r#"assistant "done""#,
+                "round finished",
+            ]
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn the_round_limit_ends_the_turn_after_its_last_round() {
+        let cwd = std::env::temp_dir().join(format!("pi-round-limit-events-{}", new_session_id()));
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(cwd.join("a.txt"), "file contents").unwrap();
+        let mut runtime = Runtime::new(
+            SessionState::new("round-limit-events", cwd.clone()),
+            ReloadableSystems {
+                max_tool_rounds: 2,
+                ..Default::default()
+            },
+        );
+        let provider = Script::new((0..2).map(|round| {
+            reply(vec![tool_call(
+                &format!("read-{round}"),
+                "read",
+                json!({"path": "a.txt"}),
+            )])
+        }));
+        let mut events = Vec::new();
+        let error = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "read forever".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::RoundLimitReached { max_rounds: 2 }
+        ));
+        let round = |id: &str| {
+            [
+                "round started".to_string(),
+                format!("call {id} read"),
+                format!(r#"assistant "" -> {id}"#),
+                format!(r#"tool {id} read {{"path":"a.txt"}}"#),
+                format!(r#"output {id} "file contents""#),
+                "finished read".to_string(),
+                "round finished".to_string(),
+            ]
+        };
+        let mut expected = round("read-0").to_vec();
+        expected.insert(1, r#"user "read forever""#.into());
+        expected.extend(round("read-1"));
+        assert_eq!(trace(&events), expected);
+
+        // Steering that arrives during the last allowed reply is still saved;
+        // it opens a round that the limit then ends.
+        let mut runtime = Runtime::new(
+            SessionState::new("round-limit-steering", cwd.clone()),
+            ReloadableSystems {
+                max_tool_rounds: 1,
+                ..Default::default()
+            },
+        );
+        let run = RunControl::default();
+        let steering = run.steering.clone();
+        let provider = Script::new([Box::new(move || {
+            steering.send("keep going".into());
+            Ok(vec![StreamEvent::Text("done".into())])
+        }) as Reply]);
+        let mut events = Vec::new();
+        let error = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "hi".into(),
+            Vec::new(),
+            &run,
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::RoundLimitReached { max_rounds: 1 }
+        ));
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "hi""#,
+                r#"text "done""#,
+                r#"assistant "done""#,
+                "round finished",
+                "round started",
+                r#"user "keep going""#,
+            ]
+        );
+        assert_eq!(
+            runtime.session.messages.last().unwrap().content,
+            "keep going"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn mid_turn_compaction_is_reported_inside_its_round() {
+        struct Summarizing;
+        #[async_trait::async_trait]
+        impl Provider for Summarizing {
+            async fn complete(
+                &self,
+                request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                // Only summary requests come without tools.
+                let text = if request.tools.is_empty() {
+                    "Goals: finish the task."
+                } else {
+                    "done"
+                };
+                Ok(vec![StreamEvent::Text(text.into())])
+            }
+        }
+        let mut state = SessionState::new("compaction-events", PathBuf::from("."));
+        state.active_model = Some(ModelRef {
+            provider: "faux".into(),
+            id: "echo".into(),
+        });
+        state.messages = vec![
+            test_message(MessageRole::User, &"old ".repeat(6_000)),
+            test_message(MessageRole::Assistant, "old answer"),
+        ];
+        let mut runtime = Runtime::new(
+            state,
+            ReloadableSystems {
+                compaction: RuntimeCompactionSettings {
+                    keep_recent_tokens: 0,
+                    reserve_tokens: 0,
+                    ..Default::default()
                 },
-                TurnEvent::ToolOutput {
-                    call: ChatToolCall {
-                        id: "call_read_1".to_string(),
-                        name: "read".to_string(),
-                        arguments: "{\"path\":\"a.txt\"}".to_string()
-                    },
-                    output: "file contents".to_string(),
-                    is_error: false,
+                model_context_windows: BTreeMap::from([("faux/echo".to_string(), 8_000)]),
+                ..Default::default()
+            },
+        );
+        let mut events = Vec::new();
+        run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &Summarizing,
+            "continue".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "continue""#,
+                "compaction started",
+                "compacted 2 messages",
+                r#"text "done""#,
+                r#"assistant "done""#,
+                "round finished",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_are_reported_before_each_backoff_and_when_the_request_ends() {
+        let mut runtime = Runtime::new(
+            SessionState::new("retry-events", PathBuf::from(".")),
+            ReloadableSystems {
+                retry: RuntimeRetrySettings {
+                    enabled: true,
+                    max_retries: 3,
+                    base_delay_ms: 1,
+                    max_agent_delay_ms: 2,
                 },
-                TurnEvent::ToolFinished {
-                    name: "read".to_string(),
-                    is_error: false,
-                },
-                TurnEvent::Provider(StreamEvent::Text("done".to_string())),
+                ..Default::default()
+            },
+        );
+        let provider = Script::new([
+            overloaded(),
+            overloaded(),
+            reply(vec![StreamEvent::Text("ok".into())]),
+        ]);
+        let mut events = Vec::new();
+        run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "hi".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        // Upstream reports auto_retry_end after the reply's message_end.
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "hi""#,
+                "retry 1 of 3 in 1ms: provider returned an invalid response: overloaded",
+                "retry 2 of 3 in 2ms: provider returned an invalid response: overloaded",
+                r#"text "ok""#,
+                r#"assistant "ok""#,
+                "retried 2: succeeded",
+                "round finished",
             ]
         );
 
-        let _ = fs::remove_dir_all(cwd);
+        runtime.systems.retry.max_retries = 1;
+        let provider = Script::new([overloaded(), overloaded()]);
+        let mut events = Vec::new();
+        let error = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "again".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentError::Provider(_)));
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "again""#,
+                "retry 1 of 1 in 1ms: provider returned an invalid response: overloaded",
+                "retried 1: provider returned an invalid response: overloaded",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_reports_how_long_the_tool_ran() {
+        let mut runtime = Runtime::new(
+            SessionState::new("tool-duration", PathBuf::from(".")),
+            ReloadableSystems {
+                shell_path: Some("/bin/sh".into()),
+                ..Default::default()
+            },
+        );
+        let provider = Script::new([
+            reply(vec![tool_call(
+                "bash-1",
+                "bash",
+                json!({"command": "sleep 0.2"}),
+            )]),
+            reply(vec![StreamEvent::Text("done".into())]),
+        ]);
+        let mut events = Vec::new();
+        run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "wait".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        let duration = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::ToolOutput { duration, .. } => Some(*duration),
+                _ => None,
+            })
+            .unwrap();
+        assert!(duration >= Duration::from_millis(200), "{duration:?}");
+    }
+
+    /// Cancels `run` after `delay`; the handle yields when it did.
+    fn cancel_after(run: &RunControl, delay: Duration) -> tokio::task::JoinHandle<Instant> {
+        let cancellation = run.cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            cancellation.cancel();
+            Instant::now()
+        })
+    }
+
+    fn assert_ended_promptly(cancelled_at: Instant) {
+        let latency = cancelled_at.elapsed();
+        assert!(
+            latency < Duration::from_secs(1),
+            "the turn ended {latency:?} after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_model_call_ends_the_turn_with_its_prompt_saved() {
+        struct Pending;
+        #[async_trait::async_trait]
+        impl Provider for Pending {
+            async fn complete(
+                &self,
+                _request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                std::future::pending().await
+            }
+        }
+        let base = std::env::temp_dir().join(format!("pi-cancel-request-{}", new_session_id()));
+        let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store.clone());
+        let run = RunControl::default();
+        let cancelled = cancel_after(&run, Duration::from_millis(20));
+        let mut events = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_user_turn_streaming_events_with_media(
+                &mut runtime,
+                &Pending,
+                "wait".into(),
+                Vec::new(),
+                &run,
+                |event| events.push(event.clone()),
+            ),
+        )
+        .await
+        .expect("cancellation ends the request");
+        assert_ended_promptly(cancelled.await.unwrap());
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(trace(&events), ["round started", r#"user "wait""#]);
+        // The saved prompt is a turn the next run continues.
+        assert_eq!(store.load().unwrap(), runtime.session);
+        assert!(runtime.session.has_unfinished_turn());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_tool_call_kills_its_process_group_and_keeps_the_call_unanswered() {
+        let base = std::env::temp_dir().join(format!("pi-cancel-tool-{}", new_session_id()));
+        fs::create_dir_all(&base).unwrap();
+        let pid_file = base.join("child.pid");
+        let (store, state) = SessionStore::create(&base.join("sessions"), base.clone()).unwrap();
+        let mut runtime = Runtime::with_store(
+            state,
+            ReloadableSystems {
+                shell_path: Some("/bin/sh".into()),
+                ..Default::default()
+            },
+            store.clone(),
+        );
+        let command = format!(
+            "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; wait",
+            pid_file.display()
+        );
+        let provider = Script::new([reply(vec![tool_call(
+            "bash-1",
+            "bash",
+            json!({ "command": command }),
+        )])]);
+        let run = RunControl::default();
+        // Cancel once the tool's background child runs.
+        let cancelled = {
+            let (run, pid_file) = (run.clone(), pid_file.clone());
+            tokio::spawn(async move {
+                let pid = loop {
+                    if let Ok(pid) = fs::read_to_string(&pid_file) {
+                        break pid.trim().parse::<i32>().unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                run.cancellation.cancel();
+                (pid, Instant::now())
+            })
+        };
+        let mut events = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_user_turn_streaming_events_with_media(
+                &mut runtime,
+                &provider,
+                "run it".into(),
+                Vec::new(),
+                &run,
+                |event| events.push(event.clone()),
+            ),
+        )
+        .await
+        .expect("cancellation ends the tool call");
+        let (pid, cancelled_at) = cancelled.await.unwrap();
+        assert_ended_promptly(cancelled_at);
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        let lines = trace(&events);
+        assert_eq!(
+            lines[..4],
+            [
+                "round started",
+                r#"user "run it""#,
+                "call bash-1 bash",
+                r#"assistant "" -> bash-1"#,
+            ]
+        );
+        assert!(lines[4].starts_with("tool bash-1 bash"), "{lines:?}");
+        assert_eq!(lines.len(), 5);
+        // A killed process stays a zombie (state Z) until reaped.
+        let running = || {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, fields)| !fields.trim_start().starts_with('Z'))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cfg!(target_os = "linux") && running() {
+            assert!(
+                Instant::now() < deadline,
+                "background child {pid} outlived the cancelled turn"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The journal keeps the reply and its unanswered call, which the
+        // next request answers with the interrupted-call placeholder.
+        assert_eq!(store.load().unwrap(), runtime.session);
+        assert!(runtime.session.tool_history.is_empty());
+        let request = provider_messages(&runtime.session.messages);
+        assert_eq!(
+            request.last().unwrap().tool_call_id.as_deref(),
+            Some("bash-1")
+        );
+        assert!(request.last().unwrap().content.contains("did not complete"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_retry_backoff_ends_the_turn() {
+        let base = std::env::temp_dir().join(format!("pi-cancel-backoff-{}", new_session_id()));
+        let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+        let mut runtime = Runtime::with_store(
+            state,
+            ReloadableSystems {
+                retry: RuntimeRetrySettings {
+                    enabled: true,
+                    max_retries: 3,
+                    base_delay_ms: 60_000,
+                    max_agent_delay_ms: 60_000,
+                },
+                ..Default::default()
+            },
+            store.clone(),
+        );
+        let provider = Script::new([overloaded()]);
+        let run = RunControl::default();
+        let cancelled = cancel_after(&run, Duration::from_millis(50));
+        let mut events = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_user_turn_streaming_events_with_media(
+                &mut runtime,
+                &provider,
+                "hi".into(),
+                Vec::new(),
+                &run,
+                |event| events.push(event.clone()),
+            ),
+        )
+        .await
+        .expect("cancellation ends the backoff");
+        assert_ended_promptly(cancelled.await.unwrap());
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "hi""#,
+                "retry 1 of 3 in 60000ms: provider returned an invalid response: overloaded",
+                "retried 1: turn cancelled",
+            ]
+        );
+        assert_eq!(store.load().unwrap(), runtime.session);
+        assert_eq!(runtime.session.messages.len(), 1);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
@@ -5298,13 +6033,16 @@ mod tests {
             &ThinkingProvider,
             "hello".into(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
         .unwrap();
         assert_eq!(
-            events,
+            events
+                .into_iter()
+                .filter(|event| matches!(event, TurnEvent::Provider(_)))
+                .collect::<Vec<_>>(),
             vec![
                 TurnEvent::Provider(StreamEvent::Thinking("summary".into())),
                 TurnEvent::Provider(StreamEvent::Text("answer".into()))
@@ -5451,7 +6189,7 @@ mod tests {
         let answer = continue_turn_streaming_events(
             &mut reopened,
             &provider,
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
@@ -5504,7 +6242,7 @@ mod tests {
             continue_turn_streaming_events(
                 &mut reopened,
                 &provider,
-                &SteeringMailbox::default(),
+                &RunControl::default(),
                 |_| {}
             )
             .await
@@ -5542,7 +6280,7 @@ mod tests {
         assert!(continue_turn_streaming_events(
             &mut runtime,
             &provider,
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |_| {}
         )
         .await
@@ -5646,7 +6384,7 @@ mod tests {
         let answer = continue_turn_streaming_events(
             &mut reopened,
             provider.as_ref(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |_| {},
         )
         .await
@@ -6652,6 +7390,110 @@ mod tests {
         let second = new_session_id();
 
         assert_ne!(first, second);
+    }
+
+    /// One line per event, for exact-order assertions. Tool durations vary,
+    /// so they are left out.
+    fn trace(events: &[TurnEvent]) -> Vec<String> {
+        let flag = |is_error: bool| if is_error { " error" } else { "" };
+        events
+            .iter()
+            .map(|event| match event {
+                TurnEvent::RoundStarted => "round started".to_string(),
+                TurnEvent::MessageAdded(message) => {
+                    let role = format!("{:?}", message.role).to_lowercase();
+                    let calls = message
+                        .tool_calls
+                        .iter()
+                        .map(|call| format!(" -> {}", call.id))
+                        .collect::<String>();
+                    format!("{role} {:?}{calls}", message.content)
+                }
+                TurnEvent::Provider(StreamEvent::Text(text)) => format!("text {text:?}"),
+                TurnEvent::Provider(StreamEvent::Thinking(text)) => format!("thinking {text:?}"),
+                TurnEvent::Provider(StreamEvent::ToolCall { id, name, .. }) => {
+                    format!("call {id} {name}")
+                }
+                TurnEvent::Provider(StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                }) => format!("usage {input_tokens}/{output_tokens}"),
+                TurnEvent::Provider(StreamEvent::Stop { reason }) => format!("stop {reason}"),
+                TurnEvent::RetryStarted(notice) => format!(
+                    "retry {} of {} in {}ms: {}",
+                    notice.attempt, notice.max_attempts, notice.delay_ms, notice.error_message
+                ),
+                TurnEvent::RetryFinished { attempt, error } => format!(
+                    "retried {attempt}: {}",
+                    error.as_deref().unwrap_or("succeeded")
+                ),
+                TurnEvent::ToolStarted { call } => {
+                    format!("tool {} {} {}", call.id, call.name, call.arguments)
+                }
+                TurnEvent::ToolOutput {
+                    call,
+                    output,
+                    is_error,
+                    ..
+                } => format!("output {} {output:?}{}", call.id, flag(*is_error)),
+                TurnEvent::ToolFinished { name, is_error } => {
+                    format!("finished {name}{}", flag(*is_error))
+                }
+                TurnEvent::TodosUpdated(todos) => format!("todos {}", todos.len()),
+                TurnEvent::CompactionStarted => "compaction started".to_string(),
+                TurnEvent::CompactionFinished(record) => {
+                    format!("compacted {} messages", record.omitted_messages)
+                }
+                TurnEvent::CompactionFailed(_) => "compaction failed".to_string(),
+                TurnEvent::RoundFinished => "round finished".to_string(),
+            })
+            .collect()
+    }
+
+    type Reply = Box<dyn FnOnce() -> Result<Vec<StreamEvent>, ProviderError> + Send>;
+
+    fn reply(events: Vec<StreamEvent>) -> Reply {
+        Box::new(move || Ok(events))
+    }
+
+    /// A failure before any output, so it is retried.
+    fn overloaded() -> Reply {
+        Box::new(|| Err(ProviderError::InvalidResponse("overloaded".into())))
+    }
+
+    /// Answers each request with the next scripted reply, which may also act
+    /// (steer, fail) when its request arrives.
+    struct Script(Mutex<VecDeque<Reply>>);
+
+    impl Script {
+        fn new(replies: impl IntoIterator<Item = Reply>) -> Self {
+            Self(Mutex::new(replies.into_iter().collect()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Script {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            let reply = self.0.lock().unwrap().pop_front();
+            reply.expect("a request the script did not expect")()
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: Value) -> StreamEvent {
+        StreamEvent::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    fn stop(reason: &str) -> StreamEvent {
+        StreamEvent::Stop {
+            reason: reason.into(),
+        }
     }
 
     struct CheckpointProvider;
