@@ -207,3 +207,29 @@ positional. The `steeringMode`/`followUpMode` settings are ignored (a legacy
 Reason: serial one-per-turn delivery made a queued burst look like five
 separate conversations with the model, and made steering feel broken when
 later messages landed turns after the user sent them.
+
+### Process-Group Kill for Timed-Out Bash
+
+A bash tool call that hits its timeout now kills the shell's whole process
+group instead of only the shell pid. Previously the children of a timed-out
+command (for example a long preflight script) were orphaned and kept running
+indefinitely, consuming resources and confusing later turns that found them
+still alive.
+
+Reason: `kill_on_drop` on the tokio child kills one pid; shells spawn trees.
+The shell runs under `process_group(0)` and the timeout path issues `killpg`,
+so the tree dies with the call.
+
+### Interactive Session Picker
+
+`/resume` without arguments opens an interactive picker in the
+Kimi/Claude/Codex style: one line per session with the first user prompt as a
+topic preview (truncated), relative age (`5s`, `2h`, `3d`), message count,
+active model, and an `unfinished` marker for sessions that ended mid-turn.
+Typing filters, Enter resumes, Esc cancels. Bare `pi` startup deliberately
+does not auto-open the picker: scripting and e2e harnesses send their first
+prompt immediately, and trapping that text in a selector would break them;
+the industry CLIs also gate the picker behind an explicit resume action.
+
+Reason: the previous flat `/resume` list showed only ids and names, which
+made picking the right session impossible without opening journals by hand.

@@ -572,6 +572,10 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/session`
 - `/changelog`
 - `/new`
+- `/resume` (no argument opens the interactive session picker: topic
+  preview, relative age, message count, model, and an unfinished-turn
+  marker for sessions that died mid-turn; type to filter, enter to resume,
+  esc to cancel)
 - `/resume [id|name|path]`
 - `/fork [id|name|path]`
 - `/clone [id|name|path]`
@@ -728,6 +732,15 @@ The agent per-run round cap is configurable alongside compaction and retry:
     "maxToolRounds": 120
   }
 }
+```
+
+Provider requests retry automatically on transient transport errors
+(default 3 retries, exponential backoff from 2s; `retry.enabled`,
+`retry.maxRetries`, `retry.baseDelayMs` in settings). When retries are
+exhausted the error names the likely causes — including a local firewall
+that denies connections from a freshly built binary until its prompt is
+approved — because on default-deny hosts an unanswered prompt is
+indistinguishable from an outage.
 ```
 
 `agent.maxToolRounds` bounds provider rounds per user run, including steering
@@ -896,7 +909,9 @@ make test-smoke
 It also starts a quiet background `cargo build -p pi-cli` watcher; successful
 rebuilds restart the running TUI process, and the continued session restores
 conversation messages from disk. Restarts wait until the active turn and its
-follow-ups finish. Interactive startup and `/resume` automatically continue
+follow-ups finish — or until you are idle between prompts with nothing
+streaming — so a rebuild never interrupts work or lands under your fingers
+while typing. Interactive startup and `/resume` automatically continue
 unfinished model turns from saved context, then drain queued follow-ups. No
 synthetic user prompt is added and saved tool calls are not replayed; missing
 results are reported to the provider as interrupted calls. Completed direct
