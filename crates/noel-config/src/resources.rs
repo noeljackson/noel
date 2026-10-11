@@ -13,8 +13,9 @@ use crate::prompt_templates::{load_prompt_templates, PromptTemplate};
 use crate::skills::{load_skills, Skill};
 use crate::{
     apply_resource_patterns, canonical_path, find_git_root, package_resource_entries,
-    read_package_manifest, resolve_resource_path, resource_ignore_pattern_matches, ConfigPaths,
-    PackageResourceType, PackageSource, Settings, CONFIG_DIR_NAME, RESOURCE_IGNORE_FILES,
+    project_config_dir, read_package_manifest, resolve_resource_path,
+    resource_ignore_pattern_matches, ConfigPaths, PackageResourceType, PackageSource, Settings,
+    RESOURCE_IGNORE_FILES,
 };
 
 /// What the command line and the environment add to resource discovery.
@@ -229,7 +230,7 @@ fn discover(
 ) -> Vec<ResourcePath> {
     let paths = sources.paths;
     let home = sources.options.home_dir.as_deref();
-    let project_base = paths.cwd.join(CONFIG_DIR_NAME);
+    let project_base = project_config_dir(&paths.cwd);
     let dir_name = match kind {
         Kind::Skills => "skills",
         Kind::Prompts => "prompts",
@@ -637,7 +638,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::read_optional_settings;
+    use crate::{read_optional_settings, value_with_noel_names};
 
     fn source_json(source: &SourceInfo) -> Value {
         let mut value = json!({
@@ -691,7 +692,10 @@ mod tests {
 
     /// For every discovery case of `skills.json`, the skills and prompt
     /// templates upstream's resource loader loads from the same tree and
-    /// flags: in its order, with its sources and its diagnostics.
+    /// flags: in its order, with its sources and its diagnostics. Each case
+    /// runs twice: on the tree as upstream wrote it, which is a project
+    /// written for pi (`.pi/`), and on the same tree under noel's names
+    /// (`.noel/`).
     #[test]
     fn discovery_matches_ts_resource_loader() {
         let fixture: Value = serde_json::from_str(include_str!(
@@ -719,11 +723,18 @@ mod tests {
                 "ignore-files",
             ]
         );
-        for case in cases {
-            let name = case["name"].as_str().unwrap();
+        let layouts = cases.iter().flat_map(|case| {
+            [
+                ("as upstream wrote it", case.clone()),
+                ("with noel's names", value_with_noel_names(case)),
+            ]
+        });
+        for (layout, case) in layouts {
+            let name = format!("{} ({layout})", case["name"].as_str().unwrap());
             // Outside any repository: one case reads every ancestor's .agents.
             let root = std::env::temp_dir().join(format!(
-                "noel-discovery-{name}-{}-{}",
+                "noel-discovery-{}-{}-{}",
+                case["name"].as_str().unwrap(),
                 std::process::id(),
                 std::time::SystemTime::UNIX_EPOCH
                     .elapsed()
@@ -761,7 +772,7 @@ mod tests {
             let agent_dir = root.join("agent");
             let paths = ConfigPaths {
                 settings_path: agent_dir.join("settings.json"),
-                project_settings_path: cwd.join(".noel/settings.json"),
+                project_settings_path: project_config_dir(&cwd).join("settings.json"),
                 session_dir: agent_dir.join("sessions"),
                 auth_path: agent_dir.join("auth.json"),
                 models_path: agent_dir.join("models.json"),

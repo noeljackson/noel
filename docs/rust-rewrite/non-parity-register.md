@@ -455,6 +455,13 @@ the text with `system-prompt.json` to the byte, and
 `prompt_and_context_files_match_ts_discovery` compares the files chosen. The
 differences:
 
+- noel's names. The first sentence says "operating inside noel, a coding
+  agent harness" where upstream's names pi, and bash's rule reads "You can
+  inspect NOEL_* environment variables for current model and session
+  details." where upstream's names `PI_*`; both sets of variables exist (see
+  Named noel, With Its State in `~/.noel`). The parity test reads upstream's
+  text through `noel_config::with_noel_names`, which changes exactly these
+  names.
 - No `<docs>` section. Upstream's points at the README, docs, and examples
   its package installs, and tells the model to read them for questions about
   pi. Rust installs one binary and no documentation, so a path would dangle;
@@ -1021,3 +1028,72 @@ became of the run it started, and have it finished when that is safe: a
 prompt is applied once, a call that is not replay-safe runs at most once, a
 replay-safe one at least once, and a model request cut off by a stop is sent
 (and billed) again.
+
+### Named noel, With Its State in `~/.noel`
+
+The port is named noel. The binary is `noel`, its state directory is
+`~/.noel` (the layout of upstream's `~/.pi/agent`), `NOEL_DIR` replaces
+`PI_CODING_AGENT_DIR`, `NOEL_SESSION_DIR` replaces
+`PI_CODING_AGENT_SESSION_DIR`, the other `PI_*` variables are `NOEL_*`, and the
+project directory is `.noel/`. The first command that loads the configuration
+without `NOEL_DIR` imports `~/.pi/agent` once when `~/.noel` does not exist
+yet, and never modifies `~/.pi`; `--version`, `--help`, and a usage error
+import nothing. Identities pinned by the parity fixtures stay pi: the Codex
+`originator` and `User-Agent` headers and the `pi (<platform> <release>;
+<arch>)` user-agent of Mistral requests. `scripts/rename-to-noel.sh` lists
+every name that stays pi and why.
+
+What the model is told changes with the name, and nothing else of upstream's
+text does:
+
+- The system prompt's first sentence names noel, and its bash rule names the
+  `NOEL_*` variables (see Default System Prompt).
+- `AI_AGENT` is `noel`.
+- bash saves long output to `noel-bash-<random>.log` in the temp directory,
+  where upstream writes `pi-bash-<random>.log`; the result names that file.
+
+The fixtures under `tests/fixtures/ts-parity` are upstream's captured output
+and keep upstream's names. A parity test that needs noel's reads the fixture
+through one substitution, `noel_config::with_noel_names`, whose whole list is
+`noel_config::UPSTREAM_NAMES`:
+
+| In the fixture | Read as | Where |
+|---|---|---|
+| `<product>` | `noel` | the system prompt's first sentence (the fixture's own placeholder for upstream's "pi") |
+| `PI_*` | `NOEL_*` | the system prompt's bash rule |
+| `.pi` as a directory in a path | `.noel` | a project's directory in the trees and paths of `system-prompt.json` and `skills.json` |
+
+`system_prompt_matches_ts_builder` reads `system-prompt.json` this way. The
+tests that load a project tree (`discovery_matches_ts_resource_loader`,
+`prompt_and_context_files_match_ts_discovery`, and
+`get_commands_matches_upstream`) run every case twice: on the tree as
+upstream wrote it, which noel reads as a project written for pi, and on the
+same tree under noel's names. Both must give upstream's result, so the order
+skills and prompt templates load in is upstream's in either directory.
+
+Reason: noel is its own product, not a drop-in build of upstream pi. With
+pi's names, both programs would install as `pi` and share one state directory,
+where each rotates OAuth refresh tokens the other holds and noel writes
+records (named accounts, todos, edited files) that upstream does not read.
+
+### Reads pi's Project Files and Sets pi's Variables
+
+noel uses a project's `.pi/` when the project has no `.noel/`: for its
+settings, `SYSTEM.md`, `APPEND_SYSTEM.md`, extensions, skills, prompt
+templates, and themes, and for what it writes there. A project with a
+`.noel/` is read from that directory alone; the two are never combined.
+`.agents/skills` is not pi's name and is read as before. noel also reads a
+`.pi-extension.json` manifest when there is no `.noel-extension.json`, and
+the `pi` key of a package's `package.json` when there is no `noel` key.
+
+What noel sets for the programs it starts, it sets under both names:
+extensions get `NOEL_EXTENSION_*` and `PI_EXTENSION_*`; the model's bash
+commands get `NOEL_SESSION_ID`, `NOEL_SESSION_FILE`, `NOEL_PROVIDER`,
+`NOEL_MODEL`, and `NOEL_REASONING_LEVEL` and the same five as `PI_*`; and the
+process marker is both `NOEL_CODING_AGENT` and `PI_CODING_AGENT`. noel itself
+reads only the `NOEL_*` names.
+
+Reason: repositories written for pi, this one and upstream's included, track
+`.pi/`, and their extensions, packages, skills, and scripts use pi's names.
+noel loads upstream-format skills, so a skill that reads `PI_SESSION_FILE`
+has to find it.

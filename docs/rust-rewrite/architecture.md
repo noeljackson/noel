@@ -273,7 +273,8 @@ File names:
 
 Project-local roots:
 
-- `.noel/`
+- `.noel/`, or `.pi/` in a project that has no `.noel/`
+  (`noel_config::project_config_dir`, the one place that chooses)
 - `.agents/skills`, in each directory from the cwd up to the repository root
 
 User skills are also read from `~/.agents/skills`.
@@ -308,7 +309,8 @@ from the active tools, the custom and appended prompt text, the context
 files, the skills, and the working directory to the text, with no runtime
 behind it.
 `system-prompt.json` holds upstream's output and the module's tests compare
-against it to the byte.
+against it to the byte, reading upstream's names as noel's
+(`noel_config::with_noel_names`).
 
 The prompt is a one-sentence role followed by tagged sections joined by blank
 lines: `tools`, `rules`, `addendum`, `project_context`, `skills`, and `cwd`. A
@@ -514,6 +516,9 @@ Rules:
   types get none.
 - `noel-cli` sets the process markers `AI_AGENT` and `NOEL_CODING_AGENT` before
   starting any thread, so every child process inherits them.
+- Every `NOEL_*` variable of the two entries above is also set under pi's
+  name (`PI_SESSION_ID`, ..., `PI_CODING_AGENT`), for skills and scripts
+  written for pi.
 - A `bash` call reports its output while it runs: `noel-tools`
   (`execute_tool_streaming`) passes what the command has printed so far,
   within the limits of the result, to a callback, at most every 100 ms;

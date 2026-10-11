@@ -8,8 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use noel_config::{
     auth_for_provider, expires_within, is_expired, listed_accounts_for_provider,
-    load_config_with_project_trust, project_is_trusted, AuthData, ConfigPaths, LoadedConfig,
-    ResolvedAuth,
+    load_config_with_project_trust, project_is_trusted, AuthData, LoadedConfig, ResolvedAuth,
 };
 use serde::Serialize;
 
@@ -148,7 +147,7 @@ async fn execute(command: &AuthCommand, refresher: &Refresher<'_>) -> Result<Out
 
 fn load_auth_config() -> Result<LoadedConfig> {
     let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd.clone(), None)?;
+    let paths = crate::config_paths(cwd.clone(), None)?;
     let trusted = project_is_trusted(&paths.agent_dir, &cwd)?;
     Ok(load_config_with_project_trust(paths, trusted)?)
 }

@@ -32,13 +32,16 @@ pub use noel_ai::catalog::{ModelCost, ThinkingLevelMap, DEFAULT_THINKING_LEVEL, 
 
 pub const APP_NAME: &str = "noel";
 pub const CONFIG_DIR_NAME: &str = ".noel";
+/// pi's directory: projects written for pi track `.pi/`, and pi kept its
+/// state in `~/.pi/agent`.
+pub const PI_CONFIG_DIR_NAME: &str = ".pi";
 pub const ENV_AGENT_DIR: &str = "NOEL_DIR";
 pub const ENV_SESSION_DIR: &str = "NOEL_SESSION_DIR";
 /// Set by the test harness (`make test`, and every `noel` the CLI tests run).
 /// noel then refuses to fall back to `~/.noel`, so a test must name its
 /// agent dir with `NOEL_DIR`, imports no Claude Code or Codex
-/// login from `$HOME`, reads no `~/.agents/skills`, and starts no background
-/// model refresh.
+/// login from `$HOME` and no `~/.pi/agent`, reads no `~/.agents/skills`, and
+/// starts no background model refresh.
 pub const ENV_TEST_ISOLATION: &str = "NOEL_TEST_ISOLATION";
 pub const PROJECT_TRUST_FILE_NAME: &str = "trust.json";
 
@@ -71,6 +74,11 @@ pub enum ConfigError {
         "NOEL_TEST_ISOLATION is set: refusing the default agent dir ~/.noel; set NOEL_DIR to a test directory"
     )]
     DefaultAgentDirInTest,
+    #[error("failed to import {path}: {source}")]
+    Import {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,15 +95,32 @@ pub struct ConfigPaths {
 }
 
 impl ConfigPaths {
+    /// The paths of noel's state and of `cwd`'s project. The agent dir is
+    /// `NOEL_DIR`, else `~/.noel`.
+    ///
+    /// The default directory is the only one pi's state is imported into:
+    /// the first time it is asked for, when it does not exist and pi's
+    /// `~/.pi/agent` does, it is created from pi's (see [`PiImport`]), and
+    /// the import is returned for the caller to report. So no command can
+    /// create `~/.noel` without the import. Nothing else here writes, and a
+    /// command asks for its paths only once it has parsed its arguments:
+    /// `--version`, `--help`, and a usage error leave the disk as it was.
     pub fn discover(
         cwd: impl Into<PathBuf>,
         session_dir_override: Option<PathBuf>,
-    ) -> Result<Self, ConfigError> {
+    ) -> Result<(Self, Option<PiImport>), ConfigError> {
         let cwd = cwd.into();
+        let mut import = None;
         let agent_dir = match env::var_os(ENV_AGENT_DIR) {
             Some(value) => expand_tilde(PathBuf::from(value))?,
             None if test_isolation() => return Err(ConfigError::DefaultAgentDirInTest),
-            None => home_dir()?.join(CONFIG_DIR_NAME),
+            None => {
+                let home = home_dir()?;
+                let agent_dir = home.join(CONFIG_DIR_NAME);
+                import =
+                    import_agent_dir(&home.join(PI_CONFIG_DIR_NAME).join("agent"), &agent_dir)?;
+                agent_dir
+            }
         };
         let session_dir = match session_dir_override {
             Some(value) => expand_tilde(value)?,
@@ -105,17 +130,18 @@ impl ConfigPaths {
             },
         };
 
-        Ok(Self {
+        let paths = Self {
             cwd: cwd.clone(),
             settings_path: agent_dir.join("settings.json"),
-            project_settings_path: cwd.join(CONFIG_DIR_NAME).join("settings.json"),
+            project_settings_path: project_config_dir(&cwd).join("settings.json"),
             auth_path: agent_dir.join("auth.json"),
             models_path: agent_dir.join("models.json"),
             model_cache_path: agent_dir.join("model-cache.json"),
             keybindings_path: agent_dir.join("keybindings.json"),
             agent_dir,
             session_dir,
-        })
+        };
+        Ok((paths, import))
     }
 
     pub fn with_session_dir(&self, session_dir: impl Into<PathBuf>) -> Result<Self, ConfigError> {
@@ -128,6 +154,198 @@ impl ConfigPaths {
         };
         Ok(next)
     }
+}
+
+/// A project's config directory: `.noel/`, or the `.pi/` of a project written
+/// for pi when it has no `.noel/`. Everything a project configures is read
+/// from this one directory (settings, `SYSTEM.md`, `APPEND_SYSTEM.md`,
+/// extensions, skills, prompts and themes) and written there, so the two
+/// directories are never mixed.
+pub fn project_config_dir(cwd: &Path) -> PathBuf {
+    let dir = cwd.join(CONFIG_DIR_NAME);
+    let pi_dir = cwd.join(PI_CONFIG_DIR_NAME);
+    if !dir.exists() && pi_dir.is_dir() {
+        pi_dir
+    } else {
+        dir
+    }
+}
+
+/// The names noel changed, as upstream's fixtures (`tests/fixtures/ts-parity`)
+/// spell them, each with noel's: the product in the system prompt's first
+/// sentence (a placeholder in the fixture), the variables its bash rule
+/// names, and a project's directory. The fixtures are upstream's captured
+/// output and stay as they are, so the parity tests read them through
+/// [`with_noel_names`]; "Named noel, With Its State in `~/.noel`" in
+/// `docs/rust-rewrite/non-parity-register.md` records the same list.
+pub const UPSTREAM_NAMES: [(&str, &str); 3] = [
+    ("<product>", APP_NAME),
+    ("PI_*", "NOEL_*"),
+    (PI_CONFIG_DIR_NAME, CONFIG_DIR_NAME),
+];
+
+/// Upstream's text with noel's names: each of [`UPSTREAM_NAMES`], the
+/// directory only where it is a whole component of a path (`repo/.pi/skills`,
+/// `repo/.pi`), never inside a word or a sentence.
+pub fn with_noel_names(upstream: &str) -> String {
+    let [product, variables, (pi_dir, dir)] = UPSTREAM_NAMES;
+    let text = upstream
+        .replace(product.0, product.1)
+        .replace(variables.0, variables.1);
+    let components = text.split('/');
+    components
+        .map(|component| if component == pi_dir { dir } else { component })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// [`with_noel_names`] for every string of a fixture value, keys included.
+pub fn value_with_noel_names(upstream: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match upstream {
+        Value::String(text) => Value::String(with_noel_names(text)),
+        Value::Array(items) => Value::Array(items.iter().map(value_with_noel_names).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (with_noel_names(key), value_with_noel_names(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// What is imported from pi's `~/.pi/agent`: everything noel reads there
+/// except the caches, which it rebuilds.
+const PI_IMPORTED_ENTRIES: [&str; 17] = [
+    "settings.json",
+    "trust.json",
+    "keybindings.json",
+    "models.json",
+    "auth.json",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md",
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+    "skills",
+    "prompts",
+    "themes",
+    "extensions",
+    "sessions",
+];
+
+/// What the first use of noel's default directory imported from pi's
+/// `~/.pi/agent`: see [`ConfigPaths::discover`], the only place that imports.
+/// `NOEL_DIR` names another directory and the test harness
+/// ([`ENV_TEST_ISOLATION`]) refuses the default one, so nothing is imported
+/// under either. `~/.pi` is never modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiImport {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub imported: Vec<String>,
+    /// Files left in `from` because noel cannot load them, with the reason.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Copies the imported entries of `from` into a new `to`. The copy is staged
+/// in a sibling directory and renamed into place, so an interrupted import
+/// leaves no `to` behind and the next run imports again.
+fn import_agent_dir(from: &Path, to: &Path) -> Result<Option<PiImport>, ConfigError> {
+    if fs::symlink_metadata(to).is_ok() || !from.is_dir() {
+        return Ok(None);
+    }
+    let mut staging = to.as_os_str().to_owned();
+    staging.push(format!(".import-{}", std::process::id()));
+    let staging = PathBuf::from(staging);
+    let _ = fs::remove_dir_all(&staging);
+    let mut import = PiImport {
+        from: from.to_path_buf(),
+        to: to.to_path_buf(),
+        imported: Vec::new(),
+        skipped: Vec::new(),
+    };
+    let result = stage_import(&staging, &mut import)
+        .and_then(|()| fs::rename(&staging, to).map_err(import_error(to)));
+    match result {
+        Ok(()) => Ok(Some(import)),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            // Another noel process finished the import first.
+            if fs::symlink_metadata(to).is_ok() {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn stage_import(staging: &Path, import: &mut PiImport) -> Result<(), ConfigError> {
+    fs::create_dir(staging).map_err(import_error(staging))?;
+    for entry in PI_IMPORTED_ENTRIES {
+        let path = import.from.join(entry);
+        if fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        // noel refuses to start with a models.json or keybindings.json it
+        // cannot load, so the import leaves such a file behind.
+        let loadable = match entry {
+            "models.json" => read_optional_json::<Vec<ModelDefinition>>(&path).map(drop),
+            "keybindings.json" => read_optional_json::<KeybindingsFile>(&path).map(drop),
+            _ => Ok(()),
+        };
+        if let Err(error) = loadable {
+            import.skipped.push((entry.to_string(), error.to_string()));
+            continue;
+        }
+        copy_tree(&path, &staging.join(entry))?;
+        import.imported.push(entry.to_string());
+    }
+    let permissions = fs::metadata(&import.from)
+        .map_err(import_error(&import.from))?
+        .permissions();
+    fs::set_permissions(staging, permissions).map_err(import_error(staging))
+}
+
+fn import_error(path: &Path) -> impl FnOnce(std::io::Error) -> ConfigError + '_ {
+    move |source| ConfigError::Import {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// Copies a directory tree with its permissions.
+fn copy_tree(from: &Path, to: &Path) -> Result<(), ConfigError> {
+    let metadata = fs::symlink_metadata(from).map_err(import_error(from))?;
+    if !metadata.is_dir() {
+        return copy_file(from, to, &metadata).map_err(import_error(from));
+    }
+    fs::create_dir(to).map_err(import_error(from))?;
+    for entry in fs::read_dir(from).map_err(import_error(from))? {
+        let entry = entry.map_err(import_error(from))?;
+        copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+    }
+    fs::set_permissions(to, metadata.permissions()).map_err(import_error(from))
+}
+
+/// Copies a file with its permissions, synced before the import is renamed
+/// into place, or a symlink as a symlink. Sockets and fifos are not state.
+fn copy_file(from: &Path, to: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(fs::read_link(from)?, to);
+        #[cfg(not(unix))]
+        return fs::copy(from, to).map(drop);
+    }
+    if metadata.is_file() {
+        fs::copy(from, to)?;
+        fs::File::open(to)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub fn save_project_trust(
@@ -1427,7 +1645,7 @@ pub fn load_config_with_resources(
         &mut diagnostics,
     );
     if project_trusted {
-        let project_base = paths.cwd.join(CONFIG_DIR_NAME);
+        let project_base = project_config_dir(&paths.cwd);
         extend_resource_files(
             &mut extensions,
             &project_base,
@@ -2215,15 +2433,16 @@ fn read_text(path: &Path) -> std::io::Result<String> {
     })
 }
 
-/// `SYSTEM.md` or `APPEND_SYSTEM.md`: the trusted project's `.noel/<name>`,
-/// else the agent dir's. As upstream, same-named files are not combined.
+/// `SYSTEM.md` or `APPEND_SYSTEM.md`: the trusted project's `.noel/<name>`
+/// (see [`project_config_dir`]), else the agent dir's. As upstream,
+/// same-named files are not combined.
 fn discovered_prompt_file(
     paths: &ConfigPaths,
     name: &str,
     project_trusted: bool,
     diagnostics: &mut Vec<String>,
 ) -> Option<String> {
-    let project = paths.cwd.join(CONFIG_DIR_NAME).join(name);
+    let project = project_config_dir(&paths.cwd).join(name);
     let path = if project_trusted && project.exists() {
         project
     } else {
@@ -2360,7 +2579,7 @@ fn load_resource_files(
 ) -> Vec<ResourceFile> {
     let mut dirs = vec![paths.agent_dir.join(resource_dir_name)];
     if project_trusted {
-        dirs.push(paths.cwd.join(CONFIG_DIR_NAME).join(resource_dir_name));
+        dirs.push(project_config_dir(&paths.cwd).join(resource_dir_name));
     }
     let mut resources = BTreeMap::<String, ResourceFile>::new();
     for dir in dirs {
@@ -2511,7 +2730,7 @@ fn read_package_manifest(
         return None;
     }
     match read_optional_json::<PackageJson>(&path) {
-        Ok(Some(package_json)) => package_json.noel,
+        Ok(Some(package_json)) => package_json.noel.or(package_json.pi),
         Ok(None) => None,
         Err(error) => {
             diagnostics.push(format!(
@@ -2585,6 +2804,8 @@ fn collect_filtered_package_paths(
 #[derive(Debug, Default, Deserialize)]
 struct PackageJson {
     noel: Option<PackageManifest>,
+    /// The key of packages written for pi, read when `noel` is absent.
+    pi: Option<PackageManifest>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2842,7 +3063,11 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 fn is_resource_metadata_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|value| value.to_str())
-        .map(|name| name.ends_with(".noel-extension.json") || RESOURCE_IGNORE_FILES.contains(&name))
+        .map(|name| {
+            name.ends_with(".noel-extension.json")
+                || name.ends_with(".pi-extension.json")
+                || RESOURCE_IGNORE_FILES.contains(&name)
+        })
         .unwrap_or(false)
 }
 
@@ -5511,6 +5736,246 @@ mod tests {
         assert!(AuthFileLock::try_acquire(&auth_path)
             .expect("try lock")
             .is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A project written for pi loads whole from its `.pi/`: settings,
+    /// extensions with their manifests, themes, skills, prompt templates and
+    /// the prompt files. A `.noel/` directory replaces it and never adds to
+    /// it.
+    #[test]
+    fn projects_written_for_pi_load_from_pi_until_they_have_a_noel_dir() {
+        let root = test_dir("noel-config-pi-project");
+        let cwd = root.join("repo");
+        let write = |path: &str, content: &str| {
+            let path = cwd.join(path);
+            fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            fs::write(path, content).expect("write file");
+        };
+        let skill = |name: &str| format!("---\nname: {name}\ndescription: A skill.\n---\nDo it.\n");
+        write(".pi/settings.json", r#"{"packages":["package"]}"#);
+        write(".pi/extensions/tool", "pi extension");
+        write(".pi/extensions/tool.pi-extension.json", "{}");
+        write(".pi/themes/dusk.json", r#"{"name":"dusk"}"#);
+        write(".pi/skills/release/SKILL.md", &skill("release"));
+        write(".pi/prompts/fix.md", "Fix $1.\n");
+        write(".pi/SYSTEM.md", "pi system\n");
+        write(".pi/APPEND_SYSTEM.md", "pi append\n");
+        write(
+            "package/package.json",
+            r#"{"pi":{"skills":["skills/pi-key.md"]}}"#,
+        );
+        write("package/skills/pi-key.md", &skill("pi-key"));
+        write("package/skills/noel-key.md", &skill("noel-key"));
+        let load = || {
+            let paths = ConfigPaths {
+                cwd: cwd.clone(),
+                agent_dir: root.join("agent"),
+                session_dir: root.join("agent/sessions"),
+                settings_path: root.join("missing-settings.json"),
+                project_settings_path: project_config_dir(&cwd).join("settings.json"),
+                auth_path: root.join("missing-auth.json"),
+                models_path: root.join("missing-models.json"),
+                model_cache_path: root.join("missing-model-cache.json"),
+                keybindings_path: root.join("missing-keybindings.json"),
+            };
+            load_config_with_resources(paths, true, &ResourceOptions::default())
+                .expect("load config")
+        };
+        let files = |resources: &[ResourceFile]| {
+            let names = resources.iter().map(|resource| resource.name.clone());
+            names.collect::<Vec<_>>()
+        };
+        let skills = |config: &LoadedConfig| {
+            let names = config.skills.iter().map(|skill| skill.name.clone());
+            names.collect::<Vec<_>>()
+        };
+
+        let config = load();
+        assert_eq!(
+            config.paths.project_settings_path,
+            cwd.join(".pi/settings.json")
+        );
+        assert_eq!(files(&config.extensions), ["tool"]);
+        assert_eq!(files(&config.themes), ["dusk"]);
+        assert_eq!(skills(&config), ["release", "pi-key"]);
+        assert_eq!(
+            config.skills[0].file_path,
+            cwd.join(".pi/skills/release/SKILL.md")
+        );
+        assert_eq!(config.prompt_templates.len(), 1);
+        assert_eq!(config.prompt_templates[0].name, "fix");
+        assert_eq!(config.system_prompt.as_deref(), Some("pi system\n"));
+        assert_eq!(config.append_system_prompt, ["pi append\n"]);
+        assert!(config.diagnostics.is_empty(), "{:?}", config.diagnostics);
+
+        // A package's `noel` key is read before its `pi` key.
+        write(
+            "package/package.json",
+            r#"{"noel":{"skills":["skills/noel-key.md"]},"pi":{"skills":["skills/pi-key.md"]}}"#,
+        );
+        assert_eq!(skills(&load()), ["release", "noel-key"]);
+
+        // With a `.noel/`, nothing of `.pi/` is read: not its settings (the
+        // package), nor any resource the new directory lacks.
+        write(".noel/skills/deploy/SKILL.md", &skill("deploy"));
+        let config = load();
+        assert_eq!(
+            config.paths.project_settings_path,
+            cwd.join(".noel/settings.json")
+        );
+        assert_eq!(skills(&config), ["deploy"]);
+        assert!(config.extensions.is_empty() && config.themes.is_empty());
+        assert!(config.prompt_templates.is_empty());
+        assert_eq!(config.system_prompt, None);
+        assert!(config.append_system_prompt.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The parity tests' one substitution: upstream's fixtures name the
+    /// product, its variables and a project's directory, and nothing else of
+    /// upstream's is renamed.
+    #[test]
+    fn upstream_text_takes_noels_names_only_for_what_noel_renamed() {
+        assert_eq!(
+            with_noel_names("operating inside <product>, a coding agent harness"),
+            "operating inside noel, a coding agent harness"
+        );
+        assert_eq!(
+            with_noel_names("You can inspect PI_* environment variables"),
+            "You can inspect NOEL_* environment variables"
+        );
+        assert_eq!(
+            with_noel_names("<location><tmp>/repo/.pi/skills/release/SKILL.md</location>"),
+            "<location><tmp>/repo/.noel/skills/release/SKILL.md</location>"
+        );
+        assert_eq!(with_noel_names("<tmp>/repo/.pi"), "<tmp>/repo/.noel");
+        assert_eq!(with_noel_names(".pi/settings.json"), ".noel/settings.json");
+        for kept in [
+            "PI_CODING_AGENT_DIR",
+            "An untrusted project's .pi files are ignored.",
+            "<tmp>/repo/.pip/cache",
+            "<tmp>/repo/.agents/skills/deploy/SKILL.md",
+            "https://github.com/earendil-works/pi",
+            "pi-messages",
+        ] {
+            assert_eq!(with_noel_names(kept), kept);
+        }
+        assert_eq!(
+            value_with_noel_names(&serde_json::json!({
+                "repo/.pi/SYSTEM.md": ["<tmp>/repo/.pi", 1, null],
+            })),
+            serde_json::json!({ "repo/.noel/SYSTEM.md": ["<tmp>/repo/.noel", 1, null] })
+        );
+    }
+
+    #[test]
+    fn pi_agent_dir_is_imported_once_without_files_noel_cannot_load() {
+        let root = test_dir("noel-config-pi-import");
+        let from = root.join(".pi/agent");
+        let to = root.join(".noel");
+        fs::create_dir_all(from.join("sessions/archive")).expect("create sessions");
+        fs::create_dir_all(from.join("skills")).expect("create skills");
+        fs::write(from.join("settings.json"), r#"{"theme":"dark"}"#).expect("write settings");
+        fs::write(
+            from.join("auth.json"),
+            r#"{"openai":{"default":{"type":"api_key","key":"dummy"}}}"#,
+        )
+        .expect("write auth");
+        fs::write(from.join("models.json"), "{ not json").expect("write models");
+        fs::write(from.join("keybindings.json"), r#"{"submit":["enter"]}"#)
+            .expect("write keybindings");
+        fs::write(from.join("model-cache.json"), "{}").expect("write model cache");
+        fs::write(from.join("skills/review.md"), "review").expect("write skill");
+        fs::write(from.join("sessions/archive/old.jsonl"), "{}\n").expect("write session");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(from.join("auth.json"), fs::Permissions::from_mode(0o600))
+                .expect("restrict auth");
+            std::os::unix::fs::symlink("/elsewhere/skill", from.join("skills/linked"))
+                .expect("link skill");
+        }
+
+        let import = import_agent_dir(&from, &to)
+            .expect("import")
+            .expect("imported");
+        assert_eq!(
+            import.imported,
+            [
+                "settings.json",
+                "keybindings.json",
+                "auth.json",
+                "skills",
+                "sessions"
+            ]
+        );
+        assert_eq!(import.skipped.len(), 1);
+        assert_eq!(import.skipped[0].0, "models.json");
+        assert!(
+            import.skipped[0].1.contains("failed to parse"),
+            "{:?}",
+            import.skipped
+        );
+        assert_eq!(
+            fs::read_to_string(to.join("sessions/archive/old.jsonl")).expect("read session"),
+            "{}\n"
+        );
+        assert!(!to.join("models.json").exists());
+        assert!(!to.join("model-cache.json").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(to.join("auth.json"))
+                .expect("auth")
+                .permissions();
+            assert_eq!(mode.mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::read_link(to.join("skills/linked")).expect("read link"),
+                Path::new("/elsewhere/skill")
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(from.join("models.json")).expect("pi models"),
+            "{ not json"
+        );
+        assert_eq!(import_agent_dir(&from, &to).expect("second run"), None);
+        let entries = fs::read_dir(&root)
+            .expect("read root")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(entries, BTreeSet::from([".noel".into(), ".pi".into()]));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_pi_import_leaves_nothing_behind_and_runs_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_dir("noel-config-pi-import-failure");
+        let from = root.join(".pi/agent");
+        let to = root.join(".noel");
+        fs::create_dir_all(from.join("sessions")).expect("create sessions");
+        fs::write(from.join("settings.json"), "{}").expect("write settings");
+        let unreadable = from.join("sessions/unreadable.jsonl");
+        fs::write(&unreadable, "{}\n").expect("write session");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("chmod");
+        // Privileged users read it anyway, so the failure cannot be staged.
+        if fs::read(&unreadable).is_err() {
+            let error = import_agent_dir(&from, &to).expect_err("import fails");
+            assert!(error.to_string().contains("unreadable.jsonl"), "{error}");
+            let entries = fs::read_dir(&root)
+                .expect("read root")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(entries, [".pi"]);
+        }
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert!(import_agent_dir(&from, &to).expect("import").is_some());
+        assert!(to.join("sessions/unreadable.jsonl").exists());
+
         let _ = fs::remove_dir_all(root);
     }
 

@@ -290,7 +290,7 @@ fn run_image_model_list(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let cwd = std::env::current_dir()?;
-    let config = load_config(ConfigPaths::discover(cwd, None)?)?;
+    let config = load_config(config_paths(cwd, None)?)?;
     let search = args.first().map(|value| value.to_ascii_lowercase());
     for model in &config.image_models {
         if let Some(search) = &search {
@@ -354,7 +354,7 @@ async fn run_image_generate(args: &[String]) -> Result<()> {
     if prompt.trim().is_empty() {
         return Err(anyhow!("image generation requires a prompt"));
     }
-    let config = load_config(ConfigPaths::discover(cwd.clone(), None)?)?;
+    let config = load_config(config_paths(cwd.clone(), None)?)?;
     println!(
         "{}",
         generate_image_to_path(
@@ -600,17 +600,21 @@ async fn run_auth_login(args: &[String]) -> Result<()> {
     })?;
     let account = account.unwrap_or_else(|| DEFAULT_ACCOUNT_NAME.to_string());
     let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd, None)?;
     // A ChatGPT login is `openai-codex`'s credential, and its only one; an
-    // API key is `openai`'s.
+    // API key is `openai`'s. The paths are asked for only once the arguments
+    // are known to be usable (see `config_paths`).
     match (provider.as_str(), &api_key) {
-        ("openai-codex", None) => return run_codex_login(&paths, &account).await,
+        ("openai-codex", None) => {
+            return run_codex_login(&config_paths(cwd, None)?, &account).await
+        }
         ("openai-codex", Some(_)) => {
             return Err(anyhow!(
                 "openai-codex signs in with ChatGPT and takes no API key: run `noel login openai-codex`, or store the key with `noel login openai --api-key <key|env:VAR|->`"
             ))
         }
-        ("anthropic", None) => return run_claude_login(&paths, &account).await,
+        ("anthropic", None) => {
+            return run_claude_login(&config_paths(cwd, None)?, &account).await
+        }
         _ => {}
     }
     let key = match api_key {
@@ -636,6 +640,7 @@ async fn run_auth_login(args: &[String]) -> Result<()> {
     if key.trim().is_empty() {
         return Err(anyhow!("api key is empty"));
     }
+    let paths = config_paths(cwd, None)?;
     noel_config::update_auth_file(&paths.auth_path, |auth| {
         auth.insert(&provider, &account, AuthCredential::ApiKey { key })
     })?;
@@ -779,7 +784,7 @@ fn run_auth_logout(args: &[String]) -> Result<()> {
         provider.ok_or_else(|| anyhow!("usage: noel logout <provider> [--account <name>]"))?;
     let account = account.unwrap_or_else(|| DEFAULT_ACCOUNT_NAME.to_string());
     let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd, None)?;
+    let paths = config_paths(cwd, None)?;
     let removed = noel_config::update_auth_file(&paths.auth_path, |auth| {
         auth.remove(&provider, &account).is_some()
     })?;
@@ -825,7 +830,7 @@ async fn run_accounts_status(args: &[String]) -> Result<()> {
         return Err(anyhow!("usage: noel accounts status [--refresh]"));
     }
     let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd, None)?;
+    let paths = config_paths(cwd, None)?;
     let config = load_config(paths)?;
     let now = unix_seconds().unwrap_or(0) as i64;
     let rows = usage::collect_account_status(&config, refresh, None, now).await;
@@ -893,7 +898,7 @@ fn run_package_update(args: &[String]) -> Result<()> {
         return Err(anyhow!("usage: noel update [source|self|noel]"));
     }
     let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd.clone(), None)?;
+    let paths = config_paths(cwd.clone(), None)?;
     let target = args.first().map(String::as_str).unwrap_or("all");
     let sources = if target == "all" {
         configured_package_sources(&paths)?
@@ -988,7 +993,7 @@ fn run_package_list(args: &[String]) -> Result<()> {
         return Err(anyhow!("unknown list argument: {invalid}"));
     }
     let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd, None)?;
+    let paths = config_paths(cwd, None)?;
     print_package_sources("user", &paths.settings_path)?;
     print_package_sources("project", &paths.project_settings_path)?;
     Ok(())
@@ -1024,7 +1029,7 @@ fn run_package_config(args: &[String]) -> Result<()> {
 
 fn print_package_config_summary() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd, None)?;
+    let paths = config_paths(cwd, None)?;
     let config = load_config(paths)?;
     println!("agent dir: {}", config.paths.agent_dir.display());
     println!(
@@ -1125,7 +1130,7 @@ fn single_package_source(command: &str, args: &[String]) -> Result<String> {
 
 fn package_settings_path(local: bool) -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd, None)?;
+    let paths = config_paths(cwd, None)?;
     Ok(if local {
         paths.project_settings_path
     } else {
@@ -1315,14 +1320,40 @@ fn print_auth_help(command: &str) {
 
 fn main() -> Result<()> {
     // Upstream's process markers, inherited by every command and tool noel
-    // starts: a generic one naming the agent, and noel's own. Set before any
-    // other thread exists, because the environment is process-wide.
+    // starts: a generic one naming the agent, and its own, which noel sets
+    // under its name and under pi's for what was written for pi. Set before
+    // any other thread exists, because the environment is process-wide.
     std::env::set_var("AI_AGENT", PRODUCT_NAME);
     std::env::set_var("NOEL_CODING_AGENT", "true");
+    std::env::set_var("PI_CODING_AGENT", "true");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(run())
+}
+
+/// The paths a command works with. The first command that asks for noel's
+/// default directory imports pi's state into it (`ConfigPaths::discover`),
+/// which is reported here. Every command asks only once its arguments are
+/// parsed, so `--version`, `--help`, and a usage error write nothing.
+pub(crate) fn config_paths(cwd: PathBuf, session_dir: Option<PathBuf>) -> Result<ConfigPaths> {
+    let (paths, import) = ConfigPaths::discover(cwd, session_dir)?;
+    if let Some(import) = import {
+        let imported = if import.imported.is_empty() {
+            "nothing".to_string()
+        } else {
+            import.imported.join(", ")
+        };
+        eprintln!(
+            "noel: imported {imported} from {} into {}",
+            import.from.display(),
+            import.to.display()
+        );
+        for (entry, reason) in &import.skipped {
+            eprintln!("noel: did not import {entry}: {reason}");
+        }
+    }
+    Ok(paths)
 }
 
 async fn run() -> Result<()> {
@@ -1344,7 +1375,7 @@ async fn run() -> Result<()> {
         ));
     }
     let cwd = std::env::current_dir()?;
-    let paths = ConfigPaths::discover(cwd.clone(), cli.session_dir.clone())?;
+    let paths = config_paths(cwd.clone(), cli.session_dir.clone())?;
     let project_trusted = if cli.approve {
         true
     } else if cli.no_approve {
@@ -10101,6 +10132,10 @@ fn run_extension_process(
         .env("NOEL_EXTENSION_NAME", &extension.name)
         .env("NOEL_EXTENSION_PATH", &extension.path)
         .env("NOEL_EXTENSION_PROTOCOL", protocol.unwrap_or("stdio"))
+        // Extensions written for pi read the same values under PI_ names.
+        .env("PI_EXTENSION_NAME", &extension.name)
+        .env("PI_EXTENSION_PATH", &extension.path)
+        .env("PI_EXTENSION_PROTOCOL", protocol.unwrap_or("stdio"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -10183,6 +10218,10 @@ fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
             "{}.noel-extension.json",
             file_name.to_string_lossy()
         )));
+        // Extensions written for pi ship a .pi-extension.json manifest.
+        paths.push(
+            path.with_file_name(format!("{}.pi-extension.json", file_name.to_string_lossy())),
+        );
         paths.push(path.with_file_name(format!("{}.json", file_name.to_string_lossy())));
     }
     if path.extension().is_some() {
@@ -11564,7 +11603,9 @@ mod tests {
 
     /// Every `discovery` case of `system-prompt.json`: from the same files,
     /// trust decision, and flags, startup gives the prompt builder what
-    /// upstream's resource loader gives its own.
+    /// upstream's resource loader gives its own. Each case runs twice: on
+    /// the tree as upstream wrote it, which is a project written for pi
+    /// (`.pi/`), and on the same tree under noel's names (`.noel/`).
     #[test]
     fn prompt_and_context_files_match_ts_discovery() {
         let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
@@ -11573,8 +11614,17 @@ mod tests {
         .expect("parse TS parity fixture");
         let cases = fixture["discovery"].as_array().expect("discovery cases");
         assert_eq!(cases.len(), 15);
-        for case in cases {
-            let name = case["name"].as_str().expect("case name");
+        let layouts = cases.iter().flat_map(|case| {
+            [
+                ("as upstream wrote it", case.clone()),
+                (
+                    "with noel's names",
+                    noel_config::value_with_noel_names(case),
+                ),
+            ]
+        });
+        for (layout, case) in layouts {
+            let name = format!("{} ({layout})", case["name"].as_str().expect("case name"));
             let root =
                 std::env::temp_dir().join(format!("noel-cli-discovery-{}", unique_temp_suffix()));
             let text = |value: &serde_json::Value| {
@@ -11615,7 +11665,8 @@ mod tests {
                     agent_dir: agent.clone(),
                     session_dir: agent.join("sessions"),
                     settings_path: agent.join("settings.json"),
-                    project_settings_path: cwd.join(".noel/settings.json"),
+                    project_settings_path: noel_config::project_config_dir(&cwd)
+                        .join("settings.json"),
                     auth_path: agent.join("auth.json"),
                     models_path: agent.join("models.json"),
                     model_cache_path: agent.join("model-cache.json"),

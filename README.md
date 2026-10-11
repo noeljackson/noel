@@ -62,13 +62,15 @@ should not clear conversation messages, cwd, session identity, tool history,
 queued messages, or active context. `make check` runs formatting, clippy, and
 Rust tests. `make e2e` runs tmux-based terminal behavior checks.
 
-Tests never touch the real `~/.noel`. `make test` sets `NOEL_TEST_ISOLATION=1`,
-under which noel refuses to fall back to `~/.noel` (a test names its agent
-dir with `NOEL_DIR`), imports no Claude Code or Codex login from
-`$HOME`, and starts no background model refresh. The
-CLI tests run every `noel` through `noel_command()`, which also sets that marker
-and gives each run a cleared environment and its own agent dir and `HOME`
-under the target directory.
+Tests never touch the real `~/.noel` or `~/.pi`. `make test` sets
+`NOEL_TEST_ISOLATION=1`, under which noel refuses to fall back to `~/.noel` (a
+test names its agent dir with `NOEL_DIR`), imports neither `~/.pi/agent` nor a
+Claude Code or Codex login from `$HOME`, and starts no background model
+refresh. The CLI tests run every `noel` through `noel_command()`, which also
+sets that marker and gives each run a cleared environment and its own agent
+dir and `HOME` under the target directory. The tmux e2e suites run without the
+marker: `scripts/e2e-isolate.sh` gives them an empty `HOME`, and the import
+suite starts noel on its default directory there.
 
 TypeScript is reference material, not a runtime dependency. Parity fixtures are
 generated only through Docker:
@@ -297,7 +299,8 @@ Project resources (`.noel/settings.json`, `.noel/SYSTEM.md`,
 `/trust`. Context files (`AGENTS.md`, `CLAUDE.md`) from the agent directory
 and from the current directory and its ancestors load whatever the trust
 decision, as upstream does; treat a repository's instructions as untrusted
-input.
+input. A project without a `.noel/` directory is read from its `.pi/`
+instead; see [Moving from pi](#moving-from-pi).
 
 Environment overrides:
 
@@ -321,6 +324,41 @@ Environment overrides:
   }
 }
 ```
+
+### Moving from pi
+
+noel keeps pi's layout under new names: `~/.pi/agent` is `~/.noel`,
+`PI_CODING_AGENT_DIR` is `NOEL_DIR`, `PI_CODING_AGENT_SESSION_DIR` is
+`NOEL_SESSION_DIR`, the other `PI_*` variables are `NOEL_*`, and the project
+directory is `.noel/`. noel reads only the new names: a `PI_*` variable set
+for pi has no effect.
+
+The first command that loads noel's configuration without `NOEL_DIR`, if
+`~/.noel` does not exist and `~/.pi/agent` does, imports pi's state once.
+`noel --version`, `noel --help`, and a command line noel rejects write
+nothing, so a version probe never imports. The import takes settings,
+`trust.json`, `keybindings.json`, `models.json`, `auth.json`, `SYSTEM.md`,
+`APPEND_SYSTEM.md`, the global context file (`AGENTS.override.md`,
+`AGENTS.md` or `CLAUDE.md`), skills, prompts, themes, extensions and
+sessions, so `noel -c` and `/resume` find pi's sessions. It prints what it
+imported and never modifies `~/.pi`; caches are rebuilt. A `models.json` or
+`keybindings.json` that noel cannot load is left behind with a notice. The
+copy is staged next to `~/.noel` and renamed into place, so an interrupted
+import never leaves a partial `~/.noel`, and the next start imports again.
+
+OAuth refresh tokens rotate: once noel refreshes an imported login, only noel's
+copy stays valid, so pi on the same host (upstream, or an earlier build of this
+port) has to log in again.
+
+Projects written for pi keep working. Without a `.noel/` directory, noel uses
+the project's `.pi/` for everything a project configures: its settings,
+`SYSTEM.md`, `APPEND_SYSTEM.md`, extensions, skills, prompt templates and
+themes, including what noel writes there (`noel install -l`, `noel config ...
+-l`). Once the project has a `.noel/`, its `.pi/` is not read at all. noel
+also reads `.pi-extension.json` manifests and the `pi` key of a package's
+`package.json`, gives extensions both the `NOEL_EXTENSION_*` and the
+`PI_EXTENSION_*` variables, and sets the [session variables](#session-variables)
+under pi's names too, for skills and scripts written for pi.
 
 ### Models and thinking levels
 
@@ -384,8 +422,9 @@ model's output cap, lowered to fit its context window.
 ### System prompt
 
 Every model request starts with noel's system prompt, in every mode. It is
-upstream's prompt, word for word: one sentence naming the role, then tagged
-sections.
+upstream's prompt, word for word under noel's names (the product in the first
+sentence, and the `NOEL_*` variables of bash's rule): one sentence naming the
+role, then tagged sections.
 
 - `<tools>`: the active tools, one line each. An extension tool is listed
   when its manifest has a `promptSnippet`.
@@ -534,13 +573,17 @@ Commands the model runs with `bash` see the session they belong to:
 | `NOEL_REASONING_LEVEL` | The reasoning level the turn's requests use: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
 
 They are set for each command as it starts, and the system prompt tells the
-model they exist. A variable with nothing to report is removed rather than
-inherited, so a noel started from another noel's command never reports its
-parent's session. Commands you type (`/bash`, `!`, `!!`) are not given them.
+model they exist. Each is also set under pi's name, with the same value, for
+skills and scripts written for pi: `PI_SESSION_ID`, `PI_SESSION_FILE`,
+`PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`. A variable with nothing
+to report is removed under both names rather than inherited, so a noel started
+from another noel's command (or pi's) never reports its parent's session.
+Commands you type (`/bash`, `!`, `!!`) are not given them.
 
 noel also marks its own process, and so every command and tool it starts:
 `AI_AGENT=noel` names the agent for any tool that asks, and
-`NOEL_CODING_AGENT=true` is noel's own marker.
+`NOEL_CODING_AGENT=true` is noel's own marker, which it also sets as
+`PI_CODING_AGENT=true`.
 
 ### Tool selection
 
@@ -1516,15 +1559,22 @@ scripted runs against a local stub model, and noel's RPC mode is compared with i
 record by record. The system prompt fixture records upstream's prompt text
 for fixed tools, prompt sources, context files, and skills, and which prompt
 and context files upstream picks from a directory tree; noel's prompt is
-compared with it to the byte. The skills fixture records which skills and
-prompt templates upstream loads from directory trees, settings, and flags,
-how it reads their frontmatter, and what it sends for `/skill:name` and
-`/template` input; noel is compared with each. The error classification
-fixture records which failed requests upstream retries and which it reads as
-a context overflow: its pattern lists, which noel keeps verbatim, and its
-verdicts for sample error messages. Secrets are redacted. Rust tests
-compare covered behavior against those fixtures, so upstream changes become
-visible as fixture diffs and test failures.
+compared with it to the byte, under noel's names. The skills fixture records
+which skills and prompt templates upstream loads from directory trees,
+settings, and flags, how it reads their frontmatter, and what it sends for
+`/skill:name` and `/template` input; noel is compared with each. The error
+classification fixture records which failed requests upstream retries and
+which it reads as a context overflow: its pattern lists, which noel keeps
+verbatim, and its verdicts for sample error messages. Secrets are redacted.
+Rust tests compare covered behavior against those fixtures, so upstream
+changes become visible as fixture diffs and test failures.
+
+The fixtures are upstream's output and keep upstream's names. Where a test
+needs noel's (the product and the `NOEL_*` variables in the system prompt, a
+project's `.noel/`), it reads the fixture through
+`noel_config::with_noel_names`, the one substitution, listed in the
+non-parity register. The tests that load a project tree run it both ways: as
+upstream wrote it, which is a project written for pi, and under noel's names.
 
 Generate fixtures from the configured reference:
 

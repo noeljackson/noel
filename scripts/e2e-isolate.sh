@@ -32,7 +32,9 @@ if [ -z "${NOEL_E2E_ROOT:-}" ]; then
   )
   # Keep the build configuration (CARGO_INCREMENTAL, RUSTFLAGS, linker and
   # target settings) so panes reuse the outer build instead of recompiling;
-  # names that look like credentials never pass.
+  # names that look like credentials never pass. Neither does
+  # NOEL_TEST_ISOLATION: HOME is the scratch root here, and e2e-import.sh
+  # starts noel on its default directory there, which that marker refuses.
   for e2e_var in $(compgen -e); do
     case "${e2e_var}" in
       *TOKEN* | *SECRET* | *PASSWORD* | *KEY*) ;;

@@ -2287,19 +2287,17 @@ fn write_files(root: &Path, files: &[(&str, &str)]) {
 /// `get_commands` for every `commands` case of `skills.json`: from the same
 /// tree and flags, the templates and skills upstream's RPC mode lists, with
 /// their sources. `--no-skills` and `--no-prompt-templates` drop what is
-/// discovered and keep the `--skill` and `--prompt-template` paths.
+/// discovered and keep the `--skill` and `--prompt-template` paths. Each case
+/// runs twice: on the tree as upstream wrote it, which is a project written
+/// for pi (`.pi/`), and on the same tree under noel's names (`.noel/`).
 #[test]
 fn get_commands_matches_upstream() {
     let fixture = skills_fixture();
-    let commands = &fixture["commands"];
-    let files = commands["files"].as_object().unwrap().iter();
-    let files = files
-        .map(|(path, content)| (path.as_str(), content.as_str().unwrap()))
-        .collect::<Vec<_>>();
-    let cases = commands["cases"].as_array().unwrap();
-    let names = cases.iter().map(|case| case["name"].as_str().unwrap());
+    let names = fixture["commands"]["cases"].as_array().unwrap().iter();
     assert_eq!(
-        names.collect::<Vec<_>>(),
+        names
+            .map(|case| case["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
         [
             "discovered",
             "untrusted",
@@ -2309,22 +2307,35 @@ fn get_commands_matches_upstream() {
             "short-flags-alone",
         ]
     );
-    for case in cases {
-        let name = case["name"].as_str().unwrap();
-        let root = fs::canonicalize(test_root(&format!("commands-{name}"))).unwrap();
-        write_files(&root, &files);
-        let tmp = root.display().to_string();
-        let args = case["args"].as_array().unwrap().iter();
-        let args = args
-            .map(|arg| arg.as_str().unwrap().replace("<tmp>", &tmp))
+    let layouts = [
+        ("pi", fixture["commands"].clone()),
+        (
+            "noel",
+            noel_config::value_with_noel_names(&fixture["commands"]),
+        ),
+    ];
+    for (layout, commands) in &layouts {
+        let files = commands["files"].as_object().unwrap().iter();
+        let files = files
+            .map(|(path, content)| (path.as_str(), content.as_str().unwrap()))
             .collect::<Vec<_>>();
-        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let mut noel = Noel::spawn(root, json!([]), &args, json!({}));
-        noel.command(json!({"id": "1", "type": "get_commands"}));
-        let response = noel.response("1").to_string().replace(&tmp, "<tmp>");
-        let response: Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(response, case["response"], "{name}");
-        assert!(noel.close().success());
+        for case in commands["cases"].as_array().unwrap() {
+            let name = format!("{}-{layout}", case["name"].as_str().unwrap());
+            let root = fs::canonicalize(test_root(&format!("commands-{name}"))).unwrap();
+            write_files(&root, &files);
+            let tmp = root.display().to_string();
+            let args = case["args"].as_array().unwrap().iter();
+            let args = args
+                .map(|arg| arg.as_str().unwrap().replace("<tmp>", &tmp))
+                .collect::<Vec<_>>();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut noel = Noel::spawn(root, json!([]), &args, json!({}));
+            noel.command(json!({"id": "1", "type": "get_commands"}));
+            let response = noel.response("1").to_string().replace(&tmp, "<tmp>");
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response, case["response"], "{name}");
+            assert!(noel.close().success());
+        }
     }
 }
 

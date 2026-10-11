@@ -11,7 +11,7 @@ use crate::frontmatter::{is_js_whitespace, js_trim, parse_frontmatter};
 use crate::resources::{
     is_markdown, sorted_entries, ResourceDiagnostic, ResourcePath, SourceInfo, SourceScope,
 };
-use crate::{ConfigPaths, CONFIG_DIR_NAME};
+use crate::{project_config_dir, ConfigPaths};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptTemplate {
@@ -96,7 +96,7 @@ pub(crate) fn load_prompt_templates(
 /// The source of a template `file` given on the command line.
 fn explicit_source(file: &Path, config: &ConfigPaths) -> SourceInfo {
     let user = config.agent_dir.join("prompts");
-    let project = config.cwd.join(CONFIG_DIR_NAME).join("prompts");
+    let project = project_config_dir(&config.cwd).join("prompts");
     if file.starts_with(&user) {
         SourceInfo::local(file, SourceScope::User, &user)
     } else if file.starts_with(&project) {

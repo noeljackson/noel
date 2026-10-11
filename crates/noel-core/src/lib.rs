@@ -3703,6 +3703,10 @@ fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
             "{}.noel-extension.json",
             file_name.to_string_lossy()
         )));
+        // Extensions written for pi ship a .pi-extension.json manifest.
+        paths.push(
+            path.with_file_name(format!("{}.pi-extension.json", file_name.to_string_lossy())),
+        );
         paths.push(path.with_file_name(format!("{}.json", file_name.to_string_lossy())));
     }
     if path.extension().is_some() {
@@ -3712,10 +3716,12 @@ fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
 }
 
 /// What a bash command the model runs learns about its session (upstream's
-/// `bash.ts`): the session, model, and thinking level as of that command.
-/// A variable with nothing to report is removed, so a noel running inside
-/// another noel's command never passes on its parent's. Commands the user
-/// types (`/bash`, `!!`) get none of this.
+/// `bash.ts`): the session, model, and thinking level as of that command,
+/// each under noel's name and under pi's, which skills and scripts written
+/// for pi read. A variable with nothing to report is removed under both
+/// names, so a noel running inside another noel's command (or pi's) never
+/// passes on its parent's. Commands the user types (`/bash`, `!!`) get none
+/// of this.
 fn bash_session_env(runtime: &Runtime) -> Vec<(String, Option<String>)> {
     let model = runtime.session.active_model.as_ref();
     let session_file = runtime.store.as_ref().map(|store| {
@@ -3724,14 +3730,26 @@ fn bash_session_env(runtime: &Runtime) -> Vec<(String, Option<String>)> {
     });
     let thinking_level = runtime.thinking_level.as_deref().unwrap_or("off");
     [
-        ("NOEL_SESSION_ID", Some(runtime.session.session_id.clone())),
-        ("NOEL_SESSION_FILE", session_file),
-        ("NOEL_PROVIDER", model.map(|model| model.provider.clone())),
-        ("NOEL_MODEL", model.map(|model| model.id.clone())),
-        ("NOEL_REASONING_LEVEL", Some(thinking_level.to_string())),
+        (
+            ["NOEL_SESSION_ID", "PI_SESSION_ID"],
+            Some(runtime.session.session_id.clone()),
+        ),
+        (["NOEL_SESSION_FILE", "PI_SESSION_FILE"], session_file),
+        (
+            ["NOEL_PROVIDER", "PI_PROVIDER"],
+            model.map(|model| model.provider.clone()),
+        ),
+        (
+            ["NOEL_MODEL", "PI_MODEL"],
+            model.map(|model| model.id.clone()),
+        ),
+        (
+            ["NOEL_REASONING_LEVEL", "PI_REASONING_LEVEL"],
+            Some(thinking_level.to_string()),
+        ),
     ]
     .into_iter()
-    .map(|(name, value)| (name.to_string(), value))
+    .flat_map(|(names, value)| names.map(|name| (name.to_string(), value.clone())))
     .collect()
 }
 
@@ -3904,6 +3922,11 @@ async fn execute_extension_tool(
         .env("NOEL_EXTENSION_PATH", &extension.extension_path)
         .env("NOEL_EXTENSION_PROTOCOL", &extension.protocol)
         .env("NOEL_EXTENSION_TOOL", &extension.name)
+        // Extensions written for pi read the same values under PI_ names.
+        .env("PI_EXTENSION_NAME", &extension.extension_name)
+        .env("PI_EXTENSION_PATH", &extension.extension_path)
+        .env("PI_EXTENSION_PROTOCOL", &extension.protocol)
+        .env("PI_EXTENSION_TOOL", &extension.name)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -5268,7 +5291,8 @@ mod tests {
                 if last.role == ChatRole::Tool {
                     return Ok(vec![StreamEvent::Text(last.content.clone())]);
                 }
-                let command = r#"printf '%s\n' "${NOEL_SESSION_ID-unset}" "${NOEL_SESSION_FILE-unset}" "${NOEL_PROVIDER-unset}" "${NOEL_MODEL-unset}" "${NOEL_REASONING_LEVEL-unset}""#;
+                // Each value under noel's name, then under pi's.
+                let command = r#"printf '%s\n' "${NOEL_SESSION_ID-unset}" "${NOEL_SESSION_FILE-unset}" "${NOEL_PROVIDER-unset}" "${NOEL_MODEL-unset}" "${NOEL_REASONING_LEVEL-unset}" "${PI_SESSION_ID-unset}" "${PI_SESSION_FILE-unset}" "${PI_PROVIDER-unset}" "${PI_MODEL-unset}" "${PI_REASONING_LEVEL-unset}""#;
                 Ok(vec![StreamEvent::ToolCall {
                     id: "bash-1".into(),
                     name: "bash".into(),
@@ -5315,7 +5339,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(printed, expected);
+            assert_eq!(printed, format!("{expected}{expected}"));
         }
         let _ = fs::remove_dir_all(base);
     }

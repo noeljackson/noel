@@ -13,7 +13,7 @@ use crate::resources::{
     is_markdown, skill_entries, ResourceDiagnostic, ResourcePath, SkillLayout, SourceInfo,
     SourceScope,
 };
-use crate::{canonical_path, ConfigPaths, CONFIG_DIR_NAME};
+use crate::{canonical_path, project_config_dir, ConfigPaths};
 
 const MAX_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
@@ -100,7 +100,7 @@ pub(crate) fn load_skills(
 fn explicit_source(file: &Path, given: &Path, config: &ConfigPaths) -> SourceInfo {
     let scope = if given.starts_with(config.agent_dir.join("skills")) {
         SourceScope::User
-    } else if given.starts_with(config.cwd.join(CONFIG_DIR_NAME).join("skills")) {
+    } else if given.starts_with(project_config_dir(&config.cwd).join("skills")) {
         SourceScope::Project
     } else {
         SourceScope::Temporary
