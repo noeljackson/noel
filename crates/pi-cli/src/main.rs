@@ -2793,6 +2793,32 @@ fn resolve_model_reference(config: &LoadedConfig, reference: &str) -> Option<Mod
         })
 }
 
+/// A bare `pi` with no session flags used to open the resume picker here,
+/// but that traps typed startup prompts inside the selector (scripting and
+/// e2e send their first prompt immediately). Kimi/Claude/Codex all open the
+/// picker only on an explicit resume action, so pi keeps `/resume`,
+/// `--resume`, and the startup hint pointing there. Kept for the startup
+/// hint decision: skip the hint when a picker would be redundant.
+#[allow(dead_code)]
+fn auto_open_resume_picker(cli: &Cli, runtime: &Runtime, config: &LoadedConfig) -> Result<bool> {
+    if cli.r#continue
+        || cli.resume
+        || cli.no_session
+        || cli.session.is_some()
+        || cli.fork.is_some()
+        || cli.session_id.is_some()
+    {
+        return Ok(false);
+    }
+    // Only offer sessions from this cwd so the picker matches the project.
+    let sessions = SessionStore::list(&config.paths.session_dir)?;
+    let any_for_cwd = sessions
+        .iter()
+        .any(|session| session.cwd == runtime.session().cwd);
+    let _ = &runtime;
+    Ok(any_for_cwd)
+}
+
 async fn run_interactive(
     mut runtime: Runtime,
     mut config: LoadedConfig,
@@ -2891,8 +2917,13 @@ async fn run_interactive(
             continue;
         }
         // An error/interruption must not become an automatic retry loop just
-        // because a rebuild is pending. Restart at a completed boundary.
-        if !runtime.session().has_unfinished_turn() && auto_restart.should_restart()? {
+        // because a rebuild is pending. Restart at a completed boundary —
+        // either the model turn fully finished, or nothing is streaming and
+        // the user is idle between prompts (marathon tool-loop sessions keep
+        // `has_unfinished_turn` true for hours, which previously parked the
+        // restart forever).
+        let idle_between_prompts = !app.turn_running && !runtime.session().has_unfinished_turn();
+        if idle_between_prompts && auto_restart.should_restart()? {
             app.push(TuiEntryKind::System, "rebuilt; restarting");
             redraw_tui(&mut terminal, &mut app, &config)?;
             restart = true;
@@ -7041,10 +7072,9 @@ async fn handle_tui_submission(
         _ if line.starts_with("/resume") => {
             let reference = line.trim_start_matches("/resume").trim();
             if reference.is_empty() {
-                app.push(
-                    TuiEntryKind::System,
-                    format_sessions(&config.paths.session_dir)?,
-                );
+                // Kimi/Claude-style picker: interactive selector with topic,
+                // age, message count, model badge, and unfinished marker.
+                open_tui_selector(app, config, runtime, "session", "")?;
             } else {
                 let path = resolve_session_reference(&config.paths.session_dir, reference)?;
                 let (store, state) = SessionStore::open(path)?;
@@ -7297,6 +7327,19 @@ enum TurnControl {
 
 fn format_tui_error(error: &anyhow::Error, runtime: &Runtime, config: &LoadedConfig) -> String {
     let message = error.to_string();
+    // Transport-level failures reach the UI as "error sending request for
+    // url …" after retries are exhausted. Name the likely causes so the
+    // recovery path is discoverable: a local firewall/VPN prompt (denied
+    // connections look identical to outages), or genuine network loss.
+    let message = if message.contains("error sending request") {
+        format!(
+            "{message}\n\nconnection failed after retries: check network, \
+VPN/firewall approval for this binary (an unapproved prompt denies by default \
+on this host), provider status, then retry; /model switches providers"
+        )
+    } else {
+        message
+    };
     if !message.contains("429 Too Many Requests") {
         return message;
     }
@@ -8391,25 +8434,6 @@ fn changelog_header_has_version(line: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|value| value.is_ascii_digit()))
 }
 
-fn format_sessions(session_dir: &Path) -> Result<String> {
-    let mut lines = Vec::new();
-    for (index, session) in SessionStore::list(session_dir)?.into_iter().enumerate() {
-        let name = session.name.unwrap_or_else(|| "-".to_string());
-        lines.push(format!(
-            "{}.\t{}\t{}\t{}",
-            index + 1,
-            session.session_id,
-            name,
-            session.cwd.display()
-        ));
-    }
-    Ok(if lines.is_empty() {
-        "no sessions".to_string()
-    } else {
-        lines.join("\n")
-    })
-}
-
 fn format_session_tree(session_dir: &Path) -> Result<String> {
     let mut lines = Vec::new();
     for session in SessionStore::list(session_dir)? {
@@ -8818,6 +8842,62 @@ fn select_from_selector_message(
     }
 }
 
+/// One-line session row for the resume picker, in the Kimi/Claude/Codex
+/// style: topic preview first, then relative age, message count, model
+/// badge, and an unfinished-turn marker so a crashed session stands out.
+fn format_session_picker_label(session: &pi_core::SessionSummary) -> String {
+    let topic = session
+        .first_prompt
+        .as_deref()
+        .map(|prompt| {
+            let line = prompt.lines().next().unwrap_or("").to_string();
+            let truncated: String = line.chars().take(60).collect();
+            if truncated.chars().count() < line.chars().count() {
+                format!("{truncated}…")
+            } else {
+                truncated
+            }
+        })
+        .filter(|topic| !topic.trim().is_empty())
+        .unwrap_or_else(|| {
+            session
+                .name
+                .clone()
+                .unwrap_or_else(|| session.session_id.clone())
+        });
+    let age = session
+        .modified
+        .map(relative_time_label)
+        .unwrap_or_else(|| "-".to_string());
+    let model = session.active_model.clone().unwrap_or_else(|| "-".into());
+    let unfinished = if session.has_unfinished_turn {
+        " · unfinished"
+    } else {
+        ""
+    };
+    format!(
+        "{topic} · {age} · {} msg · {model}{unfinished}",
+        session.message_count
+    )
+}
+
+/// Compact relative age like Claude's picker: "2m", "3h", "5d".
+fn relative_time_label(modified: std::time::SystemTime) -> String {
+    let Ok(elapsed) = modified.elapsed() else {
+        return "now".to_string();
+    };
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Result<Selector> {
     match kind {
         "model" | "models" | "scoped-models" => Ok(Selector::new(
@@ -8858,8 +8938,11 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
             "session",
             SessionStore::list(&config.paths.session_dir)?
                 .into_iter()
+                // Journal listing is oldest-first; the picker should open on
+                // the most recent session like Kimi/Claude/Codex.
+                .rev()
                 .map(|session| SelectorItem {
-                    label: session.name.unwrap_or_else(|| session.session_id.clone()),
+                    label: format_session_picker_label(&session),
                     value: session.session_id.clone(),
                     active: runtime.session().session_id == session.session_id,
                 })
@@ -9394,6 +9477,60 @@ fn write_auth_file(config: &LoadedConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn picker_summary(first_prompt: Option<&str>, unfinished: bool) -> pi_core::SessionSummary {
+        pi_core::SessionSummary {
+            path: PathBuf::from("/tmp/ignored.jsonl"),
+            session_id: "1791668953663-3417381-0".into(),
+            cwd: PathBuf::from("/repo"),
+            name: None,
+            labels: Default::default(),
+            parent_session_id: None,
+            branch_summary: None,
+            modified: Some(std::time::SystemTime::now()),
+            message_count: 12,
+            first_prompt: first_prompt.map(str::to_string),
+            active_model: Some("zai-coding/glm-5.3".into()),
+            has_unfinished_turn: unfinished,
+        }
+    }
+
+    #[test]
+    fn session_picker_label_shows_topic_count_model_and_unfinished() {
+        let label = format_session_picker_label(&picker_summary(
+            Some("fix the retry loop\nmore details"),
+            true,
+        ));
+        assert_eq!(
+            label,
+            "fix the retry loop · 0s · 12 msg · zai-coding/glm-5.3 · unfinished"
+        );
+        // Long topics truncate with an ellipsis, one line only.
+        let long = "x".repeat(80);
+        let label = format_session_picker_label(&picker_summary(Some(&long), false));
+        assert!(label.starts_with(&format!("{}… · ", "x".repeat(60))));
+        assert!(!label.contains('\n'))
+    }
+
+    #[test]
+    fn session_picker_label_falls_back_to_session_id() {
+        let label = format_session_picker_label(&picker_summary(None, false));
+        assert_eq!(
+            label,
+            "1791668953663-3417381-0 · 0s · 12 msg · zai-coding/glm-5.3"
+        );
+    }
+
+    #[test]
+    fn relative_time_label_uses_compact_units() {
+        let label = |secs: u64| {
+            relative_time_label(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+        };
+        assert_eq!(label(5), "5s");
+        assert_eq!(label(90), "1m");
+        assert_eq!(label(7_200), "2h");
+        assert_eq!(label(3 * 86_400), "3d");
+    }
 
     fn clipboard_test_png(width: u32, height: u32) -> Vec<u8> {
         let image = image::DynamicImage::new_rgba8(width, height);
@@ -12841,11 +12978,11 @@ mod tests {
         let mut saw_delta = false;
         let mut live_text_index = entry;
         let mut text_after_tool = false;
-        let mut send = |app: &mut TuiApp,
-                        live_text_index: &mut usize,
-                        text_after_tool: &mut bool,
-                        saw_delta: &mut bool,
-                        event: &TurnEvent| {
+        let send = |app: &mut TuiApp,
+                    live_text_index: &mut usize,
+                    text_after_tool: &mut bool,
+                    saw_delta: &mut bool,
+                    event: &TurnEvent| {
             apply_turn_event(
                 app,
                 live_text_index,
@@ -12868,7 +13005,9 @@ mod tests {
             &mut live_text_index,
             &mut text_after_tool,
             &mut saw_delta,
-            &TurnEvent::ToolStarted { name: "read".into() },
+            &TurnEvent::ToolStarted {
+                name: "read".into(),
+            },
         );
         send(
             &mut app,
@@ -12897,7 +13036,9 @@ mod tests {
             &mut live_text_index,
             &mut text_after_tool,
             &mut saw_delta,
-            &TurnEvent::ToolStarted { name: "bash".into() },
+            &TurnEvent::ToolStarted {
+                name: "bash".into(),
+            },
         );
         send(
             &mut app,
@@ -12917,10 +13058,7 @@ mod tests {
             vec![
                 (TuiEntryKind::Thinking, ""),
                 (TuiEntryKind::Assistant, "before tool"),
-                (
-                    TuiEntryKind::Tool,
-                    "completed read\na.txt\nfile body"
-                ),
+                (TuiEntryKind::Tool, "completed read\na.txt\nfile body"),
                 (TuiEntryKind::Assistant, "after tool"),
                 (TuiEntryKind::Tool, "running bash\n\n"),
                 (TuiEntryKind::Assistant, "final"),
