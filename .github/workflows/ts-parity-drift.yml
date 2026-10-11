@@ -62,6 +62,8 @@ jobs:
 
       # One open pull request carries the regenerated fixtures, so drift is a
       # reviewable diff whose CI run shows which Rust parity tests it breaks.
+      # Fixes pushed to the branch are kept: new drift lands as a commit on top,
+      # and nothing is committed or re-run when the fixtures did not change.
       - name: Open or update the drift pull request
         if: steps.result.outputs.drift == 'true'
         run: |
@@ -69,11 +71,22 @@ jobs:
           sha="$(cat target/ts-parity-drift/reference-sha)"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -C "$DRIFT_BRANCH"
+          if git ls-remote --exit-code --heads origin "$DRIFT_BRANCH" > /dev/null; then
+            git fetch --no-tags origin "$DRIFT_BRANCH"
+            git switch -C "$DRIFT_BRANCH" "origin/$DRIFT_BRANCH"
+          else
+            git switch -C "$DRIFT_BRANCH"
+          fi
+          # Mirror the regenerated set, so fixtures upstream dropped are removed too.
+          rm -f tests/fixtures/ts-parity/*.json
           cp target/ts-parity-drift/fixtures/*.json tests/fixtures/ts-parity/
-          git add tests/fixtures/ts-parity
-          git commit -m "parity: refresh fixtures from upstream ${TS_PARITY_TRACKING_REF} at ${sha:0:12}"
-          git push --force origin "$DRIFT_BRANCH"
+          git add -A tests/fixtures/ts-parity
+          changed=false
+          if ! git diff --cached --quiet; then
+            git commit -m "parity: refresh fixtures from upstream ${TS_PARITY_TRACKING_REF} at ${sha:0:12}"
+            git push origin "$DRIFT_BRANCH"
+            changed=true
+          fi
           title="Parity drift: upstream ${TS_PARITY_TRACKING_REF} at ${sha:0:12}"
           head -c 60000 target/ts-parity-drift/brief.md > target/ts-parity-drift/pr-body.md
           pr="$(gh pr list --head "$DRIFT_BRANCH" --state open --json number --jq '.[0].number // empty')"
@@ -83,7 +96,9 @@ jobs:
             gh pr create --draft --base main --head "$DRIFT_BRANCH" \
               --title "$title" --body-file target/ts-parity-drift/pr-body.md
           fi
-          gh workflow run ci.yml --ref "$DRIFT_BRANCH"
+          if [ "$changed" = true ]; then
+            gh workflow run ci.yml --ref "$DRIFT_BRANCH"
+          fi
 
       - name: Fail when the harness itself failed
         if: steps.parity.outcome == 'failure' && steps.result.outputs.drift != 'true'
