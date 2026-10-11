@@ -1078,3 +1078,109 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
     assert_eq!(loaded.usage.requests, 4);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn upstream_v1_1_flags_are_accepted_in_print_mode() {
+    let root = test_dir("pi-cli-v1-1-flags");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    let run = |extra: &[&str]| {
+        pi_command()
+            .current_dir(&root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .args(["--offline", "--no-session", "-p", "--model", "faux/echo"])
+            .args(extra)
+            .arg("hello")
+            .output()
+            .unwrap()
+    };
+
+    let output = run(&["--no-mcp", "--tui-mode", "regular", "--use-theme", "light"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[faux/echo] hello\n"
+    );
+    assert!(!agent.join("settings.json").exists());
+
+    let pair = run(&["--use-theme", "light/dark"]);
+    assert!(!pair.status.success());
+    assert!(String::from_utf8_lossy(&pair.stderr).contains("theme pairs are not supported"));
+    let invalid_mode = run(&["--tui-mode", "split"]);
+    assert!(!invalid_mode.status.success());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mcp_command_reports_missing_support_instead_of_prompting() {
+    let output = pi_command().args(["mcp", "list"]).output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no MCP support"));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn auth_commands_print_and_check_stored_credentials() {
+    let root = test_dir("pi-cli-auth-command");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        agent.join("auth.json"),
+        r#"{"anthropic":{"default":{"type":"api_key","key":"sk-ant-synthetic"}}}"#,
+    )
+    .unwrap();
+    let auth = |args: &[&str]| {
+        pi_command()
+            .current_dir(&root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .env("HOME", &root)
+            .arg("auth")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let stdout =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).to_string();
+
+    let help = auth(&["--help"]);
+    assert!(help.status.success());
+    assert!(stdout(&help).contains("pi auth print-bearer-token"));
+
+    let key = auth(&["print-api-key", "--provider", "anthropic"]);
+    assert!(key.status.success(), "{}", stderr(&key));
+    assert_eq!(stdout(&key), "sk-ant-synthetic\n");
+
+    let ready = auth(&["check", "--provider", "anthropic", "--json"]);
+    assert_eq!(ready.status.code(), Some(0), "{}", stderr(&ready));
+    assert_eq!(
+        stdout(&ready),
+        "{\"status\":\"ready\",\"provider\":\"anthropic\",\"authType\":\"api_key\"}\n"
+    );
+
+    let not_ready = auth(&["check", "--provider", "mistral"]);
+    assert_eq!(not_ready.status.code(), Some(1), "{}", stderr(&not_ready));
+    assert_eq!(stdout(&not_ready), "not_ready\n");
+
+    let bearer = auth(&["print-bearer-token", "--provider", "anthropic"]);
+    assert_eq!(bearer.status.code(), Some(1));
+    assert!(stderr(&bearer).contains("is not configured with an OAuth bearer token"));
+    assert!(stdout(&bearer).is_empty());
+
+    let missing = auth(&["check"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(stderr(&missing).contains("Auth checks require --provider"));
+
+    let unknown = auth(&["status"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(stderr(&unknown).contains("Unknown auth command \"status\""));
+
+    fs::remove_dir_all(root).unwrap();
+}

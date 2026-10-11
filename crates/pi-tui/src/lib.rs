@@ -263,6 +263,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "export a local HTML session share",
     },
     CommandHelp {
+        command: "/bug [description]",
+        description: "write a bug report for the pi developers",
+    },
+    CommandHelp {
         command: "/undo",
         description: "undo last conversation turn; restore prompt (files unchanged)",
     },

@@ -449,6 +449,8 @@ pub struct RetrySettings {
     pub enabled: Option<bool>,
     pub max_retries: Option<u64>,
     pub base_delay_ms: Option<u64>,
+    /// Cap on each agent-level retry backoff delay; upstream defaults to 60s.
+    pub max_agent_delay_ms: Option<u64>,
     pub provider: Option<ProviderRetrySettings>,
 }
 
@@ -458,7 +460,9 @@ impl MergeSettings for RetrySettings {
             enabled: overrides.enabled.or(self.enabled),
             max_retries: overrides.max_retries.or(self.max_retries),
             base_delay_ms: overrides.base_delay_ms.or(self.base_delay_ms),
-            provider: overrides.provider.or(self.provider),
+            max_agent_delay_ms: overrides.max_agent_delay_ms.or(self.max_agent_delay_ms),
+            // Nested settings merge recursively, like upstream deepMergeObjects.
+            provider: merge_optional_settings(self.provider, overrides.provider),
         }
     }
 }
@@ -2880,6 +2884,7 @@ mod tests {
                 "enabled": retry.and_then(|retry| retry.enabled).unwrap_or(true),
                 "maxRetries": retry.and_then(|retry| retry.max_retries).unwrap_or(3),
                 "baseDelayMs": retry.and_then(|retry| retry.base_delay_ms).unwrap_or(2000),
+                "maxAgentDelayMs": retry.and_then(|retry| retry.max_agent_delay_ms).unwrap_or(60000),
             },
             "providerRetry": provider_retry_summary(settings),
             "terminal": {
@@ -3573,7 +3578,7 @@ mod tests {
         assert_eq!(compaction.keep_recent_tokens, Some(200));
         let retry = config.settings.retry.expect("retry");
         let provider = retry.provider.expect("provider retry");
-        assert_eq!(provider.timeout_ms, None);
+        assert_eq!(provider.timeout_ms, Some(1000));
         assert_eq!(provider.max_retries, Some(2));
         let terminal = config.settings.terminal.expect("terminal");
         assert_eq!(terminal.show_images, Some(true));

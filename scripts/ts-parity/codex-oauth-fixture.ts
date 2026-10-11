@@ -70,14 +70,17 @@ async function captureCodexOAuthRequest(): Promise<CapturedRequest> {
 	};
 
 	try {
-		const [{ getModel }, { stream }] = await Promise.all([
+		const [{ getModel }, { stream }, { normalizeContext }] = await Promise.all([
 			import("/ts-reference/packages/ai/src/compat.ts"),
 			import("/ts-reference/packages/ai/src/api/openai-codex-responses.ts"),
+			import("/ts-reference/packages/ai/src/utils/transcript.ts"),
 		]);
 		const model = getModel("openai-codex", "gpt-5.5");
 		const response = stream(
 			model,
-			{
+			// The API-level stream takes a transcript: fold the system prompt into
+			// the leading system message, as the public entry points do.
+			normalizeContext({
 				systemPrompt: "pi rust cli",
 				messages: [
 					{
@@ -86,7 +89,7 @@ async function captureCodexOAuthRequest(): Promise<CapturedRequest> {
 						timestamp: 0,
 					},
 				],
-			},
+			}),
 			{
 				apiKey: fakeChatGptToken("acct_ts_parity"),
 				reasoningEffort: "xhigh",
