@@ -168,9 +168,12 @@ README's RPC Mode and the non-parity register). It lives in two modules of
 - `rpc_wire.rs` holds the protocol: serde types for commands, responses,
   events, and messages in upstream's field order, and `Recorder`, which turns
   one run's `TurnEvent`s into upstream's records. A run is one upstream run
-  (one `agent_start`, one `agent_end`, one `agent_settled`) however many
-  engine calls it takes; the recorder closes whatever an abort or a failure
-  left open, ending the run's last turn with an aborted or error reply.
+  (`agent_start`, its turns, `agent_end`, and one `agent_settled`) however
+  many engine calls it takes; the recorder closes whatever an abort or a
+  failure left open, ending the run's last turn with an aborted or error
+  reply. When the engine drops a reply to ask again (see Run Recovery), the
+  recorder ends that reply's turn with `agent_end` and starts over with
+  another `agent_start` under the same run id, as upstream does.
 - `rpc.rs` holds the mode: a reader thread that splits stdin on LF only, one
   writer that prints each record as one line, and the command loop. While a
   run is active one task polls the engine call and handles commands that
@@ -180,8 +183,9 @@ README's RPC Mode and the non-parity register). It lives in two modules of
   never contended.
 
 Each run builds its provider at the prompt (so `set_model` applies to the next
-run) and gets a `RunControl`: the shared steering mailbox and its own
-cancellation token, which `abort` cancels. Follow-ups need no engine support:
+run) and gets a `RunControl`: the shared steering mailbox, its own
+cancellation token, which `abort` cancels, and the handle `abort_retry` ends
+a backoff with. Follow-ups need no engine support:
 when an engine call returns with follow-ups queued, the run makes another
 engine call with them as its prompt. While the engine holds the runtime,
 reads answer from a copy of the session that the run's events keep current,
@@ -209,6 +213,43 @@ that older versions and the TUI ignore, reading every message as a follow-up.
 An enqueue or `clear_queue` is saved before it is applied and acknowledged; a
 delivered message leaves the saved queue once its user message is saved, so a
 crash between the two delivers it again unless the queue is cleared.
+
+## Run Recovery
+
+The run loop (`run_model_turn_streaming_events` in `pi-core`) asks for one
+reply per round. What follows a failed request is decided in one place,
+`Recovery`, the counterpart of upstream's `_handlePostAgentRun`:
+
+- `pi-ai` classifies the failure: `ProviderError::is_retryable` and
+  `is_context_overflow` apply upstream's patterns (kept verbatim, and checked
+  against `error-classification.json`) to what the provider answered, and
+  treat a transport failure as retryable by its kind.
+- A retryable failure waits out a backoff and asks again; a context overflow
+  compacts first, once (`Runtime::compact_after_overflow`, the same
+  compaction the threshold uses, without the threshold). A final reply cut
+  off at the output limit below the model's own limit
+  (`Provider::output_limit`) is handled as an overflow. Any other failure
+  ends the turn.
+- Asking again is another round of the same loop: `RetryStarted` or
+  `Overflowed` ends the round of the dropped reply, and `RoundStarted` opens
+  the next. Steering queued meanwhile joins it. A dropped round does not
+  count toward `agent.maxToolRounds`.
+
+A reply is saved only when it stands, after its request succeeded. So a
+dropped reply is never in the session or its journal: the request that asks
+again is built from the same saved messages, and there is nothing to remove.
+The only journal write of a recovery is the compaction checkpoint, which is
+atomic. A pi killed during a backoff or a compaction resumes from the saved
+prompt and recovers again; killed after the checkpoint, it resumes with the
+compacted context.
+
+A turn's cancellation ends a backoff or an overflow compaction at once, like
+any other step. `RunControl::retry` ends a backoff only, and the turn then
+fails with the error it would have retried.
+
+`pi-agent` keeps a self-contained retry (`complete_with_retry`) with the same
+classification for requests that are not a turn's reply: a compaction's
+summary.
 
 ## Config Model
 
@@ -422,6 +463,12 @@ Rules:
   types get none.
 - `pi-cli` sets the process markers `AI_AGENT` and `PI_CODING_AGENT` before
   starting any thread, so every child process inherits them.
+- A `bash` call reports its output while it runs: `pi-tools`
+  (`execute_tool_streaming`) passes what the command has printed so far,
+  within the limits of the result, to a callback, at most every 100 ms;
+  `pi-core` reports it as `TurnEvent::ToolUpdate`, which the TUI shows in the
+  running tool's entry and RPC mode sends as `tool_execution_update`. The
+  result is unchanged.
 - TUI progress rendering is controlled by `terminal.showTerminalProgress`.
 
 Patch/edit behavior uses structured local logic rather than provider-specific
@@ -563,7 +610,10 @@ Rust `pi-ai` tests compare local builders against those captures.
 `rpc-protocol.json` is a protocol transcript instead: upstream `pi --mode rpc`
 driven against a local stub model, with every stdout record in order and
 volatile values replaced by placeholders. `pi-cli`'s `rpc_parity` test replays
-each scenario against `faux/script` and compares the records. When upstream
+each scenario against `faux/script` and compares the records.
+`error-classification.json` holds the patterns upstream classifies a failed
+request with and its verdicts for sample errors; `pi-ai` keeps the same
+patterns and is checked against both. When upstream
 changes, the drift harness produces both a raw diff and an agent-oriented brief
 that states the constraints: no host npm, TypeScript only in Docker, keep Rust
 changes scoped to parity behavior, and rerun Rust validation before committing.
