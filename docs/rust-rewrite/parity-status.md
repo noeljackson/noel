@@ -66,6 +66,17 @@ The committed TypeScript parity fixtures are:
   full-tree JSONL active branches.
 - `settings.json`: settings merge and normalization cases, including
   `defaultTools` across the user and project layers.
+- `skills.json`: how upstream loads and uses skills and prompt templates.
+  What its frontmatter parser reads from a table of files; the skills and
+  templates its resource loader loads, in order, with their sources and
+  diagnostics, from trees of skill and prompt directories, settings, a local
+  package, ignore files, and command-line paths, with and without project
+  trust; the skills listing of the system prompt; what a session queues for
+  `/skill:name` and `/template` input, and which input it leaves alone; how
+  template arguments split and substitute; and `get_commands` of upstream's
+  RPC mode for `--skill`, `--prompt-template`, `--no-skills`, and
+  `--no-prompt-templates`. Directories are listed by name, and the temporary
+  directory and the YAML library's error text are placeholders.
 - `slash-commands.json`: slash command inventory and selected descriptions.
 - `system-prompt.json`: the text of upstream's system prompt builder, with
   its sections, for the default tools, every tool pi shares with upstream, a

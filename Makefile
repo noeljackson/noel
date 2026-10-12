@@ -124,6 +124,7 @@ parity-check:
 	$(CARGO) test -p pi-core --lib system_prompt_matches_ts_builder
 	$(CARGO) test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery
 	$(CARGO) test -p pi-core --lib tool_parity_tests
+	$(CARGO) test -p pi-config --lib _ts
 	$(MAKE) ts-parity-drift
 
 ts-parity-build:

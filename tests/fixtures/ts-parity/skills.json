@@ -1,0 +1,5612 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/skills-fixture.ts"
+  },
+  "format": {
+    "frontmatter": "content: a file. error: whether upstream rejects its frontmatter. fields: the frontmatter's top-level keys in order, each a string, a boolean, or another type (null when the frontmatter is not a mapping); body: the text after the frontmatter.",
+    "discovery": "files, symlinks, cwd, trusted, flags: the tree and the command line. result: the skills and prompt templates upstream's resource loader loads, in order, and their diagnostics.",
+    "listing": "skills, tool: what upstream's prompt builder is given. text: formatSkillsForPrompt's result, which the builder trims.",
+    "expansion": "files, cwd: the tree a session loads; removed, rewritten: changes made after loading. cases: for each input, the text a session queues for it.",
+    "templateArguments": "parsing: parseCommandArgs. substitution: substituteArgs on a template's content, for each input's parsed arguments.",
+    "commands": "files, cwd: the tree. args: upstream's command line after --mode rpc and the setup arguments. response: its answer to get_commands."
+  },
+  "placeholders": {
+    "<tmp>": "The case's temporary directory. The agent dir is <tmp>/agent and the home directory <tmp>/home.",
+    "<bom>": "A UTF-8 byte order mark (U+FEFF) in a file to write.",
+    "<yaml-error>": "The message of upstream's YAML parser for frontmatter it rejects."
+  },
+  "frontmatter": [
+    {
+      "name": "plain-scalars",
+      "content": "---\nname: pdf-tools\ndescription: Extract text and tables from PDF files.\n---\n# PDF tools\n",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "pdf-tools"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "Extract text and tables from PDF files."
+        }
+      ],
+      "body": "# PDF tools"
+    },
+    {
+      "name": "no-frontmatter",
+      "content": "Just a body.\n",
+      "error": false,
+      "fields": [],
+      "body": "Just a body.\n"
+    },
+    {
+      "name": "empty-frontmatter",
+      "content": "---\n---\nbody",
+      "error": false,
+      "fields": [],
+      "body": "body"
+    },
+    {
+      "name": "comments-and-blank-lines",
+      "content": "---\n# a comment\n\nname: x # trailing comment\n\ndescription: d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "unclosed-frontmatter",
+      "content": "---\nname: x\nbody",
+      "error": false,
+      "fields": [],
+      "body": "---\nname: x\nbody"
+    },
+    {
+      "name": "byte-order-mark-and-crlf",
+      "content": "<bom>---\r\nname: x\r\ndescription: two words\r\n---\r\nbody\r\nmore\r\n",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "two words"
+        }
+      ],
+      "body": "body\nmore"
+    },
+    {
+      "name": "body-is-trimmed",
+      "content": "---\nname: x\n---\n\n\n  body with space around  \n\n",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body with space around"
+    },
+    {
+      "name": "body-keeps-later-rules",
+      "content": "---\nname: x\n---\nbody\n---\nmore\n",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body\n---\nmore"
+    },
+    {
+      "name": "body-without-frontmatter-is-not-trimmed",
+      "content": "\n  spaced body  \n\n",
+      "error": false,
+      "fields": [],
+      "body": "\n  spaced body  \n\n"
+    },
+    {
+      "name": "closing-line-with-text",
+      "content": "---\nname: x\n---more\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "more\nbody"
+    },
+    {
+      "name": "four-dashes-open",
+      "content": "----\nname: x\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "double-quoted",
+      "content": "---\ndescription: \"a: b \\\"q\\\" \\n x \\u00e9 \\t \\\\ end\"\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "a: b \"q\" \n x é \t \\ end"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "single-quoted",
+      "content": "---\ndescription: 'it''s: fine # not a comment'\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "it's: fine # not a comment"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "quoted-then-comment",
+      "content": "---\nname: \"x\" # comment\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "empty-quoted",
+      "content": "---\nname: \"\"\ndescription: ''\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": ""
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": ""
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "quoted-over-lines",
+      "content": "---\ndescription: \"line one\n  line two\n\n  after a blank\"\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "line one line two\nafter a blank"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "quoted-keys",
+      "content": "---\n\"name\": x\n'description': d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "double-quoted-escapes",
+      "content": "---\ndescription: \"a\\x41\\/ \\0 \\e \\_ \\N \\L \\P \\U00010348 \\a\\b\\v\\f\\r\"\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "aA/ \u0000 \u001b        𐍈 \u0007\b\u000b\f\r"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "double-quoted-line-continuation",
+      "content": "---\ndescription: \"a\\\n  b\"\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "ab"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "booleans",
+      "content": "---\na: true\nb: True\nc: TRUE\nd: false\ne: False\nf: FALSE\ng: yes\nh: on\ni: \"true\"\nj: 'false'\nk: true # comment\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "a",
+          "type": "boolean",
+          "value": true
+        },
+        {
+          "key": "b",
+          "type": "boolean",
+          "value": true
+        },
+        {
+          "key": "c",
+          "type": "boolean",
+          "value": true
+        },
+        {
+          "key": "d",
+          "type": "boolean",
+          "value": false
+        },
+        {
+          "key": "e",
+          "type": "boolean",
+          "value": false
+        },
+        {
+          "key": "f",
+          "type": "boolean",
+          "value": false
+        },
+        {
+          "key": "g",
+          "type": "string",
+          "value": "yes"
+        },
+        {
+          "key": "h",
+          "type": "string",
+          "value": "on"
+        },
+        {
+          "key": "i",
+          "type": "string",
+          "value": "true"
+        },
+        {
+          "key": "j",
+          "type": "string",
+          "value": "false"
+        },
+        {
+          "key": "k",
+          "type": "boolean",
+          "value": true
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "nulls",
+      "content": "---\na:\nb: ~\nc: null\nd: Null\ne: NULL\nf: nul\ng: # only a comment\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "a",
+          "type": "other"
+        },
+        {
+          "key": "b",
+          "type": "other"
+        },
+        {
+          "key": "c",
+          "type": "other"
+        },
+        {
+          "key": "d",
+          "type": "other"
+        },
+        {
+          "key": "e",
+          "type": "other"
+        },
+        {
+          "key": "f",
+          "type": "string",
+          "value": "nul"
+        },
+        {
+          "key": "g",
+          "type": "other"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "numbers",
+      "content": "---\na: 123\nb: 1.5\nc: 0x1f\nd: 0o17\ne: 1e3\nf: .5\ng: +1\nh: -1\ni: 1_000\nj: 1.2.3\nk: .inf\nl: .NaN\nm: 0b11\nn: 12abc\no: 5.\np: -.inf\nq: 1e\nr: 12:30\ns: 2024-01-01\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "a",
+          "type": "other"
+        },
+        {
+          "key": "b",
+          "type": "other"
+        },
+        {
+          "key": "c",
+          "type": "other"
+        },
+        {
+          "key": "d",
+          "type": "other"
+        },
+        {
+          "key": "e",
+          "type": "other"
+        },
+        {
+          "key": "f",
+          "type": "other"
+        },
+        {
+          "key": "g",
+          "type": "other"
+        },
+        {
+          "key": "h",
+          "type": "other"
+        },
+        {
+          "key": "i",
+          "type": "string",
+          "value": "1_000"
+        },
+        {
+          "key": "j",
+          "type": "string",
+          "value": "1.2.3"
+        },
+        {
+          "key": "k",
+          "type": "other"
+        },
+        {
+          "key": "l",
+          "type": "other"
+        },
+        {
+          "key": "m",
+          "type": "string",
+          "value": "0b11"
+        },
+        {
+          "key": "n",
+          "type": "string",
+          "value": "12abc"
+        },
+        {
+          "key": "o",
+          "type": "other"
+        },
+        {
+          "key": "p",
+          "type": "other"
+        },
+        {
+          "key": "q",
+          "type": "string",
+          "value": "1e"
+        },
+        {
+          "key": "r",
+          "type": "string",
+          "value": "12:30"
+        },
+        {
+          "key": "s",
+          "type": "string",
+          "value": "2024-01-01"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "plain-with-punctuation",
+      "content": "---\na: a:b c\nb: text # comment\nc: a#b\nd: say \"hi\" and 'bye'\ne: a, b {c} [d]\nf: see https://example.com/a?b=c#frag\ng: C:\\Users\\x\nh: -x\ni: ?x\nj: :x\nk: <file> [focus]\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "a",
+          "type": "string",
+          "value": "a:b c"
+        },
+        {
+          "key": "b",
+          "type": "string",
+          "value": "text"
+        },
+        {
+          "key": "c",
+          "type": "string",
+          "value": "a#b"
+        },
+        {
+          "key": "d",
+          "type": "string",
+          "value": "say \"hi\" and 'bye'"
+        },
+        {
+          "key": "e",
+          "type": "string",
+          "value": "a, b {c} [d]"
+        },
+        {
+          "key": "f",
+          "type": "string",
+          "value": "see https://example.com/a?b=c#frag"
+        },
+        {
+          "key": "g",
+          "type": "string",
+          "value": "C:\\Users\\x"
+        },
+        {
+          "key": "h",
+          "type": "string",
+          "value": "-x"
+        },
+        {
+          "key": "i",
+          "type": "string",
+          "value": "?x"
+        },
+        {
+          "key": "j",
+          "type": "string",
+          "value": ":x"
+        },
+        {
+          "key": "k",
+          "type": "string",
+          "value": "<file> [focus]"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "plain-over-lines",
+      "content": "---\ndescription: first line\n  continues here\n  and here\nname: x\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "first line continues here and here"
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "plain-over-lines-with-blank",
+      "content": "---\ndescription: first\n\n  second paragraph\nname: x\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "first\nsecond paragraph"
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "value-on-next-line",
+      "content": "---\ndescription:\n  on the next line\nname:\n  \"quoted next\"\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "on the next line"
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "value": "quoted next"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "trailing-space",
+      "content": "---\nname: x   \ndescription:   spaced   \n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "spaced"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "tab-after-colon",
+      "content": "---\nname:\tx\ndescription: a\tb\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "a\tb"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "indented-keys",
+      "content": "---\n  name: x\n  description: d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "unicode",
+      "content": "---\ndescription: café — naïve 𐍈\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "café — naïve 𐍈"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "literal-block",
+      "content": "---\ndescription: |\n  line one\n  line two\n\n  after blank\nname: x\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "line one\nline two\n\nafter blank\n"
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "folded-block",
+      "content": "---\ndescription: >\n  folded one\n  folded two\n\n  paragraph two\n    indented more\n  back\nname: x\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "folded one folded two\nparagraph two\n  indented more\nback\n"
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "block-strip",
+      "content": "---\ndescription: |-\n  strip\n\nname: x\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "strip"
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "block-keep",
+      "content": "---\ndescription: |+\n  keep\n\nname: x\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "keep\n\n"
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "folded-strip",
+      "content": "---\ndescription: >-\n  a\n  b\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "a b"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "block-indentation-indicator",
+      "content": "---\ndescription: |2\n   three\n  two\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": " three\ntwo\n"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "block-with-comment",
+      "content": "---\ndescription: | # comment\n  text\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "text\n"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "block-empty",
+      "content": "---\ndescription: |\nname: x\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": ""
+        },
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "block-trailing-blank-lines",
+      "content": "---\ndescription: |\n  a\n\n\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "a\n"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "folded-leading-blank-line",
+      "content": "---\ndescription: >\n\n  a\n  b\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "\na b\n"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "block-with-tabs",
+      "content": "---\ndescription: |\n  a\tb\n  \tc\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "description",
+          "type": "string",
+          "value": "a\tb\n\tc\n"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "block-last-key",
+      "content": "---\nname: x\ndescription: >\n  last key\n  of the file\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "last key of the file\n"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "nested-mapping",
+      "content": "---\nname: x\nmetadata:\n  author: me\n  version: \"1.0\"\ndescription: d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        },
+        {
+          "key": "metadata",
+          "type": "other"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "nested-deep",
+      "content": "---\nmetadata:\n  a:\n    b:\n      - c\n      - d: e\n  f: g\ndescription: d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "metadata",
+          "type": "other"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "sequence-value",
+      "content": "---\nallowed-tools:\n  - Bash\n  - Read\ndescription: d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "allowed-tools",
+          "type": "other"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "sequence-at-key-indent",
+      "content": "---\nallowed-tools:\n- Bash\n- Read\ndescription: d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "allowed-tools",
+          "type": "other"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "flow-sequence",
+      "content": "---\nallowed-tools: [Bash, Read]\nargument-hint: [focus]\ndescription: d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "allowed-tools",
+          "type": "other"
+        },
+        {
+          "key": "argument-hint",
+          "type": "other"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "flow-mapping",
+      "content": "---\nmetadata: {a: 1, b: [c, d]}\ndescription: d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "metadata",
+          "type": "other"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "flow-over-lines",
+      "content": "---\nallowed-tools: [\n  Bash,\n  Read\n]\ndescription: d\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "allowed-tools",
+          "type": "other"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "d"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "skill-fields",
+      "content": "---\nname: review\ndescription: Review code.\nlicense: MIT\ncompatibility: Needs git\ndisable-model-invocation: true\nargument-hint: \"[focus]\"\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "review"
+        },
+        {
+          "key": "description",
+          "type": "string",
+          "value": "Review code."
+        },
+        {
+          "key": "license",
+          "type": "string",
+          "value": "MIT"
+        },
+        {
+          "key": "compatibility",
+          "type": "string",
+          "value": "Needs git"
+        },
+        {
+          "key": "disable-model-invocation",
+          "type": "boolean",
+          "value": true
+        },
+        {
+          "key": "argument-hint",
+          "type": "string",
+          "value": "[focus]"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "document-end-marker",
+      "content": "---\nname: x\n...\n---\nbody",
+      "error": false,
+      "fields": [
+        {
+          "key": "name",
+          "type": "string",
+          "value": "x"
+        }
+      ],
+      "body": "body"
+    },
+    {
+      "name": "scalar-document",
+      "content": "---\njust text\n---\nbody",
+      "error": false,
+      "fields": null,
+      "body": "body"
+    },
+    {
+      "name": "sequence-document",
+      "content": "---\n- a\n- b\n---\nbody",
+      "error": false,
+      "fields": null,
+      "body": "body"
+    },
+    {
+      "name": "key-without-space",
+      "content": "---\nname:x\n---\nbody",
+      "error": false,
+      "fields": null,
+      "body": "body"
+    },
+    {
+      "name": "colon-in-plain",
+      "content": "---\ndescription: Use when: reading\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "colon-ends-plain",
+      "content": "---\ndescription: ends with colon:\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "colon-in-continuation",
+      "content": "---\ndescription: first\n  second: third\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "comment-in-continuation",
+      "content": "---\ndescription: text\n  # a comment\n  more\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "duplicate-keys",
+      "content": "---\nname: a\nname: b\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "tab-indentation",
+      "content": "---\nmetadata:\n\tauthor: me\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "line-without-key",
+      "content": "---\nname: x\njust text\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "unclosed-quote",
+      "content": "---\nname: \"x\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "text-after-quote",
+      "content": "---\nname: \"x\" y\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "bad-escape",
+      "content": "---\ndescription: \"a\\q\"\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "reserved-at",
+      "content": "---\nname: @x\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "reserved-backtick",
+      "content": "---\nname: `x`\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "sequence-entry-as-value",
+      "content": "---\nname: - x\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "block-header-with-text",
+      "content": "---\nname: | x\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "block-less-indented-line",
+      "content": "---\ndescription: |\n    a\n  b\n---\nbody",
+      "error": true
+    },
+    {
+      "name": "content-after-document-end",
+      "content": "---\nname: x\n...\nbody\n---\nrest",
+      "error": true
+    }
+  ],
+  "discovery": [
+    {
+      "name": "default-directories",
+      "description": "The skill and prompt directories of the agent dir, the trusted project, and both .agents directories. Project resources come first. Only SKILL.md files and described Markdown files directly in a skills directory are skills; only Markdown files directly in a prompts directory are templates.",
+      "files": {
+        "agent/skills/alpha/SKILL.md": "---\nname: alpha\ndescription: The alpha skill.\n---\nInstructions.\n",
+        "agent/skills/alpha/extra.md": "---\ndescription: Not a skill, because its directory already has SKILL.md.\n---\nInstructions.\n",
+        "agent/skills/alpha/references/guide.md": "---\ndescription: A reference, not a skill.\n---\nInstructions.\n",
+        "agent/skills/alpha/scripts/run.sh": "#!/bin/sh\n",
+        "agent/skills/nested/deep/beta/SKILL.md": "---\ndescription: Found below two directories. Named after its directory.\n---\nInstructions.\n",
+        "agent/skills/group/readme.md": "---\ndescription: Not a skill, because it is neither SKILL.md nor in the skills directory itself.\n---\nInstructions.\n",
+        "agent/skills/root-note.md": "---\nname: root-note\ndescription: A Markdown file in the skills directory itself.\n---\nInstructions.\n",
+        "agent/skills/unnamed-note.md": "---\ndescription: Without a name, a file is called after its directory.\n---\nInstructions.\n",
+        "agent/skills/no-frontmatter.md": "Plain notes.\n",
+        "agent/skills/readme.txt": "Not Markdown.\n",
+        "agent/skills/.hidden/SKILL.md": "---\ndescription: In a hidden directory.\n---\nInstructions.\n",
+        "agent/skills/node_modules/dep/SKILL.md": "---\ndescription: In node_modules.\n---\nInstructions.\n",
+        "agent/prompts/review.md": "---\ndescription: Review staged changes\nargument-hint: \"[focus]\"\n---\nReview the staged changes. Focus on ${1:-correctness}.\n",
+        "agent/prompts/plain.md": "\nSummarize the conversation so far in a single paragraph, please, and keep it short.\n\nSecond paragraph.\n",
+        "agent/prompts/short.md": "Explain $@\n",
+        "agent/prompts/notes.txt": "Not Markdown.\n",
+        "agent/prompts/sub/nested.md": "Not a direct child.\n",
+        "agent/prompts/.hidden.md": "Hidden.\n",
+        "repo/.git/HEAD": "ref: refs/heads/main\n",
+        "repo/.pi/skills/gamma/SKILL.md": "---\nname: gamma\ndescription: A project skill.\n---\nInstructions.\n",
+        "repo/.pi/skills/project-note.md": "---\nname: project-note\ndescription: A project file skill.\n---\nInstructions.\n",
+        "repo/.pi/prompts/ship.md": "---\ndescription: Ship it\n---\nShip $1.\n",
+        "repo/.agents/skills/delta/SKILL.md": "---\ndescription: A project skill in .agents.\n---\nInstructions.\n",
+        "home/.agents/skills/epsilon/SKILL.md": "---\ndescription: A user skill in ~/.agents.\n---\nInstructions.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": true,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "gamma",
+            "description": "A project skill.",
+            "filePath": "<tmp>/repo/.pi/skills/gamma/SKILL.md",
+            "baseDir": "<tmp>/repo/.pi/skills/gamma",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/.pi/skills/gamma/SKILL.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/.pi"
+            }
+          },
+          {
+            "name": "project-note",
+            "description": "A project file skill.",
+            "filePath": "<tmp>/repo/.pi/skills/project-note.md",
+            "baseDir": "<tmp>/repo/.pi/skills",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/.pi/skills/project-note.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/.pi"
+            }
+          },
+          {
+            "name": "delta",
+            "description": "A project skill in .agents.",
+            "filePath": "<tmp>/repo/.agents/skills/delta/SKILL.md",
+            "baseDir": "<tmp>/repo/.agents/skills/delta",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/.agents/skills/delta/SKILL.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/.agents"
+            }
+          },
+          {
+            "name": "alpha",
+            "description": "The alpha skill.",
+            "filePath": "<tmp>/agent/skills/alpha/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/alpha",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/alpha/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "beta",
+            "description": "Found below two directories. Named after its directory.",
+            "filePath": "<tmp>/agent/skills/nested/deep/beta/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/nested/deep/beta",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/nested/deep/beta/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "root-note",
+            "description": "A Markdown file in the skills directory itself.",
+            "filePath": "<tmp>/agent/skills/root-note.md",
+            "baseDir": "<tmp>/agent/skills",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/root-note.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "skills",
+            "description": "Without a name, a file is called after its directory.",
+            "filePath": "<tmp>/agent/skills/unnamed-note.md",
+            "baseDir": "<tmp>/agent/skills",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/unnamed-note.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "epsilon",
+            "description": "A user skill in ~/.agents.",
+            "filePath": "<tmp>/home/.agents/skills/epsilon/SKILL.md",
+            "baseDir": "<tmp>/home/.agents/skills/epsilon",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/home/.agents/skills/epsilon/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/home/.agents"
+            }
+          }
+        ],
+        "skillDiagnostics": [],
+        "prompts": [
+          {
+            "name": "ship",
+            "description": "Ship it",
+            "argumentHint": null,
+            "content": "Ship $1.",
+            "filePath": "<tmp>/repo/.pi/prompts/ship.md",
+            "sourceInfo": {
+              "path": "<tmp>/repo/.pi/prompts/ship.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/.pi"
+            }
+          },
+          {
+            "name": "plain",
+            "description": "Summarize the conversation so far in a single paragraph, ple...",
+            "argumentHint": null,
+            "content": "\nSummarize the conversation so far in a single paragraph, please, and keep it short.\n\nSecond paragraph.\n",
+            "filePath": "<tmp>/agent/prompts/plain.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/plain.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "review",
+            "description": "Review staged changes",
+            "argumentHint": "[focus]",
+            "content": "Review the staged changes. Focus on ${1:-correctness}.",
+            "filePath": "<tmp>/agent/prompts/review.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/review.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "short",
+            "description": "Explain $@",
+            "argumentHint": null,
+            "content": "Explain $@\n",
+            "filePath": "<tmp>/agent/prompts/short.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/short.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "promptDiagnostics": []
+      }
+    },
+    {
+      "name": "untrusted-project",
+      "description": "An untrusted project's .pi and .agents resources are not loaded; the user's are.",
+      "files": {
+        "agent/skills/alpha/SKILL.md": "---\nname: alpha\ndescription: The alpha skill.\n---\nInstructions.\n",
+        "agent/skills/alpha/extra.md": "---\ndescription: Not a skill, because its directory already has SKILL.md.\n---\nInstructions.\n",
+        "agent/skills/alpha/references/guide.md": "---\ndescription: A reference, not a skill.\n---\nInstructions.\n",
+        "agent/skills/alpha/scripts/run.sh": "#!/bin/sh\n",
+        "agent/skills/nested/deep/beta/SKILL.md": "---\ndescription: Found below two directories. Named after its directory.\n---\nInstructions.\n",
+        "agent/skills/group/readme.md": "---\ndescription: Not a skill, because it is neither SKILL.md nor in the skills directory itself.\n---\nInstructions.\n",
+        "agent/skills/root-note.md": "---\nname: root-note\ndescription: A Markdown file in the skills directory itself.\n---\nInstructions.\n",
+        "agent/skills/unnamed-note.md": "---\ndescription: Without a name, a file is called after its directory.\n---\nInstructions.\n",
+        "agent/skills/no-frontmatter.md": "Plain notes.\n",
+        "agent/skills/readme.txt": "Not Markdown.\n",
+        "agent/skills/.hidden/SKILL.md": "---\ndescription: In a hidden directory.\n---\nInstructions.\n",
+        "agent/skills/node_modules/dep/SKILL.md": "---\ndescription: In node_modules.\n---\nInstructions.\n",
+        "agent/prompts/review.md": "---\ndescription: Review staged changes\nargument-hint: \"[focus]\"\n---\nReview the staged changes. Focus on ${1:-correctness}.\n",
+        "agent/prompts/plain.md": "\nSummarize the conversation so far in a single paragraph, please, and keep it short.\n\nSecond paragraph.\n",
+        "agent/prompts/short.md": "Explain $@\n",
+        "agent/prompts/notes.txt": "Not Markdown.\n",
+        "agent/prompts/sub/nested.md": "Not a direct child.\n",
+        "agent/prompts/.hidden.md": "Hidden.\n",
+        "repo/.git/HEAD": "ref: refs/heads/main\n",
+        "repo/.pi/skills/gamma/SKILL.md": "---\nname: gamma\ndescription: A project skill.\n---\nInstructions.\n",
+        "repo/.pi/skills/project-note.md": "---\nname: project-note\ndescription: A project file skill.\n---\nInstructions.\n",
+        "repo/.pi/prompts/ship.md": "---\ndescription: Ship it\n---\nShip $1.\n",
+        "repo/.agents/skills/delta/SKILL.md": "---\ndescription: A project skill in .agents.\n---\nInstructions.\n",
+        "home/.agents/skills/epsilon/SKILL.md": "---\ndescription: A user skill in ~/.agents.\n---\nInstructions.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": false,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "alpha",
+            "description": "The alpha skill.",
+            "filePath": "<tmp>/agent/skills/alpha/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/alpha",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/alpha/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "beta",
+            "description": "Found below two directories. Named after its directory.",
+            "filePath": "<tmp>/agent/skills/nested/deep/beta/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/nested/deep/beta",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/nested/deep/beta/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "root-note",
+            "description": "A Markdown file in the skills directory itself.",
+            "filePath": "<tmp>/agent/skills/root-note.md",
+            "baseDir": "<tmp>/agent/skills",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/root-note.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "skills",
+            "description": "Without a name, a file is called after its directory.",
+            "filePath": "<tmp>/agent/skills/unnamed-note.md",
+            "baseDir": "<tmp>/agent/skills",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/unnamed-note.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "epsilon",
+            "description": "A user skill in ~/.agents.",
+            "filePath": "<tmp>/home/.agents/skills/epsilon/SKILL.md",
+            "baseDir": "<tmp>/home/.agents/skills/epsilon",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/home/.agents/skills/epsilon/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/home/.agents"
+            }
+          }
+        ],
+        "skillDiagnostics": [],
+        "prompts": [
+          {
+            "name": "plain",
+            "description": "Summarize the conversation so far in a single paragraph, ple...",
+            "argumentHint": null,
+            "content": "\nSummarize the conversation so far in a single paragraph, please, and keep it short.\n\nSecond paragraph.\n",
+            "filePath": "<tmp>/agent/prompts/plain.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/plain.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "review",
+            "description": "Review staged changes",
+            "argumentHint": "[focus]",
+            "content": "Review the staged changes. Focus on ${1:-correctness}.",
+            "filePath": "<tmp>/agent/prompts/review.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/review.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "short",
+            "description": "Explain $@",
+            "argumentHint": null,
+            "content": "Explain $@\n",
+            "filePath": "<tmp>/agent/prompts/short.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/short.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "promptDiagnostics": []
+      }
+    },
+    {
+      "name": "agents-directories",
+      "description": "Project .agents/skills directories from the working directory up to the repository root, nearest first, then ~/.agents/skills. In .agents, a described Markdown file is a skill only below the skills directory, not directly in it.",
+      "files": {
+        ".agents/skills/above/SKILL.md": "---\ndescription: Above the repository root.\n---\nInstructions.\n",
+        "repo/.git/HEAD": "ref: refs/heads/main\n",
+        "repo/.agents/skills/root-skill/SKILL.md": "---\ndescription: At the repository root.\n---\nInstructions.\n",
+        "repo/.agents/skills/top.md": "---\nname: top\ndescription: Directly in .agents/skills.\n---\nInstructions.\n",
+        "repo/app/.agents/skills/app-skill/SKILL.md": "---\ndescription: In the app directory.\n---\nInstructions.\n",
+        "repo/app/src/.agents/skills/src-skill/SKILL.md": "---\ndescription: In the working directory.\n---\nInstructions.\n",
+        "repo/app/src/.agents/skills/pack/inner.md": "---\nname: inner\ndescription: A file below .agents/skills.\n---\nInstructions.\n",
+        "repo/app/src/.agents/skills/pack/unnamed.md": "---\ndescription: A file below .agents/skills, named after its directory.\n---\nInstructions.\n",
+        "home/.agents/skills/user-skill/SKILL.md": "---\ndescription: In ~/.agents/skills.\n---\nInstructions.\n",
+        "home/.agents/skills/top.md": "---\nname: user-top\ndescription: Directly in ~/.agents/skills.\n---\nInstructions.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo/app/src",
+      "trusted": true,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "inner",
+            "description": "A file below .agents/skills.",
+            "filePath": "<tmp>/repo/app/src/.agents/skills/pack/inner.md",
+            "baseDir": "<tmp>/repo/app/src/.agents/skills/pack",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/app/src/.agents/skills/pack/inner.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/app/src/.agents"
+            }
+          },
+          {
+            "name": "pack",
+            "description": "A file below .agents/skills, named after its directory.",
+            "filePath": "<tmp>/repo/app/src/.agents/skills/pack/unnamed.md",
+            "baseDir": "<tmp>/repo/app/src/.agents/skills/pack",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/app/src/.agents/skills/pack/unnamed.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/app/src/.agents"
+            }
+          },
+          {
+            "name": "src-skill",
+            "description": "In the working directory.",
+            "filePath": "<tmp>/repo/app/src/.agents/skills/src-skill/SKILL.md",
+            "baseDir": "<tmp>/repo/app/src/.agents/skills/src-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/app/src/.agents/skills/src-skill/SKILL.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/app/src/.agents"
+            }
+          },
+          {
+            "name": "app-skill",
+            "description": "In the app directory.",
+            "filePath": "<tmp>/repo/app/.agents/skills/app-skill/SKILL.md",
+            "baseDir": "<tmp>/repo/app/.agents/skills/app-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/app/.agents/skills/app-skill/SKILL.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/app/.agents"
+            }
+          },
+          {
+            "name": "root-skill",
+            "description": "At the repository root.",
+            "filePath": "<tmp>/repo/.agents/skills/root-skill/SKILL.md",
+            "baseDir": "<tmp>/repo/.agents/skills/root-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/.agents/skills/root-skill/SKILL.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/.agents"
+            }
+          },
+          {
+            "name": "user-skill",
+            "description": "In ~/.agents/skills.",
+            "filePath": "<tmp>/home/.agents/skills/user-skill/SKILL.md",
+            "baseDir": "<tmp>/home/.agents/skills/user-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/home/.agents/skills/user-skill/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/home/.agents"
+            }
+          }
+        ],
+        "skillDiagnostics": [],
+        "prompts": [],
+        "promptDiagnostics": []
+      }
+    },
+    {
+      "name": "agents-directories-without-repository",
+      "description": "Without a repository, every ancestor's .agents/skills is a project directory, except the home directory's, which stays the user's.",
+      "files": {
+        ".agents/skills/outer/SKILL.md": "---\ndescription: Above the home directory.\n---\nInstructions.\n",
+        "home/.agents/skills/user-skill/SKILL.md": "---\ndescription: In ~/.agents/skills.\n---\nInstructions.\n",
+        "home/work/.agents/skills/work-skill/SKILL.md": "---\ndescription: In the working directory.\n---\nInstructions.\n"
+      },
+      "symlinks": {},
+      "cwd": "home/work",
+      "trusted": true,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "work-skill",
+            "description": "In the working directory.",
+            "filePath": "<tmp>/home/work/.agents/skills/work-skill/SKILL.md",
+            "baseDir": "<tmp>/home/work/.agents/skills/work-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/home/work/.agents/skills/work-skill/SKILL.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/home/work/.agents"
+            }
+          },
+          {
+            "name": "outer",
+            "description": "Above the home directory.",
+            "filePath": "<tmp>/.agents/skills/outer/SKILL.md",
+            "baseDir": "<tmp>/.agents/skills/outer",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/.agents/skills/outer/SKILL.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/.agents"
+            }
+          },
+          {
+            "name": "user-skill",
+            "description": "In ~/.agents/skills.",
+            "filePath": "<tmp>/home/.agents/skills/user-skill/SKILL.md",
+            "baseDir": "<tmp>/home/.agents/skills/user-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/home/.agents/skills/user-skill/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/home/.agents"
+            }
+          }
+        ],
+        "skillDiagnostics": [],
+        "prompts": [],
+        "promptDiagnostics": []
+      }
+    },
+    {
+      "name": "untrusted-project-below-home",
+      "description": "~/.agents/skills loads for an untrusted project below the home directory.",
+      "files": {
+        "home/.agents/skills/user-skill/SKILL.md": "---\ndescription: In ~/.agents/skills.\n---\nInstructions.\n",
+        "home/work/.agents/skills/work-skill/SKILL.md": "---\ndescription: In the working directory.\n---\nInstructions.\n"
+      },
+      "symlinks": {},
+      "cwd": "home/work",
+      "trusted": false,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "user-skill",
+            "description": "In ~/.agents/skills.",
+            "filePath": "<tmp>/home/.agents/skills/user-skill/SKILL.md",
+            "baseDir": "<tmp>/home/.agents/skills/user-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/home/.agents/skills/user-skill/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/home/.agents"
+            }
+          }
+        ],
+        "skillDiagnostics": [],
+        "prompts": [],
+        "promptDiagnostics": []
+      }
+    },
+    {
+      "name": "frontmatter-rules",
+      "description": "A skill needs a description. A name defaults to the directory's. Names and descriptions outside the Agent Skills rules load with warnings; malformed frontmatter does not load.",
+      "files": {
+        "agent/skills/Bad_Name/SKILL.md": "---\ndescription: Named after a directory with invalid characters.\n---\nInstructions.\n",
+        "agent/skills/blank-description/SKILL.md": "---\ndescription: \"   \"\n---\nInstructions.\n",
+        "agent/skills/block-description/SKILL.md": "---\ndescription: >\n  Extract text and tables from PDF files.\n  Use when reading PDFs.\n---\nInstructions.\n",
+        "agent/skills/crlf/SKILL.md": "<bom>---\r\nname: crlf\r\ndescription: Windows line endings.\r\n---\r\nBody.\r\n",
+        "agent/skills/empty-name/SKILL.md": "---\nname: \"\"\ndescription: An empty name.\n---\nInstructions.\n",
+        "agent/skills/hidden/SKILL.md": "---\ndescription: Only by command.\ndisable-model-invocation: true\n---\nInstructions.\n",
+        "agent/skills/hyphens/SKILL.md": "---\nname: -lead--double-\ndescription: Hyphens in the wrong places.\n---\nInstructions.\n",
+        "agent/skills/list-description/SKILL.md": "---\ndescription:\n  - not\n  - a string\n---\nInstructions.\n",
+        "agent/skills/long-description/SKILL.md": "---\ndescription: ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n---\nInstructions.\n",
+        "agent/skills/long-name/SKILL.md": "---\nname: nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn\ndescription: A name that is too long.\n---\nInstructions.\n",
+        "agent/skills/malformed-note.md": "---\ndescription: Use when: broken\n---\nbody\n",
+        "agent/skills/malformed/SKILL.md": "---\ndescription: Use when: broken\n---\nbody\n",
+        "agent/skills/missing-description/SKILL.md": "---\nname: missing-description\n---\nInstructions.\n",
+        "agent/skills/no-frontmatter/SKILL.md": "Just text.\n",
+        "agent/skills/numeric-name/SKILL.md": "---\nname: 123\ndescription: A name that is a number.\n---\nInstructions.\n",
+        "agent/skills/quoted-flag/SKILL.md": "---\ndescription: A quoted flag.\ndisable-model-invocation: \"true\"\n---\nInstructions.\n",
+        "agent/skills/renamed/SKILL.md": "---\nname: other-name\ndescription: Named unlike its directory.\n---\nInstructions.\n",
+        "agent/skills/special/SKILL.md": "---\ndescription: \"Café <tags> & \\\"quotes\\\" — it's fine\"\n---\nInstructions.\n",
+        "agent/prompts/malformed.md": "---\ndescription: Use when: broken\n---\nbody\n",
+        "agent/prompts/number-description.md": "---\ndescription: 42\nargument-hint: [focus]\n---\nThe body's first line.\n",
+        "agent/prompts/only-frontmatter.md": "---\ndescription: Nothing else\n---\n",
+        "agent/prompts/empty.md": "",
+        "agent/prompts/crlf.md": "<bom>---\r\ndescription: Windows\r\n---\r\nLine one\r\nLine two\r\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": true,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "Bad_Name",
+            "description": "Named after a directory with invalid characters.",
+            "filePath": "<tmp>/agent/skills/Bad_Name/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/Bad_Name",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/Bad_Name/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "block-description",
+            "description": "Extract text and tables from PDF files. Use when reading PDFs.\n",
+            "filePath": "<tmp>/agent/skills/block-description/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/block-description",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/block-description/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "crlf",
+            "description": "Windows line endings.",
+            "filePath": "<tmp>/agent/skills/crlf/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/crlf",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/crlf/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "empty-name",
+            "description": "An empty name.",
+            "filePath": "<tmp>/agent/skills/empty-name/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/empty-name",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/empty-name/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "hidden",
+            "description": "Only by command.",
+            "filePath": "<tmp>/agent/skills/hidden/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/hidden",
+            "disableModelInvocation": true,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/hidden/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "-lead--double-",
+            "description": "Hyphens in the wrong places.",
+            "filePath": "<tmp>/agent/skills/hyphens/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/hyphens",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/hyphens/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "long-description",
+            "description": "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "filePath": "<tmp>/agent/skills/long-description/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/long-description",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/long-description/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+            "description": "A name that is too long.",
+            "filePath": "<tmp>/agent/skills/long-name/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/long-name",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/long-name/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "numeric-name",
+            "description": "A name that is a number.",
+            "filePath": "<tmp>/agent/skills/numeric-name/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/numeric-name",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/numeric-name/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "quoted-flag",
+            "description": "A quoted flag.",
+            "filePath": "<tmp>/agent/skills/quoted-flag/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/quoted-flag",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/quoted-flag/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "other-name",
+            "description": "Named unlike its directory.",
+            "filePath": "<tmp>/agent/skills/renamed/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/renamed",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/renamed/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "special",
+            "description": "Café <tags> & \"quotes\" — it's fine",
+            "filePath": "<tmp>/agent/skills/special/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/special",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/special/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "skillDiagnostics": [
+          {
+            "type": "warning",
+            "message": "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)",
+            "path": "<tmp>/agent/skills/Bad_Name/SKILL.md"
+          },
+          {
+            "type": "warning",
+            "message": "description is required",
+            "path": "<tmp>/agent/skills/blank-description/SKILL.md"
+          },
+          {
+            "type": "warning",
+            "message": "name must not start or end with a hyphen",
+            "path": "<tmp>/agent/skills/hyphens/SKILL.md"
+          },
+          {
+            "type": "warning",
+            "message": "name must not contain consecutive hyphens",
+            "path": "<tmp>/agent/skills/hyphens/SKILL.md"
+          },
+          {
+            "type": "warning",
+            "message": "description is required",
+            "path": "<tmp>/agent/skills/list-description/SKILL.md"
+          },
+          {
+            "type": "warning",
+            "message": "description exceeds 1024 characters (1025)",
+            "path": "<tmp>/agent/skills/long-description/SKILL.md"
+          },
+          {
+            "type": "warning",
+            "message": "name exceeds 64 characters (65)",
+            "path": "<tmp>/agent/skills/long-name/SKILL.md"
+          },
+          {
+            "type": "warning",
+            "message": "<yaml-error>",
+            "path": "<tmp>/agent/skills/malformed/SKILL.md"
+          },
+          {
+            "type": "warning",
+            "message": "description is required",
+            "path": "<tmp>/agent/skills/missing-description/SKILL.md"
+          },
+          {
+            "type": "warning",
+            "message": "description is required",
+            "path": "<tmp>/agent/skills/no-frontmatter/SKILL.md"
+          }
+        ],
+        "prompts": [
+          {
+            "name": "crlf",
+            "description": "Windows",
+            "argumentHint": null,
+            "content": "Line one\nLine two",
+            "filePath": "<tmp>/agent/prompts/crlf.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/crlf.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "empty",
+            "description": "",
+            "argumentHint": null,
+            "content": "",
+            "filePath": "<tmp>/agent/prompts/empty.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/empty.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "number-description",
+            "description": "The body's first line.",
+            "argumentHint": null,
+            "content": "The body's first line.",
+            "filePath": "<tmp>/agent/prompts/number-description.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/number-description.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "only-frontmatter",
+            "description": "Nothing else",
+            "argumentHint": null,
+            "content": "",
+            "filePath": "<tmp>/agent/prompts/only-frontmatter.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/only-frontmatter.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "promptDiagnostics": [
+          {
+            "type": "warning",
+            "message": "<yaml-error>",
+            "path": "<tmp>/agent/prompts/malformed.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "name-collisions",
+      "description": "The first skill or template of a name wins and each later one is reported. A file reached by two paths loads once, without a report.",
+      "files": {
+        "repo/.git/HEAD": "ref: refs/heads/main\n",
+        "repo/.pi/skills/shared/SKILL.md": "---\ndescription: The project's.\n---\nInstructions.\n",
+        "repo/.agents/skills/shared/SKILL.md": "---\ndescription: The project's .agents.\n---\nInstructions.\n",
+        "agent/skills/shared/SKILL.md": "---\ndescription: The user's.\n---\nInstructions.\n",
+        "agent/skills/other/SKILL.md": "---\nname: shared\ndescription: The user's, under another directory.\n---\nInstructions.\n",
+        "home/.agents/skills/shared/SKILL.md": "---\ndescription: The user's .agents.\n---\nInstructions.\n",
+        "store/real/SKILL.md": "---\ndescription: Reached by a link and by a flag.\n---\nInstructions.\n",
+        "cli/shared/SKILL.md": "---\ndescription: The command line's.\n---\nInstructions.\n",
+        "repo/.pi/prompts/review.md": "The project's.\n",
+        "agent/prompts/review.md": "The user's.\n",
+        "cli/review.md": "The command line's.\n"
+      },
+      "symlinks": {
+        "agent/skills/linked": "store/real"
+      },
+      "cwd": "repo",
+      "trusted": true,
+      "flags": {
+        "skill": [
+          "<tmp>/store/real",
+          "<tmp>/cli/shared"
+        ],
+        "noSkills": false,
+        "promptTemplate": [
+          "<tmp>/cli/review.md"
+        ],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "shared",
+            "description": "The project's.",
+            "filePath": "<tmp>/repo/.pi/skills/shared/SKILL.md",
+            "baseDir": "<tmp>/repo/.pi/skills/shared",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/.pi/skills/shared/SKILL.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/.pi"
+            }
+          },
+          {
+            "name": "linked",
+            "description": "Reached by a link and by a flag.",
+            "filePath": "<tmp>/agent/skills/linked/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/linked",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/linked/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "skillDiagnostics": [
+          {
+            "type": "collision",
+            "message": "name \"shared\" collision",
+            "path": "<tmp>/repo/.agents/skills/shared/SKILL.md",
+            "collision": {
+              "resourceType": "skill",
+              "name": "shared",
+              "winnerPath": "<tmp>/repo/.pi/skills/shared/SKILL.md",
+              "loserPath": "<tmp>/repo/.agents/skills/shared/SKILL.md"
+            }
+          },
+          {
+            "type": "collision",
+            "message": "name \"shared\" collision",
+            "path": "<tmp>/agent/skills/other/SKILL.md",
+            "collision": {
+              "resourceType": "skill",
+              "name": "shared",
+              "winnerPath": "<tmp>/repo/.pi/skills/shared/SKILL.md",
+              "loserPath": "<tmp>/agent/skills/other/SKILL.md"
+            }
+          },
+          {
+            "type": "collision",
+            "message": "name \"shared\" collision",
+            "path": "<tmp>/agent/skills/shared/SKILL.md",
+            "collision": {
+              "resourceType": "skill",
+              "name": "shared",
+              "winnerPath": "<tmp>/repo/.pi/skills/shared/SKILL.md",
+              "loserPath": "<tmp>/agent/skills/shared/SKILL.md"
+            }
+          },
+          {
+            "type": "collision",
+            "message": "name \"shared\" collision",
+            "path": "<tmp>/home/.agents/skills/shared/SKILL.md",
+            "collision": {
+              "resourceType": "skill",
+              "name": "shared",
+              "winnerPath": "<tmp>/repo/.pi/skills/shared/SKILL.md",
+              "loserPath": "<tmp>/home/.agents/skills/shared/SKILL.md"
+            }
+          },
+          {
+            "type": "collision",
+            "message": "name \"shared\" collision",
+            "path": "<tmp>/cli/shared/SKILL.md",
+            "collision": {
+              "resourceType": "skill",
+              "name": "shared",
+              "winnerPath": "<tmp>/repo/.pi/skills/shared/SKILL.md",
+              "loserPath": "<tmp>/cli/shared/SKILL.md"
+            }
+          }
+        ],
+        "prompts": [
+          {
+            "name": "review",
+            "description": "The project's.",
+            "argumentHint": null,
+            "content": "The project's.\n",
+            "filePath": "<tmp>/repo/.pi/prompts/review.md",
+            "sourceInfo": {
+              "path": "<tmp>/repo/.pi/prompts/review.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/.pi"
+            }
+          }
+        ],
+        "promptDiagnostics": [
+          {
+            "type": "collision",
+            "message": "name \"/review\" collision",
+            "path": "<tmp>/agent/prompts/review.md",
+            "collision": {
+              "resourceType": "prompt",
+              "name": "review",
+              "winnerPath": "<tmp>/repo/.pi/prompts/review.md",
+              "loserPath": "<tmp>/agent/prompts/review.md"
+            }
+          },
+          {
+            "type": "collision",
+            "message": "name \"/review\" collision",
+            "path": "<tmp>/cli/review.md",
+            "collision": {
+              "resourceType": "prompt",
+              "name": "review",
+              "winnerPath": "<tmp>/repo/.pi/prompts/review.md",
+              "loserPath": "<tmp>/cli/review.md"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "explicit-paths",
+      "description": "--skill and --prompt-template take files and directories, relative to the working directory or below ~, and load after everything discovered. A path that does not exist, or a skill path that is not Markdown, is reported.",
+      "files": {
+        "agent/skills/alpha/SKILL.md": "---\nname: alpha\ndescription: The alpha skill.\n---\nInstructions.\n",
+        "agent/prompts/review.md": "---\ndescription: Review staged changes\nargument-hint: \"[focus]\"\n---\nReview the staged changes. Focus on ${1:-correctness}.\n",
+        "agent/settings.json": "{\"skills\":[\"extra-skills\"],\"prompts\":[\"extra-prompts\"]}",
+        "agent/extra-skills/from-settings/SKILL.md": "---\ndescription: From the skills setting.\n---\nInstructions.\n",
+        "agent/extra-prompts/from-settings.md": "From the prompts setting.\n",
+        "cli/one/SKILL.md": "---\nname: one\ndescription: Given as a SKILL.md file.\n---\nInstructions.\n",
+        "cli/two/SKILL.md": "---\ndescription: Given as its directory.\n---\nInstructions.\n",
+        "cli/two/scripts/run.sh": "#!/bin/sh\n",
+        "cli/many/a/SKILL.md": "---\ndescription: First of a directory of skills.\n---\nInstructions.\n",
+        "cli/many/b/SKILL.md": "---\ndescription: Second of a directory of skills.\n---\nInstructions.\n",
+        "cli/many/b/references/guide.md": "---\ndescription: A reference.\n---\nInstructions.\n",
+        "cli/many/note.md": "---\nname: note\ndescription: A Markdown file in the given directory.\n---\nInstructions.\n",
+        "cli/many/plain.md": "No description.\n",
+        "cli/plain.md": "No description.\n",
+        "cli/tool.sh": "#!/bin/sh\n",
+        "cli/declared/SKILL.md": "No description either.\n",
+        "cli/prompts/explain.md": "---\ndescription: Explain something\n---\nExplain $@.\n",
+        "cli/prompt-dir/a.md": "Prompt a.\n",
+        "cli/prompt-dir/b.md": "Prompt b.\n",
+        "cli/prompt-dir/c.txt": "Not Markdown.\n",
+        "cli/prompt-dir/sub/d.md": "Not a direct child.\n",
+        "repo/relative/rel/SKILL.md": "---\ndescription: Given relative to the working directory.\n---\nInstructions.\n",
+        "home/home-skill/SKILL.md": "---\ndescription: Given below the home directory.\n---\nInstructions.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": true,
+      "flags": {
+        "skill": [
+          "<tmp>/cli/one/SKILL.md",
+          "<tmp>/cli/two",
+          "<tmp>/cli/many",
+          "relative/rel",
+          "~/home-skill",
+          "<tmp>/cli/missing",
+          "<tmp>/cli/tool.sh",
+          "<tmp>/cli/plain.md",
+          "<tmp>/cli/declared/SKILL.md"
+        ],
+        "noSkills": false,
+        "promptTemplate": [
+          "<tmp>/cli/prompts/explain.md",
+          "<tmp>/cli/prompt-dir",
+          "<tmp>/cli/missing.md",
+          "<tmp>/cli/tool.sh"
+        ],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "from-settings",
+            "description": "From the skills setting.",
+            "filePath": "<tmp>/agent/extra-skills/from-settings/SKILL.md",
+            "baseDir": "<tmp>/agent/extra-skills/from-settings",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/extra-skills/from-settings/SKILL.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "alpha",
+            "description": "The alpha skill.",
+            "filePath": "<tmp>/agent/skills/alpha/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/alpha",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/alpha/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "one",
+            "description": "Given as a SKILL.md file.",
+            "filePath": "<tmp>/cli/one/SKILL.md",
+            "baseDir": "<tmp>/cli/one",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/one/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/one"
+            }
+          },
+          {
+            "name": "two",
+            "description": "Given as its directory.",
+            "filePath": "<tmp>/cli/two/SKILL.md",
+            "baseDir": "<tmp>/cli/two",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/two/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/two"
+            }
+          },
+          {
+            "name": "a",
+            "description": "First of a directory of skills.",
+            "filePath": "<tmp>/cli/many/a/SKILL.md",
+            "baseDir": "<tmp>/cli/many/a",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/many/a/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/many/a"
+            }
+          },
+          {
+            "name": "b",
+            "description": "Second of a directory of skills.",
+            "filePath": "<tmp>/cli/many/b/SKILL.md",
+            "baseDir": "<tmp>/cli/many/b",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/many/b/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/many/b"
+            }
+          },
+          {
+            "name": "note",
+            "description": "A Markdown file in the given directory.",
+            "filePath": "<tmp>/cli/many/note.md",
+            "baseDir": "<tmp>/cli/many",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/many/note.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/many"
+            }
+          },
+          {
+            "name": "rel",
+            "description": "Given relative to the working directory.",
+            "filePath": "<tmp>/repo/relative/rel/SKILL.md",
+            "baseDir": "<tmp>/repo/relative/rel",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/relative/rel/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/relative/rel"
+            }
+          },
+          {
+            "name": "home-skill",
+            "description": "Given below the home directory.",
+            "filePath": "<tmp>/home/home-skill/SKILL.md",
+            "baseDir": "<tmp>/home/home-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/home/home-skill/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/home/home-skill"
+            }
+          }
+        ],
+        "skillDiagnostics": [
+          {
+            "type": "warning",
+            "message": "skill path does not exist",
+            "path": "<tmp>/cli/missing"
+          },
+          {
+            "type": "warning",
+            "message": "skill path is not a markdown file",
+            "path": "<tmp>/cli/tool.sh"
+          },
+          {
+            "type": "warning",
+            "message": "description is required",
+            "path": "<tmp>/cli/declared/SKILL.md"
+          }
+        ],
+        "prompts": [
+          {
+            "name": "from-settings",
+            "description": "From the prompts setting.",
+            "argumentHint": null,
+            "content": "From the prompts setting.\n",
+            "filePath": "<tmp>/agent/extra-prompts/from-settings.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/extra-prompts/from-settings.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "review",
+            "description": "Review staged changes",
+            "argumentHint": "[focus]",
+            "content": "Review the staged changes. Focus on ${1:-correctness}.",
+            "filePath": "<tmp>/agent/prompts/review.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/review.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "explain",
+            "description": "Explain something",
+            "argumentHint": null,
+            "content": "Explain $@.",
+            "filePath": "<tmp>/cli/prompts/explain.md",
+            "sourceInfo": {
+              "path": "<tmp>/cli/prompts/explain.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/prompts"
+            }
+          },
+          {
+            "name": "a",
+            "description": "Prompt a.",
+            "argumentHint": null,
+            "content": "Prompt a.\n",
+            "filePath": "<tmp>/cli/prompt-dir/a.md",
+            "sourceInfo": {
+              "path": "<tmp>/cli/prompt-dir/a.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/prompt-dir"
+            }
+          },
+          {
+            "name": "b",
+            "description": "Prompt b.",
+            "argumentHint": null,
+            "content": "Prompt b.\n",
+            "filePath": "<tmp>/cli/prompt-dir/b.md",
+            "sourceInfo": {
+              "path": "<tmp>/cli/prompt-dir/b.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/prompt-dir"
+            }
+          }
+        ],
+        "promptDiagnostics": [
+          {
+            "type": "error",
+            "message": "Prompt template path does not exist",
+            "path": "<tmp>/cli/missing.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "no-skills-and-no-prompt-templates",
+      "description": "--no-skills and --no-prompt-templates drop what is discovered or configured and keep the explicit paths.",
+      "files": {
+        "agent/skills/alpha/SKILL.md": "---\nname: alpha\ndescription: The alpha skill.\n---\nInstructions.\n",
+        "agent/prompts/review.md": "---\ndescription: Review staged changes\nargument-hint: \"[focus]\"\n---\nReview the staged changes. Focus on ${1:-correctness}.\n",
+        "agent/settings.json": "{\"skills\":[\"extra-skills\"],\"prompts\":[\"extra-prompts\"]}",
+        "agent/extra-skills/from-settings/SKILL.md": "---\ndescription: From the skills setting.\n---\nInstructions.\n",
+        "agent/extra-prompts/from-settings.md": "From the prompts setting.\n",
+        "cli/one/SKILL.md": "---\nname: one\ndescription: Given as a SKILL.md file.\n---\nInstructions.\n",
+        "cli/two/SKILL.md": "---\ndescription: Given as its directory.\n---\nInstructions.\n",
+        "cli/two/scripts/run.sh": "#!/bin/sh\n",
+        "cli/many/a/SKILL.md": "---\ndescription: First of a directory of skills.\n---\nInstructions.\n",
+        "cli/many/b/SKILL.md": "---\ndescription: Second of a directory of skills.\n---\nInstructions.\n",
+        "cli/many/b/references/guide.md": "---\ndescription: A reference.\n---\nInstructions.\n",
+        "cli/many/note.md": "---\nname: note\ndescription: A Markdown file in the given directory.\n---\nInstructions.\n",
+        "cli/many/plain.md": "No description.\n",
+        "cli/plain.md": "No description.\n",
+        "cli/tool.sh": "#!/bin/sh\n",
+        "cli/declared/SKILL.md": "No description either.\n",
+        "cli/prompts/explain.md": "---\ndescription: Explain something\n---\nExplain $@.\n",
+        "cli/prompt-dir/a.md": "Prompt a.\n",
+        "cli/prompt-dir/b.md": "Prompt b.\n",
+        "cli/prompt-dir/c.txt": "Not Markdown.\n",
+        "cli/prompt-dir/sub/d.md": "Not a direct child.\n",
+        "repo/relative/rel/SKILL.md": "---\ndescription: Given relative to the working directory.\n---\nInstructions.\n",
+        "home/home-skill/SKILL.md": "---\ndescription: Given below the home directory.\n---\nInstructions.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": true,
+      "flags": {
+        "skill": [
+          "<tmp>/cli/one/SKILL.md",
+          "<tmp>/cli/two",
+          "<tmp>/cli/many",
+          "relative/rel",
+          "~/home-skill",
+          "<tmp>/cli/missing",
+          "<tmp>/cli/tool.sh",
+          "<tmp>/cli/plain.md",
+          "<tmp>/cli/declared/SKILL.md"
+        ],
+        "noSkills": true,
+        "promptTemplate": [
+          "<tmp>/cli/prompts/explain.md",
+          "<tmp>/cli/prompt-dir",
+          "<tmp>/cli/missing.md",
+          "<tmp>/cli/tool.sh"
+        ],
+        "noPromptTemplates": true
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "one",
+            "description": "Given as a SKILL.md file.",
+            "filePath": "<tmp>/cli/one/SKILL.md",
+            "baseDir": "<tmp>/cli/one",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/one/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/one"
+            }
+          },
+          {
+            "name": "two",
+            "description": "Given as its directory.",
+            "filePath": "<tmp>/cli/two/SKILL.md",
+            "baseDir": "<tmp>/cli/two",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/two/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/two"
+            }
+          },
+          {
+            "name": "a",
+            "description": "First of a directory of skills.",
+            "filePath": "<tmp>/cli/many/a/SKILL.md",
+            "baseDir": "<tmp>/cli/many/a",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/many/a/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/many/a"
+            }
+          },
+          {
+            "name": "b",
+            "description": "Second of a directory of skills.",
+            "filePath": "<tmp>/cli/many/b/SKILL.md",
+            "baseDir": "<tmp>/cli/many/b",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/many/b/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/many/b"
+            }
+          },
+          {
+            "name": "note",
+            "description": "A Markdown file in the given directory.",
+            "filePath": "<tmp>/cli/many/note.md",
+            "baseDir": "<tmp>/cli/many",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/cli/many/note.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/many"
+            }
+          },
+          {
+            "name": "rel",
+            "description": "Given relative to the working directory.",
+            "filePath": "<tmp>/repo/relative/rel/SKILL.md",
+            "baseDir": "<tmp>/repo/relative/rel",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/relative/rel/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/relative/rel"
+            }
+          },
+          {
+            "name": "home-skill",
+            "description": "Given below the home directory.",
+            "filePath": "<tmp>/home/home-skill/SKILL.md",
+            "baseDir": "<tmp>/home/home-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/home/home-skill/SKILL.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/home/home-skill"
+            }
+          }
+        ],
+        "skillDiagnostics": [
+          {
+            "type": "warning",
+            "message": "skill path does not exist",
+            "path": "<tmp>/cli/missing"
+          },
+          {
+            "type": "warning",
+            "message": "skill path is not a markdown file",
+            "path": "<tmp>/cli/tool.sh"
+          },
+          {
+            "type": "warning",
+            "message": "description is required",
+            "path": "<tmp>/cli/declared/SKILL.md"
+          }
+        ],
+        "prompts": [
+          {
+            "name": "explain",
+            "description": "Explain something",
+            "argumentHint": null,
+            "content": "Explain $@.",
+            "filePath": "<tmp>/cli/prompts/explain.md",
+            "sourceInfo": {
+              "path": "<tmp>/cli/prompts/explain.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/prompts"
+            }
+          },
+          {
+            "name": "a",
+            "description": "Prompt a.",
+            "argumentHint": null,
+            "content": "Prompt a.\n",
+            "filePath": "<tmp>/cli/prompt-dir/a.md",
+            "sourceInfo": {
+              "path": "<tmp>/cli/prompt-dir/a.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/prompt-dir"
+            }
+          },
+          {
+            "name": "b",
+            "description": "Prompt b.",
+            "argumentHint": null,
+            "content": "Prompt b.\n",
+            "filePath": "<tmp>/cli/prompt-dir/b.md",
+            "sourceInfo": {
+              "path": "<tmp>/cli/prompt-dir/b.md",
+              "source": "local",
+              "scope": "temporary",
+              "origin": "top-level",
+              "baseDir": "<tmp>/cli/prompt-dir"
+            }
+          }
+        ],
+        "promptDiagnostics": [
+          {
+            "type": "error",
+            "message": "Prompt template path does not exist",
+            "path": "<tmp>/cli/missing.md"
+          }
+        ]
+      }
+    },
+    {
+      "name": "no-skills-without-paths",
+      "description": "--no-skills and --no-prompt-templates alone load nothing.",
+      "files": {
+        "agent/skills/alpha/SKILL.md": "---\nname: alpha\ndescription: The alpha skill.\n---\nInstructions.\n",
+        "agent/prompts/review.md": "---\ndescription: Review staged changes\nargument-hint: \"[focus]\"\n---\nReview the staged changes. Focus on ${1:-correctness}.\n",
+        "agent/settings.json": "{\"skills\":[\"extra-skills\"],\"prompts\":[\"extra-prompts\"]}",
+        "agent/extra-skills/from-settings/SKILL.md": "---\ndescription: From the skills setting.\n---\nInstructions.\n",
+        "agent/extra-prompts/from-settings.md": "From the prompts setting.\n",
+        "cli/one/SKILL.md": "---\nname: one\ndescription: Given as a SKILL.md file.\n---\nInstructions.\n",
+        "cli/two/SKILL.md": "---\ndescription: Given as its directory.\n---\nInstructions.\n",
+        "cli/two/scripts/run.sh": "#!/bin/sh\n",
+        "cli/many/a/SKILL.md": "---\ndescription: First of a directory of skills.\n---\nInstructions.\n",
+        "cli/many/b/SKILL.md": "---\ndescription: Second of a directory of skills.\n---\nInstructions.\n",
+        "cli/many/b/references/guide.md": "---\ndescription: A reference.\n---\nInstructions.\n",
+        "cli/many/note.md": "---\nname: note\ndescription: A Markdown file in the given directory.\n---\nInstructions.\n",
+        "cli/many/plain.md": "No description.\n",
+        "cli/plain.md": "No description.\n",
+        "cli/tool.sh": "#!/bin/sh\n",
+        "cli/declared/SKILL.md": "No description either.\n",
+        "cli/prompts/explain.md": "---\ndescription: Explain something\n---\nExplain $@.\n",
+        "cli/prompt-dir/a.md": "Prompt a.\n",
+        "cli/prompt-dir/b.md": "Prompt b.\n",
+        "cli/prompt-dir/c.txt": "Not Markdown.\n",
+        "cli/prompt-dir/sub/d.md": "Not a direct child.\n",
+        "repo/relative/rel/SKILL.md": "---\ndescription: Given relative to the working directory.\n---\nInstructions.\n",
+        "home/home-skill/SKILL.md": "---\ndescription: Given below the home directory.\n---\nInstructions.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": true,
+      "flags": {
+        "skill": [],
+        "noSkills": true,
+        "promptTemplate": [],
+        "noPromptTemplates": true
+      },
+      "result": {
+        "skills": [],
+        "skillDiagnostics": [],
+        "prompts": [],
+        "promptDiagnostics": []
+      }
+    },
+    {
+      "name": "settings-paths",
+      "description": "The skills and prompts settings name files and directories, relative to the agent dir or the project's .pi. A skills directory gives its skills, not its scripts and references; a prompts directory gives every Markdown file below it. Order: project setting, project directory, user setting, user directory.",
+      "files": {
+        "agent/settings.json": "{\"skills\":[\"team-skills\",\"<tmp>/shared/solo/SKILL.md\"],\"prompts\":[\"team-prompts\"]}",
+        "agent/team-skills/review/SKILL.md": "---\ndescription: From a directory in the user skills setting.\n---\nInstructions.\n",
+        "agent/team-skills/review/scripts/check.sh": "#!/bin/sh\n",
+        "agent/team-skills/review/references/rules.md": "---\ndescription: A reference, not a skill.\n---\nInstructions.\n",
+        "agent/team-skills/root.md": "---\nname: root\ndescription: A Markdown file in the configured directory.\n---\nInstructions.\n",
+        "agent/team-skills/sub/notes.md": "---\ndescription: Not a skill, in a subdirectory without SKILL.md.\n---\nInstructions.\n",
+        "agent/team-prompts/standup.md": "Write the standup.\n",
+        "agent/team-prompts/deep/retro.md": "Write the retro.\n",
+        "agent/team-prompts/deep/data.json": "{}\n",
+        "agent/skills/user-auto/SKILL.md": "---\ndescription: From the user skills directory.\n---\nInstructions.\n",
+        "agent/prompts/user-auto.md": "From the user prompts directory.\n",
+        "shared/solo/SKILL.md": "---\nname: solo\ndescription: A file in the user skills setting.\n---\nInstructions.\n",
+        "repo/.pi/settings.json": "{\"skills\":[\"../project-skills\"],\"prompts\":[\"../project-prompts/one.md\"]}",
+        "repo/project-skills/lint/SKILL.md": "---\ndescription: From the project skills setting.\n---\nInstructions.\n",
+        "repo/project-prompts/one.md": "From the project prompts setting.\n",
+        "repo/project-prompts/two.md": "Not listed in the setting.\n",
+        "repo/.pi/skills/project-auto/SKILL.md": "---\ndescription: From the project skills directory.\n---\nInstructions.\n",
+        "repo/.pi/prompts/project-auto.md": "From the project prompts directory.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": true,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "lint",
+            "description": "From the project skills setting.",
+            "filePath": "<tmp>/repo/project-skills/lint/SKILL.md",
+            "baseDir": "<tmp>/repo/project-skills/lint",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/project-skills/lint/SKILL.md",
+              "source": "local",
+              "scope": "project",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "project-auto",
+            "description": "From the project skills directory.",
+            "filePath": "<tmp>/repo/.pi/skills/project-auto/SKILL.md",
+            "baseDir": "<tmp>/repo/.pi/skills/project-auto",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/repo/.pi/skills/project-auto/SKILL.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/.pi"
+            }
+          },
+          {
+            "name": "review",
+            "description": "From a directory in the user skills setting.",
+            "filePath": "<tmp>/agent/team-skills/review/SKILL.md",
+            "baseDir": "<tmp>/agent/team-skills/review",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/team-skills/review/SKILL.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "root",
+            "description": "A Markdown file in the configured directory.",
+            "filePath": "<tmp>/agent/team-skills/root.md",
+            "baseDir": "<tmp>/agent/team-skills",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/team-skills/root.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "solo",
+            "description": "A file in the user skills setting.",
+            "filePath": "<tmp>/shared/solo/SKILL.md",
+            "baseDir": "<tmp>/shared/solo",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/shared/solo/SKILL.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "user-auto",
+            "description": "From the user skills directory.",
+            "filePath": "<tmp>/agent/skills/user-auto/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/user-auto",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/user-auto/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "skillDiagnostics": [],
+        "prompts": [
+          {
+            "name": "one",
+            "description": "From the project prompts setting.",
+            "argumentHint": null,
+            "content": "From the project prompts setting.\n",
+            "filePath": "<tmp>/repo/project-prompts/one.md",
+            "sourceInfo": {
+              "path": "<tmp>/repo/project-prompts/one.md",
+              "source": "local",
+              "scope": "project",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "project-auto",
+            "description": "From the project prompts directory.",
+            "argumentHint": null,
+            "content": "From the project prompts directory.\n",
+            "filePath": "<tmp>/repo/.pi/prompts/project-auto.md",
+            "sourceInfo": {
+              "path": "<tmp>/repo/.pi/prompts/project-auto.md",
+              "source": "auto",
+              "scope": "project",
+              "origin": "top-level",
+              "baseDir": "<tmp>/repo/.pi"
+            }
+          },
+          {
+            "name": "retro",
+            "description": "Write the retro.",
+            "argumentHint": null,
+            "content": "Write the retro.\n",
+            "filePath": "<tmp>/agent/team-prompts/deep/retro.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/team-prompts/deep/retro.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "standup",
+            "description": "Write the standup.",
+            "argumentHint": null,
+            "content": "Write the standup.\n",
+            "filePath": "<tmp>/agent/team-prompts/standup.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/team-prompts/standup.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "user-auto",
+            "description": "From the user prompts directory.",
+            "argumentHint": null,
+            "content": "From the user prompts directory.\n",
+            "filePath": "<tmp>/agent/prompts/user-auto.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/user-auto.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "promptDiagnostics": []
+      }
+    },
+    {
+      "name": "settings-paths-untrusted",
+      "description": "An untrusted project's settings are not read.",
+      "files": {
+        "agent/settings.json": "{\"skills\":[\"team-skills\",\"<tmp>/shared/solo/SKILL.md\"],\"prompts\":[\"team-prompts\"]}",
+        "agent/team-skills/review/SKILL.md": "---\ndescription: From a directory in the user skills setting.\n---\nInstructions.\n",
+        "agent/team-skills/review/scripts/check.sh": "#!/bin/sh\n",
+        "agent/team-skills/review/references/rules.md": "---\ndescription: A reference, not a skill.\n---\nInstructions.\n",
+        "agent/team-skills/root.md": "---\nname: root\ndescription: A Markdown file in the configured directory.\n---\nInstructions.\n",
+        "agent/team-skills/sub/notes.md": "---\ndescription: Not a skill, in a subdirectory without SKILL.md.\n---\nInstructions.\n",
+        "agent/team-prompts/standup.md": "Write the standup.\n",
+        "agent/team-prompts/deep/retro.md": "Write the retro.\n",
+        "agent/team-prompts/deep/data.json": "{}\n",
+        "agent/skills/user-auto/SKILL.md": "---\ndescription: From the user skills directory.\n---\nInstructions.\n",
+        "agent/prompts/user-auto.md": "From the user prompts directory.\n",
+        "shared/solo/SKILL.md": "---\nname: solo\ndescription: A file in the user skills setting.\n---\nInstructions.\n",
+        "repo/.pi/settings.json": "{\"skills\":[\"../project-skills\"],\"prompts\":[\"../project-prompts/one.md\"]}",
+        "repo/project-skills/lint/SKILL.md": "---\ndescription: From the project skills setting.\n---\nInstructions.\n",
+        "repo/project-prompts/one.md": "From the project prompts setting.\n",
+        "repo/project-prompts/two.md": "Not listed in the setting.\n",
+        "repo/.pi/skills/project-auto/SKILL.md": "---\ndescription: From the project skills directory.\n---\nInstructions.\n",
+        "repo/.pi/prompts/project-auto.md": "From the project prompts directory.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": false,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "review",
+            "description": "From a directory in the user skills setting.",
+            "filePath": "<tmp>/agent/team-skills/review/SKILL.md",
+            "baseDir": "<tmp>/agent/team-skills/review",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/team-skills/review/SKILL.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "root",
+            "description": "A Markdown file in the configured directory.",
+            "filePath": "<tmp>/agent/team-skills/root.md",
+            "baseDir": "<tmp>/agent/team-skills",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/team-skills/root.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "solo",
+            "description": "A file in the user skills setting.",
+            "filePath": "<tmp>/shared/solo/SKILL.md",
+            "baseDir": "<tmp>/shared/solo",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/shared/solo/SKILL.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "user-auto",
+            "description": "From the user skills directory.",
+            "filePath": "<tmp>/agent/skills/user-auto/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/user-auto",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/user-auto/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "skillDiagnostics": [],
+        "prompts": [
+          {
+            "name": "retro",
+            "description": "Write the retro.",
+            "argumentHint": null,
+            "content": "Write the retro.\n",
+            "filePath": "<tmp>/agent/team-prompts/deep/retro.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/team-prompts/deep/retro.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "standup",
+            "description": "Write the standup.",
+            "argumentHint": null,
+            "content": "Write the standup.\n",
+            "filePath": "<tmp>/agent/team-prompts/standup.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/team-prompts/standup.md",
+              "source": "local",
+              "scope": "user",
+              "origin": "top-level"
+            }
+          },
+          {
+            "name": "user-auto",
+            "description": "From the user prompts directory.",
+            "argumentHint": null,
+            "content": "From the user prompts directory.\n",
+            "filePath": "<tmp>/agent/prompts/user-auto.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/user-auto.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "promptDiagnostics": []
+      }
+    },
+    {
+      "name": "local-package",
+      "description": "A package directory named in settings gives its skills and prompts after the user's own: by its manifest, or from its skills and prompts directories.",
+      "files": {
+        "agent/settings.json": "{\"packages\":[\"<tmp>/packages/manifest\",\"<tmp>/packages/convention\"]}",
+        "agent/skills/user-auto/SKILL.md": "---\ndescription: From the user skills directory.\n---\nInstructions.\n",
+        "agent/prompts/user-auto.md": "From the user prompts directory.\n",
+        "packages/manifest/package.json": "{\"name\":\"manifest\",\"pi\":{\"skills\":[\"tools\"],\"prompts\":[\"texts\"]}}",
+        "packages/manifest/tools/pack-skill/SKILL.md": "---\ndescription: From a package manifest's skills.\n---\nInstructions.\n",
+        "packages/manifest/tools/pack-skill/scripts/run.sh": "#!/bin/sh\n",
+        "packages/manifest/tools/pack-skill/references/guide.md": "---\ndescription: A reference, not a skill.\n---\nInstructions.\n",
+        "packages/manifest/tools/note.md": "---\nname: pack-note\ndescription: A Markdown file in a package's skills directory.\n---\nInstructions.\n",
+        "packages/manifest/texts/pack-prompt.md": "From a package manifest's prompts.\n",
+        "packages/manifest/texts/deep/pack-deep.md": "Below a package's prompts directory.\n",
+        "packages/manifest/texts/data.json": "{}\n",
+        "packages/manifest/skills/unlisted/SKILL.md": "---\ndescription: Not in the manifest.\n---\nInstructions.\n",
+        "packages/convention/skills/conv-skill/SKILL.md": "---\ndescription: From a package's skills directory.\n---\nInstructions.\n",
+        "packages/convention/prompts/conv-prompt.md": "From a package's prompts directory.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": true,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "user-auto",
+            "description": "From the user skills directory.",
+            "filePath": "<tmp>/agent/skills/user-auto/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/user-auto",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/user-auto/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "pack-note",
+            "description": "A Markdown file in a package's skills directory.",
+            "filePath": "<tmp>/packages/manifest/tools/note.md",
+            "baseDir": "<tmp>/packages/manifest/tools",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/packages/manifest/tools/note.md",
+              "source": "<tmp>/packages/manifest",
+              "scope": "user",
+              "origin": "package",
+              "baseDir": "<tmp>/packages/manifest"
+            }
+          },
+          {
+            "name": "pack-skill",
+            "description": "From a package manifest's skills.",
+            "filePath": "<tmp>/packages/manifest/tools/pack-skill/SKILL.md",
+            "baseDir": "<tmp>/packages/manifest/tools/pack-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/packages/manifest/tools/pack-skill/SKILL.md",
+              "source": "<tmp>/packages/manifest",
+              "scope": "user",
+              "origin": "package",
+              "baseDir": "<tmp>/packages/manifest"
+            }
+          },
+          {
+            "name": "conv-skill",
+            "description": "From a package's skills directory.",
+            "filePath": "<tmp>/packages/convention/skills/conv-skill/SKILL.md",
+            "baseDir": "<tmp>/packages/convention/skills/conv-skill",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/packages/convention/skills/conv-skill/SKILL.md",
+              "source": "<tmp>/packages/convention",
+              "scope": "user",
+              "origin": "package",
+              "baseDir": "<tmp>/packages/convention"
+            }
+          }
+        ],
+        "skillDiagnostics": [],
+        "prompts": [
+          {
+            "name": "user-auto",
+            "description": "From the user prompts directory.",
+            "argumentHint": null,
+            "content": "From the user prompts directory.\n",
+            "filePath": "<tmp>/agent/prompts/user-auto.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/user-auto.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "pack-deep",
+            "description": "Below a package's prompts directory.",
+            "argumentHint": null,
+            "content": "Below a package's prompts directory.\n",
+            "filePath": "<tmp>/packages/manifest/texts/deep/pack-deep.md",
+            "sourceInfo": {
+              "path": "<tmp>/packages/manifest/texts/deep/pack-deep.md",
+              "source": "<tmp>/packages/manifest",
+              "scope": "user",
+              "origin": "package",
+              "baseDir": "<tmp>/packages/manifest"
+            }
+          },
+          {
+            "name": "pack-prompt",
+            "description": "From a package manifest's prompts.",
+            "argumentHint": null,
+            "content": "From a package manifest's prompts.\n",
+            "filePath": "<tmp>/packages/manifest/texts/pack-prompt.md",
+            "sourceInfo": {
+              "path": "<tmp>/packages/manifest/texts/pack-prompt.md",
+              "source": "<tmp>/packages/manifest",
+              "scope": "user",
+              "origin": "package",
+              "baseDir": "<tmp>/packages/manifest"
+            }
+          },
+          {
+            "name": "conv-prompt",
+            "description": "From a package's prompts directory.",
+            "argumentHint": null,
+            "content": "From a package's prompts directory.\n",
+            "filePath": "<tmp>/packages/convention/prompts/conv-prompt.md",
+            "sourceInfo": {
+              "path": "<tmp>/packages/convention/prompts/conv-prompt.md",
+              "source": "<tmp>/packages/convention",
+              "scope": "user",
+              "origin": "package",
+              "baseDir": "<tmp>/packages/convention"
+            }
+          }
+        ],
+        "promptDiagnostics": []
+      }
+    },
+    {
+      "name": "ignore-files",
+      "description": "A .gitignore, .ignore, or .fdignore in a skills or prompts directory hides what it names.",
+      "files": {
+        "agent/skills/.gitignore": "drafts/\nwip-*\n",
+        "agent/skills/drafts/idea/SKILL.md": "---\ndescription: Ignored with its directory.\n---\nInstructions.\n",
+        "agent/skills/wip-thing/SKILL.md": "---\ndescription: Ignored by a wildcard.\n---\nInstructions.\n",
+        "agent/skills/wip-note.md": "---\nname: wip-note\ndescription: An ignored file.\n---\nInstructions.\n",
+        "agent/skills/kept/SKILL.md": "---\ndescription: Not ignored.\n---\nInstructions.\n",
+        "agent/skills/own-ignore/SKILL.md": "---\ndescription: Ignored by the .ignore beside it.\n---\nInstructions.\n",
+        "agent/skills/own-ignore/.ignore": "SKILL.md\n",
+        "agent/skills/group/.fdignore": "inner/\n",
+        "agent/skills/group/inner/SKILL.md": "---\ndescription: Ignored by its parent's .fdignore.\n---\nInstructions.\n",
+        "agent/skills/group/outer/SKILL.md": "---\ndescription: Beside an ignored directory.\n---\nInstructions.\n",
+        "agent/prompts/.gitignore": "secret.md\n",
+        "agent/prompts/secret.md": "Ignored.\n",
+        "agent/prompts/public.md": "Not ignored.\n"
+      },
+      "symlinks": {},
+      "cwd": "repo",
+      "trusted": true,
+      "flags": {
+        "skill": [],
+        "noSkills": false,
+        "promptTemplate": [],
+        "noPromptTemplates": false
+      },
+      "result": {
+        "skills": [
+          {
+            "name": "outer",
+            "description": "Beside an ignored directory.",
+            "filePath": "<tmp>/agent/skills/group/outer/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/group/outer",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/group/outer/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          },
+          {
+            "name": "kept",
+            "description": "Not ignored.",
+            "filePath": "<tmp>/agent/skills/kept/SKILL.md",
+            "baseDir": "<tmp>/agent/skills/kept",
+            "disableModelInvocation": false,
+            "sourceInfo": {
+              "path": "<tmp>/agent/skills/kept/SKILL.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "skillDiagnostics": [],
+        "prompts": [
+          {
+            "name": "public",
+            "description": "Not ignored.",
+            "argumentHint": null,
+            "content": "Not ignored.\n",
+            "filePath": "<tmp>/agent/prompts/public.md",
+            "sourceInfo": {
+              "path": "<tmp>/agent/prompts/public.md",
+              "source": "auto",
+              "scope": "user",
+              "origin": "top-level",
+              "baseDir": "<tmp>/agent"
+            }
+          }
+        ],
+        "promptDiagnostics": []
+      }
+    }
+  ],
+  "listing": [
+    {
+      "name": "read",
+      "description": "The read tool is active: skills are loaded with it. A skill that disables model invocation is not listed.",
+      "tool": "read",
+      "skills": [
+        {
+          "name": "pdf-tools",
+          "description": "Extract text and tables from PDF files. Use when reading PDFs.",
+          "filePath": "/home/user/.pi/agent/skills/pdf-tools/SKILL.md",
+          "baseDir": "/home/user/.pi/agent/skills/pdf-tools",
+          "disableModelInvocation": false
+        },
+        {
+          "name": "release",
+          "description": "Cut a release <major|minor> & \"tag\" it; it's quick.",
+          "filePath": "/work/repo/.pi/skills/release & ship/SKILL.md",
+          "baseDir": "/work/repo/.pi/skills/release & ship",
+          "disableModelInvocation": false
+        },
+        {
+          "name": "deploy",
+          "description": "Only by command.",
+          "filePath": "/work/repo/.pi/skills/deploy/SKILL.md",
+          "baseDir": "/work/repo/.pi/skills/deploy",
+          "disableModelInvocation": true
+        },
+        {
+          "name": "notes",
+          "description": "Two lines\nof description.",
+          "filePath": "/work/repo/.agents/skills/notes/SKILL.md",
+          "baseDir": "/work/repo/.agents/skills/notes",
+          "disableModelInvocation": false
+        }
+      ],
+      "text": "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n  <skill>\n    <name>pdf-tools</name>\n    <description>Extract text and tables from PDF files. Use when reading PDFs.</description>\n    <location>/home/user/.pi/agent/skills/pdf-tools/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>release</name>\n    <description>Cut a release &lt;major|minor&gt; &amp; &quot;tag&quot; it; it&apos;s quick.</description>\n    <location>/work/repo/.pi/skills/release &amp; ship/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>notes</name>\n    <description>Two lines\nof description.</description>\n    <location>/work/repo/.agents/skills/notes/SKILL.md</location>\n  </skill>\n</available_skills>"
+    },
+    {
+      "name": "bash",
+      "description": "Only bash is active: skills are loaded with it.",
+      "tool": "bash",
+      "skills": [
+        {
+          "name": "pdf-tools",
+          "description": "Extract text and tables from PDF files. Use when reading PDFs.",
+          "filePath": "/home/user/.pi/agent/skills/pdf-tools/SKILL.md",
+          "baseDir": "/home/user/.pi/agent/skills/pdf-tools",
+          "disableModelInvocation": false
+        },
+        {
+          "name": "release",
+          "description": "Cut a release <major|minor> & \"tag\" it; it's quick.",
+          "filePath": "/work/repo/.pi/skills/release & ship/SKILL.md",
+          "baseDir": "/work/repo/.pi/skills/release & ship",
+          "disableModelInvocation": false
+        },
+        {
+          "name": "deploy",
+          "description": "Only by command.",
+          "filePath": "/work/repo/.pi/skills/deploy/SKILL.md",
+          "baseDir": "/work/repo/.pi/skills/deploy",
+          "disableModelInvocation": true
+        },
+        {
+          "name": "notes",
+          "description": "Two lines\nof description.",
+          "filePath": "/work/repo/.agents/skills/notes/SKILL.md",
+          "baseDir": "/work/repo/.agents/skills/notes",
+          "disableModelInvocation": false
+        }
+      ],
+      "text": "\n\nThe following skills provide specialized instructions for specific tasks.\nUse bash to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n  <skill>\n    <name>pdf-tools</name>\n    <description>Extract text and tables from PDF files. Use when reading PDFs.</description>\n    <location>/home/user/.pi/agent/skills/pdf-tools/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>release</name>\n    <description>Cut a release &lt;major|minor&gt; &amp; &quot;tag&quot; it; it&apos;s quick.</description>\n    <location>/work/repo/.pi/skills/release &amp; ship/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>notes</name>\n    <description>Two lines\nof description.</description>\n    <location>/work/repo/.agents/skills/notes/SKILL.md</location>\n  </skill>\n</available_skills>"
+    },
+    {
+      "name": "only-hidden-skills",
+      "description": "Nothing to list.",
+      "tool": "read",
+      "skills": [
+        {
+          "name": "deploy",
+          "description": "Only by command.",
+          "filePath": "/work/repo/.pi/skills/deploy/SKILL.md",
+          "baseDir": "/work/repo/.pi/skills/deploy",
+          "disableModelInvocation": true
+        }
+      ],
+      "text": ""
+    },
+    {
+      "name": "no-skills",
+      "description": "Nothing to list.",
+      "tool": "read",
+      "skills": [],
+      "text": ""
+    }
+  ],
+  "expansion": {
+    "files": {
+      "agent/skills/review/SKILL.md": "---\nname: review\ndescription: Review code.\n---\n\n# Review\n\nRead `references/checklist.md` first.\n\n",
+      "agent/skills/hidden/SKILL.md": "---\ndescription: Only by command.\ndisable-model-invocation: true\n---\nDeploy carefully.\n",
+      "agent/skills/windows/SKILL.md": "<bom>---\r\ndescription: Windows line endings.\r\n---\r\nLine one\r\nLine two\r\n",
+      "agent/skills/empty-body/SKILL.md": "---\ndescription: Nothing after the frontmatter.\n---\n",
+      "agent/skills/gone/SKILL.md": "---\ndescription: Deleted after it was loaded.\n---\nInstructions.\n",
+      "agent/skills/changed/SKILL.md": "---\ndescription: Malformed after it was loaded.\n---\nInstructions.\n",
+      "agent/skills/note.md": "---\nname: note\ndescription: A file skill.\n---\nTake a note.\n",
+      "agent/prompts/fix.md": "---\ndescription: Fix a bug\nargument-hint: \"<issue> [notes]\"\n---\n\nFix $1.\n\nNotes: ${@:2}\n\n",
+      "agent/prompts/echo.md": "Say $ARGUMENTS\n",
+      "agent/prompts/slash.md": "/fix nested\n",
+      "agent/prompts/input.md": "Summarize {{input}} for $1.\n",
+      "agent/prompts/skill:tpl.md": "A template named like a skill command: $@\n",
+      "agent/prompts/skill:review.md": "A template named like a loaded skill's command: used when the skill command names no skill.\n"
+    },
+    "cwd": "repo",
+    "removed": [
+      "agent/skills/gone/SKILL.md"
+    ],
+    "rewritten": {
+      "agent/skills/changed/SKILL.md": "---\ndescription: Use when: broken\n---\nbody\n"
+    },
+    "skills": [
+      {
+        "name": "changed",
+        "description": "Malformed after it was loaded.",
+        "filePath": "<tmp>/agent/skills/changed/SKILL.md",
+        "baseDir": "<tmp>/agent/skills/changed",
+        "disableModelInvocation": false,
+        "sourceInfo": {
+          "path": "<tmp>/agent/skills/changed/SKILL.md",
+          "source": "auto",
+          "scope": "user",
+          "origin": "top-level",
+          "baseDir": "<tmp>/agent"
+        }
+      },
+      {
+        "name": "empty-body",
+        "description": "Nothing after the frontmatter.",
+        "filePath": "<tmp>/agent/skills/empty-body/SKILL.md",
+        "baseDir": "<tmp>/agent/skills/empty-body",
+        "disableModelInvocation": false,
+        "sourceInfo": {
+          "path": "<tmp>/agent/skills/empty-body/SKILL.md",
+          "source": "auto",
+          "scope": "user",
+          "origin": "top-level",
+          "baseDir": "<tmp>/agent"
+        }
+      },
+      {
+        "name": "gone",
+        "description": "Deleted after it was loaded.",
+        "filePath": "<tmp>/agent/skills/gone/SKILL.md",
+        "baseDir": "<tmp>/agent/skills/gone",
+        "disableModelInvocation": false,
+        "sourceInfo": {
+          "path": "<tmp>/agent/skills/gone/SKILL.md",
+          "source": "auto",
+          "scope": "user",
+          "origin": "top-level",
+          "baseDir": "<tmp>/agent"
+        }
+      },
+      {
+        "name": "hidden",
+        "description": "Only by command.",
+        "filePath": "<tmp>/agent/skills/hidden/SKILL.md",
+        "baseDir": "<tmp>/agent/skills/hidden",
+        "disableModelInvocation": true,
+        "sourceInfo": {
+          "path": "<tmp>/agent/skills/hidden/SKILL.md",
+          "source": "auto",
+          "scope": "user",
+          "origin": "top-level",
+          "baseDir": "<tmp>/agent"
+        }
+      },
+      {
+        "name": "note",
+        "description": "A file skill.",
+        "filePath": "<tmp>/agent/skills/note.md",
+        "baseDir": "<tmp>/agent/skills",
+        "disableModelInvocation": false,
+        "sourceInfo": {
+          "path": "<tmp>/agent/skills/note.md",
+          "source": "auto",
+          "scope": "user",
+          "origin": "top-level",
+          "baseDir": "<tmp>/agent"
+        }
+      },
+      {
+        "name": "review",
+        "description": "Review code.",
+        "filePath": "<tmp>/agent/skills/review/SKILL.md",
+        "baseDir": "<tmp>/agent/skills/review",
+        "disableModelInvocation": false,
+        "sourceInfo": {
+          "path": "<tmp>/agent/skills/review/SKILL.md",
+          "source": "auto",
+          "scope": "user",
+          "origin": "top-level",
+          "baseDir": "<tmp>/agent"
+        }
+      },
+      {
+        "name": "windows",
+        "description": "Windows line endings.",
+        "filePath": "<tmp>/agent/skills/windows/SKILL.md",
+        "baseDir": "<tmp>/agent/skills/windows",
+        "disableModelInvocation": false,
+        "sourceInfo": {
+          "path": "<tmp>/agent/skills/windows/SKILL.md",
+          "source": "auto",
+          "scope": "user",
+          "origin": "top-level",
+          "baseDir": "<tmp>/agent"
+        }
+      }
+    ],
+    "prompts": [
+      {
+        "name": "echo",
+        "content": "Say $ARGUMENTS\n",
+        "filePath": "<tmp>/agent/prompts/echo.md"
+      },
+      {
+        "name": "fix",
+        "content": "Fix $1.\n\nNotes: ${@:2}",
+        "filePath": "<tmp>/agent/prompts/fix.md"
+      },
+      {
+        "name": "input",
+        "content": "Summarize {{input}} for $1.\n",
+        "filePath": "<tmp>/agent/prompts/input.md"
+      },
+      {
+        "name": "skill:review",
+        "content": "A template named like a loaded skill's command: used when the skill command names no skill.\n",
+        "filePath": "<tmp>/agent/prompts/skill:review.md"
+      },
+      {
+        "name": "skill:tpl",
+        "content": "A template named like a skill command: $@\n",
+        "filePath": "<tmp>/agent/prompts/skill:tpl.md"
+      },
+      {
+        "name": "slash",
+        "content": "/fix nested\n",
+        "filePath": "<tmp>/agent/prompts/slash.md"
+      }
+    ],
+    "cases": [
+      {
+        "input": "/skill:review",
+        "output": "<skill name=\"review\" location=\"<tmp>/agent/skills/review/SKILL.md\">\nReferences are relative to <tmp>/agent/skills/review.\n\n# Review\n\nRead `references/checklist.md` first.\n</skill>"
+      },
+      {
+        "input": "/skill:review check the auth module",
+        "output": "<skill name=\"review\" location=\"<tmp>/agent/skills/review/SKILL.md\">\nReferences are relative to <tmp>/agent/skills/review.\n\n# Review\n\nRead `references/checklist.md` first.\n</skill>\n\ncheck the auth module"
+      },
+      {
+        "input": "/skill:review   spaced   args  ",
+        "output": "<skill name=\"review\" location=\"<tmp>/agent/skills/review/SKILL.md\">\nReferences are relative to <tmp>/agent/skills/review.\n\n# Review\n\nRead `references/checklist.md` first.\n</skill>\n\nspaced   args"
+      },
+      {
+        "input": "/skill:review \n second line",
+        "output": "<skill name=\"review\" location=\"<tmp>/agent/skills/review/SKILL.md\">\nReferences are relative to <tmp>/agent/skills/review.\n\n# Review\n\nRead `references/checklist.md` first.\n</skill>\n\nsecond line"
+      },
+      {
+        "input": "/skill:review\targs after a tab",
+        "output": "A template named like a loaded skill's command: used when the skill command names no skill.\n"
+      },
+      {
+        "input": "/skill:review\nargs after a newline",
+        "output": "A template named like a loaded skill's command: used when the skill command names no skill.\n"
+      },
+      {
+        "input": "/skill:hidden go",
+        "output": "<skill name=\"hidden\" location=\"<tmp>/agent/skills/hidden/SKILL.md\">\nReferences are relative to <tmp>/agent/skills/hidden.\n\nDeploy carefully.\n</skill>\n\ngo"
+      },
+      {
+        "input": "/skill:windows",
+        "output": "<skill name=\"windows\" location=\"<tmp>/agent/skills/windows/SKILL.md\">\nReferences are relative to <tmp>/agent/skills/windows.\n\nLine one\nLine two\n</skill>"
+      },
+      {
+        "input": "/skill:empty-body",
+        "output": "<skill name=\"empty-body\" location=\"<tmp>/agent/skills/empty-body/SKILL.md\">\nReferences are relative to <tmp>/agent/skills/empty-body.\n\n\n</skill>"
+      },
+      {
+        "input": "/skill:empty-body with args",
+        "output": "<skill name=\"empty-body\" location=\"<tmp>/agent/skills/empty-body/SKILL.md\">\nReferences are relative to <tmp>/agent/skills/empty-body.\n\n\n</skill>\n\nwith args"
+      },
+      {
+        "input": "/skill:note",
+        "output": "<skill name=\"note\" location=\"<tmp>/agent/skills/note.md\">\nReferences are relative to <tmp>/agent/skills.\n\nTake a note.\n</skill>"
+      },
+      {
+        "input": "/skill:gone now",
+        "output": "/skill:gone now"
+      },
+      {
+        "input": "/skill:changed now",
+        "output": "/skill:changed now"
+      },
+      {
+        "input": "/skill:unknown do it",
+        "output": "/skill:unknown do it"
+      },
+      {
+        "input": "/skill:",
+        "output": "/skill:"
+      },
+      {
+        "input": "/skill: review",
+        "output": "/skill: review"
+      },
+      {
+        "input": " /skill:review",
+        "output": " /skill:review"
+      },
+      {
+        "input": "/SKILL:review",
+        "output": "/SKILL:review"
+      },
+      {
+        "input": "/skill:Review",
+        "output": "/skill:Review"
+      },
+      {
+        "input": "/skill:tpl a b",
+        "output": "A template named like a skill command: a b\n"
+      },
+      {
+        "input": "/skill:review.md",
+        "output": "/skill:review.md"
+      },
+      {
+        "input": "/fix",
+        "output": "Fix .\n\nNotes: "
+      },
+      {
+        "input": "/fix 42",
+        "output": "Fix 42.\n\nNotes: "
+      },
+      {
+        "input": "/fix \"issue 12\" needs care",
+        "output": "Fix issue 12.\n\nNotes: needs care"
+      },
+      {
+        "input": "/fix   a   b   c",
+        "output": "Fix a.\n\nNotes: b c"
+      },
+      {
+        "input": "/fix\ta\tb",
+        "output": "Fix a.\n\nNotes: b"
+      },
+      {
+        "input": "/fix\nline two\nline three",
+        "output": "Fix line.\n\nNotes: two line three"
+      },
+      {
+        "input": "/fix ",
+        "output": "Fix .\n\nNotes: "
+      },
+      {
+        "input": "/echo one  two",
+        "output": "Say one two\n"
+      },
+      {
+        "input": "/echo",
+        "output": "Say \n"
+      },
+      {
+        "input": "/echo 'it is' \"x y\" z",
+        "output": "Say it is x y z\n"
+      },
+      {
+        "input": "/slash",
+        "output": "/fix nested\n"
+      },
+      {
+        "input": "/input a b",
+        "output": "Summarize {{input}} for a.\n"
+      },
+      {
+        "input": "/unknown arg",
+        "output": "/unknown arg"
+      },
+      {
+        "input": "/",
+        "output": "/"
+      },
+      {
+        "input": "/ fix",
+        "output": "/ fix"
+      },
+      {
+        "input": "//fix",
+        "output": "//fix"
+      },
+      {
+        "input": "/fix/more",
+        "output": "/fix/more"
+      },
+      {
+        "input": "/Fix 1",
+        "output": "/Fix 1"
+      },
+      {
+        "input": " /fix 1",
+        "output": " /fix 1"
+      },
+      {
+        "input": "fix 1",
+        "output": "fix 1"
+      },
+      {
+        "input": "plain text",
+        "output": "plain text"
+      },
+      {
+        "input": "/home/user/project/file.rs is broken",
+        "output": "/home/user/project/file.rs is broken"
+      },
+      {
+        "input": "",
+        "output": ""
+      }
+    ]
+  },
+  "templateArguments": {
+    "parsing": [
+      {
+        "input": "",
+        "args": []
+      },
+      {
+        "input": "one",
+        "args": [
+          "one"
+        ]
+      },
+      {
+        "input": "one two three",
+        "args": [
+          "one",
+          "two",
+          "three"
+        ]
+      },
+      {
+        "input": "\"two words\" three four",
+        "args": [
+          "two words",
+          "three",
+          "four"
+        ]
+      },
+      {
+        "input": "'single quoted' \"double quoted\"",
+        "args": [
+          "single quoted",
+          "double quoted"
+        ]
+      },
+      {
+        "input": "a  b\tc\nd",
+        "args": [
+          "a",
+          "b",
+          "c",
+          "d"
+        ]
+      },
+      {
+        "input": "  leading and trailing  ",
+        "args": [
+          "leading",
+          "and",
+          "trailing"
+        ]
+      },
+      {
+        "input": "\"unterminated quote",
+        "args": [
+          "unterminated quote"
+        ]
+      },
+      {
+        "input": "it's unterminated",
+        "args": [
+          "its unterminated"
+        ]
+      },
+      {
+        "input": "\"\" '' empty",
+        "args": [
+          "empty"
+        ]
+      },
+      {
+        "input": "a\"b c\"d",
+        "args": [
+          "ab cd"
+        ]
+      },
+      {
+        "input": "x=\"1 2\" y",
+        "args": [
+          "x=1 2",
+          "y"
+        ]
+      },
+      {
+        "input": "back\\slash \\\"quote",
+        "args": [
+          "back\\slash",
+          "\\quote"
+        ]
+      },
+      {
+        "input": "$1 $@ ${1:-d}",
+        "args": [
+          "$1",
+          "$@",
+          "${1:-d}"
+        ]
+      },
+      {
+        "input": "é 𐍈 ñ",
+        "args": [
+          "é",
+          "𐍈",
+          "ñ"
+        ]
+      },
+      {
+        "input": "a b",
+        "args": [
+          "a",
+          "b"
+        ]
+      },
+      {
+        "input": "a　b",
+        "args": [
+          "a",
+          "b"
+        ]
+      },
+      {
+        "input": "a﻿b",
+        "args": [
+          "a",
+          "b"
+        ]
+      },
+      {
+        "input": "a b",
+        "args": [
+          "a",
+          "b"
+        ]
+      },
+      {
+        "input": "ab",
+        "args": [
+          "ab"
+        ]
+      },
+      {
+        "input": "a​b",
+        "args": [
+          "a​b"
+        ]
+      },
+      {
+        "input": "a\u000bb\fc",
+        "args": [
+          "a",
+          "b",
+          "c"
+        ]
+      }
+    ],
+    "substitution": [
+      {
+        "content": "$1",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "$1 $2 $3",
+        "outputs": [
+          {
+            "input": "",
+            "output": "  "
+          },
+          {
+            "input": "one",
+            "output": "one  "
+          },
+          {
+            "input": "one two three",
+            "output": "one two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled  "
+          }
+        ]
+      },
+      {
+        "content": "$@",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four five"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "$ARGUMENTS",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four five"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "[$@] [$ARGUMENTS]",
+        "outputs": [
+          {
+            "input": "",
+            "output": "[] []"
+          },
+          {
+            "input": "one",
+            "output": "[one] [one]"
+          },
+          {
+            "input": "one two three",
+            "output": "[one two three] [one two three]"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "[two words three four five] [two words three four five]"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "[$1 ${2:-x} $@] [$1 ${2:-x} $@]"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "[filled] [filled]"
+          }
+        ]
+      },
+      {
+        "content": "${1:-default}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "default"
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "${2:-two words}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "two words"
+          },
+          {
+            "input": "one",
+            "output": "two words"
+          },
+          {
+            "input": "one two three",
+            "output": "two"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "three"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${2:-x}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "two words"
+          }
+        ]
+      },
+      {
+        "content": "${@:-nothing}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "nothing"
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four five"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "${ARGUMENTS:-none}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "none"
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four five"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "${@:2}",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": ""
+          },
+          {
+            "input": "one two three",
+            "output": "two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "three four five"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": ""
+          }
+        ]
+      },
+      {
+        "content": "${@:2:1}",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": ""
+          },
+          {
+            "input": "one two three",
+            "output": "two"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "three"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${2:-x}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": ""
+          }
+        ]
+      },
+      {
+        "content": "${@:0}",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four five"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "${@:1:0}",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": ""
+          },
+          {
+            "input": "one two three",
+            "output": ""
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": ""
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": ""
+          },
+          {
+            "input": "\"\" filled",
+            "output": ""
+          }
+        ]
+      },
+      {
+        "content": "${@:5}",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": ""
+          },
+          {
+            "input": "one two three",
+            "output": ""
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": ""
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": ""
+          },
+          {
+            "input": "\"\" filled",
+            "output": ""
+          }
+        ]
+      },
+      {
+        "content": "a${@:2:2}z",
+        "outputs": [
+          {
+            "input": "",
+            "output": "az"
+          },
+          {
+            "input": "one",
+            "output": "az"
+          },
+          {
+            "input": "one two three",
+            "output": "atwo threez"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "athree fourz"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "a${2:-x} $@z"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "az"
+          }
+        ]
+      },
+      {
+        "content": "${1}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "${1}"
+          },
+          {
+            "input": "one",
+            "output": "${1}"
+          },
+          {
+            "input": "one two three",
+            "output": "${1}"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "${1}"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${1}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "${1}"
+          }
+        ]
+      },
+      {
+        "content": "${@}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "${@}"
+          },
+          {
+            "input": "one",
+            "output": "${@}"
+          },
+          {
+            "input": "one two three",
+            "output": "${@}"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "${@}"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${@}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "${@}"
+          }
+        ]
+      },
+      {
+        "content": "${ARGUMENTS}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "${ARGUMENTS}"
+          },
+          {
+            "input": "one",
+            "output": "${ARGUMENTS}"
+          },
+          {
+            "input": "one two three",
+            "output": "${ARGUMENTS}"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "${ARGUMENTS}"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${ARGUMENTS}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "${ARGUMENTS}"
+          }
+        ]
+      },
+      {
+        "content": "$10 $1",
+        "outputs": [
+          {
+            "input": "",
+            "output": " "
+          },
+          {
+            "input": "one",
+            "output": " one"
+          },
+          {
+            "input": "one two three",
+            "output": " one"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": " two words"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": " $1"
+          },
+          {
+            "input": "\"\" filled",
+            "output": " filled"
+          }
+        ]
+      },
+      {
+        "content": "$0",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": ""
+          },
+          {
+            "input": "one two three",
+            "output": ""
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": ""
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": ""
+          },
+          {
+            "input": "\"\" filled",
+            "output": ""
+          }
+        ]
+      },
+      {
+        "content": "$01",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "$",
+        "outputs": [
+          {
+            "input": "",
+            "output": "$"
+          },
+          {
+            "input": "one",
+            "output": "$"
+          },
+          {
+            "input": "one two three",
+            "output": "$"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "$"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "$"
+          }
+        ]
+      },
+      {
+        "content": "$$1",
+        "outputs": [
+          {
+            "input": "",
+            "output": "$"
+          },
+          {
+            "input": "one",
+            "output": "$one"
+          },
+          {
+            "input": "one two three",
+            "output": "$one"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "$two words"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$$1"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "$filled"
+          }
+        ]
+      },
+      {
+        "content": "$1$2",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "onetwo"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two wordsthree"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1${2:-x}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "$1abc",
+        "outputs": [
+          {
+            "input": "",
+            "output": "abc"
+          },
+          {
+            "input": "one",
+            "output": "oneabc"
+          },
+          {
+            "input": "one two three",
+            "output": "oneabc"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two wordsabc"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1abc"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filledabc"
+          }
+        ]
+      },
+      {
+        "content": "$ARGUMENTSx",
+        "outputs": [
+          {
+            "input": "",
+            "output": "x"
+          },
+          {
+            "input": "one",
+            "output": "onex"
+          },
+          {
+            "input": "one two three",
+            "output": "one two threex"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four fivex"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@x"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filledx"
+          }
+        ]
+      },
+      {
+        "content": "$arguments $Arguments",
+        "outputs": [
+          {
+            "input": "",
+            "output": "$arguments $Arguments"
+          },
+          {
+            "input": "one",
+            "output": "$arguments $Arguments"
+          },
+          {
+            "input": "one two three",
+            "output": "$arguments $Arguments"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "$arguments $Arguments"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$arguments $Arguments"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "$arguments $Arguments"
+          }
+        ]
+      },
+      {
+        "content": "${1:-}",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "${1:-a}b}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "ab}"
+          },
+          {
+            "input": "one",
+            "output": "oneb}"
+          },
+          {
+            "input": "one two three",
+            "output": "oneb}"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two wordsb}"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1b}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filledb}"
+          }
+        ]
+      },
+      {
+        "content": "${3:-$1}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "$1"
+          },
+          {
+            "input": "one",
+            "output": "$1"
+          },
+          {
+            "input": "one two three",
+            "output": "three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "four"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "$1"
+          }
+        ]
+      },
+      {
+        "content": "${3:-line\nbreak}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "line\nbreak"
+          },
+          {
+            "input": "one",
+            "output": "line\nbreak"
+          },
+          {
+            "input": "one two three",
+            "output": "three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "four"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "line\nbreak"
+          }
+        ]
+      },
+      {
+        "content": "${@:-}",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four five"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "${ @:2}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "${ @:2}"
+          },
+          {
+            "input": "one",
+            "output": "${ @:2}"
+          },
+          {
+            "input": "one two three",
+            "output": "${ @:2}"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "${ @:2}"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${ @:2}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "${ @:2}"
+          }
+        ]
+      },
+      {
+        "content": "${@:x}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "${@:x}"
+          },
+          {
+            "input": "one",
+            "output": "${@:x}"
+          },
+          {
+            "input": "one two three",
+            "output": "${@:x}"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "${@:x}"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${@:x}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "${@:x}"
+          }
+        ]
+      },
+      {
+        "content": "${@:2:}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "${@:2:}"
+          },
+          {
+            "input": "one",
+            "output": "${@:2:}"
+          },
+          {
+            "input": "one two three",
+            "output": "${@:2:}"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "${@:2:}"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${@:2:}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "${@:2:}"
+          }
+        ]
+      },
+      {
+        "content": "${@:2:x}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "${@:2:x}"
+          },
+          {
+            "input": "one",
+            "output": "${@:2:x}"
+          },
+          {
+            "input": "one two three",
+            "output": "${@:2:x}"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "${@:2:x}"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${@:2:x}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "${@:2:x}"
+          }
+        ]
+      },
+      {
+        "content": "${12:-d}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "d"
+          },
+          {
+            "input": "one",
+            "output": "d"
+          },
+          {
+            "input": "one two three",
+            "output": "d"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "d"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "d"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "d"
+          }
+        ]
+      },
+      {
+        "content": "${0:-zero}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "zero"
+          },
+          {
+            "input": "one",
+            "output": "zero"
+          },
+          {
+            "input": "one two three",
+            "output": "zero"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "zero"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "zero"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "zero"
+          }
+        ]
+      },
+      {
+        "content": "${ARGUMENTS:2}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "${ARGUMENTS:2}"
+          },
+          {
+            "input": "one",
+            "output": "${ARGUMENTS:2}"
+          },
+          {
+            "input": "one two three",
+            "output": "${ARGUMENTS:2}"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "${ARGUMENTS:2}"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "${ARGUMENTS:2}"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "${ARGUMENTS:2}"
+          }
+        ]
+      },
+      {
+        "content": "\\$1",
+        "outputs": [
+          {
+            "input": "",
+            "output": "\\"
+          },
+          {
+            "input": "one",
+            "output": "\\one"
+          },
+          {
+            "input": "one two three",
+            "output": "\\one"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "\\two words"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "\\$1"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "\\filled"
+          }
+        ]
+      },
+      {
+        "content": "$@$@",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "oneone"
+          },
+          {
+            "input": "one two three",
+            "output": "one two threeone two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four fivetwo words three four five"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@$1 ${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filledfilled"
+          }
+        ]
+      },
+      {
+        "content": "price: $5.00",
+        "outputs": [
+          {
+            "input": "",
+            "output": "price: .00"
+          },
+          {
+            "input": "one",
+            "output": "price: .00"
+          },
+          {
+            "input": "one two three",
+            "output": "price: .00"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "price: .00"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "price: .00"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "price: .00"
+          }
+        ]
+      },
+      {
+        "content": "$99999999999999999999",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": ""
+          },
+          {
+            "input": "one two three",
+            "output": ""
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": ""
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": ""
+          },
+          {
+            "input": "\"\" filled",
+            "output": ""
+          }
+        ]
+      },
+      {
+        "content": "${99999999999999999999:-big}",
+        "outputs": [
+          {
+            "input": "",
+            "output": "big"
+          },
+          {
+            "input": "one",
+            "output": "big"
+          },
+          {
+            "input": "one two three",
+            "output": "big"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "big"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "big"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "big"
+          }
+        ]
+      },
+      {
+        "content": "${@:99999999999999999999}",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": ""
+          },
+          {
+            "input": "one two three",
+            "output": ""
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": ""
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": ""
+          },
+          {
+            "input": "\"\" filled",
+            "output": ""
+          }
+        ]
+      },
+      {
+        "content": "${@:1:99999999999999999999}",
+        "outputs": [
+          {
+            "input": "",
+            "output": ""
+          },
+          {
+            "input": "one",
+            "output": "one"
+          },
+          {
+            "input": "one two three",
+            "output": "one two three"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "two words three four five"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$1 ${2:-x} $@"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "filled"
+          }
+        ]
+      },
+      {
+        "content": "$١",
+        "outputs": [
+          {
+            "input": "",
+            "output": "$١"
+          },
+          {
+            "input": "one",
+            "output": "$١"
+          },
+          {
+            "input": "one two three",
+            "output": "$١"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "$١"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "$١"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "$١"
+          }
+        ]
+      },
+      {
+        "content": "Fix $1.\n\nNotes: ${@:2}\nAll: $@\n",
+        "outputs": [
+          {
+            "input": "",
+            "output": "Fix .\n\nNotes: \nAll: \n"
+          },
+          {
+            "input": "one",
+            "output": "Fix one.\n\nNotes: \nAll: one\n"
+          },
+          {
+            "input": "one two three",
+            "output": "Fix one.\n\nNotes: two three\nAll: one two three\n"
+          },
+          {
+            "input": "\"two words\" three four five",
+            "output": "Fix two words.\n\nNotes: three four five\nAll: two words three four five\n"
+          },
+          {
+            "input": "$1 ${2:-x} $@",
+            "output": "Fix $1.\n\nNotes: ${2:-x} $@\nAll: $1 ${2:-x} $@\n"
+          },
+          {
+            "input": "\"\" filled",
+            "output": "Fix filled.\n\nNotes: \nAll: filled\n"
+          }
+        ]
+      }
+    ]
+  },
+  "commands": {
+    "files": {
+      "agent/skills/alpha/SKILL.md": "---\nname: alpha\ndescription: The alpha skill.\n---\nInstructions.\n",
+      "agent/prompts/review.md": "---\ndescription: Review staged changes\nargument-hint: \"[focus]\"\n---\nReview the staged changes. Focus on ${1:-correctness}.\n",
+      "cwd/.pi/skills/gamma/SKILL.md": "---\nname: gamma\ndescription: A project skill.\ndisable-model-invocation: true\n---\nInstructions.\n",
+      "cwd/.pi/prompts/ship.md": "Ship $1.\n",
+      "cli/one/SKILL.md": "---\nname: one\ndescription: Given on the command line.\n---\nInstructions.\n",
+      "cli/explain.md": "---\ndescription: Explain something\n---\nExplain $@.\n"
+    },
+    "cwd": "cwd",
+    "cases": [
+      {
+        "name": "discovered",
+        "description": "A trusted project: templates first, then skills.",
+        "args": [
+          "--approve"
+        ],
+        "response": {
+          "id": "1",
+          "type": "response",
+          "command": "get_commands",
+          "success": true,
+          "data": {
+            "commands": [
+              {
+                "name": "ship",
+                "description": "Ship $1.",
+                "source": "prompt",
+                "sourceInfo": {
+                  "path": "<tmp>/cwd/.pi/prompts/ship.md",
+                  "source": "auto",
+                  "scope": "project",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cwd/.pi"
+                }
+              },
+              {
+                "name": "review",
+                "description": "Review staged changes",
+                "source": "prompt",
+                "sourceInfo": {
+                  "path": "<tmp>/agent/prompts/review.md",
+                  "source": "auto",
+                  "scope": "user",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/agent"
+                }
+              },
+              {
+                "name": "skill:gamma",
+                "description": "A project skill.",
+                "source": "skill",
+                "sourceInfo": {
+                  "path": "<tmp>/cwd/.pi/skills/gamma/SKILL.md",
+                  "source": "auto",
+                  "scope": "project",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cwd/.pi"
+                }
+              },
+              {
+                "name": "skill:alpha",
+                "description": "The alpha skill.",
+                "source": "skill",
+                "sourceInfo": {
+                  "path": "<tmp>/agent/skills/alpha/SKILL.md",
+                  "source": "auto",
+                  "scope": "user",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/agent"
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "untrusted",
+        "description": "An untrusted project.",
+        "args": [
+          "--no-approve"
+        ],
+        "response": {
+          "id": "1",
+          "type": "response",
+          "command": "get_commands",
+          "success": true,
+          "data": {
+            "commands": [
+              {
+                "name": "review",
+                "description": "Review staged changes",
+                "source": "prompt",
+                "sourceInfo": {
+                  "path": "<tmp>/agent/prompts/review.md",
+                  "source": "auto",
+                  "scope": "user",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/agent"
+                }
+              },
+              {
+                "name": "skill:alpha",
+                "description": "The alpha skill.",
+                "source": "skill",
+                "sourceInfo": {
+                  "path": "<tmp>/agent/skills/alpha/SKILL.md",
+                  "source": "auto",
+                  "scope": "user",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/agent"
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "explicit-paths",
+        "description": "--skill and --prompt-template add to what is discovered.",
+        "args": [
+          "--approve",
+          "--skill",
+          "<tmp>/cli/one",
+          "--prompt-template",
+          "<tmp>/cli/explain.md"
+        ],
+        "response": {
+          "id": "1",
+          "type": "response",
+          "command": "get_commands",
+          "success": true,
+          "data": {
+            "commands": [
+              {
+                "name": "ship",
+                "description": "Ship $1.",
+                "source": "prompt",
+                "sourceInfo": {
+                  "path": "<tmp>/cwd/.pi/prompts/ship.md",
+                  "source": "auto",
+                  "scope": "project",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cwd/.pi"
+                }
+              },
+              {
+                "name": "review",
+                "description": "Review staged changes",
+                "source": "prompt",
+                "sourceInfo": {
+                  "path": "<tmp>/agent/prompts/review.md",
+                  "source": "auto",
+                  "scope": "user",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/agent"
+                }
+              },
+              {
+                "name": "explain",
+                "description": "Explain something",
+                "source": "prompt",
+                "sourceInfo": {
+                  "path": "<tmp>/cli/explain.md",
+                  "source": "local",
+                  "scope": "temporary",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cli"
+                }
+              },
+              {
+                "name": "skill:gamma",
+                "description": "A project skill.",
+                "source": "skill",
+                "sourceInfo": {
+                  "path": "<tmp>/cwd/.pi/skills/gamma/SKILL.md",
+                  "source": "auto",
+                  "scope": "project",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cwd/.pi"
+                }
+              },
+              {
+                "name": "skill:alpha",
+                "description": "The alpha skill.",
+                "source": "skill",
+                "sourceInfo": {
+                  "path": "<tmp>/agent/skills/alpha/SKILL.md",
+                  "source": "auto",
+                  "scope": "user",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/agent"
+                }
+              },
+              {
+                "name": "skill:one",
+                "description": "Given on the command line.",
+                "source": "skill",
+                "sourceInfo": {
+                  "path": "<tmp>/cli/one/SKILL.md",
+                  "source": "local",
+                  "scope": "temporary",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cli/one"
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "no-skills-with-skill",
+        "description": "--no-skills keeps the --skill path and the templates.",
+        "args": [
+          "--approve",
+          "--no-skills",
+          "--skill",
+          "<tmp>/cli/one"
+        ],
+        "response": {
+          "id": "1",
+          "type": "response",
+          "command": "get_commands",
+          "success": true,
+          "data": {
+            "commands": [
+              {
+                "name": "ship",
+                "description": "Ship $1.",
+                "source": "prompt",
+                "sourceInfo": {
+                  "path": "<tmp>/cwd/.pi/prompts/ship.md",
+                  "source": "auto",
+                  "scope": "project",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cwd/.pi"
+                }
+              },
+              {
+                "name": "review",
+                "description": "Review staged changes",
+                "source": "prompt",
+                "sourceInfo": {
+                  "path": "<tmp>/agent/prompts/review.md",
+                  "source": "auto",
+                  "scope": "user",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/agent"
+                }
+              },
+              {
+                "name": "skill:one",
+                "description": "Given on the command line.",
+                "source": "skill",
+                "sourceInfo": {
+                  "path": "<tmp>/cli/one/SKILL.md",
+                  "source": "local",
+                  "scope": "temporary",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cli/one"
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "no-prompt-templates-with-template",
+        "description": "--no-prompt-templates keeps the --prompt-template path and the skills.",
+        "args": [
+          "--approve",
+          "-np",
+          "--prompt-template",
+          "<tmp>/cli/explain.md"
+        ],
+        "response": {
+          "id": "1",
+          "type": "response",
+          "command": "get_commands",
+          "success": true,
+          "data": {
+            "commands": [
+              {
+                "name": "explain",
+                "description": "Explain something",
+                "source": "prompt",
+                "sourceInfo": {
+                  "path": "<tmp>/cli/explain.md",
+                  "source": "local",
+                  "scope": "temporary",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cli"
+                }
+              },
+              {
+                "name": "skill:gamma",
+                "description": "A project skill.",
+                "source": "skill",
+                "sourceInfo": {
+                  "path": "<tmp>/cwd/.pi/skills/gamma/SKILL.md",
+                  "source": "auto",
+                  "scope": "project",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/cwd/.pi"
+                }
+              },
+              {
+                "name": "skill:alpha",
+                "description": "The alpha skill.",
+                "source": "skill",
+                "sourceInfo": {
+                  "path": "<tmp>/agent/skills/alpha/SKILL.md",
+                  "source": "auto",
+                  "scope": "user",
+                  "origin": "top-level",
+                  "baseDir": "<tmp>/agent"
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "short-flags-alone",
+        "description": "-ns and -np alone leave no commands.",
+        "args": [
+          "--approve",
+          "-ns",
+          "-np"
+        ],
+        "response": {
+          "id": "1",
+          "type": "response",
+          "command": "get_commands",
+          "success": true,
+          "data": {
+            "commands": []
+          }
+        }
+      }
+    ]
+  }
+}

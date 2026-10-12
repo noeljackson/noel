@@ -17,6 +17,7 @@ mod clipboard;
 mod markdown;
 mod oauth_login;
 mod oauth_refresh;
+mod resource_commands;
 mod rpc;
 mod rpc_wire;
 mod signals;
@@ -53,9 +54,9 @@ use pi_ai::{
 use pi_config::{
     apply_tool_modifiers, auth_for_provider, codex_client_version, has_auth_for_provider,
     is_tool_modifier, listed_accounts_for_provider, load_config, load_config_with_project_trust,
-    project_is_trusted, read_model_cache, resolve_default_tools, save_project_trust,
-    tool_list_error, write_file_atomic, write_model_cache, AccountSource, AuthCredential, AuthData,
-    CompactionSettings, ConfigPaths, ImageModelDefinition,
+    load_config_with_resources, project_is_trusted, read_model_cache, resolve_default_tools,
+    save_project_trust, tool_list_error, write_file_atomic, write_model_cache, AccountSource,
+    AuthCredential, AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
     ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig, ModelCache,
     ModelDefinition, ModelRefreshSettings, PackageSource, ProviderApi as ConfigProviderApi,
     ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
@@ -172,15 +173,19 @@ struct Cli {
     #[arg(long)]
     no_builtin_tools: bool,
 
+    /// Load a skill file or directory (can be used multiple times).
     #[arg(long)]
     skill: Vec<PathBuf>,
 
+    /// Discover no skills; --skill paths still load.
     #[arg(long)]
     no_skills: bool,
 
+    /// Load a prompt template file or directory (can be used multiple times).
     #[arg(long)]
     prompt_template: Vec<PathBuf>,
 
+    /// Discover no prompt templates; --prompt-template paths still load.
     #[arg(long)]
     no_prompt_templates: bool,
 
@@ -1335,7 +1340,8 @@ async fn run() -> Result<()> {
     } else {
         project_is_trusted(&paths.agent_dir, &cwd)?
     };
-    let mut config = load_config_with_project_trust(paths, project_trusted)?;
+    let resources = resource_commands::resource_options(&cli);
+    let mut config = load_config_with_resources(paths, project_trusted, &resources)?;
     if cli.session_dir.is_none() && std::env::var_os(ENV_SESSION_DIR).is_none() {
         if let Some(session_dir) = &config.settings.session_dir {
             config.paths = config.paths.with_session_dir(session_dir)?;
@@ -1450,7 +1456,8 @@ static CONFIG_SOURCE: std::sync::OnceLock<ConfigSource> = std::sync::OnceLock::n
 
 impl ConfigSource {
     fn load(&self, paths: ConfigPaths) -> Result<LoadedConfig> {
-        let mut config = load_config_with_project_trust(paths, self.project_trusted)?;
+        let resources = resource_commands::resource_options(&self.cli);
+        let mut config = load_config_with_resources(paths, self.project_trusted, &resources)?;
         apply_cli_overrides(&self.cli, &self.cwd, &mut config)?;
         Ok(config)
     }
@@ -1563,28 +1570,6 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
     }
     if let Some(thinking) = &cli.thinking {
         config.settings.default_thinking_level = Some(thinking.clone());
-    }
-    if !cli.no_skills {
-        for skill in &cli.skill {
-            if skill.is_file() {
-                config.skills.push(ResourceFile {
-                    name: resource_name(skill),
-                    path: skill.clone(),
-                    content: fs::read_to_string(skill)?,
-                });
-            }
-        }
-    }
-    if !cli.no_prompt_templates {
-        for prompt_template in &cli.prompt_template {
-            if prompt_template.is_file() {
-                config.prompt_templates.push(ResourceFile {
-                    name: resource_name(prompt_template),
-                    path: prompt_template.clone(),
-                    content: fs::read_to_string(prompt_template)?,
-                });
-            }
-        }
     }
     if cli.no_extensions {
         config.extensions.clear();
@@ -7323,11 +7308,11 @@ async fn handle_tui_submission(
         "/history" => app.push(TuiEntryKind::System, format_history(&app.editor_state)),
         "/skills" => app.push(
             TuiEntryKind::System,
-            format_resources("skills", &config.skills),
+            resource_commands::format_skills(config),
         ),
         "/prompts" => app.push(
             TuiEntryKind::System,
-            format_resources("prompts", &config.prompt_templates),
+            resource_commands::format_prompts(config),
         ),
         "/themes" => app.push(TuiEntryKind::System, format_themes(config)),
         "/extensions" => app.push(
@@ -7621,12 +7606,15 @@ async fn handle_tui_submission(
         }
         _ if line.starts_with("/skill:") => {
             let (name, input) = split_resource_command(&line, "/skill:");
-            let skill = find_resource(&config.skills, name)
+            let mut skills = config.skills.iter();
+            let skill = skills
+                .find(|skill| skill.name == name)
                 .ok_or_else(|| anyhow!("skill not found: {name}"))?;
+            let content = fs::read_to_string(&skill.file_path)?;
             let prompt = if input.is_empty() {
-                skill.content.clone()
+                content
             } else {
-                format!("{}\n\n{}", skill.content, input)
+                format!("{content}\n\n{input}")
             };
             return Ok(submit_tui_prompt(
                 app,
@@ -7670,9 +7658,9 @@ async fn handle_tui_submission(
         _ if line.starts_with("/prompt ") => {
             let rest = line.trim_start_matches("/prompt ").trim();
             let (name, input) = split_once_text(rest);
-            let template = find_resource(&config.prompt_templates, name)
+            let template = resource_commands::find_template(config, name)
                 .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
-            let prompt = expand_prompt_template(&template.content, input);
+            let prompt = resource_commands::fill_prompt_template(&template.content, input);
             return Ok(submit_tui_prompt(
                 app,
                 surface,
@@ -9436,16 +9424,13 @@ fn command_completions(config: &LoadedConfig, prefix: &str) -> Vec<String> {
         "/extension:",
         &config.extensions,
     ));
-    completions.extend(resource_command_completions(
-        prefix,
-        "/skill:",
-        &config.skills,
-    ));
-    completions.extend(resource_command_completions(
-        prefix,
-        "/prompt ",
-        &config.prompt_templates,
-    ));
+    completions.extend(resource_commands::completions(config, prefix));
+    let templates = config.prompt_templates.iter();
+    completions.extend(
+        templates
+            .map(|template| format!("/prompt {}", template.name))
+            .filter(|command| command.starts_with(prefix)),
+    );
     completions.extend(
         theme_names(config)
             .into_iter()
@@ -10162,17 +10147,6 @@ fn split_once_text(value: &str) -> (&str, &str) {
     (first, rest)
 }
 
-fn expand_prompt_template(template: &str, input: &str) -> String {
-    if template.contains("{{input}}") {
-        return template.replace("{{input}}", input);
-    }
-    if input.is_empty() {
-        template.to_string()
-    } else {
-        format!("{template}\n\n{input}")
-    }
-}
-
 fn format_login_status(config: &LoadedConfig, provider: &str) -> String {
     let providers = if provider.is_empty() {
         config
@@ -10306,6 +10280,7 @@ fn remove_stored_auth(config: &mut LoadedConfig, provider: &str, account: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_config::{PromptTemplate, Skill, SourceInfo, SourceScope};
     use std::io::BufRead;
 
     /// The tool settings a command line leaves, starting from `settings`.
@@ -10768,8 +10743,13 @@ mod tests {
             keybindings: Vec::new(),
             context_files: Vec::new(),
             extensions: vec![test_resource("json-ext")],
-            skills: vec![test_resource("review")],
-            prompt_templates: vec![test_resource("fix")],
+            skills: vec![test_skill("review", "Review code.\nCarefully.")],
+            prompt_templates: vec![test_template(
+                "fix",
+                "Fix a bug",
+                Some("<issue>"),
+                "Fix $1.",
+            )],
             themes: vec![test_resource("dark")],
             diagnostics: Vec::new(),
             system_prompt: None,
@@ -10780,9 +10760,40 @@ mod tests {
             command_completions(&config, "/extension:j"),
             ["/extension:json-ext"]
         );
-        assert!(command_completions(&config, "/skill:r").contains(&"/skill:review".to_string()));
-        assert!(command_completions(&config, "/prompt f").contains(&"/prompt fix".to_string()));
+        // A skill and a template complete with what upstream shows: the
+        // argument hint, the scope, and the description on one line.
+        let skill = "/skill:review  [u] Review code. Carefully.";
+        assert_eq!(command_completions(&config, "/skill:r"), [skill]);
+        assert_eq!(command_completions(&config, "/rev"), [skill]);
+        assert_eq!(
+            command_completions(&config, "/fix"),
+            ["/fix  <issue> \u{2014} [u] Fix a bug"]
+        );
+        assert_eq!(command_completions(&config, "/prompt f"), ["/prompt fix"]);
         assert!(command_completions(&config, "/theme d").contains(&"/theme dark".to_string()));
+
+        assert_eq!(
+            resource_commands::format_skills(&config),
+            "/skill:review\t[u] Review code. Carefully.\t/skills/review/SKILL.md"
+        );
+        assert_eq!(
+            resource_commands::format_prompts(&config),
+            "/fix\t<issue> \u{2014} [u] Fix a bug\t/prompts/fix.md"
+        );
+        let empty = minimal_test_config();
+        assert_eq!(resource_commands::format_skills(&empty), "no skills");
+        assert_eq!(resource_commands::format_prompts(&empty), "no prompts");
+    }
+
+    /// pi's own `/prompt <name> [input]`: `{{input}}` stands for the input,
+    /// which otherwise follows the template.
+    #[test]
+    fn prompt_command_fills_the_input_placeholder() {
+        let fill = resource_commands::fill_prompt_template;
+        assert_eq!(fill("fix {{input}} now", "the bug"), "fix the bug now");
+        assert_eq!(fill("fix {{input}}", ""), "fix ");
+        assert_eq!(fill("review", "the diff"), "review\n\nthe diff");
+        assert_eq!(fill("review $1", ""), "review $1");
     }
 
     #[test]
@@ -11321,12 +11332,17 @@ mod tests {
         )
         .expect("write project extension");
         fs::write(project.join("AGENTS.md"), "project rules").expect("write context file");
-        let resource = |name: &str| {
+        let resource = |name: &str, content: &str| {
             let path = root.join(format!("{name}.md"));
-            fs::write(&path, format!("cli {name}")).expect("write cli resource");
+            fs::write(&path, content).expect("write cli resource");
             path.display().to_string()
         };
-        let (extension, skill, template) = (resource("ext"), resource("skill"), resource("tpl"));
+        let extension = resource("ext", "cli ext");
+        let skill = resource(
+            "skill",
+            "---\nname: cli-skill\ndescription: From a flag.\n---\n",
+        );
+        let template = resource("tpl", "cli tpl");
         let cli = Cli::try_parse_from([
             "pi",
             "--system-prompt",
@@ -11375,8 +11391,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(contents(&config.extensions), ["cli ext"]);
-        assert_eq!(contents(&config.skills), ["cli skill"]);
-        assert_eq!(contents(&config.prompt_templates), ["cli tpl"]);
+        assert_eq!(config.skills.len(), 1);
+        assert_eq!(config.skills[0].name, "cli-skill");
+        assert_eq!(config.prompt_templates.len(), 1);
+        assert_eq!(config.prompt_templates[0].name, "tpl");
+        assert_eq!(config.prompt_templates[0].content, "cli tpl");
         assert_eq!(config.system_prompt.as_deref(), Some("cli system"));
         assert_eq!(config.append_system_prompt, ["cli append"]);
         assert!(config.context_files.is_empty());
@@ -15149,6 +15168,48 @@ mod tests {
             name: name.to_string(),
             path: PathBuf::from(name),
             content: String::new(),
+        }
+    }
+
+    fn test_source(path: &Path) -> SourceInfo {
+        SourceInfo {
+            path: path.to_path_buf(),
+            source: "auto".into(),
+            scope: SourceScope::User,
+            from_package: false,
+            base_dir: None,
+        }
+    }
+
+    /// A user skill at `/skills/<name>/SKILL.md`.
+    fn test_skill(name: &str, description: &str) -> Skill {
+        let base_dir = PathBuf::from(format!("/skills/{name}"));
+        let file_path = base_dir.join("SKILL.md");
+        Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            source_info: test_source(&file_path),
+            file_path,
+            base_dir,
+            disable_model_invocation: false,
+        }
+    }
+
+    /// A user prompt template at `/prompts/<name>.md`.
+    fn test_template(
+        name: &str,
+        description: &str,
+        argument_hint: Option<&str>,
+        content: &str,
+    ) -> PromptTemplate {
+        let file_path = PathBuf::from(format!("/prompts/{name}.md"));
+        PromptTemplate {
+            name: name.to_string(),
+            description: description.to_string(),
+            argument_hint: argument_hint.map(str::to_string),
+            content: content.to_string(),
+            source_info: test_source(&file_path),
+            file_path,
         }
     }
 
