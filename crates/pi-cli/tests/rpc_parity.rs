@@ -1757,3 +1757,32 @@ fn get_commands_matches_upstream() {
         assert!(pi.close().success());
     }
 }
+
+/// A prompt that names no skill, template, or slash tool is the model's to
+/// read, as upstream sends it; a slash-tool prompt still runs its tool.
+#[test]
+fn a_prompt_that_names_no_command_goes_to_the_model() {
+    let script = json!([[text("One.")], [text("Two.")]]);
+    let mut pi = Pi::start("unknown-command", script, &["--no-context-files"]);
+    fs::write(pi.root.join("cwd/notes.txt"), "alpha\n").unwrap();
+    for (id, message) in [
+        ("1", "/nope hi"),
+        ("2", "/read notes.txt"),
+        ("3", "/home/user/main.rs is broken"),
+    ] {
+        pi.command(json!({"id": id, "type": "prompt", "message": message}));
+        pi.wait_for("agent_settled", id.parse().unwrap());
+    }
+    assert!(pi.close().success());
+    assert!(of_type(&pi.records, "agent_end").all(|end| end["willRetry"] == false));
+    let errors = pi.records.iter();
+    let errors = errors.filter(|record| !record["message"]["errorMessage"].is_null());
+    assert_eq!(errors.count(), 0, "{}", transcript(&pi.records));
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 2, "the read ran without the model");
+    assert_eq!(requests[0], json!([{"role": "user", "text": "/nope hi"}]));
+    assert_eq!(
+        requests[1].as_array().unwrap().last().unwrap(),
+        &json!({"role": "user", "text": "/home/user/main.rs is broken"})
+    );
+}
