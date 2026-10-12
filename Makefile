@@ -127,6 +127,7 @@ parity-check:
 	$(CARGO) test -p pi-config --lib _ts
 	$(CARGO) test -p pi-core --lib input_expansion_matches_ts_session
 	$(CARGO) test -p pi-cli --test rpc_parity get_commands_matches_upstream
+	$(CARGO) test -p pi-cli --test rpc_parity golden_
 	$(MAKE) ts-parity-drift
 
 ts-parity-build:
