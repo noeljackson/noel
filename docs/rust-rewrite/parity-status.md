@@ -65,6 +65,15 @@ The committed TypeScript parity fixtures are:
   full-tree JSONL active branches.
 - `settings.json`: settings merge and normalization cases.
 - `slash-commands.json`: slash command inventory and selected descriptions.
+- `system-prompt.json`: the text of upstream's system prompt builder, with
+  its sections, for the default tools, every tool pi shares with upstream, a
+  subset, no tools, context files, a custom prompt, appended text, both, and
+  extension tools; each case's inputs are the ones a real upstream session
+  passed its builder. Also what upstream's resource loader picks from a tree
+  of `SYSTEM.md`, `APPEND_SYSTEM.md`, and context files: project trust,
+  command-line flags, `AGENTS.override.md`, and nested worktrees. The
+  temporary directory, the product name, and the documentation paths are
+  placeholders; the `placeholders` block lists them.
 - `tui-transcripts.json`: deterministic TUI transcript markers.
 
 ## Fixture-Backed Rust Behavior
@@ -88,6 +97,17 @@ Current Rust parity coverage includes:
 - RPC mode: every `rpc-protocol.json` scenario, record by record and model
   request by model request, allowing the differences listed under "RPC Mode"
   in the non-parity register (`crates/pi-cli/tests/rpc_parity.rs`).
+- The system prompt: for every `system-prompt.json` case, a runtime with
+  upstream's inputs sends upstream's text to the byte, apart from the product
+  name and the `docs` section
+  (`system_prompt_matches_ts_builder` in `crates/pi-core/src/system_prompt.rs`).
+- Prompt and context file discovery: for every `system-prompt.json` discovery
+  case, startup resolves the custom prompt, appended text, and context files
+  upstream's resource loader resolves
+  (`prompt_and_context_files_match_ts_discovery` in `crates/pi-cli/src/main.rs`).
+
+Only those two tests cover the system prompt. The provider request fixtures
+pass an explicit prompt, and the RPC goldens record messages without it.
 
 ## Validation Commands
 
@@ -98,6 +118,8 @@ make ts-parity-update
 cargo test -p pi-parity
 cargo test -p pi-ai --lib matches_ts
 cargo test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
+cargo test -p pi-core --lib system_prompt_matches_ts_builder
+cargo test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery
 cargo test -p pi-cli --test rpc_parity
 make check
 make ts-parity-drift

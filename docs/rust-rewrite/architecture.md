@@ -38,6 +38,7 @@ The Rust implementation uses a Cargo workspace with explicit crate boundaries:
   - Package/config CLI commands.
 - `crates/pi-core`
   - Agent loop.
+  - System prompt.
   - Session state.
   - Conversation orchestration.
   - Session persistence and export/import.
@@ -47,6 +48,7 @@ The Rust implementation uses a Cargo workspace with explicit crate boundaries:
   - Settings loading.
   - Auth loading.
   - Keybindings config.
+  - Context file and prompt file discovery.
   - Resource/package discovery.
   - Model cache loading.
 - `crates/pi-ai`
@@ -99,6 +101,7 @@ Reloadable runtime state owns replaceable wiring:
 - Tool definitions.
 - Prompt templates.
 - Skills.
+- Custom and appended system prompt text.
 - Context files.
 - Extensions.
 - Keybinding map.
@@ -231,10 +234,19 @@ Project-local roots:
 - `.pi/`
 - `.agents/skills`
 
-Context discovery:
+Context discovery, whatever the project trust decision:
 
-- Load global `AGENTS.md`/`CLAUDE.md` from the agent dir.
-- Load cwd ancestor `AGENTS.md`/`CLAUDE.md` in root-to-leaf order.
+- One context file per directory: `AGENTS.override.md`, else `AGENTS.md`,
+  else `CLAUDE.md`.
+- Load the agent dir's, then the cwd ancestors' in root-to-leaf order.
+- In a linked worktree nested inside its main checkout, skip the main
+  checkout's file that the worktree's own file of the same name replaces.
+
+Prompt files:
+
+- `SYSTEM.md` and `APPEND_SYSTEM.md`: the trusted project's `.pi/` copy, else
+  the agent dir's. The `systemPrompt`/`appendSystemPrompt` settings and the
+  `--system-prompt`/`--append-system-prompt` flags come before the files.
 
 Validation rules:
 
@@ -243,6 +255,38 @@ Validation rules:
 - Invalid resources produce diagnostics.
 - Missing optional resource paths produce diagnostics.
 - Missing required session cwd blocks session resume outside interactive recovery.
+
+## System Prompt
+
+`crates/pi-core/src/system_prompt.rs` builds the prompt every model request
+starts with. It is a port of upstream's `buildSystemPrompt`: a pure function
+from the active tools, the custom and appended prompt text, the context
+files, and the working directory to the text, with no runtime behind it.
+`system-prompt.json` holds upstream's output and the module's tests compare
+against it to the byte.
+
+The prompt is a one-sentence role followed by tagged sections joined by blank
+lines: `tools`, `rules`, `addendum`, `project_context`, `skills`, and `cwd`. A
+custom prompt replaces the role, `tools`, and `rules`; the rest still follow
+it. `skills` is a hook: the builder renders a listing it is given, and the
+runtime gives it none yet.
+
+The runtime builds the prompt once per turn (`runtime_system_prompt`) from
+what the session and the reloadable systems hold at that moment:
+
+- The tools are the ones the request declares (`active_tool_definitions`), so
+  the tool list and rules always match the request. A builtin tool's line and
+  rules come from `PromptTool::builtin`; an extension tool's come from its
+  manifest's `promptSnippet` and `promptGuidelines`.
+- The custom prompt, appended text, and context files come from the loaded
+  config, so `/reload` picks up edited files.
+- Session `System` messages follow the prompt in the same request field.
+
+The context estimate counts the same text, so automatic compaction and the
+output cap include the prompt.
+
+`PRODUCT_NAME` is the one place the product's name is written for the prompt
+and for the `AI_AGENT` process marker.
 
 ## Session Model
 
@@ -363,6 +407,15 @@ Rules:
 - Search/list tools are read-only.
 - Tool tests do not call providers.
 - Shell execution supports configured shell path and command prefix.
+- A `bash` call from the model runs with the session's variables
+  (`PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`,
+  `PI_REASONING_LEVEL`), set per call by `pi-core` through
+  `ToolRuntimeOptions::bash_env`; a variable with nothing to report is
+  removed from the inherited environment. The reasoning level is the turn's
+  provider's thinking level (`Provider::thinking_level`). Commands the user
+  types get none.
+- `pi-cli` sets the process markers `AI_AGENT` and `PI_CODING_AGENT` before
+  starting any thread, so every child process inherits them.
 - TUI progress rendering is controlled by `terminal.showTerminalProgress`.
 
 Patch/edit behavior uses structured local logic rather than provider-specific
@@ -413,7 +466,8 @@ Extension execution supports:
 - JSON lifecycle events for `reload` and `shutdown`.
 - JSON model-tool registration from adjacent `.pi-extension.json` manifests.
   Registered tools receive `kind: "tool"` protocol requests and return JSON
-  command responses.
+  command responses. A tool's optional `promptSnippet` and `promptGuidelines`
+  become its line and rules in the system prompt.
 - Diagnostics for manifest and lifecycle failures.
 
 Intentionally unsupported:

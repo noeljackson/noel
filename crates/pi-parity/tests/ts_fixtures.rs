@@ -33,6 +33,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "session-export.json",
     "settings.json",
     "slash-commands.json",
+    "system-prompt.json",
     "tui-transcripts.json",
 ];
 
@@ -55,6 +56,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "session-export-fixture.ts",
     "settings-fixture.ts",
     "slash-command-fixture.ts",
+    "system-prompt-fixture.ts",
     "tui-transcript-fixture.ts",
 ];
 
@@ -193,6 +195,10 @@ fn every_script_output_is_committed() {
             fixture_set(&["slash-commands.json"]),
         ),
         (
+            "system-prompt-fixture.ts",
+            fixture_set(&["system-prompt.json"]),
+        ),
+        (
             "tui-transcript-fixture.ts",
             fixture_set(&["tui-transcripts.json"]),
         ),
@@ -265,6 +271,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("session-export.json", "crates/pi-core/src/lib.rs"),
         ("settings.json", "crates/pi-config/src/lib.rs"),
         ("slash-commands.json", "crates/pi-tui/src/lib.rs"),
+        ("system-prompt.json", "crates/pi-core/src/system_prompt.rs"),
         ("tui-transcripts.json", "crates/pi-tui/src/lib.rs"),
     ]
     .into_iter()

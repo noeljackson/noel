@@ -101,6 +101,9 @@ pub struct ToolRuntimeOptions {
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
     pub offline: bool,
+    /// Changes to the environment a bash command inherits: a variable to
+    /// set, or with `None` one to remove.
+    pub bash_env: Vec<(String, Option<String>)>,
 }
 
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -382,6 +385,12 @@ async fn bash_tool(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (name, value) in &options.bash_env {
+        match value {
+            Some(value) => process.env(name, value),
+            None => process.env_remove(name),
+        };
+    }
     // The shell leads its own process group, so a timeout or an interrupt
     // (dropping this future) kills the whole tree, not just the shell pid:
     // killing only the shell orphaned children like a long preflight script.

@@ -121,14 +121,18 @@ Current user files:
 Project-local files:
 
 - `.pi/settings.json`
+- `.pi/SYSTEM.md` and `.pi/APPEND_SYSTEM.md`, which replace the agent dir's
+  `SYSTEM.md` and `APPEND_SYSTEM.md`
 - `.pi/extensions`
 - `.pi/skills`
 - `.pi/prompts`
 - `.pi/themes`
 - `.agents/skills`
-- `AGENTS.md` or `CLAUDE.md` discovered from the global agent dir and cwd
-  ancestors, whatever the project trust decision; trust gates only the `.pi`
-  resources and `.agents/skills` above.
+- `AGENTS.override.md`, `AGENTS.md`, or `CLAUDE.md` (one per directory, in
+  that order) discovered from the global agent dir and cwd ancestors,
+  whatever the project trust decision; trust gates only the `.pi` resources
+  and `.agents/skills` above. A linked worktree nested in its main checkout
+  replaces the main checkout's same-named file.
 
 Rust behavior:
 
@@ -150,6 +154,8 @@ Current settings cover:
 - Model refresh settings and cache TTL.
 - Theme, keybindings, markdown, and terminal behavior.
 - Shell path and shell command prefix.
+- Custom and appended system prompt text (`systemPrompt`,
+  `appendSystemPrompt`; Rust-only settings).
 - Thinking block visibility and thinking budgets.
 - Terminal image/progress settings.
 - Image resize/block settings.
@@ -301,6 +307,29 @@ Loaded resources add dynamic commands:
 - `/skill:<name>`
 - `/prompt <name>`
 - `/theme <name>`
+
+## System Prompt
+
+Upstream sends every request a system prompt built by
+`core/system-prompt.ts`: the role, the active tools with a one-line snippet
+each, rules contributed by the tools, pointers to its documentation, appended
+text, project context files, the skills listing, and the working directory.
+
+Rust behavior:
+
+- Same builder, same text, same section order, in every mode; compared with
+  upstream's output in `system-prompt.json`.
+- `--system-prompt`, the `systemPrompt` setting, or `SYSTEM.md` replace the
+  role, tool list, and rules. `--append-system-prompt`, the
+  `appendSystemPrompt` setting, or `APPEND_SYSTEM.md` add the `addendum`.
+- The Rust-only tools (`todo`, `web_search`, `web_fetch`) have snippets in
+  upstream's style. JSON extension tools supply `promptSnippet` and
+  `promptGuidelines` in their manifest.
+- The model's `bash` commands get `PI_SESSION_ID`, `PI_SESSION_FILE`,
+  `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`, and the prompt's bash
+  rule says so. The process carries `AI_AGENT` and `PI_CODING_AGENT`.
+- Not ported: the documentation section, by decision, and the skills
+  listing, not yet (see "Default System Prompt" in the non-parity register).
 
 ## Tool Surface
 

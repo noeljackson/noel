@@ -193,13 +193,19 @@ impl Pi {
         fs::write(self.root.join(file), "").unwrap();
     }
 
-    /// What each model request contained, summarized as upstream's
-    /// fixture summarizes them.
-    fn model_requests(&self) -> Vec<Value> {
+    /// Every model request, as the faux script logged it.
+    fn logged_requests(&self) -> Vec<Value> {
         let log = fs::read_to_string(self.root.join("requests.jsonl")).unwrap_or_default();
-        log.lines()
-            .map(|line| {
-                let request: Value = serde_json::from_str(line).unwrap();
+        let requests = log.lines().map(|line| serde_json::from_str(line).unwrap());
+        requests.collect()
+    }
+
+    /// What each model request contained, summarized as upstream's
+    /// fixture summarizes them: its messages, without the system prompt.
+    fn model_requests(&self) -> Vec<Value> {
+        self.logged_requests()
+            .iter()
+            .map(|request| {
                 request["messages"]
                     .as_array()
                     .unwrap()
@@ -390,6 +396,15 @@ fn golden(name: &str, script: Value) {
         *scenario["modelRequests"].as_array().unwrap(),
         "{name}: model requests"
     );
+    // Upstream's requests lead with its system prompt, which the goldens
+    // record as `<text>` sections; pi's lead with its own.
+    for request in pi.logged_requests() {
+        let prompt = request["system_prompt"].as_str().unwrap_or_default();
+        assert!(
+            prompt.starts_with("You are an expert coding assistant") && prompt.contains("<cwd>"),
+            "{name}: system prompt {prompt:?}"
+        );
+    }
 }
 
 /// The scenario's arguments after `--mode rpc` and the model, with `<tmp>`

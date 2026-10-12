@@ -1,7 +1,10 @@
 mod compaction;
 mod session_lock;
+mod system_prompt;
 pub use compaction::RuntimeCompactionSettings;
 use session_lock::SessionLock;
+pub use system_prompt::PRODUCT_NAME;
+use system_prompt::{PromptTool, SystemPromptInput};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
@@ -19,7 +22,9 @@ use pi_ai::{
     ChatMessage, ChatRole, ChatToolCall, MediaInput, ModelRef, Provider, ProviderError,
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
 };
-use pi_config::{has_auth_for_provider, listed_accounts_for_provider, LoadedConfig, ResourceFile};
+use pi_config::{
+    has_auth_for_provider, listed_accounts_for_provider, ContextFile, LoadedConfig, ResourceFile,
+};
 /// Kills every running tool subprocess tree; for pi's fatal-signal handling.
 pub use pi_tools::kill_running_tool_groups;
 use pi_tools::{
@@ -418,9 +423,10 @@ pub struct BranchSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadableSystems {
     pub config_generation: u64,
+    /// Replaces the default prompt's role, tool list, and rules.
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
-    pub context_messages: Vec<String>,
+    pub context_files: Vec<ContextFile>,
     pub available_models: Vec<ModelRef>,
     pub configured_providers: BTreeSet<String>,
     pub available_accounts: BTreeMap<String, Vec<String>>,
@@ -446,7 +452,7 @@ impl Default for ReloadableSystems {
             config_generation: 0,
             system_prompt: None,
             append_system_prompt: Vec::new(),
-            context_messages: Vec::new(),
+            context_files: Vec::new(),
             available_models: Vec::new(),
             configured_providers: BTreeSet::new(),
             available_accounts: BTreeMap::new(),
@@ -476,6 +482,11 @@ pub struct ExtensionTool {
     /// The manifest's `replaySafe`: a call cut off by a stop may run again
     /// when the turn continues.
     pub replay_safe: bool,
+    /// The manifest's `promptSnippet` as one line: the tool's entry in the
+    /// system prompt's tool list. A tool without one is not listed there.
+    pub prompt_snippet: Option<String>,
+    /// The manifest's `promptGuidelines`: the tool's system prompt rules.
+    pub prompt_guidelines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,17 +550,11 @@ impl ReloadableSystems {
                 .chain(extension_tools.keys().cloned())
                 .collect(),
         };
-        let context_messages = config
-            .context_files
-            .iter()
-            .map(|file| format!("{}:\n{}", file.path.display(), file.content))
-            .collect();
-
         Self {
             config_generation: generation,
             system_prompt: config.system_prompt.clone(),
             append_system_prompt: config.append_system_prompt.clone(),
-            context_messages,
+            context_files: config.context_files.clone(),
             available_models,
             configured_providers,
             model_context_windows: config
@@ -1977,6 +1982,9 @@ pub struct Runtime {
     session: SessionState,
     systems: ReloadableSystems,
     store: Option<SessionStore>,
+    /// The thinking level of the current turn's provider, which bash
+    /// commands see as `PI_REASONING_LEVEL`.
+    thinking_level: Option<String>,
 }
 
 impl Runtime {
@@ -1985,6 +1993,7 @@ impl Runtime {
             session,
             systems,
             store: None,
+            thinking_level: None,
         }
     }
 
@@ -1997,6 +2006,7 @@ impl Runtime {
             session,
             systems,
             store: Some(store),
+            thinking_level: None,
         }
     }
 
@@ -2556,6 +2566,7 @@ pub async fn run_saved_prompt_streaming_events(
                     shell_path: runtime.systems.shell_path.clone(),
                     shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
                     offline: runtime.systems.offline,
+                    bash_env: Vec::new(),
                 },
             ))
             .await??;
@@ -2641,6 +2652,7 @@ async fn run_model_turn_streaming_events(
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     let system_prompt = runtime_system_prompt(runtime);
+    runtime.thinking_level = provider.thinking_level();
     let mut final_text = String::new();
     let max_tool_rounds = runtime.systems.max_tool_rounds;
     // Auto-compaction that failed on unchanged history will fail again; skip
@@ -2888,22 +2900,42 @@ async fn request_reply(
     })
 }
 
-fn runtime_system_prompt(runtime: &Runtime) -> Option<String> {
-    let mut system_prompt = runtime.systems.system_prompt.clone();
-    let mut context = runtime.systems.context_messages.clone();
-    context.extend(runtime.systems.append_system_prompt.clone());
-    if !context.is_empty() {
-        let context_text = context.join("\n\n");
-        system_prompt = Some(match system_prompt {
-            Some(prompt) => format!("{prompt}\n\n{context_text}"),
-            None => context_text,
-        });
-    }
-    system_prompt
+/// The system prompt for the session as it is now: its tools, prompt
+/// sources, context files, and working directory.
+fn runtime_system_prompt(runtime: &Runtime) -> String {
+    system_prompt::build_system_prompt(&SystemPromptInput {
+        custom_prompt: runtime.systems.system_prompt.as_deref(),
+        tools: &prompt_tools(runtime),
+        append_system_prompt: &runtime.systems.append_system_prompt.join("\n\n"),
+        context_files: &runtime.systems.context_files,
+        // Skills are not listed in the prompt yet.
+        skills: None,
+        cwd: &runtime.session.cwd,
+    })
 }
 
-fn provider_request(runtime: &Runtime, system_prompt: Option<String>) -> ProviderRequest {
-    let mut instructions = system_prompt.into_iter().collect::<Vec<_>>();
+/// The tools [`active_tool_definitions`] declares, as the prompt presents
+/// them.
+fn prompt_tools(runtime: &Runtime) -> Vec<PromptTool> {
+    let builtin = builtin_tool_definitions()
+        .into_iter()
+        .filter(|tool| model_tool_enabled(runtime, &tool.name))
+        .map(|tool| PromptTool::builtin(&tool.name));
+    let extension = runtime
+        .systems
+        .extension_tools
+        .values()
+        .filter(|tool| model_tool_enabled(runtime, &tool.name))
+        .map(|tool| PromptTool {
+            name: tool.name.clone(),
+            snippet: tool.prompt_snippet.clone(),
+            guidelines: tool.prompt_guidelines.clone(),
+        });
+    builtin.chain(extension).collect()
+}
+
+fn provider_request(runtime: &Runtime, system_prompt: String) -> ProviderRequest {
+    let mut instructions = vec![system_prompt];
     instructions.extend(
         runtime
             .session
@@ -2914,14 +2946,9 @@ fn provider_request(runtime: &Runtime, system_prompt: Option<String>) -> Provide
             })
             .map(|message| message.content.clone()),
     );
-    let system_prompt = if instructions.is_empty() {
-        None
-    } else {
-        Some(instructions.join("\n\n"))
-    };
     ProviderRequest {
         max_output_tokens: None,
-        system_prompt,
+        system_prompt: Some(instructions.join("\n\n")),
         messages: provider_messages(&runtime.session.messages),
         tools: active_tool_definitions(runtime),
     }
@@ -3224,6 +3251,9 @@ struct ExtensionToolManifest {
     parameters: Option<Value>,
     #[serde(default)]
     replay_safe: bool,
+    prompt_snippet: Option<String>,
+    #[serde(default)]
+    prompt_guidelines: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3277,6 +3307,10 @@ fn extension_tools_from_resources(extensions: &[ResourceFile]) -> BTreeMap<Strin
                     extension_path: extension.path.clone(),
                     protocol: protocol.clone(),
                     replay_safe: tool.replay_safe,
+                    prompt_snippet: system_prompt::normalize_snippet(
+                        tool.prompt_snippet.as_deref(),
+                    ),
+                    prompt_guidelines: system_prompt::normalize_guidelines(&tool.prompt_guidelines),
                 },
             );
         }
@@ -3303,6 +3337,30 @@ fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
         paths.push(path.with_extension("json"));
     }
     paths
+}
+
+/// What a bash command the model runs learns about its session (upstream's
+/// `bash.ts`): the session, model, and thinking level as of that command.
+/// A variable with nothing to report is removed, so a pi running inside
+/// another pi's command never passes on its parent's. Commands the user
+/// types (`/bash`, `!!`) get none of this.
+fn bash_session_env(runtime: &Runtime) -> Vec<(String, Option<String>)> {
+    let model = runtime.session.active_model.as_ref();
+    let session_file = runtime.store.as_ref().map(|store| {
+        let path = std::path::absolute(store.path()).unwrap_or_else(|_| store.path().into());
+        path.display().to_string()
+    });
+    let thinking_level = runtime.thinking_level.as_deref().unwrap_or("off");
+    [
+        ("PI_SESSION_ID", Some(runtime.session.session_id.clone())),
+        ("PI_SESSION_FILE", session_file),
+        ("PI_PROVIDER", model.map(|model| model.provider.clone())),
+        ("PI_MODEL", model.map(|model| model.id.clone())),
+        ("PI_REASONING_LEVEL", Some(thinking_level.to_string())),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3393,6 +3451,7 @@ async fn execute_model_tool_call(
                             shell_path: runtime.systems.shell_path.clone(),
                             shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
                             offline: runtime.systems.offline,
+                            bash_env: bash_session_env(runtime),
                         },
                     )
                     .await
@@ -3720,6 +3779,7 @@ pub async fn run_excluded_bash_result(
             shell_path: runtime.systems.shell_path.clone(),
             shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
             offline: runtime.systems.offline,
+            bash_env: Vec::new(),
         },
     )
     .await
@@ -4738,6 +4798,72 @@ mod tests {
         )));
         assert!(!runtime.session.tool_history[0].is_error);
         thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_bash_commands_see_the_session_model_and_thinking_level() {
+        /// Runs one bash command, then answers with what it printed.
+        struct BashProvider;
+        #[async_trait::async_trait]
+        impl Provider for BashProvider {
+            async fn complete(
+                &self,
+                request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                let last = request.messages.last().unwrap();
+                if last.role == ChatRole::Tool {
+                    return Ok(vec![StreamEvent::Text(last.content.clone())]);
+                }
+                let command = r#"printf '%s\n' "${PI_SESSION_ID-unset}" "${PI_SESSION_FILE-unset}" "${PI_PROVIDER-unset}" "${PI_MODEL-unset}" "${PI_REASONING_LEVEL-unset}""#;
+                Ok(vec![StreamEvent::ToolCall {
+                    id: "bash-1".into(),
+                    name: "bash".into(),
+                    arguments: json!({ "command": command }).to_string(),
+                }])
+            }
+
+            fn thinking_level(&self) -> Option<String> {
+                Some("high".into())
+            }
+        }
+        let base = durable_test_dir("bash-session-env");
+        let (store, mut session) =
+            SessionStore::create_with_id(&base, base.clone(), "env-session").unwrap();
+        let session_file = store.path().display().to_string();
+        session.active_model = Some(ModelRef {
+            provider: "faux".into(),
+            id: "echo".into(),
+        });
+        let mut saved = Runtime::with_store(session, ReloadableSystems::default(), store);
+        // A session without a journal or a model has neither to report.
+        let mut unsaved = Runtime::new(
+            SessionState::new("ephemeral", base.clone()),
+            ReloadableSystems::default(),
+        );
+        for (runtime, expected) in [
+            (
+                &mut saved,
+                format!("env-session\n{session_file}\nfaux\necho\nhigh\n"),
+            ),
+            (
+                &mut unsaved,
+                "ephemeral\nunset\nunset\nunset\nhigh\n".into(),
+            ),
+        ] {
+            runtime.systems.shell_path = Some("/bin/sh".into());
+            let printed = run_user_turn_streaming_events_with_media(
+                runtime,
+                &BashProvider,
+                "run it".into(),
+                Vec::new(),
+                &RunControl::default(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(printed, expected);
+        }
+        let _ = fs::remove_dir_all(base);
     }
 
     #[tokio::test]

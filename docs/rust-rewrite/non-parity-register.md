@@ -275,6 +275,59 @@ the industry CLIs also gate the picker behind an explicit resume action.
 Reason: the previous flat `/resume` list showed only ids and names, which
 made picking the right session impossible without opening journals by hand.
 
+### Default System Prompt
+
+Rust sends upstream's system prompt (`core/system-prompt.ts`) and reads the
+files upstream builds it from. `system_prompt_matches_ts_builder` compares
+the text with `system-prompt.json` to the byte, and
+`prompt_and_context_files_match_ts_discovery` compares the files chosen. The
+differences:
+
+- No `<docs>` section. Upstream's points at the README, docs, and examples
+  its package installs, and tells the model to read them for questions about
+  pi. Rust installs one binary and no documentation, so a path would dangle;
+  a link to this repository would need network access and a model that
+  fetches it. The parity test drops exactly this section from upstream's
+  text.
+- No `<skills>` section yet. The builder renders a listing it is given
+  (`SystemPromptInput::skills`), in upstream's place between project context
+  and the working directory, and the runtime gives it none.
+- Rust enables every builtin tool by default; upstream starts with `read`,
+  `bash`, `edit`, and `write`. So the default prompt also lists `grep`,
+  `find`, and `ls`, and leaves out the rule "Use bash for file operations
+  like ls, rg, find", as upstream's does once those tools are on (the
+  fixture's `all-tools` case).
+- `todo`, `web_search`, and `web_fetch` exist only in Rust, so their lines in
+  the tool list are Rust's own: "Track multi-step work as a checklist",
+  "Search the web for current information", and "Fetch a web page as
+  readable text". They add no rules.
+- Extension tools are listed in name order, the order Rust declares them in a
+  request. Upstream lists them in the order extensions registered them.
+- The `systemPrompt` and `appendSystemPrompt` settings are Rust's own.
+  `systemPrompt` ranks below `--system-prompt` and above `SYSTEM.md`.
+  `appendSystemPrompt` entries come before the `--append-system-prompt` text,
+  and either of the two replaces `APPEND_SYSTEM.md`. Upstream has only the
+  flags and the files.
+- Extensions cannot change the prompt beyond a tool's `promptSnippet` and
+  `promptGuidelines`. Upstream's `before_agent_start` handlers can replace
+  the prompt, add rules and sections, and hide tools.
+- The prompt is not a transcript message. Upstream records it as the leading
+  system message and sends later changes as section updates (upstream
+  #9548); Rust rebuilds the prompt each turn and sends it whole (see RPC
+  Mode).
+- A `SYSTEM.md`, `APPEND_SYSTEM.md`, or context file that cannot be read is
+  listed in `/diagnostics` and skipped. Upstream prints a warning, and for
+  the two prompt files uses the file's path as the prompt text.
+- With `--no-session`, bash's `PI_SESSION_ID` is `ephemeral`, Rust's id for a
+  session without a journal; upstream generates an id for it.
+- The rules for the `powershell` tool are not ported (see Windows-Only
+  PowerShell Tool).
+
+Reason: the prompt is how the model learns its role, its tools, and the
+project's instructions, so Rust keeps upstream's text and order and diverges
+only where it has nothing to point at (documentation, extension hooks) or has
+something upstream lacks (its own tools and settings).
+
 ### Windows-Only PowerShell Tool
 
 Rust does not ship upstream's `powershell` builtin tool. Upstream registers it
@@ -386,7 +439,9 @@ Differences in the golden records:
 
 - No system messages: upstream's transcript starts with a system message
   (upstream #9548, which pi has not ported), reported by `message_start` and
-  `message_end` and kept in `agent_end` and `get_messages`. pi reports none.
+  `message_end` and kept in `agent_end` and `get_messages`. pi reports none:
+  it sends its system prompt with every request and keeps it out of the
+  transcript.
 - `messageCount` counts the messages pi keeps: not upstream's system message,
   and not an aborted reply (see below).
 - Queue modes: pi delivers everything queued at once (see Batched Queue and
