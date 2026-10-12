@@ -26,10 +26,10 @@ pub enum ToolRequest {
         command: String,
         timeout_ms: Option<u64>,
     },
+    /// All edits apply to the original file together, or none do.
     Edit {
         path: String,
-        find: String,
-        replace: String,
+        edits: Vec<TextEdit>,
     },
     Write {
         path: String,
@@ -59,6 +59,13 @@ pub enum ToolRequest {
     },
 }
 
+/// One exact-text replacement: `find` must occur exactly once in the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextEdit {
+    pub find: String,
+    pub replace: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub output: String,
@@ -79,8 +86,8 @@ pub enum ToolError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("edit target was not found in {0}")]
-    EditTargetNotFound(String),
+    #[error("{0}")]
+    InvalidEdit(String),
     #[error("command timed out after {0} ms")]
     Timeout(u64),
 }
@@ -141,11 +148,7 @@ pub async fn execute_tool(
             command,
             timeout_ms,
         } => bash_tool(cwd, &command, timeout_ms, options).await,
-        ToolRequest::Edit {
-            path,
-            find,
-            replace,
-        } => edit_tool(cwd, &path, &find, &replace),
+        ToolRequest::Edit { path, edits } => edit_tool(cwd, &path, &edits),
         ToolRequest::Write { path, content } => write_tool(cwd, &path, &content),
         ToolRequest::Grep {
             path,
@@ -424,16 +427,13 @@ async fn bash_tool(
     })
 }
 
-fn edit_tool(cwd: &Path, path: &str, find: &str, replace: &str) -> Result<ToolResult, ToolError> {
-    let path = resolve_under_cwd(cwd, path)?;
+fn edit_tool(cwd: &Path, input_path: &str, edits: &[TextEdit]) -> Result<ToolResult, ToolError> {
+    let path = resolve_under_cwd(cwd, input_path)?;
     let content = fs::read_to_string(&path).map_err(|source| ToolError::Io {
         path: path.clone(),
         source,
     })?;
-    if !content.contains(find) {
-        return Err(ToolError::EditTargetNotFound(path.display().to_string()));
-    }
-    let next = content.replacen(find, replace, 1);
+    let next = apply_text_edits(&content, edits, input_path)?;
     fs::write(&path, next).map_err(|source| ToolError::Io {
         path: path.clone(),
         source,
@@ -442,6 +442,78 @@ fn edit_tool(cwd: &Path, path: &str, find: &str, replace: &str) -> Result<ToolRe
         is_error: false,
         output: format!("edited {}", path.display()),
     })
+}
+
+/// Applies every edit to `content`, or none (upstream
+/// `applyEditsToNormalizedContent`, without fuzzy matching). Each `find` must
+/// occur exactly once in the original content and the matched regions must
+/// not overlap. Edits use the file's line endings (CRLF when its first line
+/// ends in CRLF); the rest of the file, including a BOM, is kept byte for
+/// byte.
+fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<String, ToolError> {
+    if edits.is_empty() {
+        return Err(ToolError::InvalidEdit(format!(
+            "edits must contain at least one replacement for {path}."
+        )));
+    }
+    let crlf = content
+        .find('\n')
+        .is_some_and(|newline| content[..newline].ends_with('\r'));
+    let in_file_endings = |text: &str| {
+        let text = text.replace("\r\n", "\n");
+        if crlf {
+            text.replace('\n', "\r\n")
+        } else {
+            text
+        }
+    };
+    let single = edits.len() == 1;
+    let mut matches = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let find = in_file_endings(&edit.find);
+        if find.is_empty() {
+            return Err(ToolError::InvalidEdit(if single {
+                format!("oldText must not be empty in {path}.")
+            } else {
+                format!("edits[{index}].oldText must not be empty in {path}.")
+            }));
+        }
+        let mut occurrences = content.match_indices(find.as_str());
+        let Some((start, _)) = occurrences.next() else {
+            return Err(ToolError::InvalidEdit(if single {
+                format!("Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines.")
+            } else {
+                format!("Could not find edits[{index}] in {path}. The oldText must match exactly including all whitespace and newlines.")
+            }));
+        };
+        let count = 1 + occurrences.count();
+        if count > 1 {
+            return Err(ToolError::InvalidEdit(if single {
+                format!("Found {count} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique.")
+            } else {
+                format!("Found {count} occurrences of edits[{index}] in {path}. Each oldText must be unique. Please provide more context to make it unique.")
+            }));
+        }
+        matches.push((start, find.len(), in_file_endings(&edit.replace), index));
+    }
+    matches.sort_by_key(|(start, ..)| *start);
+    for pair in matches.windows(2) {
+        let ((start, len, _, first), (next_start, _, _, second)) = (&pair[0], &pair[1]);
+        if start + len > *next_start {
+            return Err(ToolError::InvalidEdit(format!(
+                "edits[{first}] and edits[{second}] overlap in {path}. Merge them into one edit or target disjoint regions."
+            )));
+        }
+    }
+    let mut next = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for (start, len, replace, _) in &matches {
+        next.push_str(&content[cursor..*start]);
+        next.push_str(replace);
+        cursor = start + len;
+    }
+    next.push_str(&content[cursor..]);
+    Ok(next)
 }
 
 fn write_tool(cwd: &Path, path: &str, content: &str) -> Result<ToolResult, ToolError> {
@@ -998,8 +1070,10 @@ mod tests {
             &cwd,
             ToolRequest::Edit {
                 path: "a.txt".to_string(),
-                find: "world".to_string(),
-                replace: "rust".to_string(),
+                edits: vec![TextEdit {
+                    find: "world".to_string(),
+                    replace: "rust".to_string(),
+                }],
             },
             &ToolRuntimeOptions::default(),
         )
@@ -1183,6 +1257,91 @@ mod tests {
         .expect_err("outside read should fail");
 
         assert!(matches!(error, ToolError::PathEscapesCwd(_)));
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    fn text_edits(pairs: &[(&str, &str)]) -> Vec<TextEdit> {
+        pairs
+            .iter()
+            .map(|(find, replace)| TextEdit {
+                find: find.to_string(),
+                replace: replace.to_string(),
+            })
+            .collect()
+    }
+
+    async fn edit_file(cwd: &Path, edits: &[(&str, &str)]) -> Result<ToolResult, ToolError> {
+        execute_tool(
+            cwd,
+            ToolRequest::Edit {
+                path: "a.txt".to_string(),
+                edits: text_edits(edits),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn edits_apply_all_together_or_not_at_all() {
+        let cwd = std::env::temp_dir().join(format!("pi-tools-edit-atomic-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let file = cwd.join("a.txt");
+        fs::write(&file, "alpha beta gamma\n").expect("write file");
+
+        edit_file(&cwd, &[("gamma", "G"), ("alpha", "A")])
+            .await
+            .expect("edit both");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "A beta G\n");
+
+        // A later edit that fails leaves the earlier ones unapplied.
+        let error = edit_file(&cwd, &[("beta", "B"), ("missing", "X")])
+            .await
+            .expect_err("missing text");
+        assert!(error.to_string().contains("edits[1]"), "{error}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "A beta G\n");
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn edits_require_unique_non_overlapping_old_text() {
+        let cwd = std::env::temp_dir().join(format!("pi-tools-edit-unique-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let file = cwd.join("a.txt");
+        fs::write(&file, "x = 1;\nx = 1;\nabcdef\n").expect("write file");
+
+        let error = edit_file(&cwd, &[("x = 1;", "x = 2;")])
+            .await
+            .expect_err("duplicate text");
+        assert!(error.to_string().contains("Found 2 occurrences"), "{error}");
+        let error = edit_file(&cwd, &[("abc", "1"), ("cde", "2")])
+            .await
+            .expect_err("overlapping edits");
+        assert!(
+            error.to_string().contains("edits[0] and edits[1] overlap"),
+            "{error}"
+        );
+        let error = edit_file(&cwd, &[("", "y")]).await.expect_err("empty");
+        assert!(error.to_string().contains("must not be empty"), "{error}");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "x = 1;\nx = 1;\nabcdef\n"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn edits_delete_with_empty_new_text_and_keep_bom_and_crlf() {
+        let cwd = std::env::temp_dir().join(format!("pi-tools-edit-crlf-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let file = cwd.join("a.txt");
+        fs::write(&file, "\u{feff}one\r\ntwo\r\nthree\r\n").expect("write file");
+
+        // Models send LF; the edit matches and writes CRLF.
+        edit_file(&cwd, &[("one\ntwo\n", ""), ("three", "3\nthree")])
+            .await
+            .expect("edit crlf file");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "\u{feff}3\r\nthree\r\n");
         let _ = fs::remove_dir_all(cwd);
     }
 }
