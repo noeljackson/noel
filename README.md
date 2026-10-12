@@ -626,7 +626,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `!!`
 - `/quit`
 
-`/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
+`/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state. It keeps the session's project trust decision and command-line overrides (such as `--system-prompt`, `-e`, `--tools`, and `--api-key`), as do `/models refresh`, `/models reset`, and RPC `reload`.
 
 The editor uses a rounded box with a `>` prompt. A labeled Todo section and
 queued-message previews sit above it, separated by muted rules. Drafts wrap

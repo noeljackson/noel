@@ -87,7 +87,7 @@ enum OutputMode {
     Rpc,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "pi")]
 #[command(version)]
 #[command(about = "Native Rust CLI for pi")]
@@ -1271,6 +1271,11 @@ async fn main() -> Result<()> {
         }
     }
     apply_cli_overrides(&cli, &cwd, &mut config)?;
+    let _ = CONFIG_SOURCE.set(ConfigSource {
+        cli: cli.clone(),
+        cwd: cwd.clone(),
+        project_trusted,
+    });
     if cli.verbose {
         eprintln!("agent dir: {}", config.paths.agent_dir.display());
         eprintln!("session dir: {}", config.paths.session_dir.display());
@@ -1418,7 +1423,7 @@ async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) 
                 }
             }
             "reload" => {
-                config = load_config(config.paths.clone())?;
+                config = reload_config(&config)?;
                 start_model_refresh(&config, offline, false);
                 let next_generation = runtime.systems().config_generation + 1;
                 match runtime.reload(ReloadableSystems::from_config(&config, next_generation)) {
@@ -1504,6 +1509,41 @@ fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Val
             "message": message,
         },
     })
+}
+
+/// How startup built this process's config: the project trust decision and
+/// the command line. `/reload`, `/models refresh|reset`, and RPC `reload`
+/// rebuild the config the same way, so a reload neither trusts a project the
+/// session did not trust nor drops `--system-prompt`, `-e`, `--api-key`, and
+/// the other command-line overrides.
+#[derive(Debug, Clone)]
+struct ConfigSource {
+    cli: Cli,
+    cwd: PathBuf,
+    project_trusted: bool,
+}
+
+static CONFIG_SOURCE: std::sync::OnceLock<ConfigSource> = std::sync::OnceLock::new();
+
+impl ConfigSource {
+    fn load(&self, paths: ConfigPaths) -> Result<LoadedConfig> {
+        let mut config = load_config_with_project_trust(paths, self.project_trusted)?;
+        apply_cli_overrides(&self.cli, &self.cwd, &mut config)?;
+        Ok(config)
+    }
+}
+
+/// Reloads the config the way startup built it (see [`ConfigSource`]).
+fn reload_config(config: &LoadedConfig) -> Result<LoadedConfig> {
+    match CONFIG_SOURCE.get() {
+        Some(source) => source.load(config.paths.clone()),
+        // Only startup records a source. Without one there are no overrides
+        // to keep, and a project counts as trusted only by a saved decision.
+        None => Ok(load_config_with_project_trust(
+            config.paths.clone(),
+            project_is_trusted(&config.paths.agent_dir, &config.paths.cwd)?,
+        )?),
+    }
 }
 
 fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Result<()> {
@@ -7146,7 +7186,7 @@ async fn handle_tui_submission(
         "/reload" => {
             let lifecycle_diagnostics =
                 notify_extension_lifecycle(&config.extensions, "reload", &runtime.session().cwd);
-            *config = load_config(config.paths.clone())?;
+            *config = reload_config(config)?;
             start_model_refresh(config, offline, false);
             let next_generation = runtime.systems().config_generation + 1;
             let report = runtime.reload(ReloadableSystems::from_config(config, next_generation))?;
@@ -7262,7 +7302,7 @@ async fn handle_tui_submission(
                     } else {
                         let report =
                             refresh_model_cache(config.paths.clone(), config.auth.clone()).await?;
-                        *config = load_config(config.paths.clone())?;
+                        *config = reload_config(config)?;
                         let next_generation = runtime.systems().config_generation + 1;
                         let reload_report = runtime
                             .reload(ReloadableSystems::from_config(config, next_generation))?;
@@ -7274,7 +7314,7 @@ async fn handle_tui_submission(
                 }
                 "reset" => {
                     let message = reset_model_cache(&config.paths.model_cache_path)?;
-                    *config = load_config(config.paths.clone())?;
+                    *config = reload_config(config)?;
                     let next_generation = runtime.systems().config_generation + 1;
                     let reload_report =
                         runtime.reload(ReloadableSystems::from_config(config, next_generation))?;
@@ -10866,6 +10906,95 @@ mod tests {
             .auth
             .credential("openai-codex", DEFAULT_ACCOUNT_NAME)
             .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reload_keeps_the_trust_decision_and_cli_overrides() {
+        let root =
+            std::env::temp_dir().join(format!("pi-cli-config-source-{}", unique_temp_suffix()));
+        let agent = root.join("agent");
+        let project = root.join("project");
+        fs::create_dir_all(&agent).expect("create agent dir");
+        fs::create_dir_all(project.join(".pi/extensions")).expect("create project extensions");
+        fs::write(
+            project.join(".pi/settings.json"),
+            r#"{"shellCommandPrefix":"echo untrusted"}"#,
+        )
+        .expect("write project settings");
+        fs::write(
+            project.join(".pi/extensions/project.md"),
+            "project extension",
+        )
+        .expect("write project extension");
+        fs::write(project.join("AGENTS.md"), "project rules").expect("write context file");
+        let resource = |name: &str| {
+            let path = root.join(format!("{name}.md"));
+            fs::write(&path, format!("cli {name}")).expect("write cli resource");
+            path.display().to_string()
+        };
+        let (extension, skill, template) = (resource("ext"), resource("skill"), resource("tpl"));
+        let cli = Cli::try_parse_from([
+            "pi",
+            "--system-prompt",
+            "cli system",
+            "--append-system-prompt",
+            "cli append",
+            "--no-context-files",
+            "--tools",
+            "read",
+            "--provider",
+            "anthropic",
+            "--api-key",
+            "cli-key",
+            "-e",
+            &extension,
+            "--skill",
+            &skill,
+            "--prompt-template",
+            &template,
+        ])
+        .expect("parse cli");
+        let source = ConfigSource {
+            cli,
+            cwd: project.clone(),
+            project_trusted: false,
+        };
+        let paths = ConfigPaths {
+            cwd: project.clone(),
+            agent_dir: agent.clone(),
+            session_dir: agent.join("sessions"),
+            settings_path: agent.join("settings.json"),
+            project_settings_path: project.join(".pi/settings.json"),
+            auth_path: agent.join("auth.json"),
+            models_path: agent.join("models.json"),
+            model_cache_path: agent.join("model-cache.json"),
+            keybindings_path: agent.join("keybindings.json"),
+        };
+
+        let config = source.load(paths).expect("reload config");
+
+        assert_eq!(config.settings.shell_command_prefix, None);
+        let contents = |resources: &[ResourceFile]| {
+            resources
+                .iter()
+                .map(|resource| resource.content.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(contents(&config.extensions), ["cli ext"]);
+        assert_eq!(contents(&config.skills), ["cli skill"]);
+        assert_eq!(contents(&config.prompt_templates), ["cli tpl"]);
+        assert_eq!(config.system_prompt.as_deref(), Some("cli system"));
+        assert_eq!(config.append_system_prompt, ["cli append"]);
+        assert!(config.context_files.is_empty());
+        assert_eq!(
+            config.settings.enabled_tools,
+            Some(vec!["read".to_string()])
+        );
+        assert_eq!(
+            auth_for_provider(&config.auth, "anthropic", None),
+            Some(ResolvedAuth::ApiKey("cli-key".to_string()))
+        );
         let _ = fs::remove_dir_all(root);
     }
 
