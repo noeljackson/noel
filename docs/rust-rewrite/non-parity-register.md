@@ -197,6 +197,19 @@ Reason: Anthropic requires `max_tokens`, and the former fixed 4096 cut off
 long replies, thinking, and large `write` calls. Reading the limit from the id
 keeps new Claude models working without a catalog update.
 
+### auth.json Lock and Mode
+
+Upstream serializes `auth.json` updates with a `proper-lockfile` directory
+(`auth.json.lock`, stale after 30 seconds) and applies mode 0600 only when it
+creates the file. Rust takes an advisory `flock` on a sibling
+`auth.json.flock` and replaces `auth.json` by an atomic rename, so every write
+leaves it 0600.
+
+Reason: the operating system releases a `flock` when its holder exits, so no
+stale-lock recovery is needed, and the separate name never collides with an
+upstream process's lock directory. An atomic rename cannot keep the previous
+file's mode, and credentials should never be left group- or world-readable.
+
 ### Configurable Agent Round Cap
 
 The per-run provider round cap (`agent.maxToolRounds`, default 200, including
