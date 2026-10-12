@@ -146,6 +146,44 @@ wait_for 'Ran a command'
 wait_for '… live-done'
 wait_for 'retrying in 1s (attempt 1 of 3)'
 wait_for 'Hello again.'
+# The finished turn shows its command once, and the placeholder of a reply
+# that began with a tool call is gone.
+shown_once() {
+  capture
+  local count
+  count="$(grep -Fc "$1" "${work_dir}/pane.txt" || true)"
+  [ "${count}" = 1 ] || fail "shown ${count} times, not once: $1"
+}
+shown_once 'Ran a command'
+absent 'Working...'
+tmux send-keys -t "${session}" '/quit' Enter
+sleep 0.3
+tmux kill-session -t "${session}" >/dev/null 2>&1 || true
+
+# So does a turn that is interrupted after a tool call, and one that fails
+# after it: the script has no answer to the last request.
+cat > "${work_dir}/ends.json" <<'JSON'
+[
+  [{"tool_call": {"name": "bash", "arguments": {"command": "echo settle-one"}}}],
+  [{"wait_for_file": "never"}],
+  [{"tool_call": {"name": "bash", "arguments": {"command": "echo settle-two"}}}]
+]
+JSON
+tmux new-session -d -s "${session}" -x 100 -y 40
+tmux send-keys -t "${session}" \
+  "cd '${work_dir}' && env -u PI_TUI_E2E_DUMP PI_FAUX_SCRIPT='${work_dir}/ends.json' PI_CODING_AGENT_DIR='${work_dir}/live-agent' '${pi_bin}' --no-session --model faux/script --offline" Enter
+wait_for '│ >'
+tmux send-keys -t "${session}" 'first' Enter
+wait_for 'Ran a command · $ echo settle-one'
+tmux send-keys -t "${session}" Escape
+wait_for 'interrupted'
+shown_once 'Ran a command · $ echo settle-one'
+absent 'Working...'
+tmux send-keys -t "${session}" 'second' Enter
+wait_for 'request 4 has no response'
+shown_once 'Ran a command · $ echo settle-one'
+shown_once 'Ran a command · $ echo settle-two'
+absent 'Working...'
 tmux send-keys -t "${session}" '/quit' Enter
 sleep 0.3
 tmux kill-session -t "${session}" >/dev/null 2>&1 || true
