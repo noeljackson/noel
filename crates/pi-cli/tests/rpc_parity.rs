@@ -2389,6 +2389,128 @@ fn skills_and_templates_expand_in_prompt_steer_and_follow_up() {
     assert!(system_prompt.contains(&listing), "{system_prompt}");
 }
 
+/// A prompt that expands is expanded when it arrives, and that expansion is
+/// what a recovery sends again: a retry and the request after an overflow
+/// compaction neither expand the prompt again nor read the skill's file
+/// again, and the prompt is saved once.
+#[test]
+fn a_recovery_sends_the_saved_expansion_again_without_expanding_it_again() {
+    let root = fs::canonicalize(test_root("expand-recover")).unwrap();
+    let skill_file = root.join("given/review/SKILL.md");
+    let skill_dir = root.join("given/review");
+    let skill = |rule: &str| {
+        format!(
+            "---\nname: review\ndescription: Review code for bugs.\n---\n\n# Review\n\n{rule}\n"
+        )
+    };
+    let template = "---\ndescription: Fix a bug\n---\nFix issue $1. Notes: ${@:2}\n";
+    write_files(
+        &root,
+        &[
+            ("given/review/SKILL.md", &skill("Rule one.")),
+            ("agent/prompts/fix.md", template),
+        ],
+    );
+    // What `/skill:review <arguments>` expands to while the file holds `rule`.
+    let expanded = |rule: &str, arguments: &str| {
+        format!(
+            "<skill name=\"review\" location=\"{}\">\nReferences are relative to {}.\n\n# Review\n\n{rule}\n</skill>\n\n{arguments}",
+            skill_file.display(),
+            skill_dir.display()
+        )
+    };
+    let script = json!([
+        [{"error": "overloaded"}],
+        [text("Reviewed.")],
+        [text("Fixed.")],
+        [overflow()],
+        [{"wait_for_file": "release-summary"}, text("Summary of two turns.")],
+        [text("Reviewed again.")],
+        [text("Done.")]
+    ]);
+    let sessions = root.join("sessions").display().to_string();
+    let args = [
+        "--no-context-files",
+        "--skill",
+        "../given/review",
+        "--session-dir",
+        &sessions,
+        "--session-id",
+        SESSION,
+    ];
+    let settings = json!({"retry": {"baseDelayMs": 1500}, "compaction": {"keepRecentTokens": 8}});
+    let mut pi = Pi::spawn(root.clone(), script, &args, settings);
+
+    // The request fails and is retried. Meanwhile the skill's file changes.
+    pi.command(json!({"id": "1", "type": "prompt", "message": "/skill:review one"}));
+    pi.wait_for("auto_retry_start", 1);
+    fs::write(&skill_file, skill("Rule two.")).unwrap();
+    pi.wait_for("agent_settled", 1);
+    // A second turn, so that an overflow has something to compact.
+    pi.command(json!({"id": "2", "type": "prompt", "message": "/fix 42 now"}));
+    pi.wait_for("agent_settled", 2);
+    // The request overflows. The file changes again during the compaction.
+    pi.command(json!({"id": "3", "type": "prompt", "message": "/skill:review three"}));
+    pi.wait_for("compaction_start", 1);
+    wait_for_lines(&pi.root.join("requests.jsonl"), 5);
+    fs::write(&skill_file, skill("Rule three.")).unwrap();
+    pi.release("release-summary");
+    pi.wait_for("agent_settled", 3);
+    // A new prompt reads the file as it is now: a recovery that expanded
+    // again would have sent this text.
+    pi.command(json!({"id": "4", "type": "prompt", "message": "/skill:review four"}));
+    pi.wait_for("agent_settled", 4);
+    assert!(pi.close().success());
+
+    let (one, three, four) = (
+        expanded("Rule one.", "one"),
+        expanded("Rule two.", "three"),
+        expanded("Rule three.", "four"),
+    );
+    let fix = "Fix issue 42. Notes: now";
+    let user = |text: &str| json!({"role": "user", "text": text});
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 7);
+    // The retry is the failed request again: the expansion, once.
+    assert_eq!(requests[0], json!([user(&one)]));
+    assert_eq!(requests[1], requests[0]);
+    // The request that overflowed, and after the compaction (request 4 asks
+    // for its summary) the same expansion behind the checkpoint.
+    assert_eq!(
+        requests[3].as_array().unwrap().last().unwrap(),
+        &user(&three)
+    );
+    assert_eq!(requests[5], json!([checkpoint(), user(&three)]));
+    assert_eq!(
+        requests[6].as_array().unwrap().last().unwrap(),
+        &user(&four)
+    );
+    for request in &requests {
+        let text = request.to_string();
+        assert!(
+            !text.contains("/skill:review"),
+            "an unexpanded prompt: {text}"
+        );
+    }
+
+    // Each prompt is reported once and saved once, as its expansion.
+    let reported = of_type(&pi.records, "message_end")
+        .filter(|record| record["message"]["role"] == "user")
+        .map(|record| record["message"]["content"][0]["text"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reported,
+        [json!(one), json!(fix), json!(three), json!(four)]
+    );
+    let journal = pi.journal();
+    let saved = of_type(&journal, "message")
+        .filter(|record| record["message"]["role"] == "user")
+        .map(|record| record["message"]["content"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(saved, [json!(one), json!(fix), json!(three), json!(four)]);
+    assert_eq!(of_type(&journal, "compaction_checkpoint").count(), 1);
+}
+
 /// The model follows the listing: it reads the file the system prompt names
 /// for a skill given with `--skill` from outside the working directory, then
 /// the file that skill refers to beside it, and gets the text of both.
