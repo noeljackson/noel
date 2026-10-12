@@ -4064,6 +4064,12 @@ impl TuiApp {
         self.live_thinking_index = None;
         self.turn_running = false;
         self.turn_saw_tools = false;
+        self.remove_live_entry();
+    }
+
+    /// Removes the entry a turn was filling, while the turn goes on or as
+    /// it ends: a placeholder that nothing filled.
+    fn remove_live_entry(&mut self) {
         let Some(index) = self.live_entry_index.take() else {
             return;
         };
@@ -6679,6 +6685,13 @@ fn apply_turn_event(
             *activity = Activity::Tool(call.name.clone());
             app.live_thinking_index = None;
             app.turn_saw_tools = true;
+            // A reply that starts with a tool call writes nothing into the
+            // turn's placeholder: take it away, or it stays above the calls
+            // once the turn is over.
+            if !*saw_delta {
+                app.remove_live_entry();
+                *saw_delta = true;
+            }
             // Close the current text entry: the next delta opens a fresh one
             // below this tool call.
             *text_after_tool = true;
@@ -8461,7 +8474,6 @@ async fn run_turn_tui(
             } else {
                 app.drop_live_entry();
             }
-            insert_new_tool_messages(app, runtime, tool_start, entry_index);
             let control = if matches!(stream_end, StreamEnd::Interrupted) {
                 app.push(TuiEntryKind::System, "interrupted");
                 TurnControl::Interrupted
@@ -8485,7 +8497,6 @@ async fn run_turn_tui(
             } else {
                 app.drop_live_entry();
             }
-            insert_new_tool_messages(app, runtime, tool_start, entry_index);
             redraw_tui(surface.terminal, app, config)?;
             return Err(error.into());
         }
@@ -8494,7 +8505,6 @@ async fn run_turn_tui(
     if !saw_delta {
         app.replace_entry(live_text_index, response);
     }
-    insert_new_tool_messages(app, runtime, tool_start, entry_index);
     app.finish_live_entry();
     // A mid-turn /model <ref> applies now, before the next turn starts.
     // Persistence as default happens on the next explicit /model; here we
@@ -8514,13 +8524,14 @@ async fn run_turn_tui(
     Ok(TurnControl::Completed)
 }
 
-/// Finalize live tool previews once the turn ends. Previews are already
-/// interleaved between the per-round assistant text entries, so each is
-/// replaced in place with its durable transcript text instead of being
-/// re-inserted above the response (which would bury the newest text under
-/// the tool history). Previews without a durable record (a tool dropped by
-/// an interrupt) are removed; durable records without a preview fall back
-/// to insertion above the first text entry.
+/// Finalize live tool previews once the turn ends, however it ends. Previews
+/// are already interleaved between the per-round assistant text entries, so
+/// each is replaced in place with its durable transcript text instead of
+/// being re-inserted above the response (which would bury the newest text
+/// under the tool history). Previews without a durable record (a tool dropped
+/// by an interrupt) are removed; durable records without a preview fall back
+/// to insertion above the first text entry. This is the only place a turn's
+/// tool entries are settled: inserting them again would show each twice.
 fn settle_tool_entries(
     app: &mut TuiApp,
     runtime: &Runtime,
@@ -8571,18 +8582,6 @@ fn durable_tool_texts(runtime: &Runtime, tool_start: usize) -> Vec<String> {
             }
         })
         .collect()
-}
-
-fn insert_new_tool_messages(
-    app: &mut TuiApp,
-    runtime: &Runtime,
-    tool_start: usize,
-    assistant_entry_index: usize,
-) {
-    let tool_messages = durable_tool_texts(runtime, tool_start);
-    for (offset, text) in tool_messages.into_iter().enumerate() {
-        app.insert_entry(assistant_entry_index + offset, TuiEntryKind::Tool, text);
-    }
 }
 
 fn tool_call_detail(call: &pi_ai::ChatToolCall) -> String {
@@ -12936,7 +12935,7 @@ mod tests {
             is_error: true,
         });
         let runtime = Runtime::new(session, ReloadableSystems::default());
-        insert_new_tool_messages(&mut app, &runtime, 1, entry);
+        settle_tool_entries(&mut app, &runtime, 1, entry);
         assert_eq!(app.entries[entry].text, "failed bash\n\ntest failed");
         assert_eq!(app.entries[entry + 1].text, "done");
     }
@@ -13580,7 +13579,7 @@ mod tests {
         });
         let runtime = Runtime::new(session, ReloadableSystems::default());
 
-        insert_new_tool_messages(&mut app, &runtime, 0, assistant_index);
+        settle_tool_entries(&mut app, &runtime, 0, assistant_index);
 
         assert_eq!(app.entries[1].kind, TuiEntryKind::Tool);
         assert_eq!(app.entries[1].text, "completed read\n\nfile contents");
@@ -14557,8 +14556,9 @@ mod tests {
                 assert!(screen.contains("live-file-line-11"));
                 assert_eq!(screen.contains("live-file-line-00"), expanded);
                 assert_eq!(screen.contains("11 more lines"), !expanded);
+                // The tool entry took the place of the turn's placeholder.
                 assert_eq!(
-                    app.entries[3].text,
+                    app.entries[assistant_index].text,
                     format!("completed read\nlarge.rs\n{output}")
                 );
             }
@@ -14683,8 +14683,11 @@ mod tests {
                 duration: Some(Duration::ZERO),
             },
         );
+        // The reply began with the call: the tool entry took the place of
+        // the turn's placeholder.
+        assert_eq!(app.entries.len(), 2);
         assert_eq!(
-            app.entries[2].text,
+            app.entries[index].text,
             "failed web_fetch\nhttps://example.org\nHTTP 403"
         );
         let todos = vec![TodoItem {
@@ -14895,6 +14898,61 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_that_starts_with_a_tool_call_leaves_no_placeholder() {
+        let call = |id: &str| pi_ai::ChatToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: r#"{"path":"a.txt"}"#.into(),
+        };
+        let started = |id: &str| TurnEvent::ToolStarted { call: call(id) };
+        let output = |id: &str| TurnEvent::ToolOutput {
+            call: call(id),
+            output: "file body".into(),
+            images: Vec::new(),
+            is_error: false,
+            duration: Some(Duration::ZERO),
+        };
+        let text = |text: &str| TurnEvent::Provider(StreamEvent::Text(text.into()));
+        let thinking = (TuiEntryKind::Thinking, String::new());
+        let tool = (
+            TuiEntryKind::Tool,
+            "completed read\na.txt\nfile body".to_string(),
+        );
+        let assistant = |text: &str| (TuiEntryKind::Assistant, text.to_string());
+
+        // Two calls, then the answer: nothing is left of "Working...".
+        let events = [
+            TurnEvent::RoundStarted,
+            started("1"),
+            output("1"),
+            started("2"),
+            output("2"),
+            TurnEvent::RoundStarted,
+            text("done"),
+        ];
+        assert_eq!(
+            entries_after(&events),
+            [
+                thinking.clone(),
+                tool.clone(),
+                tool.clone(),
+                assistant("done")
+            ]
+        );
+        // Text before the call took the placeholder's place, as before.
+        let events = [TurnEvent::RoundStarted, text("Let me look."), started("1")];
+        assert_eq!(
+            entries_after(&events)[..2],
+            [thinking.clone(), assistant("Let me look.")]
+        );
+        // Until a reply says or calls something, the placeholder stands.
+        assert_eq!(
+            entries_after(&[TurnEvent::RoundStarted]),
+            [thinking, assistant("Working...")]
+        );
+    }
+
+    #[test]
     fn a_running_command_shows_its_output_so_far() {
         use ratatui::backend::TestBackend;
         let call = pi_ai::ChatToolCall {
@@ -14907,7 +14965,7 @@ mod tests {
             output: output.into(),
         };
         let started = TurnEvent::ToolStarted { call: call.clone() };
-        let tool = |events: &[TurnEvent]| entries_after(events)[2].clone().1;
+        let tool = |events: &[TurnEvent]| entries_after(events)[1].clone().1;
         // The command starts, prints, prints more, and ends.
         assert_eq!(tool(std::slice::from_ref(&started)), "running bash\n\n");
         assert_eq!(
