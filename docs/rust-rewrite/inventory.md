@@ -375,6 +375,13 @@ Current auth sources:
 - Codex/ChatGPT login token fallback.
 - Custom provider fallback from model config.
 
+Startup model selection (upstream `findInitialModel`):
+
+- `--model`/`--provider`, then the resumed session's model, then the saved
+  default if its provider has credentials, then a model with credentials
+  (upstream's per-provider default model first), and `faux` only when it is
+  requested or nothing else can run. Offline, only `faux` can run.
+
 Request limits:
 
 - Anthropic Messages requests without an explicit cap send the Claude model's

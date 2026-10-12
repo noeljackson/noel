@@ -227,6 +227,13 @@ Environment overrides:
 }
 ```
 
+At startup the model comes from `--model`/`--provider`, then the resumed
+session, then the saved default if its provider has credentials, then a model
+whose provider has credentials (preferring that provider's usual model, as
+upstream does). A `faux` model is chosen only when it is requested or nothing
+else is available; with `--offline` only `faux` can run, so it is chosen
+unless `--model` names another.
+
 ### Web tools
 
 `web_search` returns numbered titles, URLs, and snippets; `web_fetch` retrieves
