@@ -390,6 +390,10 @@ Request limits:
 - Tool calls in a reply cut off by the output-token limit (`max_tokens`,
   `length`) are not run; each returns an error asking the model to re-issue
   it with complete arguments.
+- Provider requests fail after 5 minutes without response headers or without
+  new body or stream data (upstream's default HTTP idle timeout, not
+  configurable here). The timed-out request error is retried like other
+  network errors when nothing was streamed yet.
 
 Model refresh:
 

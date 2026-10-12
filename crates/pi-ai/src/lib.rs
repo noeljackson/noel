@@ -206,7 +206,10 @@ pub struct ToolDefinition {
 pub enum ProviderError {
     #[error("provider {provider} requires an API key")]
     MissingApiKey { provider: String },
-    #[error("request failed: {0}")]
+    #[error(
+        "request failed: {0}{timed_out}",
+        timed_out = if .0.is_timeout() { " (timed out)" } else { "" }
+    )]
     Request(#[from] reqwest::Error),
     #[error("request failed with status {status}: {body}")]
     Status {
@@ -238,7 +241,28 @@ pub trait Provider: Send + Sync {
 }
 
 pub fn create_provider(config: ProviderConfig) -> Box<dyn Provider> {
-    create_provider_with_client(config, reqwest::Client::new())
+    create_provider_with_client(config, provider_http_client())
+}
+
+/// Upstream's HTTP idle timeout (`DEFAULT_HTTP_IDLE_TIMEOUT_MS`): the longest
+/// a provider request waits for response headers, or for the next read of
+/// the body or stream.
+pub const PROVIDER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The client [`create_provider`] uses: a stalled request fails after
+/// [`PROVIDER_IDLE_TIMEOUT`] without progress with a timed-out
+/// [`ProviderError::Request`], which callers retry like any network error,
+/// instead of hanging the turn forever.
+pub fn provider_http_client() -> reqwest::Client {
+    provider_http_client_with_idle_timeout(PROVIDER_IDLE_TIMEOUT)
+}
+
+/// [`provider_http_client`] with another idle bound (tests use a short one).
+pub fn provider_http_client_with_idle_timeout(idle_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .read_timeout(idle_timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Builds a provider with a caller-owned client, allowing applications to set
@@ -304,7 +328,7 @@ async fn generate_openrouter_images(
             .as_deref()
             .unwrap_or("https://openrouter.ai/api/v1"),
     )?;
-    let response = reqwest::Client::new()
+    let response = provider_http_client()
         .post(format!(
             "{}/chat/completions",
             base_url.trim_end_matches('/')
@@ -3986,6 +4010,97 @@ mod tests {
         ] {
             assert!(!is_output_limit_stop(reason), "{reason}");
         }
+    }
+
+    /// Accepts one connection per reply, reads the request, writes the reply
+    /// (possibly nothing), and then keeps the connection open without
+    /// sending anything else.
+    fn spawn_stalling_server(replies: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        std::thread::spawn(move || {
+            let mut stalled = Vec::new();
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                let _ = stream.write_all(reply.as_bytes());
+                stalled.push(stream);
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn stalled_provider_requests_fail_after_the_idle_timeout() {
+        let url = spawn_stalling_server(vec![
+            // No response headers at all.
+            "",
+            // Headers and one event, then nothing.
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        ]);
+        let provider = create_provider_with_client(
+            ProviderConfig {
+                model: ModelRef {
+                    provider: "local".to_string(),
+                    id: "test".to_string(),
+                },
+                api: ProviderApi::OpenAi,
+                base_url: Some(url),
+                auth: ProviderAuth::ApiKey("test-key".to_string()),
+                thinking_level: None,
+                thinking_budget_tokens: None,
+                session_id: None,
+            },
+            provider_http_client_with_idle_timeout(Duration::from_millis(300)),
+        );
+
+        for expected_texts in [vec![], vec!["partial".to_string()]] {
+            let mut texts = Vec::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                provider.complete_streaming(uncapped_request("system"), &mut |event| {
+                    if let StreamEvent::Text(text) = event {
+                        texts.push(text);
+                    }
+                    Ok(())
+                }),
+            )
+            .await
+            .expect("the idle timeout must end a stalled request");
+            let error = result.expect_err("stalled request");
+            assert!(
+                matches!(&error, ProviderError::Request(source) if source.is_timeout()),
+                "{error:?}"
+            );
+            assert!(error.to_string().ends_with("(timed out)"), "{error}");
+            assert_eq!(texts, expected_texts);
+        }
+        assert_eq!(PROVIDER_IDLE_TIMEOUT, Duration::from_secs(300));
     }
 
     #[tokio::test]

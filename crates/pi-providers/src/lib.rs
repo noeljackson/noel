@@ -419,7 +419,7 @@ pub fn create_provider(
             thinking_budget_tokens: None,
             session_id: None,
         },
-        client.unwrap_or_default(),
+        client.unwrap_or_else(pi_ai::provider_http_client),
     ))
 }
 
