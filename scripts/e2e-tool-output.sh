@@ -81,18 +81,19 @@ for mode in owned inline; do
   if [ "${mode}" = owned ]; then
     tmux send-keys -t "${session}" '/clear' Enter
     wait_for '│ >'
-    # Default read is capped at 2000 lines with a resume notice.
+    # Default read is capped at 2000 lines with a resume notice. The file
+    # ends with a newline, which upstream counts as starting line 5001. The
+    # result is 2002 rows: the lines, a blank row, and the notice.
     tmux send-keys -t "${session}" '/read large-fixture.txt' Enter
-    wait_for '2002 more lines'
-    wait_for 'read the rest with offset=2001'
-    wait_for '… [output truncated: showing lines 1-2000 of 5000'
+    wait_for '2001 more lines'
+    wait_for '… [Showing lines 1-2000 of 5001. Use offset=2001 to continue.]'
     absent large-file-line-2001
     absent large-file-line-0001
     absent large-file-line-2000
     tmux send-keys -t "${session}" C-o
     wait_for large-file-line-1999
     tmux send-keys -t "${session}" C-o
-    wait_for '2002 more lines'
+    wait_for '2001 more lines'
     absent large-file-line-1999
     # The resume syntax from the notice reaches the file end.
     tmux send-keys -t "${session}" '/clear' Enter
@@ -111,5 +112,5 @@ done
 # Display folding must not truncate the tool result in durable context: the
 # first read returns the 2000-line cap plus the resume notice; a resumed read
 # with offset reaches the file end.
-grep -Fq 'read the rest with offset=2001' "${work_dir}/sessions/"*.jsonl
+grep -Fq 'Use offset=2001 to continue.' "${work_dir}/sessions/"*.jsonl
 echo "tool output e2e passed (artifacts: ${work_dir})"

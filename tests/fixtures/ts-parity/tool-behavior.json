@@ -1,0 +1,1760 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/tool-behavior-fixture.ts"
+  },
+  "placeholders": {
+    "<tmp>": "The directory holding the roots. Arguments may use it too.",
+    "<output-file>": "The temp file bash saves its full output to (<os tmpdir>/pi-bash-<16 hex>.log)."
+  },
+  "normalizations": {
+    "sorted-lines": "fd lists files in no fixed order, so the result lines before the first blank line are sorted.",
+    "result-count": "Which results fd returns under a limit is not fixed, so the result lines before the first blank line are replaced by <N results>.",
+    "digest": "A text longer than 2000 characters is recorded as {bytes, lines, sha256, head, tail}, with head and tail its first and last 200 characters.",
+    "ripgrep-order": "ripgrep searches files in no fixed order, so the fixture runs it with --sort=path (through RIPGREP_CONFIG_PATH)."
+  },
+  "definitions": [
+    {
+      "name": "read",
+      "description": "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file to read (relative or absolute)"
+          },
+          "offset": {
+            "type": "number",
+            "description": "Line number to start reading from (1-indexed)"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of lines to read"
+          }
+        }
+      }
+    },
+    {
+      "name": "bash",
+      "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Shell command to execute"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "Timeout in seconds (optional, no default timeout)"
+          }
+        }
+      }
+    },
+    {
+      "name": "edit",
+      "description": "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "path",
+          "edits"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file to edit (relative or absolute)"
+          },
+          "edits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "oldText",
+                "newText"
+              ],
+              "properties": {
+                "oldText": {
+                  "type": "string",
+                  "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."
+                },
+                "newText": {
+                  "type": "string",
+                  "description": "Replacement text for this targeted edit."
+                }
+              }
+            },
+            "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."
+          }
+        }
+      }
+    },
+    {
+      "name": "write",
+      "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "path",
+          "content"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file to write (relative or absolute)"
+          },
+          "content": {
+            "type": "string",
+            "description": "Content to write to the file"
+          }
+        }
+      }
+    },
+    {
+      "name": "grep",
+      "description": "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "pattern"
+        ],
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Search pattern (regex or literal string)"
+          },
+          "path": {
+            "type": "string",
+            "description": "Directory or file to search (default: current directory)"
+          },
+          "glob": {
+            "type": "string",
+            "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'"
+          },
+          "ignoreCase": {
+            "type": "boolean",
+            "description": "Case-insensitive search (default: false)"
+          },
+          "literal": {
+            "type": "boolean",
+            "description": "Treat pattern as literal string instead of regex (default: false)"
+          },
+          "context": {
+            "type": "number",
+            "description": "Number of lines to show before and after each match (default: 0)"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of matches to return (default: 100)"
+          }
+        }
+      }
+    },
+    {
+      "name": "find",
+      "description": "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "pattern"
+        ],
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"
+          },
+          "path": {
+            "type": "string",
+            "description": "Directory to search in (default: current directory)"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of results (default: 1000)"
+          }
+        }
+      }
+    },
+    {
+      "name": "ls",
+      "description": "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Directory to list (default: current directory)"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of entries to return (default: 500)"
+          }
+        }
+      }
+    }
+  ],
+  "roots": {
+    "repo": [
+      {
+        "path": ".git/description",
+        "parts": [
+          "needle in git metadata\n"
+        ]
+      },
+      {
+        "path": ".gitignore",
+        "parts": [
+          "ignored.txt\nbuild/\n"
+        ]
+      },
+      {
+        "path": ".github/workflows/ci.yml",
+        "parts": [
+          "name: ci\n# needle in workflow\n"
+        ]
+      },
+      {
+        "path": ".hidden/secret.txt",
+        "parts": [
+          "needle hidden\n"
+        ]
+      },
+      {
+        "path": "ignored.txt",
+        "parts": [
+          "needle ignored\n"
+        ]
+      },
+      {
+        "path": "build/out.txt",
+        "parts": [
+          "needle build\n"
+        ]
+      },
+      {
+        "path": "src/alpha.ts",
+        "parts": [
+          "export const alpha = 1;\n// needle one\nconst beta = 2;\n// Needle two\nconst gamma = 3;\n"
+        ]
+      },
+      {
+        "path": "src/nested/beta.spec.ts",
+        "parts": [
+          "// needle nested\n"
+        ]
+      },
+      {
+        "path": "src/data.json",
+        "parts": [
+          "{\"needle\": true}\n"
+        ]
+      },
+      {
+        "path": "docs/GUIDE.MD",
+        "parts": [
+          "# Guide\n\nneedle docs\n"
+        ]
+      },
+      {
+        "path": "crlf.txt",
+        "parts": [
+          "needle crlf\r\nplain\r\n"
+        ]
+      }
+    ],
+    "plain": [
+      {
+        "path": ".gitignore",
+        "parts": [
+          "skipped.txt\n"
+        ]
+      },
+      {
+        "path": "kept.txt",
+        "parts": [
+          "needle kept\n"
+        ]
+      },
+      {
+        "path": "skipped.txt",
+        "parts": [
+          "needle skipped\n"
+        ]
+      }
+    ],
+    "files": [
+      {
+        "path": "notes.txt",
+        "parts": [
+          "one\ntwo\nthree\nfour\nfive\n"
+        ]
+      },
+      {
+        "path": "no-newline.txt",
+        "parts": [
+          "alpha\nbeta"
+        ]
+      },
+      {
+        "path": "big.txt",
+        "lines": {
+          "count": 3000,
+          "prefix": "line-",
+          "pad": 0,
+          "suffix": ""
+        }
+      },
+      {
+        "path": "wide.txt",
+        "lines": {
+          "count": 1200,
+          "prefix": "w",
+          "pad": 4,
+          "suffix": "-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+        }
+      },
+      {
+        "path": "huge-line.txt",
+        "parts": [
+          "first\n",
+          {
+            "repeat": "y",
+            "count": 60000
+          },
+          "\nlast\n"
+        ]
+      },
+      {
+        "path": "long-line.txt",
+        "parts": [
+          "needle ",
+          {
+            "repeat": "x",
+            "count": 600
+          },
+          "\nshort needle\n"
+        ]
+      },
+      {
+        "path": "many.txt",
+        "lines": {
+          "count": 150,
+          "prefix": "match-",
+          "pad": 0,
+          "suffix": " needle"
+        }
+      },
+      {
+        "path": "pixel.png",
+        "base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+      },
+      {
+        "path": "empty",
+        "dir": true
+      },
+      {
+        "path": "ls-dir/Zeta.txt",
+        "parts": [
+          "z"
+        ]
+      },
+      {
+        "path": "ls-dir/alpha.txt",
+        "parts": [
+          "a"
+        ]
+      },
+      {
+        "path": "ls-dir/_under.txt",
+        "parts": [
+          "u"
+        ]
+      },
+      {
+        "path": "ls-dir/.dot",
+        "parts": [
+          "d"
+        ]
+      },
+      {
+        "path": "ls-dir/10.txt",
+        "parts": [
+          "10"
+        ]
+      },
+      {
+        "path": "ls-dir/9.txt",
+        "parts": [
+          "9"
+        ]
+      },
+      {
+        "path": "ls-dir/beta-file.txt",
+        "parts": [
+          "b"
+        ]
+      },
+      {
+        "path": "ls-dir/betafile.txt",
+        "parts": [
+          "b"
+        ]
+      },
+      {
+        "path": "ls-dir/sub/inner.txt",
+        "parts": [
+          "i"
+        ]
+      },
+      {
+        "path": "many-files",
+        "files": {
+          "count": 30,
+          "prefix": "file-",
+          "pad": 3,
+          "suffix": ".txt"
+        },
+        "text": "x"
+      },
+      {
+        "path": "thousand",
+        "files": {
+          "count": 1005,
+          "prefix": "f-",
+          "pad": 4,
+          "suffix": ".dat"
+        },
+        "text": "x"
+      },
+      {
+        "path": "long-names",
+        "files": {
+          "count": 600,
+          "prefix": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-",
+          "pad": 4,
+          "suffix": ""
+        },
+        "text": "x"
+      }
+    ]
+  },
+  "calls": [
+    {
+      "name": "read-whole-file",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "notes.txt"
+      },
+      "result": {
+        "text": "one\ntwo\nthree\nfour\nfive\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-without-trailing-newline",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "no-newline.txt"
+      },
+      "result": {
+        "text": "alpha\nbeta",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-offset-and-limit",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "notes.txt",
+        "offset": 2,
+        "limit": 2
+      },
+      "result": {
+        "text": "two\nthree\n\n[3 more lines in file. Use offset=4 to continue.]",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-limit-reaching-the-end",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "notes.txt",
+        "offset": 4,
+        "limit": 10
+      },
+      "result": {
+        "text": "four\nfive\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-offset-of-the-last-empty-line",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "notes.txt",
+        "offset": 6
+      },
+      "result": {
+        "text": "",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-offset-past-end",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "notes.txt",
+        "offset": 7
+      },
+      "result": {
+        "text": "Offset 7 is beyond end of file (6 lines total)",
+        "isError": true
+      }
+    },
+    {
+      "name": "read-line-cap",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "big.txt"
+      },
+      "result": {
+        "text": {
+          "bytes": 18954,
+          "lines": 2002,
+          "sha256": "75f7cbeeb226affd27b4ea64ddf6761c1d78aa39c2aa3558c4c1802618b85a15",
+          "head": "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\nline-8\nline-9\nline-10\nline-11\nline-12\nline-13\nline-14\nline-15\nline-16\nline-17\nline-18\nline-19\nline-20\nline-21\nline-22\nline-23\nline-24\nline-25\nline-26\nl",
+          "tail": "ine-1987\nline-1988\nline-1989\nline-1990\nline-1991\nline-1992\nline-1993\nline-1994\nline-1995\nline-1996\nline-1997\nline-1998\nline-1999\nline-2000\n\n[Showing lines 1-2000 of 3001. Use offset=2001 to continue.]"
+        },
+        "isError": false
+      }
+    },
+    {
+      "name": "read-continues-after-line-cap",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "big.txt",
+        "offset": 2001
+      },
+      "result": {
+        "text": {
+          "bytes": 10000,
+          "lines": 1001,
+          "sha256": "1f75b7cdd0c6460f016f5103ce7d893e0a63afa812349fe8a22ed0200228eced",
+          "head": "line-2001\nline-2002\nline-2003\nline-2004\nline-2005\nline-2006\nline-2007\nline-2008\nline-2009\nline-2010\nline-2011\nline-2012\nline-2013\nline-2014\nline-2015\nline-2016\nline-2017\nline-2018\nline-2019\nline-2020\n",
+          "tail": "line-2981\nline-2982\nline-2983\nline-2984\nline-2985\nline-2986\nline-2987\nline-2988\nline-2989\nline-2990\nline-2991\nline-2992\nline-2993\nline-2994\nline-2995\nline-2996\nline-2997\nline-2998\nline-2999\nline-3000\n"
+        },
+        "isError": false
+      }
+    },
+    {
+      "name": "read-limit-inside-large-file",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "big.txt",
+        "offset": 2990,
+        "limit": 5
+      },
+      "result": {
+        "text": "line-2990\nline-2991\nline-2992\nline-2993\nline-2994\n\n[7 more lines in file. Use offset=2995 to continue.]",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-limit-above-line-cap",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "big.txt",
+        "limit": 2500
+      },
+      "result": {
+        "text": {
+          "bytes": 18954,
+          "lines": 2002,
+          "sha256": "75f7cbeeb226affd27b4ea64ddf6761c1d78aa39c2aa3558c4c1802618b85a15",
+          "head": "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\nline-8\nline-9\nline-10\nline-11\nline-12\nline-13\nline-14\nline-15\nline-16\nline-17\nline-18\nline-19\nline-20\nline-21\nline-22\nline-23\nline-24\nline-25\nline-26\nl",
+          "tail": "ine-1987\nline-1988\nline-1989\nline-1990\nline-1991\nline-1992\nline-1993\nline-1994\nline-1995\nline-1996\nline-1997\nline-1998\nline-1999\nline-2000\n\n[Showing lines 1-2000 of 3001. Use offset=2001 to continue.]"
+        },
+        "isError": false
+      }
+    },
+    {
+      "name": "read-offset-past-end-of-large-file",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "big.txt",
+        "offset": 4000
+      },
+      "result": {
+        "text": "Offset 4000 is beyond end of file (3001 lines total)",
+        "isError": true
+      }
+    },
+    {
+      "name": "read-byte-cap",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "wide.txt"
+      },
+      "result": {
+        "text": {
+          "bytes": 51180,
+          "lines": 508,
+          "sha256": "93b9fb3d99de7286789e52f6f579c56c478fa83befb062b103fdd3f997e4ef81",
+          "head": "w0001-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\nw0002-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww",
+          "tail": "wwwwwwwwwwwwwwwwwwwwwwww\nw0506-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n\n[Showing lines 1-506 of 1201 (50.0KB limit). Use offset=507 to continue.]"
+        },
+        "isError": false
+      }
+    },
+    {
+      "name": "read-stops-before-long-line",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "huge-line.txt"
+      },
+      "result": {
+        "text": "first\n\n[Showing lines 1-1 of 4 (50.0KB limit). Use offset=2 to continue.]",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-long-line",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "huge-line.txt",
+        "offset": 2
+      },
+      "result": {
+        "text": "[Line 2 is 58.6KB, exceeds 50.0KB limit. Use bash: sed -n '2p' huge-line.txt | head -c 51200]",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-absolute-path",
+      "cwd": "repo",
+      "tool": "read",
+      "args": {
+        "path": "<tmp>/files/notes.txt",
+        "limit": 1
+      },
+      "result": {
+        "text": "one\n\n[5 more lines in file. Use offset=2 to continue.]",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-path-outside-cwd",
+      "cwd": "repo",
+      "tool": "read",
+      "args": {
+        "path": "../plain/kept.txt"
+      },
+      "result": {
+        "text": "needle kept\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-at-prefixed-path",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "@no-newline.txt"
+      },
+      "result": {
+        "text": "alpha\nbeta",
+        "isError": false
+      }
+    },
+    {
+      "name": "read-image",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "pixel.png"
+      },
+      "result": {
+        "text": "Read image file [image/png]",
+        "isError": false,
+        "images": [
+          {
+            "mimeType": "image/png",
+            "bytes": 70,
+            "sha256": "c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77"
+          }
+        ]
+      }
+    },
+    {
+      "name": "read-missing-file",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "missing.txt"
+      },
+      "result": {
+        "text": "ENOENT: no such file or directory, access '<tmp>/files/missing.txt'",
+        "isError": true
+      }
+    },
+    {
+      "name": "read-directory",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "empty"
+      },
+      "result": {
+        "text": "EISDIR: illegal operation on a directory, read",
+        "isError": true
+      }
+    },
+    {
+      "name": "bash-stdout",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "echo hello"
+      },
+      "result": {
+        "text": "hello\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "bash-no-output",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "true"
+      },
+      "result": {
+        "text": "(no output)",
+        "isError": false
+      }
+    },
+    {
+      "name": "bash-runs-in-cwd",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "pwd"
+      },
+      "result": {
+        "text": "<tmp>/files\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "bash-is-bash",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "echo ${BASH_VERSION:+bash}"
+      },
+      "result": {
+        "text": "bash\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "bash-is-not-a-login-shell",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "shopt -q login_shell && echo login || echo non-login"
+      },
+      "result": {
+        "text": "non-login\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "bash-stdin-is-empty",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "cat; echo done"
+      },
+      "result": {
+        "text": "done\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "bash-interleaves-stdout-and-stderr",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "echo out1; sleep 0.2; echo err1 >&2; sleep 0.2; echo out2; sleep 0.2; echo err2 >&2"
+      },
+      "result": {
+        "text": "out1\nerr1\nout2\nerr2\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "bash-exit-code",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "echo out; sleep 0.2; echo err >&2; exit 3"
+      },
+      "result": {
+        "text": "out\nerr\n\n\nCommand exited with code 3",
+        "isError": true
+      }
+    },
+    {
+      "name": "bash-exit-code-without-output",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "exit 2"
+      },
+      "result": {
+        "text": "(no output)\n\nCommand exited with code 2",
+        "isError": true
+      }
+    },
+    {
+      "name": "bash-killed-by-signal",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "kill -TERM $$"
+      },
+      "result": {
+        "text": "(no output)\n\nCommand exited with code 143",
+        "isError": true
+      }
+    },
+    {
+      "name": "bash-tail-by-lines",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "seq 1 5000"
+      },
+      "result": {
+        "text": {
+          "bytes": 10062,
+          "lines": 2002,
+          "sha256": "47353d1d38194b025dc7000af83d0f3899f3f812ec88439b9ace867f815535fa",
+          "head": "3001\n3002\n3003\n3004\n3005\n3006\n3007\n3008\n3009\n3010\n3011\n3012\n3013\n3014\n3015\n3016\n3017\n3018\n3019\n3020\n3021\n3022\n3023\n3024\n3025\n3026\n3027\n3028\n3029\n3030\n3031\n3032\n3033\n3034\n3035\n3036\n3037\n3038\n3039\n3040\n",
+          "tail": "73\n4974\n4975\n4976\n4977\n4978\n4979\n4980\n4981\n4982\n4983\n4984\n4985\n4986\n4987\n4988\n4989\n4990\n4991\n4992\n4993\n4994\n4995\n4996\n4997\n4998\n4999\n5000\n\n[Showing lines 3001-5000 of 5000. Full output: <output-file>]"
+        },
+        "isError": false,
+        "savedOutput": {
+          "bytes": 23893,
+          "sha256": "23f90f8b2c3a4b5f3b5e156339994afd5c2718b378aca6f0e17111f80a70d4ec"
+        }
+      }
+    },
+    {
+      "name": "bash-tail-by-lines-with-failure",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "seq 1 2500; echo failed >&2; exit 1"
+      },
+      "result": {
+        "text": {
+          "bytes": 9593,
+          "lines": 2004,
+          "sha256": "6e253429a3edc3e8b885f1d7c6267ca68f5c59622aaa2a690e928b08591a8dcd",
+          "head": "502\n503\n504\n505\n506\n507\n508\n509\n510\n511\n512\n513\n514\n515\n516\n517\n518\n519\n520\n521\n522\n523\n524\n525\n526\n527\n528\n529\n530\n531\n532\n533\n534\n535\n536\n537\n538\n539\n540\n541\n542\n543\n544\n545\n546\n547\n548\n549\n550\n551\n",
+          "tail": "480\n2481\n2482\n2483\n2484\n2485\n2486\n2487\n2488\n2489\n2490\n2491\n2492\n2493\n2494\n2495\n2496\n2497\n2498\n2499\n2500\nfailed\n\n[Showing lines 502-2501 of 2501. Full output: <output-file>]\n\nCommand exited with code 1"
+        },
+        "isError": true,
+        "savedOutput": {
+          "bytes": 11400,
+          "sha256": "dd73799174c5a2c094b742b2407c1d9e26e4102a1102727c11f62692c56f557f"
+        }
+      }
+    },
+    {
+      "name": "bash-tail-by-bytes",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "cat wide.txt"
+      },
+      "result": {
+        "text": {
+          "bytes": 51182,
+          "lines": 508,
+          "sha256": "ee0b65956f8656444f8aa2f48265f26d1c51fe6d513dabaa76866dd29fd5f570",
+          "head": "w0695-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\nw0696-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww",
+          "tail": "wwwwwwwwwwwwwwwwwwwwww\nw1200-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n\n[Showing lines 695-1200 of 1200 (50.0KB limit). Full output: <output-file>]"
+        },
+        "isError": false,
+        "savedOutput": {
+          "bytes": 121200,
+          "sha256": "c58b6652314fdec114b3be97ec5ac0922cabbb4fa48f3eb7faeddfac127331fb"
+        }
+      }
+    },
+    {
+      "name": "bash-tail-of-one-long-line",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "head -c 60000 /dev/zero | tr '\\0' z"
+      },
+      "result": {
+        "text": {
+          "bytes": 51278,
+          "lines": 3,
+          "sha256": "868abbfd4e0ad9891adf02375895e089f51df3b84f00b8c77c314810bd9c461c",
+          "head": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+          "tail": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n\n[Showing last 50.0KB of line 1 (line is 58.6KB). Full output: <output-file>]"
+        },
+        "isError": false,
+        "savedOutput": {
+          "bytes": 60000,
+          "sha256": "ca42c41a28165f8eb2b7b6546951aae07724666d991833e970fc71f024050879"
+        }
+      }
+    },
+    {
+      "name": "bash-exactly-at-line-cap",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "seq 1 2000"
+      },
+      "result": {
+        "text": {
+          "bytes": 8893,
+          "lines": 2001,
+          "sha256": "6251e5743b6fd6a7d606130bdf7c15077ce85ebd3a0fdee284d15a46df199e38",
+          "head": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n61\n62\n63\n64\n65\n66\n67\n68\n69\n70",
+          "tail": "1961\n1962\n1963\n1964\n1965\n1966\n1967\n1968\n1969\n1970\n1971\n1972\n1973\n1974\n1975\n1976\n1977\n1978\n1979\n1980\n1981\n1982\n1983\n1984\n1985\n1986\n1987\n1988\n1989\n1990\n1991\n1992\n1993\n1994\n1995\n1996\n1997\n1998\n1999\n2000\n"
+        },
+        "isError": false
+      }
+    },
+    {
+      "name": "bash-timeout-keeps-partial-output",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "echo started; sleep 20",
+        "timeout": 1
+      },
+      "result": {
+        "text": "started\n\n\nCommand timed out after 1 seconds",
+        "isError": true
+      }
+    },
+    {
+      "name": "bash-timeout-without-output",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "sleep 20",
+        "timeout": 0.5
+      },
+      "result": {
+        "text": "Command timed out after 0.5 seconds",
+        "isError": true
+      }
+    },
+    {
+      "name": "bash-invalid-timeout",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "echo never",
+        "timeout": 0
+      },
+      "result": {
+        "text": "Invalid timeout: must be a finite number of seconds",
+        "isError": true
+      }
+    },
+    {
+      "name": "bash-returns-while-a-background-job-holds-the-pipes",
+      "cwd": "files",
+      "tool": "bash",
+      "args": {
+        "command": "sleep 3 & echo started"
+      },
+      "result": {
+        "text": "started\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-respects-gitignore-and-searches-hidden-files",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle"
+      },
+      "result": {
+        "text": ".git/description:1: needle in git metadata\n.github/workflows/ci.yml:2: # needle in workflow\n.hidden/secret.txt:1: needle hidden\ncrlf.txt:1: needle crlf\ndocs/GUIDE.MD:3: needle docs\nsrc/alpha.ts:2: // needle one\nsrc/data.json:1: {\"needle\": true}\nsrc/nested/beta.spec.ts:1: // needle nested",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-in-directory",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "src"
+      },
+      "result": {
+        "text": "alpha.ts:2: // needle one\ndata.json:1: {\"needle\": true}\nnested/beta.spec.ts:1: // needle nested",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-in-file",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "src/alpha.ts"
+      },
+      "result": {
+        "text": "alpha.ts:2: // needle one",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-ignore-case",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "src/alpha.ts",
+        "ignoreCase": true
+      },
+      "result": {
+        "text": "alpha.ts:2: // needle one\nalpha.ts:4: // Needle two",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-regex",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "^const \\w+ = \\d;$",
+        "path": "src"
+      },
+      "result": {
+        "text": "alpha.ts:3: const beta = 2;\nalpha.ts:5: const gamma = 3;",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-literal",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "{\"needle\"",
+        "path": "src",
+        "literal": true
+      },
+      "result": {
+        "text": "data.json:1: {\"needle\": true}",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-glob",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "glob": "*.ts"
+      },
+      "result": {
+        "text": "src/alpha.ts:2: // needle one\nsrc/nested/beta.spec.ts:1: // needle nested",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-glob-with-directory",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "glob": "src/*.ts"
+      },
+      "result": {
+        "text": "src/alpha.ts:2: // needle one",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-glob-overrides-gitignore",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "glob": "*.txt"
+      },
+      "result": {
+        "text": ".hidden/secret.txt:1: needle hidden\ncrlf.txt:1: needle crlf\nignored.txt:1: needle ignored",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-negated-glob",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "glob": "!*.ts"
+      },
+      "result": {
+        "text": ".git/description:1: needle in git metadata\n.github/workflows/ci.yml:2: # needle in workflow\n.hidden/secret.txt:1: needle hidden\ncrlf.txt:1: needle crlf\ndocs/GUIDE.MD:3: needle docs\nsrc/data.json:1: {\"needle\": true}",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-context",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle one",
+        "path": "src/alpha.ts",
+        "context": 1
+      },
+      "result": {
+        "text": "alpha.ts-1- export const alpha = 1;\nalpha.ts:2: // needle one\nalpha.ts-3- const beta = 2;",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-context-overlaps-and-reaches-file-end",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "const (beta|gamma)",
+        "path": "src/alpha.ts",
+        "context": 2
+      },
+      "result": {
+        "text": "alpha.ts-1- export const alpha = 1;\nalpha.ts-2- // needle one\nalpha.ts:3: const beta = 2;\nalpha.ts-4- // Needle two\nalpha.ts-5- const gamma = 3;\nalpha.ts-3- const beta = 2;\nalpha.ts-4- // Needle two\nalpha.ts:5: const gamma = 3;\nalpha.ts-6- ",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-crlf-file",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "crlf.txt"
+      },
+      "result": {
+        "text": "crlf.txt:1: needle crlf",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-no-matches",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "absent-pattern"
+      },
+      "result": {
+        "text": "No matches found",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-path-not-found",
+      "cwd": "repo",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "missing"
+      },
+      "result": {
+        "text": "Path not found: <tmp>/repo/missing",
+        "isError": true
+      }
+    },
+    {
+      "name": "grep-outside-git-ignores-gitignore",
+      "cwd": "plain",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle"
+      },
+      "result": {
+        "text": "kept.txt:1: needle kept\nskipped.txt:1: needle skipped",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-default-limit",
+      "cwd": "files",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "many.txt"
+      },
+      "result": {
+        "text": {
+          "bytes": 2955,
+          "lines": 102,
+          "sha256": "639596f9263991923db99e6653cc6ac39dd5439441f029f5c52ae0395ba81cf6",
+          "head": "many.txt:1: match-1 needle\nmany.txt:2: match-2 needle\nmany.txt:3: match-3 needle\nmany.txt:4: match-4 needle\nmany.txt:5: match-5 needle\nmany.txt:6: match-6 needle\nmany.txt:7: match-7 needle\nmany.txt:8:",
+          "tail": "-96 needle\nmany.txt:97: match-97 needle\nmany.txt:98: match-98 needle\nmany.txt:99: match-99 needle\nmany.txt:100: match-100 needle\n\n[100 matches limit reached. Use limit=200 for more, or refine pattern]"
+        },
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-limit",
+      "cwd": "files",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "many.txt",
+        "limit": 3
+      },
+      "result": {
+        "text": "many.txt:1: match-1 needle\nmany.txt:2: match-2 needle\nmany.txt:3: match-3 needle\n\n[3 matches limit reached. Use limit=6 for more, or refine pattern]",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-limit-equal-to-match-count",
+      "cwd": "files",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "long-line.txt",
+        "limit": 2
+      },
+      "result": {
+        "text": "long-line.txt:1: needle xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... [truncated]\nlong-line.txt:2: short needle\n\n[2 matches limit reached. Use limit=4 for more, or refine pattern. Some lines truncated to 500 chars. Use read tool to see full lines]",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-long-line",
+      "cwd": "files",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "long-line.txt"
+      },
+      "result": {
+        "text": "long-line.txt:1: needle xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... [truncated]\nlong-line.txt:2: short needle\n\n[Some lines truncated to 500 chars. Use read tool to see full lines]",
+        "isError": false
+      }
+    },
+    {
+      "name": "grep-byte-cap",
+      "cwd": "files",
+      "tool": "grep",
+      "args": {
+        "pattern": "w",
+        "path": "wide.txt",
+        "limit": 1000
+      },
+      "result": {
+        "text": {
+          "bytes": 51277,
+          "lines": 448,
+          "sha256": "f3ce793f838d28a1f0387fbd328c4cf294b01db4a11ad43ce1a749b9a3eaee32",
+          "head": "wide.txt:1: w0001-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\nwide.txt:2: w0002-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww",
+          "tail": "46: w0446-wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n\n[1000 matches limit reached. Use limit=2000 for more, or refine pattern. 50.0KB limit reached]"
+        },
+        "isError": false
+      }
+    },
+    {
+      "name": "find-glob",
+      "cwd": "repo",
+      "tool": "find",
+      "args": {
+        "pattern": "*.ts"
+      },
+      "normalize": "sorted-lines",
+      "result": {
+        "text": "src/alpha.ts\nsrc/nested/beta.spec.ts",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-respects-gitignore-and-lists-hidden-files",
+      "cwd": "repo",
+      "tool": "find",
+      "args": {
+        "pattern": "*.txt"
+      },
+      "normalize": "sorted-lines",
+      "result": {
+        "text": ".hidden/secret.txt\ncrlf.txt",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-everything",
+      "cwd": "repo",
+      "tool": "find",
+      "args": {
+        "pattern": "*"
+      },
+      "normalize": "sorted-lines",
+      "result": {
+        "text": ".git/\n.git/description\n.github/\n.github/workflows/\n.github/workflows/ci.yml\n.gitignore\n.hidden/\n.hidden/secret.txt\ncrlf.txt\ndocs/\ndocs/GUIDE.MD\nsrc/\nsrc/alpha.ts\nsrc/data.json\nsrc/nested/\nsrc/nested/beta.spec.ts",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-directory",
+      "cwd": "repo",
+      "tool": "find",
+      "args": {
+        "pattern": "nested"
+      },
+      "normalize": "sorted-lines",
+      "result": {
+        "text": "src/nested/",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-path",
+      "cwd": "repo",
+      "tool": "find",
+      "args": {
+        "pattern": "*.ts",
+        "path": "src/nested"
+      },
+      "normalize": "sorted-lines",
+      "result": {
+        "text": "beta.spec.ts",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-glob-with-directory",
+      "cwd": "repo",
+      "tool": "find",
+      "args": {
+        "pattern": "src/**/*.spec.ts"
+      },
+      "normalize": "sorted-lines",
+      "result": {
+        "text": "src/nested/beta.spec.ts",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-lowercase-pattern-ignores-case",
+      "cwd": "repo",
+      "tool": "find",
+      "args": {
+        "pattern": "*.md"
+      },
+      "normalize": "sorted-lines",
+      "result": {
+        "text": "docs/GUIDE.MD",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-uppercase-pattern-matches-case",
+      "cwd": "repo",
+      "tool": "find",
+      "args": {
+        "pattern": "*.Md"
+      },
+      "normalize": "sorted-lines",
+      "result": {
+        "text": "No files found matching pattern",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-no-matches",
+      "cwd": "repo",
+      "tool": "find",
+      "args": {
+        "pattern": "*.absent"
+      },
+      "result": {
+        "text": "No files found matching pattern",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-outside-git-respects-gitignore",
+      "cwd": "plain",
+      "tool": "find",
+      "args": {
+        "pattern": "*.txt"
+      },
+      "normalize": "sorted-lines",
+      "result": {
+        "text": "kept.txt",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-limit",
+      "cwd": "files",
+      "tool": "find",
+      "args": {
+        "pattern": "file-*.txt",
+        "path": "many-files",
+        "limit": 5
+      },
+      "normalize": "result-count",
+      "result": {
+        "text": "<5 results>\n\n[5 results limit reached. Use limit=10 for more, or refine pattern]",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-limit-equal-to-result-count",
+      "cwd": "files",
+      "tool": "find",
+      "args": {
+        "pattern": "file-*.txt",
+        "path": "many-files",
+        "limit": 30
+      },
+      "normalize": "result-count",
+      "result": {
+        "text": "<30 results>\n\n[30 results limit reached. Use limit=60 for more, or refine pattern]",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-default-limit",
+      "cwd": "files",
+      "tool": "find",
+      "args": {
+        "pattern": "*.dat",
+        "path": "thousand"
+      },
+      "normalize": "result-count",
+      "result": {
+        "text": "<1000 results>\n\n[1000 results limit reached. Use limit=2000 for more, or refine pattern]",
+        "isError": false
+      }
+    },
+    {
+      "name": "find-byte-cap",
+      "cwd": "files",
+      "tool": "find",
+      "args": {
+        "pattern": "n*",
+        "path": "long-names"
+      },
+      "normalize": "result-count",
+      "result": {
+        "text": "<501 results>\n\n[50.0KB limit reached]",
+        "isError": false
+      }
+    },
+    {
+      "name": "ls-sorts-and-marks-directories",
+      "cwd": "files",
+      "tool": "ls",
+      "args": {
+        "path": "ls-dir"
+      },
+      "result": {
+        "text": "_under.txt\n.dot\n10.txt\n9.txt\nalpha.txt\nbeta-file.txt\nbetafile.txt\nsub/\nZeta.txt",
+        "isError": false
+      }
+    },
+    {
+      "name": "ls-limit",
+      "cwd": "files",
+      "tool": "ls",
+      "args": {
+        "path": "ls-dir",
+        "limit": 3
+      },
+      "result": {
+        "text": "_under.txt\n.dot\n10.txt\n\n[3 entries limit reached. Use limit=6 for more]",
+        "isError": false
+      }
+    },
+    {
+      "name": "ls-limit-equal-to-entry-count",
+      "cwd": "files",
+      "tool": "ls",
+      "args": {
+        "path": "ls-dir",
+        "limit": 9
+      },
+      "result": {
+        "text": "_under.txt\n.dot\n10.txt\n9.txt\nalpha.txt\nbeta-file.txt\nbetafile.txt\nsub/\nZeta.txt",
+        "isError": false
+      }
+    },
+    {
+      "name": "ls-default-limit",
+      "cwd": "files",
+      "tool": "ls",
+      "args": {
+        "path": "thousand"
+      },
+      "result": {
+        "text": {
+          "bytes": 5553,
+          "lines": 502,
+          "sha256": "1bef1d58c6a604f2d4fd212d219bd306799c0ad77622e2180d8e30ebda0b6fb6",
+          "head": "f-0001.dat\nf-0002.dat\nf-0003.dat\nf-0004.dat\nf-0005.dat\nf-0006.dat\nf-0007.dat\nf-0008.dat\nf-0009.dat\nf-0010.dat\nf-0011.dat\nf-0012.dat\nf-0013.dat\nf-0014.dat\nf-0015.dat\nf-0016.dat\nf-0017.dat\nf-0018.dat\nf-",
+          "tail": "dat\nf-0488.dat\nf-0489.dat\nf-0490.dat\nf-0491.dat\nf-0492.dat\nf-0493.dat\nf-0494.dat\nf-0495.dat\nf-0496.dat\nf-0497.dat\nf-0498.dat\nf-0499.dat\nf-0500.dat\n\n[500 entries limit reached. Use limit=1000 for more]"
+        },
+        "isError": false
+      }
+    },
+    {
+      "name": "ls-byte-cap",
+      "cwd": "files",
+      "tool": "ls",
+      "args": {
+        "path": "long-names",
+        "limit": 600
+      },
+      "result": {
+        "text": {
+          "bytes": 51125,
+          "lines": 503,
+          "sha256": "6c5c7961a5bd55710fe00fba88340583a09f78cdc149c596969ea9cff895539a",
+          "head": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-0001\nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-0",
+          "tail": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-0500\nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-0501\n\n[50.0KB limit reached]"
+        },
+        "isError": false
+      }
+    },
+    {
+      "name": "ls-cwd",
+      "cwd": "plain",
+      "tool": "ls",
+      "args": {},
+      "result": {
+        "text": ".gitignore\nkept.txt\nskipped.txt",
+        "isError": false
+      }
+    },
+    {
+      "name": "ls-empty-directory",
+      "cwd": "files",
+      "tool": "ls",
+      "args": {
+        "path": "empty"
+      },
+      "result": {
+        "text": "(empty directory)",
+        "isError": false
+      }
+    },
+    {
+      "name": "ls-not-a-directory",
+      "cwd": "files",
+      "tool": "ls",
+      "args": {
+        "path": "notes.txt"
+      },
+      "result": {
+        "text": "Not a directory: <tmp>/files/notes.txt",
+        "isError": true
+      }
+    },
+    {
+      "name": "ls-path-not-found",
+      "cwd": "files",
+      "tool": "ls",
+      "args": {
+        "path": "missing"
+      },
+      "result": {
+        "text": "Path not found: <tmp>/files/missing",
+        "isError": true
+      }
+    },
+    {
+      "name": "write-creates-parent-directories",
+      "cwd": "files",
+      "tool": "write",
+      "args": {
+        "path": "written/deep/file.txt",
+        "content": "alpha\nbeta\ngamma\nbeta again\n"
+      },
+      "result": {
+        "text": "Successfully wrote to written/deep/file.txt",
+        "isError": false
+      }
+    },
+    {
+      "name": "write-result-is-readable",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "written/deep/file.txt"
+      },
+      "result": {
+        "text": "alpha\nbeta\ngamma\nbeta again\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "write-absolute-path",
+      "cwd": "repo",
+      "tool": "write",
+      "args": {
+        "path": "<tmp>/files/written/absolute.txt",
+        "content": ""
+      },
+      "result": {
+        "text": "Successfully wrote to <tmp>/files/written/absolute.txt",
+        "isError": false
+      }
+    },
+    {
+      "name": "write-path-outside-cwd",
+      "cwd": "repo",
+      "tool": "write",
+      "args": {
+        "path": "../files/written/outside.txt",
+        "content": "outside"
+      },
+      "result": {
+        "text": "Successfully wrote to ../files/written/outside.txt",
+        "isError": false
+      }
+    },
+    {
+      "name": "write-outside-cwd-is-readable",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "written/outside.txt"
+      },
+      "result": {
+        "text": "outside",
+        "isError": false
+      }
+    },
+    {
+      "name": "edit-replaces-blocks",
+      "cwd": "files",
+      "tool": "edit",
+      "args": {
+        "path": "written/deep/file.txt",
+        "edits": [
+          {
+            "oldText": "gamma",
+            "newText": "GAMMA"
+          },
+          {
+            "oldText": "alpha\n",
+            "newText": ""
+          }
+        ]
+      },
+      "result": {
+        "text": "Successfully replaced 2 block(s) in written/deep/file.txt.",
+        "isError": false
+      }
+    },
+    {
+      "name": "edit-result-is-readable",
+      "cwd": "files",
+      "tool": "read",
+      "args": {
+        "path": "written/deep/file.txt"
+      },
+      "result": {
+        "text": "beta\nGAMMA\nbeta again\n",
+        "isError": false
+      }
+    },
+    {
+      "name": "edit-text-not-found",
+      "cwd": "files",
+      "tool": "edit",
+      "args": {
+        "path": "written/deep/file.txt",
+        "edits": [
+          {
+            "oldText": "absent",
+            "newText": "x"
+          }
+        ]
+      },
+      "result": {
+        "text": "Could not find the exact text in written/deep/file.txt. The old text must match exactly including all whitespace and newlines.",
+        "isError": true
+      }
+    },
+    {
+      "name": "edit-text-not-unique",
+      "cwd": "files",
+      "tool": "edit",
+      "args": {
+        "path": "written/deep/file.txt",
+        "edits": [
+          {
+            "oldText": "beta",
+            "newText": "x"
+          }
+        ]
+      },
+      "result": {
+        "text": "Found 2 occurrences of the text in written/deep/file.txt. The text must be unique. Please provide more context to make it unique.",
+        "isError": true
+      }
+    },
+    {
+      "name": "edit-missing-file",
+      "cwd": "files",
+      "tool": "edit",
+      "args": {
+        "path": "written/missing.txt",
+        "edits": [
+          {
+            "oldText": "a",
+            "newText": "b"
+          }
+        ]
+      },
+      "result": {
+        "text": "Could not edit file: written/missing.txt. Error code: ENOENT.",
+        "isError": true
+      }
+    }
+  ]
+}

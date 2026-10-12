@@ -258,8 +258,8 @@ indefinitely, consuming resources and confusing later turns that found them
 still alive.
 
 Reason: `kill_on_drop` on the tokio child kills one pid; shells spawn trees.
-The shell runs under `process_group(0)` and the timeout path issues `killpg`,
-so the tree dies with the call.
+The shell leads its own session and process group and the timeout path issues
+`killpg`, so the tree dies with the call.
 
 ### Interactive Session Picker
 
@@ -335,14 +335,167 @@ on every platform, so `local-tools.json` lists it, but leaves it out of the
 default tool selection and executes it only on Windows: `getPowerShellConfig()`
 throws "The powershell tool is only available on Windows." elsewhere, and the
 CLI help describes it as "Execute PowerShell commands on Windows". The
-`local-tools.json` parity tests (`builtin_tools_cover_upstream_ts_names`,
-`model_tool_definitions_match_ts_local_tool_schema_keys`) exempt exactly this
-tool and fail once Rust defines it, so the exemption and this entry go together.
+`local-tools.json` parity test (`builtin_tools_cover_upstream_ts_names`)
+exempts exactly this tool and fails once Rust defines it, so the exemption and
+this entry go together.
 
 Reason: pi targets Linux and macOS terminals, where the upstream tool can only
 fail, and Rust enables every builtin tool by default, so porting it would offer
 the model a tool that cannot run. `bash` covers shell execution on the supported
 platforms. Revisit if pi adds Windows support.
+
+### All Built-in Tools Enabled by Default
+
+Upstream enables `read`, `bash`, `edit`, and `write` at startup and leaves
+`grep`, `find`, and `ls` off until `--tools` or `defaultTools` names them. Rust
+enables every built-in tool it has: those seven and its own `todo`,
+`web_search`, and `web_fetch`. So a `defaultTools` or `--tools` list of only
+`+name`/`-name` entries starts from ten tools in Rust and four upstream, and
+`-grep` removes a tool that upstream never had on.
+
+Reason: this is how the Rust port has always started, recorded here rather
+than chosen in this entry. Which tools are on by default is a product decision
+for the owner; the selection settings and flags already follow upstream, so
+changing the default set is a one-line change to that list.
+
+### Tool Selection Is Computed From Settings and Flags
+
+`defaultTools`, `--tools` (an allowlist with `*` patterns, or `+name`/`-name`
+entries), `--exclude-tools`, `--no-builtin-tools`, and `--no-tools` select
+tools as upstream's do, and `settings.json` layers merge `defaultTools` as
+upstream merges them (`settings.json` fixture). These parts differ:
+
+- Rust computes the selection from the settings and the flags at startup and
+  again on `/reload`. Upstream keeps an active-tool list in the session: its
+  `/reload` only adds tools newly named in `defaultTools`, and extensions can
+  change the list with `setActiveTools()`. In Rust a tool removed from
+  `defaultTools` is gone after `/reload`.
+- `enabledTools` is a Rust-only setting: a persistent allowlist, like `--tools`
+  with plain names.
+- Upstream's `defaultActive: false` extension tools (`codemode`,
+  `tool_search`) and its MCP rules for `--tools` do not exist in Rust; every
+  extension tool is on unless an allowlist or `--exclude-tools` leaves it out.
+- Tool flags are not saved with the session. Earlier Rust versions saved them
+  as the session's disabled tools; a saved list is cleared when the session is
+  opened, so a resumed session follows the flags of the run that resumes it.
+- Rust declares the built-in tools in its own fixed order, then the extension
+  tools by name, whatever order `--tools` or `defaultTools` names them in.
+  Upstream declares tools in the order the selection names them. The system
+  prompt lists tools in the declared order, so its list differs the same way.
+
+Reason: Rust's reloadable systems are rebuilt from configuration, and durable
+session state is kept apart from them (see the reload rules in `AGENTS.md`).
+A selection computed from settings and flags needs no session record, and the
+flags mean the same on every run.
+
+### Built-in Tools Run In-Process
+
+Upstream's `grep` runs ripgrep and its `find` runs fd, downloading them when
+they are missing. Rust searches in-process with ripgrep's own `ignore` and
+`globset` crates and the `regex` crate, passing the options upstream passes
+(`rg --hidden [--ignore-case] [--fixed-strings] [--glob]`, `fd --glob
+--hidden`). `tool-behavior.json` records upstream's results for 93 calls and
+`crates/pi-core/src/tool_parity_tests.rs` requires Rust's to be identical.
+Outside those calls these differences are known:
+
+- Order. ripgrep and fd walk in parallel, so upstream's results have no fixed
+  order and a `find` limit keeps whichever results arrived first. Rust lists
+  files in path order and a limit keeps the first in that order. (The fixture
+  runs ripgrep with `--sort=path` and sorts or counts fd's lines.)
+- Configuration of the binaries does not apply: `RIPGREP_CONFIG_PATH` and
+  fd's global ignore file. `.gitignore`, `.ignore`, `.rgignore`, `.fdignore`,
+  `.git/info/exclude`, and git's global excludes file do.
+- Binary files. ripgrep reads a file in 64 KB blocks and stops at a block
+  holding a NUL byte; Rust searches the lines before the 64 KB block that
+  holds the first NUL, which is the same file prefix only approximately.
+- UTF-16 files are not transcoded; ripgrep recognizes their byte order mark.
+- A file or directory that cannot be read is skipped. ripgrep reports it and
+  exits with status 2, which makes upstream fail the whole call.
+- Error text is Rust's: an invalid pattern gives the `regex` crate's message
+  without ripgrep's `rg:` prefix, a pattern containing a newline gives a
+  one-line error, and a `find` path that does not exist gives `Path not found`
+  rather than fd's message.
+- `find` ignores case when the glob has no uppercase character; fd decides
+  from the regular expression the glob compiles to.
+- `ls` sorts ASCII names in upstream's collation order; names with other
+  characters sort after them by code point, where upstream uses the locale's
+  collation.
+
+Reason: a native binary should not download or depend on other binaries, and
+the two crates are the ones ripgrep and fd walk with, so ignore rules and globs
+behave the same. Path order makes results repeatable.
+
+### Shell Tool Differences
+
+The `bash` tool follows upstream's (`bash -c`, no default timeout, the last
+2000 lines or 50 KB with the whole output saved to a temp file, a timeout that
+keeps the output). These parts differ:
+
+- stdout and stderr share one pipe, so the output is in the order the command
+  wrote it. Upstream reads two pipes and appends chunks as they arrive, which
+  can reorder writes that come close together.
+- Upstream reports output to the UI while the command runs; Rust reports it
+  when the command ends.
+- Upstream puts its managed tool directory (`~/.pi/agent/bin`) on the
+  command's `PATH`. Rust has no such directory.
+- A timeout is kept in milliseconds, so the notice prints at most three
+  decimals of the seconds the model gave.
+- `!` and `/bash` in the TUI run through the same tool with a 120 second
+  timeout and cannot be interrupted on their own. Upstream runs them without a
+  timeout, strips terminal escapes from their output, and lets Esc cancel
+  them.
+
+Reason: one pipe is the only way to keep the order exact, and it makes results
+repeatable. The TUI's command UX is separate work; the timeout keeps a command
+that never ends from blocking the TUI until then.
+
+### File Tool Differences
+
+`read`, `write`, and `edit` resolve paths and word their results as upstream
+does, including the common failures (`ENOENT: no such file or directory,
+access '<path>'`, `Could not edit file: <path>. Error code: ENOENT.`). These
+parts differ:
+
+- Other I/O failures are worded by Rust (`failed to access <path>: <error>`),
+  not by Node.
+- `read` tries the macOS screenshot spellings of a missing path (a narrow
+  no-break space before AM/PM, a curly apostrophe) but not the decomposed
+  Unicode (NFD) spelling upstream also tries.
+- Images are resized with the `image` crate rather than upstream's Photon, so
+  a resized image is not byte-identical; the limits (2000 pixels a side, 4.5 MB
+  of base64), the PNG-then-JPEG candidates, and the notes are the same.
+- `edit` matches exactly (see Exact-Match edit Tool) and, like `write`,
+  returns no diff: tool results are text.
+
+Reason: the remaining differences are either invisible to the model or need a
+dependency (Unicode normalization) for a rare case.
+
+### Tool Result Images Depend on the Provider API
+
+Upstream sends the images of a tool result (`read` of an image file) to every
+model whose catalog entry lists image input, and replaces them with a note for
+other models. Rust's model catalog has no input types, so it decides by
+provider API:
+
+- Anthropic Messages, OpenAI Responses (OpenAI, Codex, Azure, GitHub Copilot),
+  Google Gemini and Vertex, and Bedrock Converse: the image is sent in the tool
+  result (for Gemini 2, in a user turn after it), to every model.
+- OpenAI chat completions and Mistral: the image is not sent. The tool result
+  text ends with `(tool image omitted: this provider API does not accept images
+  in tool results)`. Upstream sends it in a user message after the tool
+  results.
+- Upstream adds `[Current model does not support images. ...]` to the `read`
+  result for a model without image input. Rust never does.
+- With `images.blockImages`, `read` returns `Image reading is disabled.` in
+  place of the image. Upstream returns the image and removes it from each
+  request, so turning the setting off later sends it; in Rust it is not saved.
+
+Reason: chat completions is the API of most text-only models, and a tool
+message there cannot hold an image. Without knowing which models accept
+images, sending one in an extra user message risks an error on every later
+request of the session, because the image stays in the conversation. The four
+APIs that carry images in tool results serve models that almost all accept
+them. Revisit when the model catalog records input types.
 
 ### No MCP Support
 
@@ -453,7 +606,8 @@ Differences in the golden records:
 - Assistant messages have no `responseId`. Usage holds the input and output
   tokens providers report to pi; cache tokens and costs are zero, and there is
   no `reasoning` count.
-- Tool results are text: no `structuredContent` or `details`.
+- Tool results are text, and for a `read` of an image the image: no
+  `structuredContent` or `details`.
 - `get_messages` returns what the session saves: no timestamps, and assistant
   messages with their content and `stopReason` (`toolUse` or `stop`) but no
   model, usage, raw stop reason, or timings.

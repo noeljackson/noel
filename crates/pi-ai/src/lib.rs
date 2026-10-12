@@ -1009,7 +1009,7 @@ fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> V
             return json!({
                 "role": "tool",
                 "tool_call_id": message.tool_call_id.as_deref().map(|id| normalize_openai_chat_tool_call_id(config, id)),
-                "content": message.content,
+                "content": tool_result_text_without_images(message),
             });
         }
         if message.role == ChatRole::Assistant && !message.tool_calls.is_empty() {
@@ -1051,6 +1051,24 @@ fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> V
         })
     }));
     messages
+}
+
+/// What a tool result's images are replaced by where they cannot be sent.
+const TOOL_IMAGE_OMITTED: &str =
+    "(tool image omitted: this provider API does not accept images in tool results)";
+
+/// A tool result for the chat completions API, whose tool messages are text
+/// only. Upstream sends the images in a user message that follows, for
+/// models its catalog lists as accepting images; pi's catalog does not say
+/// which models do, so the images are left out and the model is told.
+fn tool_result_text_without_images(message: &ChatMessage) -> String {
+    if message.media.is_empty() {
+        message.content.clone()
+    } else if message.content.is_empty() {
+        TOOL_IMAGE_OMITTED.to_string()
+    } else {
+        format!("{}\n{TOOL_IMAGE_OMITTED}", message.content)
+    }
 }
 
 fn normalize_openai_chat_tool_call_id(config: &ProviderConfig, id: &str) -> String {
@@ -3282,7 +3300,7 @@ fn bedrock_messages(messages: &[ChatMessage]) -> Vec<Value> {
                     "content": [{
                         "toolResult": {
                             "toolUseId": message.tool_call_id,
-                            "content": [{ "text": message.content }],
+                            "content": bedrock_content(message),
                         },
                     }],
                 });
@@ -3307,24 +3325,30 @@ fn bedrock_messages(messages: &[ChatMessage]) -> Vec<Value> {
                     "content": content,
                 });
             }
-            let mut content = vec![json!({ "text": message.content })];
-            content.extend(message.media.iter().filter_map(|media| {
-                let format = media.mime_type.strip_prefix("image/")?;
-                Some(json!({
-                    "image": {
-                        "format": format,
-                        "source": {
-                            "bytes": media.data_base64,
-                        },
-                    }
-                }))
-            }));
             json!({
                 "role": if message.role == ChatRole::Assistant { "assistant" } else { "user" },
-                "content": content,
+                "content": bedrock_content(message),
             })
         })
         .collect()
+}
+
+/// A message's text and images as Converse content blocks, for a user
+/// message or inside a tool result.
+fn bedrock_content(message: &ChatMessage) -> Vec<Value> {
+    let mut content = vec![json!({ "text": message.content })];
+    content.extend(message.media.iter().filter_map(|media| {
+        let format = media.mime_type.strip_prefix("image/")?;
+        Some(json!({
+            "image": {
+                "format": format,
+                "source": {
+                    "bytes": media.data_base64,
+                },
+            }
+        }))
+    }));
+    content
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -3991,7 +4015,7 @@ fn anthropic_messages_with_cache_control(
                         "content": [{
                             "type": "tool_result",
                             "tool_use_id": tool_call_id,
-                            "content": message.content,
+                            "content": anthropic_tool_result_content(message),
                         }],
                     });
                 }
@@ -4025,16 +4049,7 @@ fn anthropic_messages_with_cache_control(
                     "type": "text",
                     "text": message.content,
                 })];
-                parts.extend(message.media.iter().map(|media| {
-                    json!({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media.mime_type,
-                            "data": media.data_base64,
-                        },
-                    })
-                }));
+                parts.extend(message.media.iter().map(anthropic_image_block));
                 Value::Array(parts)
             };
             json!({
@@ -4047,6 +4062,33 @@ fn anthropic_messages_with_cache_control(
         apply_anthropic_cache_control_to_last_user_message(&mut output);
     }
     output
+}
+
+fn anthropic_image_block(media: &MediaInput) -> Value {
+    json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media.mime_type,
+            "data": media.data_base64,
+        },
+    })
+}
+
+/// A tool result's content (upstream `convertContentBlocks`): its text, or
+/// with images a text block followed by the images.
+fn anthropic_tool_result_content(message: &ChatMessage) -> Value {
+    if message.media.is_empty() {
+        return json!(message.content);
+    }
+    let text = if message.content.is_empty() {
+        "(see attached image)"
+    } else {
+        &message.content
+    };
+    let mut blocks = vec![json!({ "type": "text", "text": text })];
+    blocks.extend(message.media.iter().map(anthropic_image_block));
+    Value::Array(blocks)
 }
 
 fn apply_anthropic_cache_control_to_last_user_message(messages: &mut [Value]) {
@@ -7133,6 +7175,92 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("acct_from_jwt")
         );
+    }
+
+    fn image_tool_result(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: content.to_string(),
+            media: vec![MediaInput {
+                mime_type: "image/png".to_string(),
+                data_base64: "aW1hZ2U=".to_string(),
+                path: None,
+                width: None,
+                height: None,
+            }],
+            tool_call_id: Some("call_1".to_string()),
+            tool_name: Some("read".to_string()),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_results_carry_images_as_content_blocks() {
+        let messages = anthropic_messages(&[
+            image_tool_result("Read image file [image/png]"),
+            image_tool_result(""),
+        ]);
+        assert_eq!(
+            messages[0]["content"][0],
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "call_1",
+                "content": [
+                    { "type": "text", "text": "Read image file [image/png]" },
+                    {
+                        "type": "image",
+                        "source": { "type": "base64", "media_type": "image/png", "data": "aW1hZ2U=" },
+                    },
+                ],
+            })
+        );
+        // An image alone still needs a text block.
+        assert_eq!(
+            messages[1]["content"][0]["content"][0],
+            json!({ "type": "text", "text": "(see attached image)" })
+        );
+    }
+
+    #[test]
+    fn bedrock_tool_results_carry_images_as_content_blocks() {
+        let messages = bedrock_messages(&[image_tool_result("Read image file [image/png]")]);
+        assert_eq!(
+            messages[0]["content"][0]["toolResult"]["content"],
+            json!([
+                { "text": "Read image file [image/png]" },
+                { "image": { "format": "png", "source": { "bytes": "aW1hZ2U=" } } },
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_tool_results_say_their_images_were_left_out() {
+        let request = ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: vec![image_tool_result("Read image file [image/png]")],
+            tools: Vec::new(),
+        };
+        for api in [ProviderApi::OpenAi, ProviderApi::Mistral] {
+            let config = ProviderConfig {
+                model: ModelRef {
+                    provider: "local".to_string(),
+                    id: "test".to_string(),
+                },
+                api,
+                base_url: None,
+                auth: ProviderAuth::None,
+                thinking_level: None,
+                thinking_budget_tokens: None,
+                session_id: None,
+            };
+            let messages = openai_chat_messages(&config, &request);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                messages[0]["content"],
+                "Read image file [image/png]\n(tool image omitted: this provider API does not accept images in tool results)"
+            );
+        }
     }
 
     #[test]

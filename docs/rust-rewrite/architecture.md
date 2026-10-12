@@ -387,8 +387,9 @@ payloads.
 
 ## Tool Architecture
 
-Tool definitions live in `pi-tools`; active tool selection lives in session
-state.
+Tool definitions live in `pi-tools`. The tools a run may use are computed
+from the tool settings and command-line flags whenever the reloadable systems
+are built; the session does not record a selection.
 
 Built-ins:
 
@@ -402,7 +403,8 @@ Built-ins:
 
 Rules:
 
-- Tools receive an explicit cwd.
+- Tools receive an explicit cwd. Paths resolve against it but, as in
+  upstream, are not confined to it.
 - File mutation tools must protect unrelated user changes.
 - Search/list tools are read-only.
 - Tool tests do not call providers.

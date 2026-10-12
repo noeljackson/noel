@@ -10,6 +10,12 @@ native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
 
 [dependencies]
+base64.workspace = true
+# ripgrep's own crates: `grep` and `find` walk the tree and match globs the
+# way `rg` and `fd` do, without running either binary.
+globset = "=0.4.20"
+ignore = "=0.4.33"
+image.workspace = true
 reqwest.workspace = true
 regex = "1"
 serde_json.workspace = true

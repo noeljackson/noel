@@ -176,6 +176,8 @@ Useful CLI scope flags:
 
 ```bash
 cargo run -p pi-cli -- --models faux/echo --tools read,write -p "hello"
+cargo run -p pi-cli -- --tools -bash,-write -p "everything but bash and write"
+cargo run -p pi-cli -- --no-builtin-tools -p "extension tools only"
 cargo run -p pi-cli -- --no-tools -p "no tools"
 cargo run -p pi-cli -- --system-prompt prompt.md --append-system-prompt extra.md -p "hello"
 cargo run -p pi-cli -- --image screenshot.png -p "describe this"
@@ -328,8 +330,10 @@ sections.
 - `<cwd>`: the working directory.
 
 The tool list and rules follow the tools the request declares, so
-`enabledTools`, `--tools`, `--exclude-tools`, `--no-tools`, and `--offline`
-(which removes the web tools) change them. Upstream's `<docs>` section, which
+`defaultTools`, `enabledTools`, `--tools`, `--exclude-tools`,
+`--no-builtin-tools`, `--no-tools`, and `--offline` (which removes the web
+tools) change them. An extension tool named like a built-in tool replaces it
+here too: the tool appears once, with the extension's snippet and guidelines. Upstream's `<docs>` section, which
 points at its installed documentation, is left out: pi installs none.
 
 A custom prompt replaces the role, `<tools>`, and `<rules>`. The appended
@@ -376,12 +380,98 @@ pi also marks its own process, and so every command and tool it starts:
 `AI_AGENT=pi` names the agent for any tool that asks, and
 `PI_CODING_AGENT=true` is pi's own marker.
 
+### Tool selection
+
+Every built-in tool is enabled by default. Upstream pi enables only `read`,
+`bash`, `edit`, and `write`; apart from that default set, selection works as
+upstream's does:
+
+- `defaultTools` in `settings.json` selects the built-in tools. Plain names
+  replace the default set; `+name` adds a tool and `-name` removes one, in
+  list order. A project list of only `+name`/`-name` entries changes the
+  user's list instead of replacing it. `[]` disables every built-in tool.
+  Extension tools are not part of this selection and stay enabled.
+- `--tools` with plain names is an allowlist over built-in and extension
+  tools; `*` matches any characters (`--tools 'read,web_*'`). With only
+  `+name`/`-name` entries it changes the default selection for one run
+  (`--tools -bash,+grep`). The two forms cannot be mixed.
+- `--exclude-tools` removes tools by name or pattern.
+- `--no-builtin-tools` disables the built-in tools and keeps extension tools.
+  `--no-tools` disables every tool `--tools` does not name.
+- `enabledTools` in `settings.json` is a persistent allowlist, like `--tools`
+  with plain names; `--tools`, `--no-builtin-tools`, and `--no-tools` replace
+  it for the run. Upstream has no such setting.
+
+The flags apply to the run they are given to and are not saved with the
+session. `/reload` selects again from the reloaded settings and the same flags.
+
+### File and shell tools
+
+`read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls` take upstream pi's
+arguments and return upstream's results: limits, notices, and wording are
+compared with results recorded from upstream's tools
+(`tests/fixtures/ts-parity/tool-behavior.json`). A path may be relative to the
+working directory, absolute, or under `~/`; as in upstream, tools are not
+confined to the working directory. Differences from upstream are listed in
+`docs/rust-rewrite/non-parity-register.md`.
+
+- `read` returns at most 2000 lines or 50 KB of a text file, whichever comes
+  first, and says which `offset` continues. `offset` is the first line
+  (1-based) and `limit` the number of lines; an `offset` past the end is an
+  error. A line longer than 50 KB is not returned: the result gives a `sed`
+  command for it. An image (PNG, JPEG, GIF, WebP, or BMP, recognized by its
+  content) is attached to the result; see below.
+- `bash` runs `bash -c` in its own session with empty stdin: `/bin/bash`, else
+  `bash` on `PATH`, else `sh`. The `shellPath` setting names another shell and
+  `shellCommandPrefix` is put before every command. It is not a login shell.
+  stdout and stderr come back as one stream in the order written. The model
+  gets the last 2000 lines or 50 KB; longer output is also saved whole to
+  `pi-bash-<random>.log` in the temp directory (readable only by you), and
+  the result names that file. There is no default timeout. With `timeout`
+  (seconds) the command and its process group are killed when it passes, and
+  the result is the output so far followed by `Command timed out after N
+  seconds`. A non-zero exit is an error result ending in `Command exited with
+  code N`.
+- `edit` replaces exact text: every `oldText` must occur once, the edits must
+  not overlap, and all apply or none do.
+- `write` creates or replaces a file, creating its parent directories.
+- `grep` searches like `rg --hidden`: hidden files are searched, `.ignore` and
+  `.rgignore` files apply, and so does `.gitignore` inside a git repository.
+  `glob` filters the files, `ignoreCase` and `literal` change matching, and
+  `context` adds lines around each match. It returns at most 100 matches
+  (`limit`) or 50 KB, cuts lines at 500 characters, and lists files in path
+  order. `.git/` is searched like any hidden directory.
+- `find` matches a glob like `fd --glob --hidden`: against the file name, or
+  against the path when the glob contains `/`. It lists files and directories
+  (directories end in `/`) below `path`, applies `.gitignore`, `.ignore`, and
+  `.fdignore`, ignores case unless the glob has an uppercase letter, and
+  returns at most 1000 results (`limit`) or 50 KB in path order.
+- `ls` lists a directory, dotfiles included and directories ending in `/`,
+  sorted without regard to case, up to 500 entries (`limit`) or 50 KB.
+
+Images that `read` returns reach the model only where the provider API carries
+images in tool results:
+
+| Provider API | Providers | Image in a `read` result |
+|---|---|---|
+| Anthropic Messages | Anthropic, Claude Code OAuth, Anthropic-compatible aliases | Sent in the tool result |
+| OpenAI Responses | OpenAI, Codex, Azure OpenAI, GitHub Copilot | Sent in the tool result |
+| Google Gemini / Vertex | Google | Sent in the tool result (Gemini 3) or the next user turn |
+| Bedrock Converse | Amazon Bedrock | Sent in the tool result |
+| OpenAI chat completions | OpenAI chat models, OpenRouter, Cloudflare, Mistral, and the OpenAI-compatible aliases | Not sent; the result says the image was left out |
+
+pi's model catalog does not record which models accept images, so an image is
+sent to every model behind the first four APIs. `images.blockImages` keeps
+`read` from returning images at all, and `images.autoResize` (on by default)
+scales an image down to at most 2000 pixels a side and 4.5 MB.
+
 ### Web tools
 
 `web_search` returns numbered titles, URLs, and snippets; `web_fetch` retrieves
 readable HTML/text/JSON/XML, retaining source URLs and links. They are enabled
-by default unless `enabledTools`, `--tools`, `--exclude-tools`, or `--no-tools`
-restricts them. `--offline` / `PI_OFFLINE=1` blocks both, including after reload.
+by default unless `defaultTools`, `enabledTools`, `--tools`, `--exclude-tools`,
+`--no-builtin-tools`, or `--no-tools` leaves them out. `--offline` /
+`PI_OFFLINE=1` blocks both, including after reload.
 
 Search uses DuckDuckGo HTML without an API key by default. For a more reliable
 backend, set `BRAVE_SEARCH_API_KEY`, or set `PI_SEARXNG_URL` to the complete
@@ -689,6 +779,10 @@ Executable extensions can opt into the JSON protocol with an adjacent
 tools; Pi sends `kind: "tool"` JSON requests on stdin and expects a JSON
 response with `output` or `error`. Like `bash`, a tool process has no
 controlling terminal, and an interrupted call kills its process group. A
+non-zero exit is a failed call: the model gets what the extension printed as
+an error result. Output beyond 2000 lines or 50 KB is cut there and saved
+whole to a temp file the result names. A tool named like a built-in tool
+replaces it: the model is offered the extension's definition only. A
 call that a stop cut off never runs again when its turn continues unless the
 tool declares `"replaySafe": true` (it only reads, so running it twice is
 harmless). `promptSnippet` is the tool's line in the system prompt's tool
@@ -798,8 +892,8 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/read <path>`
 - `/write <path> <text>`
 - `/edit <path> <find> <replace>`
-- `/grep <text> [path]`
-- `/find <text>`
+- `/grep <pattern> [path]`
+- `/find <glob>`
 - `/ls [path]`
 - `/bash <command>`
 - `! <command>`
@@ -827,7 +921,7 @@ Collapsed thinking and tool blocks use at most three terminal rows (excluding th
 
 Queued follow-ups are visible immediately above the editor, one truncated line per message (the newest four when the queue overflows). Up with an empty editor recalls the newest queued message for editing (otherwise prompt-history navigation is unchanged). Mid-turn `ctrl+s` steers queued messages followed by the draft at the next provider boundary (a prose-only response has no interior boundary, so steering is delivered after it finishes and the queue hint says so); the existing steering mode still controls batch size. Queue edits are journaled during streaming and survive reload/resume.
 
-Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Shell commands (`!`, `/bash`, and the model's `bash` tool) are non-interactive: stdin is empty and the command runs in its own session without a controlling terminal, so a program that prompts for input fails instead of waiting. A command that times out (120s by default) or whose turn is interrupted is killed together with its whole process group; background jobs started by a command that finished normally keep running. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
+Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Shell commands (`!`, `/bash`, and the model's `bash` tool) are non-interactive: stdin is empty and the command runs in its own session without a controlling terminal, so a program that prompts for input fails instead of waiting. A command that times out or whose turn is interrupted is killed together with its whole process group, and a timeout returns the output so far; background jobs started by a command that finished normally keep running, and the command returns without waiting for them. `!` and `/bash` commands time out after 120 seconds; the model's `bash` calls have no timeout unless the model sets one. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
 
 The TUI defaults to an owned alternate-screen transcript with a fixed composer. Mouse wheel and PageUp/PageDown scroll only the conversation; Up/Down retain prompt-history/queue navigation. At the bottom, new output follows automatically. Scrolling up anchors the reader to logical text: streaming, resizing, panel changes, and reload do not steal the reading position. `↓ Scroll to bottom · Esc` appears while reading (with `new output` when text arrives); click it, press Esc, or scroll down to resume following. Live thinking-tail previews are frozen while reading; returning to latest refreshes them. Esc dismisses an open selector/diff panel first, otherwise returns to latest without clearing the draft/attachments or interrupting generation. At latest it retains the existing clear/interrupt behavior. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 

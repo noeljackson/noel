@@ -331,12 +331,12 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "replace text",
     },
     CommandHelp {
-        command: "/grep <text> [path]",
+        command: "/grep <pattern> [path]",
         description: "search files",
     },
     CommandHelp {
-        command: "/find <text>",
-        description: "find files by substring",
+        command: "/find <glob>",
+        description: "find files by glob",
     },
     CommandHelp {
         command: "/ls [path]",

@@ -1,6 +1,10 @@
 mod compaction;
 mod session_lock;
 mod system_prompt;
+#[cfg(test)]
+mod tool_parity_tests;
+#[cfg(test)]
+mod tool_tests;
 pub use compaction::RuntimeCompactionSettings;
 use session_lock::SessionLock;
 pub use system_prompt::PRODUCT_NAME;
@@ -28,8 +32,8 @@ use pi_config::{
 /// Kills every running tool subprocess tree; for pi's fatal-signal handling.
 pub use pi_tools::kill_running_tool_groups;
 use pi_tools::{
-    builtin_tool_definitions, execute_tool, spawn_tool_process, ToolError, ToolRequest,
-    ToolRuntimeOptions,
+    builtin_tool_definitions, cap_tool_output, execute_tool, spawn_tool_process, ToolError,
+    ToolRequest, ToolResult, ToolRuntimeOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -436,6 +440,10 @@ pub struct ReloadableSystems {
     pub keybinding_generation: u64,
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
+    /// The `images.autoResize` and `images.blockImages` settings, for images
+    /// the `read` tool returns.
+    pub auto_resize_images: bool,
+    pub block_images: bool,
     pub retry: RuntimeRetrySettings,
     pub offline: bool,
     pub compaction: RuntimeCompactionSettings,
@@ -462,6 +470,8 @@ impl Default for ReloadableSystems {
             keybinding_generation: 0,
             shell_path: None,
             shell_command_prefix: None,
+            auto_resize_images: true,
+            block_images: false,
             retry: RuntimeRetrySettings::default(),
             offline: false,
             compaction: RuntimeCompactionSettings::default(),
@@ -469,6 +479,58 @@ impl Default for ReloadableSystems {
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         }
     }
+}
+
+/// The tools a run may use, from the tool settings and the command-line
+/// flags folded into them (upstream `createAgentSession`):
+///
+/// - `enabledTools` (`--tools` with plain names) is an allowlist of names
+///   and `*` patterns over every built-in and extension tool.
+/// - Otherwise the built-in tools are those `defaultTools` selects (all of
+///   them when it is unset), and every extension tool is available.
+/// - `--exclude-tools` then removes the tools it names or matches.
+fn available_tool_names(
+    settings: &pi_config::Settings,
+    extension_tools: &BTreeMap<String, ExtensionTool>,
+) -> BTreeSet<String> {
+    let builtin = builtin_tool_definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    let selected: BTreeSet<String> = match (&settings.enabled_tools, &settings.default_tools) {
+        (Some(allowed), _) => builtin
+            .iter()
+            .chain(extension_tools.keys())
+            .filter(|name| pi_config::tool_name_matches(allowed, name))
+            .cloned()
+            .collect(),
+        (None, Some(entries)) => pi_config::resolve_default_tools(entries, &builtin)
+            .into_iter()
+            .filter(|name| builtin.contains(name))
+            .chain(extension_tools.keys().cloned())
+            .collect(),
+        (None, None) => builtin
+            .into_iter()
+            .chain(extension_tools.keys().cloned())
+            .collect(),
+    };
+    selected
+        .into_iter()
+        .filter(|name| !pi_config::tool_name_matches(&settings.excluded_tools, name))
+        .collect()
+}
+
+fn image_setting(
+    config: &LoadedConfig,
+    setting: impl Fn(&pi_config::ImageSettings) -> Option<bool>,
+    default: bool,
+) -> bool {
+    config
+        .settings
+        .images
+        .as_ref()
+        .and_then(setting)
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -542,14 +604,7 @@ impl ReloadableSystems {
             })
             .collect();
         let extension_tools = extension_tools_from_resources(&config.extensions);
-        let available_tool_names = match &config.settings.enabled_tools {
-            Some(enabled_tools) => enabled_tools.iter().cloned().collect(),
-            None => builtin_tool_definitions()
-                .into_iter()
-                .map(|definition| definition.name)
-                .chain(extension_tools.keys().cloned())
-                .collect(),
-        };
+        let available_tool_names = available_tool_names(&config.settings, &extension_tools);
         Self {
             config_generation: generation,
             system_prompt: config.system_prompt.clone(),
@@ -583,6 +638,8 @@ impl ReloadableSystems {
             keybinding_generation: generation,
             shell_path: config.settings.shell_path.clone(),
             shell_command_prefix: config.settings.shell_command_prefix.clone(),
+            auto_resize_images: image_setting(config, |images| images.auto_resize, true),
+            block_images: image_setting(config, |images| images.block_images, false),
             offline: std::env::var("PI_OFFLINE")
                 .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
             retry: RuntimeRetrySettings {
@@ -2277,10 +2334,16 @@ impl Runtime {
                 .unwrap_or(false),
             _ => true,
         };
+        // Tools the session could use before the reload and no longer can.
+        let was_available = |tool_name: &String| {
+            !self.systems.tool_scope_configured
+                || self.systems.available_tool_names.contains(tool_name)
+        };
         let removed_active_tools = self
             .session
             .active_tool_names
             .iter()
+            .filter(|tool_name| was_available(tool_name))
             .filter(|tool_name| !next.available_tool_names.contains(*tool_name))
             .cloned()
             .collect();
@@ -2473,10 +2536,12 @@ pub enum TurnEvent {
         name: String,
         is_error: bool,
     },
-    /// A tool call's result as saved, and how long the tool ran.
+    /// A tool call's result as saved, and how long the tool ran. `images`
+    /// are the attachments of the result (`read` of an image).
     ToolOutput {
         call: ChatToolCall,
         output: String,
+        images: Vec<MediaInput>,
         is_error: bool,
         duration: Duration,
     },
@@ -2562,12 +2627,7 @@ pub async fn run_saved_prompt_streaming_events(
             .until_cancelled(execute_tool(
                 &runtime.session.cwd,
                 command.request,
-                &ToolRuntimeOptions {
-                    shell_path: runtime.systems.shell_path.clone(),
-                    shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
-                    offline: runtime.systems.offline,
-                    bash_env: Vec::new(),
-                },
+                &tool_runtime_options(runtime, Vec::new()),
             ))
             .await??;
         if let Some(path) = edited_path {
@@ -2583,7 +2643,7 @@ pub async fn run_saved_prompt_streaming_events(
             thinking: String::new(),
             role: MessageRole::Tool,
             content: result.output.clone(),
-            media: Vec::new(),
+            media: tool_result_media(result.images),
             tool_call_id: None,
             tool_name: Some(command.name.clone()),
             tool_calls: Vec::new(),
@@ -2813,9 +2873,17 @@ async fn run_tool_call(
         .filter(|event| event.id == tool_call.id);
     let is_error = result.is_err() || event.is_some_and(|event| event.is_error);
     if let Some(event) = event {
+        let images = runtime
+            .session
+            .messages
+            .last()
+            .filter(|message| message.tool_call_id.as_deref() == Some(&tool_call.id))
+            .map(|message| message.media.clone())
+            .unwrap_or_default();
         on_event(&TurnEvent::ToolOutput {
             call: tool_call.clone(),
             output: event.result.clone(),
+            images,
             is_error,
             duration,
         });
@@ -2915,10 +2983,12 @@ fn runtime_system_prompt(runtime: &Runtime) -> String {
 }
 
 /// The tools [`active_tool_definitions`] declares, as the prompt presents
-/// them.
+/// them. Like there, an extension tool with a built-in tool's name replaces
+/// it, so each tool is presented once.
 fn prompt_tools(runtime: &Runtime) -> Vec<PromptTool> {
     let builtin = builtin_tool_definitions()
         .into_iter()
+        .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
         .filter(|tool| model_tool_enabled(runtime, &tool.name))
         .map(|tool| PromptTool::builtin(&tool.name));
     let extension = runtime
@@ -3052,9 +3122,44 @@ fn retry_policy(retry: &RuntimeRetrySettings) -> RetryPolicy {
     }
 }
 
+/// The options every tool runs with. `bash_env` is what a bash command
+/// learns about its session: [`bash_session_env`] for a call the model
+/// makes, nothing for a command the user types (`/bash`, `!`, `!!`).
+fn tool_runtime_options(
+    runtime: &Runtime,
+    bash_env: Vec<(String, Option<String>)>,
+) -> ToolRuntimeOptions {
+    ToolRuntimeOptions {
+        shell_path: runtime.systems.shell_path.clone(),
+        shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
+        offline: runtime.systems.offline,
+        bash_env,
+        auto_resize_images: runtime.systems.auto_resize_images,
+        block_images: runtime.systems.block_images,
+    }
+}
+
+/// The images of a tool result as message attachments.
+fn tool_result_media(images: Vec<pi_tools::ToolImage>) -> Vec<MediaInput> {
+    images
+        .into_iter()
+        .map(|image| MediaInput {
+            mime_type: image.mime_type,
+            data_base64: image.data_base64,
+            path: None,
+            width: None,
+            height: None,
+        })
+        .collect()
+}
+
+/// The tools offered to the model. An extension tool with a built-in tool's
+/// name replaces it: the model is sent one definition per name, the one
+/// that runs.
 fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
     let mut definitions = builtin_tool_definitions()
         .into_iter()
+        .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
         .filter(|tool| model_tool_enabled(runtime, &tool.name))
         .filter_map(|tool| model_tool_definition(&tool.name))
         .collect::<Vec<_>>();
@@ -3083,50 +3188,77 @@ fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
             || runtime.systems.available_tool_names.contains(name))
 }
 
+/// What the model is told about a built-in tool. The definitions of
+/// upstream's tools are upstream's, word for word (`tool-behavior.json`).
 fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
     let definition = match name {
         "read" => AiToolDefinition {
             name: "read".to_string(),
-            description: "Read a UTF-8 text file from the current workspace. Returns at most 2000 lines; when truncated the output says which lines were shown — continue with offset/limit. For files larger than a few hundred lines, prefer grep to locate code first and read only the relevant range.".to_string(),
+            description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "offset": { "type": "number" },
-                    "limit": { "type": "number" }
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read (relative or absolute)"
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "Line number to start reading from (1-indexed)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of lines to read"
+                    }
                 },
                 "required": ["path"]
             }),
         },
         "bash" => AiToolDefinition {
             name: "bash".to_string(),
-            description: "Execute a shell command in the current workspace. Output is capped at 30000 characters (head kept); redirect large output to a file and read a slice, or pipe through grep/head.".to_string(),
+            description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string" },
-                    "timeout": { "type": "number" }
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute"
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Timeout in seconds (optional, no default timeout)"
+                    }
                 },
                 "required": ["command"]
             }),
         },
         "edit" => AiToolDefinition {
             name: "edit".to_string(),
-            description: "Apply exact text replacements to a file. Each edits[].oldText must match a unique, non-overlapping region of the original file; all edits apply together or none do.".to_string(),
+            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to edit (relative or absolute)"
+                    },
                     "edits": {
                         "type": "array",
                         "items": {
                             "type": "object",
+                            "required": ["oldText", "newText"],
                             "properties": {
-                                "oldText": { "type": "string" },
-                                "newText": { "type": "string" }
-                            },
-                            "required": ["oldText", "newText"]
-                        }
+                                "oldText": {
+                                    "type": "string",
+                                    "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."
+                                },
+                                "newText": {
+                                    "type": "string",
+                                    "description": "Replacement text for this targeted edit."
+                                }
+                            }
+                        },
+                        "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."
                     }
                 },
                 "required": ["path", "edits"]
@@ -3134,56 +3266,97 @@ fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
         },
         "write" => AiToolDefinition {
             name: "write".to_string(),
-            description: "Write UTF-8 text to a file in the current workspace.".to_string(),
+            description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to write (relative or absolute)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write to the file"
+                    }
                 },
                 "required": ["path", "content"]
             }),
         },
         "grep" => AiToolDefinition {
             name: "grep".to_string(),
-            description: "Search file contents in the current workspace with regex. Returns at most 200 matches with a truncation notice; narrow the path or pattern instead of reading whole large files.".to_string(),
+            description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" },
-                    "glob": { "type": "string" },
-                    "literal": { "type": "boolean" },
-                    "ignoreCase": { "type": "boolean" },
-                    "context": { "type": "number" },
-                    "limit": { "type": "number" }
+                    "pattern": {
+                        "type": "string",
+                        "description": "Search pattern (regex or literal string)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search (default: current directory)"
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'"
+                    },
+                    "ignoreCase": {
+                        "type": "boolean",
+                        "description": "Case-insensitive search (default: false)"
+                    },
+                    "literal": {
+                        "type": "boolean",
+                        "description": "Treat pattern as literal string instead of regex (default: false)"
+                    },
+                    "context": {
+                        "type": "number",
+                        "description": "Number of lines to show before and after each match (default: 0)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of matches to return (default: 100)"
+                    }
                 },
                 "required": ["pattern"]
             }),
         },
         "find" => AiToolDefinition {
             name: "find".to_string(),
-            description: "Find file paths in the current workspace. Returns at most 200 paths with a truncation notice; narrow the pattern if truncated.".to_string(),
+            description: "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" },
-                    "limit": { "type": "number" }
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search in (default: current directory)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of results (default: 1000)"
+                    }
                 },
                 "required": ["pattern"]
             }),
         },
         "ls" => AiToolDefinition {
             name: "ls".to_string(),
-            description: "List directory entries in the current workspace.".to_string(),
+            description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "limit": { "type": "number" }
-                },
-                "required": []
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to list (default: current directory)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of entries to return (default: 500)"
+                    }
+                }
             }),
         },
         "web_search" => AiToolDefinition {
@@ -3403,11 +3576,15 @@ async fn execute_model_tool_call(
         .get(&tool_call.name)
         .cloned();
     let mut is_error = false;
+    let mut images = Vec::new();
     let outputs = if let Some(extension_tool) =
         extension_tool.filter(|_| model_tool_enabled(runtime, &tool_call.name))
     {
         match execute_extension_tool(&runtime.session.cwd, &extension_tool, tool_call).await {
-            Ok(output) => vec![output],
+            Ok(result) => {
+                is_error = result.is_error;
+                vec![result.output]
+            }
             Err(error) => {
                 is_error = true;
                 vec![error.to_string()]
@@ -3447,12 +3624,7 @@ async fn execute_model_tool_call(
                     let output = match execute_tool(
                         &runtime.session.cwd,
                         request,
-                        &ToolRuntimeOptions {
-                            shell_path: runtime.systems.shell_path.clone(),
-                            shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
-                            offline: runtime.systems.offline,
-                            bash_env: bash_session_env(runtime),
-                        },
+                        &tool_runtime_options(runtime, bash_session_env(runtime)),
                     )
                     .await
                     {
@@ -3461,6 +3633,7 @@ async fn execute_model_tool_call(
                             if let Some(path) = edited_path {
                                 edited_paths.push(path);
                             }
+                            images.extend(result.images);
                             result.output
                         }
                         Err(error) => {
@@ -3496,7 +3669,7 @@ async fn execute_model_tool_call(
         thinking: String::new(),
         role: MessageRole::Tool,
         content: output,
-        media: Vec::new(),
+        media: tool_result_media(images),
         tool_call_id: Some(tool_call.id.clone()),
         tool_name: Some(tool_call.name.clone()),
         tool_calls: Vec::new(),
@@ -3504,11 +3677,14 @@ async fn execute_model_tool_call(
     Ok(())
 }
 
+/// Runs an extension's tool. Its output is capped like a built-in tool's,
+/// and a non-zero exit is an error result carrying what the extension
+/// printed.
 async fn execute_extension_tool(
     cwd: &Path,
     extension: &ExtensionTool,
     tool_call: &ChatToolCall,
-) -> Result<String, AgentError> {
+) -> Result<ToolResult, AgentError> {
     let cwd_string = cwd.display().to_string();
     let request = ExtensionProtocolRequest {
         protocol_version: 1,
@@ -3563,10 +3739,10 @@ async fn execute_extension_tool(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        return Ok(format!(
+        return Ok(ToolResult::error(cap_tool_output(format!(
             "extension {} failed:\n{}{}",
             extension.extension_name, stdout, stderr
-        ));
+        ))));
     }
     let response =
         serde_json::from_str::<ExtensionCommandResponse>(stdout.trim()).map_err(|source| {
@@ -3581,12 +3757,14 @@ async fn execute_extension_tool(
             message: format!("extension {} failed: {error}", extension.extension_name),
         });
     }
-    Ok(response.output.unwrap_or_else(|| {
-        format!(
-            "extension {} tool {} completed",
-            extension.extension_name, extension.name
-        )
-    }))
+    Ok(ToolResult::text(cap_tool_output(
+        response.output.unwrap_or_else(|| {
+            format!(
+                "extension {} tool {} completed",
+                extension.extension_name, extension.name
+            )
+        }),
+    )))
 }
 
 fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, AgentError> {
@@ -3599,9 +3777,7 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "bash" => vec![ToolRequest::Bash {
             command: string_tool_arg(&args, &["command"], &tool_call.name)?,
-            timeout_ms: optional_number_tool_arg(&args, &["timeout", "timeout_ms"])
-                .map(|timeout| timeout.saturating_mul(1_000))
-                .or(Some(120_000)),
+            timeout_ms: bash_timeout_ms(&args)?,
         }],
         "write" => vec![ToolRequest::Write {
             path: string_tool_arg(&args, &["path"], &tool_call.name)?,
@@ -3609,8 +3785,9 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "edit" => edit_tool_requests(&args, &tool_call.name)?,
         "grep" => vec![ToolRequest::Grep {
-            path: optional_string_tool_arg(&args, &["path", "glob"]),
+            path: optional_string_tool_arg(&args, &["path"]),
             pattern: string_tool_arg(&args, &["pattern"], &tool_call.name)?,
+            glob: optional_string_tool_arg(&args, &["glob"]),
             literal: optional_bool_tool_arg(&args, &["literal"]),
             ignore_case: optional_bool_tool_arg(&args, &["ignoreCase", "ignore_case"]),
             context: optional_integer_tool_arg(&args, "context", &tool_call.name)?,
@@ -3618,6 +3795,8 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "find" => vec![ToolRequest::Find {
             pattern: string_tool_arg(&args, &["pattern"], &tool_call.name)?,
+            path: optional_string_tool_arg(&args, &["path"]),
+            limit: optional_integer_tool_arg(&args, "limit", &tool_call.name)?,
         }],
         "web_search" => vec![ToolRequest::WebSearch {
             query: string_tool_arg(&args, &["query"], &tool_call.name)?,
@@ -3629,6 +3808,7 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "ls" => vec![ToolRequest::Ls {
             path: optional_string_tool_arg(&args, &["path"]),
+            limit: optional_integer_tool_arg(&args, "limit", &tool_call.name)?,
         }],
         _ => {
             return Err(AgentError::InvalidToolCall {
@@ -3752,11 +3932,35 @@ fn optional_integer_tool_arg(
     }
 }
 
-fn optional_number_tool_arg(args: &serde_json::Value, names: &[&str]) -> Option<u64> {
-    names
-        .iter()
-        .find_map(|name| args.get(*name).and_then(serde_json::Value::as_u64))
+/// Largest timeout upstream accepts, in milliseconds (a 32-bit timer).
+const MAX_BASH_TIMEOUT_MS: f64 = 2_147_483_647.0;
+
+/// The bash tool's optional `timeout`, in seconds and possibly fractional.
+/// There is no default: without it a command runs until it exits or the
+/// turn is interrupted. Errors are worded as upstream words them.
+fn bash_timeout_ms(args: &Value) -> Result<Option<u64>, AgentError> {
+    let Some(timeout) = args.get("timeout").filter(|timeout| !timeout.is_null()) else {
+        return Ok(None);
+    };
+    let invalid = |message: String| AgentError::Tool(ToolError::Failed(message));
+    let milliseconds = timeout
+        .as_f64()
+        .filter(|seconds| *seconds > 0.0)
+        .map(|seconds| seconds * 1000.0)
+        .ok_or_else(|| invalid("Invalid timeout: must be a finite number of seconds".into()))?;
+    if milliseconds > MAX_BASH_TIMEOUT_MS {
+        return Err(invalid(format!(
+            "Invalid timeout: maximum is {} seconds",
+            MAX_BASH_TIMEOUT_MS / 1000.0
+        )));
+    }
+    Ok(Some(milliseconds.round() as u64))
 }
+
+/// How long a command the user runs (`!` and `/bash`) may take. Unlike a
+/// model's bash call, which has no default timeout, these have no way to
+/// set one and cannot be interrupted individually.
+const USER_BASH_TIMEOUT_MS: u64 = 120_000;
 
 pub async fn run_excluded_bash(runtime: &Runtime, command: String) -> Result<String, AgentError> {
     Ok(run_excluded_bash_result(runtime, command).await?.output)
@@ -3773,14 +3977,9 @@ pub async fn run_excluded_bash_result(
         &runtime.session.cwd,
         ToolRequest::Bash {
             command,
-            timeout_ms: Some(120_000),
+            timeout_ms: Some(USER_BASH_TIMEOUT_MS),
         },
-        &ToolRuntimeOptions {
-            shell_path: runtime.systems.shell_path.clone(),
-            shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
-            offline: runtime.systems.offline,
-            bash_env: Vec::new(),
-        },
+        &tool_runtime_options(runtime, Vec::new()),
     )
     .await
     .map_err(Into::into)
@@ -3841,7 +4040,7 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
             name: "bash".to_string(),
             request: ToolRequest::Bash {
                 command: required_arg(command, rest)?.to_string(),
-                timeout_ms: Some(120_000),
+                timeout_ms: Some(USER_BASH_TIMEOUT_MS),
             },
         })),
         "/write" => {
@@ -3876,6 +4075,7 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
                 request: ToolRequest::Grep {
                     path: path.map(ToString::to_string),
                     pattern: pattern.to_string(),
+                    glob: None,
                     literal: None,
                     ignore_case: None,
                     context: None,
@@ -3887,6 +4087,8 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
             name: "find".to_string(),
             request: ToolRequest::Find {
                 pattern: required_arg(command, rest)?.to_string(),
+                path: None,
+                limit: None,
             },
         })),
         "/ls" => Ok(Some(ParsedToolCommand {
@@ -3897,6 +4099,7 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
                 } else {
                     Some(rest.to_string())
                 },
+                limit: None,
             },
         })),
         "/reload" | "/quit" | "/help" => Ok(None),
@@ -4973,79 +5176,6 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, TurnEvent::CompactionFailed(_))));
-    }
-
-    #[test]
-    fn model_tool_definitions_match_ts_local_tool_schema_keys() {
-        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
-            "../../../tests/fixtures/ts-parity/local-tools.json"
-        ))
-        .expect("parse local tools fixture");
-        let expected = fixture["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .map(|tool| {
-                (
-                    tool["name"].as_str().expect("tool name").to_string(),
-                    (
-                        tool["parameters"]["properties"]
-                            .as_array()
-                            .expect("properties")
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                        tool["parameters"]["required"]
-                            .as_array()
-                            .expect("required")
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let actual = builtin_tool_definitions()
-            .into_iter()
-            .map(|tool| {
-                let definition = model_tool_definition(&tool.name).expect("model tool definition");
-                let mut properties = definition.parameters["properties"]
-                    .as_object()
-                    .expect("properties object")
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                properties.sort();
-                let mut required = definition.parameters["required"]
-                    .as_array()
-                    .expect("required array")
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
-                required.sort();
-                (definition.name, (properties, required))
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        // Rust intentionally adds tools beyond the upstream set (see
-        // docs/rust-rewrite/non-parity-register.md); upstream tools must keep
-        // their schema keys, but rust-only tools are not in the fixture.
-        // Upstream's `powershell` tool only runs on Windows, so Rust omits it
-        // ("Windows-Only PowerShell Tool" in non-parity-register.md).
-        const WINDOWS_ONLY_UPSTREAM_TOOL: &str = "powershell";
-        for (name, keys) in &expected {
-            if name == WINDOWS_ONLY_UPSTREAM_TOOL {
-                assert!(
-                    !actual.contains_key(name),
-                    "{name} is now ported; drop its non-parity exception"
-                );
-                continue;
-            }
-            assert_eq!(actual.get(name), Some(keys), "schema keys for {name}");
-        }
     }
 
     #[test]
@@ -7438,7 +7568,7 @@ mod tests {
             requests: requests.clone(),
         };
 
-        let response = run_user_turn(&mut runtime, &provider, "read outside".to_string())
+        let response = run_user_turn(&mut runtime, &provider, "read missing".to_string())
             .await
             .expect("run tool loop");
 
@@ -7446,18 +7576,17 @@ mod tests {
         assert_eq!(runtime.session().tool_history.len(), 1);
         assert_eq!(runtime.session().tool_history[0].id, "call_read_bad");
         assert_eq!(runtime.session().tool_history[0].name, "read");
-        assert_eq!(
-            runtime.session().tool_history[0].result,
-            "path escapes cwd: ../outside.txt"
+        let failure = format!(
+            "ENOENT: no such file or directory, access '{}'",
+            cwd.join("missing.txt").display()
         );
+        assert_eq!(runtime.session().tool_history[0].result, failure);
+        assert!(runtime.session().tool_history[0].is_error);
         assert_eq!(
             runtime.session().messages[2].tool_call_id.as_deref(),
             Some("call_read_bad")
         );
-        assert_eq!(
-            runtime.session().messages[2].content,
-            "path escapes cwd: ../outside.txt"
-        );
+        assert_eq!(runtime.session().messages[2].content, failure);
 
         let captured = requests.lock().expect("requests").clone();
         assert_eq!(captured.len(), 2);
@@ -8246,7 +8375,7 @@ mod tests {
                     StreamEvent::ToolCall {
                         id: "call_read_bad".to_string(),
                         name: "read".to_string(),
-                        arguments: r#"{"path":"../outside.txt"}"#.to_string(),
+                        arguments: r#"{"path":"missing.txt"}"#.to_string(),
                     },
                     StreamEvent::Stop {
                         reason: "toolUse".to_string(),

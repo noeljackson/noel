@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pi_ai::{ChatToolCall, ModelRef, StreamEvent};
+use pi_ai::{ChatToolCall, MediaInput, ModelRef, StreamEvent};
 use pi_config::{model_context_window, LoadedConfig, ProviderApi};
 use pi_core::{
     CompactionRecord, ConversationMessage, MessageRole, Run, RunStatus, Runtime, SessionState,
@@ -491,12 +491,10 @@ pub(crate) enum Message {
 impl Message {
     /// A user message: its text, then its images.
     fn user(message: &ConversationMessage, timestamp: Option<u64>) -> Self {
-        let mut content = vec![Content::text(&message.content)];
-        content.extend(message.media.iter().map(|media| Content::Image {
-            data: media.data_base64.clone(),
-            mime_type: media.mime_type.clone(),
-        }));
-        Message::User { content, timestamp }
+        Message::User {
+            content: Content::text_and_images(&message.content, &message.media),
+            timestamp,
+        }
     }
 
     /// A saved reply: its thinking, text and tool calls, and how it stopped.
@@ -536,7 +534,7 @@ impl Message {
                         .or_else(|| event.map(|event| event.id.clone()))
                         .unwrap_or_default(),
                     tool_name: message.tool_name.clone().unwrap_or_default(),
-                    content: vec![Content::text(&message.content)],
+                    content: Content::text_and_images(&message.content, &message.media),
                     is_error: event.is_some_and(|event| event.is_error),
                     duration_ms: None,
                     timestamp: None,
@@ -621,6 +619,17 @@ impl Content {
         Content::Text {
             text: text.to_owned(),
         }
+    }
+
+    /// A text block, then one block per image (a user's attachments, or
+    /// the images of a tool result).
+    fn text_and_images(text: &str, images: &[MediaInput]) -> Vec<Self> {
+        let mut content = vec![Content::text(text)];
+        content.extend(images.iter().map(|image| Content::Image {
+            data: image.data_base64.clone(),
+            mime_type: image.mime_type.clone(),
+        }));
+        content
     }
 
     fn tool_call(call: &ChatToolCall) -> Self {
@@ -1063,9 +1072,13 @@ impl Recorder {
             TurnEvent::ToolOutput {
                 call,
                 output,
+                images,
                 is_error,
                 duration,
-            } => self.tool_output(call, output, *is_error, Some(millis(*duration)), sink),
+            } => {
+                let content = Content::text_and_images(output, images);
+                self.tool_output(call, content, *is_error, Some(millis(*duration)), sink);
+            }
             TurnEvent::CompactionStarted => {
                 self.compacting = true;
                 sink(Event::CompactionStart {
@@ -1125,13 +1138,8 @@ impl Recorder {
     fn stop(&mut self, error: Option<&str>, sink: Sink) {
         let message = error.unwrap_or(ABORTED);
         if let Some(call) = self.tool.take() {
-            self.tool_output(
-                &call,
-                error.unwrap_or("Operation aborted"),
-                true,
-                None,
-                sink,
-            );
+            let content = vec![Content::text(error.unwrap_or("Operation aborted"))];
+            self.tool_output(&call, content, true, None, sink);
         }
         if let Some(attempt) = self.retry.take() {
             sink(Event::AutoRetryEnd {
@@ -1254,13 +1262,12 @@ impl Recorder {
     fn tool_output(
         &mut self,
         call: &ChatToolCall,
-        output: &str,
+        content: Vec<Content>,
         is_error: bool,
         duration_ms: Option<u64>,
         sink: Sink,
     ) {
         self.tool = None;
-        let content = vec![Content::text(output)];
         sink(Event::ToolExecutionEnd {
             tool_call_id: &call.id,
             tool_name: &call.name,

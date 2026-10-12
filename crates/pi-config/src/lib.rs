@@ -170,8 +170,17 @@ pub struct Settings {
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
     pub hide_thinking_block: Option<bool>,
+    /// An allowlist of tool names and `*` patterns: only matching tools are
+    /// available. `--tools` with plain names sets it for one run.
     #[serde(default)]
     pub enabled_tools: Option<Vec<String>>,
+    /// The built-in tools enabled at startup; see [`resolve_default_tools`].
+    #[serde(default)]
+    pub default_tools: Option<Vec<String>>,
+    /// Tool names and `*` patterns `--exclude-tools` removes for one run.
+    /// Not a settings file key.
+    #[serde(skip)]
+    pub excluded_tools: Vec<String>,
     #[serde(default)]
     pub enabled_models: Option<Vec<String>>,
     pub theme: Option<String>,
@@ -240,6 +249,12 @@ impl Settings {
             shell_command_prefix: overrides.shell_command_prefix.or(self.shell_command_prefix),
             hide_thinking_block: overrides.hide_thinking_block.or(self.hide_thinking_block),
             enabled_tools: overrides.enabled_tools.or(self.enabled_tools),
+            default_tools: merge_default_tools(self.default_tools, overrides.default_tools),
+            excluded_tools: if overrides.excluded_tools.is_empty() {
+                self.excluded_tools
+            } else {
+                overrides.excluded_tools
+            },
             enabled_models: overrides.enabled_models.or(self.enabled_models),
             theme: overrides.theme.or(self.theme),
             accent_color: overrides.accent_color.or(self.accent_color),
@@ -373,6 +388,110 @@ pub struct PackageSourceConfig {
     pub prompts: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub themes: Option<Vec<String>>,
+}
+
+/// Whether a tool selection entry is a `+name` or `-name` modifier.
+pub fn is_tool_modifier(entry: &str) -> bool {
+    entry.starts_with(['+', '-'])
+}
+
+/// What is wrong with a `--tools` list, if anything. It is either an
+/// allowlist of names and `*` patterns, or only `+name`/`-name` entries with
+/// exact names.
+pub fn tool_list_error(entries: &[String]) -> Option<String> {
+    let modifiers = entries
+        .iter()
+        .filter(|entry| is_tool_modifier(entry))
+        .collect::<Vec<_>>();
+    if modifiers.is_empty() {
+        return None;
+    }
+    if modifiers.len() < entries.len() {
+        return Some("tool names cannot be mixed with +name or -name entries".to_string());
+    }
+    modifiers
+        .into_iter()
+        .find(|entry| entry.contains('*'))
+        .map(|pattern| {
+            format!("+name and -name entries take exact tool names, not patterns: {pattern}")
+        })
+}
+
+/// Applies the `+name` and `-name` entries to `base` in order: `+name` adds
+/// a tool and `-name` removes one. Other entries are ignored.
+pub fn apply_tool_modifiers(base: &[String], entries: &[String]) -> Vec<String> {
+    let mut tools = base.to_vec();
+    for entry in entries.iter().filter(|entry| is_tool_modifier(entry)) {
+        let name = &entry[1..];
+        let position = tools.iter().position(|tool| tool == name);
+        match (entry.starts_with('+'), position) {
+            (true, None) if !name.is_empty() => tools.push(name.to_string()),
+            (false, Some(position)) => {
+                tools.remove(position);
+            }
+            _ => {}
+        }
+    }
+    tools
+}
+
+/// The tools a merged `defaultTools` list selects: its plain names replace
+/// `defaults`, then `+name` adds and `-name` removes a tool, in list order.
+/// An empty list selects nothing.
+pub fn resolve_default_tools(entries: &[String], defaults: &[String]) -> Vec<String> {
+    let plain = entries
+        .iter()
+        .filter(|entry| !is_tool_modifier(entry))
+        .cloned()
+        .collect::<Vec<_>>();
+    let base = if plain.is_empty() && !entries.is_empty() {
+        defaults
+    } else {
+        &plain
+    };
+    apply_tool_modifiers(base, entries)
+}
+
+/// Whether a tool name is one of `entries`, each an exact name or a pattern
+/// where `*` matches any characters.
+pub fn tool_name_matches(entries: &[String], name: &str) -> bool {
+    entries.iter().any(|entry| {
+        let mut parts = entry.split('*');
+        let Some(rest) = parts.next().and_then(|first| name.strip_prefix(first)) else {
+            return false;
+        };
+        let Some(last) = parts.next_back() else {
+            // No `*`: an exact name.
+            return rest.is_empty();
+        };
+        let mut rest = rest;
+        for part in parts {
+            let Some(found) = rest.find(part) else {
+                return false;
+            };
+            rest = &rest[found + part.len()..];
+        }
+        rest.ends_with(last)
+    })
+}
+
+/// Merges `defaultTools` of two settings layers. A list with plain tool
+/// names replaces the inherited one; a list of only `+name`/`-name` entries
+/// is appended, so it modifies the inherited selection.
+fn merge_default_tools(
+    base: Option<Vec<String>>,
+    overrides: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    match (base, overrides) {
+        (base, None) => base,
+        (Some(mut base), Some(overrides))
+            if overrides.iter().all(|entry| is_tool_modifier(entry)) =>
+        {
+            base.extend(overrides);
+            Some(base)
+        }
+        (_, overrides) => overrides,
+    }
 }
 
 trait MergeSettings {
@@ -3161,6 +3280,12 @@ mod tests {
             "steeringMode": settings.steering_mode.as_deref().unwrap_or("one-at-a-time"),
             "followUpMode": settings.follow_up_mode.as_deref().unwrap_or("one-at-a-time"),
             "enabledModels": settings.enabled_models.as_ref(),
+            // Resolved against upstream's default tools, which the fixture
+            // records; pi's own default set is larger.
+            "defaultTools": settings.default_tools.as_ref().map(|entries| {
+                let upstream_defaults = ["read", "bash", "edit", "write"].map(String::from);
+                resolve_default_tools(entries, &upstream_defaults)
+            }),
             "compaction": {
                 "enabled": compaction.and_then(|compaction| compaction.enabled).unwrap_or(true),
                 "reserveTokens": compaction.and_then(|compaction| compaction.reserve_tokens).unwrap_or(16384),
@@ -3840,6 +3965,48 @@ mod tests {
 
         assert_eq!(next.session_dir, cwd.join("local-sessions"));
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn tool_lists_validate_and_match_like_upstream() {
+        let list = |entries: &[&str]| entries.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(tool_list_error(&list(&["read", "mcp_*"])), None);
+        assert_eq!(tool_list_error(&list(&["+grep", "-bash"])), None);
+        assert_eq!(
+            tool_list_error(&list(&["read", "+grep"])).as_deref(),
+            Some("tool names cannot be mixed with +name or -name entries")
+        );
+        assert_eq!(
+            tool_list_error(&list(&["+grep", "-web_*"])).as_deref(),
+            Some("+name and -name entries take exact tool names, not patterns: -web_*")
+        );
+
+        let patterns = list(&["read", "web_*", "*_tool", "a*b*c"]);
+        for name in [
+            "read",
+            "web_",
+            "web_search",
+            "my_tool",
+            "abc",
+            "a-b-c",
+            "axxbyybc",
+        ] {
+            assert!(tool_name_matches(&patterns, name), "{name}");
+        }
+        // A pattern covers the whole name, and a plain entry is exact.
+        for name in [
+            "reader",
+            "xread",
+            "the_web_search",
+            "tool_x",
+            "ab",
+            "acb",
+            "abcd",
+        ] {
+            assert!(!tool_name_matches(&patterns, name), "{name}");
+        }
+        assert!(tool_name_matches(&list(&["*"]), "anything"));
+        assert!(!tool_name_matches(&[], "read"));
     }
 
     #[test]

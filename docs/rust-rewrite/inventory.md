@@ -59,8 +59,9 @@ Implemented CLI flags include:
 - `--system-prompt <text-or-path>`
 - `--append-system-prompt <text-or-path>`
 - `--no-tools`, `-nt`
-- `--no-builtin-tools`, `-nbt`
-- `--tools`, `-t`
+- `--no-builtin-tools`, `-nbt` (extension tools stay enabled)
+- `--tools`, `-t` (names and `*` patterns, or only `+name`/`-name` entries)
+- `--exclude-tools`, `-xt` (names and `*` patterns)
 - `--skill <path>`
 - `--no-skills`, `-ns`
 - `--prompt-template <path>`
@@ -150,7 +151,10 @@ Rust behavior:
 Current settings cover:
 
 - Default provider/model/thinking level.
-- Enabled model scopes and active tools.
+- Enabled model scopes.
+- Tool selection: `defaultTools` (upstream's setting, merged across the user
+  and project layers as upstream merges it) and `enabledTools` (a Rust-only
+  allowlist).
 - Model refresh settings and cache TTL.
 - Theme, keybindings, markdown, and terminal behavior.
 - Shell path and shell command prefix.
@@ -293,8 +297,8 @@ Implemented built-in slash commands include:
 - `/read <path>`
 - `/write <path> <text>`
 - `/edit <path> <find> <replace>`
-- `/grep <text> [path]`
-- `/find <text>`
+- `/grep <pattern> [path]`
+- `/find <glob>`
 - `/ls [path]`
 - `/bash <command>`
 - `! <command>`
@@ -342,25 +346,50 @@ Built-in tools:
 - `grep`
 - `find`
 - `ls`
+- `todo`, `web_search`, `web_fetch` (Rust additions; upstream has none of them)
 
-Current defaults:
+Upstream also has `powershell`, which Rust does not port (see the non-parity
+register).
 
-- Coding tool set defaults to `read`, `bash`, `edit`, `write`.
-- Read-only tools include `grep`, `find`, and `ls`.
-- CLI flags can disable all tools, disable built-in tools, or allowlist tools.
+Defaults:
+
+- Upstream enables `read`, `bash`, `edit`, and `write` at startup; `grep`,
+  `find`, and `ls` are available but off until `--tools` or `defaultTools`
+  names them.
+- Rust enables all ten of its built-in tools at startup. This is a recorded
+  difference ("All Built-in Tools Enabled by Default" in the non-parity
+  register), not a parity claim.
+- `defaultTools`, `--tools` (allowlist with `*` patterns, or `+name`/`-name`
+  modifiers), `--exclude-tools`, `--no-builtin-tools`, and `--no-tools` select
+  tools as upstream's do, starting from Rust's default set.
 
 Rust behavior:
 
-- Preserve tool names and user-facing semantics.
-- Preserve dirty-worktree awareness and avoid wiping unrelated user changes.
+- `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls` return what
+  upstream's tools return for the calls recorded in `tool-behavior.json`
+  (`crates/pi-core/src/tool_parity_tests.rs` compares them exactly), and send
+  the model upstream's descriptions and parameter schemas.
+- Paths resolve as upstream's do: relative to the working directory, absolute,
+  or under `~/`, with a leading `@` dropped. They are not confined to the
+  working directory.
+- `read`: 2000 lines or 50 KB, whichever comes first, with a continuation
+  notice; an offset past the end is an error; images are returned as
+  attachments where the provider API carries them (README, "File and shell
+  tools").
+- `bash`: `bash -c` (`/bin/bash`, then `bash` on `PATH`, then `sh`; `shellPath`
+  and `shellCommandPrefix` apply), stdout and stderr as one stream, the last
+  2000 lines or 50 KB with the whole output saved to a temp file, no default
+  timeout, and a timeout that returns the output so far.
+- `grep` and `find` walk the tree in-process with ripgrep's `ignore` and
+  `globset` crates instead of running `rg` and `fd`.
 - `edit`: each `oldText` must occur exactly once in the original file and the
   edits must not overlap; all edits apply in memory and the file is written
   once, or nothing changes. An empty `newText` deletes; `edits` may arrive as a
   JSON string. Edits follow the file's CRLF line endings and keep a BOM. No
   fuzzy matching (upstream normalizes quotes, dashes, and trailing spaces when
   an exact match fails).
-- `write` accepts empty `content`.
-- Execute shell commands with configured shell settings.
+- `write` accepts empty `content` and creates parent directories.
+- `!` and `/bash` run through the same shell path with a 120 second timeout.
 - Show visible TUI progress when terminal progress is enabled.
 
 ## Provider and Model Surface
@@ -451,7 +480,9 @@ Rust supports:
 - JSON executable extension model tools. An executable extension can declare
   `protocol: "json"` and a `tools` array in its adjacent
   `.pi-extension.json`; those tools are exposed to providers and receive
-  `kind: "tool"` JSON requests on stdin.
+  `kind: "tool"` JSON requests on stdin. A non-zero exit is an error result,
+  output is capped at 2000 lines or 50 KB with the whole output saved to a
+  temp file, and a tool named like a built-in tool replaces it.
 
 Rust intentionally does not support:
 
