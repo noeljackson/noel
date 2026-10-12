@@ -219,6 +219,7 @@ impl Rpc {
             Ok(Command::GetLastAssistantText) => {
                 Ok(Some(Data::last_assistant_text(self.runtime.session())))
             }
+            Ok(Command::GetCommands) => Ok(Some(Data::commands(&self.config))),
             Ok(Command::SetModel { provider, model_id }) => self.set_model(provider, model_id),
             Ok(Command::SetThinkingLevel { level }) => self.set_thinking_level(level),
             Ok(Command::SetSteeringMode { mode } | Command::SetFollowUpMode { mode }) => {
@@ -353,9 +354,12 @@ impl Rpc {
         self.shared().run = Some(run);
 
         let Rpc {
-            runtime, shared, ..
+            runtime,
+            shared,
+            config,
+            ..
         } = self;
-        let shared = &*shared;
+        let (shared, config) = (&*shared, &*config);
         let mut next = Some(call);
         let outcome = loop {
             let Some(call) = next.take() else {
@@ -392,7 +396,7 @@ impl Rpc {
                     }
                 }
             };
-            let Some(result) = drive(turn, lines, shared).await else {
+            let Some(result) = drive(turn, lines, shared, config).await else {
                 return false;
             };
             let mut guard = lock(shared);
@@ -595,13 +599,14 @@ async fn drive<T>(
     turn: impl Future<Output = T>,
     lines: &mut Lines,
     shared: &Mutex<Shared>,
+    config: &LoadedConfig,
 ) -> Option<T> {
     tokio::pin!(turn);
     loop {
         tokio::select! {
             biased;
             result = &mut turn => return Some(result),
-            line = lines.recv() => lock(shared).command(&line?),
+            line = lines.recv() => lock(shared).command(&line?, config),
         }
     }
 }
@@ -616,7 +621,7 @@ impl Shared {
     }
 
     /// Handles a command while a run is active.
-    fn command(&mut self, line: &str) {
+    fn command(&mut self, line: &str, config: &LoadedConfig) {
         let request = match Request::parse(line) {
             Ok(request) => request,
             Err(error) => return send(&Response::parse_error(error)),
@@ -663,6 +668,7 @@ impl Shared {
             Ok(Command::GetLastAssistantText) => {
                 Ok(Some(Data::last_assistant_text(&self.active().session)))
             }
+            Ok(Command::GetCommands) => Ok(Some(Data::commands(config))),
             Ok(Command::SetSteeringMode { mode } | Command::SetFollowUpMode { mode }) => {
                 mode.reply()
             }

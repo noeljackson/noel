@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pi_ai::{ChatToolCall, MediaInput, ModelRef, StreamEvent};
-use pi_config::{model_context_window, LoadedConfig, ProviderApi};
+use pi_config::{model_context_window, LoadedConfig, ProviderApi, SourceInfo};
 use pi_core::{
     CompactionRecord, ConversationMessage, MessageRole, Run, RunStatus, Runtime, SessionState,
     SteeringMailbox, ToolEvent, TurnEvent, STEERING_JOIN,
@@ -40,7 +40,6 @@ const UNSUPPORTED: &[&str] = &[
     "fork",
     "get_available_models",
     "get_available_thinking_levels",
-    "get_commands",
     "get_entries",
     "get_fork_messages",
     "get_session_stats",
@@ -112,6 +111,7 @@ pub(crate) enum Command {
     GetState,
     GetMessages,
     GetLastAssistantText,
+    GetCommands,
     SetModel {
         provider: String,
         model_id: String,
@@ -256,6 +256,49 @@ pub(crate) enum Data {
         cancelled: bool,
     },
     Compaction(Compaction),
+    Commands {
+        commands: Vec<SlashCommand>,
+    },
+}
+
+/// A command a prompt can run, in `get_commands`: a prompt template by its
+/// name, or a skill as `skill:<name>`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SlashCommand {
+    name: String,
+    description: String,
+    source: &'static str,
+    source_info: CommandSource,
+}
+
+/// Upstream's `SourceInfo`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandSource {
+    path: String,
+    source: String,
+    scope: &'static str,
+    origin: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_dir: Option<String>,
+}
+
+impl SlashCommand {
+    fn new(name: String, description: &str, source: &'static str, info: &SourceInfo) -> Self {
+        Self {
+            name,
+            description: description.to_owned(),
+            source,
+            source_info: CommandSource {
+                path: info.path.display().to_string(),
+                source: info.source.clone(),
+                scope: info.scope.as_str(),
+                origin: info.origin(),
+                base_dir: info.base_dir.as_ref().map(|dir| dir.display().to_string()),
+            },
+        }
+    }
 }
 
 impl Data {
@@ -284,6 +327,22 @@ impl Data {
                 "started"
             },
             run_id: Some(run.id.clone()),
+        }
+    }
+
+    /// `get_commands`: the prompt templates, then the skills, as upstream
+    /// lists them. pi has no extension commands to list before them.
+    pub fn commands(config: &LoadedConfig) -> Self {
+        let templates = config.prompt_templates.iter().map(|template| {
+            let name = template.name.clone();
+            SlashCommand::new(name, &template.description, "prompt", &template.source_info)
+        });
+        let skills = config.skills.iter().map(|skill| {
+            let name = format!("skill:{}", skill.name);
+            SlashCommand::new(name, &skill.description, "skill", &skill.source_info)
+        });
+        Data::Commands {
+            commands: templates.chain(skills).collect(),
         }
     }
 
