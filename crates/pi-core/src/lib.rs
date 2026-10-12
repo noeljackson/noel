@@ -2239,6 +2239,7 @@ async fn run_model_turn_streaming_events(
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
         let mut usage = None;
+        let mut truncated = false;
         for event in events {
             match event {
                 StreamEvent::Text(delta) => {
@@ -2258,7 +2259,7 @@ async fn run_model_turn_streaming_events(
                     input_tokens,
                     output_tokens,
                 } => usage = Some((input_tokens, output_tokens)),
-                StreamEvent::Stop { .. } => {}
+                StreamEvent::Stop { reason } => truncated |= pi_ai::is_output_limit_stop(&reason),
             }
         }
 
@@ -2289,7 +2290,11 @@ async fn run_model_turn_streaming_events(
             on_event(&TurnEvent::ToolStarted {
                 name: tool_call.name.clone(),
             });
-            let result = execute_model_tool_call(runtime, &tool_call).await;
+            let result = if truncated {
+                fail_truncated_tool_call(runtime, &tool_call)
+            } else {
+                execute_model_tool_call(runtime, &tool_call).await
+            };
             let event = runtime
                 .session
                 .tool_history
@@ -2766,6 +2771,31 @@ fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
 #[derive(Debug, Deserialize)]
 struct TodoToolArgs {
     todos: Vec<TodoItem>,
+}
+
+/// A reply cut off by the output limit can carry truncated arguments that
+/// still parse, so its tool calls are recorded as errors instead of run.
+fn fail_truncated_tool_call(
+    runtime: &mut Runtime,
+    tool_call: &ChatToolCall,
+) -> Result<(), AgentError> {
+    let output = pi_ai::truncated_tool_call_error(&tool_call.name);
+    runtime.push_tool_event(ToolEvent {
+        id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        result: output.clone(),
+        is_error: true,
+    })?;
+    runtime.push_message(ConversationMessage {
+        thinking: String::new(),
+        role: MessageRole::Tool,
+        content: output,
+        media: Vec::new(),
+        tool_call_id: Some(tool_call.id.clone()),
+        tool_name: Some(tool_call.name.clone()),
+        tool_calls: Vec::new(),
+    })?;
+    Ok(())
 }
 
 async fn execute_model_tool_call(
@@ -5563,6 +5593,70 @@ mod tests {
             captured[1].messages[2].tool_call_id.as_deref(),
             Some("call_read_bad")
         );
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_from_a_reply_cut_off_at_the_output_limit_are_not_run() {
+        struct TruncatedReplyProvider {
+            requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for TruncatedReplyProvider {
+            async fn complete(
+                &self,
+                request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                let mut requests = self.requests.lock().expect("requests");
+                requests.push(request);
+                if requests.len() > 1 {
+                    return Ok(vec![StreamEvent::Text("done".to_string())]);
+                }
+                // The write arguments parse but were cut off mid-content.
+                Ok(vec![
+                    StreamEvent::ToolCall {
+                        id: "call_write_cut".to_string(),
+                        name: "write".to_string(),
+                        arguments: r#"{"path":"a.txt","content":"partial"}"#.to_string(),
+                    },
+                    StreamEvent::Stop {
+                        reason: "max_tokens".to_string(),
+                    },
+                ])
+            }
+        }
+
+        let cwd = std::env::temp_dir().join(format!("pi-truncated-tool-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = TruncatedReplyProvider {
+            requests: requests.clone(),
+        };
+
+        let response = run_user_turn(&mut runtime, &provider, "write a.txt".to_string())
+            .await
+            .expect("run tool loop");
+
+        assert_eq!(response, "done");
+        assert!(!cwd.join("a.txt").exists(), "truncated write must not run");
+        let event = &runtime.session().tool_history[0];
+        assert_eq!(event.id, "call_write_cut");
+        assert!(event.is_error);
+        assert!(
+            event.result.contains("output token limit"),
+            "{}",
+            event.result
+        );
+        let captured = requests.lock().expect("requests").clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[1].messages[2].role, ChatRole::Tool);
+        assert_eq!(captured[1].messages[2].content, event.result);
 
         let _ = fs::remove_dir_all(cwd);
     }
