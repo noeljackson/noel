@@ -125,7 +125,9 @@ Project-local files:
 - `.pi/prompts`
 - `.pi/themes`
 - `.agents/skills`
-- `AGENTS.md` or `CLAUDE.md` discovered from the global agent dir and cwd ancestors.
+- `AGENTS.md` or `CLAUDE.md` discovered from the global agent dir and cwd
+  ancestors, whatever the project trust decision; trust gates only the `.pi`
+  resources and `.agents/skills` above.
 
 Rust behavior:
 

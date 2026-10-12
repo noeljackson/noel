@@ -964,7 +964,7 @@ pub fn load_config_with_project_trust(
     let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
         .map(KeybindingsFile::into_keybindings)
         .unwrap_or_default();
-    let context_files = load_context_files(&paths.cwd, &paths.agent_dir, project_trusted)?;
+    let context_files = load_context_files(&paths.cwd, &paths.agent_dir)?;
     let mut extensions =
         load_resource_files(&paths, "extensions", project_trusted, &mut diagnostics);
     let mut skills = load_skill_resource_files(&paths, project_trusted, &mut diagnostics);
@@ -1715,17 +1715,13 @@ fn resolve_prompt_input(input: Option<&str>) -> Result<Option<String>, ConfigErr
     Ok(Some(input.to_string()))
 }
 
-fn load_context_files(
-    cwd: &Path,
-    agent_dir: &Path,
-    project_trusted: bool,
-) -> Result<Vec<ContextFile>, ConfigError> {
+/// AGENTS.md / CLAUDE.md from the agent dir, then from the outermost ancestor
+/// of `cwd` down to `cwd`. Like upstream, these load whatever the project
+/// trust decision: trust gates only `.pi` resources and `.agents/skills`.
+fn load_context_files(cwd: &Path, agent_dir: &Path) -> Result<Vec<ContextFile>, ConfigError> {
     let mut result = Vec::new();
     if let Some(file) = load_context_file_from_dir(agent_dir)? {
         result.push(file);
-    }
-    if !project_trusted {
-        return Ok(result);
     }
 
     let mut ancestors = Vec::new();
@@ -3345,6 +3341,58 @@ mod tests {
             .iter()
             .any(|resource| resource.name == "ignored"));
         assert!(config.diagnostics.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn untrusted_projects_load_context_files_but_not_project_resources() {
+        let root = test_dir("pi-config-untrusted-context");
+        let agent_dir = root.join("agent");
+        let repo = root.join("repo");
+        let cwd = repo.join("nested");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(cwd.join(".pi/extensions")).expect("create project extensions");
+        fs::create_dir_all(repo.join(".agents/skills/repo")).expect("create repo skill");
+        fs::write(repo.join(".git"), "").expect("mark git root");
+        fs::write(agent_dir.join("AGENTS.md"), "global rules").expect("write global");
+        fs::write(repo.join("AGENTS.md"), "repo rules").expect("write repo rules");
+        fs::write(cwd.join("CLAUDE.md"), "nested rules").expect("write nested rules");
+        fs::write(
+            cwd.join(".pi/settings.json"),
+            r#"{"shellCommandPrefix":"echo untrusted"}"#,
+        )
+        .expect("write project settings");
+        fs::write(cwd.join(".pi/extensions/local.md"), "project extension")
+            .expect("write project extension");
+        fs::write(repo.join(".agents/skills/repo/SKILL.md"), "repo skill")
+            .expect("write repo skill");
+
+        let config = load_config_with_project_trust(
+            ConfigPaths {
+                cwd: cwd.clone(),
+                agent_dir: agent_dir.clone(),
+                session_dir: agent_dir.join("sessions"),
+                settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".pi/settings.json"),
+                auth_path: root.join("missing-auth.json"),
+                models_path: root.join("missing-models.json"),
+                model_cache_path: root.join("missing-model-cache.json"),
+                keybindings_path: root.join("missing-keybindings.json"),
+            },
+            false,
+        )
+        .expect("load config");
+
+        let contents = config
+            .context_files
+            .iter()
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["global rules", "repo rules", "nested rules"]);
+        assert_eq!(config.settings.shell_command_prefix, None);
+        assert!(config.extensions.is_empty());
+        assert!(config.skills.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

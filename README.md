@@ -197,6 +197,14 @@ Project skills are also discovered from `.agents/skills` directories from the
 current working directory up to the git root. `SKILL.md` files are named by
 their containing directory.
 
+Project resources (`.pi/settings.json`, `.pi/extensions`, `.pi/skills`,
+`.pi/prompts`, `.pi/themes`, and `.agents/skills`) load only for a trusted
+project: pass `-a`/`--approve` (or `--no-approve` to refuse) or save a
+decision with `/trust`. `AGENTS.md` and `CLAUDE.md` from the agent directory
+and from the current directory and its ancestors load whatever the trust
+decision, as upstream does; treat a repository's instructions as untrusted
+input.
+
 Environment overrides:
 
 - `PI_CODING_AGENT_DIR`
