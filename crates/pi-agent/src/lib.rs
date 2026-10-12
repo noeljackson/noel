@@ -497,4 +497,98 @@ mod tests {
             result.content
         );
     }
+
+    #[tokio::test]
+    async fn a_request_that_stalls_before_any_output_is_retried() {
+        use std::io::{Read, Write};
+        // The first connection never answers; the second one does.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        std::thread::spawn(move || {
+            let mut stalled = Vec::new();
+            for answer in [false, true] {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                // Read the whole request so closing the socket cannot reset it.
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let line = line.to_ascii_lowercase();
+                                line.strip_prefix("content-length:")?.trim().parse().ok()
+                            })
+                            .unwrap_or(0usize);
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                if answer {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+                          data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                    );
+                } else {
+                    stalled.push(stream);
+                }
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let provider = pi_ai::create_provider_with_client(
+            pi_ai::ProviderConfig {
+                model: pi_ai::ModelRef {
+                    provider: "local".to_string(),
+                    id: "test".to_string(),
+                },
+                api: pi_ai::ProviderApi::OpenAi,
+                base_url: Some(url),
+                auth: pi_ai::ProviderAuth::ApiKey("test-key".to_string()),
+                thinking_level: None,
+                thinking_budget_tokens: None,
+                session_id: None,
+            },
+            pi_ai::provider_http_client_with_idle_timeout(Duration::from_millis(300)),
+        );
+        let request = ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hi".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+        };
+
+        let events = tokio::time::timeout(
+            Duration::from_secs(20),
+            complete_with_retry(
+                provider.as_ref(),
+                request,
+                &RetryPolicy {
+                    max_retries: 1,
+                    base_delay_ms: 0,
+                },
+                &CancellationToken::default(),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("the idle timeout must end the stalled attempt")
+        .expect("the retry succeeds");
+
+        assert!(events.contains(&StreamEvent::Text("ok".to_string())));
+    }
 }
