@@ -5080,8 +5080,19 @@ mod tests {
             ReloadableSystems::default(),
         );
         assert_eq!(runtime.systems.max_tool_rounds, DEFAULT_MAX_TOOL_ROUNDS);
+        let agent_dir = cwd.join("agent");
         let config = LoadedConfig {
-            paths: pi_config::ConfigPaths::discover(cwd.clone(), None).unwrap(),
+            paths: pi_config::ConfigPaths {
+                cwd: cwd.clone(),
+                session_dir: agent_dir.join("sessions"),
+                settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".pi/settings.json"),
+                auth_path: agent_dir.join("auth.json"),
+                models_path: agent_dir.join("models.json"),
+                model_cache_path: agent_dir.join("model-cache.json"),
+                keybindings_path: agent_dir.join("keybindings.json"),
+                agent_dir,
+            },
             settings: pi_config::Settings {
                 agent: Some(pi_config::AgentSettings {
                     max_tool_rounds: Some(120),

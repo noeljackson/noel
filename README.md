@@ -60,6 +60,14 @@ should not clear conversation messages, cwd, session identity, tool history,
 queued messages, or active context. `make check` runs formatting, clippy, and
 Rust tests. `make e2e` runs tmux-based terminal behavior checks.
 
+Tests never touch the real `~/.pi`. `make test` sets `PI_TEST_ISOLATION=1`,
+under which pi refuses to fall back to `~/.pi/agent` (a test names its agent
+dir with `PI_CODING_AGENT_DIR`), imports no Claude Code or Codex login from
+`$HOME`, and starts no background model refresh. The
+CLI tests run every `pi` through `pi_command()`, which also sets that marker
+and gives each run a cleared environment and its own agent dir and `HOME`
+under the target directory.
+
 TypeScript is reference material, not a runtime dependency. Parity fixtures are
 generated only through Docker:
 

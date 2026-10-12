@@ -2,24 +2,50 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Every `pi` a test runs is isolated: a cleared environment (no provider
+/// keys or PI_* variables leak in), PI_TEST_ISOLATION (pi refuses the default
+/// ~/.pi/agent, imports no login from $HOME, and starts no background model
+/// refresh), and its own agent dir and HOME under the target dir (paths
+/// only; nothing exists there unless pi writes). A test that needs a
+/// particular agent dir or HOME sets its own.
 fn pi_command() -> Command {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let isolated = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "pi-cli-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
-    command.stdin(Stdio::null());
-    command.env_remove("OPENAI_API_KEY");
-    command.env_remove("ANTHROPIC_API_KEY");
-    command.env_remove("GEMINI_API_KEY");
-    command.env_remove("GOOGLE_API_KEY");
-    command.env_remove("AZURE_OPENAI_API_KEY");
-    command.env_remove("COPILOT_GITHUB_TOKEN");
-    command.env_remove("OPENROUTER_API_KEY");
-    command.env_remove("GOOGLE_CLOUD_API_KEY");
-    command.env_remove("AWS_BEARER_TOKEN_BEDROCK");
-    command.env_remove("MISTRAL_API_KEY");
-    command.env_remove("CLOUDFLARE_API_KEY");
-    command.env_remove("CODEX_ACCESS_TOKEN");
     command
+        .stdin(Stdio::null())
+        .env_clear()
+        .env("PI_TEST_ISOLATION", "1")
+        .env("PI_CODING_AGENT_DIR", isolated.join("agent"))
+        .env("HOME", isolated.join("home"));
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command
+}
+
+#[test]
+fn tests_cannot_fall_back_to_the_default_agent_dir() {
+    // Without its own agent dir a test fails instead of reading ~/.pi/agent.
+    let output = pi_command()
+        .env_remove("PI_CODING_AGENT_DIR")
+        .args(["--no-session", "-p", "--model", "faux/echo", "hello"])
+        .output()
+        .expect("run pi");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing the default agent dir ~/.pi/agent"),
+        "{stderr}"
+    );
 }
 
 #[test]
