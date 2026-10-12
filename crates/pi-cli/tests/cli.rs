@@ -126,7 +126,13 @@ fn print_mode_runs_a_faux_script_tool_round_and_logs_each_request() {
     );
     let log = faux_script_log(&root);
     assert_eq!(log.len(), 2);
-    assert_eq!(log[1]["system_prompt"], "Be brief.");
+    // A custom prompt replaces the default role, tool list, and rules; the
+    // working directory still follows it.
+    let cwd = fs::canonicalize(&root).unwrap();
+    assert_eq!(
+        log[1]["system_prompt"],
+        format!("Be brief.\n\n<cwd>\n{}\n</cwd>", cwd.display())
+    );
     assert!(log[1]["tools"]
         .as_array()
         .unwrap()
@@ -150,6 +156,211 @@ fn print_mode_runs_a_faux_script_tool_round_and_logs_each_request() {
             .contains("alpha\nbeta"),
         "{}",
         messages[2]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Runs pi once in `root` on a one-reply script and returns the system
+/// prompt its request carried.
+fn system_prompt_sent(root: &Path, args: &[&str]) -> String {
+    fs::write(root.join("script.json"), r#"[[{"text": "ok"}]]"#).unwrap();
+    let _ = fs::remove_file(root.join("requests.jsonl"));
+    let output = faux_script_pi(root, args)
+        .args(["-p", "hello"])
+        .output()
+        .expect("run pi");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = faux_script_log(root);
+    assert_eq!(log.len(), 1);
+    log[0]["system_prompt"]
+        .as_str()
+        .expect("system prompt")
+        .to_string()
+}
+
+#[test]
+fn print_mode_sends_the_default_system_prompt_and_the_prompt_files() {
+    let root = test_dir("pi-cli-system-prompt");
+    fs::create_dir_all(root.join("agent")).unwrap();
+    fs::create_dir_all(root.join(".pi")).unwrap();
+    fs::write(root.join("AGENTS.md"), "Project rules.\n").unwrap();
+    fs::write(root.join("agent/APPEND_SYSTEM.md"), "Answer in French.\n").unwrap();
+    fs::write(root.join(".pi/SYSTEM.md"), "You are the project's bot.\n").unwrap();
+    let cwd = fs::canonicalize(&root).unwrap();
+    let cwd = cwd.display();
+    let after_role = format!(
+        "<addendum>\nAnswer in French.\n\n</addendum>\n\n\
+         <project_context>\nProject-specific instructions and guidelines:\n\n\
+         <project_instructions path=\"{cwd}/AGENTS.md\">\nProject rules.\n\n</project_instructions>\n\
+         </project_context>\n\n\
+         <cwd>\n{cwd}\n</cwd>"
+    );
+
+    // Not trusted: the project's .pi/SYSTEM.md is ignored.
+    let prompt = system_prompt_sent(&root, &["--no-approve"]);
+    let role = format!(
+        "You are an expert coding assistant operating inside {}, a coding agent harness.",
+        pi_core::PRODUCT_NAME
+    );
+    assert!(prompt.starts_with(&role), "{prompt}");
+    assert!(
+        prompt.contains("\n\n<tools>\n- read: Read file contents\n- bash: "),
+        "{prompt}"
+    );
+    // --offline keeps the web tools out of the request, so out of the list.
+    assert!(prompt.contains("\n- todo: "), "{prompt}");
+    assert!(!prompt.contains("web_search"), "{prompt}");
+    assert!(
+        prompt.ends_with(&format!("\n</rules>\n\n{after_role}")),
+        "{prompt}"
+    );
+
+    // Trusted: it replaces the role, tool list, and rules.
+    assert_eq!(
+        system_prompt_sent(&root, &["--approve"]),
+        format!("You are the project's bot.\n\n\n{after_role}")
+    );
+
+    // Flags replace both files, whatever the trust decision.
+    assert_eq!(
+        system_prompt_sent(
+            &root,
+            &[
+                "--approve",
+                "--no-context-files",
+                "--system-prompt",
+                "Be brief.",
+                "--append-system-prompt",
+                "No emojis.",
+            ],
+        ),
+        format!("Be brief.\n\n<addendum>\nNo emojis.\n</addendum>\n\n<cwd>\n{cwd}\n</cwd>")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Prints what a bash command sees of its session and of pi, a line each.
+const SESSION_ENV: &str = r#"printf '%s\n' "${PI_SESSION_ID-unset}" "${PI_SESSION_FILE-unset}" "${PI_PROVIDER-unset}" "${PI_MODEL-unset}" "${PI_REASONING_LEVEL-unset}" "${AI_AGENT-unset}" "${PI_CODING_AGENT-unset}""#;
+
+/// Variables a pi started by another pi's bash command inherits.
+fn inside_another_pi(command: &mut Command) -> &mut Command {
+    command
+        .env("PI_SESSION_ID", "parent")
+        .env("PI_SESSION_FILE", "/parent.jsonl")
+        .env("PI_PROVIDER", "parent-provider")
+        .env("PI_MODEL", "parent-model")
+        .env("PI_REASONING_LEVEL", "max")
+}
+
+#[test]
+fn model_bash_commands_see_their_session_and_the_process_markers() {
+    let root = test_dir("pi-cli-bash-session-env");
+    fs::create_dir_all(root.join("agent")).unwrap();
+    let call =
+        serde_json::json!([{"tool_call": {"name": "bash", "arguments": {"command": SESSION_ENV}}}]);
+    let done = serde_json::json!([{"text": "done"}]);
+    fs::write(
+        root.join("script.json"),
+        serde_json::json!([call, done, call, done]).to_string(),
+    )
+    .unwrap();
+    // What the model's bash call printed in the run of `command`.
+    let seen = |command: &mut Command| {
+        let output = command.output().expect("run pi");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = faux_script_log(&root);
+        let result = log.last().unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(result["role"], "tool");
+        let lines = result["content"].as_str().unwrap().lines();
+        lines.map(str::to_string).collect::<Vec<_>>()
+    };
+
+    // Without a session file there is none to name, and nothing the parent
+    // pi set is passed on.
+    assert_eq!(
+        seen(inside_another_pi(&mut faux_script_pi(&root, &["-p", "go"]))),
+        [
+            "ephemeral",
+            "unset",
+            "faux",
+            "script",
+            "off",
+            pi_core::PRODUCT_NAME,
+            "true"
+        ]
+    );
+
+    // A saved session names its journal.
+    let sessions = fs::canonicalize(&root).unwrap().join("sessions");
+    let mut saved = pi_command();
+    saved
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env("PI_CODING_AGENT_DIR", root.join("agent"))
+        .env("PI_FAUX_SCRIPT", root.join("script.json"))
+        .env("PI_FAUX_SCRIPT_LOG", root.join("requests.jsonl"))
+        .args(["--offline", "--model", "faux/script", "--session-dir"])
+        .arg(&sessions)
+        .args(["--session-id", "saved", "-p", "go"]);
+    assert_eq!(
+        seen(&mut saved),
+        [
+            "saved",
+            &path_text(&sessions.join("saved.jsonl")),
+            "faux",
+            "script",
+            "off",
+            pi_core::PRODUCT_NAME,
+            "true"
+        ]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn user_bash_commands_are_not_given_session_variables() {
+    // `/bash` runs the tool without the model: it inherits pi's environment
+    // as it is, which has pi's process markers.
+    let root = test_dir("pi-cli-user-bash-env");
+    fs::create_dir_all(&root).unwrap();
+    let mut command = pi_command();
+    command
+        .current_dir(&root)
+        .args(["--offline", "--no-session", "--model", "faux/echo", "-p"])
+        .arg(format!("/bash {SESSION_ENV}"));
+    let output = inside_another_pi(&mut command).output().expect("run pi");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Print mode ends the command's output with a line break of its own.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "parent",
+            "/parent.jsonl",
+            "parent-provider",
+            "parent-model",
+            "max",
+            pi_core::PRODUCT_NAME,
+            "true"
+        ]
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -1465,7 +1676,13 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
         .as_str()
         .unwrap()
         .contains("preserve database decisions"));
+    // The system prompt leads every request; the checkpoint follows it.
+    assert_eq!(requests[3]["messages"][0]["role"], "system");
     assert!(requests[3]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("You are an expert coding assistant"));
+    assert!(requests[3]["messages"][1]["content"]
         .as_str()
         .unwrap()
         .contains("Previous conversation checkpoint"));

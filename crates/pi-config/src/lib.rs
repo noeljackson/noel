@@ -983,7 +983,7 @@ pub fn load_config_with_project_trust(
     let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
         .map(KeybindingsFile::into_keybindings)
         .unwrap_or_default();
-    let context_files = load_context_files(&paths.cwd, &paths.agent_dir)?;
+    let context_files = load_context_files(&paths.cwd, &paths.agent_dir, &mut diagnostics);
     let mut extensions =
         load_resource_files(&paths, "extensions", project_trusted, &mut diagnostics);
     let mut skills = load_skill_resource_files(&paths, project_trusted, &mut diagnostics);
@@ -1070,8 +1070,13 @@ pub fn load_config_with_project_trust(
         PackageResourceType::Themes,
         settings.disabled_resources.as_ref(),
     );
-    let system_prompt = resolve_prompt_input(settings.system_prompt.as_deref())?;
-    let append_system_prompt = settings
+    // The `systemPrompt` and `appendSystemPrompt` settings stand where
+    // upstream's flags do: a discovered file applies only without them.
+    let system_prompt = match resolve_prompt_input(settings.system_prompt.as_deref())? {
+        Some(prompt) => Some(prompt),
+        None => discovered_prompt_file(&paths, "SYSTEM.md", project_trusted, &mut diagnostics),
+    };
+    let mut append_system_prompt = settings
         .append_system_prompt
         .iter()
         .map(|source| {
@@ -1079,6 +1084,14 @@ pub fn load_config_with_project_trust(
                 .map(|content| content.unwrap_or_else(|| source.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if append_system_prompt.is_empty() {
+        append_system_prompt.extend(discovered_prompt_file(
+            &paths,
+            "APPEND_SYSTEM.md",
+            project_trusted,
+            &mut diagnostics,
+        ));
+    }
 
     Ok(LoadedConfig {
         paths,
@@ -1728,7 +1741,7 @@ fn resolve_prompt_input(input: Option<&str>) -> Result<Option<String>, ConfigErr
     };
     let path = Path::new(input);
     if path.exists() {
-        return fs::read_to_string(path)
+        return read_text(path)
             .map(Some)
             .map_err(|source| ConfigError::Read {
                 path: path.to_path_buf(),
@@ -1738,40 +1751,151 @@ fn resolve_prompt_input(input: Option<&str>) -> Result<Option<String>, ConfigErr
     Ok(Some(input.to_string()))
 }
 
-/// AGENTS.md / CLAUDE.md from the agent dir, then from the outermost ancestor
-/// of `cwd` down to `cwd`. Like upstream, these load whatever the project
-/// trust decision: trust gates only `.pi` resources and `.agents/skills`.
-fn load_context_files(cwd: &Path, agent_dir: &Path) -> Result<Vec<ContextFile>, ConfigError> {
-    let mut result = Vec::new();
-    if let Some(file) = load_context_file_from_dir(agent_dir)? {
-        result.push(file);
-    }
+/// A prompt or context file's text, as upstream reads one: invalid UTF-8 is
+/// replaced and a leading byte order mark is dropped.
+fn read_text(path: &Path) -> std::io::Result<String> {
+    let text = String::from_utf8_lossy(&fs::read(path)?).into_owned();
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(text) => text.to_string(),
+        None => text,
+    })
+}
 
+/// `SYSTEM.md` or `APPEND_SYSTEM.md`: the trusted project's `.pi/<name>`,
+/// else the agent dir's. As upstream, same-named files are not combined.
+fn discovered_prompt_file(
+    paths: &ConfigPaths,
+    name: &str,
+    project_trusted: bool,
+    diagnostics: &mut Vec<String>,
+) -> Option<String> {
+    let project = paths.cwd.join(CONFIG_DIR_NAME).join(name);
+    let path = if project_trusted && project.exists() {
+        project
+    } else {
+        paths.agent_dir.join(name)
+    };
+    if !path.exists() {
+        return None;
+    }
+    match read_text(&path) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            diagnostics.push(format!("failed to read {}: {error}", path.display()));
+            None
+        }
+    }
+}
+
+/// Context file names, first match wins: one file per directory.
+/// `AGENTS.override.md` replaces only its own directory's file.
+const CONTEXT_FILE_NAMES: [&str; 5] = [
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+];
+
+/// Context files from the agent dir, then from the outermost ancestor of
+/// `cwd` down to `cwd`. Like upstream, these load whatever the project trust
+/// decision: trust gates only `.pi` resources and `.agents/skills`.
+fn load_context_files(
+    cwd: &Path,
+    agent_dir: &Path,
+    diagnostics: &mut Vec<String>,
+) -> Vec<ContextFile> {
+    let global = load_context_file_from_dir(agent_dir, diagnostics);
+    let shadowed = shadowed_context_file(cwd);
     let mut ancestors = Vec::new();
     let mut current = Some(cwd);
     while let Some(dir) = current {
-        if let Some(file) = load_context_file_from_dir(dir)? {
-            ancestors.push(file);
+        if let Some(file) = load_context_file_from_dir(dir, diagnostics) {
+            // Compare the directory's real path, not the file's: a worktree
+            // file that links to the main checkout's would resolve to the
+            // shadowed file itself.
+            let is_shadowed = file.path.file_name().is_some_and(|name| {
+                shadowed.as_deref() == Some(canonical_path(dir).join(name).as_path())
+            });
+            // The agent dir can also be an ancestor of `cwd`.
+            let is_global = global
+                .as_ref()
+                .is_some_and(|global| global.path == file.path);
+            if !is_shadowed && !is_global {
+                ancestors.push(file);
+            }
         }
         current = dir.parent();
     }
     ancestors.reverse();
-    result.extend(ancestors);
-    Ok(result)
+    global.into_iter().chain(ancestors).collect()
 }
 
-fn load_context_file_from_dir(dir: &Path) -> Result<Option<ContextFile>, ConfigError> {
-    for filename in ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"] {
+fn load_context_file_from_dir(dir: &Path, diagnostics: &mut Vec<String>) -> Option<ContextFile> {
+    for filename in CONTEXT_FILE_NAMES {
         let path = dir.join(filename);
-        if path.exists() {
-            let content = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-                path: path.clone(),
-                source,
-            })?;
-            return Ok(Some(ContextFile { path, content }));
+        if !path.is_file() {
+            continue;
+        }
+        match read_text(&path) {
+            Ok(content) => return Some(ContextFile { path, content }),
+            Err(error) => diagnostics.push(format!("failed to read {}: {error}", path.display())),
         }
     }
-    Ok(None)
+    None
+}
+
+/// The main checkout's context file that a linked worktree nested inside that
+/// checkout replaces with its own: both describe the same repository, so
+/// loading both would apply its instructions twice. `None` for an ordinary
+/// repository, a worktree beside its main checkout, a bare layout, and a
+/// submodule, where ancestors load as usual.
+fn shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
+    let (worktree_root, common_git_dir) = git_paths(cwd)?;
+    let worktree_root = canonical_path(&worktree_root);
+    let common_git_dir = canonical_path(&common_git_dir);
+    let main_root = common_git_dir.parent()?;
+    if worktree_root == main_root || !worktree_root.starts_with(main_root) {
+        return None;
+    }
+    // The common git dir's parent is the main checkout only when that dir is
+    // its `.git`: not `proj/.bare`, and not a submodule's `.git/modules/x`.
+    if canonical_path(&main_root.join(".git")) != common_git_dir {
+        return None;
+    }
+    let file = load_context_file_from_dir(&worktree_root, &mut Vec::new())?;
+    Some(main_root.join(file.path.file_name()?))
+}
+
+/// The work tree root and common git dir of the repository holding `cwd`:
+/// `.git` is a directory, or a linked worktree's `gitdir:` file.
+fn git_paths(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        let git = dir.join(".git");
+        if git.is_dir() {
+            return git.join("HEAD").exists().then(|| (dir.to_path_buf(), git));
+        }
+        let pointer = fs::read_to_string(&git).unwrap_or_default();
+        if let Some(target) = pointer.trim().strip_prefix("gitdir: ") {
+            let git_dir = dir.join(target.trim());
+            if !git_dir.join("HEAD").exists() {
+                return None;
+            }
+            let common_git_dir = match fs::read_to_string(git_dir.join("commondir")) {
+                Ok(common) => git_dir.join(common.trim()),
+                Err(_) => git_dir,
+            };
+            return Some((dir.to_path_buf(), common_git_dir));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// `path` with symlinks resolved, or as given when it cannot be resolved.
+fn canonical_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn load_resource_files(
@@ -3425,6 +3549,68 @@ mod tests {
         assert_eq!(config.settings.shell_command_prefix, None);
         assert!(config.extensions.is_empty());
         assert!(config.skills.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_settings_come_before_discovered_prompt_files() {
+        let root = test_dir("pi-config-prompt-files");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        fs::write(agent_dir.join("SYSTEM.md"), "file system").expect("write SYSTEM.md");
+        fs::write(agent_dir.join("APPEND_SYSTEM.md"), "file append").expect("write append");
+        let load = || {
+            load_config(ConfigPaths {
+                cwd: cwd.clone(),
+                agent_dir: agent_dir.clone(),
+                session_dir: agent_dir.join("sessions"),
+                settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".pi/settings.json"),
+                auth_path: root.join("missing-auth.json"),
+                models_path: root.join("missing-models.json"),
+                model_cache_path: root.join("missing-model-cache.json"),
+                keybindings_path: root.join("missing-keybindings.json"),
+            })
+            .expect("load config")
+        };
+
+        let config = load();
+        assert_eq!(config.system_prompt.as_deref(), Some("file system"));
+        assert_eq!(config.append_system_prompt, ["file append"]);
+
+        // The settings are explicit, as upstream's flags are: each replaces
+        // its discovered file.
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"systemPrompt":"setting system","appendSystemPrompt":["one","two"]}"#,
+        )
+        .expect("write settings");
+        let config = load();
+        assert_eq!(config.system_prompt.as_deref(), Some("setting system"));
+        assert_eq!(config.append_system_prompt, ["one", "two"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_context_file_that_is_not_utf8_still_loads() {
+        let root = test_dir("pi-config-context-bytes");
+        let agent_dir = root.join("agent");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::write(agent_dir.join("AGENTS.md"), b"caf\xe9 rules").expect("write context file");
+
+        let mut diagnostics = Vec::new();
+        let files = load_context_files(&root, &agent_dir, &mut diagnostics);
+        let contents = files
+            .iter()
+            .filter(|file| file.path.starts_with(&root))
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["caf\u{fffd} rules"]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
         let _ = fs::remove_dir_all(root);
     }

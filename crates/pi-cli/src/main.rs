@@ -66,7 +66,7 @@ use pi_core::{
     run_user_turn_streaming_events_with_media, run_user_turn_streaming_with_media,
     write_session_export, AgentError, CompactionKind, ConversationMessage, FollowUpQueue,
     MessageRole, ReloadReport, ReloadableSystems, RunControl, Runtime, SessionError, SessionState,
-    SessionStore, SteeringMailbox, TodoItem, TodoStatus, TurnEvent, STEERING_JOIN,
+    SessionStore, SteeringMailbox, TodoItem, TodoStatus, TurnEvent, PRODUCT_NAME, STEERING_JOIN,
 };
 use pi_tui::{
     parse_theme_color, EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector,
@@ -1293,8 +1293,19 @@ fn print_auth_help(command: &str) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Upstream's process markers, inherited by every command and tool pi
+    // starts: a generic one naming the agent, and pi's own. Set before any
+    // other thread exists, because the environment is process-wide.
+    std::env::set_var("AI_AGENT", PRODUCT_NAME);
+    std::env::set_var("PI_CODING_AGENT", "true");
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     signals::install();
     if try_run_image_command().await? {
         return Ok(());
@@ -1466,12 +1477,18 @@ fn reload_config(config: &LoadedConfig) -> Result<LoadedConfig> {
 
 fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Result<()> {
     if let Some(system_prompt) = &cli.system_prompt {
-        config.system_prompt = Some(resolve_text_or_file(cwd, system_prompt)?);
+        config.system_prompt = Some(resolve_prompt_flag(cwd, system_prompt)?);
+    }
+    // As upstream, the flags replace a discovered APPEND_SYSTEM.md; they add
+    // to the `appendSystemPrompt` setting, which the config loaded instead
+    // of that file.
+    if !cli.append_system_prompt.is_empty() && config.settings.append_system_prompt.is_empty() {
+        config.append_system_prompt.clear();
     }
     for prompt in &cli.append_system_prompt {
         config
             .append_system_prompt
-            .push(resolve_text_or_file(cwd, prompt)?);
+            .push(resolve_prompt_flag(cwd, prompt)?);
     }
     if cli.no_context_files {
         config.context_files.clear();
@@ -2357,6 +2374,16 @@ fn resolve_text_or_file(cwd: &Path, value: &str) -> Result<String> {
         return fs::read_to_string(path).map_err(Into::into);
     }
     Ok(value.to_string())
+}
+
+/// A prompt flag's value: the text itself, or the file it names, read as
+/// upstream reads a prompt file (without a leading byte order mark).
+fn resolve_prompt_flag(cwd: &Path, value: &str) -> Result<String> {
+    let text = resolve_text_or_file(cwd, value)?;
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(text) => text.to_string(),
+        None => text,
+    })
 }
 
 fn expand_message_inputs(cwd: &Path, messages: &[String]) -> Result<String> {
@@ -8885,6 +8912,10 @@ impl pi_ai::Provider for FreshAuthProvider {
             .complete_streaming(request, on_event)
             .await
     }
+
+    fn thinking_level(&self) -> Option<String> {
+        self.config.thinking_level.clone()
+    }
 }
 
 fn active_thinking_level(
@@ -11244,6 +11275,136 @@ mod tests {
         assert_eq!(
             auth_for_provider(&config.auth, "anthropic", None),
             Some(ResolvedAuth::ApiKey("cli-key".to_string()))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every `discovery` case of `system-prompt.json`: from the same files,
+    /// trust decision, and flags, startup gives the prompt builder what
+    /// upstream's resource loader gives its own.
+    #[test]
+    fn prompt_and_context_files_match_ts_discovery() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/system-prompt.json"
+        ))
+        .expect("parse TS parity fixture");
+        let cases = fixture["discovery"].as_array().expect("discovery cases");
+        assert_eq!(cases.len(), 15);
+        for case in cases {
+            let name = case["name"].as_str().expect("case name");
+            let root =
+                std::env::temp_dir().join(format!("pi-cli-discovery-{}", unique_temp_suffix()));
+            let text = |value: &serde_json::Value| {
+                let text = value.as_str().expect("fixture string");
+                text.replace("<tmp>", &root.display().to_string())
+                    .replace("<bom>", "\u{feff}")
+            };
+            let (agent, cwd) = (root.join("agent"), root.join(text(&case["cwd"])));
+            let dirs = case["dirs"].as_array().expect("dirs").iter().map(text);
+            for dir in dirs.chain(["agent".to_string(), text(&case["cwd"])]) {
+                fs::create_dir_all(root.join(dir)).expect("create dir");
+            }
+            for (path, content) in case["files"].as_object().expect("files") {
+                let path = root.join(path);
+                fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+                fs::write(path, text(content)).expect("write file");
+            }
+
+            let flags = &case["flags"];
+            let mut args = vec!["pi".to_string()];
+            if !flags["systemPrompt"].is_null() {
+                args.extend(["--system-prompt".to_string(), text(&flags["systemPrompt"])]);
+            }
+            for value in flags["appendSystemPrompt"].as_array().expect("flags") {
+                args.extend(["--append-system-prompt".to_string(), text(value)]);
+            }
+            if flags["noContextFiles"] == true {
+                args.push("--no-context-files".to_string());
+            }
+            let source = ConfigSource {
+                cli: Cli::try_parse_from(args).expect("parse cli"),
+                cwd: cwd.clone(),
+                project_trusted: case["trusted"].as_bool().expect("trusted"),
+            };
+            let config = source
+                .load(ConfigPaths {
+                    cwd: cwd.clone(),
+                    agent_dir: agent.clone(),
+                    session_dir: agent.join("sessions"),
+                    settings_path: agent.join("settings.json"),
+                    project_settings_path: cwd.join(".pi/settings.json"),
+                    auth_path: agent.join("auth.json"),
+                    models_path: agent.join("models.json"),
+                    model_cache_path: agent.join("model-cache.json"),
+                    keybindings_path: agent.join("keybindings.json"),
+                })
+                .expect("load config");
+
+            let result = &case["result"];
+            assert_eq!(
+                config.system_prompt.as_deref(),
+                result["customPrompt"].as_str(),
+                "{name}: custom prompt"
+            );
+            assert_eq!(
+                config.append_system_prompt.join("\n\n"),
+                text(&result["appendSystemPrompt"]),
+                "{name}: appended prompt"
+            );
+            // Directories above the case's tree are not part of the case.
+            let context_files = config
+                .context_files
+                .iter()
+                .filter(|file| file.path.starts_with(&root))
+                .map(|file| (file.path.display().to_string(), file.content.clone()))
+                .collect::<Vec<_>>();
+            let expected = result["contextFiles"].as_array().expect("context files");
+            let expected = expected
+                .iter()
+                .map(|file| (text(&file["path"]), text(&file["content"])))
+                .collect::<Vec<_>>();
+            assert_eq!(context_files, expected, "{name}: context files");
+            assert_eq!(config.diagnostics, Vec::<String>::new(), "{name}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn append_flags_add_to_the_setting() {
+        // The fixture above covers upstream: flags replace APPEND_SYSTEM.md.
+        // The `appendSystemPrompt` setting is pi's own, and flags add to it.
+        let root =
+            std::env::temp_dir().join(format!("pi-cli-append-setting-{}", unique_temp_suffix()));
+        let agent = root.join("agent");
+        fs::create_dir_all(&agent).expect("create agent dir");
+        fs::write(agent.join("APPEND_SYSTEM.md"), "from the file").expect("write append file");
+        fs::write(
+            agent.join("settings.json"),
+            r#"{"appendSystemPrompt":["from the setting"]}"#,
+        )
+        .expect("write settings");
+        let source = ConfigSource {
+            cli: Cli::try_parse_from(["pi", "--append-system-prompt", "from the flag"])
+                .expect("parse cli"),
+            cwd: root.clone(),
+            project_trusted: false,
+        };
+        let config = source
+            .load(ConfigPaths {
+                cwd: root.clone(),
+                agent_dir: agent.clone(),
+                session_dir: agent.join("sessions"),
+                settings_path: agent.join("settings.json"),
+                project_settings_path: root.join(".pi/settings.json"),
+                auth_path: agent.join("auth.json"),
+                models_path: agent.join("models.json"),
+                model_cache_path: agent.join("model-cache.json"),
+                keybindings_path: agent.join("keybindings.json"),
+            })
+            .expect("load config");
+        assert_eq!(
+            config.append_system_prompt,
+            ["from the setting", "from the flag"]
         );
         let _ = fs::remove_dir_all(root);
     }

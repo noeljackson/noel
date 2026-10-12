@@ -14,7 +14,8 @@ Current Rust implementation:
 - Append-only JSONL sessions
 - Context-safe `/reload`
 - Config/auth/model loading from `~/.pi/agent`
-- `AGENTS.md` and `CLAUDE.md` context discovery
+- Upstream's default system prompt, with `SYSTEM.md`, `APPEND_SYSTEM.md`,
+  and `AGENTS.md`/`CLAUDE.md` context discovery
 - Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `todo`, `web_search`, `web_fetch`
 - Providers: faux test provider, OpenAI chat/responses/Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini/Vertex, OpenRouter, GitHub Copilot, Amazon Bedrock bearer-token Converse, Mistral, Cloudflare Workers AI/AI Gateway, OpenAI-compatible aliases for DeepSeek, Groq, Cerebras, xAI, Z.AI, Hugging Face, Together, Moonshot AI, and OpenCode, plus Anthropic-compatible aliases for Vercel AI Gateway, Fireworks, MiniMax, Kimi Coding, and Xiaomi MiMo
 
@@ -261,6 +262,8 @@ Supported files:
 - `model-cache.json`
 - `usage-cache.json`
 - `keybindings.json`
+- `SYSTEM.md`, `APPEND_SYSTEM.md`, and a context file (see
+  [System prompt](#system-prompt))
 - `extensions/`
 - `skills/`
 - `prompts/`
@@ -271,10 +274,11 @@ Project skills are also discovered from `.agents/skills` directories from the
 current working directory up to the git root. `SKILL.md` files are named by
 their containing directory.
 
-Project resources (`.pi/settings.json`, `.pi/extensions`, `.pi/skills`,
-`.pi/prompts`, `.pi/themes`, and `.agents/skills`) load only for a trusted
-project: pass `-a`/`--approve` (or `--no-approve` to refuse) or save a
-decision with `/trust`. `AGENTS.md` and `CLAUDE.md` from the agent directory
+Project resources (`.pi/settings.json`, `.pi/SYSTEM.md`,
+`.pi/APPEND_SYSTEM.md`, `.pi/extensions`, `.pi/skills`, `.pi/prompts`,
+`.pi/themes`, and `.agents/skills`) load only for a trusted project: pass
+`-a`/`--approve` (or `--no-approve` to refuse) or save a decision with
+`/trust`. Context files (`AGENTS.md`, `CLAUDE.md`) from the agent directory
 and from the current directory and its ancestors load whatever the trust
 decision, as upstream does; treat a repository's instructions as untrusted
 input.
@@ -307,6 +311,70 @@ whose provider has credentials (preferring that provider's usual model, as
 upstream does). A `faux` model is chosen only when it is requested or nothing
 else is available; with `--offline` only `faux` can run, so it is chosen
 unless `--model` names another.
+
+### System prompt
+
+Every model request starts with pi's system prompt, in every mode. It is
+upstream's prompt, word for word: one sentence naming the role, then tagged
+sections.
+
+- `<tools>`: the active tools, one line each. An extension tool is listed
+  when its manifest has a `promptSnippet`.
+- `<rules>`: each active tool's guidelines, then two general rules. Without
+  `grep`, `find`, and `ls`, a rule sends file operations to `bash`.
+- `<addendum>`: appended text, when there is any.
+- `<project_context>`: the context files, each inside
+  `<project_instructions path="...">`.
+- `<cwd>`: the working directory.
+
+The tool list and rules follow the tools the request declares, so
+`enabledTools`, `--tools`, `--exclude-tools`, `--no-tools`, and `--offline`
+(which removes the web tools) change them. Upstream's `<docs>` section, which
+points at its installed documentation, is left out: pi installs none.
+
+A custom prompt replaces the role, `<tools>`, and `<rules>`. The appended
+text, context files, and working directory still follow it. It is the first
+of these that exists:
+
+1. `--system-prompt <text-or-path>`
+2. the `systemPrompt` setting
+3. `.pi/SYSTEM.md` in the working directory, if the project is trusted
+4. `SYSTEM.md` in the agent directory
+
+Appended text is the `appendSystemPrompt` setting's entries followed by each
+`--append-system-prompt <text-or-path>`. Without either, it is
+`.pi/APPEND_SYSTEM.md` of a trusted project, else `APPEND_SYSTEM.md` in the
+agent directory. Files with the same name are not combined: the project's
+replaces the agent directory's.
+
+Context files come from the agent directory, then from each directory from
+the filesystem root down to the working directory. A directory contributes
+one file: `AGENTS.override.md`, else `AGENTS.md`, else `CLAUDE.md`. An
+override replaces only its own directory's file. In a linked git worktree
+checked out inside its main checkout, the worktree's file replaces the main
+checkout's file of the same name instead of adding to it.
+`--no-context-files` (`-nc`) loads none.
+
+### Session variables
+
+Commands the model runs with `bash` see the session they belong to:
+
+| Variable | Value |
+|---|---|
+| `PI_SESSION_ID` | The session id (`ephemeral` with `--no-session`) |
+| `PI_SESSION_FILE` | Absolute path of the session journal; unset with `--no-session` |
+| `PI_PROVIDER` | The active model's provider |
+| `PI_MODEL` | The active model's id |
+| `PI_REASONING_LEVEL` | The reasoning level the turn's requests use: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
+
+They are set for each command as it starts, and the system prompt tells the
+model they exist. A variable with nothing to report is removed rather than
+inherited, so a pi started from another pi's command never reports its
+parent's session. Commands you type (`/bash`, `!`, `!!`) are not given them.
+
+pi also marks its own process, and so every command and tool it starts:
+`AI_AGENT=pi` names the agent for any tool that asks, and
+`PI_CODING_AGENT=true` is pi's own marker.
 
 ### Web tools
 
@@ -623,7 +691,9 @@ response with `output` or `error`. Like `bash`, a tool process has no
 controlling terminal, and an interrupted call kills its process group. A
 call that a stop cut off never runs again when its turn continues unless the
 tool declares `"replaySafe": true` (it only reads, so running it twice is
-harmless):
+harmless). `promptSnippet` is the tool's line in the system prompt's tool
+list, and `promptGuidelines` are rules added to the prompt while the tool is
+active; both are optional, and a tool without a snippet is not listed:
 
 ```json
 {
@@ -637,7 +707,9 @@ harmless):
         "properties": { "text": { "type": "string" } },
         "required": ["text"]
       },
-      "replaySafe": true
+      "replaySafe": true,
+      "promptSnippet": "Echo text back",
+      "promptGuidelines": ["Use fixture_echo only in tests."]
     }
   ]
 }
@@ -1031,7 +1103,10 @@ CLI flags, slash commands, settings normalization, and session/export shape
 where Rust intentionally supports compatibility or analogous behavior. The RPC
 protocol fixture records every stdout record of upstream `pi --mode rpc` for
 scripted runs against a local stub model, and pi's RPC mode is compared with it
-record by record. Secrets are redacted. Rust tests
+record by record. The system prompt fixture records upstream's prompt text
+for fixed tools, prompt sources, and context files, and which prompt and
+context files upstream picks from a directory tree; pi's prompt is compared
+with it to the byte. Secrets are redacted. Rust tests
 compare covered behavior against those fixtures, so upstream changes become
 visible as fixture diffs and test failures.
 

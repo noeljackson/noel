@@ -245,6 +245,12 @@ pub trait Provider: Send + Sync {
         }
         Ok(())
     }
+
+    /// The thinking level this provider's requests ask for; `None` when
+    /// thinking is off or the model has none.
+    fn thinking_level(&self) -> Option<String> {
+        None
+    }
 }
 
 pub fn create_provider(config: ProviderConfig) -> Box<dyn Provider> {
@@ -1225,6 +1231,9 @@ fn openai_codex_responses_body(config: &ProviderConfig, request: &ProviderReques
         "model": config.model.id,
         "store": false,
         "stream": true,
+        // The Codex backend rejects a request without instructions, so a
+        // caller that sends no system prompt gets upstream's placeholder
+        // (`openai-codex-responses.ts`). pi's sessions always send one.
         "instructions": request
             .system_prompt
             .clone()
@@ -6446,6 +6455,18 @@ mod tests {
 
         let body = openai_responses_body(&config, &request);
         assert_eq!(body, fixture_request["body"]);
+
+        // Without a system prompt, upstream's placeholder stands in.
+        for system_prompt in [None, Some(String::new())] {
+            let request = ProviderRequest {
+                system_prompt,
+                ..request.clone()
+            };
+            assert_eq!(
+                openai_responses_body(&config, &request)["instructions"],
+                "You are a helpful assistant."
+            );
+        }
     }
 
     #[test]

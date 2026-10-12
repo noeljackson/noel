@@ -140,8 +140,7 @@ impl Runtime {
     /// Includes reloadable instructions, tool schemas, attachments, and calls.
     /// Billed session totals are deliberately not used as active-context size.
     pub fn estimated_context_tokens(&self) -> u64 {
-        let prompt = runtime_system_prompt(self);
-        let system = prompt.as_deref().map(text_tokens).unwrap_or(0);
+        let system = text_tokens(&runtime_system_prompt(self));
         let tools = active_tool_definitions(self)
             .iter()
             .map(|tool| {
@@ -349,8 +348,7 @@ impl Runtime {
             .saturating_sub(messages_tokens(&self.session.messages))
             .saturating_add(messages_tokens(&messages));
         if kind == CompactionKind::Automatic && self.exceeds_compaction_budget(projected_tokens) {
-            let prompt = runtime_system_prompt(self);
-            let system = prompt.as_deref().map(text_tokens).unwrap_or(0);
+            let system = text_tokens(&runtime_system_prompt(self));
             let tools = active_tool_definitions(self)
                 .iter()
                 .map(|tool| {
@@ -612,10 +610,10 @@ mod tests {
     async fn semantic_checkpoint_sees_middle_focus_calls_and_preserves_state_and_instructions() {
         let mut runtime = runtime();
         runtime.systems.system_prompt = Some("persistent safety rule".into());
-        runtime
-            .systems
-            .context_messages
-            .push("AGENTS.md: project conventions".into());
+        runtime.systems.context_files.push(ContextFile {
+            path: "AGENTS.md".into(),
+            content: "project conventions".into(),
+        });
         runtime
             .session
             .messages
