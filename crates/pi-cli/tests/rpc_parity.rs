@@ -1758,6 +1758,113 @@ fn get_commands_matches_upstream() {
     }
 }
 
+/// A skill given with `--skill` works end to end: it is listed in the
+/// system prompt and by `get_commands`, and its command expands in a
+/// `prompt`. A template expands in `steer` and `follow_up`, and the queue
+/// holds the expansion. A command that names nothing is text for the model.
+#[test]
+fn skills_and_templates_expand_in_prompt_steer_and_follow_up() {
+    let root = fs::canonicalize(test_root("skills")).unwrap();
+    write_files(
+        &root,
+        &[
+            (
+                "given/review/SKILL.md",
+                "---\nname: review\ndescription: Review code for bugs.\n---\n\n# Review\n\nRead `rules.md` first.\n",
+            ),
+            ("given/review/rules.md", "No panics.\n"),
+            (
+                "agent/prompts/fix.md",
+                "---\ndescription: Fix a bug\nargument-hint: \"<issue>\"\n---\nFix issue $1. Notes: ${@:2}\n",
+            ),
+        ],
+    );
+    let skill_dir = root.join("given/review");
+    let skill_file = skill_dir.join("SKILL.md");
+    let script = json!([
+        [held_until(0), text("Reviewed.")],
+        [text("Fixed.")],
+        [text("Done.")]
+    ]);
+    let args = ["--no-context-files", "--skill", "../given/review"];
+    let mut pi = Pi::spawn(root.clone(), script, &args, json!({}));
+
+    pi.command(json!({"id": "commands", "type": "get_commands"}));
+    let commands = pi.response("commands")["data"]["commands"].clone();
+    let listed = commands.as_array().unwrap().iter();
+    let listed = listed
+        .map(|command| (command["name"].as_str().unwrap(), &command["sourceInfo"]))
+        .collect::<Vec<_>>();
+    assert_eq!(listed.len(), 2, "{commands}");
+    assert_eq!(listed[0].0, "fix");
+    assert_eq!(listed[1].0, "skill:review");
+    assert_eq!(
+        *listed[1].1,
+        json!({
+            "path": skill_file,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "baseDir": skill_dir,
+        })
+    );
+
+    let block = format!(
+        "<skill name=\"review\" location=\"{}\">\nReferences are relative to {}.\n\n# Review\n\nRead `rules.md` first.\n</skill>",
+        skill_file.display(),
+        skill_dir.display()
+    );
+    pi.command(json!({"id": "1", "type": "prompt", "message": "/skill:review the parser"}));
+    pi.response("1");
+    pi.wait_for("turn_start", 1);
+    pi.command(json!({"id": "2", "type": "steer", "message": "/fix 42 \"be careful\" please"}));
+    pi.response("2");
+    pi.command(json!({"id": "3", "type": "follow_up", "message": "/skill:nope later"}));
+    pi.response("3");
+    pi.command(json!({"id": "4", "type": "follow_up", "message": "/skill:review"}));
+    pi.response("4");
+    let queue = of_type(&pi.records, "queue_update").last().unwrap().clone();
+    assert_eq!(
+        queue["steering"],
+        json!(["Fix issue 42. Notes: be careful please"])
+    );
+    assert_eq!(queue["followUp"], json!(["/skill:nope later", block]));
+    pi.release("release-0");
+    pi.wait_for("agent_settled", 1);
+    assert!(pi.close().success());
+
+    let user_texts = |records: &[Value]| {
+        let ends = of_type(records, "message_end");
+        ends.filter(|record| record["message"]["role"] == "user")
+            .map(|record| record["message"]["content"][0]["text"].clone())
+            .collect::<Vec<_>>()
+    };
+    let prompt = format!("{block}\n\nthe parser");
+    assert_eq!(
+        user_texts(&pi.records),
+        [
+            json!(prompt),
+            json!("Fix issue 42. Notes: be careful please"),
+            json!(format!("/skill:nope later\n---\n{block}")),
+        ]
+    );
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0], json!([{"role": "user", "text": prompt}]));
+    assert_eq!(
+        requests[2].as_array().unwrap().last().unwrap()["text"],
+        json!(format!("/skill:nope later\n---\n{block}"))
+    );
+    let system_prompt = pi.logged_requests()[0]["system_prompt"].clone();
+    let system_prompt = system_prompt.as_str().unwrap();
+    let listing = format!(
+        "<available_skills>\n  <skill>\n    <name>review</name>\n    <description>Review code for bugs.</description>\n    <location>{}</location>\n  </skill>\n</available_skills>\n</skills>\n\n<cwd>",
+        skill_file.display()
+    );
+    assert!(system_prompt.contains("\n\n<skills>\nThe following skills provide"));
+    assert!(system_prompt.contains(&listing), "{system_prompt}");
+}
+
 /// A prompt that names no skill, template, or slash tool is the model's to
 /// read, as upstream sends it; a slash-tool prompt still runs its tool.
 #[test]

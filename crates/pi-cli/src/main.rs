@@ -63,7 +63,7 @@ use pi_config::{
     DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR, MODEL_CACHE_VERSION,
 };
 use pi_core::{
-    continue_turn_streaming_events, default_active_tool_names, format_todo_list,
+    continue_turn_streaming_events, default_active_tool_names, expand_input, format_todo_list,
     run_excluded_bash_result, run_user_turn, run_user_turn_streaming,
     run_user_turn_streaming_events_with_media, run_user_turn_streaming_with_media,
     write_session_export, AgentError, CompactionKind, ConversationMessage, FollowUpQueue,
@@ -1421,14 +1421,9 @@ async fn run() -> Result<()> {
         if initial_prompt.is_empty() {
             return Err(anyhow!("print mode requires a prompt"));
         }
-        let response = run_prompt_media(
-            &mut runtime,
-            &config,
-            initial_prompt,
-            initial_media,
-            offline,
-        )
-        .await?;
+        let prompt = expand_input(&config, &initial_prompt);
+        let response =
+            run_prompt_media(&mut runtime, &config, prompt, initial_media, offline).await?;
         if let Some(path) = &cli.export {
             export_session(&runtime, path)?;
         }
@@ -6245,7 +6240,7 @@ fn handle_streaming_tui_key(
                 app.push(TuiEntryKind::System, format!("steering> {queued}"));
             }
             if !line.is_empty() {
-                steering.send(line.clone());
+                steering.send(expand_input(config, &line));
                 app.push(TuiEntryKind::System, format!("steering> {line}"));
             }
             return StreamingKeyOutcome::Changed;
@@ -6438,7 +6433,7 @@ fn handle_streaming_command(
         command if command.starts_with("queue ") => {
             let message = command.trim_start_matches("queue ").trim();
             if !message.is_empty() {
-                followups.push(message.to_string());
+                followups.push(expand_input(config, message));
             }
             StreamingKeyOutcome::Changed
         }
@@ -6518,10 +6513,18 @@ fn handle_streaming_command(
             StreamingKeyOutcome::Changed
         }
         _ => {
-            app.push(
-                TuiEntryKind::System,
-                format!("/{command} is not available while a turn is running"),
-            );
+            // A skill command or a prompt template queues as a follow-up,
+            // like any text typed mid-turn.
+            let typed = format!("/{command}");
+            let prompt = expand_input(config, &typed);
+            if prompt == typed {
+                app.push(
+                    TuiEntryKind::System,
+                    format!("{typed} is not available while a turn is running"),
+                );
+            } else {
+                followups.push(prompt);
+            }
             StreamingKeyOutcome::Changed
         }
     }
@@ -7216,7 +7219,7 @@ async fn handle_tui_submission(
 ) -> Result<bool> {
     if let Some(lines) = app.multiline.as_mut() {
         if line == "." {
-            let prompt = lines.join("\n");
+            let prompt = TypedPrompt::expand(config, lines.join("\n"));
             app.multiline = None;
             let quit =
                 submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
@@ -7420,6 +7423,7 @@ async fn handle_tui_submission(
             let initial = line.trim_start_matches("/editor").trim();
             match read_external_editor_prompt(initial) {
                 Ok(prompt) if !prompt.trim().is_empty() => {
+                    let prompt = TypedPrompt::expand(config, prompt);
                     return Ok(submit_tui_prompt(
                         app,
                         surface,
@@ -7549,7 +7553,7 @@ async fn handle_tui_submission(
             }
         }
         _ if line.starts_with("/queue ") => {
-            let message = line.trim_start_matches("/queue ").trim().to_string();
+            let message = expand_input(config, line.trim_start_matches("/queue ").trim());
             runtime.queue_message(message)?;
             app.push(
                 TuiEntryKind::System,
@@ -7603,29 +7607,6 @@ async fn handle_tui_submission(
             // None means inherit defaults, not an explicit off selection.
             runtime.set_active_thinking_level(Some(level.to_string()))?;
             app.push(TuiEntryKind::System, format!("thinking: {level}"));
-        }
-        _ if line.starts_with("/skill:") => {
-            let (name, input) = split_resource_command(&line, "/skill:");
-            let mut skills = config.skills.iter();
-            let skill = skills
-                .find(|skill| skill.name == name)
-                .ok_or_else(|| anyhow!("skill not found: {name}"))?;
-            let content = fs::read_to_string(&skill.file_path)?;
-            let prompt = if input.is_empty() {
-                content
-            } else {
-                format!("{content}\n\n{input}")
-            };
-            return Ok(submit_tui_prompt(
-                app,
-                surface,
-                runtime,
-                config,
-                prompt,
-                Vec::new(),
-                offline,
-            )
-            .await);
         }
         _ if line.starts_with("/extension:") => {
             let (name, input) = split_resource_command(&line, "/extension:");
@@ -7843,10 +7824,20 @@ async fn handle_tui_submission(
                 format!("share exported {}", path.display()),
             );
         }
+        // Anything else is a prompt: a skill command or a prompt template
+        // expands, and other text goes to the model as typed.
         _ => {
-            return Ok(
-                submit_tui_prompt(app, surface, runtime, config, line, Vec::new(), offline).await,
+            let prompt = TypedPrompt::expand(config, line);
+            return Ok(submit_tui_prompt(
+                app,
+                surface,
+                runtime,
+                config,
+                prompt,
+                Vec::new(),
+                offline,
             )
+            .await);
         }
     }
     Ok(false)
@@ -7945,15 +7936,40 @@ fn apply_midturn_session_resume(
     Ok(())
 }
 
+/// A prompt to submit, and the input that stands for it in history.
+struct TypedPrompt {
+    typed: String,
+    prompt: String,
+}
+
+impl TypedPrompt {
+    /// Typed input: a skill command or a prompt template expands.
+    fn expand(config: &LoadedConfig, typed: String) -> Self {
+        let prompt = expand_input(config, &typed);
+        Self { typed, prompt }
+    }
+}
+
+/// A prompt a command has built, which is sent as it is.
+impl From<String> for TypedPrompt {
+    fn from(prompt: String) -> Self {
+        Self {
+            typed: prompt.clone(),
+            prompt,
+        }
+    }
+}
+
 async fn submit_tui_prompt(
     app: &mut TuiApp,
     surface: &mut TuiSurface<'_>,
     runtime: &mut Runtime,
     config: &LoadedConfig,
-    prompt: String,
+    prompt: impl Into<TypedPrompt>,
     media: Vec<MediaInput>,
     offline: bool,
 ) -> bool {
+    let TypedPrompt { typed, prompt } = prompt.into();
     if images_blocked(config) && (!media.is_empty() || !app.input_media.is_empty()) {
         app.push(
             TuiEntryKind::Error,
@@ -7966,8 +7982,15 @@ async fn submit_tui_prompt(
     for attachment in &media {
         app.push(TuiEntryKind::System, format_media_fallback(attachment));
     }
-    app.editor_state.record_history(prompt.clone());
-    app.push(TuiEntryKind::User, prompt.clone());
+    // A template shows as the prompt it became. A skill's prompt is its
+    // whole file, so its command stands for it.
+    let shown = if typed.starts_with("/skill:") {
+        typed.clone()
+    } else {
+        prompt.clone()
+    };
+    app.editor_state.record_history(typed);
+    app.push(TuiEntryKind::User, shown);
     let control = match run_prompt_with_queue_tui(
         app, surface, runtime, config, prompt, media, offline,
     )
@@ -10794,6 +10817,80 @@ mod tests {
         assert_eq!(fill("fix {{input}}", ""), "fix ");
         assert_eq!(fill("review", "the diff"), "review\n\nthe diff");
         assert_eq!(fill("review $1", ""), "review $1");
+    }
+
+    /// Typed input expands before it is submitted: history keeps what was
+    /// typed, and a skill's command stands for its file in the transcript.
+    #[test]
+    fn typed_prompts_expand_skills_and_templates() {
+        let root = std::env::temp_dir().join(format!("pi-cli-typed-{}", unique_temp_suffix()));
+        fs::create_dir_all(root.join("review")).unwrap();
+        let skill_file = root.join("review/SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\ndescription: Review code.\n---\nCheck it.\n",
+        )
+        .unwrap();
+        let mut config = minimal_test_config();
+        config.skills = vec![Skill {
+            file_path: skill_file.clone(),
+            base_dir: root.join("review"),
+            ..test_skill("review", "Review code.")
+        }];
+        config.prompt_templates = vec![test_template("fix", "Fix a bug", None, "Fix $1.")];
+
+        let template = TypedPrompt::expand(&config, "/fix 42".into());
+        assert_eq!(
+            (template.typed.as_str(), template.prompt.as_str()),
+            ("/fix 42", "Fix 42.")
+        );
+        let skill = TypedPrompt::expand(&config, "/skill:review the parser".into());
+        assert_eq!(skill.typed, "/skill:review the parser");
+        assert_eq!(
+            skill.prompt,
+            format!(
+                "<skill name=\"review\" location=\"{}\">\nReferences are relative to {}.\n\nCheck it.\n</skill>\n\nthe parser",
+                skill_file.display(),
+                root.join("review").display()
+            )
+        );
+        for text in ["/skill:nope x", "/nope x", "plain", "/read notes.txt"] {
+            assert_eq!(TypedPrompt::expand(&config, text.into()).prompt, text);
+        }
+        // A prompt a command built is sent as it is.
+        assert_eq!(TypedPrompt::from("/fix 42".to_string()).prompt, "/fix 42");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Mid-turn, a skill command or a template queues expanded: steering
+    /// with the steer key, a follow-up with Enter or `/queue`.
+    #[test]
+    fn streaming_input_expands_templates_into_the_queues() {
+        let mut config = minimal_test_config();
+        config.prompt_templates = vec![test_template("fix", "Fix a bug", None, "Fix $1.")];
+        let followups = FollowUpQueue::default();
+        let steering = SteeringMailbox::default();
+        let mut app = TuiApp::default();
+        let press = |app: &mut TuiApp, input: &str, key: KeyEvent| {
+            app.set_input(input);
+            handle_streaming_tui_key(key, app, &followups, &steering, &config)
+        };
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let steer = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        press(&mut app, "/fix 1", steer);
+        assert_eq!(steering.drain(), ["Fix 1."]);
+        assert_eq!(app.entries[0].text, "steering> /fix 1");
+        press(&mut app, "/fix 2", enter);
+        press(&mut app, "/queue /fix 3", enter);
+        assert_eq!(followups.list(), ["Fix 2.", "Fix 3."]);
+        // A command that names no template is still refused mid-turn.
+        press(&mut app, "/nope", enter);
+        assert_eq!(followups.pending(), 2);
+        assert_eq!(
+            app.entries.last().unwrap().text,
+            "/nope is not available while a turn is running"
+        );
     }
 
     #[test]

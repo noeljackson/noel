@@ -243,6 +243,97 @@ fn print_mode_sends_the_default_system_prompt_and_the_prompt_files() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// Print mode expands a skill command and a prompt template before the
+/// model sees the prompt, and lists the skill in the system prompt.
+/// `--no-skills` and `--no-prompt-templates` keep what `--skill` and
+/// `--prompt-template` name and drop what is discovered.
+#[test]
+fn print_mode_expands_skills_and_templates_and_honors_the_resource_flags() {
+    let root = fs::canonicalize({
+        let root = test_dir("pi-cli-skills");
+        fs::create_dir_all(root.join("agent/prompts")).unwrap();
+        fs::create_dir_all(root.join("agent/skills/found")).unwrap();
+        fs::create_dir_all(root.join("given/review")).unwrap();
+        root
+    })
+    .unwrap();
+    let skill = |description: &str| format!("---\ndescription: {description}\n---\nDo it.\n");
+    fs::write(root.join("agent/skills/found/SKILL.md"), skill("Found.")).unwrap();
+    fs::write(root.join("given/review/SKILL.md"), skill("Given.")).unwrap();
+    fs::write(root.join("agent/prompts/fix.md"), "Fix $1.\n").unwrap();
+    fs::write(root.join("given/explain.md"), "Explain ${1:-it}.\n").unwrap();
+    fs::write(
+        root.join("script.json"),
+        r#"[[{"text": "ok"}], [{"text": "ok"}], [{"text": "ok"}], [{"text": "ok"}], [{"text": "ok"}]]"#,
+    )
+    .unwrap();
+    // The prompt of each run, and its request's last user message and
+    // system prompt.
+    let run = |args: &[&str]| {
+        let output = faux_script_pi(&root, &["--no-context-files"])
+            .args(args)
+            .output()
+            .expect("run pi");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let request = faux_script_log(&root).pop().expect("a request");
+        let prompt = request["messages"].as_array().unwrap().last().unwrap()["content"].clone();
+        let system = request["system_prompt"].as_str().unwrap().to_string();
+        (prompt.as_str().unwrap().to_string(), system)
+    };
+    let block = |name: &str, dir: &str| {
+        let dir = root.join(dir);
+        format!(
+            "<skill name=\"{name}\" location=\"{}\">\nReferences are relative to {}.\n\nDo it.\n</skill>",
+            dir.join("SKILL.md").display(),
+            dir.display()
+        )
+    };
+    let location = |dir: &str| {
+        format!(
+            "<location>{}</location>",
+            root.join(dir).join("SKILL.md").display()
+        )
+    };
+
+    // Arguments join into one prompt, which is the skill's command.
+    let (prompt, system) = run(&[
+        "--skill",
+        "given/review",
+        "-p",
+        "/skill:review",
+        "the parser",
+    ]);
+    assert_eq!(
+        prompt,
+        format!("{}\n\nthe parser", block("review", "given/review"))
+    );
+    assert!(system.contains(&location("agent/skills/found")), "{system}");
+    assert!(system.contains(&location("given/review")), "{system}");
+
+    let (prompt, _) = run(&["-p", "/fix 42"]);
+    assert_eq!(prompt, "Fix 42.\n");
+    let (prompt, _) = run(&["--prompt-template", "given/explain.md", "-p", "/explain"]);
+    assert_eq!(prompt, "Explain it.\n");
+
+    // Discovery off: the explicit paths still load, the discovered do not.
+    let flags = [
+        "--no-skills",
+        "--skill",
+        "given/review",
+        "-np",
+        "--prompt-template",
+        "given",
+    ];
+    let (prompt, system) = run(&[&flags[..], &["-p", "/skill:review"]].concat());
+    assert_eq!(prompt, block("review", "given/review"));
+    assert!(!system.contains("agent/skills/found"), "{system}");
+    assert!(system.contains(&location("given/review")), "{system}");
+    let (prompt, _) = run(&[&flags[..], &["-p", "/fix 42 /skill:found /explain now"]].concat());
+    assert_eq!(prompt, "/fix 42 /skill:found /explain now");
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Prints what a bash command sees of its session and of pi, a line each.
 const SESSION_ENV: &str = r#"printf '%s\n' "${PI_SESSION_ID-unset}" "${PI_SESSION_FILE-unset}" "${PI_PROVIDER-unset}" "${PI_MODEL-unset}" "${PI_REASONING_LEVEL-unset}" "${AI_AGENT-unset}" "${PI_CODING_AGENT-unset}""#;
 

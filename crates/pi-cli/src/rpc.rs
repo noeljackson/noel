@@ -8,6 +8,10 @@
 //! how the session's last run ended, and `resume_run` continues it if a
 //! stop interrupted it.
 //!
+//! A `prompt`, `steer` or `follow_up` that is a skill command or a prompt
+//! template expands when it arrives, as upstream's does: the queue and the
+//! session hold the expansion.
+//!
 //! One task reads commands and drives the active run, so records keep the
 //! order things happen in. While a run is active, commands that change the
 //! session are refused and reads answer from a copy of the session that the
@@ -26,7 +30,7 @@ use base64::Engine;
 use pi_ai::ModelRef;
 use pi_config::LoadedConfig;
 use pi_core::{
-    continue_turn_streaming_events, run_saved_prompt_streaming_events,
+    continue_turn_streaming_events, expand_input, run_saved_prompt_streaming_events,
     run_user_turn_streaming_events_with_media, AgentError, CancellationToken, CompactionKind,
     ConversationMessage, MessageRole, RunControl, RunStart, RunStatus, Runtime, SessionState,
     SessionStore, ToolEvent, TurnEvent,
@@ -204,10 +208,8 @@ impl Rpc {
                     Err(error) => Err(error),
                 }
             }
-            Ok(Command::Steer(input)) => self.shared().enqueue(StreamingBehavior::Steer, input),
-            Ok(Command::FollowUp(input)) => {
-                self.shared().enqueue(StreamingBehavior::FollowUp, input)
-            }
+            Ok(Command::Steer(input)) => self.enqueue(StreamingBehavior::Steer, input),
+            Ok(Command::FollowUp(input)) => self.enqueue(StreamingBehavior::FollowUp, input),
             Ok(Command::Abort { expected_run_id }) => self.abort(expected_run_id),
             Ok(Command::ClearQueue) => self.shared().clear_queue(),
             Ok(Command::NewSession { parent_session }) => {
@@ -233,6 +235,12 @@ impl Rpc {
         };
         send(&Response::to(&request, reply));
         None
+    }
+
+    /// Queues a message while no run is active.
+    fn enqueue(&mut self, behavior: StreamingBehavior, input: &Input) -> Reply {
+        let shared = self.shared.get_mut().expect("rpc state");
+        shared.enqueue(behavior, input, &self.config)
     }
 
     /// The reply to a prompt whose `requestId` already started a run.
@@ -266,9 +274,10 @@ impl Rpc {
             request_id: input.request_id.clone(),
         };
         let run_id = run.id.clone();
+        let message = expand_input(&self.config, &input.message);
         let prompt = self
             .runtime
-            .start_run(run, input.message.clone(), media)
+            .start_run(run, message, media)
             .map_err(|error| error.to_string())?;
         Ok(Start {
             run_id,
@@ -637,11 +646,13 @@ impl Shared {
                     (Some(data), _) => Ok(Some(data)),
                     (None, None) => Err(BUSY.into()),
                     (None, Some(_)) if request_id.is_some() => Err(QUEUED_REQUEST.into()),
-                    (None, Some(behavior)) => self.enqueue(behavior, input),
+                    (None, Some(behavior)) => self.enqueue(behavior, input, config),
                 }
             }
-            Ok(Command::Steer(input)) => self.enqueue(StreamingBehavior::Steer, input),
-            Ok(Command::FollowUp(input)) => self.enqueue(StreamingBehavior::FollowUp, input),
+            Ok(Command::Steer(input)) => self.enqueue(StreamingBehavior::Steer, input, config),
+            Ok(Command::FollowUp(input)) => {
+                self.enqueue(StreamingBehavior::FollowUp, input, config)
+            }
             Ok(Command::Abort { expected_run_id }) => match self.fence(expected_run_id) {
                 // Answered once the run settles.
                 Ok(()) => {
@@ -706,18 +717,25 @@ impl Shared {
         }
     }
 
-    /// Queues a message, as steering or a follow-up, once it is saved.
-    fn enqueue(&mut self, behavior: StreamingBehavior, input: &Input) -> Reply {
+    /// Queues a message, as steering or a follow-up, once it is saved. A
+    /// skill command or a prompt template is queued expanded.
+    fn enqueue(
+        &mut self,
+        behavior: StreamingBehavior,
+        input: &Input,
+        config: &LoadedConfig,
+    ) -> Reply {
         self.fence(&input.expected_run_id)?;
         if !input.images.is_empty() {
             return Err(
                 "queued messages are text only; send images with a prompt that starts a run".into(),
             );
         }
+        let message = expand_input(config, &input.message);
         let (mut steering, mut follow_ups) = self.queue.contents();
         match behavior {
-            StreamingBehavior::Steer => steering.push(input.message.clone()),
-            StreamingBehavior::FollowUp => follow_ups.push(input.message.clone()),
+            StreamingBehavior::Steer => steering.push(message),
+            StreamingBehavior::FollowUp => follow_ups.push(message),
         }
         self.set_queue((steering, follow_ups))?;
         Ok(Some(Data::queued()))
