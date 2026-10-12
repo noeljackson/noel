@@ -379,11 +379,6 @@ Loading:
 
 Use:
 
-- Until the `read` tool may leave the working directory, the model cannot
-  load a skill file outside it with `read`, as the listing tells it to: a
-  user skill in the agent directory, or one given with `--skill` from
-  elsewhere. `bash` can read it, and `/skill:name` is not affected. This
-  entry goes when the tool's confinement does.
 - Input is expanded where each mode takes it (`pi_core::expand_input`): the
   TUI on submit, on steering, and on queueing, print mode for its prompt, and
   RPC mode for `prompt`, `steer`, and `follow_up`. Upstream expands in its

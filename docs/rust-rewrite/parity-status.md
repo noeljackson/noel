@@ -157,7 +157,9 @@ pass an explicit prompt, and the RPC goldens record messages without it.
   (`skills_and_templates_expand_in_prompt_steer_and_follow_up`), print mode
   (`print_mode_expands_skills_and_templates_and_honors_the_resource_flags`),
   and the TUI (`typed_prompts_expand_skills_and_templates`,
-  `streaming_input_expands_templates_into_the_queues`).
+  `streaming_input_expands_templates_into_the_queues`). Another RPC test has
+  the model `read` the listed file of a skill given from outside the working
+  directory (`the_model_reads_a_skill_from_outside_the_working_directory`).
 
 ## Validation Commands
 

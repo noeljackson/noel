@@ -1865,6 +1865,69 @@ fn skills_and_templates_expand_in_prompt_steer_and_follow_up() {
     assert!(system_prompt.contains(&listing), "{system_prompt}");
 }
 
+/// The model follows the listing: it reads the file the system prompt names
+/// for a skill given with `--skill` from outside the working directory, then
+/// the file that skill refers to beside it, and gets the text of both.
+#[test]
+fn the_model_reads_a_skill_from_outside_the_working_directory() {
+    let root = fs::canonicalize(test_root("skill-read")).unwrap();
+    let skill =
+        "---\ndescription: Review code for bugs.\n---\n# Review\n\nRead `rules.md` first.\n";
+    let files = [
+        ("given/review/SKILL.md", skill),
+        ("given/review/rules.md", "No panics.\n"),
+    ];
+    write_files(&root, &files);
+    let skill_dir = root.join("given/review");
+    assert!(!skill_dir.starts_with(root.join("cwd")));
+    let read = |id: &str, file: &str| {
+        let path = skill_dir.join(file);
+        json!({"tool_call": {"id": id, "name": "read", "arguments": {"path": path}}})
+    };
+    let script = json!([
+        [read("r1", "SKILL.md")],
+        [read("r2", "rules.md")],
+        [text("Reviewed.")]
+    ]);
+    let args = [
+        "--no-context-files",
+        "--no-skills",
+        "--skill",
+        "../given/review",
+    ];
+    let mut pi = Pi::spawn(root.clone(), script, &args, json!({}));
+    pi.command(json!({"id": "1", "type": "prompt", "message": "review the parser"}));
+    pi.wait_for("agent_settled", 1);
+    assert!(pi.close().success());
+
+    // The first path the model read is the location the listing gave it.
+    let system_prompt = pi.logged_requests()[0]["system_prompt"].clone();
+    let location = skill_dir.join("SKILL.md");
+    let listed = format!("<location>{}</location>", location.display());
+    assert!(system_prompt.as_str().unwrap().contains(&listed));
+
+    let results = of_type(&pi.records, "tool_execution_end")
+        .map(|end| (&end["isError"], &end["result"]["content"][0]["text"]))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        [
+            (&json!(false), &json!(skill)),
+            (&json!(false), &json!("No panics.\n"))
+        ]
+    );
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2][2],
+        json!({"role": "tool", "text": skill, "toolCallId": "r1"})
+    );
+    assert_eq!(
+        requests[2][4],
+        json!({"role": "tool", "text": "No panics.\n", "toolCallId": "r2"})
+    );
+}
+
 /// A prompt that names no skill, template, or slash tool is the model's to
 /// read, as upstream sends it; a slash-tool prompt still runs its tool.
 #[test]
