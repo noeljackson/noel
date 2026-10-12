@@ -232,7 +232,9 @@ File names:
 Project-local roots:
 
 - `.pi/`
-- `.agents/skills`
+- `.agents/skills`, in each directory from the cwd up to the repository root
+
+User skills are also read from `~/.agents/skills`.
 
 Context discovery, whatever the project trust decision:
 
@@ -261,15 +263,17 @@ Validation rules:
 `crates/pi-core/src/system_prompt.rs` builds the prompt every model request
 starts with. It is a port of upstream's `buildSystemPrompt`: a pure function
 from the active tools, the custom and appended prompt text, the context
-files, and the working directory to the text, with no runtime behind it.
+files, the skills, and the working directory to the text, with no runtime
+behind it.
 `system-prompt.json` holds upstream's output and the module's tests compare
 against it to the byte.
 
 The prompt is a one-sentence role followed by tagged sections joined by blank
 lines: `tools`, `rules`, `addendum`, `project_context`, `skills`, and `cwd`. A
 custom prompt replaces the role, `tools`, and `rules`; the rest still follow
-it. `skills` is a hook: the builder renders a listing it is given, and the
-runtime gives it none yet.
+it. `skills` is the listing of the loaded skills
+(`pi_config::format_skills_for_prompt`), present while `read` or `bash` is
+active.
 
 The runtime builds the prompt once per turn (`runtime_system_prompt`) from
 what the session and the reloadable systems hold at that moment:
@@ -278,8 +282,8 @@ what the session and the reloadable systems hold at that moment:
   the tool list and rules always match the request. A builtin tool's line and
   rules come from `PromptTool::builtin`; an extension tool's come from its
   manifest's `promptSnippet` and `promptGuidelines`.
-- The custom prompt, appended text, and context files come from the loaded
-  config, so `/reload` picks up edited files.
+- The custom prompt, appended text, context files, and skills come from the
+  loaded config, so `/reload` picks up edited files.
 - Session `System` messages follow the prompt in the same request field.
 
 The context estimate counts the same text, so automatic compaction and the
@@ -448,6 +452,45 @@ Keybindings:
 - Load defaults plus user overrides.
 - Support reload without recreating `SessionState`.
 - Keep action checks routed through the keybinding layer where user-configurable behavior is required.
+
+## Skills and Prompt Templates
+
+Skills and prompt templates are ports of upstream's modules, kept file for
+file so each can be read against its source:
+
+- `crates/pi-config/src/frontmatter.rs` (`utils/frontmatter.ts`): the
+  frontmatter and body of a Markdown file. Upstream uses a YAML library;
+  this is a parser for the YAML the Agent Skills specification uses.
+- `crates/pi-config/src/resources.rs` (the skill and prompt parts of
+  `core/package-manager.ts` and `core/resource-loader.ts`): which files to
+  load, in the order that decides a name collision: project setting, project
+  directories, user setting, user directories, packages, then the command
+  line's paths. `--no-skills` and `--no-prompt-templates` keep only the last.
+- `crates/pi-config/src/skills.rs` (`core/skills.ts`): a skill from its file,
+  the Agent Skills name and description rules, first-wins collisions, and the
+  system prompt's listing.
+- `crates/pi-config/src/prompt_templates.rs` (`core/prompt-templates.ts`): a
+  template from its file, argument splitting, and placeholder substitution.
+- `crates/pi-core/src/input.rs` (the session's expansion in
+  `core/agent-session.ts`): `expand_input`, which turns `/skill:name` and
+  `/template` input into the prompt it stands for.
+
+`LoadedConfig` holds the loaded skills and templates, so `/reload` replaces
+them with the rest of the configuration. Their diagnostics join the
+configuration's. `ReloadableSystems` copies the skills for the system prompt.
+
+`expand_input` is applied where input enters a mode, as upstream's session
+applies it in `prompt`, `steer`, and `followUp`: the TUI when a line is
+submitted, queued, or sent as steering; print mode for its prompt; RPC mode
+for `prompt`, `steer`, and `follow_up`. The engine takes the text it is
+given, so a queued message is expanded once, when it is queued, and the queue
+and the session hold the expansion. Rust's slash-tool prompts are checked
+first: `/read notes.txt` stays a tool command whatever templates exist. Text
+that is none of these goes to the model.
+
+`skills.json` holds upstream's results for each step (what loads from a
+tree, the listing, the expansions, the argument table, and `get_commands`),
+and each module's tests compare with it exactly.
 
 ## Extension and Package Resource Architecture
 

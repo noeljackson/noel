@@ -180,6 +180,7 @@ cargo run -p pi-cli -- --tools -bash,-write -p "everything but bash and write"
 cargo run -p pi-cli -- --no-builtin-tools -p "extension tools only"
 cargo run -p pi-cli -- --no-tools -p "no tools"
 cargo run -p pi-cli -- --system-prompt prompt.md --append-system-prompt extra.md -p "hello"
+cargo run -p pi-cli -- --skill ./skills/review -p "/skill:review src/"
 cargo run -p pi-cli -- --image screenshot.png -p "describe this"
 cargo run -p pi-cli -- --export session.json -p "hello"
 cargo run -p pi-cli -- --export session.html -p "hello"
@@ -272,9 +273,9 @@ Supported files:
 - `themes/`
 - `sessions/`
 
-Project skills are also discovered from `.agents/skills` directories from the
-current working directory up to the git root. `SKILL.md` files are named by
-their containing directory.
+Skills are also read from `.agents/skills` directories; see [Skills](#skills)
+and [Prompt templates](#prompt-templates) for what `skills/` and `prompts/`
+hold.
 
 Project resources (`.pi/settings.json`, `.pi/SYSTEM.md`,
 `.pi/APPEND_SYSTEM.md`, `.pi/extensions`, `.pi/skills`, `.pi/prompts`,
@@ -327,6 +328,8 @@ sections.
 - `<addendum>`: appended text, when there is any.
 - `<project_context>`: the context files, each inside
   `<project_instructions path="...">`.
+- `<skills>`: the loaded skills, while `read` or `bash` is active (see
+  [Skills](#skills)).
 - `<cwd>`: the working directory.
 
 The tool list and rules follow the tools the request declares, so
@@ -337,8 +340,8 @@ here too: the tool appears once, with the extension's snippet and guidelines. Up
 points at its installed documentation, is left out: pi installs none.
 
 A custom prompt replaces the role, `<tools>`, and `<rules>`. The appended
-text, context files, and working directory still follow it. It is the first
-of these that exists:
+text, context files, skills, and working directory still follow it. It is the
+first of these that exists:
 
 1. `--system-prompt <text-or-path>`
 2. the `systemPrompt` setting
@@ -358,6 +361,99 @@ override replaces only its own directory's file. In a linked git worktree
 checked out inside its main checkout, the worktree's file replaces the main
 checkout's file of the same name instead of adding to it.
 `--no-context-files` (`-nc`) loads none.
+
+### Skills
+
+A skill is a directory with a `SKILL.md`: frontmatter with a `description`,
+then instructions. pi loads and uses skills as upstream does (its
+`docs/skills.md`, and the Agent Skills specification).
+
+```markdown
+---
+name: pdf-tools
+description: Extract text and tables from PDF files. Use when reading PDFs.
+---
+# PDF tools
+
+Read `references/formats.md` before converting a document.
+```
+
+Where skills come from, in the order they load:
+
+1. The `skills` setting of a trusted project, then `.pi/skills`, then
+   `.agents/skills` in each directory from the working directory up to the
+   repository root.
+2. The user's `skills` setting, then `skills/` in the agent directory, then
+   `~/.agents/skills`.
+3. Packages.
+4. Each `--skill <path>`, a file or a directory. `--no-skills` (`-ns`) turns
+   everything above off and keeps these.
+
+In a directory, every `SKILL.md` below it is a skill, and nothing below a
+skill's own directory is searched, so its scripts and references are not
+skills. A Markdown file with a `description` is a skill too when it sits
+directly in `skills/` (in `.agents/skills`, when it sits below it). A skill is
+named by its frontmatter `name`, else by its directory. A `SKILL.md` without
+a `description`, or with frontmatter pi cannot read, is not loaded.
+Frontmatter is read as the YAML the Agent Skills specification uses: plain
+and quoted values, `true`/`false`, and `|` or `>` blocks; a nested mapping or
+a list is accepted and ignored.
+
+When two skills have one name, the first loaded wins. `/diagnostics` reports
+the others, and names and descriptions that break the specification's rules
+(those still load).
+
+The system prompt lists each skill's name, description, and file, and tells
+the model to load the file with `read` (with `bash` when `read` is off) when
+a task matches. A skill with `disable-model-invocation: true` is not listed.
+
+`/skill:<name> [arguments]` sends the skill itself, in every mode: the file's
+text without its frontmatter, in a `<skill>` block that names the file and
+the directory its relative paths start from, followed by the arguments.
+`/skills` lists the loaded skills.
+
+### Prompt templates
+
+A Markdown file `name.md` is the command `/name`, as in upstream's
+`docs/prompt-templates.md`. Templates come from the `prompts` setting and
+`.pi/prompts` of a trusted project, the user's `prompts` setting and
+`prompts/` in the agent directory, packages, and each
+`--prompt-template <path>` (a file or a directory), in that order; the first
+of a name wins. `--no-prompt-templates` (`-np`) keeps only the
+`--prompt-template` paths. A prompts directory gives the Markdown files
+directly in it; a directory named by a setting or a package gives every
+Markdown file below it.
+
+```markdown
+---
+description: Review staged git changes
+argument-hint: "[focus]"
+---
+Review the staged changes. Focus on ${1:-correctness}.
+```
+
+`/review concurrency` sends the file's text without its frontmatter, with the
+command's arguments substituted:
+
+| Placeholder | Stands for |
+|---|---|
+| `$1`, `$2`, ... | one argument |
+| `$@`, `$ARGUMENTS` | all arguments, joined by spaces |
+| `${1:-default}`, `${@:-default}` | the argument, or all of them, or the default |
+| `${@:N}`, `${@:N:L}` | the arguments from the Nth on, or `L` of them |
+
+Quotes keep spaces in an argument: `/review "API compatibility"`. `/prompts`
+lists the templates, and command completion shows each one's argument hint
+and description.
+
+Skill commands and templates expand wherever input enters: a prompt in the
+TUI, in print mode, and in RPC mode, and steering and follow-ups in the TUI
+and in RPC mode. A command that names neither is sent to the model as text.
+The TUI's own commands come first, then pi's slash-tool prompts (`/read
+<path>`, `/bash <command>`, ...), then skills, then templates.
+
+pi also keeps `/prompt <name> [input]` in the TUI: `{{input}}` in the
+template stands for the input, which otherwise follows the template's text.
 
 ### Session variables
 
@@ -746,7 +842,7 @@ resources by convention through `extensions/`, `skills/`, `prompts/`, and
 {
   "pi": {
     "extensions": ["extensions/assist"],
-    "skills": ["skills/review.md"],
+    "skills": ["skills/review"],
     "prompts": ["prompts/fix.md"],
     "themes": ["themes/dark.json"]
   }
@@ -838,8 +934,9 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/image-models [search]`
 - `/generate-image <output> <prompt>`
 - `/skills`
-- `/skill:<name> [input]`
+- `/skill:<name> [arguments]` (see [Skills](#skills))
 - `/prompts`
+- `/<template> [arguments]` (see [Prompt templates](#prompt-templates))
 - `/prompt <name> [input]`
 - `/themes`
 - `/theme <name>`
@@ -921,7 +1018,7 @@ Collapsed thinking and tool blocks use at most three terminal rows (excluding th
 
 Queued follow-ups are visible immediately above the editor, one truncated line per message (the newest four when the queue overflows). Up with an empty editor recalls the newest queued message for editing (otherwise prompt-history navigation is unchanged). Mid-turn `ctrl+s` steers queued messages followed by the draft at the next provider boundary (a prose-only response has no interior boundary, so steering is delivered after it finishes and the queue hint says so); the existing steering mode still controls batch size. Queue edits are journaled during streaming and survive reload/resume.
 
-Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Shell commands (`!`, `/bash`, and the model's `bash` tool) are non-interactive: stdin is empty and the command runs in its own session without a controlling terminal, so a program that prompts for input fails instead of waiting. A command that times out or whose turn is interrupted is killed together with its whole process group, and a timeout returns the output so far; background jobs started by a command that finished normally keep running, and the command returns without waiting for them. `!` and `/bash` commands time out after 120 seconds; the model's `bash` calls have no timeout unless the model sets one. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
+Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. A skill command or a prompt template typed mid-turn is queued expanded: as a follow-up with Enter, as steering with ctrl+s. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Shell commands (`!`, `/bash`, and the model's `bash` tool) are non-interactive: stdin is empty and the command runs in its own session without a controlling terminal, so a program that prompts for input fails instead of waiting. A command that times out or whose turn is interrupted is killed together with its whole process group, and a timeout returns the output so far; background jobs started by a command that finished normally keep running, and the command returns without waiting for them. `!` and `/bash` commands time out after 120 seconds; the model's `bash` calls have no timeout unless the model sets one. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
 
 The TUI defaults to an owned alternate-screen transcript with a fixed composer. Mouse wheel and PageUp/PageDown scroll only the conversation; Up/Down retain prompt-history/queue navigation. At the bottom, new output follows automatically. Scrolling up anchors the reader to logical text: streaming, resizing, panel changes, and reload do not steal the reading position. `↓ Scroll to bottom · Esc` appears while reading (with `new output` when text arrives); click it, press Esc, or scroll down to resume following. Live thinking-tail previews are frozen while reading; returning to latest refreshes them. Esc dismisses an open selector/diff panel first, otherwise returns to latest without clearing the draft/attachments or interrupting generation. At latest it retains the existing clear/interrupt behavior. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 
@@ -1070,10 +1167,18 @@ arguments.
 
 Commands: `prompt` (with `images`, `streamingBehavior`, and `requestId`),
 `steer`, `follow_up`, `abort`, `resume_run`, `clear_queue`, `get_state`,
-`get_messages`, `get_last_assistant_text`, `new_session`, `switch_session`,
-`set_model`, `set_thinking_level`, `set_steering_mode`, `set_follow_up_mode`,
-`compact`, and `set_session_name`. Other upstream commands answer
-`Unsupported command: <type>`, and unknown types `Unknown command: <type>`.
+`get_messages`, `get_last_assistant_text`, `get_commands`, `new_session`,
+`switch_session`, `set_model`, `set_thinking_level`, `set_steering_mode`,
+`set_follow_up_mode`, `compact`, and `set_session_name`. Other upstream
+commands answer `Unsupported command: <type>`, and unknown types
+`Unknown command: <type>`.
+
+A `prompt`, `steer`, or `follow_up` whose message is a skill command or a
+prompt template is expanded when it arrives, so the queue and the session
+hold the expansion. `get_commands` lists the templates and the skills (as
+`skill:<name>`) with their descriptions and where each was loaded from. A
+message that starts with `/` and names neither goes to the model as text,
+except pi's slash-tool prompts, which run their tool.
 
 A `prompt` that starts a run answers `{"disposition":"started","runId":"…"}`,
 then the run reports `agent_start`, its turns (`turn_start` … `turn_end`),
@@ -1198,9 +1303,12 @@ where Rust intentionally supports compatibility or analogous behavior. The RPC
 protocol fixture records every stdout record of upstream `pi --mode rpc` for
 scripted runs against a local stub model, and pi's RPC mode is compared with it
 record by record. The system prompt fixture records upstream's prompt text
-for fixed tools, prompt sources, and context files, and which prompt and
-context files upstream picks from a directory tree; pi's prompt is compared
-with it to the byte. Secrets are redacted. Rust tests
+for fixed tools, prompt sources, context files, and skills, and which prompt
+and context files upstream picks from a directory tree; pi's prompt is
+compared with it to the byte. The skills fixture records which skills and
+prompt templates upstream loads from directory trees, settings, and flags,
+how it reads their frontmatter, and what it sends for `/skill:name` and
+`/template` input; pi is compared with each. Secrets are redacted. Rust tests
 compare covered behavior against those fixtures, so upstream changes become
 visible as fixture diffs and test failures.
 

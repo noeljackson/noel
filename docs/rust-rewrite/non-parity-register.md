@@ -289,9 +289,9 @@ differences:
   a link to this repository would need network access and a model that
   fetches it. The parity test drops exactly this section from upstream's
   text.
-- No `<skills>` section yet. The builder renders a listing it is given
-  (`SystemPromptInput::skills`), in upstream's place between project context
-  and the working directory, and the runtime gives it none.
+- The `<skills>` section is upstream's, and present while `read` or `bash`
+  is active. Upstream also keeps it, naming no tool, when an extension hides
+  the reader from the model; Rust has no hidden tools.
 - Rust enables every builtin tool by default; upstream starts with `read`,
   `bash`, `edit`, and `write`. So the default prompt also lists `grep`,
   `find`, and `ls`, and leaves out the rule "Use bash for file operations
@@ -327,6 +327,96 @@ Reason: the prompt is how the model learns its role, its tools, and the
 project's instructions, so Rust keeps upstream's text and order and diverges
 only where it has nothing to point at (documentation, extension hooks) or has
 something upstream lacks (its own tools and settings).
+
+### Skills and Prompt Templates
+
+Rust loads, lists, and expands skills and prompt templates as upstream does
+(`core/skills.ts`, `core/prompt-templates.ts`, and the session's expansion
+in `core/agent-session.ts`). `skills.json` holds upstream's results, and
+`discovery_matches_ts_resource_loader`, `frontmatter_matches_ts_parser`,
+`skills_listing_matches_ts_formatter`, `template_arguments_match_ts`,
+`input_expansion_matches_ts_session`, and `get_commands_matches_upstream`
+compare with them exactly. The differences:
+
+Loading:
+
+- Frontmatter is read by a parser for the part of YAML the Agent Skills
+  specification uses: one mapping of plain or quoted scalars, booleans, and
+  `|` / `>` block scalars. A nested mapping, a sequence, or a flow collection
+  is accepted as a value that is not a string. Anchors, aliases, tags,
+  complex keys, directives, and a frontmatter that is one flow mapping are
+  malformed here and load in upstream. A file with malformed frontmatter is
+  reported and not loaded, as in upstream; the message is Rust's, not the
+  YAML library's (the fixture records it as `<yaml-error>`).
+- A directory's entries are read by name. Upstream reads them in the order
+  the filesystem lists them, so which of two same-named skills in one
+  directory wins is not defined there. The fixture script lists directories
+  by name to record a stable order.
+- Ignore files (`.gitignore`, `.ignore`, `.fdignore`) use Rust's matcher: `*`
+  and `?`, a trailing `/` for directories, and `!` to negate; a pattern with
+  a slash matches the path below the top directory and one without matches a
+  name at any depth. Upstream applies full gitignore rules (`**`, character
+  classes, escapes).
+- The `skills` and `prompts` settings name paths. Upstream also reads
+  pattern entries there (`!pattern`, `+path`, `-path`, and globs), which
+  narrow the named paths and switch discovered resources on and off. Rust
+  reads none; it has `disabledResources` and `pi config enable|disable`,
+  applied after loading, so disabling the skill that won a name does not
+  load the one it beat. A setting's path that does not exist is listed in
+  `/diagnostics`; upstream passes over it.
+- Packages are Rust's local package directories. The project's `packages`
+  setting replaces the user's instead of adding to it, so package resources
+  are the project's when the project lists packages and the user's
+  otherwise. Upstream's extensions can add skill and template paths
+  (`resources_discover`, and packages given with `-e`); Rust's cannot.
+- A `file://` URL as a resource path is not resolved.
+- Under the test harness (`PI_TEST_ISOLATION`), `~/.agents/skills` is not
+  read.
+- Diagnostics appear in `/diagnostics` and the footer's count, all alike.
+  Upstream prints skill and prompt conflicts at startup, a
+  `--prompt-template` path that does not exist as an error and the rest as
+  warnings.
+
+Use:
+
+- Until the `read` tool may leave the working directory, the model cannot
+  load a skill file outside it with `read`, as the listing tells it to: a
+  user skill in the agent directory, or one given with `--skill` from
+  elsewhere. `bash` can read it, and `/skill:name` is not affected. This
+  entry goes when the tool's confinement does.
+- Input is expanded where each mode takes it (`pi_core::expand_input`): the
+  TUI on submit, on steering, and on queueing, print mode for its prompt, and
+  RPC mode for `prompt`, `steer`, and `follow_up`. Upstream expands in its
+  session, after extension commands and `input` handlers, which Rust lacks.
+- Rust's slash-tool prompts (`/read <path>`, `/bash <command>`, `/write`,
+  `/edit`, `/grep`, `/find`, `/ls`, `/web-search`, `/web-fetch`) come before
+  skills and templates in every mode, so a template with one of those names
+  is not reachable by its command. A template's expansion is submitted as
+  typed text: one that begins with a slash-tool command runs that tool.
+  Upstream has no slash-tool prompts.
+- A skill whose file can no longer be read when its command is used is sent
+  as the command's text, as in upstream, without upstream's error event.
+- Print mode joins its arguments into one prompt, so `pi -p /fix 42` is the
+  command `/fix 42`. Upstream sends each argument as its own prompt.
+- TUI: `/skills`, `/prompts`, and `/prompt <name> [input]` are Rust's own.
+  `/prompt` sends the template's text without its frontmatter, with
+  `{{input}}` replaced by the input or the input appended; it substitutes no
+  `$1` placeholders. A template named like a TUI command is reachable only in
+  print and RPC modes, as with upstream's built-in commands.
+- TUI: a skill command or template entered while a turn runs is queued as a
+  follow-up, as any text entered then is, or as steering with the steer key.
+  Upstream steers it. Other unknown commands are refused mid-turn.
+- TUI: the transcript shows a submitted skill command as it was typed, and a
+  resumed session shows the saved `<skill>` block as text. Upstream renders
+  the block collapsed in both.
+- TUI: completion matches commands by prefix, a skill also by its bare name;
+  upstream matches fuzzily. Skill commands always complete: upstream's
+  `enableSkillCommands` setting is not read.
+
+Reason: a skill or template written for upstream, or for another Agent
+Skills tool, should load and read the same here, so the loading order, the
+listing, and the expansions are upstream's to the byte. Rust differs where it
+has no YAML library, no extension runtime, and its own commands and queue.
 
 ### Windows-Only PowerShell Tool
 
@@ -671,8 +761,10 @@ Other differences:
   `set_auto_compaction`, `cycle_model`, `get_available_models`,
   `cycle_thinking_level`, `get_available_thinking_levels`,
   `get_session_stats`, `export_html`, `fork`, `clone`, `get_fork_messages`,
-  `get_entries`, `get_tree`, and `get_commands`. pi has no extension UI
-  requests.
+  `get_entries`, and `get_tree`. pi has no extension UI requests.
+- `get_commands` lists prompt templates, then skills. pi has no extension
+  commands to list before them, and its own `/extension:<name>` commands
+  exist only in the TUI.
 - `--mode rpc` takes no prompt arguments; upstream ignores them.
 
 Reason: pi's run engine, session journal, and queue are its own (see Batched

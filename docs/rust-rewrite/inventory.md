@@ -62,10 +62,11 @@ Implemented CLI flags include:
 - `--no-builtin-tools`, `-nbt` (extension tools stay enabled)
 - `--tools`, `-t` (names and `*` patterns, or only `+name`/`-name` entries)
 - `--exclude-tools`, `-xt` (names and `*` patterns)
-- `--skill <path>`
-- `--no-skills`, `-ns`
-- `--prompt-template <path>`
-- `--no-prompt-templates`, `-np`
+- `--skill <path>` (a file or a directory; repeatable)
+- `--no-skills`, `-ns` (no discovery; `--skill` paths still load)
+- `--prompt-template <path>` (a file or a directory; repeatable)
+- `--no-prompt-templates`, `-np` (no discovery; `--prompt-template` paths
+  still load)
 - `--theme <path>`
 - `--no-themes`
 - `--no-context-files`, `-nc`
@@ -128,12 +129,14 @@ Project-local files:
 - `.pi/skills`
 - `.pi/prompts`
 - `.pi/themes`
-- `.agents/skills`
+- `.agents/skills`, in each directory from the cwd up to the repository root
 - `AGENTS.override.md`, `AGENTS.md`, or `CLAUDE.md` (one per directory, in
   that order) discovered from the global agent dir and cwd ancestors,
   whatever the project trust decision; trust gates only the `.pi` resources
   and `.agents/skills` above. A linked worktree nested in its main checkout
   replaces the main checkout's same-named file.
+
+Outside both, `~/.agents/skills` holds user skills, as upstream reads it.
 
 Rust behavior:
 
@@ -260,9 +263,10 @@ Implemented built-in slash commands include:
 - `/image-models [search]`
 - `/generate-image <output> <prompt>`
 - `/skills`
-- `/skill:<name> [input]`
+- `/skill:<name> [arguments]`
 - `/prompts`
-- `/prompt <name> [input]`
+- `/<template> [arguments]`
+- `/prompt <name> [input]` (Rust-only)
 - `/themes`
 - `/theme <name>`
 - `/queue [prompt]`
@@ -309,8 +313,11 @@ Loaded resources add dynamic commands:
 
 - `/extension:<name>`
 - `/skill:<name>`
-- `/prompt <name>`
+- `/<template>`, and `/prompt <template>`
 - `/theme <name>`
+
+A line that is none of these, nor a slash-tool prompt, skill command, or
+template, is sent to the model as text, as upstream sends it.
 
 ## System Prompt
 
@@ -332,8 +339,50 @@ Rust behavior:
 - The model's `bash` commands get `PI_SESSION_ID`, `PI_SESSION_FILE`,
   `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`, and the prompt's bash
   rule says so. The process carries `AI_AGENT` and `PI_CODING_AGENT`.
-- Not ported: the documentation section, by decision, and the skills
-  listing, not yet (see "Default System Prompt" in the non-parity register).
+- The skills listing is upstream's `formatSkillsForPrompt` text, present
+  while `read` or `bash` is active and without the skills that set
+  `disable-model-invocation`.
+- Not ported: the documentation section, by decision (see "Default System
+  Prompt" in the non-parity register).
+
+## Skills and Prompt Templates
+
+Upstream loads skills (`core/skills.ts`) and prompt templates
+(`core/prompt-templates.ts`) through its resource loader and package manager,
+lists skills in the system prompt, and expands `/skill:name` and `/template`
+input in its session (`core/agent-session.ts`).
+
+Rust behavior, compared with upstream's results in `skills.json`:
+
+- Discovery: `skills/` in the agent dir and a trusted project's `.pi/skills`
+  (every `SKILL.md` below, and described Markdown files directly in them);
+  `~/.agents/skills` and a trusted project's `.agents/skills` from the cwd up
+  to the repository root; the `skills` and `prompts` settings; packages;
+  `--skill` and `--prompt-template`, each a file or a directory. Templates
+  are the Markdown files directly in a `prompts/` directory.
+- Order: project setting, project directories, user setting, user
+  directories, packages, command line. The first resource of a name wins;
+  the others are reported in `/diagnostics`.
+- `--no-skills` and `--no-prompt-templates` turn discovery off and keep the
+  command line's paths.
+- Frontmatter: `name`, a required `description`, and
+  `disable-model-invocation` for skills; `description` and `argument-hint`
+  for templates. A `SKILL.md` without a description is not loaded. Names and
+  descriptions outside the Agent Skills rules are reported and still load.
+- `/skill:name arguments`: the skill's file without frontmatter in
+  upstream's `<skill>` block, then the arguments.
+- `/name arguments`: the template's text with `$1`, `$@`, `$ARGUMENTS`,
+  `${1:-default}`, `${@:N}`, and `${@:N:L}` substituted; quotes keep spaces
+  in an argument.
+- Expansion applies to prompts in the TUI, print mode, and RPC mode, and to
+  steering and follow-ups in the TUI and RPC mode (`pi_core::expand_input`).
+  A command that names no skill or template is text for the model.
+- RPC `get_commands` lists templates and skills with `source` and
+  `sourceInfo`.
+- Rust-only: `/skills`, `/prompts`, and `/prompt <name> [input]` with its
+  `{{input}}` placeholder; slash-tool prompts come before templates.
+- Differences are listed under "Skills and Prompt Templates" in the
+  non-parity register.
 
 ## Tool Surface
 
@@ -526,7 +575,9 @@ URL, method, selected headers, body, and payload shape for covered providers.
 Rust tests compare local provider request builders against those captures.
 `rpc-protocol.json` records upstream RPC mode instead: every stdout record, in
 order, for scripted runs against a local stub model; `pi-cli`'s `rpc_parity`
-test compares pi's RPC mode with it record by record. Drift
+test compares pi's RPC mode with it record by record. `skills.json` records
+what upstream loads, lists, and expands for skills and prompt templates;
+`pi-config`, `pi-core`, and the `rpc_parity` test compare with it. Drift
 is handled by updating Rust behavior and committed fixtures together, then
 running `make parity-check` and `make check`.
 
