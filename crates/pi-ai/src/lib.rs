@@ -31,6 +31,26 @@ pub enum StreamEvent {
     },
 }
 
+/// True when a stop reason means the reply was cut off by the output-token
+/// or context limit, so tool-call arguments in it may be truncated:
+/// Anthropic and Bedrock `max_tokens`, OpenAI-compatible `length`, Gemini
+/// `MAX_TOKENS`, and Anthropic `model_context_window_exceeded`.
+pub fn is_output_limit_stop(reason: &str) -> bool {
+    matches!(
+        reason.to_ascii_lowercase().as_str(),
+        "max_tokens" | "length" | "max_output_tokens" | "model_context_window_exceeded"
+    )
+}
+
+/// Tool result for a call that came in a reply cut off by the output limit
+/// (upstream `failToolCallsFromTruncatedMessage`). The call is not run, so
+/// the model can re-issue it with complete arguments.
+pub fn truncated_tool_call_error(tool_name: &str) -> String {
+    format!(
+        "Tool call \"{tool_name}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments."
+    )
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderApi {
@@ -3942,6 +3962,29 @@ mod tests {
             assert!(OpenAiResponsesSseParser::default()
                 .parse_data(&json!({"type":kind}).to_string(), &mut |_| Ok(()))
                 .is_err());
+        }
+    }
+
+    #[test]
+    fn output_limit_stop_reasons_cover_every_provider_spelling() {
+        for reason in [
+            "max_tokens",
+            "MAX_TOKENS",
+            "length",
+            "max_output_tokens",
+            "model_context_window_exceeded",
+        ] {
+            assert!(is_output_limit_stop(reason), "{reason}");
+        }
+        for reason in [
+            "stop",
+            "STOP",
+            "end_turn",
+            "tool_use",
+            "toolUse",
+            "completed",
+        ] {
+            assert!(!is_output_limit_stop(reason), "{reason}");
         }
     }
 

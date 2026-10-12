@@ -168,6 +168,9 @@ pub async fn run_turn(
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();
+        // A reply cut off by the output limit may carry truncated arguments
+        // that still parse; none of its tool calls run.
+        let mut truncated = false;
         for event in events {
             match event {
                 StreamEvent::Text(delta) => text.push_str(&delta),
@@ -180,6 +183,7 @@ pub async fn run_turn(
                     name,
                     arguments,
                 }),
+                StreamEvent::Stop { reason } => truncated |= pi_ai::is_output_limit_stop(&reason),
                 _ => {}
             }
         }
@@ -194,7 +198,11 @@ pub async fn run_turn(
         });
 
         if let FinalOutputPolicy::RequiredTool { name } = &config.final_output {
-            if let Some(call) = tool_calls.iter().find(|call| &call.name == name) {
+            if let Some(call) = tool_calls
+                .iter()
+                .find(|call| &call.name == name)
+                .filter(|_| !truncated)
+            {
                 let arguments = serde_json::from_str(&call.arguments).map_err(|source| {
                     AgentError::InvalidToolArguments {
                         tool: call.name.clone(),
@@ -227,7 +235,11 @@ pub async fn run_turn(
                 return Err(AgentError::Cancelled);
             }
             on_event(&AgentEvent::ToolStarted(call.clone()));
-            let result = executor.execute(&call).await;
+            let result = if truncated {
+                Err(pi_ai::truncated_tool_call_error(&call.name))
+            } else {
+                executor.execute(&call).await
+            };
             let (output, is_error) = match result {
                 Ok(output) => (output, false),
                 Err(error) => (error, true),
@@ -419,5 +431,70 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, AgentError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn tool_calls_from_a_reply_cut_off_at_the_output_limit_are_not_run() {
+        struct TruncatedThenDone(std::sync::Mutex<usize>);
+
+        #[async_trait]
+        impl Provider for TruncatedThenDone {
+            async fn complete(
+                &self,
+                _request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                let mut calls = self.0.lock().unwrap();
+                *calls += 1;
+                if *calls > 1 {
+                    return Ok(vec![StreamEvent::Text("done".to_string())]);
+                }
+                Ok(vec![
+                    StreamEvent::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: r#"{"command":"rm -rf build"}"#.to_string(),
+                    },
+                    StreamEvent::Stop {
+                        reason: "length".to_string(),
+                    },
+                ])
+            }
+        }
+
+        struct RecordingExecutor(std::sync::Mutex<Vec<String>>);
+
+        #[async_trait]
+        impl ToolExecutor for RecordingExecutor {
+            async fn execute(&self, call: &ChatToolCall) -> Result<String, String> {
+                self.0.lock().unwrap().push(call.name.clone());
+                Ok("ran".to_string())
+            }
+        }
+
+        let executor = RecordingExecutor(std::sync::Mutex::new(Vec::new()));
+        let mut state = AgentState::default();
+        let output = run_turn(
+            &TruncatedThenDone(std::sync::Mutex::new(0)),
+            &mut state,
+            "clean up".into(),
+            &AgentConfig::default(),
+            &executor,
+            &CancellationToken::default(),
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, AgentOutput::Text("done".to_string()));
+        assert!(executor.0.lock().unwrap().is_empty());
+        let result = &state.messages[2];
+        assert_eq!(result.role, ChatRole::Tool);
+        assert_eq!(result.tool_call_id.as_deref(), Some("call_1"));
+        assert!(
+            result.content.contains("output token limit"),
+            "{}",
+            result.content
+        );
     }
 }

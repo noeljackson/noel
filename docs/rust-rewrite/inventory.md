@@ -362,6 +362,9 @@ Request limits:
 - Anthropic Messages requests without an explicit cap send the Claude model's
   output limit, lowered to fit the context window; other models on the
   Anthropic API default to 16384 tokens.
+- Tool calls in a reply cut off by the output-token limit (`max_tokens`,
+  `length`) are not run; each returns an error asking the model to re-issue
+  it with complete arguments.
 
 Model refresh:
 
