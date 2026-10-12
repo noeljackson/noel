@@ -753,8 +753,6 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error(transparent)]
     Tool(#[from] ToolError),
-    #[error("unknown slash command: {0}")]
-    UnknownCommand(String),
     #[error("missing argument for slash command: {0}")]
     MissingCommandArgument(String),
     #[error("tool is disabled: {0}")]
@@ -4106,8 +4104,9 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
                 limit: None,
             },
         })),
-        "/reload" | "/quit" | "/help" => Ok(None),
-        _ => Err(AgentError::UnknownCommand(command.to_string())),
+        // As upstream, any other text is for the model, whatever it starts
+        // with: a path, or a command that names nothing.
+        _ => Ok(None),
     }
 }
 
@@ -4897,6 +4896,50 @@ mod tests {
                 offset: None,
                 limit: None
             }
+        );
+    }
+
+    /// Text that starts with a slash but is no tool command is a prompt for
+    /// the model, as upstream sends it: a path, or a command nothing defines.
+    #[tokio::test]
+    async fn a_prompt_that_is_no_tool_command_goes_to_the_model() {
+        for prompt in ["/nope hi", "/home/user/main.rs is broken", "/help", "/"] {
+            assert_eq!(parse_tool_command(prompt).unwrap(), None, "{prompt}");
+        }
+        // A tool command without its argument is still refused.
+        assert!(matches!(
+            parse_tool_command("/read"),
+            Err(AgentError::MissingCommandArgument(command)) if command == "/read"
+        ));
+
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let provider = create_provider(ProviderConfig {
+            model: ModelRef {
+                provider: "faux".to_string(),
+                id: "echo".to_string(),
+            },
+            api: ProviderApi::Faux,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        });
+        let reply = run_user_turn(&mut runtime, provider.as_ref(), "/nope hi".to_string())
+            .await
+            .expect("the model answers");
+        assert_eq!(reply, "[faux/echo] /nope hi");
+        let roles = runtime
+            .session()
+            .messages
+            .iter()
+            .map(|message| &message.role);
+        assert_eq!(
+            roles.collect::<Vec<_>>(),
+            [&MessageRole::User, &MessageRole::Assistant]
         );
     }
 
