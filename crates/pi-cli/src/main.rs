@@ -3539,6 +3539,13 @@ struct TuiApp {
     /// has no interior round boundary, so ctrl+s steering only lands after
     /// the response finishes and the hint must not promise a boundary.
     turn_saw_tools: bool,
+    /// True once the reply of the current provider round has streamed text.
+    /// If the turn drops that reply to ask again, the text stays where it is
+    /// and the next reply starts a new entry below it.
+    round_saw_text: bool,
+    /// True while a compaction answers a context overflow: if it fails, the
+    /// turn does not go on with the full history, it stops asking.
+    overflow_compaction: bool,
     /// Provider name of the active model, kept in sync for pickers that open
     /// while the runtime is borrowed by a streaming turn.
     active_model_provider: Option<String>,
@@ -6646,8 +6653,10 @@ fn apply_turn_event(
     event: &TurnEvent,
 ) {
     match event {
+        TurnEvent::RoundStarted => app.round_saw_text = false,
         TurnEvent::Provider(StreamEvent::Text(text)) => {
             *activity = Activity::Writing;
+            app.round_saw_text = true;
             app.live_thinking_index = None;
             // Text that follows a tool round starts a new assistant entry at
             // the bottom of the transcript instead of growing the first one
@@ -6676,6 +6685,20 @@ fn apply_turn_event(
             app.live_tool_indices.push(app.entries.len());
             app.push(TuiEntryKind::Tool, format!("running {}\n\n", call.name));
         }
+        // A running command's output so far. The collapsed preview shows
+        // its last line; ctrl+o shows all of it.
+        TurnEvent::ToolUpdate { call, output } => {
+            if let Some(index) = app.live_tool_indices.last().copied() {
+                app.replace_entry(
+                    index,
+                    format!(
+                        "running {}\n{}\n{output}",
+                        call.name,
+                        tool_call_detail(call)
+                    ),
+                );
+            }
+        }
         TurnEvent::ToolOutput {
             call,
             output,
@@ -6695,15 +6718,44 @@ fn apply_turn_event(
                 );
             }
         }
+        TurnEvent::RetryStarted(notice) => {
+            *activity = Activity::Waiting;
+            let delay = match notice.delay_ms {
+                delay if delay >= 1000 => format!("{}s", delay / 1000),
+                delay => format!("{delay}ms"),
+            };
+            app.push(
+                TuiEntryKind::System,
+                format!(
+                    "retrying in {delay} (attempt {} of {}): {}",
+                    notice.attempt, notice.max_attempts, notice.error_message
+                ),
+            );
+            *text_after_tool |= std::mem::take(&mut app.round_saw_text);
+        }
+        TurnEvent::Overflowed { error } => {
+            app.push(
+                TuiEntryKind::System,
+                match error {
+                    Some(error) => format!("context overflow; compacting to ask again: {error}"),
+                    None => "reply cut off at the output limit; compacting to ask again".into(),
+                },
+            );
+            app.overflow_compaction = true;
+            *text_after_tool |= std::mem::take(&mut app.round_saw_text);
+        }
         TurnEvent::CompactionStarted => *activity = Activity::Compacting,
         TurnEvent::CompactionFailed(reason) => {
             *activity = Activity::Waiting;
-            app.push(
-                TuiEntryKind::System,
-                format!("auto-compaction skipped: {reason}; continuing with full history"),
-            );
+            let notice = if std::mem::take(&mut app.overflow_compaction) {
+                format!("compaction failed, not asking again: {reason}")
+            } else {
+                format!("auto-compaction skipped: {reason}; continuing with full history")
+            };
+            app.push(TuiEntryKind::System, notice);
         }
         TurnEvent::CompactionFinished(record) => {
+            app.overflow_compaction = false;
             *activity = Activity::Waiting;
             app.push(
                 TuiEntryKind::System,
@@ -8960,6 +9012,10 @@ impl pi_ai::Provider for FreshAuthProvider {
 
     fn thinking_level(&self) -> Option<String> {
         self.config.thinking_level.clone()
+    }
+
+    fn output_limit(&self) -> Option<u64> {
+        pi_ai::model_output_limit(&self.config)
     }
 }
 
@@ -14463,7 +14519,7 @@ mod tests {
                 output: output.clone(),
                 images: Vec::new(),
                 is_error: false,
-                duration: Duration::ZERO,
+                duration: Some(Duration::ZERO),
             },
         ] {
             let mut live_text_index = assistant_index;
@@ -14624,7 +14680,7 @@ mod tests {
                 output: "HTTP 403".into(),
                 images: Vec::new(),
                 is_error: true,
-                duration: Duration::ZERO,
+                duration: Some(Duration::ZERO),
             },
         );
         assert_eq!(
@@ -14763,7 +14819,7 @@ mod tests {
                 output: "file body".into(),
                 images: Vec::new(),
                 is_error: false,
-                duration: Duration::ZERO,
+                duration: Some(Duration::ZERO),
             },
         );
         send(
@@ -14814,6 +14870,201 @@ mod tests {
         // The live pointer tracks the newest text entry, not the original.
         assert_eq!(live_text_index, app.entries.len() - 1);
         assert_eq!(app.live_entry_index, Some(app.entries.len() - 1));
+    }
+
+    /// Applies `events` to a new turn's entries (its thinking entry, then
+    /// its reply's placeholder) and returns them.
+    fn entries_after(events: &[TurnEvent]) -> Vec<(TuiEntryKind, String)> {
+        let mut app = TuiApp::default();
+        let thinking = app.push_placeholder(TuiEntryKind::Thinking, "");
+        let mut live_text_index = app.push_placeholder(TuiEntryKind::Assistant, "Working...");
+        let (mut saw_delta, mut text_after_tool) = (false, false);
+        for event in events {
+            apply_turn_event(
+                &mut app,
+                &mut live_text_index,
+                &mut text_after_tool,
+                thinking,
+                &mut saw_delta,
+                &mut Activity::Waiting,
+                event,
+            );
+        }
+        let entries = app.entries.into_iter();
+        entries.map(|entry| (entry.kind, entry.text)).collect()
+    }
+
+    #[test]
+    fn a_running_command_shows_its_output_so_far() {
+        use ratatui::backend::TestBackend;
+        let call = pi_ai::ChatToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"make test"}"#.into(),
+        };
+        let update = |output: &str| TurnEvent::ToolUpdate {
+            call: call.clone(),
+            output: output.into(),
+        };
+        let started = TurnEvent::ToolStarted { call: call.clone() };
+        let tool = |events: &[TurnEvent]| entries_after(events)[2].clone().1;
+        // The command starts, prints, prints more, and ends.
+        assert_eq!(tool(std::slice::from_ref(&started)), "running bash\n\n");
+        assert_eq!(
+            tool(&[started.clone(), update("")]),
+            "running bash\n$ make test\n"
+        );
+        let running = [
+            started.clone(),
+            update(""),
+            update("one\n"),
+            update("one\ntwo\nthree\n"),
+        ];
+        assert_eq!(
+            tool(&running),
+            "running bash\n$ make test\none\ntwo\nthree\n"
+        );
+        let mut finished = running.to_vec();
+        finished.push(TurnEvent::ToolOutput {
+            call: call.clone(),
+            output: "one\ntwo\nthree\nfour\n".into(),
+            images: Vec::new(),
+            is_error: false,
+            duration: Some(Duration::ZERO),
+        });
+        assert_eq!(
+            tool(&finished),
+            "completed bash\n$ make test\none\ntwo\nthree\nfour\n"
+        );
+
+        // On screen the running command shows its latest line, and all of
+        // its output once previews are expanded.
+        let config = minimal_test_config();
+        let mut app = TuiApp {
+            owned_screen: true,
+            turn_running: true,
+            ..Default::default()
+        };
+        app.push(TuiEntryKind::Tool, tool(&running));
+        app.live_tool_indices.push(0);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        let screen = buffer_rows(terminal.backend().buffer()).join("\n");
+        assert!(
+            screen.contains("Running a command · $ make test · 2 more lines"),
+            "{screen}"
+        );
+        assert!(screen.contains("… three"), "{screen}");
+        assert!(!screen.contains("one"), "{screen}");
+        app.previews_expanded = true;
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        let screen = buffer_rows(terminal.backend().buffer()).join("\n");
+        for line in ["  one", "  two", "  three"] {
+            assert!(screen.contains(line), "{line}: {screen}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_reply_stays_above_a_notice_and_the_next_reply_starts_below() {
+        let text = |text: &str| TurnEvent::Provider(StreamEvent::Text(text.into()));
+        let retry = TurnEvent::RetryStarted(pi_core::RetryNotice {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 2_000,
+            error_message: "request failed with status 503 Service Unavailable: overloaded".into(),
+        });
+        let notice = (
+            TuiEntryKind::System,
+            "retrying in 2s (attempt 1 of 3): request failed with status 503 Service Unavailable: overloaded".to_string(),
+        );
+        let thinking = (TuiEntryKind::Thinking, String::new());
+        let assistant = |text: &str| (TuiEntryKind::Assistant, text.to_string());
+
+        // The reply broke off after some text: the text stays, and the
+        // reply that replaces it is a new entry below the notice.
+        let events = [
+            TurnEvent::RoundStarted,
+            text("Hel"),
+            retry.clone(),
+            TurnEvent::RoundStarted,
+            text("Hello "),
+            text("again."),
+        ];
+        assert_eq!(
+            entries_after(&events),
+            [
+                thinking.clone(),
+                assistant("Hel"),
+                notice.clone(),
+                assistant("Hello again.")
+            ]
+        );
+        // The request failed before any text: the placeholder still waits
+        // for the reply.
+        let events = [
+            TurnEvent::RoundStarted,
+            retry.clone(),
+            TurnEvent::RoundStarted,
+            text("Hello again."),
+        ];
+        assert_eq!(
+            entries_after(&events),
+            [thinking.clone(), assistant("Hello again."), notice]
+        );
+        // A reply cut off at the output limit is dropped the same way once
+        // a compaction makes room to ask again.
+        let events = [
+            TurnEvent::RoundStarted,
+            text("This answer is cut"),
+            TurnEvent::Overflowed { error: None },
+            TurnEvent::CompactionStarted,
+            TurnEvent::CompactionFinished(pi_core::CompactionRecord {
+                kind: pi_core::CompactionKind::Automatic,
+                omitted_messages: 4,
+                retained_messages: 1,
+                summary: "Summary.".into(),
+            }),
+            TurnEvent::RoundStarted,
+            text("The whole answer."),
+        ];
+        assert_eq!(
+            entries_after(&events),
+            [
+                thinking,
+                assistant("This answer is cut"),
+                (
+                    TuiEntryKind::System,
+                    "reply cut off at the output limit; compacting to ask again".to_string()
+                ),
+                (
+                    TuiEntryKind::System,
+                    "auto-compacted: omitted 4 message(s)".to_string()
+                ),
+                assistant("The whole answer.")
+            ]
+        );
+        // If that compaction fails, the turn does not ask again.
+        let events = [
+            TurnEvent::RoundStarted,
+            TurnEvent::Overflowed {
+                error: Some("too large".into()),
+            },
+            TurnEvent::CompactionStarted,
+            TurnEvent::CompactionFailed("nothing to compact".into()),
+        ];
+        assert_eq!(
+            entries_after(&events)[2..],
+            [
+                (
+                    TuiEntryKind::System,
+                    "context overflow; compacting to ask again: too large".to_string()
+                ),
+                (
+                    TuiEntryKind::System,
+                    "compaction failed, not asking again: nothing to compact".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]

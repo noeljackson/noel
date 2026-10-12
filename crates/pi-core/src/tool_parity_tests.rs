@@ -190,7 +190,7 @@ async fn builtin_tools_behave_like_upstream() {
             name: call["tool"].as_str().expect("call tool").to_string(),
             arguments: call["args"].to_string().replace("<tmp>", tmp_text),
         };
-        execute_model_tool_call(&mut runtime, &tool_call)
+        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
             .await
             .expect("record tool result");
         let event = runtime.session.tool_history.last().expect("tool event");

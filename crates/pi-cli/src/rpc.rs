@@ -32,8 +32,8 @@ use pi_config::LoadedConfig;
 use pi_core::{
     continue_turn_streaming_events, expand_input, run_saved_prompt_streaming_events,
     run_user_turn_streaming_events_with_media, AgentError, CancellationToken, CompactionKind,
-    ConversationMessage, MessageRole, RunControl, RunStart, RunStatus, Runtime, SessionState,
-    SessionStore, ToolEvent, TurnEvent,
+    ConversationMessage, MessageRole, RetryAbort, RunControl, RunStart, RunStatus, Runtime,
+    SessionState, SessionStore, ToolEvent, TurnEvent,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -142,12 +142,16 @@ struct Shared {
 struct Run {
     recorder: Recorder,
     cancellation: CancellationToken,
+    retry: RetryAbort,
     /// The session as the run has left it so far, for reads.
     session: SessionState,
     /// What `get_state` reports while the run cannot change it.
     state: State,
     /// Aborts to answer once the run settles.
     aborts: Vec<Option<Value>>,
+    /// `abort_retry` commands to answer once the retry they ended is
+    /// reported as ended.
+    retry_aborts: Vec<Option<Value>>,
 }
 
 /// A run accepted to start, or to continue.
@@ -211,6 +215,12 @@ impl Rpc {
             Ok(Command::Steer(input)) => self.enqueue(StreamingBehavior::Steer, input),
             Ok(Command::FollowUp(input)) => self.enqueue(StreamingBehavior::FollowUp, input),
             Ok(Command::Abort { expected_run_id }) => self.abort(expected_run_id),
+            // No run, so no retry is waiting.
+            Ok(Command::AbortRetry) => Ok(None),
+            Ok(Command::SetAutoRetry { enabled }) => {
+                self.runtime.set_retry_enabled(*enabled);
+                Ok(None)
+            }
             Ok(Command::ClearQueue) => self.shared().clear_queue(),
             Ok(Command::NewSession { parent_session }) => {
                 self.new_session(parent_session.as_deref())
@@ -344,7 +354,7 @@ impl Rpc {
         } = start;
         let control = RunControl {
             steering: self.shared().queue.steering.clone(),
-            cancellation: CancellationToken::default(),
+            ..RunControl::default()
         };
         let mut state = self.state();
         state.is_streaming = true;
@@ -356,9 +366,11 @@ impl Rpc {
         let run = Run {
             recorder: Recorder::start(run_id.clone(), source, &mut |record| send(&record)),
             cancellation: control.cancellation.clone(),
+            retry: control.retry.clone(),
             session,
             state,
             aborts: Vec::new(),
+            retry_aborts: Vec::new(),
         };
         self.shared().run = Some(run);
 
@@ -663,6 +675,15 @@ impl Shared {
                 }
                 Err(error) => Err(error),
             },
+            Ok(Command::AbortRetry) => {
+                let run = self.active();
+                if run.retry.abort() {
+                    // Answered once the retry is reported as ended.
+                    run.retry_aborts.push(request.id.clone());
+                    return;
+                }
+                Ok(None)
+            }
             Ok(Command::ClearQueue) => self.clear_queue(),
             Ok(Command::GetState) => {
                 let pending_message_count = self.queue.pending();
@@ -685,6 +706,7 @@ impl Shared {
             }
             Ok(
                 Command::ResumeRun { .. }
+                | Command::SetAutoRetry { .. }
                 | Command::NewSession { .. }
                 | Command::SwitchSession { .. }
                 | Command::SetModel { .. }
@@ -808,6 +830,9 @@ impl Shared {
         run.mirror(event);
         run.recorder
             .record(event, queue, &mut |record| send(&record));
+        if matches!(event, TurnEvent::RetryFinished { .. }) {
+            run.answer_retry_aborts();
+        }
         if matches!(event, TurnEvent::MessageAdded(message) if message.role == MessageRole::User) {
             self.save_delivered();
         }
@@ -829,9 +854,10 @@ impl Shared {
 
     /// Ends the active run's records and answers the aborts it waited for.
     fn settle(&mut self, outcome: Outcome) {
-        let Some(run) = self.run.take() else {
+        let Some(mut run) = self.run.take() else {
             return;
         };
+        run.answer_retry_aborts();
         run.recorder.finish(outcome, &mut |record| send(&record));
         for id in run.aborts {
             send(&Response::new(id.as_ref(), Some("abort"), Ok(None)));
@@ -840,6 +866,12 @@ impl Shared {
 }
 
 impl Run {
+    fn answer_retry_aborts(&mut self) {
+        for id in self.retry_aborts.drain(..) {
+            send(&Response::new(id.as_ref(), Some("abort_retry"), Ok(None)));
+        }
+    }
+
     /// Keeps the session copy in step with what the engine saves.
     fn mirror(&mut self, event: &TurnEvent) {
         match event {

@@ -9,7 +9,7 @@ use pi_ai::{ChatToolCall, MediaInput, ModelRef, StreamEvent};
 use pi_config::{model_context_window, LoadedConfig, ProviderApi, SourceInfo};
 use pi_core::{
     CompactionRecord, ConversationMessage, MessageRole, Run, RunStatus, Runtime, SessionState,
-    SteeringMailbox, ToolEvent, TurnEvent, STEERING_JOIN,
+    SteeringMailbox, ToolEvent, TurnEvent, RETRY_CANCELLED, STEERING_JOIN,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,7 +31,6 @@ const ABORTED: &str = "Request was aborted";
 /// Upstream commands pi does not implement; any other type is unknown.
 const UNSUPPORTED: &[&str] = &[
     "abort_bash",
-    "abort_retry",
     "bash",
     "clone",
     "cycle_model",
@@ -45,7 +44,6 @@ const UNSUPPORTED: &[&str] = &[
     "get_session_stats",
     "get_tree",
     "set_auto_compaction",
-    "set_auto_retry",
 ];
 
 // Commands.
@@ -100,6 +98,10 @@ pub(crate) enum Command {
     },
     ResumeRun {
         expected_run_id: String,
+    },
+    AbortRetry,
+    SetAutoRetry {
+        enabled: bool,
     },
     ClearQueue,
     NewSession {
@@ -834,6 +836,12 @@ pub(crate) enum Event<'a> {
         tool_name: &'a str,
         args: Value,
     },
+    ToolExecutionUpdate {
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+        args: Value,
+        partial_result: ExecutionResult<'a>,
+    },
     ToolExecutionEnd {
         tool_call_id: &'a str,
         tool_name: &'a str,
@@ -923,7 +931,7 @@ pub(crate) enum AssistantEvent<'a> {
     },
 }
 
-/// `tool_execution_end`'s result: the tool's output as text.
+/// A tool's result, or what it has printed so far: its output as text.
 #[derive(Serialize)]
 pub(crate) struct ExecutionResult<'a> {
     content: &'a [Content],
@@ -1016,12 +1024,15 @@ impl Outcome {
 }
 
 /// Writes one run's records from the engine's events. A run is one upstream
-/// run whatever its engine calls (one per batch of follow-ups): one
-/// agent_start, its turns, then one agent_end and one agent_settled.
+/// run whatever its engine calls (one per batch of follow-ups): agent_start,
+/// its turns, agent_end, and one agent_settled. As upstream does, a run that
+/// drops a reply to ask again (a retry, or a compaction after a context
+/// overflow) ends that reply's turn with agent_end and starts over with
+/// another agent_start, under the same run id.
 pub(crate) struct Recorder {
     run_id: String,
     source: Source,
-    /// The run's messages, for agent_end.
+    /// The messages since the last agent_start, for agent_end.
     messages: Vec<Message>,
     prompt: Option<Prompt>,
     /// Whether the current engine call reported a round.
@@ -1029,8 +1040,15 @@ pub(crate) struct Recorder {
     round: Option<Round>,
     reply: Option<Streaming>,
     tool: Option<ChatToolCall>,
-    retry: Option<u64>,
+    /// The retry not yet reported as ended, and the error it ended with if
+    /// the engine has reported one.
+    retry: Option<(u64, Option<String>)>,
     compacting: bool,
+    /// The compaction answers a context overflow: its reason is overflow,
+    /// and the run asks again once it succeeds.
+    overflowed: bool,
+    /// agent_end is written and nothing has started since.
+    ended: bool,
 }
 
 /// An open turn: when it started and where its reply is in the run's
@@ -1060,6 +1078,8 @@ impl Recorder {
             tool: None,
             retry: None,
             compacting: false,
+            overflowed: false,
+            ended: false,
         }
     }
 
@@ -1104,7 +1124,8 @@ impl Recorder {
             TurnEvent::MessageAdded(message) => self.add_user(message, queue, sink),
             TurnEvent::Provider(event) => self.stream(event, sink),
             TurnEvent::RetryStarted(notice) => {
-                self.retry = Some(notice.attempt);
+                self.drop_reply("error", Some(&notice.error_message), true, sink);
+                self.retry = Some((notice.attempt, None));
                 sink(Event::AutoRetryStart {
                     attempt: notice.attempt,
                     max_attempts: notice.max_attempts,
@@ -1112,13 +1133,29 @@ impl Recorder {
                     error_message: &notice.error_message,
                 });
             }
-            TurnEvent::RetryFinished { attempt, error } => {
+            TurnEvent::RetryFinished {
+                attempt,
+                error: None,
+            } => {
                 self.retry = None;
                 sink(Event::AutoRetryEnd {
-                    success: error.is_none(),
+                    success: true,
                     attempt: *attempt,
-                    final_error: error.as_deref(),
+                    final_error: None,
                 });
+            }
+            // Upstream reports a retry that failed after the agent_end of
+            // its last reply: now if that is written, else when it is.
+            TurnEvent::RetryFinished { attempt, error } => {
+                self.retry = Some((*attempt, error.clone()));
+                if self.ended {
+                    self.end_retry(None, sink);
+                }
+            }
+            TurnEvent::Overflowed { error } => {
+                let stop = if error.is_some() { "error" } else { "length" };
+                self.drop_reply(stop, error.as_deref(), false, sink);
+                self.overflowed = true;
             }
             TurnEvent::ToolStarted { call } => {
                 sink(Event::ToolExecutionStart {
@@ -1128,6 +1165,19 @@ impl Recorder {
                 });
                 self.tool = Some(call.clone());
             }
+            TurnEvent::ToolUpdate { call, output } => {
+                // Like upstream's bash, the report that the command starts
+                // has no content.
+                let content = (!output.is_empty()).then(|| Content::text(output));
+                sink(Event::ToolExecutionUpdate {
+                    tool_call_id: &call.id,
+                    tool_name: &call.name,
+                    args: parse_arguments(&call.arguments),
+                    partial_result: ExecutionResult {
+                        content: content.as_slice(),
+                    },
+                });
+            }
             TurnEvent::ToolOutput {
                 call,
                 output,
@@ -1136,12 +1186,12 @@ impl Recorder {
                 duration,
             } => {
                 let content = Content::text_and_images(output, images);
-                self.tool_output(call, content, *is_error, Some(millis(*duration)), sink);
+                self.tool_output(call, content, *is_error, duration.map(millis), sink);
             }
             TurnEvent::CompactionStarted => {
                 self.compacting = true;
                 sink(Event::CompactionStart {
-                    reason: "threshold",
+                    reason: self.compaction_reason(),
                 });
             }
             TurnEvent::CompactionFinished(record) => self.end_compaction(Ok(record), sink),
@@ -1173,22 +1223,89 @@ impl Recorder {
     }
 
     /// Ends the run: closes what an abort or a failure left open, then
-    /// agent_end and agent_settled.
+    /// agent_end, unless the run ended with a reply it had dropped, and
+    /// agent_settled.
     pub fn finish(mut self, outcome: Outcome, sink: Sink) {
         let aborted = matches!(outcome, Outcome::Aborted);
-        match outcome {
-            Outcome::Completed => {}
-            Outcome::Aborted => self.stop(None, sink),
-            Outcome::Failed(error) => self.stop(Some(&error), sink),
+        let error = match &outcome {
+            Outcome::Failed(error) => Some(error.as_str()),
+            Outcome::Completed | Outcome::Aborted => None,
+        };
+        if self.ended {
+            // Only the compaction that was to recover the dropped reply can
+            // still be open.
+            self.interrupt_compaction(error, sink);
+        } else {
+            if !matches!(outcome, Outcome::Completed) {
+                self.stop(error, sink);
+            }
+            self.end_agent(false, sink);
         }
-        sink(Event::AgentEnd {
-            messages: &self.messages,
-            will_retry: false,
-        });
+        // A retry the engine did not report as ended: an abort cancelled it.
+        self.end_retry(error, sink);
         sink(Event::AgentSettled {
             aborted,
             run_id: &self.run_id,
         });
+    }
+
+    /// Ends the turn of a reply the run drops to ask again, as upstream
+    /// does: the reply as it is (`error` is `None` for one cut off at the
+    /// output limit), turn_end, and agent_end.
+    fn drop_reply(
+        &mut self,
+        stop: &'static str,
+        error: Option<&str>,
+        will_retry: bool,
+        sink: Sink,
+    ) {
+        self.end_reply(stop, error, sink);
+        self.end_round(sink);
+        self.end_agent(will_retry, sink);
+    }
+
+    fn end_agent(&mut self, will_retry: bool, sink: Sink) {
+        sink(Event::AgentEnd {
+            messages: &self.messages,
+            will_retry,
+        });
+        self.messages.clear();
+        self.ended = true;
+    }
+
+    /// Reports the open retry, if any, as failed: with the error the engine
+    /// reported, else `error`, else as cancelled.
+    fn end_retry(&mut self, error: Option<&str>, sink: Sink) {
+        if let Some((attempt, reported)) = self.retry.take() {
+            let final_error = reported.as_deref().or(error).unwrap_or(RETRY_CANCELLED);
+            sink(Event::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: Some(final_error),
+            });
+        }
+    }
+
+    fn compaction_reason(&self) -> &'static str {
+        if self.overflowed {
+            "overflow"
+        } else {
+            "threshold"
+        }
+    }
+
+    /// Ends a compaction the engine left open when it stopped (`error` is
+    /// `None` for an abort).
+    fn interrupt_compaction(&mut self, error: Option<&str>, sink: Sink) {
+        if std::mem::take(&mut self.compacting) {
+            sink(Event::CompactionEnd {
+                reason: self.compaction_reason(),
+                result: None,
+                aborted: error.is_none(),
+                will_retry: false,
+                error_message: error,
+            });
+        }
     }
 
     /// Closes what the engine left open when it stopped (`error` is `None`
@@ -1200,22 +1317,7 @@ impl Recorder {
             let content = vec![Content::text(error.unwrap_or("Operation aborted"))];
             self.tool_output(&call, content, true, None, sink);
         }
-        if let Some(attempt) = self.retry.take() {
-            sink(Event::AutoRetryEnd {
-                success: false,
-                attempt,
-                final_error: Some(message),
-            });
-        }
-        if std::mem::take(&mut self.compacting) {
-            sink(Event::CompactionEnd {
-                reason: "threshold",
-                result: None,
-                aborted: error.is_none(),
-                will_retry: false,
-                error_message: error,
-            });
-        }
+        self.interrupt_compaction(error, sink);
         let awaiting_reply = self.reply.is_some()
             || self
                 .round
@@ -1245,6 +1347,12 @@ impl Recorder {
     }
 
     fn start_round(&mut self, sink: Sink) {
+        // The run starts over after a reply it dropped.
+        if std::mem::take(&mut self.ended) {
+            sink(Event::AgentStart {
+                run_id: &self.run_id,
+            });
+        }
         sink(Event::TurnStart);
         self.round = Some(Round {
             started: Instant::now(),
@@ -1298,7 +1406,11 @@ impl Recorder {
             .reply
             .take()
             .unwrap_or_else(|| Streaming::new(&self.source));
-        reply.close(sink);
+        // A reply a provider error broke off keeps its last block open, as
+        // upstream's does.
+        if stop_reason != "error" {
+            reply.close(sink);
+        }
         let assistant = &mut reply.assistant;
         assistant.stop_reason = stop_reason;
         assistant.error_message = error.map(str::to_owned);
@@ -1350,12 +1462,14 @@ impl Recorder {
     fn end_compaction(&mut self, result: Result<&CompactionRecord, &String>, sink: Sink) {
         self.compacting = false;
         sink(Event::CompactionEnd {
-            reason: "threshold",
+            reason: self.compaction_reason(),
             result: result.ok().map(Compaction::from),
             aborted: false,
-            will_retry: false,
+            // After an overflow, the run asks again with the smaller context.
+            will_retry: self.overflowed && result.is_ok(),
             error_message: result.err().map(String::as_str),
         });
+        self.overflowed = false;
     }
 }
 
@@ -1452,15 +1566,14 @@ impl Streaming {
     }
 }
 
-/// Upstream's stop reason for a reply. A reply with tool calls is `toolUse`
-/// whatever the provider's reason: one cut off at a token limit too, whose
-/// calls get error results instead of running. Without tool calls, every
-/// reason except a token limit is a normal stop. The provider's reason stays
-/// in `rawStopReason`.
+/// Upstream's stop reason for a reply. One cut off at a token limit is
+/// `length`, with or without tool calls (its calls get error results instead
+/// of running). Otherwise a reply with tool calls is `toolUse`, and any other
+/// a normal stop. The provider's reason stays in `rawStopReason`.
 fn stop_reason(raw: Option<&str>, tool_calls: bool) -> &'static str {
     match raw {
+        Some(raw) if pi_ai::is_output_limit_stop(raw) => "length",
         _ if tool_calls => "toolUse",
-        Some("length" | "max_tokens" | "MAX_TOKENS" | "model_context_window_exceeded") => "length",
         _ => "stop",
     }
 }

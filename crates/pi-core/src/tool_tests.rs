@@ -69,7 +69,7 @@ async fn call_tool(
         name: name.to_string(),
         arguments: arguments.to_string(),
     };
-    execute_model_tool_call(runtime, &call)
+    execute_model_tool_call(runtime, &call, &mut |_| {})
         .await
         .expect("save tool result");
     let event = runtime.session.tool_history.last().expect("tool event");
