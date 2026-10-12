@@ -323,6 +323,13 @@ Rust behavior:
 
 - Preserve tool names and user-facing semantics.
 - Preserve dirty-worktree awareness and avoid wiping unrelated user changes.
+- `edit`: each `oldText` must occur exactly once in the original file and the
+  edits must not overlap; all edits apply in memory and the file is written
+  once, or nothing changes. An empty `newText` deletes; `edits` may arrive as a
+  JSON string. Edits follow the file's CRLF line endings and keep a BOM. No
+  fuzzy matching (upstream normalizes quotes, dashes, and trailing spaces when
+  an exact match fails).
+- `write` accepts empty `content`.
 - Execute shell commands with configured shell settings.
 - Show visible TUI progress when terminal progress is enabled.
 

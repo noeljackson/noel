@@ -2551,7 +2551,7 @@ fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
         },
         "edit" => AiToolDefinition {
             name: "edit".to_string(),
-            description: "Apply exact text replacements to a file.".to_string(),
+            description: "Apply exact text replacements to a file. Each edits[].oldText must match a unique, non-overlapping region of the original file; all edits apply together or none do.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3007,7 +3007,7 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "write" => vec![ToolRequest::Write {
             path: string_tool_arg(&args, &["path"], &tool_call.name)?,
-            content: string_tool_arg(&args, &["content"], &tool_call.name)?,
+            content: text_tool_arg(&args, &["content"], &tool_call.name)?,
         }],
         "edit" => edit_tool_requests(&args, &tool_call.name)?,
         "grep" => vec![ToolRequest::Grep {
@@ -3052,34 +3052,51 @@ fn parse_tool_arguments(tool_call: &ChatToolCall) -> Result<serde_json::Value, A
     })
 }
 
+/// One edit request carrying every replacement, so they apply together or
+/// not at all. Like upstream `prepareEditArguments`, `edits` may arrive as a
+/// JSON string or a single object, and a top-level `oldText`/`newText` pair
+/// is one edit. An empty `newText` deletes the matched text.
 fn edit_tool_requests(
     args: &serde_json::Value,
     tool: &str,
 ) -> Result<Vec<ToolRequest>, AgentError> {
     let path = string_tool_arg(args, &["path"], tool)?;
-    if let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) {
-        if edits.is_empty() {
-            return Err(AgentError::InvalidToolCall {
-                tool: tool.to_string(),
-                message: "edits must not be empty".to_string(),
-            });
+    let invalid = |message: &str| AgentError::InvalidToolCall {
+        tool: tool.to_string(),
+        message: message.to_string(),
+    };
+    let entries = match args.get("edits") {
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Array(edits)) => edits,
+            Ok(edit @ Value::Object(_)) => vec![edit],
+            _ => {
+                return Err(invalid(
+                    "edits must be an array of {oldText, newText} objects",
+                ))
+            }
+        },
+        Some(Value::Array(edits)) => edits.clone(),
+        Some(edit @ Value::Object(_)) => vec![edit.clone()],
+        Some(_) => {
+            return Err(invalid(
+                "edits must be an array of {oldText, newText} objects",
+            ))
         }
-        return edits
-            .iter()
-            .map(|edit| {
-                Ok(ToolRequest::Edit {
-                    path: path.clone(),
-                    find: string_tool_arg(edit, &["oldText", "find"], tool)?,
-                    replace: string_tool_arg(edit, &["newText", "replace"], tool)?,
-                })
-            })
-            .collect();
+        None => vec![args.clone()],
+    };
+    if entries.is_empty() {
+        return Err(invalid("edits must not be empty"));
     }
-    Ok(vec![ToolRequest::Edit {
-        path,
-        find: string_tool_arg(args, &["oldText", "find"], tool)?,
-        replace: string_tool_arg(args, &["newText", "replace"], tool)?,
-    }])
+    let edits = entries
+        .iter()
+        .map(|edit| {
+            Ok(pi_tools::TextEdit {
+                find: text_tool_arg(edit, &["oldText", "find"], tool)?,
+                replace: text_tool_arg(edit, &["newText", "replace"], tool)?,
+            })
+        })
+        .collect::<Result<Vec<_>, AgentError>>()?;
+    Ok(vec![ToolRequest::Edit { path, edits }])
 }
 
 fn string_tool_arg(
@@ -3091,6 +3108,19 @@ fn string_tool_arg(
         tool: tool.to_string(),
         message: format!("missing string argument {}", names[0]),
     })
+}
+
+/// A string argument that may be empty: file content, or replacement text
+/// that deletes.
+fn text_tool_arg(args: &Value, names: &[&str], tool: &str) -> Result<String, AgentError> {
+    names
+        .iter()
+        .find_map(|name| args.get(*name).and_then(Value::as_str))
+        .map(ToString::to_string)
+        .ok_or_else(|| AgentError::InvalidToolCall {
+            tool: tool.to_string(),
+            message: format!("missing string argument {}", names[0]),
+        })
 }
 
 fn optional_string_tool_arg(args: &serde_json::Value, names: &[&str]) -> Option<String> {
@@ -3232,8 +3262,10 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
                 name: "edit".to_string(),
                 request: ToolRequest::Edit {
                     path: path.to_string(),
-                    find: find.to_string(),
-                    replace: replace.to_string(),
+                    edits: vec![pi_tools::TextEdit {
+                        find: find.to_string(),
+                        replace: replace.to_string(),
+                    }],
                 },
             }))
         }
@@ -5461,6 +5493,56 @@ mod tests {
             .expect("execute write tool again");
 
         assert_eq!(runtime.session().edited_files, ["src/new.rs".to_string()]);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_accept_empty_text_and_edits_as_a_json_string() {
+        let cwd = std::env::temp_dir().join(format!("pi-edit-args-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let call = |id: &str, name: &str, arguments: Value| ChatToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        };
+
+        let calls = [
+            call(
+                "write_empty",
+                "write",
+                serde_json::json!({"path": "empty.txt", "content": ""}),
+            ),
+            call(
+                "write_code",
+                "write",
+                serde_json::json!({"path": "a.rs", "content": "keep\ndrop\nlast\n"}),
+            ),
+            // Some models send `edits` as a JSON string; an empty newText
+            // deletes the matched text.
+            call(
+                "edit_string",
+                "edit",
+                serde_json::json!({
+                    "path": "a.rs",
+                    "edits": r#"[{"oldText":"drop\n","newText":""},{"oldText":"last","newText":"end"}]"#
+                }),
+            ),
+        ];
+        for tool_call in &calls {
+            execute_model_tool_call(&mut runtime, tool_call)
+                .await
+                .expect("execute tool call");
+        }
+
+        for event in &runtime.session().tool_history {
+            assert!(!event.is_error, "{}: {}", event.id, event.result);
+        }
+        assert_eq!(fs::read_to_string(cwd.join("empty.txt")).unwrap(), "");
+        assert_eq!(fs::read_to_string(cwd.join("a.rs")).unwrap(), "keep\nend\n");
         let _ = fs::remove_dir_all(cwd);
     }
 

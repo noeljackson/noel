@@ -210,6 +210,18 @@ stale-lock recovery is needed, and the separate name never collides with an
 upstream process's lock directory. An atomic rename cannot keep the previous
 file's mode, and credentials should never be left group- or world-readable.
 
+### Exact-Match edit Tool
+
+The `edit` tool follows upstream's rules (unique `oldText`, no overlapping
+edits, all edits applied at once, empty `newText`, `edits` as a JSON string,
+BOM and CRLF kept) but matches exactly: it does not fall back to upstream's
+fuzzy matching of smart quotes, Unicode dashes and spaces, and trailing
+whitespace. It also converts only the edited text to the file's line endings
+instead of normalizing a mixed-ending file.
+
+Reason: an exact match cannot edit the wrong region, and bytes outside the
+edits stay untouched.
+
 ### Configurable Agent Round Cap
 
 The per-run provider round cap (`agent.maxToolRounds`, default 200, including
