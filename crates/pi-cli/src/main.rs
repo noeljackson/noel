@@ -7328,6 +7328,7 @@ async fn handle_tui_submission(
                 Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
             }
         }
+        "/image" => app.push(TuiEntryKind::System, "usage: /image <path> [prompt]"),
         _ if line.starts_with("/image ") => {
             let rest = line.trim_start_matches("/image ").trim();
             let (path, prompt) = split_once_text(rest);
@@ -7543,6 +7544,7 @@ async fn handle_tui_submission(
             )
             .await);
         }
+        "/prompt" => app.push(TuiEntryKind::System, "usage: /prompt <name> [input]"),
         _ if line.starts_with("/prompt ") => {
             let rest = line.trim_start_matches("/prompt ").trim();
             let (name, input) = split_once_text(rest);
@@ -7620,8 +7622,20 @@ async fn handle_tui_submission(
         }
         _ if line.starts_with("/name") => {
             let name = line.trim_start_matches("/name").trim();
-            runtime.rename_session((!name.is_empty()).then(|| name.to_string()))?;
-            app.push(TuiEntryKind::System, format_session(runtime));
+            if name.is_empty() {
+                // Upstream: a bare /name shows the current name; it never
+                // clears it.
+                app.push(
+                    TuiEntryKind::System,
+                    match &runtime.session().name {
+                        Some(name) => format!("session name: {name}"),
+                        None => "usage: /name <name>".to_string(),
+                    },
+                );
+            } else {
+                runtime.rename_session(Some(name.to_string()))?;
+                app.push(TuiEntryKind::System, format_session(runtime));
+            }
         }
         _ if line.starts_with("/labels") => {
             let labels = line
@@ -7632,11 +7646,21 @@ async fn handle_tui_submission(
             runtime.set_labels(labels)?;
             app.push(TuiEntryKind::System, format_session(runtime));
         }
-        _ if line.starts_with("/export ") => {
-            let path = PathBuf::from(line.trim_start_matches("/export ").trim());
+        _ if line == "/export" || line.starts_with("/export ") => {
+            let requested = line.trim_start_matches("/export").trim();
+            let path = if requested.is_empty() {
+                // Upstream's default: pi-session-<session>.html in the cwd.
+                runtime
+                    .session()
+                    .cwd
+                    .join(format!("pi-session-{}.html", runtime.session().session_id))
+            } else {
+                PathBuf::from(requested)
+            };
             export_session(runtime, &path)?;
             app.push(TuiEntryKind::System, format!("exported {}", path.display()));
         }
+        "/import" => app.push(TuiEntryKind::System, "usage: /import <path.jsonl>"),
         _ if line.starts_with("/import ") => {
             let path = PathBuf::from(line.trim_start_matches("/import ").trim());
             let (store, state) = SessionStore::import_path(&config.paths.session_dir, &path)?;
@@ -10014,14 +10038,14 @@ fn delete_session_message(
     line: &str,
 ) -> Result<String> {
     let reference = line.trim_start_matches("/delete").trim();
-    let target = if reference.is_empty() {
-        runtime
-            .store()
-            .map(|store| store.path().to_path_buf())
-            .ok_or_else(|| anyhow!("ephemeral session cannot be deleted"))?
-    } else {
-        resolve_session_reference(&config.paths.session_dir, reference)?
-    };
+    if reference.is_empty() {
+        // Deleting is never implicit: name the session, even the current one.
+        return Ok(format!(
+            "usage: /delete <id|name|path> (the current session is {})",
+            runtime.session().session_id
+        ));
+    }
+    let target = resolve_session_reference(&config.paths.session_dir, reference)?;
     let deleting_current = runtime
         .store()
         .map(|store| store.path() == target)
@@ -11319,6 +11343,80 @@ mod tests {
             let (_, reopened) =
                 SessionStore::open(runtime.store().unwrap().path().to_path_buf()).unwrap();
             assert_eq!(reopened, expected);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bare_session_commands_never_reach_the_model_or_destroy_state() {
+        let root =
+            std::env::temp_dir().join(format!("pi-cli-bare-commands-{}", unique_temp_suffix()));
+        let mut config = minimal_test_config();
+        config.paths.session_dir = root.join("sessions");
+        config.models.push(ModelDefinition {
+            context_window: None,
+            provider: "faux".to_string(),
+            id: "echo".to_string(),
+            name: None,
+            api: ConfigProviderApi::Faux,
+            base_url: None,
+        });
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut viewport_height = 24;
+        let (store, state) = SessionStore::create(&config.paths.session_dir, root.clone()).unwrap();
+        let session_file = store.path().to_path_buf();
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
+        runtime
+            .set_active_model(Some(ModelRef {
+                provider: "faux".into(),
+                id: "echo".into(),
+            }))
+            .unwrap();
+        runtime.rename_session(Some("keep me".into())).unwrap();
+        let mut app = TuiApp::new(&config, &runtime);
+        let mut surface = TuiSurface {
+            terminal: &mut terminal,
+            viewport_height: &mut viewport_height,
+        };
+
+        for command in [
+            "/name", "/delete", "/export", "/import", "/image", "/prompt",
+        ] {
+            handle_tui_submission(
+                &mut app,
+                &mut surface,
+                &mut runtime,
+                &mut config,
+                true,
+                command.to_string(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // None of them became a prompt, cleared the name, or deleted the
+        // session; a bare /export wrote upstream's default file.
+        assert!(runtime.session().messages.is_empty());
+        assert_eq!(runtime.session().name.as_deref(), Some("keep me"));
+        assert!(session_file.exists());
+        let export = root.join(format!("pi-session-{}.html", runtime.session().session_id));
+        assert!(export.exists(), "{}", export.display());
+        let transcript = app.transcript_text();
+        for expected in [
+            "session name: keep me",
+            "usage: /delete <id|name|path>",
+            "exported",
+            "usage: /import",
+            "usage: /image",
+            "usage: /prompt",
+        ] {
+            assert!(transcript.contains(expected), "{expected}\n{transcript}");
         }
         fs::remove_dir_all(root).unwrap();
     }

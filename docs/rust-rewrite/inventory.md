@@ -272,10 +272,10 @@ Implemented built-in slash commands include:
 - `/clone [id|name|path]`
 - `/tree`
 - `/summaries`
-- `/delete [id|name|path]`
-- `/name <name>`
+- `/delete <id|name|path>` (bare `/delete` shows usage; it never deletes)
+- `/name [name]` (bare `/name` shows the current name)
 - `/labels <labels...>`
-- `/export <file>`
+- `/export [file]` (default `pi-session-<session id>.html` in the session cwd)
 - `/import <file>`
 - `/copy`
 - `/share [file]`
