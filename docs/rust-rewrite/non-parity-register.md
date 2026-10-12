@@ -182,6 +182,21 @@ Reason: model lists are provider-owned and change out of band; a stale or
 poisoned cache must never delete working models, and the user needs a manual
 escape hatch when the background refresh cannot recover on its own.
 
+### Anthropic Output Cap Without an Output Catalog
+
+Upstream sends each request the model's catalog `maxTokens`, lowered so the
+estimated input fits the context window. The Rust model catalog has no output
+limits, so an Anthropic Messages request without an explicit cap reads the
+Claude output limit and context window from the version in the model id (for
+example 128000 for Opus 4.6 and later, 64000 for Sonnet and Haiku 4.5, 32000
+for Opus 4.1) and applies the same context clamp. Other models served over
+the Anthropic API get upstream's 16384 default for models without a catalog
+limit instead of their upstream catalog values.
+
+Reason: Anthropic requires `max_tokens`, and the former fixed 4096 cut off
+long replies, thinking, and large `write` calls. Reading the limit from the id
+keeps new Claude models working without a catalog update.
+
 ### Configurable Agent Round Cap
 
 The per-run provider round cap (`agent.maxToolRounds`, default 200, including

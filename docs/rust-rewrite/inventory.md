@@ -357,6 +357,12 @@ Current auth sources:
 - Codex/ChatGPT login token fallback.
 - Custom provider fallback from model config.
 
+Request limits:
+
+- Anthropic Messages requests without an explicit cap send the Claude model's
+  output limit, lowered to fit the context window; other models on the
+  Anthropic API default to 16384 tokens.
+
 Model refresh:
 
 - Uses built-in models, cached models, and explicit `models.json` immediately.
