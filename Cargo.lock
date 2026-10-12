@@ -1737,6 +1737,7 @@ version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

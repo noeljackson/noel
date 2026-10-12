@@ -3,12 +3,13 @@ use std::{
     env, fs,
     io::Write as _,
     path::{Path, PathBuf},
-    sync::{Mutex, PoisonError},
+    sync::{LazyLock, Mutex, PoisonError},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use regex::{Regex, RegexBuilder};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -231,6 +232,189 @@ pub enum ProviderError {
     InvalidResponse(String),
 }
 
+impl ProviderError {
+    /// Whether the same request may succeed if it is sent again: a transport
+    /// failure, or a provider's answer that upstream reads as transient
+    /// ([`is_retryable_error_text`]). A context overflow never is: compaction
+    /// answers it, not a retry.
+    pub fn is_retryable(&self) -> bool {
+        match self.provider_answer() {
+            Some(answer) => !is_context_overflow_text(&answer) && is_retryable_error_text(&answer),
+            // The connection could not be made, or broke before or during
+            // the response. A request pi could not build never succeeds.
+            None => {
+                matches!(self, Self::Request(error) if !error.is_builder() && !error.is_redirect())
+            }
+        }
+    }
+
+    /// Whether `provider` refused the request because its input exceeds the
+    /// model's context window ([`is_context_overflow_text`]). Cerebras
+    /// answers an overflow with a 400 or 413 without a body.
+    pub fn is_context_overflow(&self, provider: &str) -> bool {
+        if let Self::Status { status, body } = self {
+            if provider == "cerebras"
+                && matches!(status.as_u16(), 400 | 413)
+                && body.trim().is_empty()
+            {
+                return true;
+            }
+        }
+        self.provider_answer()
+            .is_some_and(|answer| is_context_overflow_text(&answer))
+    }
+
+    /// The error as text, if it is what the provider answered: an HTTP
+    /// status with its body, or a response pi could not use. Upstream's
+    /// patterns read only this. pi's own errors (no credential, a bad
+    /// header, its configuration) may name paths and numbers that would
+    /// match them by accident.
+    fn provider_answer(&self) -> Option<String> {
+        match self {
+            Self::Status { .. } | Self::InvalidResponse(_) => Some(self.to_string()),
+            Self::Request(error) if error.is_status() => Some(self.to_string()),
+            Self::Request(_) | Self::MissingApiKey { .. } | Self::Header(_) | Self::Config(_) => {
+                None
+            }
+        }
+    }
+}
+
+/// Upstream's `RETRYABLE_PROVIDER_ERROR_PATTERN` (`packages/ai/src/utils/retry.ts`):
+/// provider load, HTTP statuses, and transport failures, as they appear in
+/// error text. `error-classification.json` holds upstream's list.
+const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
+    "overloaded",
+    "server_busy",
+    "servers are currently busy",
+    "currently experiencing high demand",
+    "model is at capacity",
+    "rate.?limit",
+    "too many requests",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "520",
+    "524",
+    "service.?unavailable",
+    "server.?error",
+    "internal.?error",
+    "provider.?returned.?error",
+    "exceeded request buffer limit while retrying upstream",
+    "network.?error",
+    "connection.?error",
+    "connection.?refused",
+    "connection.?lost",
+    "other side closed",
+    "fetch failed",
+    "getaddrinfo",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "upstream.?connect",
+    "reset before headers",
+    "socket hang up",
+    "socket connection was closed",
+    "timed? out",
+    "timeout",
+    "terminated",
+    "websocket.?closed",
+    "websocket.?error",
+    "ended without",
+    "stream ended before message_stop",
+    "stream ended before a terminal response event",
+    "http2 request did not get a response",
+    "pending stream has been canceled",
+    "retry delay",
+    "you can retry your request",
+    "try your request again",
+    "please retry your request",
+    "ResourceExhausted",
+    "subscription_sharing_usage_unavailable",
+    "subscription_sharing_user_unavailable",
+];
+
+/// Upstream's `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`: quota, budget and
+/// subscription limits that a retry cannot lift, whatever else the text says.
+const NON_RETRYABLE_ERROR_PATTERNS: &[&str] = &[
+    "GoUsageLimitError",
+    "FreeUsageLimitError",
+    "Monthly usage limit reached",
+    "available balance",
+    "insufficient_quota",
+    "out of budget",
+    "quota exceeded",
+    "billing",
+    "subscription_sharing_usage_limit_exceeded",
+];
+
+/// Upstream's `OVERFLOW_PATTERNS` (`packages/ai/src/utils/overflow.ts`): how
+/// each provider words an input that exceeds the context window.
+const OVERFLOW_PATTERNS: &[&str] = &[
+    r"prompt (?:is )?too long",
+    r"prompt exceeds max length",
+    r"request_too_large",
+    r"input is too long for requested model",
+    r"exceeds the context window",
+    r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))",
+    r"input token count.*exceeds the maximum",
+    r"maximum prompt length is \d+",
+    r"reduce the length of the messages",
+    r"maximum context length is \d+ tokens",
+    r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?",
+    r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)",
+    r"exceeds the limit of \d+",
+    r"exceeds the available context size",
+    r"greater than the context length",
+    r"context window exceeds limit",
+    r"exceeded model token limit",
+    r"too large for model with \d+ maximum context length",
+    r"prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?",
+    r"model_context_window_exceeded",
+    r"prompt too long; exceeded (?:max )?context length",
+    r"range of input length should be",
+    r"context[_ ]length[_ ]exceeded",
+    r"too many tokens",
+    r"token limit exceeded",
+];
+
+/// Upstream's `NON_OVERFLOW_PATTERNS`: throttling errors that would otherwise
+/// match an overflow pattern ("Too many tokens, please wait").
+const NON_OVERFLOW_PATTERNS: &[&str] = &[
+    r"^(Throttling error|Service unavailable):",
+    r"rate limit",
+    r"too many requests",
+];
+
+/// One regular expression matching any of `patterns`, ignoring case.
+fn any_pattern(patterns: &[&str]) -> Regex {
+    let alternatives = patterns
+        .iter()
+        .map(|pattern| format!("(?:{pattern})"))
+        .collect::<Vec<_>>();
+    RegexBuilder::new(&alternatives.join("|"))
+        .case_insensitive(true)
+        .build()
+        .expect("error patterns are valid regular expressions")
+}
+
+/// Upstream's `isRetryableAssistantError` for an error with this text: it
+/// looks transient, and is not a quota or billing limit.
+pub fn is_retryable_error_text(text: &str) -> bool {
+    static RETRYABLE: LazyLock<Regex> = LazyLock::new(|| any_pattern(RETRYABLE_ERROR_PATTERNS));
+    static NON_RETRYABLE: LazyLock<Regex> =
+        LazyLock::new(|| any_pattern(NON_RETRYABLE_ERROR_PATTERNS));
+    !text.is_empty() && !NON_RETRYABLE.is_match(text) && RETRYABLE.is_match(text)
+}
+
+/// Upstream's `isContextOverflow` for an error with this text.
+pub fn is_context_overflow_text(text: &str) -> bool {
+    static OVERFLOW: LazyLock<Regex> = LazyLock::new(|| any_pattern(OVERFLOW_PATTERNS));
+    static NON_OVERFLOW: LazyLock<Regex> = LazyLock::new(|| any_pattern(NON_OVERFLOW_PATTERNS));
+    !NON_OVERFLOW.is_match(text) && OVERFLOW.is_match(text)
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError>;
@@ -250,6 +434,28 @@ pub trait Provider: Send + Sync {
     /// thinking is off or the model has none.
     fn thinking_level(&self) -> Option<String> {
         None
+    }
+
+    /// The most output tokens the model writes in one reply, when that is
+    /// known ([`model_output_limit`]). A reply cut off below it was cut off
+    /// by the context window, not by the model's own limit.
+    fn output_limit(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// The model's output limit before any clamp to the context window: upstream's
+/// catalog `maxTokens`, for the models whose limit pi knows. Those are the
+/// models whose requests carry an explicit cap: every model served over the
+/// Anthropic API, and the ones in `catalog_output_limits`.
+pub fn model_output_limit(config: &ProviderConfig) -> Option<u64> {
+    let model = &config.model;
+    match config.api {
+        ProviderApi::Anthropic => Some(
+            claude_output_limits(&model.id)
+                .map_or(ANTHROPIC_UNCATALOGED_MAX_TOKENS, |limits| limits.0),
+        ),
+        _ => catalog_output_limits(&model.provider, &model.id).map(|limits| limits.0),
     }
 }
 
@@ -564,11 +770,20 @@ enum FauxScriptStep {
         output: u64,
     },
     Stop(String),
-    /// Fails the request; before any output, the agent retries it.
-    Error(String),
+    /// Fails the request here, before or after other steps' output.
+    Error(FauxScriptError),
     DelayMs(u64),
     /// Holds the response until the file exists; relative to the script.
     WaitForFile(PathBuf),
+}
+
+/// How a scripted request fails: a message is the body of an HTTP 503,
+/// which the agent retries; `status` and `body` are any other response.
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum FauxScriptError {
+    Overloaded(String),
+    Status { status: u16, body: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -641,10 +856,24 @@ impl FauxScript {
                         reason: reason.clone(),
                     })?;
                 }
-                FauxScriptStep::Error(message) => {
+                FauxScriptStep::Error(error) => {
+                    let (status, body) = match error {
+                        FauxScriptError::Overloaded(message) => {
+                            (reqwest::StatusCode::SERVICE_UNAVAILABLE, message)
+                        }
+                        FauxScriptError::Status { status, body } => {
+                            let status = reqwest::StatusCode::from_u16(*status).map_err(|_| {
+                                ProviderError::Config(format!(
+                                    "faux script {}: {status} is not an HTTP status",
+                                    self.path.display()
+                                ))
+                            })?;
+                            (status, body)
+                        }
+                    };
                     return Err(ProviderError::Status {
-                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                        body: message.clone(),
+                        status,
+                        body: body.clone(),
                     });
                 }
                 FauxScriptStep::DelayMs(delay) => {
@@ -1577,6 +1806,9 @@ fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     body
 }
 
+/// Upstream's output cap for a model without a catalog limit.
+const ANTHROPIC_UNCATALOGED_MAX_TOKENS: u64 = 16_384;
+
 /// Output cap for an Anthropic Messages request that carries none. Upstream
 /// sends the model's catalog `maxTokens`, lowered so the estimated input fits
 /// the context window (`clampMaxTokensToContext`). The port has no output
@@ -1584,9 +1816,8 @@ fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
 /// the Anthropic API get upstream's default for models without a catalog
 /// limit.
 fn anthropic_default_max_tokens(model_id: &str, request: &ProviderRequest) -> u64 {
-    const UNCATALOGED_MAX_TOKENS: u64 = 16_384;
     let Some((max_tokens, context_window)) = claude_output_limits(model_id) else {
-        return UNCATALOGED_MAX_TOKENS;
+        return ANTHROPIC_UNCATALOGED_MAX_TOKENS;
     };
     let available = context_window
         .saturating_sub(estimate_request_tokens(request))
@@ -4793,6 +5024,225 @@ mod tests {
             StreamEvent::Text("recovered".into())
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn faux_script_error_can_name_its_status_and_follow_output() {
+        let dir = faux_script_dir("status-error");
+        fs::write(
+            dir.join("script.json"),
+            r#"[
+                [{"error": {"status": 401, "body": "bad key"}}],
+                [{"text": "Hel"}, {"error": "terminated"}],
+                [{"error": {"status": 99, "body": ""}}]
+            ]"#,
+        )
+        .unwrap();
+        let script = FauxScript {
+            path: dir.join("script.json"),
+            log: None,
+        };
+        let request = user_request("hi");
+        let error = run_faux_script(&script, &request).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "request failed with status 401 Unauthorized: bad key"
+        );
+        assert!(!error.is_retryable());
+        // An error after other steps breaks the reply off where it is.
+        let mut events = Vec::new();
+        let error = script
+            .respond(&request, &mut |event| {
+                events.push(event);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(events, [StreamEvent::Text("Hel".into())]);
+        assert_eq!(
+            error.to_string(),
+            "request failed with status 503 Service Unavailable: terminated"
+        );
+        assert!(error.is_retryable());
+        let error = run_faux_script(&script, &request).await.unwrap_err();
+        assert!(
+            error.to_string().contains("99 is not an HTTP status"),
+            "{error}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn error_classification_matches_ts_patterns_and_verdicts() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/ts-parity/error-classification.json"
+        ))
+        .unwrap();
+        let patterns = |name: &str| -> Vec<String> {
+            let patterns = fixture["patterns"][name].as_array().unwrap();
+            let sources = patterns.iter().map(|pattern| pattern.as_str().unwrap());
+            sources.map(str::to_owned).collect()
+        };
+        assert_eq!(RETRYABLE_ERROR_PATTERNS, patterns("retryable"));
+        assert_eq!(NON_RETRYABLE_ERROR_PATTERNS, patterns("nonRetryable"));
+        assert_eq!(OVERFLOW_PATTERNS, patterns("overflow"));
+        assert_eq!(NON_OVERFLOW_PATTERNS, patterns("nonOverflow"));
+
+        let cases = fixture["cases"].as_array().unwrap();
+        assert!(cases.len() > 100, "{} cases", cases.len());
+        for case in cases {
+            let message = case["message"].as_str().unwrap();
+            assert_eq!(
+                is_retryable_error_text(message),
+                case["retryable"].as_bool().unwrap(),
+                "retryable: {message:?}"
+            );
+            assert_eq!(
+                is_context_overflow_text(message),
+                case["overflow"].as_bool().unwrap(),
+                "overflow: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_errors_are_retryable_by_kind_and_text() {
+        let status = |status: u16, body: &str| ProviderError::Status {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            body: body.to_string(),
+        };
+        let invalid = |text: &str| ProviderError::InvalidResponse(text.to_string());
+        for (error, retryable) in [
+            (status(429, "slow down"), true),
+            (status(500, ""), true),
+            (status(502, ""), true),
+            (status(503, "overloaded"), true),
+            (status(504, ""), true),
+            (
+                status(529, r#"{"error":{"type":"overloaded_error"}}"#),
+                true,
+            ),
+            (status(408, ""), true),
+            (invalid("stream ended before message_stop"), true),
+            (
+                status(400, r#"{"error":{"message":"bad parameter"}}"#),
+                false,
+            ),
+            (status(401, r#"{"error":{"message":"bad key"}}"#), false),
+            (status(403, ""), false),
+            (
+                status(404, r#"{"error":{"message":"no such model"}}"#),
+                false,
+            ),
+            (status(422, ""), false),
+            // A quota or billing limit, though the status says rate limit.
+            (
+                status(429, r#"{"error":{"code":"insufficient_quota"}}"#),
+                false,
+            ),
+            (invalid("{}"), false),
+            (ProviderError::Config("no credentials".into()), false),
+            // pi's own errors are never the provider's answer, whatever
+            // their text happens to contain.
+            (
+                ProviderError::Config("faux script /tmp/run-503/script.json is exhausted".into()),
+                false,
+            ),
+            (
+                ProviderError::MissingApiKey {
+                    provider: "anthropic".into(),
+                },
+                false,
+            ),
+            // Compaction answers a context overflow, whatever else it says.
+            (
+                status(400, r#"{"error":{"code":"context_length_exceeded"}}"#),
+                false,
+            ),
+            (
+                status(413, r#"{"error":{"type":"request_too_large"}}"#),
+                false,
+            ),
+            (
+                status(503, "prompt is too long: 9 tokens > 8 maximum"),
+                false,
+            ),
+        ] {
+            assert_eq!(error.is_retryable(), retryable, "{error}");
+        }
+    }
+
+    #[test]
+    fn context_overflow_is_read_from_the_error_text_and_cerebras_statuses() {
+        let status = |status: u16, body: &str| ProviderError::Status {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            body: body.to_string(),
+        };
+        let overflow = status(400, r#"{"error":{"code":"context_length_exceeded"}}"#);
+        assert!(overflow.is_context_overflow("openai"));
+        assert!(status(413, r#"{"error":{"type":"request_too_large"}}"#)
+            .is_context_overflow("anthropic"));
+        // Throttling that mentions tokens is not an overflow.
+        let throttled = status(429, r#"{"message":"Too many tokens, please wait."}"#);
+        assert!(!throttled.is_context_overflow("amazon-bedrock"));
+        assert!(throttled.is_retryable());
+        assert!(!status(400, "bad parameter").is_context_overflow("openai"));
+        // Cerebras answers an overflow without a body.
+        for code in [400, 413] {
+            assert!(status(code, "").is_context_overflow("cerebras"));
+            assert!(!status(code, "").is_context_overflow("openai"));
+        }
+        assert!(!status(400, "bad parameter").is_context_overflow("cerebras"));
+        assert!(!status(500, "").is_context_overflow("cerebras"));
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_cannot_be_made_is_retryable() {
+        // Nothing listens on the port, so the request fails in transport.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = reqwest::Client::new().get(url).send().await.unwrap_err();
+        let error = ProviderError::Request(error);
+        // The text names no cause upstream's patterns know; the kind does.
+        assert!(!is_retryable_error_text(&error.to_string()), "{error}");
+        assert!(error.is_retryable());
+        assert!(!error.is_context_overflow("openai"));
+    }
+
+    #[test]
+    fn output_limits_are_known_for_claude_and_cataloged_models() {
+        let config = |api: ProviderApi, provider: &str, id: &str| ProviderConfig {
+            model: ModelRef {
+                provider: provider.to_string(),
+                id: id.to_string(),
+            },
+            api,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        let limit = |api, provider, id| model_output_limit(&config(api, provider, id));
+        assert_eq!(
+            limit(ProviderApi::Anthropic, "anthropic", "claude-opus-4-6"),
+            Some(128_000)
+        );
+        assert_eq!(
+            limit(ProviderApi::Anthropic, "anthropic", "claude-sonnet-4-5"),
+            Some(64_000)
+        );
+        // Upstream's default for a model the Anthropic catalog does not have.
+        assert_eq!(
+            limit(ProviderApi::Anthropic, "kimi-coding", "kimi-for-coding"),
+            Some(16_384)
+        );
+        assert_eq!(
+            limit(ProviderApi::OpenAiResponses, "openai", "gpt-5.4"),
+            Some(128_000)
+        );
+        assert_eq!(limit(ProviderApi::OpenAi, "local", "llama"), None);
     }
 
     #[tokio::test]
