@@ -120,7 +120,8 @@ pub(crate) fn find_template<'a>(
 }
 
 /// pi's own `/prompt <name> [input]`: `{{input}}` in the template stands for
-/// the input, which otherwise follows the template.
+/// the input, which otherwise follows the template. Upstream's `/name`
+/// commands and `$1` placeholders are `pi_core::expand_input`.
 pub(crate) fn fill_prompt_template(template: &str, input: &str) -> String {
     if template.contains("{{input}}") {
         return template.replace("{{input}}", input);

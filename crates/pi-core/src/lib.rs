@@ -1,4 +1,5 @@
 mod compaction;
+mod input;
 mod session_lock;
 mod system_prompt;
 #[cfg(test)]
@@ -6,6 +7,7 @@ mod tool_parity_tests;
 #[cfg(test)]
 mod tool_tests;
 pub use compaction::RuntimeCompactionSettings;
+pub use input::expand_input;
 use session_lock::SessionLock;
 pub use system_prompt::PRODUCT_NAME;
 use system_prompt::{PromptTool, SystemPromptInput};
@@ -2610,7 +2612,8 @@ pub async fn run_user_turn_streaming_events_with_media(
 /// Runs `message`, a user prompt the caller has just saved (as
 /// [`Runtime::start_run`] does): a tool command runs its tool without the
 /// model, and any other prompt runs provider rounds until a reply calls no
-/// tools.
+/// tools. The prompt is taken as it is: a caller expands typed input with
+/// [`expand_input`] first.
 pub async fn run_saved_prompt_streaming_events(
     runtime: &mut Runtime,
     provider: &dyn Provider,

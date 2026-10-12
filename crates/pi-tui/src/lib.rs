@@ -147,8 +147,12 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "list prompt templates",
     },
     CommandHelp {
+        command: "/<template> [arguments]",
+        description: "invoke a prompt template by its name",
+    },
+    CommandHelp {
         command: "/prompt <name> [input]",
-        description: "invoke a prompt template",
+        description: "invoke a prompt template, filling {{input}}",
     },
     CommandHelp {
         command: "/themes",
