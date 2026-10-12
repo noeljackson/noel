@@ -204,6 +204,11 @@ Reload behavior:
 - No hot module reload.
 - Reject reload while an assistant response is in progress.
 - Preserve messages, cwd, session id/file, tool history, queued messages, branch state, active model, and active thinking level.
+- Keep the session's project trust decision and re-apply the command-line
+  overrides (`--system-prompt`, `--append-system-prompt`, `--no-context-files`,
+  `-e`, `--no-extensions`, `--tools`, `--api-key`, `--skill`,
+  `--prompt-template`, ...); the same holds for `/models refresh`,
+  `/models reset`, and RPC `reload`.
 - Surface diagnostics for invalid resources instead of clearing context.
 - Notify JSON executable extensions with `reload`; notify them with `shutdown` on quit.
 

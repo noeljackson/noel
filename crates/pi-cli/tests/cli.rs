@@ -718,6 +718,76 @@ fn rpc_mode_accepts_json_line_requests_from_stdin() {
 }
 
 #[test]
+fn rpc_reload_keeps_an_untrusted_project_untrusted() {
+    let root = test_dir("pi-cli-rpc-reload-trust");
+    let agent = root.join("agent");
+    let project = root.join("project");
+    fs::create_dir_all(&agent).expect("create agent dir");
+    fs::create_dir_all(project.join(".pi")).expect("create project config dir");
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"modelRefresh":{"enabled":false}}"#,
+    )
+    .expect("write settings");
+    // An untrusted repository's settings must not take effect, before or
+    // after a reload.
+    fs::write(
+        project.join(".pi/settings.json"),
+        r#"{"shellCommandPrefix":"echo untrusted-prefix"}"#,
+    )
+    .expect("write project settings");
+
+    let mut child = pi_command()
+        .current_dir(&project)
+        .env("HOME", &root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--model",
+            "faux/echo",
+            "--no-approve",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pi");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    for request in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"prompt","params":{"prompt":"/bash echo hi"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"reload"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"prompt","params":{"prompt":"/bash echo hi"}}"#,
+    ] {
+        writeln!(stdin, "{request}").expect("write request");
+    }
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for pi");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json response"))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 3, "{responses:?}");
+    assert!(responses[1].get("result").is_some(), "{}", responses[1]);
+    for response in [&responses[0], &responses[2]] {
+        assert_eq!(
+            response["result"]["message"].as_str().map(str::trim),
+            Some("hi"),
+            "{response}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn print_mode_expands_at_file_and_exports_session() {
     let root = test_dir("pi-cli-at-file-export");
     let sessions = root.join("sessions");
