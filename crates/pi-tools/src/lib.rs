@@ -200,6 +200,20 @@ pub async fn execute_tool(
     request: ToolRequest,
     options: &ToolRuntimeOptions,
 ) -> Result<ToolResult, ToolError> {
+    execute_tool_streaming(cwd, request, options, &mut |_| {}).await
+}
+
+/// [`execute_tool`] that also reports a `bash` command's output while it
+/// runs. `on_output` gets everything printed so far, within the limits of
+/// the result (the last 2000 lines or 50 KB): once, empty, when the command
+/// starts, then as output arrives, at most every [`BASH_UPDATE_THROTTLE`].
+/// Other tools report nothing before their result.
+pub async fn execute_tool_streaming(
+    cwd: &Path,
+    request: ToolRequest,
+    options: &ToolRuntimeOptions,
+    on_output: &mut (dyn FnMut(&str) + Send),
+) -> Result<ToolResult, ToolError> {
     if options.offline
         && matches!(
             &request,
@@ -219,7 +233,7 @@ pub async fn execute_tool(
         ToolRequest::Bash {
             command,
             timeout_ms,
-        } => bash_tool(cwd, &command, timeout_ms, options).await,
+        } => bash_tool(cwd, &command, timeout_ms, options, on_output).await,
         ToolRequest::Edit { path, edits } => edit_tool(cwd, &path, &edits),
         ToolRequest::Write { path, content } => write_tool(cwd, &path, &content),
         ToolRequest::Grep {
@@ -292,6 +306,10 @@ pub fn cap_tool_output(output: String) -> String {
 /// After the shell exits, output still arriving (a background job holds the
 /// pipes) is read until it pauses for this long.
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(100);
+
+/// The shortest time between two reports of a running command's output
+/// (upstream `BASH_UPDATE_THROTTLE_MS`).
+pub const BASH_UPDATE_THROTTLE: Duration = Duration::from_millis(100);
 
 /// The shell commands run in (upstream `getShellConfig`): the `shellPath`
 /// setting, else `/bin/bash`, else `bash` on PATH, else `sh`.
@@ -383,13 +401,19 @@ fn with_status(text: String, status: &str) -> String {
 /// Runs `command` with `bash -c` (upstream `bash.ts`). stdout and stderr are
 /// one stream in the order written; the model gets its last 2000 lines or
 /// 50 KB, and a longer output is saved whole to a temp file. A timeout or a
-/// non-zero exit is an error result that still carries the output.
+/// non-zero exit is an error result that still carries the output. While
+/// the command runs, `on_output` gets its output so far (see
+/// [`execute_tool_streaming`]).
 async fn bash_tool(
     cwd: &Path,
     command: &str,
     timeout_ms: Option<u64>,
     options: &ToolRuntimeOptions,
+    on_output: &mut (dyn FnMut(&str) + Send),
 ) -> Result<ToolResult, ToolError> {
+    // Like upstream, the first report says the command is starting, even if
+    // it then cannot start.
+    on_output("");
     let command = match &options.shell_command_prefix {
         Some(prefix) if !prefix.trim().is_empty() => format!("{prefix}\n{command}"),
         _ => command.to_string(),
@@ -445,12 +469,32 @@ async fn bash_tool(
     let mut status = None;
     // Once the shell has exited, output is read until it pauses.
     let mut output_grace = None;
+    // Output not reported yet is reported once the throttle allows.
+    let mut unreported = false;
+    let mut last_report: Option<Instant> = None;
+    let mut report_due = None;
     while status.is_none() || pipe.is_some() {
         tokio::select! {
             read = read_chunk(&mut pipe, &mut buffer) => match read {
-                Some(read) => output.append(&buffer[..read]).map_err(io_error)?,
+                Some(read) => {
+                    output.append(&buffer[..read]).map_err(io_error)?;
+                    unreported = true;
+                    let due = last_report.map(|at| at + BASH_UPDATE_THROTTLE);
+                    match due.filter(|due| *due > Instant::now()) {
+                        Some(due) => report_due = Some(due),
+                        None => {
+                            (unreported, report_due, last_report) =
+                                (false, None, Some(Instant::now()));
+                            on_output(&output.tail());
+                        }
+                    }
+                }
                 None => pipe = None,
             },
+            () = sleep_until(report_due) => {
+                (unreported, report_due, last_report) = (false, None, Some(Instant::now()));
+                on_output(&output.tail());
+            }
             exit = child.wait(), if status.is_none() => status = Some(exit.map_err(io_error)?),
             () = sleep_until(deadline) => {
                 // Dropping the group kills the tree; what it wrote is kept.
@@ -466,6 +510,9 @@ async fn bash_tool(
     }
     if let Some(group) = group {
         group.finish();
+    }
+    if unreported {
+        on_output(&output.tail());
     }
 
     let snapshot = output.finish().map_err(io_error)?;
@@ -1044,6 +1091,102 @@ mod tests {
         assert!(full.starts_with("1\n2\n") && full.ends_with("\n20000\nthe-error\n"));
         let _ = fs::remove_file(saved);
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// Runs `command`, collecting what it reports while it runs and when.
+    async fn run_streaming(command: &str) -> (ToolResult, Vec<(String, std::time::Instant)>) {
+        let mut reports = Vec::new();
+        let result = execute_tool_streaming(
+            Path::new("."),
+            bash(command),
+            &ToolRuntimeOptions::default(),
+            &mut |output| reports.push((output.to_string(), std::time::Instant::now())),
+        )
+        .await
+        .expect("bash");
+        (result, reports)
+    }
+
+    #[tokio::test]
+    async fn bash_reports_its_output_while_it_runs() {
+        let (result, reports) = run_streaming("printf 'one\\n'; sleep 0.5; printf 'two\\n'").await;
+        assert_eq!(result.output, "one\ntwo\n");
+        let outputs = reports
+            .iter()
+            .map(|(output, _)| output.as_str())
+            .collect::<Vec<_>>();
+        // Starting, then everything printed so far each time more arrives.
+        assert_eq!(outputs, ["", "one\n", "one\ntwo\n"]);
+        // The first line was reported while the command still slept.
+        let waited = reports[2].1.duration_since(reports[1].1);
+        assert!(waited >= Duration::from_millis(400), "{waited:?}");
+    }
+
+    #[tokio::test]
+    async fn bash_reports_are_throttled_and_end_with_all_the_output() {
+        // 40 lines over about 400 ms: far fewer reports than lines.
+        let (result, reports) =
+            run_streaming("for i in $(seq 1 40); do echo line-$i; sleep 0.01; done").await;
+        assert_eq!(result.output.lines().count(), 40);
+        assert_eq!(reports[0].0, "");
+        assert!(reports.len() < 15, "{} reports", reports.len());
+        assert!(reports.len() > 2, "{} reports", reports.len());
+        for pair in reports[1..].windows(2) {
+            let apart = pair[1].1.duration_since(pair[0].1);
+            // The last report flushes what is left when the command ends.
+            if pair[1].0 != result.output {
+                assert!(apart >= BASH_UPDATE_THROTTLE, "{apart:?} apart");
+            }
+            assert!(pair[1].0.starts_with(&pair[0].0), "a report lost output");
+        }
+        assert_eq!(reports.last().unwrap().0, result.output);
+    }
+
+    #[tokio::test]
+    async fn bash_reports_stay_within_the_result_limits() {
+        let (result, reports) = run_streaming("seq 1 20000").await;
+        let (shown, rest) = result
+            .output
+            .split_once("\n\n[Showing lines 18001-20000 of 20000. Full output: ")
+            .expect("truncation notice");
+        // A report is the output's end, like the result without its notice.
+        assert_eq!(reports.last().unwrap().0, shown);
+        for (output, _) in &reports {
+            assert!(output.lines().count() <= DEFAULT_MAX_LINES);
+            assert!(output.len() <= DEFAULT_MAX_BYTES);
+        }
+        let _ = fs::remove_file(rest.trim_end_matches(']'));
+    }
+
+    #[tokio::test]
+    async fn a_command_that_cannot_start_still_reports_that_it_starts() {
+        let mut reports = Vec::new();
+        let error = execute_tool_streaming(
+            Path::new("/nonexistent/pi-tools-cwd"),
+            bash("echo never"),
+            &ToolRuntimeOptions::default(),
+            &mut |output| reports.push(output.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Working directory does not exist"));
+        assert_eq!(reports, [""]);
+        // Other tools report nothing before their result.
+        let mut reports = Vec::new();
+        execute_tool_streaming(
+            Path::new("."),
+            ToolRequest::Ls {
+                path: None,
+                limit: None,
+            },
+            &ToolRuntimeOptions::default(),
+            &mut |output| reports.push(output.to_string()),
+        )
+        .await
+        .expect("ls");
+        assert_eq!(reports, Vec::<String>::new());
     }
 
     #[tokio::test]

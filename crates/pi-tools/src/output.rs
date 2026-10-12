@@ -110,16 +110,26 @@ impl OutputAccumulator {
         }
     }
 
+    /// The end of the output so far, within the limits: what
+    /// [`OutputAccumulator::finish`] would show if the output ended here.
+    pub fn tail(&self) -> String {
+        self.tail_truncation().content
+    }
+
+    fn tail_truncation(&self) -> Truncation {
+        let text = match self.tail.find('\n') {
+            Some(newline) if !self.tail_starts_at_line_boundary => &self.tail[newline + 1..],
+            _ => self.tail.as_str(),
+        };
+        truncate_tail(text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES)
+    }
+
     /// Ends the output and returns what the model is shown.
     pub fn finish(mut self) -> io::Result<OutputSnapshot> {
         if !std::mem::take(&mut self.undecoded).is_empty() {
             self.append_text("\u{fffd}");
         }
-        let text = match self.tail.find('\n') {
-            Some(newline) if !self.tail_starts_at_line_boundary => &self.tail[newline + 1..],
-            _ => self.tail.as_str(),
-        };
-        let mut truncation = truncate_tail(text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let mut truncation = self.tail_truncation();
         let total_lines = self.completed_lines + usize::from(self.has_open_line);
         let truncated =
             total_lines > DEFAULT_MAX_LINES || self.total_decoded_bytes > DEFAULT_MAX_BYTES;
