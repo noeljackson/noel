@@ -32,6 +32,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "rpc-protocol.json",
     "session-export.json",
     "settings.json",
+    "skills.json",
     "slash-commands.json",
     "system-prompt.json",
     "tool-behavior.json",
@@ -56,6 +57,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "rpc-protocol-fixture.ts",
     "session-export-fixture.ts",
     "settings-fixture.ts",
+    "skills-fixture.ts",
     "slash-command-fixture.ts",
     "system-prompt-fixture.ts",
     "tool-behavior-fixture.ts",
@@ -192,6 +194,7 @@ fn every_script_output_is_committed() {
             fixture_set(&["session-export.json"]),
         ),
         ("settings-fixture.ts", fixture_set(&["settings.json"])),
+        ("skills-fixture.ts", fixture_set(&["skills.json"])),
         (
             "slash-command-fixture.ts",
             fixture_set(&["slash-commands.json"]),
@@ -276,6 +279,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("rpc-protocol.json", "crates/pi-cli/tests/rpc_parity.rs"),
         ("session-export.json", "crates/pi-core/src/lib.rs"),
         ("settings.json", "crates/pi-config/src/lib.rs"),
+        ("skills.json", "crates/pi-config/src/skills.rs"),
         ("slash-commands.json", "crates/pi-tui/src/lib.rs"),
         ("system-prompt.json", "crates/pi-core/src/system_prompt.rs"),
         (

@@ -1,3 +1,13 @@
+mod frontmatter;
+mod prompt_templates;
+mod resources;
+mod skills;
+
+pub use frontmatter::{js_trim, strip_frontmatter};
+pub use prompt_templates::{expand_prompt_template, PromptTemplate};
+pub use resources::{ResourceOptions, SourceInfo, SourceScope};
+pub use skills::{format_skills_for_prompt, Skill, SkillReader};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
@@ -19,7 +29,8 @@ pub const ENV_SESSION_DIR: &str = "PI_CODING_AGENT_SESSION_DIR";
 /// Set by the test harness (`make test`, and every `pi` the CLI tests run).
 /// pi then refuses to fall back to `~/.pi/agent`, so a test must name its
 /// agent dir with `PI_CODING_AGENT_DIR`, imports no Claude Code or Codex
-/// login from `$HOME`, and starts no background model refresh.
+/// login from `$HOME`, reads no `~/.agents/skills`, and starts no background
+/// model refresh.
 pub const ENV_TEST_ISOLATION: &str = "PI_TEST_ISOLATION";
 pub const PROJECT_TRUST_FILE_NAME: &str = "trust.json";
 
@@ -1032,8 +1043,9 @@ pub struct LoadedConfig {
     pub keybindings: Vec<KeybindingConfig>,
     pub context_files: Vec<ContextFile>,
     pub extensions: Vec<ResourceFile>,
-    pub skills: Vec<ResourceFile>,
-    pub prompt_templates: Vec<ResourceFile>,
+    /// In the order they loaded; the first of a name won.
+    pub skills: Vec<Skill>,
+    pub prompt_templates: Vec<PromptTemplate>,
     pub themes: Vec<ResourceFile>,
     pub diagnostics: Vec<String>,
     pub system_prompt: Option<String>,
@@ -1060,6 +1072,16 @@ pub fn load_config(paths: ConfigPaths) -> Result<LoadedConfig, ConfigError> {
 pub fn load_config_with_project_trust(
     paths: ConfigPaths,
     project_trusted: bool,
+) -> Result<LoadedConfig, ConfigError> {
+    load_config_with_resources(paths, project_trusted, &ResourceOptions::from_env())
+}
+
+/// Loads the configuration with the command line's skill and prompt
+/// template flags, which decide what is discovered and what loads after it.
+pub fn load_config_with_resources(
+    paths: ConfigPaths,
+    project_trusted: bool,
+    resource_options: &ResourceOptions,
 ) -> Result<LoadedConfig, ConfigError> {
     let global_settings = read_optional_settings(&paths.settings_path)?;
     let project_settings = if project_trusted {
@@ -1105,26 +1127,11 @@ pub fn load_config_with_project_trust(
     let context_files = load_context_files(&paths.cwd, &paths.agent_dir, &mut diagnostics);
     let mut extensions =
         load_resource_files(&paths, "extensions", project_trusted, &mut diagnostics);
-    let mut skills = load_skill_resource_files(&paths, project_trusted, &mut diagnostics);
-    let mut prompt_templates =
-        load_resource_files(&paths, "prompts", project_trusted, &mut diagnostics);
     let mut themes = load_resource_files(&paths, "themes", project_trusted, &mut diagnostics);
     extend_resource_files(
         &mut extensions,
         &paths.agent_dir,
         &global_settings.extensions,
-        &mut diagnostics,
-    );
-    extend_resource_files(
-        &mut skills,
-        &paths.agent_dir,
-        &global_settings.skills,
-        &mut diagnostics,
-    );
-    extend_resource_files(
-        &mut prompt_templates,
-        &paths.agent_dir,
-        &global_settings.prompts,
         &mut diagnostics,
     );
     extend_resource_files(
@@ -1142,18 +1149,6 @@ pub fn load_config_with_project_trust(
             &mut diagnostics,
         );
         extend_resource_files(
-            &mut skills,
-            &project_base,
-            &project_settings.skills,
-            &mut diagnostics,
-        );
-        extend_resource_files(
-            &mut prompt_templates,
-            &project_base,
-            &project_settings.prompts,
-            &mut diagnostics,
-        );
-        extend_resource_files(
             &mut themes,
             &project_base,
             &project_settings.themes,
@@ -1164,31 +1159,45 @@ pub fn load_config_with_project_trust(
         &paths.cwd,
         &settings.packages,
         &mut extensions,
-        &mut skills,
-        &mut prompt_templates,
         &mut themes,
         &mut diagnostics,
     );
-    filter_disabled_resource_files(
-        &mut extensions,
-        PackageResourceType::Extensions,
-        settings.disabled_resources.as_ref(),
+    let resources::LoadedResources {
+        mut skills,
+        skill_diagnostics,
+        mut prompt_templates,
+        prompt_diagnostics,
+    } = resources::load_resources(
+        &resources::ResourceSources {
+            paths: &paths,
+            project_trusted,
+            user_settings: &global_settings,
+            project_settings: &project_settings,
+            packages: &settings.packages,
+            options: resource_options,
+        },
+        &mut diagnostics,
     );
-    filter_disabled_resource_files(
-        &mut skills,
-        PackageResourceType::Skills,
-        settings.disabled_resources.as_ref(),
+    diagnostics.extend(skill_diagnostics.iter().map(|d| d.describe("skill")));
+    diagnostics.extend(
+        prompt_diagnostics
+            .iter()
+            .map(|d| d.describe("prompt template")),
     );
-    filter_disabled_resource_files(
-        &mut prompt_templates,
-        PackageResourceType::Prompts,
-        settings.disabled_resources.as_ref(),
-    );
-    filter_disabled_resource_files(
-        &mut themes,
-        PackageResourceType::Themes,
-        settings.disabled_resources.as_ref(),
-    );
+    let disabled = settings.disabled_resources.as_ref();
+    let enabled = |resource_type, name: &str, path: &Path| {
+        !resource_disabled(disabled, resource_type, name, path)
+    };
+    extensions.retain(|file| enabled(PackageResourceType::Extensions, &file.name, &file.path));
+    skills.retain(|skill| enabled(PackageResourceType::Skills, &skill.name, &skill.file_path));
+    prompt_templates.retain(|template| {
+        enabled(
+            PackageResourceType::Prompts,
+            &template.name,
+            &template.file_path,
+        )
+    });
+    themes.retain(|file| enabled(PackageResourceType::Themes, &file.name, &file.path));
     // The `systemPrompt` and `appendSystemPrompt` settings stand where
     // upstream's flags do: a discovered file applies only without them.
     let system_prompt = match resolve_prompt_input(settings.system_prompt.as_deref())? {
@@ -2063,39 +2072,6 @@ fn load_resource_files(
     resources.into_values().collect()
 }
 
-fn load_skill_resource_files(
-    paths: &ConfigPaths,
-    project_trusted: bool,
-    diagnostics: &mut Vec<String>,
-) -> Vec<ResourceFile> {
-    let resources = load_resource_files(paths, "skills", project_trusted, diagnostics);
-    let mut map = resources
-        .into_iter()
-        .map(|resource| (resource.name.clone(), resource))
-        .collect::<BTreeMap<_, _>>();
-    if project_trusted {
-        for dir in ancestor_agents_skill_dirs(&paths.cwd) {
-            collect_agent_skill_path(&mut map, &dir, diagnostics);
-        }
-    }
-    map.into_values().collect()
-}
-
-fn ancestor_agents_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let git_root = find_git_root(cwd);
-    let mut dirs = Vec::new();
-    let mut current = Some(cwd);
-    while let Some(dir) = current {
-        dirs.push(dir.join(".agents").join("skills"));
-        if git_root.as_deref() == Some(dir) {
-            break;
-        }
-        current = dir.parent();
-    }
-    dirs.reverse();
-    dirs
-}
-
 fn find_git_root(cwd: &Path) -> Option<PathBuf> {
     let mut current = Some(cwd);
     while let Some(dir) = current {
@@ -2105,54 +2081,6 @@ fn find_git_root(cwd: &Path) -> Option<PathBuf> {
         current = dir.parent();
     }
     None
-}
-
-fn collect_agent_skill_path(
-    resources: &mut BTreeMap<String, ResourceFile>,
-    path: &Path,
-    diagnostics: &mut Vec<String>,
-) {
-    if !path.exists() {
-        return;
-    }
-    if path.is_file() {
-        if path.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
-            push_resource_file(resources, path, diagnostics);
-        }
-        return;
-    }
-    if !path.is_dir() {
-        return;
-    }
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(error) => {
-            diagnostics.push(format!("failed to read {}: {error}", path.display()));
-            return;
-        }
-    };
-    let ignore_patterns = read_resource_ignore_patterns(path, diagnostics);
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                diagnostics.push(format!(
-                    "failed to read entry in {}: {error}",
-                    path.display()
-                ));
-                continue;
-            }
-        };
-        let child = entry.path();
-        if resource_path_ignored(&child, path, &ignore_patterns) {
-            continue;
-        }
-        if child.is_dir() {
-            collect_agent_skill_path(resources, &child, diagnostics);
-        } else if child.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
-            push_resource_file(resources, &child, diagnostics);
-        }
-    }
 }
 
 fn extend_resource_files(
@@ -2178,12 +2106,12 @@ fn extend_resource_files(
     resources.extend(map.into_values());
 }
 
+/// The extensions and themes of the packages. Their skills and prompt
+/// templates load with the others, in `resources`.
 fn load_package_resources(
     cwd: &Path,
     packages: &[PackageSource],
     extensions: &mut Vec<ResourceFile>,
-    skills: &mut Vec<ResourceFile>,
-    prompts: &mut Vec<ResourceFile>,
     themes: &mut Vec<ResourceFile>,
     diagnostics: &mut Vec<String>,
 ) {
@@ -2214,15 +2142,7 @@ fn load_package_resources(
             ));
             continue;
         }
-        load_package_root_resources(
-            &package_root,
-            package,
-            extensions,
-            skills,
-            prompts,
-            themes,
-            diagnostics,
-        );
+        load_package_root_resources(&package_root, package, extensions, themes, diagnostics);
     }
 }
 
@@ -2230,8 +2150,6 @@ fn load_package_root_resources(
     package_root: &Path,
     package: &PackageSource,
     extensions: &mut Vec<ResourceFile>,
-    skills: &mut Vec<ResourceFile>,
-    prompts: &mut Vec<ResourceFile>,
     themes: &mut Vec<ResourceFile>,
     diagnostics: &mut Vec<String>,
 ) {
@@ -2240,12 +2158,6 @@ fn load_package_root_resources(
         manifest.as_ref().map(|manifest| &manifest.extensions),
         "extensions",
     );
-    let skill_entries =
-        package_resource_entries(manifest.as_ref().map(|manifest| &manifest.skills), "skills");
-    let prompt_entries = package_resource_entries(
-        manifest.as_ref().map(|manifest| &manifest.prompts),
-        "prompts",
-    );
     let theme_entries =
         package_resource_entries(manifest.as_ref().map(|manifest| &manifest.themes), "themes");
     extend_package_resource_files(
@@ -2253,20 +2165,6 @@ fn load_package_root_resources(
         package_root,
         &extension_entries,
         package.filters(PackageResourceType::Extensions),
-        diagnostics,
-    );
-    extend_package_resource_files(
-        skills,
-        package_root,
-        &skill_entries,
-        package.filters(PackageResourceType::Skills),
-        diagnostics,
-    );
-    extend_package_resource_files(
-        prompts,
-        package_root,
-        &prompt_entries,
-        package.filters(PackageResourceType::Prompts),
         diagnostics,
     );
     extend_package_resource_files(
@@ -2403,13 +2301,16 @@ impl PackageResourceType {
     }
 }
 
-fn filter_disabled_resource_files(
-    resources: &mut Vec<ResourceFile>,
-    resource_type: PackageResourceType,
+/// Whether `disabledResources` in settings names this resource: by name,
+/// as `skills/<name>` or `skill:<name>`, or by path. Wildcards apply.
+fn resource_disabled(
     disabled_resources: Option<&ResourceStateSettings>,
-) {
+    resource_type: PackageResourceType,
+    name: &str,
+    path: &Path,
+) -> bool {
     let Some(disabled_resources) = disabled_resources else {
-        return;
+        return false;
     };
     let patterns = match resource_type {
         PackageResourceType::Extensions => &disabled_resources.extensions,
@@ -2417,29 +2318,16 @@ fn filter_disabled_resource_files(
         PackageResourceType::Prompts => &disabled_resources.prompts,
         PackageResourceType::Themes => &disabled_resources.themes,
     };
-    if patterns.is_empty() {
-        return;
-    }
-    resources.retain(|resource| {
-        !patterns
-            .iter()
-            .any(|pattern| resource_state_pattern_matches(resource, resource_type, pattern))
-    });
-}
-
-fn resource_state_pattern_matches(
-    resource: &ResourceFile,
-    resource_type: PackageResourceType,
-    pattern: &str,
-) -> bool {
-    let pattern = normalize_pattern(pattern);
-    let path = normalize_resource_path(&resource.path);
+    let path = normalize_resource_path(path);
     let key = resource_type.key();
     let singular = resource_type.singular();
-    wildcard_matches(&pattern, &resource.name)
-        || wildcard_matches(&pattern, &format!("{key}/{}", resource.name))
-        || wildcard_matches(&pattern, &format!("{singular}:{}", resource.name))
-        || wildcard_matches(&pattern, &path)
+    patterns.iter().any(|pattern| {
+        let pattern = normalize_pattern(pattern);
+        wildcard_matches(&pattern, name)
+            || wildcard_matches(&pattern, &format!("{key}/{name}"))
+            || wildcard_matches(&pattern, &format!("{singular}:{name}"))
+            || wildcard_matches(&pattern, &path)
+    })
 }
 
 fn resolve_resource_path(base_dir: &Path, entry: &str) -> Result<PathBuf, ConfigError> {
@@ -2721,13 +2609,6 @@ fn push_resource_file(
 }
 
 fn resource_name(path: &Path) -> Option<String> {
-    if path.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
-        return path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|value| value.to_str())
-            .map(ToString::to_string);
-    }
     path.file_stem()
         .and_then(|value| value.to_str())
         .map(ToString::to_string)
@@ -3370,11 +3251,15 @@ mod tests {
             r#"{"submit":["enter"],"cancel":["escape"]}"#,
         )
         .expect("write keybindings");
-        fs::create_dir_all(agent_dir.join("skills")).expect("create skills");
+        fs::create_dir_all(agent_dir.join("skills/review")).expect("create skills");
         fs::create_dir_all(agent_dir.join("prompts")).expect("create prompts");
         fs::create_dir_all(agent_dir.join("extensions")).expect("create extensions");
         fs::create_dir_all(cwd.join(".pi/themes")).expect("create project themes");
-        fs::write(agent_dir.join("skills/review.md"), "review skill").expect("write skill");
+        fs::write(
+            agent_dir.join("skills/review/SKILL.md"),
+            "---\ndescription: Review code.\n---\nreview skill",
+        )
+        .expect("write skill");
         fs::write(agent_dir.join("prompts/fix.md"), "fix {{input}}").expect("write prompt");
         fs::write(agent_dir.join("extensions/plan.md"), "plan extension").expect("write extension");
         fs::write(cwd.join(".pi/themes/dark.json"), r#"{"name":"dark"}"#).expect("write theme");
@@ -3409,8 +3294,9 @@ mod tests {
         assert_eq!(config.extensions[0].name, "plan");
         assert_eq!(config.extensions[0].content, "plan extension");
         assert_eq!(config.skills[0].name, "review");
-        assert_eq!(config.skills[0].content, "review skill");
+        assert_eq!(config.skills[0].description, "Review code.");
         assert_eq!(config.prompt_templates[0].name, "fix");
+        assert_eq!(config.prompt_templates[0].content, "fix {{input}}");
         assert_eq!(config.themes[0].name, "dark");
         assert!(config.diagnostics.is_empty(), "{:?}", config.diagnostics);
 
@@ -3451,7 +3337,11 @@ mod tests {
         .expect("write package manifest");
         fs::write(package_dir.join("extensions/pkg.md"), "package extension")
             .expect("write package extension");
-        fs::write(package_dir.join("skills/pkg.md"), "package skill").expect("write package skill");
+        fs::write(
+            package_dir.join("skills/pkg.md"),
+            "---\nname: pkg\ndescription: A package skill.\n---\npackage skill",
+        )
+        .expect("write package skill");
 
         let config = load_config(ConfigPaths {
             cwd: cwd.clone(),
@@ -3477,7 +3367,7 @@ mod tests {
         assert!(config
             .skills
             .iter()
-            .any(|resource| resource.name == "pkg" && resource.content == "package skill"));
+            .any(|skill| skill.name == "pkg" && skill.source_info.from_package));
         assert!(config
             .prompt_templates
             .iter()
@@ -3585,14 +3475,17 @@ mod tests {
         fs::write(repo.join(".git"), "").expect("mark git root");
         fs::write(
             cwd.join(".agents/skills/local/SKILL.md"),
-            "local skill body",
+            "---\ndescription: The local skill.\n---\nlocal skill body",
         )
         .expect("write local skill");
-        fs::write(repo.join(".agents/skills/repo/SKILL.md"), "repo skill body")
-            .expect("write repo skill");
+        fs::write(
+            repo.join(".agents/skills/repo/SKILL.md"),
+            "---\ndescription: The repo skill.\n---\nrepo skill body",
+        )
+        .expect("write repo skill");
         fs::write(
             cwd.join(".agents/skills/ignored.md"),
-            "ignored root markdown",
+            "---\nname: ignored\ndescription: Directly in .agents/skills.\n---\n",
         )
         .expect("write ignored root markdown");
 
@@ -3609,18 +3502,11 @@ mod tests {
         })
         .expect("load config");
 
-        assert!(config
-            .skills
-            .iter()
-            .any(|resource| resource.name == "repo" && resource.content == "repo skill body"));
-        assert!(config
-            .skills
-            .iter()
-            .any(|resource| resource.name == "local" && resource.content == "local skill body"));
-        assert!(!config
-            .skills
-            .iter()
-            .any(|resource| resource.name == "ignored"));
+        // Nearest first; a Markdown file directly in .agents/skills is no skill.
+        let names = config.skills.iter().map(|skill| skill.name.as_str());
+        assert_eq!(names.collect::<Vec<_>>(), ["local", "repo"]);
+        assert_eq!(config.skills[1].description, "The repo skill.");
+        assert_eq!(config.skills[1].base_dir, repo.join(".agents/skills/repo"));
         assert!(config.diagnostics.is_empty());
 
         let _ = fs::remove_dir_all(root);
@@ -3646,8 +3532,11 @@ mod tests {
         .expect("write project settings");
         fs::write(cwd.join(".pi/extensions/local.md"), "project extension")
             .expect("write project extension");
-        fs::write(repo.join(".agents/skills/repo/SKILL.md"), "repo skill")
-            .expect("write repo skill");
+        fs::write(
+            repo.join(".agents/skills/repo/SKILL.md"),
+            "---\ndescription: The repo skill.\n---\nrepo skill",
+        )
+        .expect("write repo skill");
 
         let config = load_config_with_project_trust(
             ConfigPaths {
