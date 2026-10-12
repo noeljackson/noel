@@ -1,0 +1,729 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/error-classification-fixture.ts"
+  },
+  "format": {
+    "patterns": "Regular expression sources, all matched ignoring case. A message is retryable when it matches a retryable pattern and no nonRetryable one; it is a context overflow when it matches an overflow pattern and no nonOverflow one.",
+    "cases": "For each error message, isRetryableAssistantError and isContextOverflow of an assistant message that failed with it. The provider is not Cerebras, whose bodyless 400 and 413 upstream also reads as overflow."
+  },
+  "patterns": {
+    "retryable": [
+      "overloaded",
+      "server_busy",
+      "servers are currently busy",
+      "currently experiencing high demand",
+      "model is at capacity",
+      "rate.?limit",
+      "too many requests",
+      "429",
+      "500",
+      "502",
+      "503",
+      "504",
+      "520",
+      "524",
+      "service.?unavailable",
+      "server.?error",
+      "internal.?error",
+      "provider.?returned.?error",
+      "exceeded request buffer limit while retrying upstream",
+      "network.?error",
+      "connection.?error",
+      "connection.?refused",
+      "connection.?lost",
+      "other side closed",
+      "fetch failed",
+      "getaddrinfo",
+      "ENOTFOUND",
+      "EAI_AGAIN",
+      "upstream.?connect",
+      "reset before headers",
+      "socket hang up",
+      "socket connection was closed",
+      "timed? out",
+      "timeout",
+      "terminated",
+      "websocket.?closed",
+      "websocket.?error",
+      "ended without",
+      "stream ended before message_stop",
+      "stream ended before a terminal response event",
+      "http2 request did not get a response",
+      "pending stream has been canceled",
+      "retry delay",
+      "you can retry your request",
+      "try your request again",
+      "please retry your request",
+      "ResourceExhausted",
+      "subscription_sharing_usage_unavailable",
+      "subscription_sharing_user_unavailable"
+    ],
+    "nonRetryable": [
+      "GoUsageLimitError",
+      "FreeUsageLimitError",
+      "Monthly usage limit reached",
+      "available balance",
+      "insufficient_quota",
+      "out of budget",
+      "quota exceeded",
+      "billing",
+      "subscription_sharing_usage_limit_exceeded"
+    ],
+    "overflow": [
+      "prompt (?:is )?too long",
+      "prompt exceeds max length",
+      "request_too_large",
+      "input is too long for requested model",
+      "exceeds the context window",
+      "exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\\d,]+ tokens?|\\s*\\([\\d,]+\\))",
+      "input token count.*exceeds the maximum",
+      "maximum prompt length is \\d+",
+      "reduce the length of the messages",
+      "maximum context length is \\d+ tokens",
+      "exceeds (?:the )?maximum allowed input length of [\\d,]+ tokens?",
+      "input \\(\\d+ tokens\\) is longer than the model'?s context length \\(\\d+ tokens\\)",
+      "exceeds the limit of \\d+",
+      "exceeds the available context size",
+      "greater than the context length",
+      "context window exceeds limit",
+      "exceeded model token limit",
+      "too large for model with \\d+ maximum context length",
+      "prompt has [\\d,]+ tokens?, but the configured context size is [\\d,]+ tokens?",
+      "model_context_window_exceeded",
+      "prompt too long; exceeded (?:max )?context length",
+      "range of input length should be",
+      "context[_ ]length[_ ]exceeded",
+      "too many tokens",
+      "token limit exceeded"
+    ],
+    "nonOverflow": [
+      "^(Throttling error|Service unavailable):",
+      "rate limit",
+      "too many requests"
+    ]
+  },
+  "cases": [
+    {
+      "message": "request failed with status 400 Bad Request: {\"error\":{\"message\":\"Unsupported parameter: 'temperature'.\",\"type\":\"invalid_request_error\"}}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 400 Bad Request: {\"error\":{\"message\":\"This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "request failed with status 400 Bad Request: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 213462 tokens > 200000 maximum\"}}",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "request failed with status 400 Bad Request: ",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 401 Unauthorized: {\"error\":{\"message\":\"Incorrect API key provided.\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 402 Payment Required: {\"error\":{\"message\":\"Insufficient credits.\"}}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 403 Forbidden: {\"error\":{\"message\":\"The model is not available in your region.\"}}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 404 Not Found: {\"error\":{\"message\":\"The model does not exist.\"}}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 408 Request Timeout: ",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 409 Conflict: {\"error\":{\"message\":\"The request conflicts with another request.\"}}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 413 Payload Too Large: {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "request failed with status 413 Payload Too Large: ",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 422 Unprocessable Entity: {\"detail\":\"messages: field required\"}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 429 Too Many Requests: {\"error\":{\"message\":\"Rate limit reached for requests.\",\"type\":\"requests\"}}",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 429 Too Many Requests: {\"error\":{\"message\":\"You exceeded your current quota.\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 429 Too Many Requests: {\"message\":\"Too many tokens, please wait before trying again.\"}",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 429 Too Many Requests: {\"type\":\"error\",\"error\":{\"type\":\"GoUsageLimitError\",\"message\":\"Monthly usage limit reached\"}}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 500 Internal Server Error: {\"error\":{\"message\":\"The server had an error while processing your request.\"}}",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 502 Bad Gateway: <html><body>bad gateway</body></html>",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 503 Service Unavailable: {\"error\":{\"message\":\"The server is overloaded.\",\"type\":\"server_error\"}}",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 503 Service Unavailable: {\"message\":\"Too many tokens, please wait before trying again.\"}",
+      "retryable": true,
+      "overflow": true
+    },
+    {
+      "message": "request failed with status 504 Gateway Timeout: ",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 520 <unknown status code>: ",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 524 <unknown status code>: ",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed with status 529 <unknown status code>: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed: error sending request for url (https://api.example.test/v1/messages)",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "request failed: error sending request for url (https://api.example.test/v1/messages) (timed out)",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "request failed: error decoding response body",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "provider anthropic requires an API key",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "provider config error: no credentials are configured for anthropic",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "provider returned an invalid response: overloaded",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "provider returned an invalid response: incomplete provider response: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"The server had an error.\"}}",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "provider returned an invalid response: incomplete provider response: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "provider returned an invalid response: {}",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "invalid header value: failed to parse header value",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "prompt is too long: 213462 tokens > 200000 maximum",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "413 {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "Your input exceeds the context window of this model",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "Requested token count exceeds the model's maximum context length of 131072 tokens",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "Input length (265330) exceeds model's maximum context length (262144).",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "This model's maximum prompt length is 131072 but the request contains 537812 tokens",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "Please reduce the length of the messages or completion",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "This endpoint's maximum context length is 200000 tokens. However, you requested about 250000 tokens",
+      "retryable": true,
+      "overflow": true
+    },
+    {
+      "message": "Input length 300000 exceeds the maximum allowed input length of 262144 tokens.",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "The input (300000 tokens) is longer than the model's context length (262144 tokens).",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "the request exceeds the available context size, try increasing it",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "tokens to keep from the initial prompt is greater than the context length",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "prompt token count of 150000 exceeds the limit of 128000",
+      "retryable": true,
+      "overflow": true
+    },
+    {
+      "message": "invalid params, context window exceeds limit",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "Your request exceeded model token limit: 262144 (requested: 300000)",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "Prompt has 9,000 tokens, but the configured context size is 8,192 tokens",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "Prompt contains 300000 tokens and 0 draft tokens, too large for model with 262144 maximum context length",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "{\"code\":\"1261\",\"message\":\"Prompt too long\"}",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "{\"code\":\"1261\",\"message\":\"Prompt exceeds max length\"}",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "Range of input length should be [1, 129024]",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "prompt too long; exceeded max context length by 100 tokens",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "Input is too long for requested model.",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "model_context_window_exceeded",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "context length exceeded",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "token limit exceeded",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "400 status code (no body)",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "Throttling error: Too many tokens, please wait before trying again.",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "Service unavailable: too many tokens in flight",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "ThrottlingException: Too many tokens, please wait before trying again.",
+      "retryable": false,
+      "overflow": true
+    },
+    {
+      "message": "rate limit reached: too many tokens per minute",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Too many requests: token limit exceeded for this minute",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "The response was cut off at the maximum context length",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "overloaded_error",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "server_busy",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Our servers are currently busy, please try again later",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "We are currently experiencing high demand",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "The model is at capacity",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "rate_limit_exceeded",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "RateLimitError",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Too Many Requests",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Service Unavailable",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "service_unavailable",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Internal server error",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "internal_error",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Provider returned error",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "exceeded request buffer limit while retrying upstream",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Network error",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Connection error.",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "connect ECONNREFUSED 127.0.0.1:443: connection refused",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Connection lost",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "other side closed",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "fetch failed",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "getaddrinfo ENOTFOUND api.example.test",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "EAI_AGAIN api.example.test",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "upstream connect error or disconnect/reset before headers",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "socket hang up",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "The socket connection was closed unexpectedly",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Request timed out.",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "The operation time out",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "ETIMEDOUT: timeout",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "terminated",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "WebSocket closed with code 1006",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "websocket error",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "stream ended without sending any chunks",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Anthropic stream ended before message_stop",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "stream ended before a terminal response event",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "http2 request did not get a response",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "The pending stream has been canceled (caused by: )",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Server requested 120s retry delay (max: 60s). Rate limited",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "An error occurred while processing your request. You can retry your request.",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Please try your request again in a few seconds",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "Something went wrong; please retry your request",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "ResourceExhausted: out of capacity",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "subscription_sharing_usage_unavailable",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "subscription_sharing_user_unavailable",
+      "retryable": true,
+      "overflow": false
+    },
+    {
+      "message": "GoUsageLimitError: rate limit",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "FreeUsageLimitError",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "Monthly usage limit reached (429)",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "429 Enable usage from your available balance to continue",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "insufficient_quota",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "You are out of budget (HTTP 429)",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "Quota exceeded for this project, 429",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "Billing hard limit has been reached, 429",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "subscription_sharing_usage_limit_exceeded",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "Invalid API key",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "The model `missing` does not exist",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "Unknown error",
+      "retryable": false,
+      "overflow": false
+    },
+    {
+      "message": "",
+      "retryable": false,
+      "overflow": false
+    }
+  ]
+}

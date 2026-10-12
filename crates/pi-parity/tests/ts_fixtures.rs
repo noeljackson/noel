@@ -16,6 +16,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "bedrock-tools.json",
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
+    "error-classification.json",
     "github-copilot-gpt-5.4.json",
     "google-gemini-2.5-pro.json",
     "google-tool-image-routing.json",
@@ -48,6 +49,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "cloudflare-fixture.ts",
     "codex-oauth-fixture.ts",
     "copilot-fixture.ts",
+    "error-classification-fixture.ts",
     "google-fixture.ts",
     "local-tools-fixture.ts",
     "mistral-fixture.ts",
@@ -152,6 +154,10 @@ fn every_script_output_is_committed() {
         (
             "copilot-fixture.ts",
             fixture_set(&["github-copilot-gpt-5.4.json"]),
+        ),
+        (
+            "error-classification-fixture.ts",
+            fixture_set(&["error-classification.json"]),
         ),
         (
             "google-fixture.ts",
@@ -263,6 +269,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("bedrock-tools.json", "crates/pi-ai/src/lib.rs"),
         ("cli-contract.json", "crates/pi-cli/src/main.rs"),
         ("cloudflare-ai-gateway-kimi.json", "crates/pi-ai/src/lib.rs"),
+        ("error-classification.json", "crates/pi-ai/src/lib.rs"),
         ("github-copilot-gpt-5.4.json", "crates/pi-ai/src/lib.rs"),
         ("google-gemini-2.5-pro.json", "crates/pi-ai/src/lib.rs"),
         ("google-tool-image-routing.json", "crates/pi-ai/src/lib.rs"),

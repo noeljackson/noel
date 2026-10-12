@@ -34,6 +34,11 @@ The committed TypeScript parity fixtures are:
 - `cli-contract.json`: upstream CLI option and command contract.
 - `cloudflare-ai-gateway-kimi.json`: Cloudflare AI Gateway OpenAI-compatible
   request shape.
+- `error-classification.json`: how upstream reads a failed model request from
+  its error text: the pattern lists of `isRetryableAssistantError` and
+  `isContextOverflow`, and both verdicts for 124 error messages (HTTP
+  statuses and bodies as pi words them, the overflow errors of each provider,
+  transport failures, and quota and billing limits).
 - `github-copilot-gpt-5.4.json`: GitHub Copilot Responses request shape.
 - `google-gemini-2.5-pro.json`: Gemini request shape and thinking config.
 - `google-tool-image-routing.json`: Gemini 2 versus Gemini 3 tool-result
