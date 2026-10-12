@@ -820,6 +820,10 @@ fn openrouter_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Tokens upstream keeps free for the request beyond its estimate
+/// (`CONTEXT_SAFETY_TOKENS`).
+const CONTEXT_SAFETY_TOKENS: u64 = 4_096;
+
 fn provider_max_tokens(config: &ProviderConfig, request: &ProviderRequest) -> Option<u64> {
     if let Some(limit) = request.max_output_tokens {
         return Some(limit.max(1));
@@ -837,6 +841,38 @@ fn provider_max_tokens(config: &ProviderConfig, request: &ProviderRequest) -> Op
         ("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") => Some(251_899),
         _ => None,
     }
+}
+
+/// Upstream `estimateContextTokens` (`packages/ai/src/utils/estimate.ts`)
+/// without its usage shortcut: `ceil(chars / 3.5)` per message, where the
+/// leading system message carries the prompt and the tool definitions' JSON
+/// and each image counts as 4800 characters.
+fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
+    const ESTIMATED_IMAGE_CHARS: usize = 4_800;
+    fn tokens(chars: usize) -> u64 {
+        (chars as u64 * 2).div_ceil(7)
+    }
+    let mut total = 0;
+    if let Some(system_prompt) = &request.system_prompt {
+        total += tokens(system_prompt.chars().count());
+    }
+    if !request.tools.is_empty() {
+        let tools = serde_json::to_string(&request.tools).unwrap_or_default();
+        total += tokens(tools.chars().count());
+    }
+    for message in &request.messages {
+        let tool_call_chars: usize = message
+            .tool_calls
+            .iter()
+            .map(|call| call.name.chars().count() + call.arguments.chars().count())
+            .sum();
+        total += tokens(
+            message.content.chars().count()
+                + message.media.len() * ESTIMATED_IMAGE_CHARS
+                + tool_call_chars,
+        );
+    }
+    total
 }
 
 fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
@@ -1183,9 +1219,13 @@ fn anthropic_messages_url(config: &ProviderConfig) -> Result<String, ProviderErr
 }
 
 fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let max_tokens = request
+        .max_output_tokens
+        .unwrap_or_else(|| anthropic_default_max_tokens(&config.model.id, request))
+        .max(1);
     let mut body = json!({
         "model": config.model.id,
-        "max_tokens": request.max_output_tokens.unwrap_or(4096).max(1),
+        "max_tokens": max_tokens,
         "stream": true,
         "system": anthropic_system(config, request),
         "messages": anthropic_messages_with_cache_control(&request.messages, true),
@@ -1194,20 +1234,79 @@ fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
         body["tools"] = json!(anthropic_tools(&request.tools));
     }
     apply_anthropic_thinking(&mut body, config);
-    if request.max_output_tokens.is_some()
-        && body.pointer("/thinking/type").and_then(Value::as_str) == Some("enabled")
-    {
-        let limit = request.max_output_tokens.unwrap_or(4096);
-        if limit <= 1024 {
+    // A thinking budget must stay below max_tokens. An explicit cap keeps half
+    // of it for the answer; the model default keeps upstream's 1024 tokens.
+    if body.pointer("/thinking/type").and_then(Value::as_str) == Some("enabled") {
+        let answer_room = if request.max_output_tokens.is_some() {
+            max_tokens / 2
+        } else {
+            max_tokens.saturating_sub(1024)
+        };
+        if max_tokens <= 1024 {
             body["thinking"] = json!({"type":"disabled"});
         } else if let Some(budget) = body
             .pointer("/thinking/budget_tokens")
             .and_then(Value::as_u64)
         {
-            body["thinking"]["budget_tokens"] = json!(budget.min((limit / 2).max(1024)));
+            body["thinking"]["budget_tokens"] = json!(budget.min(answer_room.max(1024)));
         }
     }
     body
+}
+
+/// Output cap for an Anthropic Messages request that carries none. Upstream
+/// sends the model's catalog `maxTokens`, lowered so the estimated input fits
+/// the context window (`clampMaxTokensToContext`). The port has no output
+/// catalog, so Claude limits come from the model id; other models served over
+/// the Anthropic API get upstream's default for models without a catalog
+/// limit.
+fn anthropic_default_max_tokens(model_id: &str, request: &ProviderRequest) -> u64 {
+    const UNCATALOGED_MAX_TOKENS: u64 = 16_384;
+    let Some((max_tokens, context_window)) = claude_output_limits(model_id) else {
+        return UNCATALOGED_MAX_TOKENS;
+    };
+    let available = context_window
+        .saturating_sub(estimate_request_tokens(request))
+        .saturating_sub(CONTEXT_SAFETY_TOKENS)
+        .max(1);
+    max_tokens.min(available)
+}
+
+/// `(max output tokens, context window)` of a Claude model, read from the
+/// version in its id: `claude-opus-4-1-20250805`, `claude-sonnet-5`,
+/// `claude-3-5-haiku-20241022`. A date suffix is not a minor version.
+fn claude_output_limits(model_id: &str) -> Option<(u64, u64)> {
+    let id = model_id
+        .to_ascii_lowercase()
+        .replace(['.', '_', ':', '@'], "-");
+    let name = id.split("claude-").nth(1)?;
+    // Claude 3 ids put the version before the family.
+    if let Some(minor) = name.strip_prefix("3-") {
+        return Some(match minor.split('-').next() {
+            Some("7") => (64_000, 200_000),
+            Some("5") => (8_192, 200_000),
+            _ => (4_096, 200_000),
+        });
+    }
+    let mut parts = name.split('-');
+    let family = parts.next()?;
+    if matches!(family, "fable" | "mythos") {
+        return Some((128_000, 1_000_000));
+    }
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .filter(|minor| *minor < 100)
+        .unwrap_or(0);
+    match (family, major, minor) {
+        ("opus" | "sonnet" | "haiku", 5.., _) | ("opus" | "sonnet", 4, 6..) => {
+            Some((128_000, 1_000_000))
+        }
+        ("sonnet" | "haiku", 4, _) | ("opus", 4, 5) => Some((64_000, 200_000)),
+        ("opus", 4, _) => Some((32_000, 200_000)),
+        _ => None,
+    }
 }
 
 fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
@@ -5145,6 +5244,92 @@ mod tests {
         }
     }
 
+    fn anthropic_test_config(
+        id: &str,
+        thinking: Option<&str>,
+        budget: Option<u64>,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            model: ModelRef {
+                provider: "anthropic".to_string(),
+                id: id.to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: thinking.map(str::to_string),
+            thinking_budget_tokens: budget,
+            session_id: None,
+        }
+    }
+
+    fn uncapped_request(system_prompt: &str) -> ProviderRequest {
+        ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: Some(system_prompt.to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "write the file".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn anthropic_requests_without_a_cap_use_the_model_output_limit() {
+        let request = uncapped_request("system");
+        for (id, expected) in [
+            ("claude-opus-4-8", 128_000),
+            ("claude-opus-5", 128_000),
+            ("claude-sonnet-4-6", 128_000),
+            ("claude-fable-5-1", 128_000),
+            ("claude-sonnet-4-5-20250929", 64_000),
+            ("claude-haiku-4-5-20251001", 64_000),
+            ("claude-opus-4-5", 64_000),
+            ("claude-sonnet-4-20250514", 64_000),
+            ("claude-opus-4-1-20250805", 32_000),
+            ("claude-opus-4-20250514", 32_000),
+            ("claude-3-7-sonnet-20250219", 64_000),
+            ("claude-3-5-haiku-20241022", 8_192),
+            ("claude-3-haiku-20240307", 4_096),
+            ("kimi-for-coding", 16_384),
+            ("MiniMax-M2.7", 16_384),
+        ] {
+            let body = anthropic_body(&anthropic_test_config(id, None, None), &request);
+            assert_eq!(body["max_tokens"], expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn anthropic_default_cap_leaves_room_in_the_context_window() {
+        // The input estimates as 160_004 tokens (560k + 14 characters at 3.5
+        // per token); 200k minus that and the 4096 safety margin remain.
+        let request = uncapped_request(&"x".repeat(560_000));
+        let config = anthropic_test_config("claude-sonnet-4-5", None, None);
+        assert_eq!(anthropic_body(&config, &request)["max_tokens"], 35_900);
+
+        // A thinking budget stays below the cap and leaves 1024 for the answer.
+        let thinking = anthropic_test_config("claude-sonnet-4-5", Some("high"), Some(50_000));
+        let body = anthropic_body(&thinking, &request);
+        assert_eq!(body["thinking"]["budget_tokens"], 34_876);
+        let body = anthropic_body(&thinking, &uncapped_request("system"));
+        assert_eq!(body["max_tokens"], 64_000);
+        assert_eq!(body["thinking"]["budget_tokens"], 50_000);
+
+        // An explicit cap is still sent as given.
+        let capped = ProviderRequest {
+            max_output_tokens: Some(2048),
+            ..request
+        };
+        let body = anthropic_body(&thinking, &capped);
+        assert_eq!(body["max_tokens"], 2048);
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+    }
+
     #[test]
     fn opus_5_5_uses_adaptive_thinking_with_xhigh() {
         let request = ProviderRequest {
@@ -5215,7 +5400,8 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
-            max_output_tokens: None,
+            // The TS fixture script passes an explicit `maxTokens: 4096`.
+            max_output_tokens: Some(4096),
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5271,7 +5457,8 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
-            max_output_tokens: None,
+            // The TS fixture script passes an explicit `maxTokens: 4096`.
+            max_output_tokens: Some(4096),
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5481,7 +5668,8 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
-            max_output_tokens: None,
+            // The TS fixture script passes an explicit `maxTokens: 4096`.
+            max_output_tokens: Some(4096),
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
