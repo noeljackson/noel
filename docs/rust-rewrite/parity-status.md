@@ -80,11 +80,12 @@ The committed TypeScript parity fixtures are:
 - `slash-commands.json`: slash command inventory and selected descriptions.
 - `system-prompt.json`: the text of upstream's system prompt builder, with
   its sections, for the default tools, every tool pi shares with upstream, a
-  subset, no tools, context files, a custom prompt, appended text, both, and
-  extension tools; each case's inputs are the ones a real upstream session
-  passed its builder. Also what upstream's resource loader picks from a tree
-  of `SYSTEM.md`, `APPEND_SYSTEM.md`, and context files: project trust,
-  command-line flags, `AGENTS.override.md`, and nested worktrees. The
+  subset, no tools, context files, a custom prompt, appended text, both,
+  extension tools, and skills (with `read`, with `bash` only, with neither,
+  and after a custom prompt); each case's inputs are the ones a real upstream
+  session passed its builder. Also what upstream's resource loader picks from
+  a tree of `SYSTEM.md`, `APPEND_SYSTEM.md`, and context files: project
+  trust, command-line flags, `AGENTS.override.md`, and nested worktrees. The
   temporary directory, the product name, and the documentation paths are
   placeholders; the `placeholders` block lists them.
 - `tool-behavior.json`: what upstream's `read`, `bash`, `edit`, `write`,

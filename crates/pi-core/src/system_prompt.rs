@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use pi_config::ContextFile;
+use pi_config::{format_skills_for_prompt, ContextFile, Skill, SkillReader};
 
 /// The product's name, wherever the prompt or the environment states it.
 pub const PRODUCT_NAME: &str = "pi";
@@ -100,10 +100,10 @@ pub struct SystemPromptInput<'a> {
     /// `APPEND_SYSTEM.md`.
     pub append_system_prompt: &'a str,
     pub context_files: &'a [ContextFile],
-    /// The skills listing; `None` until skills are listed here. Upstream
-    /// renders it with `formatSkillsForPrompt` and only while `read` or
-    /// `bash` is active, naming that tool as the way to read a skill's file.
-    pub skills: Option<&'a str>,
+    /// The loaded skills. They are listed only while `read` or `bash` is
+    /// active, as the tool to load a skill's file with, and without the
+    /// skills that disable model invocation.
+    pub skills: &'a [Skill],
     pub cwd: &'a Path,
 }
 
@@ -130,8 +130,17 @@ pub fn build_system_prompt(input: &SystemPromptInput<'_>) -> String {
             &project_context(input.context_files),
         ));
     }
-    if let Some(skills) = input.skills.map(str::trim).filter(|text| !text.is_empty()) {
-        sections.push(section("skills", skills));
+    let has = |name: &str| input.tools.iter().any(|tool| tool.name == name);
+    let reader = match (has("read"), has("bash")) {
+        (true, _) => Some(SkillReader::Read),
+        (false, true) => Some(SkillReader::Bash),
+        (false, false) => None,
+    };
+    if let Some(reader) = reader {
+        let listing = format_skills_for_prompt(input.skills, reader);
+        if !listing.trim().is_empty() {
+            sections.push(section("skills", listing.trim()));
+        }
     }
     let cwd = input.cwd.display().to_string().replace('\\', "/");
     sections.push(section("cwd", &cwd));
@@ -203,7 +212,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use pi_config::ResourceFile;
+    use pi_config::{ResourceFile, SourceInfo, SourceScope};
     use pi_tools::builtin_tool_definitions;
     use serde_json::{json, Value};
 
@@ -230,8 +239,28 @@ mod tests {
             .replace("<product>", PRODUCT_NAME)
     }
 
+    /// The skill a fixture describes; where it came from is not in the prompt.
+    fn skill(value: &Value, tmp: &Path) -> Skill {
+        let path = |key: &str| PathBuf::from(text(&value[key], tmp));
+        Skill {
+            name: text(&value["name"], tmp),
+            description: text(&value["description"], tmp),
+            file_path: path("filePath"),
+            base_dir: path("baseDir"),
+            source_info: SourceInfo {
+                path: path("filePath"),
+                source: "auto".into(),
+                scope: SourceScope::User,
+                from_package: false,
+                base_dir: None,
+            },
+            disable_model_invocation: value["disableModelInvocation"].as_bool().unwrap(),
+        }
+    }
+
     /// A runtime set up as the fixture case's `input` describes: its tools,
-    /// prompt sources, and context files. `dir` holds the extension manifest.
+    /// prompt sources, context files, and skills. `dir` holds the extension
+    /// manifest.
     fn runtime_for(input: &Value, tmp: &Path, dir: &Path) -> Runtime {
         let extension = dir.join("tools");
         fs::write(&extension, "").unwrap();
@@ -269,6 +298,8 @@ mod tests {
                 content: text(&file["content"], tmp),
             })
             .collect();
+        let skills = input["skills"].as_array().unwrap().iter();
+        runtime.systems.skills = skills.map(|value| skill(value, tmp)).collect();
         runtime
     }
 
@@ -310,6 +341,10 @@ mod tests {
                 "appended-prompt",
                 "custom-and-appended-prompt",
                 "extension-tool",
+                "skills",
+                "skills-with-bash-only",
+                "skills-without-a-reader",
+                "skills-with-custom-prompt",
             ]
         );
         for case in cases {
@@ -407,28 +442,40 @@ In addition to the tools above, you may have access to other custom tools depend
         }
     }
 
+    /// The listing appears only with a tool to load a skill's file, and
+    /// names `read` before `bash`. pi's own tools change nothing.
     #[test]
-    fn skills_go_between_project_context_and_cwd() {
-        let files = [ContextFile {
-            path: PathBuf::from("/work/AGENTS.md"),
-            content: "rules".into(),
-        }];
-        let mut input = SystemPromptInput {
-            custom_prompt: Some("custom"),
-            tools: &[],
-            append_system_prompt: "",
-            context_files: &files,
-            skills: Some("\nlisting\n"),
-            cwd: Path::new("/work"),
+    fn skills_are_listed_only_with_a_tool_that_reads_them() {
+        let listed = json!({
+            "name": "review", "description": "Review code.", "disableModelInvocation": false,
+            "filePath": "/skills/review/SKILL.md", "baseDir": "/skills/review",
+        });
+        let skills = [skill(&listed, Path::new("/"))];
+        let prompt = |tools: &[&str], skills: &[Skill]| {
+            let tools = tools.iter().map(|name| PromptTool::builtin(name));
+            build_system_prompt(&SystemPromptInput {
+                custom_prompt: None,
+                tools: &tools.collect::<Vec<_>>(),
+                append_system_prompt: "",
+                context_files: &[],
+                skills,
+                cwd: Path::new("/work"),
+            })
         };
-        assert_eq!(
-            build_system_prompt(&input),
-            "custom\n\n<project_context>\nProject-specific instructions and guidelines:\n\n\
-             <project_instructions path=\"/work/AGENTS.md\">\nrules\n</project_instructions>\n\
-             </project_context>\n\n<skills>\nlisting\n</skills>\n\n<cwd>\n/work\n</cwd>"
-        );
-        input.skills = Some(" \n");
-        assert!(!build_system_prompt(&input).contains("<skills>"));
+        let with_read = prompt(&["bash", "todo", "read"], &skills);
+        assert!(with_read.contains("\n\n<skills>\nThe following skills provide"));
+        assert!(with_read.contains("Use the read tool to load a skill's file"));
+        assert!(with_read.ends_with("</available_skills>\n</skills>\n\n<cwd>\n/work\n</cwd>"));
+        let with_bash = prompt(&["web_fetch", "bash"], &skills);
+        assert!(with_bash.contains("Use bash to load a skill's file"));
+        assert!(!prompt(&["edit", "todo", "web_search"], &skills).contains("<skills>"));
+        assert!(!prompt(&["read"], &[]).contains("<skills>"));
+
+        let hidden = Skill {
+            disable_model_invocation: true,
+            ..skills[0].clone()
+        };
+        assert!(!prompt(&["read"], &[hidden]).contains("<skills>"));
     }
 
     #[test]
@@ -438,7 +485,7 @@ In addition to the tools above, you may have access to other custom tools depend
             tools: &[],
             append_system_prompt: "",
             context_files: &[],
-            skills: None,
+            skills: &[],
             cwd: Path::new("C:\\work\\repo"),
         });
         assert!(prompt.starts_with("You are an expert coding assistant"));

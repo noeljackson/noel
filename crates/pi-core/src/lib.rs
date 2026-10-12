@@ -28,6 +28,7 @@ use pi_ai::{
 };
 use pi_config::{
     has_auth_for_provider, listed_accounts_for_provider, ContextFile, LoadedConfig, ResourceFile,
+    Skill,
 };
 /// Kills every running tool subprocess tree; for pi's fatal-signal handling.
 pub use pi_tools::kill_running_tool_groups;
@@ -431,6 +432,8 @@ pub struct ReloadableSystems {
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
     pub context_files: Vec<ContextFile>,
+    /// The loaded skills, which the system prompt lists.
+    pub skills: Vec<Skill>,
     pub available_models: Vec<ModelRef>,
     pub configured_providers: BTreeSet<String>,
     pub available_accounts: BTreeMap<String, Vec<String>>,
@@ -461,6 +464,7 @@ impl Default for ReloadableSystems {
             system_prompt: None,
             append_system_prompt: Vec::new(),
             context_files: Vec::new(),
+            skills: Vec::new(),
             available_models: Vec::new(),
             configured_providers: BTreeSet::new(),
             available_accounts: BTreeMap::new(),
@@ -610,6 +614,7 @@ impl ReloadableSystems {
             system_prompt: config.system_prompt.clone(),
             append_system_prompt: config.append_system_prompt.clone(),
             context_files: config.context_files.clone(),
+            skills: config.skills.clone(),
             available_models,
             configured_providers,
             model_context_windows: config
@@ -2976,8 +2981,7 @@ fn runtime_system_prompt(runtime: &Runtime) -> String {
         tools: &prompt_tools(runtime),
         append_system_prompt: &runtime.systems.append_system_prompt.join("\n\n"),
         context_files: &runtime.systems.context_files,
-        // Skills are not listed in the prompt yet.
-        skills: None,
+        skills: &runtime.systems.skills,
         cwd: &runtime.session.cwd,
     })
 }
