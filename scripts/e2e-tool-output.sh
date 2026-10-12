@@ -113,4 +113,40 @@ done
 # first read returns the 2000-line cap plus the resume notice; a resumed read
 # with offset reaches the file end.
 grep -Fq 'Use offset=2001 to continue.' "${work_dir}/sessions/"*.jsonl
+
+# A command the model runs shows its latest output while it still runs. Then
+# the model's reply breaks off: the retry is announced, and the reply that
+# replaces it arrives.
+wait_for_both() {
+  for _ in $(seq 1 100); do
+    capture
+    if grep -Fq "$1" "${work_dir}/pane.txt" && grep -Fq "$2" "${work_dir}/pane.txt"; then return; fi
+    sleep 0.1
+  done
+  fail "missing together: $1 and $2"
+}
+cat > "${work_dir}/script.json" <<'JSON'
+[
+  [{"tool_call": {"name": "bash", "arguments": {"command": "for i in 1 2 3 4; do echo live-line-$i; sleep 1; done; sleep 2; echo live-done"}}}],
+  [{"text": "Hel"}, {"error": "terminated"}],
+  [{"text": "Hello again."}]
+]
+JSON
+mkdir -p "${work_dir}/live-agent"
+printf '{"modelRefresh":{"enabled":false},"retry":{"baseDelayMs":1500}}\n' > "${work_dir}/live-agent/settings.json"
+tmux new-session -d -s "${session}" -x 100 -y 40
+tmux send-keys -t "${session}" \
+  "cd '${work_dir}' && env -u PI_TUI_E2E_DUMP PI_FAUX_SCRIPT='${work_dir}/script.json' PI_CODING_AGENT_DIR='${work_dir}/live-agent' '${pi_bin}' --no-session --model faux/script --offline" Enter
+wait_for '│ >'
+tmux send-keys -t "${session}" 'run it' Enter
+# The last line so far, under a command that has not ended.
+wait_for_both 'Running a command' '… live-line-4'
+absent live-done
+wait_for 'Ran a command'
+wait_for '… live-done'
+wait_for 'retrying in 1s (attempt 1 of 3)'
+wait_for 'Hello again.'
+tmux send-keys -t "${session}" '/quit' Enter
+sleep 0.3
+tmux kill-session -t "${session}" >/dev/null 2>&1 || true
 echo "tool output e2e passed (artifacts: ${work_dir})"

@@ -1,5 +1,7 @@
 mod compaction;
 mod input;
+#[cfg(test)]
+mod recovery_tests;
 mod session_lock;
 mod system_prompt;
 #[cfg(test)]
@@ -35,8 +37,8 @@ use pi_config::{
 /// Kills every running tool subprocess tree; for pi's fatal-signal handling.
 pub use pi_tools::kill_running_tool_groups;
 use pi_tools::{
-    builtin_tool_definitions, cap_tool_output, execute_tool, spawn_tool_process, ToolError,
-    ToolRequest, ToolResult, ToolRuntimeOptions,
+    builtin_tool_definitions, cap_tool_output, execute_tool, execute_tool_streaming,
+    spawn_tool_process, ToolError, ToolRequest, ToolResult, ToolRuntimeOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2275,6 +2277,12 @@ impl Runtime {
         Ok(())
     }
 
+    /// Turns automatic retries on or off for this runtime's turns; the
+    /// settings file keeps its value.
+    pub fn set_retry_enabled(&mut self, enabled: bool) {
+        self.systems.retry.enabled = enabled;
+    }
+
     /// Whether a tool call cut off by a stop may run again when its turn
     /// continues: `read`, `grep`, `find`, `ls`, and extension tools whose
     /// manifest declares `"replaySafe": true`.
@@ -2459,16 +2467,55 @@ impl SteeringMailbox {
 pub const STEERING_JOIN: &str = "\n---\n";
 
 /// A caller's handles on a running turn: steering for its next provider
-/// round, and cancellation. Cancelling ends the turn with
-/// [`AgentError::Cancelled`] at once, dropping an in-flight request, backoff,
-/// compaction or tool call (a dropped tool takes its process group with it).
-/// What the turn saved stays saved: a reply whose tool calls have no results
-/// continues with the interrupted-call placeholders. Clones share both.
+/// round, cancellation, and the backoff of a retry. Cancelling ends the turn
+/// with [`AgentError::Cancelled`] at once, dropping an in-flight request,
+/// backoff, compaction or tool call (a dropped tool takes its process group
+/// with it). What the turn saved stays saved: a reply whose tool calls have
+/// no results continues with the interrupted-call placeholders. Clones share
+/// all three.
 #[derive(Debug, Clone, Default)]
 pub struct RunControl {
     pub steering: SteeringMailbox,
     pub cancellation: CancellationToken,
+    pub retry: RetryAbort,
 }
+
+/// Ends the backoff a turn is waiting out before a retry (upstream
+/// `abortRetry`): the turn then ends with the failure it would have retried.
+/// Outside a backoff there is nothing to end. Clones share the backoff.
+#[derive(Debug, Clone, Default)]
+pub struct RetryAbort(Arc<Mutex<Option<CancellationToken>>>);
+
+impl RetryAbort {
+    /// Ends the backoff in progress; `false` if there is none.
+    pub fn abort(&self) -> bool {
+        let backoff = self.0.lock().expect("retry backoff");
+        backoff.as_ref().map(CancellationToken::cancel).is_some()
+    }
+
+    /// Sleeps for `delay` unless [`RetryAbort::abort`] ends the backoff
+    /// first; `false` if it did.
+    async fn backoff(&self, delay: Duration) -> bool {
+        /// The backoff is over however it ends, a dropped turn included.
+        struct Over<'a>(&'a RetryAbort);
+        impl Drop for Over<'_> {
+            fn drop(&mut self) {
+                *self.0 .0.lock().expect("retry backoff") = None;
+            }
+        }
+        let aborted = CancellationToken::default();
+        *self.0.lock().expect("retry backoff") = Some(aborted.clone());
+        let _over = Over(self);
+        tokio::select! {
+            biased;
+            () = aborted.cancelled() => false,
+            () = tokio::time::sleep(delay) => true,
+        }
+    }
+}
+
+/// How a retry ends when its backoff is ended early, as upstream words it.
+pub const RETRY_CANCELLED: &str = "Retry cancelled";
 
 impl RunControl {
     /// Runs `step` unless the turn is cancelled first; cancelling drops it.
@@ -2508,12 +2555,18 @@ pub async fn run_user_turn_streaming_with_media(
 /// so a UI can show what the agent is doing between text blocks.
 ///
 /// Each provider round of a turn reports `RoundStarted`, its user messages
-/// (the prompt or steering), any compaction, retries and the reply's
-/// `Provider` deltas, the reply, then `ToolStarted`, `ToolOutput` and
+/// (the prompt or steering), any compaction and the reply's `Provider`
+/// deltas, the reply, then `ToolStarted`, `ToolUpdate`, `ToolOutput` and
 /// `ToolFinished` for each tool call, and `RoundFinished`. A turn that fails
 /// or is cancelled stops mid-round without further events. A continued turn
 /// whose saved reply has replay-safe calls without results first finishes
 /// that round: `RoundResumed`, those calls, `RoundFinished`.
+///
+/// A round whose reply is dropped ends there instead, and the turn asks
+/// again in a new round: after `RetryStarted`, once the backoff is over;
+/// after `Overflowed`, once its compaction (`CompactionStarted`, then
+/// `CompactionFinished`) is done. A dropped reply is never saved, so its
+/// `Provider` deltas are all that was reported of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
     /// A provider round started: one reply and the tool calls it asks for.
@@ -2526,31 +2579,51 @@ pub enum TurnEvent {
     MessageAdded(ConversationMessage),
     /// Everything the provider streams for the round's reply.
     Provider(StreamEvent),
-    /// A request failed before any output; it is retried after the delay.
+    /// The round's request failed, before or after part of its reply, with
+    /// an error a retry can fix. The reply is dropped and the request is
+    /// sent again in a new round after the delay.
     RetryStarted(RetryNotice),
-    /// A retried request ended after `attempt` retries: with its reply
-    /// (reported after the reply), or with the `error` that ends the turn.
+    /// The retries of a reply ended after `attempt` of them: with the reply
+    /// (reported after it), or with the `error` that ends the turn
+    /// ([`RETRY_CANCELLED`] if the backoff was ended early).
     RetryFinished {
         attempt: u64,
+        error: Option<String>,
+    },
+    /// The round's reply ran out of context: the provider refused the
+    /// request as too large (`error`), or cut the final reply off at the
+    /// output limit (`None`). The reply is dropped. A compaction follows; if
+    /// it succeeds the turn asks again in a new round, and otherwise the
+    /// turn ends: with the error, or with the cut-off reply saved after all.
+    Overflowed {
         error: Option<String>,
     },
     ToolStarted {
         call: ChatToolCall,
     },
+    /// What a running tool has printed so far: a `bash` command's output,
+    /// within the limits of its result. Empty when the command starts.
+    ToolUpdate {
+        call: ChatToolCall,
+        output: String,
+    },
     ToolFinished {
         name: String,
         is_error: bool,
     },
-    /// A tool call's result as saved, and how long the tool ran. `images`
-    /// are the attachments of the result (`read` of an image).
+    /// A tool call's result as saved, and how long the tool ran (`None` for
+    /// a call of a reply cut off at the output limit, which is not run).
+    /// `images` are the attachments of the result (`read` of an image).
     ToolOutput {
         call: ChatToolCall,
         output: String,
         images: Vec<MediaInput>,
         is_error: bool,
-        duration: Duration,
+        duration: Option<Duration>,
     },
     TodosUpdated(Vec<TodoItem>),
+    /// A compaction started: because the context estimate crossed the
+    /// threshold, or after `Overflowed`.
     CompactionStarted,
     CompactionFinished(CompactionRecord),
     /// Automatic compaction could not run (nothing compactable, or the
@@ -2726,7 +2799,10 @@ async fn run_model_turn_streaming_events(
     let mut failed_compaction_fingerprint: Option<(usize, Option<usize>)> = None;
     // Steering that arrived during a final reply has opened the next round.
     let mut round_open = false;
-    for _ in 0..max_tool_rounds {
+    // Replies kept so far. A round whose reply is dropped is not counted.
+    let mut rounds = 0;
+    let mut recovery = Recovery::default();
+    while rounds < max_tool_rounds {
         if !std::mem::take(&mut round_open) {
             on_event(&TurnEvent::RoundStarted);
         }
@@ -2764,14 +2840,18 @@ async fn run_model_turn_streaming_events(
             }
         }
         let request = provider_request(runtime, system_prompt.clone());
-        let (events, retries) = request_reply(
-            provider,
-            request,
-            &runtime.systems.retry,
-            &run.cancellation,
-            &mut on_event,
-        )
-        .await?;
+        let events = match request_reply(provider, request, &run.cancellation, &mut on_event).await
+        {
+            Ok(events) => events,
+            // The failed reply was never saved: recovering only asks again.
+            Err(AgentError::Provider(error)) => {
+                recovery
+                    .after_failure(runtime, provider, run, error, &mut on_event)
+                    .await?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let mut text = String::new();
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
@@ -2803,25 +2883,45 @@ async fn run_model_turn_streaming_events(
         if let Some((input, output)) = usage {
             runtime.record_usage(input, output)?;
         }
-        final_text.push_str(&text);
-        add_message(
-            runtime,
-            ConversationMessage {
-                thinking,
-                role: MessageRole::Assistant,
-                content: text,
-                media: Vec::new(),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: tool_calls.clone(),
-            },
-            &mut on_event,
-        )?;
-        if retries > 0 {
-            on_event(&TurnEvent::RetryFinished {
-                attempt: retries,
-                error: None,
-            });
+        let reply = ConversationMessage {
+            thinking,
+            role: MessageRole::Assistant,
+            content: text,
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: tool_calls.clone(),
+        };
+        // A final reply cut off below the model's own output limit ran out
+        // of context, like a refused request. (One with tool calls goes on:
+        // its calls get error results and the model issues them again.)
+        let output_tokens = usage.map_or(0, |(_, output)| output);
+        if truncated
+            && tool_calls.is_empty()
+            && provider
+                .output_limit()
+                .is_none_or(|limit| output_tokens < limit)
+            && recovery.can_compact(runtime)
+        {
+            on_event(&TurnEvent::Overflowed { error: None });
+            recovery.finish_retries(None, &mut on_event);
+            if recovery
+                .compact(runtime, provider, run, &mut on_event)
+                .await?
+            {
+                continue;
+            }
+            // Nothing replaces the reply, so it stands, already reported.
+            final_text.push_str(&reply.content);
+            runtime.push_message(reply)?;
+            return Ok(final_text);
+        }
+        rounds += 1;
+        final_text.push_str(&reply.content);
+        add_message(runtime, reply, &mut on_event)?;
+        recovery.finish_retries(None, &mut on_event);
+        if !truncated {
+            recovery.overflowed = false;
         }
 
         if tool_calls.is_empty() {
@@ -2848,6 +2948,120 @@ async fn run_model_turn_streaming_events(
     })
 }
 
+/// What a turn has done so far to recover the reply it is asking for, as
+/// upstream's agent session does after a failed run: a transient failure is
+/// retried after a backoff, and a context overflow is answered by one
+/// compaction. Both drop the failed reply and ask again.
+#[derive(Default)]
+struct Recovery {
+    /// Retries of the reply being requested.
+    retries: u64,
+    /// Whether an overflow was already answered by compaction since the
+    /// last reply that was not cut off.
+    overflowed: bool,
+}
+
+impl Recovery {
+    /// Recovers from a failed request for a reply: `Ok` when the turn may
+    /// ask again, or the error that ends it.
+    async fn after_failure(
+        &mut self,
+        runtime: &mut Runtime,
+        provider: &dyn Provider,
+        run: &RunControl,
+        error: ProviderError,
+        on_event: &mut (impl FnMut(&TurnEvent) + Send),
+    ) -> Result<(), AgentError> {
+        let model = runtime.session.active_model.as_ref();
+        let model_provider = model.map(|model| model.provider.clone());
+        if error.is_context_overflow(model_provider.as_deref().unwrap_or_default()) {
+            if self.can_compact(runtime) {
+                on_event(&TurnEvent::Overflowed {
+                    error: Some(error.to_string()),
+                });
+                self.finish_retries(Some(&error), on_event);
+                if self.compact(runtime, provider, run, on_event).await? {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+        } else if error.is_retryable() {
+            let policy = retry_policy(&runtime.systems.retry);
+            if self.retries < policy.max_retries {
+                let delay = pi_agent::retry_delay_ms(&policy, self.retries);
+                self.retries += 1;
+                on_event(&TurnEvent::RetryStarted(RetryNotice {
+                    attempt: self.retries,
+                    max_attempts: policy.max_retries,
+                    delay_ms: delay,
+                    error_message: error.to_string(),
+                }));
+                let backoff = run.retry.backoff(Duration::from_millis(delay));
+                if run.until_cancelled(backoff).await? {
+                    return Ok(());
+                }
+                on_event(&TurnEvent::RetryFinished {
+                    attempt: std::mem::take(&mut self.retries),
+                    error: Some(RETRY_CANCELLED.into()),
+                });
+                return Err(error.into());
+            }
+        }
+        self.finish_retries(Some(&error), on_event);
+        Err(error.into())
+    }
+
+    /// Reports the end of the reply's retries, if it had any: with the
+    /// reply, or with the `error` no retry follows.
+    fn finish_retries(
+        &mut self,
+        error: Option<&ProviderError>,
+        on_event: &mut impl FnMut(&TurnEvent),
+    ) {
+        let attempt = std::mem::take(&mut self.retries);
+        if attempt > 0 {
+            on_event(&TurnEvent::RetryFinished {
+                attempt,
+                error: error.map(ToString::to_string),
+            });
+        }
+    }
+
+    /// Whether an overflow can be answered by compaction: automatic
+    /// compaction is on, there is something to summarize, and the reply
+    /// before this one did not overflow too. Asking takes the one attempt.
+    fn can_compact(&mut self, runtime: &Runtime) -> bool {
+        let can = !self.overflowed && runtime.systems.compaction.enabled && runtime.can_compact();
+        self.overflowed |= can;
+        can
+    }
+
+    /// Compacts after an overflow; whether it succeeded, so that asking
+    /// again has a smaller context.
+    async fn compact(
+        &mut self,
+        runtime: &mut Runtime,
+        provider: &dyn Provider,
+        run: &RunControl,
+        on_event: &mut (impl FnMut(&TurnEvent) + Send),
+    ) -> Result<bool, AgentError> {
+        on_event(&TurnEvent::CompactionStarted);
+        // Like any compaction, this one saves its checkpoint only once
+        // complete: cancelled or failed, it leaves the history untouched.
+        let compaction = runtime.compact_after_overflow(provider);
+        match run.until_cancelled(compaction).await? {
+            Ok(record) => {
+                on_event(&TurnEvent::CompactionFinished(record));
+                Ok(true)
+            }
+            Err(error) => {
+                on_event(&TurnEvent::CompactionFailed(error.to_string()));
+                Ok(false)
+            }
+        }
+    }
+}
+
 /// Runs one tool call of a reply, saving and reporting its result. A call
 /// of a reply cut off at the output limit (`truncated`) is not run: its
 /// saved and reported result is the error asking to re-issue it.
@@ -2868,10 +3082,16 @@ async fn run_tool_call(
     let result = if truncated {
         fail_truncated_tool_call(runtime, &tool_call)
     } else {
-        run.until_cancelled(execute_model_tool_call(runtime, &tool_call))
-            .await?
+        let mut on_output = |output: &str| {
+            on_event(&TurnEvent::ToolUpdate {
+                call: tool_call.clone(),
+                output: output.to_owned(),
+            })
+        };
+        let execution = execute_model_tool_call(runtime, &tool_call, &mut on_output);
+        run.until_cancelled(execution).await?
     };
-    let duration = started.elapsed();
+    let duration = (!truncated).then(|| started.elapsed());
     let event = runtime
         .session
         .tool_history
@@ -2934,44 +3154,17 @@ fn add_message(
     Ok(())
 }
 
-/// Requests one reply, reporting its stream events and any retries as they
-/// happen. Returns the events and how many retries the reply took; when the
-/// request still fails after retries, [`TurnEvent::RetryFinished`] reports
-/// the error first.
+/// Requests one reply, reporting its stream events as they arrive. A
+/// request that fails leaves the events of its broken reply reported.
 async fn request_reply(
     provider: &dyn Provider,
     request: ProviderRequest,
-    retry: &RuntimeRetrySettings,
     cancellation: &CancellationToken,
     on_event: &mut (impl FnMut(&TurnEvent) + Send),
-) -> Result<(Vec<StreamEvent>, u64), AgentError> {
-    let mut retries = 0;
-    let reply = {
-        // Both callbacks report through `on_event`; they never run at once.
-        let report = Mutex::new(&mut *on_event);
-        pi_agent::complete_with_retry_observed(
-            provider,
-            request,
-            &retry_policy(retry),
-            cancellation,
-            |event| (*report.lock().expect("turn events"))(&TurnEvent::Provider(event.clone())),
-            |notice| {
-                retries = notice.attempt;
-                (*report.lock().expect("turn events"))(&TurnEvent::RetryStarted(notice));
-            },
-        )
-        .await
-    };
-    reply.map(|events| (events, retries)).map_err(|error| {
-        let error = AgentError::from(error);
-        if retries > 0 {
-            on_event(&TurnEvent::RetryFinished {
-                attempt: retries,
-                error: Some(error.to_string()),
-            });
-        }
-        error
-    })
+) -> Result<Vec<StreamEvent>, AgentError> {
+    let report = |event: &StreamEvent| on_event(&TurnEvent::Provider(event.clone()));
+    let reply = pi_agent::complete_once(provider, request, cancellation, report).await;
+    reply.map_err(AgentError::from)
 }
 
 /// The system prompt for the session as it is now: its tools, prompt
@@ -3571,9 +3764,12 @@ fn fail_truncated_tool_call(
     Ok(())
 }
 
+/// Runs a tool call of the model and saves its result. `on_output` gets a
+/// running `bash` command's output so far.
 async fn execute_model_tool_call(
     runtime: &mut Runtime,
     tool_call: &ChatToolCall,
+    on_output: &mut (dyn FnMut(&str) + Send),
 ) -> Result<(), AgentError> {
     let extension_tool = runtime
         .systems
@@ -3626,10 +3822,11 @@ async fn execute_model_tool_call(
                         }
                         _ => None,
                     };
-                    let output = match execute_tool(
+                    let output = match execute_tool_streaming(
                         &runtime.session.cwd,
                         request,
                         &tool_runtime_options(runtime, bash_session_env(runtime)),
+                        on_output,
                     )
                     .await
                     {
@@ -4959,6 +5156,7 @@ mod tests {
                 name: "web_fetch".into(),
                 arguments: r#"{"url":"file:///etc/passwd"}"#.into(),
             },
+            &mut |_| {},
         )
         .await
         .unwrap();
@@ -4976,6 +5174,7 @@ mod tests {
                 name: "web_search".into(),
                 arguments: r#"{"query":"rust","limit":0}"#.into(),
             },
+            &mut |_| {},
         )
         .await
         .unwrap();
@@ -6317,14 +6516,17 @@ mod tests {
         )
         .await
         .unwrap();
-        // Upstream reports auto_retry_end after the reply's message_end.
+        // Each retry asks again in a new round. Upstream reports
+        // auto_retry_end after the reply's message_end.
         assert_eq!(
             trace(&events),
             [
                 "round started",
                 r#"user "hi""#,
                 "retry 1 of 3 in 1ms: provider returned an invalid response: overloaded",
+                "round started",
                 "retry 2 of 3 in 2ms: provider returned an invalid response: overloaded",
+                "round started",
                 r#"text "ok""#,
                 r#"assistant "ok""#,
                 "retried 2: succeeded",
@@ -6352,6 +6554,7 @@ mod tests {
                 "round started",
                 r#"user "again""#,
                 "retry 1 of 1 in 1ms: provider returned an invalid response: overloaded",
+                "round started",
                 "retried 1: provider returned an invalid response: overloaded",
             ]
         );
@@ -6392,7 +6595,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert!(duration >= Duration::from_millis(200), "{duration:?}");
+        assert!(duration >= Some(Duration::from_millis(200)), "{duration:?}");
     }
 
     /// Cancels `run` after `delay`; the handle yields when it did.
@@ -6519,7 +6722,8 @@ mod tests {
             ]
         );
         assert!(lines[4].starts_with("tool bash-1 bash"), "{lines:?}");
-        assert_eq!(lines.len(), 5);
+        // The command reported that it starts; it printed nothing.
+        assert_eq!(lines[5..], [r#"update bash-1 """#]);
         // A killed process stays a zombie (state Z) until reaped.
         let running = || {
             fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -6590,7 +6794,6 @@ mod tests {
                 "round started",
                 r#"user "hi""#,
                 "retry 1 of 3 in 60000ms: provider returned an invalid response: overloaded",
-                "retried 1: turn cancelled",
             ]
         );
         assert_eq!(store.load().unwrap(), runtime.session);
@@ -7298,7 +7501,7 @@ mod tests {
             .to_string(),
         };
 
-        execute_model_tool_call(&mut runtime, &tool_call)
+        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
             .await
             .expect("execute todo tool");
 
@@ -7321,7 +7524,7 @@ mod tests {
             arguments: "{\"todos\": \"not-a-list\"}".to_string(),
         };
 
-        execute_model_tool_call(&mut runtime, &tool_call)
+        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
             .await
             .expect("execute todo tool");
 
@@ -7456,10 +7659,10 @@ mod tests {
             .to_string(),
         };
 
-        execute_model_tool_call(&mut runtime, &tool_call)
+        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
             .await
             .expect("execute write tool");
-        execute_model_tool_call(&mut runtime, &tool_call)
+        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
             .await
             .expect("execute write tool again");
 
@@ -7504,7 +7707,7 @@ mod tests {
             ),
         ];
         for tool_call in &calls {
-            execute_model_tool_call(&mut runtime, tool_call)
+            execute_model_tool_call(&mut runtime, tool_call, &mut |_| {})
                 .await
                 .expect("execute tool call");
         }
@@ -8188,7 +8391,7 @@ mod tests {
 
     /// One line per event, for exact-order assertions. Tool durations vary,
     /// so they are left out.
-    fn trace(events: &[TurnEvent]) -> Vec<String> {
+    pub(crate) fn trace(events: &[TurnEvent]) -> Vec<String> {
         let flag = |is_error: bool| if is_error { " error" } else { "" };
         let message = |message: &ConversationMessage| {
             let role = format!("{:?}", message.role).to_lowercase();
@@ -8223,9 +8426,14 @@ mod tests {
                     "retried {attempt}: {}",
                     error.as_deref().unwrap_or("succeeded")
                 ),
+                TurnEvent::Overflowed { error } => format!(
+                    "overflowed: {}",
+                    error.as_deref().unwrap_or("reply cut off")
+                ),
                 TurnEvent::ToolStarted { call } => {
                     format!("tool {} {} {}", call.id, call.name, call.arguments)
                 }
+                TurnEvent::ToolUpdate { call, output } => format!("update {} {output:?}", call.id),
                 TurnEvent::ToolOutput {
                     call,
                     output,
@@ -8252,7 +8460,7 @@ mod tests {
         Box::new(move || Ok(events))
     }
 
-    /// A failure before any output, so it is retried.
+    /// A failure a retry can fix.
     fn overloaded() -> Reply {
         Box::new(|| Err(ProviderError::InvalidResponse("overloaded".into())))
     }
@@ -8491,7 +8699,7 @@ mod tests {
         ) -> Result<Vec<StreamEvent>, ProviderError> {
             let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
             if attempt < self.fail_before_success {
-                return Err(ProviderError::InvalidResponse("temporary".to_string()));
+                return Err(ProviderError::InvalidResponse("overloaded".to_string()));
             }
             Ok(vec![
                 StreamEvent::Text("retried".to_string()),

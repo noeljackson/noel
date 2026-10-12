@@ -313,8 +313,11 @@ pub async fn run_turn(
     Err(AgentError::ToolLoopExhausted)
 }
 
-/// Shared retry behavior. A request is retried only before any output or tool
-/// call has been observed, preventing duplicate side effects and text.
+/// Requests a reply, retrying failures a retry can fix
+/// ([`ProviderError::is_retryable`]) after a backoff. A failed attempt's
+/// events were already reported to `on_event`; the returned events are those
+/// of the attempt that succeeded, so a reply that broke off is never mixed
+/// into the one that replaces it.
 pub async fn complete_with_retry(
     provider: &dyn Provider,
     request: ProviderRequest,
@@ -335,60 +338,62 @@ pub async fn complete_with_retry_observed(
     mut on_event: impl FnMut(&StreamEvent) + Send,
     mut on_retry: impl FnMut(RetryNotice) + Send,
 ) -> Result<Vec<StreamEvent>, AgentError> {
-    let total_attempts = retry.max_retries.saturating_add(1);
     let mut attempt = 0u64;
     loop {
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Cancelled);
+        let error =
+            match complete_once(provider, request.clone(), cancellation, &mut on_event).await {
+                Err(AgentError::Provider(error)) => error,
+                other => return other,
+            };
+        if attempt >= retry.max_retries || !error.is_retryable() {
+            return Err(error.into());
         }
-        let request_attempt = async {
-            let mut events = Vec::new();
-            let result = provider
-                .complete_streaming(request.clone(), &mut |event| {
-                    on_event(&event);
-                    events.push(event);
-                    Ok(())
-                })
-                .await;
-            (result, events)
-        };
-        let (result, events) = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(AgentError::Cancelled),
-            outcome = request_attempt => outcome,
-        };
-        match result {
-            Ok(()) => return Ok(events),
-            Err(error) if !events.is_empty() => return Err(error.into()),
-            Err(error) if is_context_overflow(&error) => return Err(error.into()),
-            Err(error) if attempt + 1 >= total_attempts => return Err(error.into()),
-            Err(error) => {
-                let delay = retry_delay_ms(retry, attempt);
-                attempt += 1;
-                on_retry(RetryNotice {
-                    attempt,
-                    max_attempts: retry.max_retries,
-                    delay_ms: delay,
-                    error_message: error.to_string(),
-                });
-                if delay > 0 {
-                    tokio::select! {
-                        biased;
-                        () = cancellation.cancelled() => return Err(AgentError::Cancelled),
-                        () = sleep(Duration::from_millis(delay)) => {}
-                    }
-                }
+        let delay = retry_delay_ms(retry, attempt);
+        attempt += 1;
+        on_retry(RetryNotice {
+            attempt,
+            max_attempts: retry.max_retries,
+            delay_ms: delay,
+            error_message: error.to_string(),
+        });
+        if delay > 0 {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(AgentError::Cancelled),
+                () = sleep(Duration::from_millis(delay)) => {}
             }
         }
     }
 }
 
-fn is_context_overflow(error: &ProviderError) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("context_length")
-        || message.contains("context window")
-        || message.contains("too many tokens")
-        || message.contains("maximum context")
+/// Requests a reply once, reporting its events as they arrive. Cancellation
+/// drops the request. A failure leaves the events of the broken reply
+/// reported but not returned.
+pub async fn complete_once(
+    provider: &dyn Provider,
+    request: ProviderRequest,
+    cancellation: &CancellationToken,
+    mut on_event: impl FnMut(&StreamEvent) + Send,
+) -> Result<Vec<StreamEvent>, AgentError> {
+    if cancellation.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    let attempt = async {
+        let mut events = Vec::new();
+        let result = provider
+            .complete_streaming(request, &mut |event| {
+                on_event(&event);
+                events.push(event);
+                Ok(())
+            })
+            .await;
+        result.map(|()| events)
+    };
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(AgentError::Cancelled),
+        outcome = attempt => Ok(outcome?),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -544,7 +549,7 @@ mod tests {
         }
     }
 
-    /// Fails before producing output, so every failure is retryable.
+    /// Fails every request with an error a retry can fix.
     struct FailingProvider(std::sync::atomic::AtomicU64);
 
     #[async_trait]
@@ -554,8 +559,53 @@ mod tests {
             _request: ProviderRequest,
         ) -> Result<Vec<StreamEvent>, ProviderError> {
             let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
-            Err(ProviderError::InvalidResponse(format!("transient {call}")))
+            Err(ProviderError::InvalidResponse(format!("overloaded {call}")))
         }
+    }
+
+    /// Answers each request with the next scripted reply: the events it
+    /// streams, then the error that breaks it off, if any.
+    struct ScriptedProvider(std::sync::Mutex<Vec<(Vec<StreamEvent>, Option<ProviderError>)>>);
+
+    impl ScriptedProvider {
+        fn new(mut replies: Vec<(Vec<StreamEvent>, Option<ProviderError>)>) -> Self {
+            replies.reverse();
+            Self(std::sync::Mutex::new(replies))
+        }
+
+        fn remaining(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            unreachable!("the retry loop streams")
+        }
+
+        async fn complete_streaming(
+            &self,
+            _request: ProviderRequest,
+            on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
+        ) -> Result<(), ProviderError> {
+            let (events, error) = self.0.lock().unwrap().pop().expect("a scripted reply");
+            for event in events {
+                on_event(event)?;
+            }
+            error.map_or(Ok(()), Err)
+        }
+    }
+
+    fn invalid(response: &str) -> ProviderError {
+        ProviderError::InvalidResponse(response.to_string())
+    }
+
+    fn text(text: &str) -> StreamEvent {
+        StreamEvent::Text(text.to_string())
     }
 
     #[tokio::test]
@@ -650,18 +700,89 @@ mod tests {
         // The final attempt's error is returned, not followed by a notice.
         assert_eq!(
             error.to_string(),
-            "provider returned an invalid response: transient 4"
+            "provider returned an invalid response: overloaded 4"
         );
         assert_eq!(provider.0.load(Ordering::SeqCst), 4);
         let notice = |attempt, delay_ms, call: u64| RetryNotice {
             attempt,
             max_attempts: 3,
             delay_ms,
-            error_message: format!("provider returned an invalid response: transient {call}"),
+            error_message: format!("provider returned an invalid response: overloaded {call}"),
         };
         assert_eq!(
             notices,
             vec![notice(1, 10, 1), notice(2, 20, 2), notice(3, 25, 3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_no_retry_can_fix_fail_at_once() {
+        for error in [
+            invalid(r#"{"error":{"message":"Incorrect API key provided."}}"#),
+            // A quota is not a rate limit: waiting does not lift it.
+            invalid(r#"{"error":{"message":"Rate limit","code":"insufficient_quota"}}"#),
+            ProviderError::MissingApiKey {
+                provider: "anthropic".into(),
+            },
+            ProviderError::Config("no credentials".into()),
+            // Compaction answers a context overflow, not a retry.
+            invalid(r#"{"error":{"code":"context_length_exceeded"}}"#),
+            invalid("overloaded: prompt is too long: 9 tokens > 8 maximum"),
+        ] {
+            let expected = error.to_string();
+            let provider = ScriptedProvider::new(vec![
+                (Vec::new(), Some(error)),
+                (vec![text("never asked")], None),
+            ]);
+            let mut notices = Vec::new();
+            let error = complete_with_retry_observed(
+                &provider,
+                empty_request(),
+                &RetryPolicy {
+                    base_delay_ms: 0,
+                    ..RetryPolicy::default()
+                },
+                &CancellationToken::default(),
+                |_| {},
+                |notice| notices.push(notice),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(notices, Vec::new(), "{expected}");
+            assert_eq!(provider.remaining(), 1, "{expected} was retried");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_breaks_off_is_retried_and_left_out_of_the_result() {
+        let provider = ScriptedProvider::new(vec![
+            (vec![text("Hel"), text("lo")], Some(invalid("terminated"))),
+            (vec![text("Hello again.")], None),
+        ]);
+        let mut streamed = Vec::new();
+        let mut notices = Vec::new();
+        let events = complete_with_retry_observed(
+            &provider,
+            empty_request(),
+            &RetryPolicy {
+                base_delay_ms: 0,
+                ..RetryPolicy::default()
+            },
+            &CancellationToken::default(),
+            |event| streamed.push(event.clone()),
+            |notice| notices.push(notice),
+        )
+        .await
+        .unwrap();
+        // The broken reply was streamed, but only its replacement is returned.
+        assert_eq!(streamed, [text("Hel"), text("lo"), text("Hello again.")]);
+        assert_eq!(events, [text("Hello again.")]);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].attempt, 1);
+        assert_eq!(
+            notices[0].error_message,
+            "provider returned an invalid response: terminated"
         );
     }
 
