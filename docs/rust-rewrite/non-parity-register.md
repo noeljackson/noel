@@ -519,16 +519,18 @@ keeps the output). These parts differ:
 - stdout and stderr share one pipe, so the output is in the order the command
   wrote it. Upstream reads two pipes and appends chunks as they arrive, which
   can reorder writes that come close together.
-- Upstream reports output to the UI while the command runs; Rust reports it
-  when the command ends.
+- A running command's output is reported as upstream reports it (all of it
+  so far, within the result's limits, at most every 100 ms), but without
+  upstream's `details`: the truncation data and the path of the saved output
+  come with the result only.
 - Upstream puts its managed tool directory (`~/.pi/agent/bin`) on the
   command's `PATH`. Rust has no such directory.
 - A timeout is kept in milliseconds, so the notice prints at most three
   decimals of the seconds the model gave.
 - `!` and `/bash` in the TUI run through the same tool with a 120 second
-  timeout and cannot be interrupted on their own. Upstream runs them without a
-  timeout, strips terminal escapes from their output, and lets Esc cancel
-  them.
+  timeout, show their output when they end, and cannot be interrupted on
+  their own. Upstream runs them without a timeout, shows their output while
+  they run, strips terminal escapes from it, and lets Esc cancel them.
 
 Reason: one pipe is the only way to keep the order exact, and it makes results
 repeatable. The TUI's command UX is separate work; the timeout keeps a command
@@ -659,6 +661,60 @@ sign the user out of Claude Code or Codex. After pi refreshes such a login it
 keeps its own `claude-import`/`codex-import` account, which refreshes early
 like any stored account.
 
+### Run Recovery
+
+pi retries a failed model request and answers a context overflow with one
+compaction and one more request, as upstream's agent session does after a
+failed run. `error-classification.json` holds upstream's rules and
+`rpc-protocol.json` its records for both; pi is compared with each. These
+parts differ:
+
+- Upstream's patterns read the error text, and pi applies them to its own
+  text for what the provider answered: an HTTP status with its body, or a
+  response pi could not use. A transport failure (no connection, a timeout, a
+  stream that broke) is retried by its kind instead, because its text is the
+  HTTP library's and not the one the patterns expect. pi's own errors (no
+  credential, an invalid header, its configuration, a faux script that ran
+  out) are never retried, whatever their text contains.
+- A reply the run drops is not saved. Upstream saves the failed or cut-off
+  attempt and hides it from the model with a `context_edit` journal entry, so
+  its history and exports still show it. pi saves a reply only once it
+  stands: a retried or overflowed attempt leaves no record, and a pi killed
+  during a recovery resumes from the prompt, or from the compaction
+  checkpoint once that is written.
+- A final reply cut off at the output limit stands when nothing replaces it:
+  there is nothing to compact, compaction is off, or the compaction fails.
+  Upstream hides the reply from the model in those cases too, so its next
+  request no longer contains it. pi could only drop it altogether, and it
+  may be the only answer the user got, so pi keeps it: saved, and sent with
+  the next request.
+- Upstream decides whether a cut-off reply could have been longer from the
+  model's catalog `maxTokens`. pi knows that limit for Claude models and the
+  few models whose requests carry a cap (see Anthropic Output Cap Without an
+  Output Catalog). For any other model it takes a cut-off final reply for a
+  context overflow, and compacts once.
+- Upstream also reads a reply that completed as an overflow when the usage
+  it reports exceeds the context window, and compacts right after it. pi
+  compacts before the next request, when its own estimate crosses the
+  threshold.
+- After a second overflow in a row upstream also reports a failed compaction
+  ("recovery failed after one compact-and-retry attempt"). pi ends the turn
+  with the provider's error alone.
+- `retry.provider.timeoutMs`, `retry.provider.maxRetries`, and
+  `retry.provider.maxRetryDelayMs` are read and not used: pi has no retries
+  inside one provider request and does not follow `Retry-After`. Only the
+  retry above applies.
+- In the TUI a retry or an overflow is a system line, text the dropped reply
+  had streamed stays above it (thinking included), and Esc during a backoff
+  interrupts the turn. Upstream shows a retry indicator with the attempt and
+  the delay, and Esc during the backoff cancels only the retry.
+
+Reason: the rules, the single compact-and-retry, and the records are
+upstream's, so a run survives what upstream's survives and a client sees the
+same protocol. The differences follow from pi's journal, which saves what the
+model will see again and nothing else; from its missing output catalog; and
+from its own HTTP stack.
+
 ### RPC Mode
 
 `pi --mode rpc` speaks upstream's RPC protocol, with four additions listed in
@@ -669,8 +725,8 @@ repeats a `requestId` gets the run the first one started), and `resume-run`
 (`get_state.lastRun`, and `resume_run` to continue an interrupted run).
 `crates/pi-cli/tests/rpc_parity.rs` compares every scenario of
 `rpc-protocol.json` with pi's records and allows exactly the differences in
-the first list; its `normalize`, `expected`, and `without_extensions`
-functions name them, so the two lists change together. The extensions' keys
+the first list; its `normalize`, `expected`, and `without_own` functions
+name them, so the two lists change together. The extensions' keys
 (`runId`, `requestId`, `lastRun`, `rpcExtensions`) are the allowed extras.
 
 Differences in the golden records:
@@ -692,19 +748,37 @@ Differences in the golden records:
   tokens providers report to pi; cache tokens and costs are zero, and there is
   no `reasoning` count.
 - Tool results are text, and for a `read` of an image the image: no
-  `structuredContent` or `details`.
+  `structuredContent` or `details`, in a `tool_execution_update`'s
+  `partialResult` either.
+- No `entry_appended` records: they report the journal entry with which
+  upstream hides a dropped reply from the model, and pi never saves that
+  reply (see Run Recovery).
+- A provider error is in pi's words, in an error reply's `errorMessage` and
+  in `auto_retry_start` and `auto_retry_end`: `request failed with status 503
+  Service Unavailable: <body>` where upstream has `503: <body>`.
+- A compaction's `result` is `{summary, details: {omittedMessages,
+  retainedMessages}}`, not upstream's entry ids and token estimates. What a
+  compaction summarizes is pi's choice (see Clipboard Drafts, Conversation
+  Undo, and Session Usage), so after an overflow the summary request and the
+  request that asks again are not upstream's.
+- A final reply cut off at the output limit stays in the conversation when
+  no compaction replaces it, so the next request contains it (see Run
+  Recovery).
 - `get_messages` returns what the session saves: no timestamps, and assistant
   messages with their content and `stopReason` (`toolUse` or `stop`) but no
   model, usage, raw stop reason, or timings.
 
 Other differences:
 
-- While a run is active, `set_model`, `set_thinking_level`, `compact`,
-  `new_session`, `switch_session`, and `set_session_name` are refused.
+- While a run is active, `set_model`, `set_thinking_level`, `set_auto_retry`,
+  `compact`, `new_session`, `switch_session`, and `set_session_name` are
+  refused. Upstream takes `set_auto_retry` at any time and saves it in
+  `settings.json`; pi's lasts for the process.
 - An aborted reply, and the `Operation aborted` result of a tool call the
   abort interrupted, are reported but not saved, so `get_messages` and later
   model requests leave them out. Upstream keeps the aborted reply in the
-  session but also leaves it out of model requests.
+  session but also leaves it out of model requests. The same goes for a reply
+  a run drops to ask again (see Run Recovery).
 - Closing stdin during a run stops it where it is, kills its tool processes,
   and exits without `agent_end` or `agent_settled`; what the run saved stays
   in the session, and the run stays interrupted for `resume_run`. A signal
@@ -724,26 +798,21 @@ Other differences:
   `new_session` starts empty. Upstream's queue lives in memory.
 - A queued prompt (`streamingBehavior` during a run) cannot have a
   `requestId`, which names runs.
-- Retries happen inside the request, before the reply's first record:
-  `auto_retry_start` comes before the reply's `message_start`, and
-  `auto_retry_end` after its `message_end`. Upstream ends the turn with an
-  error reply and retries in a new low-level run.
 - Steering queued together arrives as one user message, its parts joined by
   `---`, and so do follow-ups. Queued messages are text only: `steer`,
   `follow_up`, and a queued `prompt` with images fail.
 - Tool calls arrive whole, so `toolcall_delta` carries all of the arguments
   at once. A tool call that fails before its tool runs (unknown tool, invalid
-  arguments) still has a `durationMs`.
-- Stop reasons: a reply with tool calls is `toolUse`, a token limit `length`,
-  and anything else `stop`, with the provider's reason in `rawStopReason`.
-  A reply cut off at a token limit that has tool calls is `toolUse` too (its
-  calls get error results instead of running); upstream reports `length`.
-  Upstream treats content-filter and refusal reasons as errors.
+  arguments) still has a `durationMs`; a call of a reply cut off at a token
+  limit has none, as upstream's.
+- Stop reasons: a reply cut off at a token limit is `length`, another reply
+  with tool calls `toolUse`, and anything else `stop`, with the provider's
+  reason in `rawStopReason`. Upstream treats content-filter and refusal
+  reasons as errors.
 - During a run, `get_messages` and `messageCount` show an automatic
   compaction only once the engine call that ran it returns.
 - `compact` runs to completion: commands sent meanwhile wait, and `abort` does
-  not cancel it. Its result is `{summary, details: {omittedMessages,
-  retainedMessages}}`, not upstream's entry ids and token estimates.
+  not cancel it.
 - `set_thinking_level` refuses a level the model does not support; upstream
   clamps it.
 - `new_session` refuses `parentSession`. With `--no-session` the session id
@@ -752,11 +821,11 @@ Other differences:
   without the model; the run reports its user message and tool result, but no
   turn.
 - Upstream commands pi does not implement answer `Unsupported command:
-  <type>`: `bash`, `abort_bash`, `abort_retry`, `set_auto_retry`,
-  `set_auto_compaction`, `cycle_model`, `get_available_models`,
-  `cycle_thinking_level`, `get_available_thinking_levels`,
-  `get_session_stats`, `export_html`, `fork`, `clone`, `get_fork_messages`,
-  `get_entries`, and `get_tree`. pi has no extension UI requests.
+  <type>`: `bash`, `abort_bash`, `set_auto_compaction`, `cycle_model`,
+  `get_available_models`, `cycle_thinking_level`,
+  `get_available_thinking_levels`, `get_session_stats`, `export_html`,
+  `fork`, `clone`, `get_fork_messages`, `get_entries`, and `get_tree`. pi has
+  no extension UI requests.
 - `get_commands` lists prompt templates, then skills. pi has no extension
   commands to list before them, and its own `/extension:<name>` commands
   exist only in the TUI.

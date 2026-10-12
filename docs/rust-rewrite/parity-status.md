@@ -64,9 +64,14 @@ The committed TypeScript parity fixtures are:
   scripted runs against a local OpenAI-compatible stub: a text prompt, a tool
   round, steer, follow_up, abort (also with queued messages), prompts while
   busy, state queries, clear_queue, parse and unknown-command errors, and queue
-  modes. Each scenario also lists the commands sent and what each model request
-  contained. Timestamps, durations, usage, ids, and paths are placeholders; the
-  `placeholders` block lists them.
+  modes. Run recovery: a retryable failure that is retried, retries that run
+  out, an abort and an `abort_retry` during a backoff, `set_auto_retry`, a
+  failure that is not retried, a connection dropped mid-reply, a context
+  overflow answered by compaction and one retry, a reply cut off at the output
+  limit with and without a tool call, and a bash command whose output arrives
+  while it runs. Each scenario also lists the commands sent, the settings it
+  adds, and what each model request contained. Timestamps, durations, usage,
+  ids, and paths are placeholders; the `placeholders` block lists them.
 - `session-export.json`: session tree/export shape, including direct open of
   full-tree JSONL active branches.
 - `settings.json`: settings merge and normalization cases, including
@@ -128,7 +133,16 @@ Current Rust parity coverage includes:
 - TypeScript full-tree session JSONL active-branch loading.
 - RPC mode: every `rpc-protocol.json` scenario, record by record and model
   request by model request, allowing the differences listed under "RPC Mode"
-  in the non-parity register (`crates/pi-cli/tests/rpc_parity.rs`).
+  in the non-parity register (`crates/pi-cli/tests/rpc_parity.rs`). In two
+  scenarios the model requests are compared only up to where pi's own choice
+  begins: after the overflow of `overflow-recovery` (pi's compaction), and
+  after the cut-off reply of `length-stop` (which pi keeps).
+- Run recovery: `pi-ai` holds upstream's four pattern lists verbatim and
+  gives upstream's verdict (retryable, context overflow) for every message of
+  `error-classification.json`
+  (`error_classification_matches_ts_patterns_and_verdicts`). How the run loop
+  acts on a verdict is covered by the RPC scenarios above and by
+  `crates/pi-core/src/recovery_tests.rs`.
 - The system prompt: for every `system-prompt.json` case, a runtime with
   upstream's inputs sends upstream's text to the byte, apart from the product
   name and the `docs` section

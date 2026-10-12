@@ -227,8 +227,11 @@ and each step is an object with one key:
 - `{"usage": {"input": 120, "output": 9}}` reports token usage.
 - `{"stop": "..."}` sets the stop reason. Without it, a response ends with
   `tool_use` after a tool call and `stop` otherwise.
-- `{"error": "..."}` fails the request with a provider error (status 503).
-  Before any output the agent retries it, and the retry gets the next response.
+- `{"error": "..."}` fails the request with a provider error (status 503),
+  which the agent retries: the retry gets the next response. After other
+  steps it breaks the reply off where it is. `{"error": {"status": 401,
+  "body": "..."}}` fails the request with another status and body; whether
+  that is retried follows the rules for a real provider's error.
 - `{"delay_ms": 200}` pauses the response.
 - `{"wait_for_file": "path"}` holds the response until the file exists, for
   example while a test steers or kills pi. Relative paths resolve against the
@@ -241,8 +244,8 @@ JSON line and fsynced before the response starts. A line holds the
 of the offered `tools`. The number of requests already in the log selects the
 response, so a restarted pi continues the script where the previous process
 stopped. Without a log, a counter in the process selects it. A request past the
-end of the script fails with a provider error, which is retried like any other;
-set `"retry": {"enabled": false}` in `settings.json` to fail at once.
+end of the script fails at once with a configuration error, which is never
+retried.
 
 ```bash
 PI_FAUX_SCRIPT=script.json PI_FAUX_SCRIPT_LOG=requests.jsonl \
@@ -527,7 +530,10 @@ confined to the working directory. Differences from upstream are listed in
   (seconds) the command and its process group are killed when it passes, and
   the result is the output so far followed by `Command timed out after N
   seconds`. A non-zero exit is an error result ending in `Command exited with
-  code N`.
+  code N`. While a command the model called runs, its output so far (within
+  the same limits) is reported at most every 100 ms: the TUI shows the latest
+  line under the running command (`ctrl+o` shows all of it), and RPC mode
+  sends `tool_execution_update` records.
 - `edit` replaces exact text: every `oldText` must occur once, the edits must
   not overlap, and all apply or none do.
 - `write` creates or replaces a file, creating its parent directories.
@@ -1115,8 +1121,8 @@ system prompt, tool set, or persistent instructions, or a single turn larger
 than the window), the turn continues with the original history instead of
 failing: the failure is reported in the transcript with a token breakdown
 (`system prompt`/`tools`/`persistent instructions`/`retained recent turns`),
-and re-attempts are skipped until history changes. The provider still returns
-a real error if the request genuinely exceeds its window.
+and re-attempts are skipped until history changes. If the provider then
+refuses the request as too large, "Run recovery" below applies.
 Known model windows come from the catalog/provider metadata; custom `models.json`
 entries can specify `contextWindow`. Unknown windows fall back to 128,000 tokens.
 Token counts are heuristics, not exact provider tokenization.
@@ -1131,19 +1137,48 @@ The agent per-run round cap is configurable alongside compaction and retry:
 }
 ```
 
-Provider requests retry automatically on transient transport errors
-(default 3 retries, exponential backoff from 2s; `retry.enabled`,
-`retry.maxRetries`, `retry.baseDelayMs` in settings). When retries are
-exhausted the error names the likely causes — including a local firewall
-that denies connections from a freshly built binary until its prompt is
-approved — because on default-deny hosts an unanswered prompt is
-indistinguishable from an outage.
-```
-
 `agent.maxToolRounds` bounds provider rounds per user run, including steering
 rounds. The default is 200; values are clamped to at least 1. When the cap is
 reached the turn stops with a round-limit error, all work stays saved, and
 sending any prompt (or restarting, which auto-continues) gets a fresh budget.
+A request that is retried, or asked again after an overflow, is one round.
+
+### Run recovery
+
+A model request that fails is handled as upstream pi handles it, in the TUI,
+print mode, and RPC mode alike:
+
+- **Retry.** A failure that a retry can fix is retried, whether the request
+  failed before any output or broke off mid-reply: a connection that cannot
+  be made or drops, a timeout, HTTP 408, 429, 500, 502, 503, 504, 520, and
+  524, and any answer that says the provider is overloaded or rate limited.
+  The reply that broke off is dropped: it is not saved and not sent back to
+  the model. Defaults are 3 retries with exponential backoff from
+  2 s, capped at 60 s (`retry.enabled`, `retry.maxRetries`,
+  `retry.baseDelayMs`, `retry.maxAgentDelayMs`). Other failures end the turn
+  at once: 400, 401, 403, and 404 responses, other statuses whose body names
+  nothing transient, a missing credential, and quota or billing limits even
+  when they arrive as a 429. The rules are upstream's
+  patterns over the error text (`error-classification.json`). When retries
+  run out, the error names the likely causes, including a local firewall
+  that denies connections from a freshly built binary until its prompt is
+  approved, because on default-deny hosts an unanswered prompt is
+  indistinguishable from an outage.
+- **Context overflow.** When the provider refuses a request as too large for
+  the model's context window, pi compacts and asks again, once. The same
+  happens when a final reply is cut off at the output limit although the
+  model could have written more (pi knows that limit for Claude models and a
+  few others; for the rest it assumes the context was the cause): the cut-off
+  reply is dropped and the compacted request is sent again. A reply cut off
+  while calling a tool is kept instead; its calls get error results and the
+  model issues them again. If there is nothing to compact, or compaction is
+  off or fails, an overflow error ends the turn, and a cut-off reply stands
+  as the turn's answer. A second overflow in a row is not compacted again.
+
+In the TUI a retry or an overflow appears as a system line (`retrying in 2s
+(attempt 1 of 3): …`); text the dropped reply had streamed stays above it,
+and the reply that replaces it starts below. Esc during a backoff interrupts
+the turn.
 
 The original transcript remains in the session journal. A validated, smaller
 checkpoint and its replacement context are committed together through an atomic
@@ -1166,12 +1201,12 @@ go to stderr. RPC mode starts when stdin is not a terminal and takes no prompt
 arguments.
 
 Commands: `prompt` (with `images`, `streamingBehavior`, and `requestId`),
-`steer`, `follow_up`, `abort`, `resume_run`, `clear_queue`, `get_state`,
-`get_messages`, `get_last_assistant_text`, `get_commands`, `new_session`,
-`switch_session`, `set_model`, `set_thinking_level`, `set_steering_mode`,
-`set_follow_up_mode`, `compact`, and `set_session_name`. Other upstream
-commands answer `Unsupported command: <type>`, and unknown types
-`Unknown command: <type>`.
+`steer`, `follow_up`, `abort`, `abort_retry`, `set_auto_retry`, `resume_run`,
+`clear_queue`, `get_state`, `get_messages`, `get_last_assistant_text`,
+`get_commands`, `new_session`, `switch_session`, `set_model`,
+`set_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`,
+and `set_session_name`. Other upstream commands answer
+`Unsupported command: <type>`, and unknown types `Unknown command: <type>`.
 
 A `prompt`, `steer`, or `follow_up` whose message is a skill command or a
 prompt template is expanded when it arrives, so the queue and the session
@@ -1189,11 +1224,28 @@ delivered in it, after the turn that would otherwise end it. `abort` answers
 once the run has settled, or at once when no run is active, and leaves queued
 messages for the next prompt. While a run is active, a `prompt` needs
 `streamingBehavior` (`steer` or `followUp`); `set_model`,
-`set_thinking_level`, `compact`, `new_session`, `switch_session`,
-`set_session_name`, and `resume_run` are refused; and `get_state`,
-`get_messages`, and `get_last_assistant_text` answer from the run's current
-state. `set_model` changes the session's model, not the default model in
-`settings.json`.
+`set_thinking_level`, `set_auto_retry`, `compact`, `new_session`,
+`switch_session`, `set_session_name`, and `resume_run` are refused; and
+`get_state`, `get_messages`, and `get_last_assistant_text` answer from the
+run's current state. `set_model` changes the session's model, not the default
+model in `settings.json`; `set_auto_retry` likewise turns retries on or off
+for this process only.
+
+A run that recovers (see "Run recovery") reports it as upstream does. The
+reply it drops ends its turn: `message_end` with `stopReason` `error` (or
+`length` for a reply cut off at the output limit), `turn_end`, and
+`agent_end`, whose `willRetry` is true before a retry. Then come
+`auto_retry_start` and the backoff, or `compaction_start` and
+`compaction_end` with reason `overflow` (`willRetry` true when the run asks
+again). The run then starts over with another `agent_start`, under the same
+`runId`, and still settles exactly once. `auto_retry_end` follows the reply
+that succeeded, or the `agent_end` of the last failure. `abort_retry` ends a
+backoff in progress: the run settles with the failure it would have retried,
+and `auto_retry_end` reports `Retry cancelled`.
+
+While a `bash` call runs, `tool_execution_update` records carry its output so
+far in `partialResult.content`: none when the command starts, then all of it
+(within the result's limits) each time more arrives, at most every 100 ms.
 
 pi adds four extensions, listed in `get_state.rpcExtensions`:
 
@@ -1308,7 +1360,10 @@ and context files upstream picks from a directory tree; pi's prompt is
 compared with it to the byte. The skills fixture records which skills and
 prompt templates upstream loads from directory trees, settings, and flags,
 how it reads their frontmatter, and what it sends for `/skill:name` and
-`/template` input; pi is compared with each. Secrets are redacted. Rust tests
+`/template` input; pi is compared with each. The error classification
+fixture records which failed requests upstream retries and which it reads as
+a context overflow: its pattern lists, which pi keeps verbatim, and its
+verdicts for sample error messages. Secrets are redacted. Rust tests
 compare covered behavior against those fixtures, so upstream changes become
 visible as fixture diffs and test failures.
 

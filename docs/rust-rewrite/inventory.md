@@ -179,6 +179,24 @@ Rust behavior:
 - `disabledResources` and `pi config enable|disable` filter loaded extensions, skills, prompts, and themes.
 - npm-specific package settings are not preserved.
 
+## Run Recovery
+
+Rust behavior, in the TUI, print mode, and RPC mode:
+
+- A failed model request is retried only when a retry can fix it, by
+  upstream's rules (`error-classification.json`): transport failures, HTTP
+  408, 429, 500, 502, 503, 504, 520, and 524, an overloaded or rate-limiting
+  provider. Authentication and request errors, a missing credential, and
+  quota or billing limits end the turn at once. `retry.enabled`, `retry.maxRetries`, `retry.baseDelayMs`, and
+  `retry.maxAgentDelayMs` apply; `retry.provider.*` is read and not used.
+- A reply that breaks off mid-stream is retried too, and left out of the
+  conversation.
+- A context overflow, or a final reply cut off at the output limit, is
+  answered by one compaction and one more request.
+- RPC mode reports all of it with upstream's records (`agent_end.willRetry`,
+  `auto_retry_start`/`auto_retry_end`, `compaction_start`/`compaction_end`
+  with reason `overflow`) and takes `abort_retry` and `set_auto_retry`.
+
 ## Session Behavior
 
 Rust sessions:
@@ -428,7 +446,9 @@ Rust behavior:
 - `bash`: `bash -c` (`/bin/bash`, then `bash` on `PATH`, then `sh`; `shellPath`
   and `shellCommandPrefix` apply), stdout and stderr as one stream, the last
   2000 lines or 50 KB with the whole output saved to a temp file, no default
-  timeout, and a timeout that returns the output so far.
+  timeout, and a timeout that returns the output so far. A command the model
+  called reports its output while it runs (the TUI's running entry, RPC
+  `tool_execution_update`).
 - `grep` and `find` walk the tree in-process with ripgrep's `ignore` and
   `globset` crates instead of running `rg` and `fd`.
 - `edit`: each `oldText` must occur exactly once in the original file and the
@@ -438,7 +458,8 @@ Rust behavior:
   fuzzy matching (upstream normalizes quotes, dashes, and trailing spaces when
   an exact match fails).
 - `write` accepts empty `content` and creates parent directories.
-- `!` and `/bash` run through the same shell path with a 120 second timeout.
+- `!` and `/bash` run through the same shell path with a 120 second timeout,
+  and show their output when they end.
 - Show visible TUI progress when terminal progress is enabled.
 
 ## Provider and Model Surface
@@ -577,7 +598,9 @@ Rust tests compare local provider request builders against those captures.
 order, for scripted runs against a local stub model; `pi-cli`'s `rpc_parity`
 test compares pi's RPC mode with it record by record. `skills.json` records
 what upstream loads, lists, and expands for skills and prompt templates;
-`pi-config`, `pi-core`, and the `rpc_parity` test compare with it. Drift
+`pi-config`, `pi-core`, and the `rpc_parity` test compare with it.
+`error-classification.json` records how upstream classifies failed requests
+(retryable, context overflow); `pi-ai` is compared with it. Drift
 is handled by updating Rust behavior and committed fixtures together, then
 running `make parity-check` and `make check`.
 
