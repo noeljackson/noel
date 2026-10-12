@@ -1697,3 +1697,63 @@ fn the_queue_is_saved_with_the_session_before_it_is_acknowledged() {
     assert_eq!(pi.response("state")["data"]["pendingMessageCount"], 0);
     assert!(pi.close().success());
 }
+
+// Skills and prompt templates.
+
+fn skills_fixture() -> Value {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ts-parity/skills.json");
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Writes `files`: each path below `root`, and its content.
+fn write_files(root: &Path, files: &[(&str, &str)]) {
+    for (path, content) in files {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), content).unwrap();
+    }
+}
+
+/// `get_commands` for every `commands` case of `skills.json`: from the same
+/// tree and flags, the templates and skills upstream's RPC mode lists, with
+/// their sources. `--no-skills` and `--no-prompt-templates` drop what is
+/// discovered and keep the `--skill` and `--prompt-template` paths.
+#[test]
+fn get_commands_matches_upstream() {
+    let fixture = skills_fixture();
+    let commands = &fixture["commands"];
+    let files = commands["files"].as_object().unwrap().iter();
+    let files = files
+        .map(|(path, content)| (path.as_str(), content.as_str().unwrap()))
+        .collect::<Vec<_>>();
+    let cases = commands["cases"].as_array().unwrap();
+    let names = cases.iter().map(|case| case["name"].as_str().unwrap());
+    assert_eq!(
+        names.collect::<Vec<_>>(),
+        [
+            "discovered",
+            "untrusted",
+            "explicit-paths",
+            "no-skills-with-skill",
+            "no-prompt-templates-with-template",
+            "short-flags-alone",
+        ]
+    );
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let root = fs::canonicalize(test_root(&format!("commands-{name}"))).unwrap();
+        write_files(&root, &files);
+        let tmp = root.display().to_string();
+        let args = case["args"].as_array().unwrap().iter();
+        let args = args
+            .map(|arg| arg.as_str().unwrap().replace("<tmp>", &tmp))
+            .collect::<Vec<_>>();
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut pi = Pi::spawn(root, json!([]), &args, json!({}));
+        pi.command(json!({"id": "1", "type": "get_commands"}));
+        let response = pi.response("1").to_string().replace(&tmp, "<tmp>");
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response, case["response"], "{name}");
+        assert!(pi.close().success());
+    }
+}
