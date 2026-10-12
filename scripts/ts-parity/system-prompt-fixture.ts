@@ -21,7 +21,8 @@ import { allToolNames, createToolDefinition, type ToolName } from "/ts-reference
  * `prompts`: for fixed inputs, the text of upstream's `buildSystemPrompt` and
  * its sections. The inputs are the ones a real session passes its builder: each
  * case runs a real resource loader and agent session in a temporary tree, and
- * the fixture fails unless the session's prompt is the recorded text.
+ * the fixture fails unless the session's prompt is the recorded text. A case
+ * with `skills` loads them from its tree as well; `skills.json` covers how.
  *
  * `discovery`: what upstream's resource loader picks from a tree of
  * `SYSTEM.md`, `APPEND_SYSTEM.md`, and context files, with and without project
@@ -59,9 +60,21 @@ type PromptCase = {
 	/** `--append-system-prompt`, once per entry. */
 	appendSystemPrompt?: string[];
 	extensionTools?: ExtensionTool[];
+	/** Load the skills among `files`. Each directory holds one, so no listing order matters. */
+	skills?: boolean;
 };
 
 const PROJECT_RULES = "# Project\n\nRun `make check` before committing.\n";
+
+/** A user skill, a project skill whose text needs escaping, and a skill only its command loads. */
+const SKILL_FILES = {
+	"agent/skills/pdf-tools/SKILL.md":
+		"---\nname: pdf-tools\ndescription: Extract text and tables from PDF files. Use when reading PDFs.\n---\n# PDF tools\n",
+	"repo/.git/HEAD": "ref: refs/heads/main\n",
+	"repo/.pi/skills/release/SKILL.md":
+		'---\ndescription: "Cut a release <major|minor> & \\"tag\\" it; it\'s quick."\n---\n# Release\n',
+	"repo/.agents/skills/deploy/SKILL.md": "---\ndescription: Deploy the app.\ndisable-model-invocation: true\n---\n# Deploy\n",
+};
 
 const PROMPT_CASES: PromptCase[] = [
 	{
@@ -135,6 +148,34 @@ const PROMPT_CASES: PromptCase[] = [
 			},
 		],
 	},
+	{
+		name: "skills",
+		description:
+			"Skills are listed after project context, to be loaded with read. A skill that disables model invocation is not listed.",
+		files: { ...SKILL_FILES, "repo/AGENTS.md": PROJECT_RULES },
+		skills: true,
+	},
+	{
+		name: "skills-with-bash-only",
+		description: "Without read, skills are loaded with bash.",
+		tools: ["bash", "edit"],
+		files: SKILL_FILES,
+		skills: true,
+	},
+	{
+		name: "skills-without-a-reader",
+		description: "Without read and bash, skills are not listed.",
+		tools: ["edit", "write", "grep"],
+		files: SKILL_FILES,
+		skills: true,
+	},
+	{
+		name: "skills-with-custom-prompt",
+		description: "A custom prompt keeps the skills listing.",
+		systemPrompt: "You are a release bot.",
+		files: SKILL_FILES,
+		skills: true,
+	},
 ];
 
 type DiscoveryCase = {
@@ -150,6 +191,8 @@ type DiscoveryCase = {
 	/** Command-line flags; `<tmp>` in a value is the temporary directory. */
 	flags?: { systemPrompt?: string; appendSystemPrompt?: string[]; noContextFiles?: boolean };
 };
+
+type LoaderFlags = DiscoveryCase["flags"] & { skills?: boolean };
 
 const BOTH_SCOPES = {
 	"agent/SYSTEM.md": "agent system\n",
@@ -326,7 +369,7 @@ async function writeTree(root: string, files: Record<string, string>, dirs: stri
 	}
 }
 
-function loader(root: string, cwd: string, trusted: boolean, flags: DiscoveryCase["flags"] = {}) {
+function loader(root: string, cwd: string, trusted: boolean, flags: LoaderFlags = {}) {
 	const agentDir = join(root, "agent");
 	const settingsManager = SettingsManager.create(cwd, agentDir);
 	settingsManager.setProjectTrusted(trusted);
@@ -335,7 +378,7 @@ function loader(root: string, cwd: string, trusted: boolean, flags: DiscoveryCas
 		agentDir,
 		settingsManager,
 		noExtensions: true,
-		noSkills: true,
+		noSkills: !flags.skills,
 		noPromptTemplates: true,
 		noThemes: true,
 		noContextFiles: flags.noContextFiles,
@@ -364,12 +407,16 @@ function stable<T>(value: T, root: string): T {
 
 async function capturePrompt(testCase: PromptCase) {
 	const root = await mkdtemp(join(tmpdir(), "pi-system-prompt-"));
+	// ~/.agents/skills is read below HOME.
+	const home = process.env.HOME;
+	process.env.HOME = join(root, "home");
 	try {
 		const cwd = join(root, testCase.cwd ?? "repo");
 		await writeTree(root, testCase.files ?? {}, [testCase.cwd ?? "repo"]);
 		const { agentDir, settingsManager, resourceLoader } = loader(root, cwd, true, {
 			systemPrompt: testCase.systemPrompt,
 			appendSystemPrompt: testCase.appendSystemPrompt,
+			skills: testCase.skills,
 		});
 		await resourceLoader.reload();
 		const extensionTools = testCase.extensionTools ?? [];
@@ -409,6 +456,7 @@ async function capturePrompt(testCase: PromptCase) {
 			customPrompt: resourceLoader.getSystemPrompt(),
 			appendSystemPrompt: resourceLoader.getAppendSystemPrompt().join("\n\n"),
 			contextFiles: resourceLoader.getAgentsFiles().agentsFiles,
+			skills: resourceLoader.getSkills().skills,
 		};
 		const prompt = buildSystemPrompt(options);
 		const sections = Object.entries(buildSystemPromptSections(options)).map(([name, text]) => ({ name, text }));
@@ -439,6 +487,13 @@ async function capturePrompt(testCase: PromptCase) {
 					customPrompt: options.customPrompt ?? null,
 					appendSystemPrompt: options.appendSystemPrompt,
 					contextFiles: options.contextFiles,
+					skills: (options.skills ?? []).map(({ name, description, filePath, baseDir, disableModelInvocation }) => ({
+						name,
+						description,
+						filePath,
+						baseDir,
+						disableModelInvocation,
+					})),
 				},
 				sections,
 				prompt,
@@ -446,6 +501,7 @@ async function capturePrompt(testCase: PromptCase) {
 			root,
 		);
 	} finally {
+		process.env.HOME = home;
 		await rm(root, { recursive: true, force: true });
 	}
 }
@@ -504,7 +560,7 @@ async function main() {
 				},
 				format: {
 					prompts:
-						"input: what upstream's session passed its prompt builder (extensionTools as their definitions give them). sections: the builder's sections in order; prompt: their text joined by blank lines.",
+						"input: what upstream's session passed its prompt builder (extensionTools as their definitions give them, skills as its resource loader loaded them). sections: the builder's sections in order; prompt: their text joined by blank lines.",
 					discovery:
 						"files, dirs, cwd, trusted, flags: the tree and the command line. result: the custom prompt, the appended text, and the context files upstream's resource loader passes the builder.",
 				},
