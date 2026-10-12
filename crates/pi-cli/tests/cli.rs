@@ -482,6 +482,55 @@ fn login_logout_round_trip_named_accounts() {
 }
 
 #[test]
+fn login_waits_for_another_process_auth_lock_and_writes_owner_only() {
+    let root = test_dir("pi-cli-login-lock");
+    let agent = root.join("agent");
+    let auth_path = agent.join("auth.json");
+    let held = pi_config::AuthFileLock::try_acquire(&auth_path)
+        .expect("lock auth.json")
+        .expect("free lock");
+
+    let mut login = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["login", "anthropic", "--api-key", "locked-key"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn login");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        login.try_wait().expect("poll login").is_none(),
+        "login finished while another process held the auth.json lock"
+    );
+    assert!(!auth_path.exists());
+
+    drop(held);
+    let output = login.wait_with_output().expect("wait for login");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let auth = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(&auth_path).expect("auth.json"),
+    )
+    .expect("parse auth.json");
+    assert_eq!(auth["anthropic"]["default"]["key"], "locked-key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&auth_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn accounts_status_prints_table_or_empty_state() {
     let root = test_dir("pi-cli-accounts-status");
     let agent = root.join("agent");

@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use pi_config::{
-    auth_for_provider, expires_within, import_account_name, is_expired, write_file_atomic,
-    AuthCredential, AuthData, ResolvedAuth,
+    auth_for_provider, expires_within, import_account_name, is_expired, read_auth_file,
+    write_auth_file, AuthCredential, AuthData, AuthFileLock, ResolvedAuth, AUTH_LOCK_TIMEOUT,
 };
 use serde::Deserialize;
 
@@ -140,13 +141,26 @@ fn refresh_lock(provider: &str, account: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-fn read_auth_file(auth_path: &Path) -> AuthData {
-    std::fs::read_to_string(auth_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<AuthData>(&content).ok())
-        .unwrap_or_default()
+/// The auth.json lock that other pi processes take for logins, logouts, and
+/// refreshes, awaited without blocking the runtime.
+async fn lock_auth_file(auth_path: &Path) -> Result<AuthFileLock> {
+    let deadline = tokio::time::Instant::now() + AUTH_LOCK_TIMEOUT;
+    loop {
+        if let Some(lock) = AuthFileLock::try_acquire(auth_path)? {
+            return Ok(lock);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "timed out waiting for another pi process to finish updating {}",
+                auth_path.display()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
+/// Stores refreshed tokens for one account in auth.json as it is now; the
+/// caller holds the auth.json lock.
 fn persist_tokens(
     auth_path: &Path,
     provider: &str,
@@ -154,10 +168,7 @@ fn persist_tokens(
     tokens: &RefreshedTokens,
     account_id: Option<String>,
 ) -> Result<()> {
-    if let Some(parent) = auth_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut stored = read_auth_file(auth_path);
+    let mut stored = read_auth_file(auth_path)?;
     stored.insert(
         provider,
         account,
@@ -168,10 +179,7 @@ fn persist_tokens(
             account_id,
         },
     );
-    write_file_atomic(
-        auth_path,
-        format!("{}\n", serde_json::to_string_pretty(&stored)?).as_bytes(),
-    )?;
+    write_auth_file(auth_path, &stored)?;
     Ok(())
 }
 
@@ -203,14 +211,6 @@ fn account_id_of(auth: &ResolvedAuth) -> Option<String> {
     }
 }
 
-fn access_token_of(auth: &ResolvedAuth) -> &str {
-    match auth {
-        ResolvedAuth::ApiKey(key) => key,
-        ResolvedAuth::ClaudeCodeOAuth { access_token, .. }
-        | ResolvedAuth::ChatGptOAuth { access_token, .. } => access_token,
-    }
-}
-
 pub async fn refresh_expiring_auth(
     client: &reqwest::Client,
     auth_path: &Path,
@@ -227,6 +227,22 @@ pub async fn refresh_expiring_auth(
         return Ok(Some(resolved));
     }
     let account = persisted_account_name(auth, provider, account);
+    let lock = refresh_lock(provider, &account);
+    let _guard = lock.lock().await;
+    let _file_lock = lock_auth_file(auth_path).await?;
+
+    // `auth` may be a snapshot from before an earlier refresh, here or in
+    // another process. Refresh tokens rotate, so continue from the auth
+    // file's credential: it may be fresh already, and only it holds the
+    // refresh token that is still valid.
+    let stored = read_auth_file(auth_path)?;
+    let resolved = stored
+        .credential(provider, &account)
+        .and_then(|_| auth_for_provider(&stored, provider, Some(&account)))
+        .unwrap_or(resolved);
+    if !expires_within(resolved.expires(), now, REFRESH_WINDOW_SECONDS) {
+        return Ok(Some(resolved));
+    }
     if !needs_refresh(&resolved, now) {
         if is_expired(resolved.expires(), now) {
             return Err(refresh_failure(
@@ -241,23 +257,6 @@ pub async fn refresh_expiring_auth(
     else {
         return Ok(Some(resolved));
     };
-
-    let lock = refresh_lock(provider, &account);
-    let _guard = lock.lock().await;
-
-    let stored = read_auth_file(auth_path);
-    if let Some(AuthCredential::OAuth {
-        access_token,
-        expires,
-        ..
-    }) = stored.credential(provider, &account)
-    {
-        let refreshed_elsewhere = access_token != access_token_of(&resolved)
-            && !expires_within(*expires, now, REFRESH_WINDOW_SECONDS);
-        if refreshed_elsewhere {
-            return Ok(auth_for_provider(&stored, provider, Some(&account)));
-        }
-    }
 
     match execute_refresh(
         client,
@@ -545,7 +544,7 @@ mod tests {
             }
         );
 
-        let persisted = read_auth_file(&auth_path);
+        let persisted = read_auth_file(&auth_path).expect("read auth file");
         let credential = persisted
             .credential("openai-codex", "default")
             .expect("persisted credential");
@@ -588,7 +587,7 @@ mod tests {
         .expect("auth");
         assert_eq!(resolved.refresh_token(), Some("work-refresh"));
 
-        let persisted = read_auth_file(&auth_path);
+        let persisted = read_auth_file(&auth_path).expect("read auth file");
         assert!(persisted
             .credential("openai-codex", "work")
             .is_some_and(|credential| {
@@ -746,6 +745,107 @@ mod tests {
                 expires: 1_030,
             }
         );
+        assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn refresh_continues_from_the_auth_file_not_the_startup_snapshot() {
+        let root = test_dir("pi-cli-oauth-live-refresh-token");
+        let auth_path = root.join("agent").join("auth.json");
+        let stub = spawn_stub(
+            200,
+            r#"{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}"#,
+        );
+        // The startup snapshot still holds a refresh token that another pi
+        // process has since rotated; auth.json holds the rotated one (about
+        // to expire as well) and an account this process never saw.
+        let snapshot = expired_stored_auth("anthropic", "default");
+        let mut current = AuthData::default();
+        current.insert(
+            "anthropic",
+            "default",
+            AuthCredential::OAuth {
+                access_token: "rotated-access".to_string(),
+                refresh_token: Some("rotated-refresh".to_string()),
+                expires: 1_010,
+                account_id: None,
+            },
+        );
+        current.insert(
+            "openai",
+            "default",
+            AuthCredential::ApiKey {
+                key: "other-process".to_string(),
+            },
+        );
+        write_auth_file(&auth_path, &current).expect("seed auth file");
+
+        let resolved = refresh_expiring_auth(
+            &reqwest::Client::new(),
+            &auth_path,
+            &snapshot,
+            "anthropic",
+            None,
+            Some((&stub.url, "test-client")),
+            1_000,
+        )
+        .await
+        .expect("refresh")
+        .expect("auth");
+
+        assert_eq!(resolved.refresh_token(), Some("fresh-refresh"));
+        let requests = stub.requests.lock().expect("requests lock").clone();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].contains("refresh_token=rotated-refresh"),
+            "{}",
+            requests[0]
+        );
+        let persisted = read_auth_file(&auth_path).expect("read auth file");
+        assert!(matches!(
+            persisted.credential("anthropic", "default"),
+            Some(AuthCredential::OAuth { access_token, .. }) if access_token == "fresh-access"
+        ));
+        assert_eq!(
+            persisted.credential("openai", "default"),
+            Some(&AuthCredential::ApiKey {
+                key: "other-process".to_string()
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn refresh_waits_while_another_holder_locks_auth_file() {
+        let root = test_dir("pi-cli-oauth-locked");
+        let auth_path = root.join("agent").join("auth.json");
+        let stub = spawn_stub(200, r#"{"access_token":"fresh-access","expires_in":3600}"#);
+        let auth = expired_stored_auth("openai-codex", "default");
+        let client = reqwest::Client::new();
+        let refresh = || {
+            refresh_expiring_auth(
+                &client,
+                &auth_path,
+                &auth,
+                "openai-codex",
+                None,
+                Some((&stub.url, "test-client")),
+                1_000,
+            )
+        };
+
+        let held = AuthFileLock::try_acquire(&auth_path)
+            .expect("lock")
+            .expect("free lock");
+        let blocked = tokio::time::timeout(Duration::from_millis(200), refresh()).await;
+        assert!(blocked.is_err(), "refresh ran while auth.json was locked");
+        assert_eq!(stub.hits.load(Ordering::SeqCst), 0);
+
+        drop(held);
+        refresh().await.expect("refresh").expect("auth");
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_dir_all(root);

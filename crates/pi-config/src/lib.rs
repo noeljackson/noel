@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1212,9 +1213,140 @@ pub fn write_usage_cache(path: &Path, cache: &UsageCache) -> Result<(), ConfigEr
     write_file_atomic(path, format!("{content}\n").as_bytes())
 }
 
+/// How long an `auth.json` update waits for another pi process to finish its
+/// own (a login, logout, or OAuth refresh).
+pub const AUTH_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cross-process advisory lock serializing every read-modify-write of
+/// `auth.json`. The file itself is replaced by rename, so the lock lives in a
+/// sibling `auth.json.flock` that is never replaced. Dropping the lock
+/// releases it, and so does the process exiting.
+#[derive(Debug)]
+pub struct AuthFileLock {
+    _file: fs::File,
+}
+
+impl AuthFileLock {
+    /// Takes the lock unless another holder has it.
+    pub fn try_acquire(auth_path: &Path) -> Result<Option<Self>, ConfigError> {
+        let file_name = auth_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "auth.json".to_string());
+        let lock_path = auth_path.with_file_name(format!("{file_name}.flock"));
+        if let Some(parent) = lock_path.parent() {
+            create_private_dir_all(parent)?;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock_error = |source| ConfigError::Write {
+            path: lock_path.clone(),
+            source,
+        };
+        let file = options.open(&lock_path).map_err(lock_error)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(source)) => Err(lock_error(source)),
+        }
+    }
+
+    /// Waits up to [`AUTH_LOCK_TIMEOUT`] for the lock.
+    pub fn acquire(auth_path: &Path) -> Result<Self, ConfigError> {
+        let deadline = Instant::now() + AUTH_LOCK_TIMEOUT;
+        loop {
+            if let Some(lock) = Self::try_acquire(auth_path)? {
+                return Ok(lock);
+            }
+            if Instant::now() >= deadline {
+                return Err(ConfigError::Write {
+                    path: auth_path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "another pi process holds the auth.json lock",
+                    ),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Reads `auth.json` as it is on disk now; a missing file holds no
+/// credentials.
+pub fn read_auth_file(auth_path: &Path) -> Result<AuthData, ConfigError> {
+    Ok(read_optional_json::<AuthData>(auth_path)?.unwrap_or_default())
+}
+
+/// Writes `auth.json` atomically (temporary file, then rename) and owner-only
+/// (0600), creating its directory owner-only (0700) when missing. Callers
+/// hold [`AuthFileLock`].
+pub fn write_auth_file(auth_path: &Path, auth: &AuthData) -> Result<(), ConfigError> {
+    if let Some(parent) = auth_path.parent() {
+        create_private_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(auth).map_err(|source| ConfigError::Parse {
+        path: auth_path.to_path_buf(),
+        source,
+    })?;
+    write_file_atomic_with_mode(auth_path, format!("{content}\n").as_bytes(), Some(0o600))
+}
+
+/// Applies `mutate` to `auth.json` as it is now, under [`AuthFileLock`], and
+/// writes the result back only when it changed. Logins and logouts go through
+/// here and OAuth refreshes hold the same lock, so a change only touches its
+/// own entry and never restores another process's stale copy.
+pub fn update_auth_file<T>(
+    auth_path: &Path,
+    mutate: impl FnOnce(&mut AuthData) -> T,
+) -> Result<T, ConfigError> {
+    let _lock = AuthFileLock::acquire(auth_path)?;
+    let mut auth = read_auth_file(auth_path)?;
+    let before = auth.clone();
+    let result = mutate(&mut auth);
+    if auth != before {
+        write_auth_file(auth_path, &auth)?;
+    }
+    Ok(result)
+}
+
+/// Creates `dir` and any missing parents owner-only; an existing directory
+/// keeps its permissions.
+fn create_private_dir_all(dir: &Path) -> Result<(), ConfigError> {
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir).map_err(|source| ConfigError::Write {
+        path: dir.to_path_buf(),
+        source,
+    })
+}
+
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
+    write_file_atomic_with_mode(path, contents, None)
+}
+
+/// `mode` holds Unix permission bits for the new file, set before any
+/// content is written.
+fn write_file_atomic_with_mode(
+    path: &Path,
+    contents: &[u8],
+    mode: Option<u32>,
+) -> Result<(), ConfigError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -1227,6 +1359,13 @@ pub fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError
     ));
     let result = (|| -> std::io::Result<()> {
         let mut file = fs::File::create(&temp_path)?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
         file.write_all(contents)?;
         file.sync_all()?;
         fs::rename(&temp_path, path)
@@ -4640,6 +4779,118 @@ mod tests {
 
         let entries: Vec<_> = fs::read_dir(&root).expect("read dir").collect();
         assert_eq!(entries.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn api_key(key: &str) -> AuthCredential {
+        AuthCredential::ApiKey {
+            key: key.to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn auth_file_updates_are_private_and_change_only_their_entry() {
+        let root = test_dir("pi-config-auth-update");
+        let auth_path = root.join("agent").join("auth.json");
+
+        update_auth_file(&auth_path, |auth| {
+            auth.insert("anthropic", DEFAULT_ACCOUNT_NAME, api_key("first"))
+        })
+        .expect("first update");
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_of(&auth_path), 0o600);
+            assert_eq!(mode_of(auth_path.parent().unwrap()), 0o700);
+        }
+
+        // Another process rewrote the file (world-readable) since this one
+        // read it: an update keeps its entries and restores owner-only mode.
+        let mut current = read_auth_file(&auth_path).expect("read");
+        current.insert("anthropic", DEFAULT_ACCOUNT_NAME, api_key("rotated"));
+        current.insert("openai", DEFAULT_ACCOUNT_NAME, api_key("other"));
+        fs::write(
+            &auth_path,
+            serde_json::to_string(&current).expect("serialize"),
+        )
+        .expect("rewrite");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        }
+        update_auth_file(&auth_path, |auth| {
+            auth.insert("google", "work", api_key("google"))
+        })
+        .expect("second update");
+        let stored = read_auth_file(&auth_path).expect("read back");
+        assert_eq!(
+            stored.credential("anthropic", DEFAULT_ACCOUNT_NAME),
+            Some(&api_key("rotated"))
+        );
+        assert_eq!(
+            stored.credential("openai", DEFAULT_ACCOUNT_NAME),
+            Some(&api_key("other"))
+        );
+        assert_eq!(
+            stored.credential("google", "work"),
+            Some(&api_key("google"))
+        );
+        #[cfg(unix)]
+        assert_eq!(mode_of(&auth_path), 0o600);
+        let mut names = fs::read_dir(auth_path.parent().unwrap())
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8")
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["auth.json", "auth.json.flock"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auth_file_update_never_overwrites_a_file_it_cannot_parse() {
+        let root = test_dir("pi-config-auth-unparsable");
+        fs::create_dir_all(&root).expect("create root");
+        let auth_path = root.join("auth.json");
+        fs::write(&auth_path, "{ not json").expect("write");
+
+        let result = update_auth_file(&auth_path, |auth| {
+            auth.insert("anthropic", DEFAULT_ACCOUNT_NAME, api_key("key"))
+        });
+
+        assert!(matches!(result, Err(ConfigError::Parse { .. })));
+        assert_eq!(fs::read_to_string(&auth_path).expect("read"), "{ not json");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auth_file_lock_excludes_other_holders_until_released() {
+        let root = test_dir("pi-config-auth-lock");
+        let auth_path = root.join("auth.json");
+
+        let held = AuthFileLock::try_acquire(&auth_path)
+            .expect("lock")
+            .expect("free lock");
+        // flock locks belong to the open file, so a second open in the same
+        // process contends exactly like another process would.
+        assert!(AuthFileLock::try_acquire(&auth_path)
+            .expect("try lock")
+            .is_none());
+        drop(held);
+        assert!(AuthFileLock::try_acquire(&auth_path)
+            .expect("try lock")
+            .is_some());
         let _ = fs::remove_dir_all(root);
     }
 

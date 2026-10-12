@@ -340,6 +340,13 @@ Older flat files (`{ "openai": { "type": "api_key", ... } }`) are migrated on
 read; writes always use the nested form. Without an explicit selection the
 `default` account is used, or the sole account when only one exists.
 
+`auth.json` is written atomically and owner-only (`0600`; a missing agent
+directory is created `0700`). Logins, logouts, and OAuth refreshes hold an
+advisory lock on `auth.json.flock`, re-read the file, and change only their
+own entry, so concurrent pi processes never drop each other's credentials or
+rotated refresh tokens. A `--api-key` value is used for that run only and is
+never written.
+
 Or use the CLI helper:
 
 ```bash

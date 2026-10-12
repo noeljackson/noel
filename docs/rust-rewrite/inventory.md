@@ -130,7 +130,11 @@ Project-local files:
 Rust behavior:
 
 - Preserve the config root and key file names where useful.
-- Keep `auth.json` permissions strict where the platform supports it.
+- Write `auth.json` atomically and owner-only (0600; a missing agent directory
+  is created 0700). Logins, logouts, and OAuth refreshes take a cross-process
+  lock (`auth.json.flock`), re-read the file, and change only their own entry;
+  a refresh continues from the stored refresh token, not the startup snapshot.
+- Keep `--api-key` values in memory; they are never written to `auth.json`.
 - Reuse Claude Code OAuth and Codex/ChatGPT login credentials when available.
 - Do not automatically migrate legacy TypeScript sessions.
 

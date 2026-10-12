@@ -565,9 +565,9 @@ async fn run_auth_login(args: &[String]) -> Result<()> {
     if key.trim().is_empty() {
         return Err(anyhow!("api key is empty"));
     }
-    let mut auth = read_auth_data(&paths.auth_path)?;
-    auth.insert(&provider, &account, AuthCredential::ApiKey { key });
-    write_auth_data(&paths.auth_path, &auth)?;
+    pi_config::update_auth_file(&paths.auth_path, |auth| {
+        auth.insert(&provider, &account, AuthCredential::ApiKey { key })
+    })?;
     println!(
         "stored API-key auth for {provider}{} in {}",
         account_suffix(&account),
@@ -607,21 +607,22 @@ async fn run_codex_login(paths: &ConfigPaths, account: &str) -> Result<()> {
         },
     )
     .await?;
-    let mut auth = read_auth_data(&paths.auth_path)?;
-    let replaced = auth.credential("openai-codex", account).is_some();
-    for provider in ["openai", "openai-codex"] {
-        auth.insert(
-            provider,
-            account,
-            AuthCredential::OAuth {
-                access_token: tokens.access_token.clone(),
-                refresh_token: tokens.refresh_token.clone(),
-                expires: tokens.expires,
-                account_id: tokens.account_id.clone(),
-            },
-        );
-    }
-    write_auth_data(&paths.auth_path, &auth)?;
+    let replaced = pi_config::update_auth_file(&paths.auth_path, |auth| {
+        let replaced = auth.credential("openai-codex", account).is_some();
+        for provider in ["openai", "openai-codex"] {
+            auth.insert(
+                provider,
+                account,
+                AuthCredential::OAuth {
+                    access_token: tokens.access_token.clone(),
+                    refresh_token: tokens.refresh_token.clone(),
+                    expires: tokens.expires,
+                    account_id: tokens.account_id.clone(),
+                },
+            );
+        }
+        replaced
+    })?;
     println!(
         "logged in as account {account}{}",
         if replaced {
@@ -652,19 +653,20 @@ async fn run_claude_login(paths: &ConfigPaths, account: &str) -> Result<()> {
     )
     .await
     .map_err(|_| anyhow!("login timed out after 15 minutes"))??;
-    let mut auth = read_auth_data(&paths.auth_path)?;
-    let replaced = auth.credential("anthropic", account).is_some();
-    auth.insert(
-        "anthropic",
-        account,
-        AuthCredential::OAuth {
-            access_token: tokens.access_token.clone(),
-            refresh_token: tokens.refresh_token.clone(),
-            expires: tokens.expires,
-            account_id: tokens.account_id.clone(),
-        },
-    );
-    write_auth_data(&paths.auth_path, &auth)?;
+    let replaced = pi_config::update_auth_file(&paths.auth_path, |auth| {
+        let replaced = auth.credential("anthropic", account).is_some();
+        auth.insert(
+            "anthropic",
+            account,
+            AuthCredential::OAuth {
+                access_token: tokens.access_token.clone(),
+                refresh_token: tokens.refresh_token.clone(),
+                expires: tokens.expires,
+                account_id: tokens.account_id.clone(),
+            },
+        );
+        replaced
+    })?;
     println!(
         "logged in as account {account}{}",
         if replaced {
@@ -709,9 +711,10 @@ fn run_auth_logout(args: &[String]) -> Result<()> {
     let account = account.unwrap_or_else(|| DEFAULT_ACCOUNT_NAME.to_string());
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd, None)?;
-    let mut auth = read_auth_data(&paths.auth_path)?;
-    if auth.remove(&provider, &account).is_some() {
-        write_auth_data(&paths.auth_path, &auth)?;
+    let removed = pi_config::update_auth_file(&paths.auth_path, |auth| {
+        auth.remove(&provider, &account).is_some()
+    })?;
+    if removed {
         println!(
             "removed stored auth for {provider}{}",
             account_suffix(&account)
@@ -1185,26 +1188,6 @@ fn read_settings_packages(path: &Path) -> Result<Vec<PackageSource>> {
     }
     let settings = serde_json::from_str::<Settings>(&fs::read_to_string(path)?)?;
     Ok(settings.packages)
-}
-
-fn read_auth_data(path: &Path) -> Result<AuthData> {
-    if !path.exists() {
-        return Ok(AuthData::default());
-    }
-    Ok(serde_json::from_str::<AuthData>(&fs::read_to_string(
-        path,
-    )?)?)
-}
-
-fn write_auth_data(path: &Path, auth: &AuthData) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_file_atomic(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(auth)?).as_bytes(),
-    )?;
-    Ok(())
 }
 
 fn default_api_key_env(provider: &str) -> Option<&'static str> {
@@ -6744,12 +6727,7 @@ fn apply_tui_selector_selection(
             );
         }
         "logout" => {
-            if config
-                .auth
-                .remove(&item.value, DEFAULT_ACCOUNT_NAME)
-                .is_some()
-            {
-                write_auth_file(config)?;
+            if remove_stored_auth(config, &item.value, DEFAULT_ACCOUNT_NAME)? {
                 app.push(
                     TuiEntryKind::System,
                     format!("removed stored auth for {}", item.value),
@@ -7581,8 +7559,7 @@ async fn handle_tui_submission(
                 let mut parts = args.split_whitespace();
                 let provider = parts.next().unwrap_or_default();
                 let account = parts.next().unwrap_or(DEFAULT_ACCOUNT_NAME);
-                if config.auth.remove(provider, account).is_some() {
-                    write_auth_file(config)?;
+                if remove_stored_auth(config, provider, account)? {
                     app.push(
                         TuiEntryKind::System,
                         format!(
@@ -9290,12 +9267,7 @@ fn select_from_selector_message(
             ))
         }
         "logout" => {
-            if config
-                .auth
-                .remove(&item.value, DEFAULT_ACCOUNT_NAME)
-                .is_some()
-            {
-                write_auth_file(config)?;
+            if remove_stored_auth(config, &item.value, DEFAULT_ACCOUNT_NAME)? {
                 Ok(format!("removed stored auth for {}", item.value))
             } else {
                 Ok(format!("no stored auth for {}", item.value))
@@ -9978,15 +9950,15 @@ async fn copy_last_assistant_message(runtime: &Runtime) -> Result<String> {
     Ok(format!("{}\n{status}", message.content))
 }
 
-fn write_auth_file(config: &LoadedConfig) -> Result<()> {
-    if let Some(parent) = config.paths.auth_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_file_atomic(
-        &config.paths.auth_path,
-        serde_json::to_string_pretty(&config.auth)?.as_bytes(),
-    )?;
-    Ok(())
+/// Logs one account out: removes it from `auth.json` as the file is now (so
+/// tokens refreshed since startup survive) and from this session's config.
+/// The in-memory auth is never written back: it may hold a `--api-key`
+/// value, which must not be persisted.
+fn remove_stored_auth(config: &mut LoadedConfig, provider: &str, account: &str) -> Result<bool> {
+    let removed = pi_config::update_auth_file(&config.paths.auth_path, |auth: &mut AuthData| {
+        auth.remove(provider, account).is_some()
+    })?;
+    Ok(config.auth.remove(provider, account).is_some() || removed)
 }
 
 #[cfg(test)]
@@ -10838,6 +10810,63 @@ mod tests {
                 .expect("clear account");
         assert_eq!(message, "account: auto");
         assert_eq!(runtime.session().active_account, None);
+    }
+
+    #[test]
+    fn logout_rewrites_only_its_entry_and_never_persists_runtime_keys() {
+        let root = std::env::temp_dir().join(format!("pi-cli-logout-{}", unique_temp_suffix()));
+        let auth_path = root.join("agent").join("auth.json");
+        let oauth = |token: &str, expires| AuthCredential::OAuth {
+            access_token: format!("{token}-access"),
+            refresh_token: Some(format!("{token}-refresh")),
+            expires,
+            account_id: None,
+        };
+        let codex = AuthCredential::ApiKey {
+            key: "codex-key".to_string(),
+        };
+        // auth.json now holds tokens another process refreshed since startup.
+        let mut current = AuthData::default();
+        current.insert(
+            "anthropic",
+            DEFAULT_ACCOUNT_NAME,
+            oauth("rotated", 4_000_000_000),
+        );
+        current.insert("openai-codex", DEFAULT_ACCOUNT_NAME, codex.clone());
+        pi_config::write_auth_file(&auth_path, &current).expect("seed auth.json");
+        // This session's startup snapshot: the stale tokens plus a value that
+        // came from `--api-key` and must stay in memory.
+        let mut snapshot = AuthData::default();
+        snapshot.insert("anthropic", DEFAULT_ACCOUNT_NAME, oauth("stale", 1));
+        snapshot.insert("openai-codex", DEFAULT_ACCOUNT_NAME, codex);
+        snapshot.insert(
+            "google",
+            DEFAULT_ACCOUNT_NAME,
+            AuthCredential::ApiKey {
+                key: "cli-only-key".to_string(),
+            },
+        );
+        let mut config = account_test_config(snapshot);
+        config.paths.auth_path = auth_path.clone();
+
+        assert!(remove_stored_auth(&mut config, "openai-codex", DEFAULT_ACCOUNT_NAME).unwrap());
+
+        let content = fs::read_to_string(&auth_path).expect("read auth.json");
+        assert!(!content.contains("cli-only-key"), "{content}");
+        assert!(!content.contains("stale-"), "{content}");
+        let stored = pi_config::read_auth_file(&auth_path).expect("parse auth.json");
+        assert_eq!(
+            stored.credential("anthropic", DEFAULT_ACCOUNT_NAME),
+            Some(&oauth("rotated", 4_000_000_000))
+        );
+        assert!(stored
+            .credential("openai-codex", DEFAULT_ACCOUNT_NAME)
+            .is_none());
+        assert!(config
+            .auth
+            .credential("openai-codex", DEFAULT_ACCOUNT_NAME)
+            .is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
