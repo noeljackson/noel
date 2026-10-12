@@ -1,16 +1,27 @@
+mod output;
+mod paths;
 mod process;
+mod read;
+mod search;
+mod truncate;
 mod web;
 
 use std::fs;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::process::Command;
+use tokio::io::AsyncReadExt;
+use tokio::process::{ChildStdout, Command};
+use tokio::time::Instant;
 
+use output::{OutputAccumulator, OutputSnapshot};
+use paths::resolve_to_cwd;
 pub use process::{kill_running_tool_groups, spawn_tool_process, ToolProcessGroup};
+use truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -26,6 +37,7 @@ pub enum ToolRequest {
         offset: Option<u64>,
         limit: Option<u64>,
     },
+    /// Without `timeout_ms` the command runs until it exits.
     Bash {
         command: String,
         timeout_ms: Option<u64>,
@@ -42,6 +54,8 @@ pub enum ToolRequest {
     Grep {
         path: Option<String>,
         pattern: String,
+        #[serde(default)]
+        glob: Option<String>,
         literal: Option<bool>,
         ignore_case: Option<bool>,
         context: Option<u64>,
@@ -49,9 +63,15 @@ pub enum ToolRequest {
     },
     Find {
         pattern: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        limit: Option<u64>,
     },
     Ls {
         path: Option<String>,
+        #[serde(default)]
+        limit: Option<u64>,
     },
     WebSearch {
         query: String,
@@ -75,6 +95,32 @@ pub struct ToolResult {
     pub output: String,
     #[serde(default)]
     pub is_error: bool,
+    /// Images that go to the model with the output (`read` of an image).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ToolImage>,
+}
+
+impl ToolResult {
+    pub fn text(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            is_error: false,
+            images: Vec::new(),
+        }
+    }
+
+    pub fn error(output: impl Into<String>) -> Self {
+        Self {
+            is_error: true,
+            ..Self::text(output)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolImage {
+    pub mime_type: String,
+    pub data_base64: String,
 }
 
 #[derive(Debug, Error)]
@@ -83,8 +129,6 @@ pub enum ToolError {
     Web(String),
     #[error("unknown tool: {0}")]
     Unknown(String),
-    #[error("path escapes cwd: {0}")]
-    PathEscapesCwd(String),
     #[error("failed to access {path}: {source}")]
     Io {
         path: PathBuf,
@@ -92,11 +136,14 @@ pub enum ToolError {
     },
     #[error("{0}")]
     InvalidEdit(String),
+    /// A failure whose message is the whole result, worded as upstream does.
+    #[error("{0}")]
+    Failed(String),
     #[error("command timed out after {0} ms")]
     Timeout(u64),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ToolRuntimeOptions {
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
@@ -104,6 +151,24 @@ pub struct ToolRuntimeOptions {
     /// Changes to the environment a bash command inherits: a variable to
     /// set, or with `None` one to remove.
     pub bash_env: Vec<(String, Option<String>)>,
+    /// Scale images that `read` returns down to what providers accept
+    /// (the `images.autoResize` setting).
+    pub auto_resize_images: bool,
+    /// Never return images from `read` (the `images.blockImages` setting).
+    pub block_images: bool,
+}
+
+impl Default for ToolRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            shell_path: None,
+            shell_command_prefix: None,
+            offline: false,
+            bash_env: Vec::new(),
+            auto_resize_images: true,
+            block_images: false,
+        }
+    }
 }
 
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -150,7 +215,7 @@ pub async fn execute_tool(
             path,
             offset,
             limit,
-        } => read_tool(cwd, &path, offset, limit),
+        } => read::read_tool(cwd, &path, offset, limit, options),
         ToolRequest::Bash {
             command,
             timeout_ms,
@@ -160,21 +225,29 @@ pub async fn execute_tool(
         ToolRequest::Grep {
             path,
             pattern,
+            glob,
             literal,
             ignore_case,
             context,
             limit,
-        } => grep_tool(
+        } => search::grep_tool(
             cwd,
-            path.as_deref(),
-            &pattern,
-            literal.unwrap_or(false),
-            ignore_case.unwrap_or(false),
-            context.unwrap_or(0),
-            limit,
+            search::GrepArgs {
+                pattern: &pattern,
+                path: path.as_deref(),
+                glob: glob.as_deref(),
+                ignore_case: ignore_case.unwrap_or(false),
+                literal: literal.unwrap_or(false),
+                context: context.unwrap_or(0),
+                limit,
+            },
         ),
-        ToolRequest::Find { pattern } => find_tool(cwd, &pattern),
-        ToolRequest::Ls { path } => ls_tool(cwd, path.as_deref()),
+        ToolRequest::Find {
+            pattern,
+            path,
+            limit,
+        } => search::find_tool(cwd, &pattern, path.as_deref(), limit),
+        ToolRequest::Ls { path, limit } => search::ls_tool(cwd, path.as_deref(), limit),
         ToolRequest::WebSearch { query, limit } => {
             tokio::time::timeout(Duration::from_secs(30), web::search(&query, limit))
                 .await
@@ -188,177 +261,129 @@ pub async fn execute_tool(
     }
 }
 
-/// Default caps on tool outputs entering the model context. Large results
-/// are truncated with instructions for narrowing the next request instead of
-/// silently consuming the whole window (Claude Code: 2,000-line reads, 30k-char
-/// bash output; pi keeps the same order of magnitude).
-pub const MAX_READ_LINES: usize = 2_000;
-pub const MAX_TOOL_OUTPUT_CHARS: usize = 30_000;
-pub const MAX_GREP_MATCHES: usize = 200;
-
-/// Truncation notice appended to oversized outputs so the model retries with
-/// narrower parameters instead of assuming it saw everything.
-fn truncation_notice(omitted: &str, hint: &str) -> String {
-    format!("\n[output truncated: {omitted}. {hint}]")
-}
-
-fn truncate_chars(text: &str, max: usize, hint: &str) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
+/// Caps the output of a tool pi does not implement (an extension tool) like
+/// the built-in ones: the first 2000 lines or 50 KB, with the whole output
+/// saved to a temp file the notice names.
+pub fn cap_tool_output(output: String) -> String {
+    let truncation = truncate_head(&output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    if !truncation.truncated {
+        return output;
     }
-    let mut end = text.len();
-    for (count, (byte, _)) in text.char_indices().enumerate() {
-        if count == max {
-            end = byte;
-            break;
-        }
-    }
-    let mut cut = text[..end].to_string();
-    cut.push_str(&truncation_notice(
-        &format!("showing first {max} of {} characters", text.chars().count()),
-        hint,
-    ));
-    cut
-}
-
-fn read_tool(
-    cwd: &Path,
-    path: &str,
-    offset: Option<u64>,
-    limit: Option<u64>,
-) -> Result<ToolResult, ToolError> {
-    let path = resolve_under_cwd(cwd, path)?;
-    let content = fs::read_to_string(&path).map_err(|source| ToolError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let total_lines = content.lines().count();
-    // offset is 1-based to match the schema advertised to models. An offset
-    // past EOF yields an empty read rather than silently restarting at 1.
-    let start = match offset {
-        Some(offset) => (offset.saturating_sub(1) as usize).min(total_lines),
-        None => 0,
-    };
-    let effective_limit = limit.map(|limit| limit as usize).unwrap_or(MAX_READ_LINES);
-    let mut output = String::new();
-    let mut shown = 0usize;
-    for line in content.lines().skip(start).take(effective_limit) {
-        output.push_str(line);
-        output.push('\n');
-        shown += 1;
-    }
-    // `lines()` drops the file's own trailing newline; preserve the file's
-    // ending verbatim when nothing was truncated so unchanged files round-trip.
-    let truncated = start + shown < total_lines;
-    if !truncated && !content.ends_with('\n') {
-        output.pop();
-    }
-    if truncated {
-        output.push_str(&truncation_notice(
-            &format!(
-                "showing lines {}-{} of {total_lines}",
-                start + 1,
-                start + shown
-            ),
-            &format!(
-                "read the rest with offset={}, or narrow with grep/limit",
-                start + shown + 1
-            ),
-        ));
-    }
-    Ok(ToolResult {
-        output,
-        is_error: false,
-    })
-}
-
-/// Head-limited, truncation-noted listing for grep/find-style outputs.
-fn truncate_matches(matches: &[String], limit: Option<u64>, max: usize, hint: &str) -> String {
-    let shown = limit
-        .map(|limit| limit as usize)
-        .unwrap_or(max)
-        .min(max)
-        .max(1);
-    let mut output = matches
-        .iter()
-        .take(shown)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
-    if matches.len() > shown {
-        output.push_str(&truncation_notice(
-            &format!("showing {shown} of {} matches", matches.len()),
-            hint,
-        ));
-    }
-    output
-}
-
-fn grep_tool(
-    cwd: &Path,
-    path: Option<&str>,
-    pattern: &str,
-    literal: bool,
-    ignore_case: bool,
-    context: u64,
-    limit: Option<u64>,
-) -> Result<ToolResult, ToolError> {
-    let root = match path {
-        Some(path) => resolve_under_cwd(cwd, path)?,
-        None => cwd.to_path_buf(),
-    };
-    let pattern = if literal {
-        regex::escape(pattern)
+    let saved = output::create_output_file("pi-tool")
+        .and_then(|(path, mut file)| {
+            std::io::Write::write_all(&mut file, output.as_bytes())?;
+            Ok(path)
+        })
+        .map_or_else(
+            |error| format!("Full output could not be saved: {error}"),
+            |path| format!("Full output: {}", path.display()),
+        );
+    let cause = if truncation.by_lines {
+        String::new()
     } else {
-        pattern.to_string()
+        format!(" ({} limit)", format_size(DEFAULT_MAX_BYTES))
     };
-    let matcher = if ignore_case {
-        regex::RegexBuilder::new(&pattern)
-            .case_insensitive(true)
-            .build()
-    } else {
-        regex::Regex::new(&pattern)
-    }
-    .map_err(|source| ToolError::Web(format!("invalid regex: {source}")))?;
-    let mut matches = Vec::new();
-    visit_files(&root, &mut |file| {
-        if let Ok(content) = fs::read_to_string(file) {
-            let lines: Vec<&str> = content.lines().collect();
-            for (index, line) in lines.iter().enumerate() {
-                if matcher.is_match(line) {
-                    let mut formatted =
-                        format!("{}:{}:{line}", display_relative(cwd, file), index + 1);
-                    // context lines are additive around the match; cap each
-                    // line's output so a context-heavy request cannot exceed
-                    // the shared output budget either.
-                    for delta in 1..=context {
-                        if let Some(before) =
-                            lines.get(index.checked_sub(delta as usize).unwrap_or(usize::MAX))
-                        {
-                            formatted =
-                                format!("{}-{}:{before}\n", formatted, index + 1 - delta as usize);
-                        }
-                        if let Some(after) = lines.get(index + delta as usize) {
-                            formatted =
-                                format!("{}+{}:{after}\n", formatted, index + delta as usize + 1);
-                        }
-                    }
-                    matches.push(formatted);
-                }
-            }
-        }
-    })?;
-    Ok(ToolResult {
-        output: truncate_matches(
-            &matches,
-            limit,
-            MAX_GREP_MATCHES,
-            "narrow the path or pattern, or set limit",
-        ),
-        is_error: false,
-    })
+    format!(
+        "{}\n\n[Showing lines 1-{} of {}{cause}. {saved}]",
+        truncation.content, truncation.output_lines, truncation.total_lines
+    )
 }
 
+/// After the shell exits, output still arriving (a background job holds the
+/// pipes) is read until it pauses for this long.
+const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(100);
+
+/// The shell commands run in (upstream `getShellConfig`): the `shellPath`
+/// setting, else `/bin/bash`, else `bash` on PATH, else `sh`.
+fn shell_program(shell_path: Option<&str>) -> Result<PathBuf, ToolError> {
+    if let Some(shell_path) = shell_path {
+        return if Path::new(shell_path).exists() {
+            Ok(PathBuf::from(shell_path))
+        } else {
+            Err(ToolError::Failed(format!(
+                "Custom shell path not found: {shell_path}"
+            )))
+        };
+    }
+    let bin_bash = Path::new("/bin/bash");
+    if bin_bash.exists() {
+        return Ok(bin_bash.to_path_buf());
+    }
+    Ok(std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("bash"))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from("sh")))
+}
+
+/// Reads the next chunk of the output pipe; `None` once it is closed. A
+/// closed pipe never completes, so `select!` keeps waiting on its other
+/// branches.
+async fn read_chunk(pipe: &mut Option<ChildStdout>, buffer: &mut [u8]) -> Option<usize> {
+    match pipe {
+        Some(open) => match open.read(buffer).await {
+            Ok(read) if read > 0 => Some(read),
+            _ => None,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The text of a finished command: the end of its output, and when that is
+/// not all of it, where the rest is.
+fn bash_output_text(snapshot: &OutputSnapshot, empty: &str) -> String {
+    let truncation = &snapshot.truncation;
+    let mut text = if truncation.content.is_empty() {
+        empty.to_string()
+    } else {
+        truncation.content.clone()
+    };
+    if !truncation.truncated {
+        return text;
+    }
+    let path = snapshot
+        .full_output_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let last = truncation.total_lines;
+    let first = last + 1 - truncation.output_lines;
+    let limit = format_size(DEFAULT_MAX_BYTES);
+    text.push_str(&if truncation.last_line_partial {
+        format!(
+            "\n\n[Showing last {} of line {last} (line is {}). Full output: {path}]",
+            format_size(truncation.output_bytes),
+            format_size(snapshot.last_line_bytes)
+        )
+    } else if truncation.by_lines {
+        format!("\n\n[Showing lines {first}-{last} of {last}. Full output: {path}]")
+    } else {
+        format!("\n\n[Showing lines {first}-{last} of {last} ({limit} limit). Full output: {path}]")
+    });
+    text
+}
+
+fn with_status(text: String, status: &str) -> String {
+    if text.is_empty() {
+        status.to_string()
+    } else {
+        format!("{text}\n\n{status}")
+    }
+}
+
+/// Runs `command` with `bash -c` (upstream `bash.ts`). stdout and stderr are
+/// one stream in the order written; the model gets its last 2000 lines or
+/// 50 KB, and a longer output is saved whole to a temp file. A timeout or a
+/// non-zero exit is an error result that still carries the output.
 async fn bash_tool(
     cwd: &Path,
     command: &str,
@@ -369,22 +394,31 @@ async fn bash_tool(
         Some(prefix) if !prefix.trim().is_empty() => format!("{prefix}\n{command}"),
         _ => command.to_string(),
     };
-    let shell = options
-        .shell_path
-        .clone()
-        .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/sh".to_string());
+    let shell = shell_program(options.shell_path.as_deref())?;
+    if !cwd.exists() {
+        return Err(ToolError::Failed(format!(
+            "Working directory does not exist: {}\nCannot execute bash commands.",
+            cwd.display()
+        )));
+    }
+    let io_error = |source| ToolError::Io {
+        path: cwd.to_path_buf(),
+        source,
+    };
+    // stdout and stderr share one pipe, so the output is in the order it
+    // was written.
+    let (reader, writer) = std::io::pipe().map_err(io_error)?;
     let mut process = Command::new(shell);
     process
-        .arg("-lc")
+        .arg("-c")
         .arg(command)
         .current_dir(cwd)
         // Commands are non-interactive: stdin is empty and the shell gets no
         // controlling terminal, so nothing can read pi's input (the RPC
         // request stream or the TUI's terminal).
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(writer.try_clone().map_err(io_error)?)
+        .stderr(writer);
     for (name, value) in &options.bash_env {
         match value {
             Some(value) => process.env(name, value),
@@ -394,56 +428,101 @@ async fn bash_tool(
     // The shell leads its own process group, so a timeout or an interrupt
     // (dropping this future) kills the whole tree, not just the shell pid:
     // killing only the shell orphaned children like a long preflight script.
-    let (child, group) = spawn_tool_process(&mut process).map_err(|source| ToolError::Io {
-        path: cwd.to_path_buf(),
-        source,
-    })?;
-
-    let wait = child.wait_with_output();
-    let output = match timeout_ms {
-        // Returning on timeout drops `group`, which kills the tree.
-        Some(timeout_ms) => tokio::time::timeout(Duration::from_millis(timeout_ms), wait)
-            .await
-            .map_err(|_| ToolError::Timeout(timeout_ms))?,
-        None => wait.await,
+    let (mut child, group) = spawn_tool_process(&mut process).map_err(io_error)?;
+    // The builder holds the pipe's write ends; the pipe closes once the
+    // command's processes are its only writers.
+    drop(process);
+    let mut group = Some(group);
+    let mut pipe = Some(
+        ChildStdout::from_std(std::process::ChildStdout::from(OwnedFd::from(reader)))
+            .map_err(io_error)?,
+    );
+    let mut buffer = vec![0; 64 * 1024];
+    let mut output = OutputAccumulator::new("pi-bash");
+    let mut deadline = timeout_ms
+        .and_then(|timeout_ms| Instant::now().checked_add(Duration::from_millis(timeout_ms)));
+    let mut timed_out = false;
+    let mut status = None;
+    // Once the shell has exited, output is read until it pauses.
+    let mut output_grace = None;
+    while status.is_none() || pipe.is_some() {
+        tokio::select! {
+            read = read_chunk(&mut pipe, &mut buffer) => match read {
+                Some(read) => output.append(&buffer[..read]).map_err(io_error)?,
+                None => pipe = None,
+            },
+            exit = child.wait(), if status.is_none() => status = Some(exit.map_err(io_error)?),
+            () = sleep_until(deadline) => {
+                // Dropping the group kills the tree; what it wrote is kept.
+                timed_out = true;
+                deadline = None;
+                drop(group.take());
+            }
+            () = sleep_until(output_grace) => break,
+        }
+        if status.is_some() {
+            output_grace = Some(Instant::now() + EXIT_OUTPUT_GRACE);
+        }
     }
-    .map_err(|source| ToolError::Io {
-        path: cwd.to_path_buf(),
-        source,
-    })?;
-    group.finish();
-
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    if !output.status.success() {
-        text.push_str(&format!("\nexit status: {}", output.status));
+    if let Some(group) = group {
+        group.finish();
     }
-    Ok(ToolResult {
-        output: truncate_chars(
-            &text,
-            MAX_TOOL_OUTPUT_CHARS,
-            "redirect large output to a file and read a slice, or filter with grep/head",
-        ),
-        is_error: !output.status.success(),
+
+    let snapshot = output.finish().map_err(io_error)?;
+    if timed_out {
+        let seconds = timeout_ms.unwrap_or_default() as f64 / 1000.0;
+        return Ok(ToolResult::error(with_status(
+            bash_output_text(&snapshot, ""),
+            &format!("Command timed out after {seconds} seconds"),
+        )));
+    }
+    let text = bash_output_text(&snapshot, "(no output)");
+    // A shell killed by a signal has no exit code; report it the shell way.
+    let code = status.and_then(|status| {
+        status.code().or_else(|| {
+            std::os::unix::process::ExitStatusExt::signal(&status).map(|signal| 128 + signal)
+        })
+    });
+    Ok(match code {
+        Some(0) => ToolResult::text(text),
+        Some(code) => ToolResult::error(with_status(
+            text,
+            &format!("Command exited with code {code}"),
+        )),
+        None => ToolResult::error(with_status(text, "Command terminated without an exit code")),
     })
 }
 
+/// The error code Node reports for an I/O failure, where upstream's tools
+/// put it in their results.
+pub(crate) fn node_error_code(error: &std::io::Error) -> Option<&'static str> {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => Some("ENOENT"),
+        std::io::ErrorKind::PermissionDenied => Some("EACCES"),
+        std::io::ErrorKind::IsADirectory => Some("EISDIR"),
+        _ => None,
+    }
+}
+
 fn edit_tool(cwd: &Path, input_path: &str, edits: &[TextEdit]) -> Result<ToolResult, ToolError> {
-    let path = resolve_under_cwd(cwd, input_path)?;
-    let content = fs::read_to_string(&path).map_err(|source| ToolError::Io {
-        path: path.clone(),
-        source,
-    })?;
+    let path = resolve_to_cwd(cwd, input_path);
+    // A file that cannot be read or written is reported as upstream does.
+    let io_error = |source: std::io::Error| match node_error_code(&source) {
+        Some(code) => ToolError::Failed(format!(
+            "Could not edit file: {input_path}. Error code: {code}."
+        )),
+        None => ToolError::Io {
+            path: path.clone(),
+            source,
+        },
+    };
+    let content = fs::read_to_string(&path).map_err(io_error)?;
     let next = apply_text_edits(&content, edits, input_path)?;
-    fs::write(&path, next).map_err(|source| ToolError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    Ok(ToolResult {
-        is_error: false,
-        output: format!("edited {}", path.display()),
-    })
+    fs::write(&path, next).map_err(io_error)?;
+    Ok(ToolResult::text(format!(
+        "Successfully replaced {} block(s) in {input_path}.",
+        edits.len()
+    )))
 }
 
 /// Applies every edit to `content`, or none (upstream
@@ -518,8 +597,8 @@ fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<Str
     Ok(next)
 }
 
-fn write_tool(cwd: &Path, path: &str, content: &str) -> Result<ToolResult, ToolError> {
-    let path = resolve_under_cwd_for_write(cwd, path)?;
+fn write_tool(cwd: &Path, input_path: &str, content: &str) -> Result<ToolResult, ToolError> {
+    let path = resolve_to_cwd(cwd, input_path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ToolError::Io {
             path: parent.to_path_buf(),
@@ -530,160 +609,9 @@ fn write_tool(cwd: &Path, path: &str, content: &str) -> Result<ToolResult, ToolE
         path: path.clone(),
         source,
     })?;
-    Ok(ToolResult {
-        is_error: false,
-        output: format!("wrote {}", path.display()),
-    })
-}
-
-fn find_tool(cwd: &Path, pattern: &str) -> Result<ToolResult, ToolError> {
-    let mut matches = Vec::new();
-    visit_files(cwd, &mut |file| {
-        let relative = display_relative(cwd, file);
-        if relative.contains(pattern) {
-            matches.push(relative);
-        }
-    })?;
-    Ok(ToolResult {
-        is_error: false,
-        output: truncate_matches(
-            &matches,
-            None,
-            MAX_GREP_MATCHES,
-            "narrow the pattern, or search a subdirectory",
-        ),
-    })
-}
-
-fn ls_tool(cwd: &Path, path: Option<&str>) -> Result<ToolResult, ToolError> {
-    let path = match path {
-        Some(path) => resolve_under_cwd(cwd, path)?,
-        None => cwd.to_path_buf(),
-    };
-    let mut entries = fs::read_dir(&path)
-        .map_err(|source| ToolError::Io {
-            path: path.clone(),
-            source,
-        })?
-        .map(|entry| {
-            entry.map(|entry| {
-                let marker = entry
-                    .file_type()
-                    .map(|ty| if ty.is_dir() { "/" } else { "" })
-                    .unwrap_or("");
-                format!("{}{}", entry.file_name().to_string_lossy(), marker)
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| ToolError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    entries.sort();
-    Ok(ToolResult {
-        is_error: false,
-        output: entries.join("\n"),
-    })
-}
-
-fn visit_files(root: &Path, visit: &mut dyn FnMut(&Path)) -> Result<(), ToolError> {
-    if root.is_file() {
-        visit(root);
-        return Ok(());
-    }
-    for entry in fs::read_dir(root).map_err(|source| ToolError::Io {
-        path: root.to_path_buf(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| ToolError::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with(".git") || name == "target" || name == "node_modules"
-        {
-            continue;
-        }
-        if path.is_dir() {
-            visit_files(&path, visit)?;
-        } else if path.is_file() {
-            visit(&path);
-        }
-    }
-    Ok(())
-}
-
-fn resolve_under_cwd(cwd: &Path, input: &str) -> Result<PathBuf, ToolError> {
-    let candidate = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        cwd.join(input)
-    };
-    let canonical_cwd = cwd.canonicalize().map_err(|source| ToolError::Io {
-        path: cwd.to_path_buf(),
-        source,
-    })?;
-
-    if let Ok(canonical_candidate) = candidate.canonicalize() {
-        if !canonical_candidate.starts_with(&canonical_cwd) {
-            return Err(ToolError::PathEscapesCwd(input.to_string()));
-        }
-        return Ok(canonical_candidate);
-    }
-
-    let parent = candidate.parent().unwrap_or(cwd);
-    let canonical_parent = parent.canonicalize().map_err(|source| ToolError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    if !canonical_parent.starts_with(&canonical_cwd) {
-        return Err(ToolError::PathEscapesCwd(input.to_string()));
-    }
-    Ok(candidate
-        .file_name()
-        .map(|file_name| canonical_parent.join(file_name))
-        .unwrap_or(canonical_parent))
-}
-
-fn resolve_under_cwd_for_write(cwd: &Path, input: &str) -> Result<PathBuf, ToolError> {
-    let candidate = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        cwd.join(input)
-    };
-    let canonical_cwd = cwd.canonicalize().map_err(|source| ToolError::Io {
-        path: cwd.to_path_buf(),
-        source,
-    })?;
-    if let Ok(canonical_candidate) = candidate.canonicalize() {
-        if !canonical_candidate.starts_with(&canonical_cwd) {
-            return Err(ToolError::PathEscapesCwd(input.to_string()));
-        }
-        return Ok(canonical_candidate);
-    }
-
-    let mut existing_parent = candidate.parent().unwrap_or(cwd);
-    while !existing_parent.exists() {
-        existing_parent = existing_parent.parent().unwrap_or(cwd);
-    }
-    let canonical_parent = existing_parent
-        .canonicalize()
-        .map_err(|source| ToolError::Io {
-            path: existing_parent.to_path_buf(),
-            source,
-        })?;
-    if !canonical_parent.starts_with(&canonical_cwd) {
-        return Err(ToolError::PathEscapesCwd(input.to_string()));
-    }
-    Ok(candidate)
-}
-
-fn display_relative(cwd: &Path, path: &Path) -> String {
-    path.strip_prefix(cwd)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
+    Ok(ToolResult::text(format!(
+        "Successfully wrote to {input_path}"
+    )))
 }
 
 #[cfg(test)]
@@ -726,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_nonzero_exit_is_preserved_as_a_tool_failure() {
+    async fn bash_nonzero_exit_is_an_error_that_keeps_the_output() {
         let result = execute_tool(
             Path::new("."),
             ToolRequest::Bash {
@@ -738,8 +666,7 @@ mod tests {
         .await
         .unwrap();
         assert!(result.is_error);
-        assert!(result.output.contains("failed-output"));
-        assert!(result.output.contains("exit status"));
+        assert_eq!(result.output, "failed-output\n\nCommand exited with code 7");
     }
 
     #[tokio::test]
@@ -764,7 +691,9 @@ mod tests {
             &ToolRuntimeOptions::default(),
         )
         .await;
-        assert!(matches!(result, Err(ToolError::Timeout(750))));
+        let result = result.expect("a timeout is a result, not a failure to run");
+        assert!(result.is_error);
+        assert_eq!(result.output, "Command timed out after 0.75 seconds");
         // Give the group kill a moment to land, then verify no orphan lives on
         // to create the marker file later.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -875,8 +804,7 @@ mod tests {
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!result.is_error, "{}", result.output);
-        // Skip anything a login profile printed.
-        let mut lines = result.output.lines().skip_while(|line| *line != "cat-done");
+        let mut lines = result.output.lines();
         assert_eq!(lines.next(), Some("cat-done"), "{}", result.output);
         if linux {
             let fields = lines
@@ -904,7 +832,7 @@ mod tests {
             &sh_options(),
         )
         .await;
-        assert!(matches!(result, Err(ToolError::Timeout(2_000))));
+        assert_eq!(result.unwrap().output, "Command timed out after 2 seconds");
         let pid = read_pid_file(&pid_file).await;
         assert_exits(pid, "timeout").await;
     }
@@ -963,218 +891,345 @@ mod tests {
         assert!(running, "a normal finish must not kill background jobs");
     }
 
+    /// A fresh directory under the system temp directory.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pi-tools-{name}-{}-{}",
+            std::process::id(),
+            new_marker_nonce()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    async fn run(cwd: &Path, request: ToolRequest) -> Result<ToolResult, ToolError> {
+        execute_tool(cwd, request, &ToolRuntimeOptions::default()).await
+    }
+
+    fn read(path: &str, offset: Option<u64>, limit: Option<u64>) -> ToolRequest {
+        ToolRequest::Read {
+            path: path.to_string(),
+            offset,
+            limit,
+        }
+    }
+
+    fn bash(command: &str) -> ToolRequest {
+        ToolRequest::Bash {
+            command: command.to_string(),
+            timeout_ms: Some(10_000),
+        }
+    }
+
+    fn grep(pattern: &str, path: Option<&str>, glob: Option<&str>) -> ToolRequest {
+        ToolRequest::Grep {
+            path: path.map(ToString::to_string),
+            pattern: pattern.to_string(),
+            glob: glob.map(ToString::to_string),
+            literal: None,
+            ignore_case: None,
+            context: None,
+            limit: None,
+        }
+    }
+
+    fn find(pattern: &str) -> ToolRequest {
+        ToolRequest::Find {
+            pattern: pattern.to_string(),
+            path: None,
+            limit: None,
+        }
+    }
+
+    fn ls(path: Option<&str>) -> ToolRequest {
+        ToolRequest::Ls {
+            path: path.map(ToString::to_string),
+            limit: None,
+        }
+    }
+
     #[tokio::test]
-    async fn read_caps_lines_honors_offset_and_limit_and_notes_truncation() {
-        let cwd = std::env::temp_dir().join(format!("pi-read-cap-{}", std::process::id()));
-        fs::create_dir_all(&cwd).expect("create temp dir");
+    async fn read_caps_lines_and_says_how_to_continue() {
+        let cwd = temp_dir("read-cap");
         let content = (1..=3_000)
             .map(|line| format!("line-{line}"))
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(cwd.join("big.txt"), content).expect("write big file");
 
-        // Default cap: first 2000 lines plus a truncation notice with the
-        // exact resume offset.
-        let capped = execute_tool(
-            &cwd,
-            ToolRequest::Read {
-                path: "big.txt".to_string(),
-                offset: None,
-                limit: None,
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("capped read");
-        assert!(capped.output.contains("line-2000\n"));
-        assert!(!capped.output.contains("line-2001\n"));
-        assert!(capped.output.contains("showing lines 1-2000 of 3000"));
-        assert!(capped.output.contains("offset=2001"));
+        let capped = run(&cwd, read("big.txt", None, None)).await.expect("read");
+        assert!(capped.output.starts_with("line-1\nline-2\n"));
+        assert!(capped.output.ends_with(
+            "line-2000\n\n[Showing lines 1-2000 of 3000. Use offset=2001 to continue.]"
+        ));
 
-        // Explicit offset resumes exactly where the notice said.
-        let resumed = execute_tool(
-            &cwd,
-            ToolRequest::Read {
-                path: "big.txt".to_string(),
-                offset: Some(2001),
-                limit: Some(5),
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("resumed read");
-        assert!(resumed.output.starts_with("line-2001\n"));
-        assert!(resumed.output.contains("line-2005\n"));
-        assert!(!resumed.output.contains("line-2006"));
-        assert!(resumed.output.contains("showing lines 2001-2005 of 3000"));
+        // The offset from the notice continues exactly there.
+        let resumed = run(&cwd, read("big.txt", Some(2001), Some(2)))
+            .await
+            .expect("resumed read");
+        assert_eq!(
+            resumed.output,
+            "line-2001\nline-2002\n\n[998 more lines in file. Use offset=2003 to continue.]"
+        );
 
-        // offset past the end yields an empty result, not an error.
-        let past = execute_tool(
-            &cwd,
-            ToolRequest::Read {
-                path: "big.txt".to_string(),
-                offset: Some(9_999),
-                limit: None,
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("past-end read");
-        assert_eq!(past.output, "");
-
+        let past = run(&cwd, read("big.txt", Some(9_999), None)).await;
+        assert_eq!(
+            past.expect_err("offset past the end").to_string(),
+            "Offset 9999 is beyond end of file (3000 lines total)"
+        );
         let _ = fs::remove_dir_all(cwd);
     }
 
     #[tokio::test]
-    async fn bash_output_is_capped_with_guidance() {
-        let cwd = std::env::temp_dir().join(format!("pi-bash-cap-{}", std::process::id()));
-        fs::create_dir_all(&cwd).expect("create temp dir");
-        let result = execute_tool(
+    async fn read_returns_images_as_attachments_unless_blocked() {
+        use base64::Engine as _;
+        let cwd = temp_dir("read-image");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(3, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode png");
+        // The type comes from the content, not the name.
+        fs::write(cwd.join("picture.dat"), png.get_ref()).expect("write image");
+
+        let result = run(&cwd, read("picture.dat", None, None))
+            .await
+            .expect("read");
+        assert_eq!(result.output, "Read image file [image/png]");
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].mime_type, "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&result.images[0].data_base64)
+                .expect("base64"),
+            *png.get_ref()
+        );
+
+        let blocked = execute_tool(
             &cwd,
-            ToolRequest::Bash {
-                command: "seq 1 20000".to_string(),
-                timeout_ms: Some(10_000),
+            read("picture.dat", None, None),
+            &ToolRuntimeOptions {
+                block_images: true,
+                ..Default::default()
             },
-            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .expect("blocked read");
+        assert_eq!(
+            blocked.output,
+            "Read image file [image/png]\nImage reading is disabled."
+        );
+        assert!(blocked.images.is_empty());
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn bash_keeps_the_end_of_long_output_and_saves_all_of_it() {
+        let cwd = temp_dir("bash-cap");
+        let result = run(&cwd, bash("seq 1 20000; echo the-error >&2; exit 4"))
+            .await
+            .expect("bash");
+        assert!(result.is_error);
+        assert!(result.output.starts_with("18002\n18003\n"));
+        let (shown, rest) = result
+            .output
+            .split_once("\n\n[Showing lines 18002-20001 of 20001. Full output: ")
+            .expect("truncation notice");
+        assert!(shown.ends_with("\n20000\nthe-error"));
+        let (saved, status) = rest.split_once("]\n\n").expect("saved output path");
+        assert_eq!(status, "Command exited with code 4");
+        let saved = PathBuf::from(saved);
+        assert_eq!(saved.parent(), Some(std::env::temp_dir().as_path()));
+        let full = fs::read_to_string(&saved).expect("read saved output");
+        assert_eq!(full.lines().count(), 20_001);
+        assert!(full.starts_with("1\n2\n") && full.ends_with("\n20000\nthe-error\n"));
+        let _ = fs::remove_file(saved);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn bash_returns_while_a_background_job_holds_its_output() {
+        // The job inherits stdout; waiting for the pipe to close would take
+        // as long as the job runs.
+        let started = std::time::Instant::now();
+        let result = run(Path::new("."), bash("sleep 30 & echo $!"))
+            .await
+            .expect("bash");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!result.is_error, "{}", result.output);
+        let pid = result.output.trim().parse::<i32>().expect("job pid");
+        let running = process_is_running(pid);
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(running, "a normal finish must not kill background jobs");
+    }
+
+    #[tokio::test]
+    async fn bash_uses_the_configured_shell_and_command_prefix() {
+        let options = |shell_path: &str| ToolRuntimeOptions {
+            shell_path: Some(shell_path.to_string()),
+            shell_command_prefix: Some("GREETING=from-prefix".to_string()),
+            ..Default::default()
+        };
+        let command = "echo \"$GREETING ${BASH_VERSION:+bash}\"";
+        let result = execute_tool(Path::new("."), bash(command), &options("/bin/sh"))
+            .await
+            .expect("bash with /bin/sh");
+        // /bin/sh may be bash in sh mode or another shell; the prefix ran.
+        assert!(
+            result.output.starts_with("from-prefix"),
+            "{}",
+            result.output
+        );
+
+        let missing =
+            execute_tool(Path::new("."), bash(command), &options("/nonexistent/sh")).await;
+        assert_eq!(
+            missing.expect_err("missing shell").to_string(),
+            "Custom shell path not found: /nonexistent/sh"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_default_shell_is_a_plain_bash() {
+        if !Path::new("/bin/bash").exists() {
+            return;
+        }
+        let result = run(
+            Path::new("."),
+            bash("shopt -q login_shell && echo login || echo ${BASH_VERSION:+plain-bash}"),
         )
         .await
         .expect("bash");
-        assert!(result.output.chars().count() <= 30_000 + 300);
-        assert!(result
-            .output
-            .contains("[output truncated: showing first 30000 of"));
-        assert!(result.output.contains("redirect large output"));
-        let _ = fs::remove_dir_all(cwd);
+        assert_eq!(result.output, "plain-bash\n");
     }
 
-    #[tokio::test]
-    async fn grep_supports_regex_case_and_context_and_limits_matches() {
-        let cwd = std::env::temp_dir().join(format!("pi-grep-opts-{}", std::process::id()));
-        fs::create_dir_all(&cwd).expect("create temp dir");
-        fs::write(cwd.join("a.txt"), "alpha\nBETA\ngamma\nAlpha\ndelta\n").expect("write a");
-
-        // Regex, case-insensitive.
-        let insensitive = execute_tool(
-            &cwd,
-            ToolRequest::Grep {
-                path: None,
-                pattern: "^al".to_string(),
-                literal: None,
-                ignore_case: Some(true),
-                context: None,
-                limit: None,
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("case-insensitive grep");
-        assert!(insensitive.output.contains("a.txt:1:alpha"));
-        assert!(insensitive.output.contains("a.txt:4:Alpha"));
-
-        // Literal escapes regex metacharacters.
-        let literal = execute_tool(
-            &cwd,
-            ToolRequest::Grep {
-                path: None,
-                pattern: "al.*a".to_string(),
-                literal: Some(true),
-                ignore_case: None,
-                context: None,
-                limit: None,
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("literal grep");
-        assert_eq!(literal.output, "");
-
-        // Context lines surround the match.
-        let with_context = execute_tool(
-            &cwd,
-            ToolRequest::Grep {
-                path: None,
-                pattern: "BETA".to_string(),
-                literal: None,
-                ignore_case: None,
-                context: Some(1),
-                limit: None,
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("context grep");
-        assert!(with_context.output.contains("a.txt:2:BETA"));
-        assert!(with_context.output.contains("-1:alpha"));
-        assert!(with_context.output.contains("+3:gamma"));
-
-        // Match cap with notice.
-        fs::write(
-            cwd.join("many.txt"),
-            (0..500)
-                .map(|i| format!("needle-{i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .expect("write many");
-        let capped = execute_tool(
-            &cwd,
-            ToolRequest::Grep {
-                path: Some("many.txt".to_string()),
-                pattern: "needle-".to_string(),
-                literal: Some(true),
-                ignore_case: None,
-                context: None,
-                limit: None,
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("capped grep");
-        assert!(capped.output.contains("showing 200 of 500 matches"));
-        assert!(!capped.output.contains("needle-499"));
-
-        // limit lowers the cap.
-        let limited = execute_tool(
-            &cwd,
-            ToolRequest::Grep {
-                path: Some("many.txt".to_string()),
-                pattern: "needle-".to_string(),
-                literal: Some(true),
-                ignore_case: None,
-                context: None,
-                limit: Some(10),
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("limited grep");
-        assert!(limited.output.contains("needle-9\n"));
-        assert!(limited.output.contains("showing 10 of 500 matches"));
-
-        let _ = fs::remove_dir_all(cwd);
-    }
-
-    #[tokio::test]
-    async fn find_output_is_capped_with_notice() {
-        let cwd = std::env::temp_dir().join(format!("pi-find-cap-{}", std::process::id()));
-        fs::create_dir_all(&cwd).expect("create temp dir");
-        for i in 0..250 {
-            fs::write(cwd.join(format!("file-{i:03}.txt")), "x").expect("write file");
+    /// A repository with ignored, hidden, binary, and linked files.
+    fn search_tree(name: &str) -> PathBuf {
+        let cwd = temp_dir(name);
+        for directory in [".git", ".github", "src"] {
+            fs::create_dir_all(cwd.join(directory)).expect("create dir");
         }
-        let result = execute_tool(
+        for (path, content) in [
+            (".gitignore", "ignored.txt\n".as_bytes()),
+            (".rgignore", "only-rg-skips.txt\n".as_bytes()),
+            (".fdignore", "only-fd-skips.txt\n".as_bytes()),
+            (".github/ci.yml", b"needle workflow\n"),
+            ("ignored.txt", b"needle ignored\n"),
+            ("only-rg-skips.txt", b"needle rg\n"),
+            ("only-fd-skips.txt", b"needle fd\n"),
+            ("binary.dat", b"needle before\n\0needle after\n"),
+            ("bom.txt", b"\xef\xbb\xbfneedle bom\r\n"),
+            ("src/real.txt", b"needle real\n"),
+        ] {
+            fs::write(cwd.join(path), content).expect("write file");
+        }
+        std::os::unix::fs::symlink("src/real.txt", cwd.join("link.txt")).expect("symlink");
+        std::os::unix::fs::symlink("missing", cwd.join("broken")).expect("symlink");
+        cwd
+    }
+
+    #[tokio::test]
+    async fn grep_searches_what_ripgrep_would() {
+        let cwd = search_tree("grep");
+        // Hidden files are searched; ignored and binary files and links are
+        // not. A byte order mark does not hide the start of a line.
+        let result = run(&cwd, grep("^needle", None, None)).await.expect("grep");
+        assert_eq!(
+            result.output,
+            ".github/ci.yml:1: needle workflow\nbom.txt:1: needle bom\nonly-fd-skips.txt:1: needle fd\nsrc/real.txt:1: needle real"
+        );
+        // A file named as the search path is searched whatever it is.
+        let binary = run(&cwd, grep("needle", Some("binary.dat"), None))
+            .await
+            .expect("grep binary");
+        assert_eq!(
+            binary.output,
+            "binary.dat:1: needle before\nbinary.dat:2: \0needle after"
+        );
+        let linked = run(&cwd, grep("needle", Some("link.txt"), None))
+            .await
+            .expect("grep link");
+        assert_eq!(linked.output, "link.txt:1: needle real");
+        // A glob selects files, even ignored ones.
+        let globbed = run(&cwd, grep("needle", None, Some("ign*.txt")))
+            .await
+            .expect("grep glob");
+        assert_eq!(globbed.output, "ignored.txt:1: needle ignored");
+
+        let invalid = run(&cwd, grep("needle(", None, None)).await;
+        let message = invalid.expect_err("invalid regex").to_string();
+        assert!(message.contains("regex parse error"), "{message}");
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn find_lists_what_fd_would() {
+        let cwd = search_tree("find");
+        let result = run(&cwd, find("*.txt")).await.expect("find");
+        assert_eq!(
+            result.output,
+            "bom.txt\nlink.txt\nonly-rg-skips.txt\nsrc/real.txt"
+        );
+        // Directories match too and end with a slash; a pattern with a
+        // directory matches the whole path.
+        assert_eq!(
+            run(&cwd, find("SRC")).await.expect("find").output,
+            "No files found matching pattern"
+        );
+        assert_eq!(run(&cwd, find("src")).await.expect("find").output, "src/");
+        assert_eq!(
+            run(&cwd, find(".github/*.yml")).await.expect("find").output,
+            ".github/ci.yml"
+        );
+        let missing = run(
             &cwd,
             ToolRequest::Find {
-                pattern: "file-".to_string(),
+                pattern: "*".to_string(),
+                path: Some("nowhere".to_string()),
+                limit: None,
             },
-            &ToolRuntimeOptions::default(),
         )
-        .await
-        .expect("find");
-        assert!(result.output.contains("showing 200 of 250 matches"));
-        // file names are returned in directory order; only assert that some
-        // files were omitted rather than any specific name.
-        assert_eq!(result.output.lines().count(), 201);
+        .await;
+        assert_eq!(
+            missing.expect_err("missing path").to_string(),
+            format!("Path not found: {}", cwd.join("nowhere").display())
+        );
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn ls_lists_dotfiles_and_follows_links() {
+        let cwd = search_tree("ls");
+        std::os::unix::fs::symlink("src", cwd.join("src-link")).expect("symlink");
+        let result = run(&cwd, ls(None)).await.expect("ls");
+        // A link to a directory is a directory; a broken link is left out.
+        assert_eq!(
+            result.output,
+            ".fdignore\n.git/\n.github/\n.gitignore\n.rgignore\nbinary.dat\nbom.txt\nignored.txt\nlink.txt\nonly-fd-skips.txt\nonly-rg-skips.txt\nsrc/\nsrc-link/"
+        );
+        assert_eq!(
+            run(&cwd, ls(Some("."))).await.expect("ls dot").output,
+            result.output
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn oversized_extension_output_is_capped_and_saved() {
+        assert_eq!(cap_tool_output("short\n".to_string()), "short\n");
+        let long = (1..=2_500)
+            .map(|line| format!("row {line}\n"))
+            .collect::<String>();
+        let capped = cap_tool_output(long.clone());
+        let (shown, notice) = capped
+            .split_once("\n\n[Showing lines 1-2000 of 2500. Full output: ")
+            .expect("truncation notice");
+        assert!(shown.starts_with("row 1\n") && shown.ends_with("\nrow 2000"));
+        let saved = PathBuf::from(notice.strip_suffix(']').expect("notice end"));
+        assert_eq!(fs::read_to_string(&saved).expect("saved output"), long);
+        let _ = fs::remove_file(saved);
     }
 
     #[test]
@@ -1196,7 +1251,9 @@ mod tests {
             .collect::<Vec<_>>();
         // Rust intentionally adds tools beyond the upstream set (see
         // docs/rust-rewrite/non-parity-register.md); upstream names must all
-        // be covered, but equality is not required.
+        // be covered, but equality is not required. What the tools do and
+        // what they tell the model is compared with upstream in
+        // crates/pi-core/src/tool_parity_tests.rs (tool-behavior.json).
         // Upstream's `powershell` tool only runs on Windows, so Rust omits it
         // ("Windows-Only PowerShell Tool" in non-parity-register.md).
         const WINDOWS_ONLY_UPSTREAM_TOOL: &str = "powershell";
@@ -1223,18 +1280,6 @@ mod tests {
         assert!(!read_only["edit"]);
         assert!(!read_only["write"]);
         assert!(read_only["todo"]);
-
-        let grep = fixture["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .find(|tool| tool["name"] == "grep")
-            .expect("grep fixture");
-        assert!(grep["parameters"]["properties"]
-            .as_array()
-            .expect("grep properties")
-            .iter()
-            .any(|property| property == "glob"));
     }
 
     #[tokio::test]
@@ -1282,168 +1327,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_find_ls_and_bash_return_text_outputs() {
-        let cwd = std::env::temp_dir().join(format!("pi-tools-search-test-{}", std::process::id()));
-        fs::create_dir_all(cwd.join("src")).expect("create temp dir");
-        fs::write(cwd.join("src/a.txt"), "alpha\nbeta\n").expect("write a");
-        fs::write(cwd.join("src/b.txt"), "gamma\n").expect("write b");
+    async fn write_edit_and_read_follow_paths_outside_cwd() {
+        // Like upstream, a path is not confined to the working directory.
+        let root = temp_dir("outside");
+        let cwd = root.join("project");
+        fs::create_dir_all(&cwd).expect("create cwd");
 
-        let grep = execute_tool(
-            &cwd,
-            ToolRequest::Grep {
-                path: Some("src".to_string()),
-                pattern: "alpha".to_string(),
-                literal: None,
-                ignore_case: None,
-                context: None,
-                limit: None,
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("grep");
-        assert!(grep.output.contains("src/a.txt:1:alpha"));
-
-        let find = execute_tool(
-            &cwd,
-            ToolRequest::Find {
-                pattern: "a.txt".to_string(),
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("find");
-        assert_eq!(find.output, "src/a.txt");
-
-        let ls = execute_tool(
-            &cwd,
-            ToolRequest::Ls {
-                path: Some("src".to_string()),
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("ls");
-        assert_eq!(ls.output, "a.txt\nb.txt");
-
-        let bash = execute_tool(
-            &cwd,
-            ToolRequest::Bash {
-                command: "printf tool-ok".to_string(),
-                timeout_ms: Some(1000),
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("bash");
-        assert_eq!(bash.output, "tool-ok");
-
-        let _ = fs::remove_dir_all(cwd);
-    }
-
-    #[tokio::test]
-    async fn dot_paths_resolve_to_cwd() {
-        let cwd =
-            std::env::temp_dir().join(format!("pi-tools-dot-path-test-{}", std::process::id()));
-        fs::create_dir_all(cwd.join("src")).expect("create temp dir");
-        fs::write(cwd.join("src/a.txt"), "alpha\n").expect("write a");
-
-        let ls = execute_tool(
-            &cwd,
-            ToolRequest::Ls {
-                path: Some(".".to_string()),
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("ls dot");
-        assert!(ls.output.contains("src/"));
-
-        let grep = execute_tool(
-            &cwd,
-            ToolRequest::Grep {
-                path: Some(".".to_string()),
-                pattern: "alpha".to_string(),
-                literal: None,
-                ignore_case: None,
-                context: None,
-                limit: None,
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect("grep dot");
-        assert_eq!(grep.output, "src/a.txt:1:alpha");
-
-        let _ = fs::remove_dir_all(cwd);
-    }
-
-    #[tokio::test]
-    async fn write_creates_nested_directories_inside_cwd() {
-        let cwd =
-            std::env::temp_dir().join(format!("pi-tools-nested-write-test-{}", std::process::id()));
-        fs::create_dir_all(&cwd).expect("create temp dir");
-
-        execute_tool(
+        run(
             &cwd,
             ToolRequest::Write {
-                path: "nested/child/file.txt".to_string(),
-                content: "content".to_string(),
+                path: "../sibling/note.txt".to_string(),
+                content: "hello world".to_string(),
             },
-            &ToolRuntimeOptions::default(),
         )
         .await
-        .expect("write nested file");
+        .expect("write outside cwd");
+        let note = root.join("sibling/note.txt");
+        assert_eq!(
+            fs::read_to_string(&note).expect("written file"),
+            "hello world"
+        );
 
-        let content =
-            fs::read_to_string(cwd.join("nested/child/file.txt")).expect("read nested file");
-        assert_eq!(content, "content");
-        let _ = fs::remove_dir_all(cwd);
-    }
-
-    #[tokio::test]
-    async fn write_rejects_paths_outside_cwd() {
-        let cwd = std::env::temp_dir().join(format!(
-            "pi-tools-outside-write-test-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&cwd).expect("create temp dir");
-
-        let error = execute_tool(
+        run(
             &cwd,
-            ToolRequest::Write {
-                path: "../outside.txt".to_string(),
-                content: "content".to_string(),
+            ToolRequest::Edit {
+                path: note.display().to_string(),
+                edits: text_edits(&[("world", "rust")]),
             },
-            &ToolRuntimeOptions::default(),
         )
         .await
-        .expect_err("outside write should fail");
-
-        assert!(matches!(error, ToolError::PathEscapesCwd(_)));
-        let _ = fs::remove_dir_all(cwd);
-    }
-
-    #[tokio::test]
-    async fn read_rejects_paths_outside_cwd() {
-        let cwd =
-            std::env::temp_dir().join(format!("pi-tools-outside-read-test-{}", std::process::id()));
-        fs::create_dir_all(&cwd).expect("create temp dir");
-
-        let error = execute_tool(
-            &cwd,
-            ToolRequest::Read {
-                path: "../outside.txt".to_string(),
-                offset: None,
-                limit: None,
-            },
-            &ToolRuntimeOptions::default(),
-        )
-        .await
-        .expect_err("outside read should fail");
-
-        assert!(matches!(error, ToolError::PathEscapesCwd(_)));
-        let _ = fs::remove_dir_all(cwd);
+        .expect("edit by absolute path");
+        let result = run(&cwd, read("../sibling/note.txt", None, None))
+            .await
+            .expect("read outside cwd");
+        assert_eq!(result.output, "hello rust");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn text_edits(pairs: &[(&str, &str)]) -> Vec<TextEdit> {

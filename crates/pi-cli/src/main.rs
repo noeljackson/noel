@@ -51,10 +51,11 @@ use pi_ai::{
     StreamEvent,
 };
 use pi_config::{
-    auth_for_provider, codex_client_version, has_auth_for_provider, listed_accounts_for_provider,
-    load_config, load_config_with_project_trust, project_is_trusted, read_model_cache,
-    save_project_trust, write_file_atomic, write_model_cache, AccountSource, AuthCredential,
-    AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
+    apply_tool_modifiers, auth_for_provider, codex_client_version, has_auth_for_provider,
+    is_tool_modifier, listed_accounts_for_provider, load_config, load_config_with_project_trust,
+    project_is_trusted, read_model_cache, resolve_default_tools, save_project_trust,
+    tool_list_error, write_file_atomic, write_model_cache, AccountSource, AuthCredential, AuthData,
+    CompactionSettings, ConfigPaths, ImageModelDefinition,
     ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig, ModelCache,
     ModelDefinition, ModelRefreshSettings, PackageSource, ProviderApi as ConfigProviderApi,
     ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
@@ -160,7 +161,9 @@ struct Cli {
     #[arg(long)]
     no_tools: bool,
 
-    #[arg(short = 't', long, value_delimiter = ',')]
+    /// An allowlist of tool names and `*` patterns, or only `+name` and
+    /// `-name` entries that change the default selection.
+    #[arg(short = 't', long, value_delimiter = ',', allow_hyphen_values = true)]
     tools: Vec<String>,
 
     #[arg(long, value_delimiter = ',')]
@@ -1377,20 +1380,11 @@ async fn run() -> Result<()> {
     systems.offline = offline;
     let mut runtime = create_runtime_when_unlocked(&cli, &cwd, &config, systems).await?;
     select_initial_model(&mut runtime, &config, &cli, offline)?;
-    if cli.no_tools || cli.no_builtin_tools {
-        runtime.set_disabled_tools(default_active_tool_names())?;
-    } else {
-        let mut disabled: BTreeSet<String> = cli.exclude_tools.iter().cloned().collect();
-        if !cli.tools.is_empty() {
-            for name in default_active_tool_names() {
-                if !cli.tools.contains(&name) {
-                    disabled.insert(name);
-                }
-            }
-        }
-        if !disabled.is_empty() {
-            runtime.set_disabled_tools(disabled)?;
-        }
+    // The tool flags apply to this run (`apply_tool_flags`). Earlier
+    // versions saved them in the session as disabled tools; a resumed
+    // session follows this run's flags instead.
+    if !runtime.session().disabled_tools.is_empty() {
+        runtime.set_disabled_tools(BTreeSet::new())?;
     }
     if let Some(name) = &cli.name {
         let name = name.trim();
@@ -1475,6 +1469,51 @@ fn reload_config(config: &LoadedConfig) -> Result<LoadedConfig> {
     }
 }
 
+/// Folds the tool flags into the tool settings, as upstream resolves them.
+/// `--tools` with plain names is an allowlist of names and `*` patterns;
+/// with only `+name`/`-name` entries it changes the default selection.
+/// `--no-builtin-tools` empties the default selection, which leaves the
+/// extension tools; `--no-tools` leaves only what `--tools` names. Any of
+/// the three replaces the `enabledTools` setting for the run.
+fn apply_tool_flags(cli: &Cli, settings: &mut Settings) -> Result<()> {
+    let entries = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+    };
+    let tools = entries(&cli.tools);
+    if let Some(error) = tool_list_error(&tools) {
+        return Err(anyhow!("--tools: {error}"));
+    }
+    if cli.no_tools || cli.no_builtin_tools || !tools.is_empty() {
+        // The flags decide for this run, not the saved allowlist.
+        settings.enabled_tools = None;
+    }
+    if cli.no_tools || cli.no_builtin_tools {
+        settings.default_tools = Some(Vec::new());
+    }
+    if tools.iter().any(|entry| is_tool_modifier(entry)) {
+        let builtin = default_active_tool_names().into_iter().collect::<Vec<_>>();
+        let defaults = match &settings.default_tools {
+            Some(entries) => resolve_default_tools(entries, &builtin),
+            None => builtin,
+        };
+        let selected = apply_tool_modifiers(&defaults, &tools);
+        if cli.no_tools {
+            settings.enabled_tools = Some(selected.clone());
+        }
+        settings.default_tools = Some(selected);
+    } else if !tools.is_empty() {
+        settings.enabled_tools = Some(tools);
+    } else if cli.no_tools {
+        settings.enabled_tools = Some(Vec::new());
+    }
+    settings.excluded_tools = entries(&cli.exclude_tools);
+    Ok(())
+}
+
 fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Result<()> {
     if let Some(system_prompt) = &cli.system_prompt {
         config.system_prompt = Some(resolve_prompt_flag(cwd, system_prompt)?);
@@ -1503,12 +1542,7 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
             })
         });
     }
-    if cli.no_tools || cli.no_builtin_tools {
-        config.settings.enabled_tools = Some(Vec::new());
-    }
-    if !cli.tools.is_empty() {
-        config.settings.enabled_tools = Some(cli.tools.clone());
-    }
+    apply_tool_flags(cli, &mut config.settings)?;
     if cli.no_themes {
         config.settings.theme = None;
         config.settings.accent_color = None;
@@ -10274,6 +10308,84 @@ mod tests {
     use super::*;
     use std::io::BufRead;
 
+    /// The tool settings a command line leaves, starting from `settings`.
+    fn tool_flags(arguments: &[&str], settings: serde_json::Value) -> Result<Settings> {
+        let arguments = std::iter::once("pi").chain(arguments.iter().copied());
+        let cli = Cli::try_parse_from(normalized_cli_args(arguments.map(String::from)))?;
+        let mut settings: Settings = serde_json::from_value(settings)?;
+        apply_tool_flags(&cli, &mut settings)?;
+        Ok(settings)
+    }
+
+    #[test]
+    fn tool_flags_select_tools_as_upstream_does() {
+        let names =
+            |names: &[&str]| Some(names.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let none = serde_json::json!({});
+
+        // Plain names and patterns are an allowlist.
+        let settings = tool_flags(&["--tools", "read, grep,mcp_*"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, names(&["read", "grep", "mcp_*"]));
+        assert_eq!(settings.default_tools, None);
+
+        // Only +name/-name entries change the default selection instead.
+        let settings = tool_flags(&["-t", "-bash,+grep,-write"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, None);
+        let defaults = settings.default_tools.expect("default selection");
+        assert!(defaults.contains(&"grep".to_string()) && defaults.contains(&"read".to_string()));
+        assert!(
+            !defaults.contains(&"bash".to_string()) && !defaults.contains(&"write".to_string())
+        );
+        let settings = tool_flags(
+            &["--tools", "+ls"],
+            serde_json::json!({ "defaultTools": ["read", "-read", "grep"] }),
+        )
+        .unwrap();
+        assert_eq!(settings.default_tools, names(&["grep", "ls"]));
+
+        // --no-builtin-tools empties the default selection; extension tools
+        // are not part of it, so they stay.
+        let settings =
+            tool_flags(&["-nbt"], serde_json::json!({ "defaultTools": ["read"] })).unwrap();
+        assert_eq!(
+            (settings.default_tools, settings.enabled_tools),
+            (names(&[]), None)
+        );
+        let settings = tool_flags(&["-nbt"], serde_json::json!({ "enabledTools": ["read"] }));
+        assert_eq!(settings.unwrap().enabled_tools, None);
+        let settings =
+            tool_flags(&["--no-builtin-tools", "--tools", "+read"], none.clone()).unwrap();
+        assert_eq!(
+            (settings.default_tools, settings.enabled_tools),
+            (names(&["read"]), None)
+        );
+
+        // --no-tools leaves only what --tools names.
+        let settings = tool_flags(&["--no-tools"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, names(&[]));
+        let settings = tool_flags(&["-nt", "--tools", "+read"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, names(&["read"]));
+        let settings = tool_flags(&["--no-tools", "--tools", "read,ext_*"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, names(&["read", "ext_*"]));
+
+        let settings = tool_flags(&["-xt", "web_*,todo"], none.clone()).unwrap();
+        assert_eq!(settings.excluded_tools, ["web_*", "todo"]);
+
+        for (tools, error) in [
+            (
+                "read,+grep",
+                "--tools: tool names cannot be mixed with +name or -name entries",
+            ),
+            (
+                "+re*",
+                "--tools: +name and -name entries take exact tool names, not patterns: +re*",
+            ),
+        ] {
+            let failure = tool_flags(&["--tools", tools], none.clone()).unwrap_err();
+            assert_eq!(failure.to_string(), error);
+        }
+    }
+
     #[test]
     fn diff_panel_lists_files_under_cwd_relative_to_it() {
         let entries = collect_diff_file_entries(
@@ -14233,6 +14345,7 @@ mod tests {
             TurnEvent::ToolOutput {
                 call,
                 output: output.clone(),
+                images: Vec::new(),
                 is_error: false,
                 duration: Duration::ZERO,
             },
@@ -14351,7 +14464,7 @@ mod tests {
         let mut failed = Vec::new();
         push_tool_lines(
             &mut failed,
-            "failed bash\n$ false\nexit status: 1",
+            "failed bash\n$ false\n(no output)\n\nCommand exited with code 1",
             &palette,
         );
         assert_eq!(failed[0].spans[0].content, "✗ ");
@@ -14393,6 +14506,7 @@ mod tests {
             &TurnEvent::ToolOutput {
                 call,
                 output: "HTTP 403".into(),
+                images: Vec::new(),
                 is_error: true,
                 duration: Duration::ZERO,
             },
@@ -14531,6 +14645,7 @@ mod tests {
             &TurnEvent::ToolOutput {
                 call: read,
                 output: "file body".into(),
+                images: Vec::new(),
                 is_error: false,
                 duration: Duration::ZERO,
             },

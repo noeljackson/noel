@@ -15,6 +15,33 @@ WORKDIR /ts-reference
 RUN npm ci --ignore-scripts
 RUN npm --prefix packages/ai run generate-models
 
+# Upstream's grep and find tools run ripgrep and fd. When they are not on PATH
+# upstream downloads the latest release of each from GitHub; pin those
+# releases here, by version and checksum, so fixtures are reproducible.
+ARG RIPGREP_VERSION=15.2.0
+ARG RIPGREP_SHA256_X86_64=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+ARG RIPGREP_SHA256_AARCH64=800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915
+ARG FD_VERSION=10.5.0
+ARG FD_SHA256_X86_64=761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7
+ARG FD_SHA256_AARCH64=d76c4317f7d5dba69f8a2a15856c90c777e7f0dd4e85f0de8c76de6992c374d4
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "${arch}" in \
+        x86_64) rg_sha="${RIPGREP_SHA256_X86_64}"; fd_sha="${FD_SHA256_X86_64}" ;; \
+        aarch64) rg_sha="${RIPGREP_SHA256_AARCH64}"; fd_sha="${FD_SHA256_AARCH64}" ;; \
+        *) echo "unsupported architecture: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    rg="ripgrep-${RIPGREP_VERSION}-${arch}-unknown-linux-musl"; \
+    fd="fd-v${FD_VERSION}-${arch}-unknown-linux-musl"; \
+    cd /tmp; \
+    curl -fsSLO "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${rg}.tar.gz"; \
+    curl -fsSLO "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/${fd}.tar.gz"; \
+    printf '%s  %s\n' "${rg_sha}" "${rg}.tar.gz" "${fd_sha}" "${fd}.tar.gz" | sha256sum -c -; \
+    tar xzf "${rg}.tar.gz"; \
+    tar xzf "${fd}.tar.gz"; \
+    install -m 0755 "${rg}/rg" "${fd}/fd" /usr/local/bin/; \
+    rm -rf "${rg}" "${fd}" "${rg}.tar.gz" "${fd}.tar.gz"
+
 COPY scripts/ts-parity /ts-parity
 
 CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do npx tsx \"$fixture\" /fixtures; done"]

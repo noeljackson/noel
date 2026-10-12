@@ -823,6 +823,7 @@ impl Run {
             TurnEvent::ToolOutput {
                 call,
                 output,
+                images,
                 is_error,
                 ..
             } => {
@@ -836,7 +837,7 @@ impl Run {
                     role: MessageRole::Tool,
                     content: output.clone(),
                     thinking: String::new(),
-                    media: Vec::new(),
+                    media: images.clone(),
                     tool_call_id: Some(call.id.clone()),
                     tool_name: Some(call.name.clone()),
                     tool_calls: Vec::new(),

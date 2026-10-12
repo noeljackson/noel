@@ -39,8 +39,9 @@ The committed TypeScript parity fixtures are:
 - `google-tool-image-routing.json`: Gemini 2 versus Gemini 3 tool-result
   image routing.
 - `google-tools.json`: Gemini request shape with model-callable tools.
-- `local-tools.json`: built-in local tool inventory and model-callable schema
-  key coverage.
+- `local-tools.json`: built-in local tool inventory (names, labels, prompt
+  snippets, parameter names). Rust checks only that every upstream tool is
+  present; `tool-behavior.json` covers what the tools do.
 - `mistral-devstral.json`: Mistral chat-completions request shape.
 - `mistral-tool-id.json`: Mistral tool-history request shape and 9-character
   tool-call ID normalization.
@@ -63,7 +64,8 @@ The committed TypeScript parity fixtures are:
   `placeholders` block lists them.
 - `session-export.json`: session tree/export shape, including direct open of
   full-tree JSONL active branches.
-- `settings.json`: settings merge and normalization cases.
+- `settings.json`: settings merge and normalization cases, including
+  `defaultTools` across the user and project layers.
 - `slash-commands.json`: slash command inventory and selected descriptions.
 - `system-prompt.json`: the text of upstream's system prompt builder, with
   its sections, for the default tools, every tool pi shares with upstream, a
@@ -74,6 +76,13 @@ The committed TypeScript parity fixtures are:
   command-line flags, `AGENTS.override.md`, and nested worktrees. The
   temporary directory, the product name, and the documentation paths are
   placeholders; the `placeholders` block lists them.
+- `tool-behavior.json`: what upstream's `read`, `bash`, `edit`, `write`,
+  `grep`, `find`, and `ls` return for fixed calls in fixed trees (result text,
+  error flag, images, and bash's saved output), and the description and
+  parameter schema each sends the model. The trees are part of the fixture.
+  The `placeholders` and `normalizations` blocks list what is not recorded
+  verbatim: temp paths, the unordered results of `fd`, and long texts, which
+  are recorded as a hash with both ends.
 - `tui-transcripts.json`: deterministic TUI transcript markers.
 
 ## Fixture-Backed Rust Behavior
@@ -91,8 +100,14 @@ Current Rust parity coverage includes:
 - Mistral tool-history message shape and tool-call ID normalization.
 - Auth discovery and credential redaction for supported providers.
 - CLI flags, command inventory, settings normalization, slash commands,
-  selected TUI markers, local tool inventory/schema keys, session export shape,
-  and model catalog targets.
+  selected TUI markers, local tool inventory, session export shape, and model
+  catalog targets.
+- Built-in tools: every call of `tool-behavior.json` run against pi's tools in
+  the same trees, with results compared exactly, and each tool's description
+  and parameter schema compared exactly
+  (`crates/pi-core/src/tool_parity_tests.rs`). The differences that remain are
+  outside the recorded calls and are listed under "Built-in Tools Run
+  In-Process" and the entries after it in the non-parity register.
 - TypeScript full-tree session JSONL active-branch loading.
 - RPC mode: every `rpc-protocol.json` scenario, record by record and model
   request by model request, allowing the differences listed under "RPC Mode"
@@ -120,6 +135,7 @@ cargo test -p pi-ai --lib matches_ts
 cargo test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
 cargo test -p pi-core --lib system_prompt_matches_ts_builder
 cargo test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery
+cargo test -p pi-core --lib tool_parity_tests
 cargo test -p pi-cli --test rpc_parity
 make check
 make ts-parity-drift
