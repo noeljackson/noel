@@ -136,6 +136,29 @@ Current Rust parity coverage includes:
 Only those two tests cover the system prompt. The provider request fixtures
 pass an explicit prompt, and the RPC goldens record messages without it.
 
+- Skills and prompt templates, each against `skills.json`:
+  - frontmatter fields, types, and bodies, and which files are rejected
+    (`frontmatter_matches_ts_parser` in `crates/pi-config/src/frontmatter.rs`);
+  - what loads, in what order, from where, with which diagnostics
+    (`discovery_matches_ts_resource_loader` in
+    `crates/pi-config/src/resources.rs`);
+  - the listing text (`skills_listing_matches_ts_formatter` in
+    `crates/pi-config/src/skills.rs`), and inside the whole prompt the
+    `skills` cases of `system_prompt_matches_ts_builder`;
+  - argument splitting and substitution (`template_arguments_match_ts` in
+    `crates/pi-config/src/prompt_templates.rs`);
+  - `/skill:name` and `/template` expansion, and the input left as it is
+    (`input_expansion_matches_ts_session` in `crates/pi-core/src/input.rs`);
+  - `get_commands` and the resource flags, through the binary
+    (`get_commands_matches_upstream` in `crates/pi-cli/tests/rpc_parity.rs`).
+
+  Expansion in each mode is covered by Rust's own tests: RPC `prompt`,
+  `steer`, and `follow_up` with a skill given by `--skill`
+  (`skills_and_templates_expand_in_prompt_steer_and_follow_up`), print mode
+  (`print_mode_expands_skills_and_templates_and_honors_the_resource_flags`),
+  and the TUI (`typed_prompts_expand_skills_and_templates`,
+  `streaming_input_expands_templates_into_the_queues`).
+
 ## Validation Commands
 
 Use these before accepting intentional parity changes:
@@ -148,6 +171,8 @@ cargo test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_cal
 cargo test -p pi-core --lib system_prompt_matches_ts_builder
 cargo test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery
 cargo test -p pi-core --lib tool_parity_tests
+cargo test -p pi-config --lib _ts
+cargo test -p pi-core --lib input_expansion_matches_ts_session
 cargo test -p pi-cli --test rpc_parity
 make check
 make ts-parity-drift
