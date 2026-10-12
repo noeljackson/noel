@@ -26,6 +26,8 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "mistral-tool-id.json",
     "mistral-tools.json",
     "model-catalog.json",
+    "model-resolution.json",
+    "model-thinking.json",
     "openai-codex-chatgpt-oauth.json",
     "openai-responses-tool-id.json",
     "openai-responses-tools.json",
@@ -54,6 +56,8 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "local-tools-fixture.ts",
     "mistral-fixture.ts",
     "model-catalog-fixture.ts",
+    "model-resolution-fixture.ts",
+    "model-thinking-fixture.ts",
     "openai-tools-fixture.ts",
     "openrouter-fixture.ts",
     "rpc-protocol-fixture.ts",
@@ -181,6 +185,14 @@ fn every_script_output_is_committed() {
             fixture_set(&["model-catalog.json"]),
         ),
         (
+            "model-resolution-fixture.ts",
+            fixture_set(&["model-resolution.json"]),
+        ),
+        (
+            "model-thinking-fixture.ts",
+            fixture_set(&["model-thinking.json"]),
+        ),
+        (
             "openai-tools-fixture.ts",
             fixture_set(&[
                 "openai-responses-tool-id.json",
@@ -279,6 +291,14 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("mistral-tool-id.json", "crates/pi-ai/src/lib.rs"),
         ("mistral-tools.json", "crates/pi-ai/src/lib.rs"),
         ("model-catalog.json", "crates/pi-config/src/lib.rs"),
+        (
+            "model-resolution.json",
+            "crates/pi-parity/tests/ts_fixtures.rs",
+        ),
+        (
+            "model-thinking.json",
+            "crates/pi-parity/tests/ts_fixtures.rs",
+        ),
         ("openai-codex-chatgpt-oauth.json", "crates/pi-ai/src/lib.rs"),
         ("openai-responses-tool-id.json", "crates/pi-ai/src/lib.rs"),
         ("openai-responses-tools.json", "crates/pi-ai/src/lib.rs"),

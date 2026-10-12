@@ -53,6 +53,20 @@ The committed TypeScript parity fixtures are:
 - `mistral-tools.json`: Mistral chat-completions request shape with
   model-callable tools.
 - `model-catalog.json`: selected upstream model catalog targets.
+- `model-resolution.json`: how upstream picks a model, from its own functions
+  on its built-in catalog: `--model`/`--provider`/`--thinking` resolution
+  (`resolveCliModel`), scope patterns (`resolveModelScopeFromModels`), exact
+  references (`findExactModelReferenceMatch`), the startup default
+  (`findInitialModel`), and the glob matcher behind scope patterns
+  (`minimatch`), each with its inputs and upstream's answer or error text.
+  Its `launches` start upstream `pi --mode rpc` with model and thinking flags,
+  settings, and fake provider keys, and record `get_state`, `set_model`, and
+  `set_thinking_level` answers, the `thinking_level_changed` events, stderr,
+  and the exit code.
+- `model-thinking.json`: what upstream's `getSupportedThinkingLevels` and
+  `clampThinkingLevel` answer for every shape of model in its built-in
+  catalog (one case per distinct `reasoning` flag and `thinkingLevelMap`),
+  with the level names and the default level.
 - `openai-codex-chatgpt-oauth.json`: Codex Responses request shape using
   ChatGPT OAuth credentials.
 - `openai-responses-tool-id.json`: OpenAI Responses pipe-separated tool-call

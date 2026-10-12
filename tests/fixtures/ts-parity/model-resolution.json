@@ -1,0 +1,5473 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/model-resolution-fixture.ts"
+  },
+  "cliModel": [
+    {
+      "input": {
+        "model": "anthropic/claude-opus-4-8",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "ANTHROPIC/Claude-Opus-4-8",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/claude-opus-4-8:max",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        },
+        "thinkingLevel": "max",
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/claude-opus-4-8:max",
+        "thinking": "low",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        },
+        "thinkingLevel": "max",
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/claude-opus-4-8:bogus",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8:bogus"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"claude-opus-4-8:bogus\" not found for provider \"anthropic\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "claude-opus-4-8:bogus",
+          "name": "claude-opus-4-8:bogus",
+          "api": "anthropic-messages",
+          "provider": "anthropic",
+          "baseUrl": "https://api.anthropic.com",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 25,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "claude-haiku-4-5-20251001",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-haiku-4-5-20251001"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "Claude-Haiku-4-5-20251001",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-haiku-4-5-20251001"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "CLAUDE-OPUS-4-8",
+        "provider": "anthropic",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "devstral-medium-latest:high",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "mistral",
+          "id": "devstral-medium-latest"
+        },
+        "thinkingLevel": "high",
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "gpt-5.5",
+        "authenticated": []
+      },
+      "expected": {
+        "model": null,
+        "thinkingLevel": null,
+        "warning": null,
+        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, github-copilot/gpt-5.5, openai-codex/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5, radius/gpt-5.5. No matching provider is authenticated. Use --provider or provider/model."
+      }
+    },
+    {
+      "input": {
+        "model": "gpt-5.5",
+        "authenticated": [
+          "openai"
+        ]
+      },
+      "expected": {
+        "model": {
+          "provider": "openai",
+          "id": "gpt-5.5"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "gpt-5.5",
+        "authenticated": [
+          "openai",
+          "azure"
+        ]
+      },
+      "expected": {
+        "model": null,
+        "thinkingLevel": null,
+        "warning": null,
+        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, github-copilot/gpt-5.5, openai-codex/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5, radius/gpt-5.5. More than one matching provider is authenticated. Use --provider or provider/model."
+      }
+    },
+    {
+      "input": {
+        "model": "GPT-5.5",
+        "authenticated": [
+          "github-copilot"
+        ]
+      },
+      "expected": {
+        "model": {
+          "provider": "github-copilot",
+          "id": "gpt-5.5"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "claude-opus-4-8",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "sonnet:high",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "amazon-bedrock",
+          "id": "us.anthropic.claude-sonnet-5-5"
+        },
+        "thinkingLevel": "high",
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "sonnet",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "amazon-bedrock",
+          "id": "us.anthropic.claude-sonnet-5-5"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "opus",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "amazon-bedrock",
+          "id": "us.anthropic.claude-opus-5-5"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "haiku:low",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "model": {
+          "provider": "amazon-bedrock",
+          "id": "us.anthropic.claude-haiku-5-5"
+        },
+        "thinkingLevel": "low",
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "opus",
+        "provider": "anthropic",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-5-5"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "haiku-4",
+        "provider": "anthropic",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-haiku-4-5"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "20251001",
+        "provider": "anthropic",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-haiku-4-5-20251001"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "Opus 4.8",
+        "provider": "anthropic",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "gpt-5",
+        "provider": "openai",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "openai",
+          "id": "gpt-5"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "gpt",
+        "provider": "openai",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "openai",
+          "id": "gpt-realtime-2.1"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "codex",
+        "provider": "openai",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "openai",
+          "id": "gpt-5.3-codex-spark"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "gemini",
+        "provider": "google",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "google",
+          "id": "gemini-flash-lite-latest"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "kimi",
+        "provider": "huggingface",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "huggingface",
+          "id": "moonshotai/Kimi-K3"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "minimax",
+        "provider": "minimax",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "minimax",
+          "id": "MiniMax-M3"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "glm",
+        "provider": "zai",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "zai",
+          "id": "glm-5.3-highspeed"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "claude",
+        "provider": "amazon-bedrock",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "amazon-bedrock",
+          "id": "us.anthropic.claude-sonnet-5-5"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "claude",
+        "provider": "openrouter",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "openrouter",
+          "id": "anthropic/claude-sonnet-5.5:batch"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "kimi",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "cloudflare-ai-gateway",
+          "id": "workers-ai/@cf/moonshotai/kimi-k2.7-code"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "glm-5",
+        "authenticated": []
+      },
+      "expected": {
+        "model": null,
+        "thinkingLevel": null,
+        "warning": null,
+        "error": "Model \"glm-5\" is ambiguous across providers: opencode/glm-5, qwen-token-plan-cn/glm-5, qwen-token-plan/glm-5. No matching provider is authenticated. Use --provider or provider/model."
+      }
+    },
+    {
+      "input": {
+        "model": "claude-opus-4-8",
+        "provider": "ANTHROPIC",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/opus",
+        "provider": "anthropic",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "claude-opus-5-5"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "gemini-2.5-pro:xhigh",
+        "provider": "google",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "google",
+          "id": "gemini-2.5-pro"
+        },
+        "thinkingLevel": "xhigh",
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "moonshotai/kimi-k2.6",
+        "provider": "openrouter",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "openrouter",
+          "id": "moonshotai/kimi-k2.6"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "new-model",
+        "provider": "nope",
+        "authenticated": []
+      },
+      "expected": {
+        "model": null,
+        "thinkingLevel": null,
+        "warning": null,
+        "error": "Unknown provider \"nope\". Use --list-models to see available providers/models."
+      }
+    },
+    {
+      "input": {
+        "model": "zai/glm-5",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "zai",
+          "id": "glm-5.3-highspeed"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "zai/glm-5.1",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "vercel-ai-gateway",
+          "id": "zai/glm-5.1"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "moonshotai/kimi-k2.6",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "moonshotai",
+          "id": "kimi-k2.6"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "moonshotai/kimi-k2.6",
+        "authenticated": [
+          "openrouter"
+        ]
+      },
+      "expected": {
+        "model": {
+          "provider": "openrouter",
+          "id": "moonshotai/kimi-k2.6"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "moonshotai/kimi-k2.6",
+        "authenticated": [
+          "openrouter",
+          "moonshotai"
+        ]
+      },
+      "expected": {
+        "model": {
+          "provider": "moonshotai",
+          "id": "kimi-k2.6"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "openai/gpt-4o:extended",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "openai",
+          "id": "gpt-4o:extended"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"gpt-4o:extended\" not found for provider \"openai\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "gpt-4o:extended",
+          "name": "gpt-4o:extended",
+          "api": "openai-responses",
+          "provider": "openai",
+          "baseUrl": "https://api.openai.com/v1",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": null
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 30,
+            "cacheRead": 0.5,
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 10,
+                "output": 45,
+                "cacheRead": 1,
+                "cacheWrite": 0
+              }
+            ]
+          },
+          "contextWindow": 272000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "amazon.nova-pro-v1:0",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "amazon-bedrock",
+          "id": "amazon.nova-pro-v1:0"
+        },
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "amazon-bedrock/amazon.nova-pro-v1:0:low",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "amazon-bedrock",
+          "id": "amazon.nova-pro-v1:0"
+        },
+        "thinkingLevel": "low",
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "amazon.nova-pro-v1:0:low",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "amazon-bedrock",
+          "id": "amazon.nova-pro-v1:0"
+        },
+        "thinkingLevel": "low",
+        "warning": null,
+        "error": null
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/new-model",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "new-model"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"new-model\" not found for provider \"anthropic\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model",
+          "name": "new-model",
+          "api": "anthropic-messages",
+          "provider": "anthropic",
+          "baseUrl": "https://api.anthropic.com",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 25,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/new-model:high",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "new-model"
+        },
+        "thinkingLevel": "high",
+        "warning": "Model \"new-model\" not found for provider \"anthropic\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model",
+          "name": "new-model",
+          "api": "anthropic-messages",
+          "provider": "anthropic",
+          "baseUrl": "https://api.anthropic.com",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 25,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/new-model:off",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "new-model"
+        },
+        "thinkingLevel": "off",
+        "warning": "Model \"new-model\" not found for provider \"anthropic\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model",
+          "name": "new-model",
+          "api": "anthropic-messages",
+          "provider": "anthropic",
+          "baseUrl": "https://api.anthropic.com",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 25,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/new-model:bogus",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "new-model:bogus"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"new-model:bogus\" not found for provider \"anthropic\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model:bogus",
+          "name": "new-model:bogus",
+          "api": "anthropic-messages",
+          "provider": "anthropic",
+          "baseUrl": "https://api.anthropic.com",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 25,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/new-model",
+        "thinking": "high",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "new-model"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"new-model\" not found for provider \"anthropic\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model",
+          "name": "new-model",
+          "api": "anthropic-messages",
+          "provider": "anthropic",
+          "baseUrl": "https://api.anthropic.com",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 25,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "anthropic/new-model:low",
+        "thinking": "off",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "anthropic",
+          "id": "new-model:low"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"new-model:low\" not found for provider \"anthropic\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model:low",
+          "name": "new-model:low",
+          "api": "anthropic-messages",
+          "provider": "anthropic",
+          "baseUrl": "https://api.anthropic.com",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 25,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "openai/gpt-4.1-custom",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "openai",
+          "id": "gpt-4.1-custom"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"gpt-4.1-custom\" not found for provider \"openai\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "gpt-4.1-custom",
+          "name": "gpt-4.1-custom",
+          "api": "openai-responses",
+          "provider": "openai",
+          "baseUrl": "https://api.openai.com/v1",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": null
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 30,
+            "cacheRead": 0.5,
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 10,
+                "output": 45,
+                "cacheRead": 1,
+                "cacheWrite": 0
+              }
+            ]
+          },
+          "contextWindow": 272000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "openai/gpt-4.1-custom",
+        "thinking": "medium",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "openai",
+          "id": "gpt-4.1-custom"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"gpt-4.1-custom\" not found for provider \"openai\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "gpt-4.1-custom",
+          "name": "gpt-4.1-custom",
+          "api": "openai-responses",
+          "provider": "openai",
+          "baseUrl": "https://api.openai.com/v1",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": null
+          },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 5,
+            "output": 30,
+            "cacheRead": 0.5,
+            "cacheWrite": 0,
+            "tiers": [
+              {
+                "inputTokensAbove": 272000,
+                "input": 10,
+                "output": 45,
+                "cacheRead": 1,
+                "cacheWrite": 0
+              }
+            ]
+          },
+          "contextWindow": 272000,
+          "maxTokens": 128000
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "new-model",
+        "provider": "mistral",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "mistral",
+          "id": "new-model"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"new-model\" not found for provider \"mistral\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model",
+          "name": "new-model",
+          "api": "mistral-conversations",
+          "provider": "mistral",
+          "baseUrl": "https://api.mistral.ai",
+          "reasoning": false,
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0.4,
+            "output": 2,
+            "cacheRead": 0.04,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
+          "maxTokens": 262144
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "new-model",
+        "provider": "mistral",
+        "thinking": "high",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "mistral",
+          "id": "new-model"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"new-model\" not found for provider \"mistral\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model",
+          "name": "new-model",
+          "api": "mistral-conversations",
+          "provider": "mistral",
+          "baseUrl": "https://api.mistral.ai",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0.4,
+            "output": 2,
+            "cacheRead": 0.04,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
+          "maxTokens": 262144
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "new-model",
+        "provider": "mistral",
+        "thinking": "off",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "mistral",
+          "id": "new-model"
+        },
+        "thinkingLevel": null,
+        "warning": "Model \"new-model\" not found for provider \"mistral\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model",
+          "name": "new-model",
+          "api": "mistral-conversations",
+          "provider": "mistral",
+          "baseUrl": "https://api.mistral.ai",
+          "reasoning": false,
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0.4,
+            "output": 2,
+            "cacheRead": 0.04,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
+          "maxTokens": 262144
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "mistral/new-model:low",
+        "authenticated": []
+      },
+      "expected": {
+        "model": {
+          "provider": "mistral",
+          "id": "new-model"
+        },
+        "thinkingLevel": "low",
+        "warning": "Model \"new-model\" not found for provider \"mistral\". Using custom model id.",
+        "error": null,
+        "custom": {
+          "id": "new-model",
+          "name": "new-model",
+          "api": "mistral-conversations",
+          "provider": "mistral",
+          "baseUrl": "https://api.mistral.ai",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0.4,
+            "output": 2,
+            "cacheRead": 0.04,
+            "cacheWrite": 0
+          },
+          "contextWindow": 262144,
+          "maxTokens": 262144
+        }
+      }
+    },
+    {
+      "input": {
+        "model": "typesafe/new-model",
+        "authenticated": []
+      },
+      "expected": {
+        "model": null,
+        "thinkingLevel": null,
+        "warning": null,
+        "error": "Model \"typesafe/new-model\" not found. Use --list-models to see available models."
+      }
+    },
+    {
+      "input": {
+        "model": "totally-unknown",
+        "authenticated": []
+      },
+      "expected": {
+        "model": null,
+        "thinkingLevel": null,
+        "warning": null,
+        "error": "Model \"totally-unknown\" not found. Use --list-models to see available models."
+      }
+    },
+    {
+      "input": {
+        "model": "nope/new-model",
+        "authenticated": []
+      },
+      "expected": {
+        "model": null,
+        "thinkingLevel": null,
+        "warning": null,
+        "error": "Model \"nope/new-model\" not found. Use --list-models to see available models."
+      }
+    },
+    {
+      "input": {
+        "model": "",
+        "authenticated": []
+      },
+      "expected": {
+        "model": null,
+        "thinkingLevel": null,
+        "warning": null,
+        "error": null
+      }
+    }
+  ],
+  "modelScope": [
+    {
+      "input": {
+        "patterns": [
+          "anthropic/*"
+        ],
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "anthropic",
+            "id": "claude-fable-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-fable-5-1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-4-5-20251001",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-5-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-5-20251101",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-7",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-8",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-5-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-5-20250929",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-5-5",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "anthropic/*"
+        ],
+        "authenticated": [
+          "anthropic",
+          "openrouter"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "anthropic",
+            "id": "claude-fable-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-fable-5-1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-4-5-20251001",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-5-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-5-20251101",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-7",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-8",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-5-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-5-20250929",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-5-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5.1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-haiku-4.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-haiku-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.7",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.8",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4.6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5.1:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-haiku-4.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-haiku-5.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.1:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.6:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.7:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.8:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-5.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4.6:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-5.5:batch",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "anthropic/*",
+          "openai/*"
+        ],
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "anthropic",
+            "id": "claude-fable-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-fable-5-1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-4-5-20251001",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-5-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-5-20251101",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-7",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-8",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-5-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-5-20250929",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-5-5",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": [
+          "No models match pattern \"openai/*\""
+        ]
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "ANTHROPIC/CLAUDE-OPUS-*:high"
+        ],
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-5",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-5-20251101",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-6",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-7",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-8",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-5",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-5-5",
+            "thinkingLevel": "high"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "*sonnet*"
+        ],
+        "authenticated": [
+          "anthropic",
+          "openrouter"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-5-20250929",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-4-6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-5-5",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "*sonnet*:bogus"
+        ],
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "models": [],
+        "diagnostics": [
+          "No models match pattern \"*sonnet*:bogus\""
+        ]
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "openrouter/*"
+        ],
+        "authenticated": [
+          "openrouter"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "openrouter",
+            "id": "auto",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "openrouter/auto",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "openrouter/auto-beta",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "openrouter/free",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "openrouter/fusion",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "openrouter/anthropic/**"
+        ],
+        "authenticated": [
+          "openrouter"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5.1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-haiku-4.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-haiku-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.7",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.8",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4.6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-fable-5.1:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-haiku-4.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-haiku-5.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.1:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.6:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.7:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.8:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-5.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4.5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-4.6:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-5:batch",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-sonnet-5.5:batch",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "openrouter/anthropic/claude-opus-4.?"
+        ],
+        "authenticated": [
+          "openrouter"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.6",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.7",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-4.8",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "gpt-5.[45]",
+          "gpt-[!0-5]*-sol"
+        ],
+        "authenticated": [
+          "openai"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "openai",
+            "id": "gpt-5.4",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-6-sol",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-6.1-sol",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "{anthropic,openai}/gpt-5.5",
+          "{anthropic,openai}/gpt-5.?"
+        ],
+        "authenticated": [
+          "openai"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "openai",
+            "id": "gpt-5.1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.2",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.4",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.5",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": [
+          "No models match pattern \"{anthropic,openai}/gpt-5.5\""
+        ]
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "gpt-5.5",
+          "openai/gpt-5.5",
+          "gpt-5.*"
+        ],
+        "authenticated": [
+          "openai"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "openai",
+            "id": "gpt-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.1",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.2",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.2-chat-latest",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.2-pro",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.3-chat-latest",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.3-codex",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.3-codex-spark",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.4",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.4-mini",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.4-nano",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.4-pro",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.5-pro",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.6-luna",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.6-sol",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.6-terra",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "claude-opus-4-8:high",
+          "gpt-5.5",
+          "sonnet:bogus",
+          "haiku:low",
+          "nomatch",
+          "anthropic/claude-opus-4-8"
+        ],
+        "authenticated": [
+          "anthropic",
+          "openai"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "anthropic",
+            "id": "claude-opus-4-8",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-sonnet-5-5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "anthropic",
+            "id": "claude-haiku-5-5",
+            "thinkingLevel": "low"
+          }
+        ],
+        "diagnostics": [
+          "Invalid thinking level \"bogus\" in pattern \"sonnet:bogus\". Using default instead.",
+          "No models match pattern \"nomatch\""
+        ]
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "gpt-5.5"
+        ],
+        "authenticated": [
+          "openai",
+          "azure"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "azure",
+            "id": "gpt-5.5-pro",
+            "thinkingLevel": null
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "amazon.nova-pro-v1:0",
+          "amazon.nova-lite-v1:0:low",
+          "*nova-micro*:high"
+        ],
+        "authenticated": [
+          "amazon-bedrock"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "amazon-bedrock",
+            "id": "amazon.nova-pro-v1:0",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "amazon-bedrock",
+            "id": "amazon.nova-lite-v1:0",
+            "thinkingLevel": "low"
+          },
+          {
+            "provider": "amazon-bedrock",
+            "id": "amazon.nova-micro-v1:0",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "amazon-bedrock",
+            "id": "apac.amazon.nova-micro-v1:0",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "amazon-bedrock",
+            "id": "eu.amazon.nova-micro-v1:0",
+            "thinkingLevel": "high"
+          },
+          {
+            "provider": "amazon-bedrock",
+            "id": "us.amazon.nova-micro-v1:0",
+            "thinkingLevel": "high"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "minimax-m*",
+          "moonshotai/kimi-*:low",
+          "MINIMAX-M3"
+        ],
+        "authenticated": [
+          "minimax",
+          "huggingface"
+        ]
+      },
+      "expected": {
+        "models": [
+          {
+            "provider": "minimax",
+            "id": "MiniMax-M2.7",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "minimax",
+            "id": "MiniMax-M2.7-highspeed",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "minimax",
+            "id": "MiniMax-M3",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "huggingface",
+            "id": "moonshotai/Kimi-K2-Instruct",
+            "thinkingLevel": "low"
+          },
+          {
+            "provider": "huggingface",
+            "id": "moonshotai/Kimi-K2-Instruct-0905",
+            "thinkingLevel": "low"
+          },
+          {
+            "provider": "huggingface",
+            "id": "moonshotai/Kimi-K2-Thinking",
+            "thinkingLevel": "low"
+          },
+          {
+            "provider": "huggingface",
+            "id": "moonshotai/Kimi-K2.5",
+            "thinkingLevel": "low"
+          },
+          {
+            "provider": "huggingface",
+            "id": "moonshotai/Kimi-K2.6",
+            "thinkingLevel": "low"
+          },
+          {
+            "provider": "huggingface",
+            "id": "moonshotai/Kimi-K2.7-Code",
+            "thinkingLevel": "low"
+          },
+          {
+            "provider": "huggingface",
+            "id": "moonshotai/Kimi-K3",
+            "thinkingLevel": "low"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "input": {
+        "patterns": [
+          "anthropic/*"
+        ],
+        "authenticated": []
+      },
+      "expected": {
+        "models": [],
+        "diagnostics": [
+          "No models match pattern \"anthropic/*\""
+        ]
+      }
+    },
+    {
+      "input": {
+        "patterns": [],
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "models": [],
+        "diagnostics": []
+      }
+    }
+  ],
+  "exactReference": [
+    {
+      "input": {
+        "reference": "anthropic/claude-opus-4-8",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "reference": " Anthropic/Claude-Opus-4-8 ",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "reference": "claude-opus-4-8",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "reference": "CLAUDE-OPUS-4-8",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "reference": "minimax-m3",
+        "authenticated": [
+          "minimax"
+        ]
+      },
+      "expected": {
+        "provider": "minimax",
+        "id": "MiniMax-M3"
+      }
+    },
+    {
+      "input": {
+        "reference": "MINIMAX/minimax-m3",
+        "authenticated": [
+          "minimax"
+        ]
+      },
+      "expected": {
+        "provider": "minimax",
+        "id": "MiniMax-M3"
+      }
+    },
+    {
+      "input": {
+        "reference": "Anthropic / Claude-Opus-4-8",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "reference": "minimax / MINIMAX-M3",
+        "authenticated": [
+          "minimax"
+        ]
+      },
+      "expected": {
+        "provider": "minimax",
+        "id": "MiniMax-M3"
+      }
+    },
+    {
+      "input": {
+        "reference": "claude-opus-4-8",
+        "authenticated": [
+          "anthropic",
+          "github-copilot"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "reference": "moonshotai/kimi-k2.6",
+        "authenticated": [
+          "openrouter"
+        ]
+      },
+      "expected": {
+        "provider": "openrouter",
+        "id": "moonshotai/kimi-k2.6"
+      }
+    },
+    {
+      "input": {
+        "reference": "moonshotai/kimi-k2.6",
+        "authenticated": [
+          "openrouter",
+          "moonshotai"
+        ]
+      },
+      "expected": {
+        "provider": "moonshotai",
+        "id": "kimi-k2.6"
+      }
+    },
+    {
+      "input": {
+        "reference": "openrouter/moonshotai/kimi-k2.6",
+        "authenticated": [
+          "openrouter",
+          "moonshotai"
+        ]
+      },
+      "expected": {
+        "provider": "openrouter",
+        "id": "moonshotai/kimi-k2.6"
+      }
+    },
+    {
+      "input": {
+        "reference": "opus",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": null
+    },
+    {
+      "input": {
+        "reference": "anthropic/claude-opus-4-8",
+        "authenticated": [
+          "openai"
+        ]
+      },
+      "expected": null
+    },
+    {
+      "input": {
+        "reference": "",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": null
+    },
+    {
+      "input": {
+        "reference": "Team/Local/m1",
+        "authenticated": [],
+        "custom": [
+          {
+            "provider": "team/Local",
+            "id": "M1"
+          }
+        ]
+      },
+      "expected": {
+        "provider": "team/Local",
+        "id": "M1"
+      }
+    },
+    {
+      "input": {
+        "reference": "team/local/m1",
+        "authenticated": [
+          "anthropic"
+        ],
+        "custom": [
+          {
+            "provider": "team",
+            "id": "local/m1"
+          }
+        ]
+      },
+      "expected": {
+        "provider": "team",
+        "id": "local/m1"
+      }
+    }
+  ],
+  "initialModel": [
+    {
+      "input": {
+        "authenticated": []
+      },
+      "expected": null
+    },
+    {
+      "input": {
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "authenticated": [
+          "openai",
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "authenticated": [
+          "zai",
+          "openrouter"
+        ]
+      },
+      "expected": {
+        "provider": "openrouter",
+        "id": "moonshotai/kimi-k2.6"
+      }
+    },
+    {
+      "input": {
+        "authenticated": [
+          "typesafe"
+        ]
+      },
+      "expected": null
+    },
+    {
+      "input": {
+        "defaultProvider": "openai",
+        "defaultModel": "gpt-5.4",
+        "authenticated": [
+          "openai",
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "openai",
+        "id": "gpt-5.4"
+      }
+    },
+    {
+      "input": {
+        "defaultProvider": "openai",
+        "defaultModel": "gpt-5.4",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "defaultProvider": "anthropic",
+        "defaultModel": "no-such-model",
+        "authenticated": [
+          "anthropic"
+        ]
+      },
+      "expected": {
+        "provider": "anthropic",
+        "id": "claude-opus-4-8"
+      }
+    },
+    {
+      "input": {
+        "defaultProvider": "anthropic",
+        "authenticated": [
+          "openai"
+        ]
+      },
+      "expected": {
+        "provider": "openai",
+        "id": "gpt-5.5"
+      }
+    }
+  ],
+  "globs": [
+    {
+      "pattern": "anthropic/*",
+      "text": "anthropic/claude-opus-4-8",
+      "matches": true
+    },
+    {
+      "pattern": "anthropic/*",
+      "text": "openrouter/anthropic/claude-opus-4.8",
+      "matches": false
+    },
+    {
+      "pattern": "ANTHROPIC/Claude-*",
+      "text": "anthropic/claude-opus-4-8",
+      "matches": true
+    },
+    {
+      "pattern": "*sonnet*",
+      "text": "claude-sonnet-5",
+      "matches": true
+    },
+    {
+      "pattern": "*sonnet*",
+      "text": "anthropic/claude-sonnet-5",
+      "matches": false
+    },
+    {
+      "pattern": "*.*",
+      "text": "gpt-5.5",
+      "matches": true
+    },
+    {
+      "pattern": "gpt-5.5",
+      "text": "GPT-5.5",
+      "matches": true
+    },
+    {
+      "pattern": "a*b*c",
+      "text": "aXXbYYc",
+      "matches": true
+    },
+    {
+      "pattern": "*:free",
+      "text": "qwen3-coder:free",
+      "matches": true
+    },
+    {
+      "pattern": "@cf/*/*",
+      "text": "@cf/moonshotai/kimi-k2.6",
+      "matches": true
+    },
+    {
+      "pattern": "a?c",
+      "text": "a/c",
+      "matches": false
+    },
+    {
+      "pattern": "a[/]c",
+      "text": "a/c",
+      "matches": false
+    },
+    {
+      "pattern": "*",
+      "text": "",
+      "matches": false
+    },
+    {
+      "pattern": "",
+      "text": "",
+      "matches": true
+    },
+    {
+      "pattern": "*/",
+      "text": "anthropic/",
+      "matches": true
+    },
+    {
+      "pattern": "anthropic/",
+      "text": "anthropic",
+      "matches": false
+    },
+    {
+      "pattern": "openrouter/**",
+      "text": "openrouter/anthropic/claude-opus-4.8",
+      "matches": true
+    },
+    {
+      "pattern": "openrouter/**",
+      "text": "openrouter/auto",
+      "matches": true
+    },
+    {
+      "pattern": "openrouter/**",
+      "text": "openrouter",
+      "matches": false
+    },
+    {
+      "pattern": "**/claude-*",
+      "text": "openrouter/anthropic/claude-opus-4.8",
+      "matches": true
+    },
+    {
+      "pattern": "**/claude-*",
+      "text": "claude-opus-4.8",
+      "matches": true
+    },
+    {
+      "pattern": "**",
+      "text": "openrouter/anthropic/claude-opus-4.8",
+      "matches": true
+    },
+    {
+      "pattern": "**",
+      "text": "claude",
+      "matches": true
+    },
+    {
+      "pattern": "*/**/claude-*",
+      "text": "openrouter/anthropic/claude-opus-4.8",
+      "matches": true
+    },
+    {
+      "pattern": "a/**/b",
+      "text": "a/b",
+      "matches": true
+    },
+    {
+      "pattern": "a/**/b",
+      "text": "a/x/y/b",
+      "matches": true
+    },
+    {
+      "pattern": "claude**",
+      "text": "claude-opus",
+      "matches": true
+    },
+    {
+      "pattern": "claude**",
+      "text": "claude/opus",
+      "matches": false
+    },
+    {
+      "pattern": "gpt-5.[45]",
+      "text": "gpt-5.4",
+      "matches": true
+    },
+    {
+      "pattern": "gpt-5.[45]",
+      "text": "gpt-5.6",
+      "matches": false
+    },
+    {
+      "pattern": "gpt-[!0-5]*",
+      "text": "gpt-6-sol",
+      "matches": true
+    },
+    {
+      "pattern": "gpt-[^0-5]*",
+      "text": "gpt-5",
+      "matches": false
+    },
+    {
+      "pattern": "gpt-?.5",
+      "text": "gpt-5.5",
+      "matches": true
+    },
+    {
+      "pattern": "gpt-?.5",
+      "text": "gpt-5.55",
+      "matches": false
+    },
+    {
+      "pattern": "[a-c]*",
+      "text": "Claude",
+      "matches": true
+    },
+    {
+      "pattern": "[A-C]*",
+      "text": "claude",
+      "matches": true
+    },
+    {
+      "pattern": "[]x]*",
+      "text": "]y",
+      "matches": true
+    },
+    {
+      "pattern": "[!]x]*",
+      "text": "ay",
+      "matches": true
+    },
+    {
+      "pattern": "gpt-5[",
+      "text": "gpt-5[",
+      "matches": true
+    },
+    {
+      "pattern": "gpt-5[*",
+      "text": "gpt-5[x",
+      "matches": true
+    },
+    {
+      "pattern": "{anthropic,openai}/gpt-5.?",
+      "text": "openai/gpt-5.5",
+      "matches": true
+    },
+    {
+      "pattern": "{anthropic,openai}/gpt-5.?",
+      "text": "azure/gpt-5.5",
+      "matches": false
+    },
+    {
+      "pattern": "a{b,c{d,e}}*",
+      "text": "acez",
+      "matches": true
+    },
+    {
+      "pattern": "a{b,c{d,e}}*",
+      "text": "abz",
+      "matches": true
+    },
+    {
+      "pattern": "{single}*",
+      "text": "{single}x",
+      "matches": true
+    },
+    {
+      "pattern": "{single}*",
+      "text": "singlex",
+      "matches": false
+    },
+    {
+      "pattern": "gpt-{4..6}*",
+      "text": "gpt-5.5",
+      "matches": true
+    },
+    {
+      "pattern": "gpt-{4..6}*",
+      "text": "gpt-7",
+      "matches": false
+    },
+    {
+      "pattern": "x\\*y",
+      "text": "x*y",
+      "matches": true
+    },
+    {
+      "pattern": "x\\*y",
+      "text": "xzy",
+      "matches": false
+    },
+    {
+      "pattern": "!anthropic/*",
+      "text": "openai/gpt-5.5",
+      "matches": true
+    },
+    {
+      "pattern": "!anthropic/*",
+      "text": "anthropic/claude-opus-4-8",
+      "matches": false
+    },
+    {
+      "pattern": "!!anthropic/*",
+      "text": "anthropic/claude-opus-4-8",
+      "matches": true
+    },
+    {
+      "pattern": "#*",
+      "text": "#x",
+      "matches": false
+    },
+    {
+      "pattern": "*",
+      "text": ".hidden",
+      "matches": false
+    },
+    {
+      "pattern": ".*",
+      "text": ".hidden",
+      "matches": true
+    },
+    {
+      "pattern": "**",
+      "text": ".hidden/x",
+      "matches": false
+    },
+    {
+      "pattern": "**",
+      "text": "x/.hidden",
+      "matches": false
+    }
+  ],
+  "launches": [
+    {
+      "name": "model",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-4-8"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "model-without-credentials",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-4-8"
+      ],
+      "authenticated": [],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-4-8",
+        "--thinking",
+        "max"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "max"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking-clamped-down",
+      "args": [
+        "--model",
+        "anthropic/claude-haiku-4-5",
+        "--thinking",
+        "xhigh"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-haiku-4-5",
+              "name": "Claude Haiku 4.5 (latest)",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25
+              },
+              "contextWindow": 200000,
+              "maxTokens": 64000
+            },
+            "thinkingLevel": "high"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking-clamped-up",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-5",
+        "--thinking",
+        "off"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-5",
+              "name": "Claude Opus 5",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": null,
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "minimal"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking-on-a-model-without-reasoning",
+      "args": [
+        "--model",
+        "openai/gpt-4.1",
+        "--thinking",
+        "high"
+      ],
+      "authenticated": [
+        "openai"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-4.1",
+              "name": "GPT-4.1",
+              "api": "openai-responses",
+              "provider": "openai",
+              "baseUrl": "https://api.openai.com/v1",
+              "reasoning": false,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 2,
+                "output": 8,
+                "cacheRead": 0.5,
+                "cacheWrite": 0
+              },
+              "contextWindow": 1047576,
+              "maxTokens": 32768
+            },
+            "thinkingLevel": "off"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking-level-the-model-maps-away",
+      "args": [
+        "--model",
+        "openai/gpt-5.5",
+        "--thinking",
+        "minimal"
+      ],
+      "authenticated": [
+        "openai"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-5.5",
+              "name": "GPT-5.5",
+              "api": "openai-responses",
+              "provider": "openai",
+              "baseUrl": "https://api.openai.com/v1",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": null
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 30,
+                "cacheRead": 0.5,
+                "cacheWrite": 0,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 272000,
+                    "input": 10,
+                    "output": 45,
+                    "cacheRead": 1,
+                    "cacheWrite": 0
+                  }
+                ]
+              },
+              "contextWindow": 272000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "low"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking-on-gemini",
+      "args": [
+        "--model",
+        "google/gemini-2.5-pro",
+        "--thinking",
+        "xhigh"
+      ],
+      "authenticated": [
+        "google"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gemini-2.5-pro",
+              "name": "Gemini 2.5 Pro",
+              "api": "google-generative-ai",
+              "provider": "google",
+              "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 1.25,
+                "output": 10,
+                "cacheRead": 0.125,
+                "cacheWrite": 0,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 200000,
+                    "input": 2.5,
+                    "output": 15,
+                    "cacheRead": 0.25,
+                    "cacheWrite": 0
+                  }
+                ]
+              },
+              "contextWindow": 1048576,
+              "maxTokens": 65536
+            },
+            "thinkingLevel": "high"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking-suffix",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-4-8:low"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "low"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking-flag-beats-suffix",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-4-8:low",
+        "--thinking",
+        "high"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "high"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking-invalid",
+      "args": [
+        "--model",
+        "anthropic/claude-haiku-4-5",
+        "--thinking",
+        "bogus"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [
+        "Warning: Invalid thinking level \"bogus\". Valid values: off, minimal, low, medium, high, xhigh, max"
+      ],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-haiku-4-5",
+              "name": "Claude Haiku 4.5 (latest)",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25
+              },
+              "contextWindow": 200000,
+              "maxTokens": 64000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "fuzzy-with-thinking",
+      "args": [
+        "--model",
+        "sonnet:high"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "us.anthropic.claude-sonnet-5-5",
+              "name": "Claude Sonnet 5.5 (US)",
+              "api": "bedrock-converse-stream",
+              "provider": "amazon-bedrock",
+              "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 2.2,
+                "output": 11,
+                "cacheRead": 0.11,
+                "cacheWrite": 2.75
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "high"
+          }
+        }
+      ]
+    },
+    {
+      "name": "provider-and-fuzzy-model",
+      "args": [
+        "--provider",
+        "anthropic",
+        "--model",
+        "opus"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "custom-model",
+      "args": [
+        "--model",
+        "anthropic/new-id"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [
+        "Warning: Model \"new-id\" not found for provider \"anthropic\". Using custom model id."
+      ],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "new-id",
+              "name": "new-id",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "custom-model-with-thinking",
+      "args": [
+        "--model",
+        "openai/gpt-4.1-custom",
+        "--thinking",
+        "high"
+      ],
+      "authenticated": [
+        "openai"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [
+        "Warning: Model \"gpt-4.1-custom\" not found for provider \"openai\". Using custom model id."
+      ],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-4.1-custom",
+              "name": "gpt-4.1-custom",
+              "api": "openai-responses",
+              "provider": "openai",
+              "baseUrl": "https://api.openai.com/v1",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": null
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 30,
+                "cacheRead": 0.5,
+                "cacheWrite": 0,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 272000,
+                    "input": 10,
+                    "output": 45,
+                    "cacheRead": 1,
+                    "cacheWrite": 0
+                  }
+                ]
+              },
+              "contextWindow": 272000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "high"
+          }
+        }
+      ]
+    },
+    {
+      "name": "custom-model-made-to-reason",
+      "args": [
+        "--model",
+        "mistral/new-model",
+        "--thinking",
+        "high"
+      ],
+      "authenticated": [],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [
+        "Warning: Model \"new-model\" not found for provider \"mistral\". Using custom model id."
+      ],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "new-model",
+              "name": "new-model",
+              "api": "mistral-conversations",
+              "provider": "mistral",
+              "baseUrl": "https://api.mistral.ai",
+              "reasoning": true,
+              "input": [
+                "text"
+              ],
+              "cost": {
+                "input": 0.4,
+                "output": 2,
+                "cacheRead": 0.04,
+                "cacheWrite": 0
+              },
+              "contextWindow": 262144,
+              "maxTokens": 262144
+            },
+            "thinkingLevel": "high"
+          }
+        }
+      ]
+    },
+    {
+      "name": "custom-model-of-a-provider-without-reasoning",
+      "args": [
+        "--model",
+        "mistral/new-model"
+      ],
+      "authenticated": [],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [
+        "Warning: Model \"new-model\" not found for provider \"mistral\". Using custom model id."
+      ],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "new-model",
+              "name": "new-model",
+              "api": "mistral-conversations",
+              "provider": "mistral",
+              "baseUrl": "https://api.mistral.ai",
+              "reasoning": false,
+              "input": [
+                "text"
+              ],
+              "cost": {
+                "input": 0.4,
+                "output": 2,
+                "cacheRead": 0.04,
+                "cacheWrite": 0
+              },
+              "contextWindow": 262144,
+              "maxTokens": 262144
+            },
+            "thinkingLevel": "off"
+          }
+        }
+      ]
+    },
+    {
+      "name": "provider-without-model",
+      "args": [
+        "--provider",
+        "anthropic"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 1,
+      "stderr": [
+        "Error: --provider requires --model (for example: --provider anthropic --model <pattern>)"
+      ],
+      "exchanges": []
+    },
+    {
+      "name": "unknown-provider",
+      "args": [
+        "--provider",
+        "nope",
+        "--model",
+        "x"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 1,
+      "stderr": [
+        "Error: Unknown provider \"nope\". Use --list-models to see available providers/models."
+      ],
+      "exchanges": []
+    },
+    {
+      "name": "unknown-model",
+      "args": [
+        "--model",
+        "nope/x"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 1,
+      "stderr": [
+        "Error: Model \"nope/x\" not found. Use --list-models to see available models."
+      ],
+      "exchanges": []
+    },
+    {
+      "name": "default-model",
+      "args": [],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "default-model-of-the-first-provider",
+      "args": [],
+      "authenticated": [
+        "openai",
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "saved-default-model",
+      "args": [],
+      "authenticated": [
+        "openai",
+        "anthropic"
+      ],
+      "settings": {
+        "defaultProvider": "openai",
+        "defaultModel": "gpt-5.4"
+      },
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-5.4",
+              "name": "GPT-5.4",
+              "api": "openai-responses",
+              "provider": "openai",
+              "baseUrl": "https://api.openai.com/v1",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": null
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 2.5,
+                "output": 15,
+                "cacheRead": 0.25,
+                "cacheWrite": 0,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 272000,
+                    "input": 5,
+                    "output": 22.5,
+                    "cacheRead": 0.5,
+                    "cacheWrite": 0
+                  }
+                ]
+              },
+              "contextWindow": 272000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "saved-default-without-credentials",
+      "args": [],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {
+        "defaultProvider": "openai",
+        "defaultModel": "gpt-5.4"
+      },
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "default-thinking-level-setting",
+      "args": [],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {
+        "defaultThinkingLevel": "high"
+      },
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "high"
+          }
+        }
+      ]
+    },
+    {
+      "name": "model-thinking-level-setting",
+      "args": [],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {
+        "defaultThinkingLevel": "high",
+        "modelThinkingLevels": {
+          "anthropic/claude-opus-4-8": "xhigh"
+        }
+      },
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "xhigh"
+          }
+        }
+      ]
+    },
+    {
+      "name": "thinking-flag-beats-settings",
+      "args": [
+        "--thinking",
+        "low"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {
+        "defaultThinkingLevel": "high",
+        "modelThinkingLevels": {
+          "anthropic/claude-opus-4-8": "xhigh"
+        }
+      },
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "low"
+          }
+        }
+      ]
+    },
+    {
+      "name": "scope-flag",
+      "args": [
+        "--models",
+        "anthropic/claude-sonnet-*:low"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-sonnet-4-5",
+              "name": "Claude Sonnet 4.5 (latest)",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 3,
+                "output": 15,
+                "cacheRead": 0.3,
+                "cacheWrite": 3.75
+              },
+              "contextWindow": 200000,
+              "maxTokens": 64000
+            },
+            "thinkingLevel": "low"
+          }
+        }
+      ]
+    },
+    {
+      "name": "scope-flag-keeps-the-saved-default",
+      "args": [
+        "--models",
+        "anthropic/claude-sonnet-*:low"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {
+        "defaultProvider": "anthropic",
+        "defaultModel": "claude-sonnet-5"
+      },
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-sonnet-5",
+              "name": "Claude Sonnet 5",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.2,
+                "cacheWrite": 2.5
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "low"
+          }
+        }
+      ]
+    },
+    {
+      "name": "scope-setting",
+      "args": [],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {
+        "enabledModels": [
+          "anthropic/claude-haiku-*",
+          "anthropic/claude-opus-4-8:high"
+        ]
+      },
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-haiku-4-5",
+              "name": "Claude Haiku 4.5 (latest)",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25
+              },
+              "contextWindow": 200000,
+              "maxTokens": 64000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "scope-flag-replaces-the-setting",
+      "args": [
+        "--models",
+        "claude-opus-4-7:max,nomatch"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {
+        "enabledModels": [
+          "anthropic/claude-haiku-*"
+        ]
+      },
+      "exitCode": 0,
+      "stderr": [
+        "Warning: No models match pattern \"nomatch\""
+      ],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-7",
+              "name": "Claude Opus 4.7",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "max"
+          }
+        }
+      ]
+    },
+    {
+      "name": "scope-without-a-match",
+      "args": [
+        "--models",
+        "openai/*"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [
+        "Warning: No models match pattern \"openai/*\""
+      ],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "model-flag-beats-scope",
+      "args": [
+        "--models",
+        "anthropic/claude-sonnet-*:low",
+        "--model",
+        "anthropic/claude-opus-4-8"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "set-thinking-level",
+      "args": [
+        "--model",
+        "anthropic/claude-haiku-4-5"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-haiku-4-5",
+              "name": "Claude Haiku 4.5 (latest)",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25
+              },
+              "contextWindow": 200000,
+              "maxTokens": 64000
+            },
+            "thinkingLevel": "medium"
+          }
+        },
+        {
+          "command": {
+            "type": "set_thinking_level",
+            "level": "xhigh"
+          },
+          "events": [
+            {
+              "type": "thinking_level_changed",
+              "level": "high"
+            }
+          ],
+          "response": {
+            "success": true
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-haiku-4-5",
+              "name": "Claude Haiku 4.5 (latest)",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25
+              },
+              "contextWindow": 200000,
+              "maxTokens": 64000
+            },
+            "thinkingLevel": "high"
+          }
+        },
+        {
+          "command": {
+            "type": "set_thinking_level",
+            "level": "high"
+          },
+          "events": [],
+          "response": {
+            "success": true
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-haiku-4-5",
+              "name": "Claude Haiku 4.5 (latest)",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25
+              },
+              "contextWindow": 200000,
+              "maxTokens": 64000
+            },
+            "thinkingLevel": "high"
+          }
+        },
+        {
+          "command": {
+            "type": "set_thinking_level",
+            "level": "off"
+          },
+          "events": [
+            {
+              "type": "thinking_level_changed",
+              "level": "off"
+            }
+          ],
+          "response": {
+            "success": true
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-haiku-4-5",
+              "name": "Claude Haiku 4.5 (latest)",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25
+              },
+              "contextWindow": 200000,
+              "maxTokens": 64000
+            },
+            "thinkingLevel": "off"
+          }
+        }
+      ]
+    },
+    {
+      "name": "set-thinking-level-clamped-up",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-5"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "set_thinking_level",
+            "level": "off"
+          },
+          "events": [
+            {
+              "type": "thinking_level_changed",
+              "level": "minimal"
+            }
+          ],
+          "response": {
+            "success": true
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-5",
+              "name": "Claude Opus 5",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": null,
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "minimal"
+          }
+        }
+      ]
+    },
+    {
+      "name": "set-model",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-4-8",
+        "--thinking",
+        "max"
+      ],
+      "authenticated": [
+        "anthropic",
+        "openai"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "max"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "anthropic",
+            "modelId": "claude-haiku-4-5"
+          },
+          "events": [
+            {
+              "type": "thinking_level_changed",
+              "level": "high"
+            }
+          ],
+          "response": {
+            "success": true,
+            "model": {
+              "provider": "anthropic",
+              "id": "claude-haiku-4-5"
+            }
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-haiku-4-5",
+              "name": "Claude Haiku 4.5 (latest)",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25
+              },
+              "contextWindow": 200000,
+              "maxTokens": 64000
+            },
+            "thinkingLevel": "high"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "anthropic",
+            "modelId": "claude-opus-4-8"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "provider": "anthropic",
+              "id": "claude-opus-4-8"
+            }
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "high"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "openai",
+            "modelId": "gpt-4.1"
+          },
+          "events": [
+            {
+              "type": "thinking_level_changed",
+              "level": "off"
+            }
+          ],
+          "response": {
+            "success": true,
+            "model": {
+              "provider": "openai",
+              "id": "gpt-4.1"
+            }
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-4.1",
+              "name": "GPT-4.1",
+              "api": "openai-responses",
+              "provider": "openai",
+              "baseUrl": "https://api.openai.com/v1",
+              "reasoning": false,
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 2,
+                "output": 8,
+                "cacheRead": 0.5,
+                "cacheWrite": 0
+              },
+              "contextWindow": 1047576,
+              "maxTokens": 32768
+            },
+            "thinkingLevel": "off"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "openai",
+            "modelId": "gpt-5.5"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "provider": "openai",
+              "id": "gpt-5.5"
+            }
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-5.5",
+              "name": "GPT-5.5",
+              "api": "openai-responses",
+              "provider": "openai",
+              "baseUrl": "https://api.openai.com/v1",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": null
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 30,
+                "cacheRead": 0.5,
+                "cacheWrite": 0,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 272000,
+                    "input": 10,
+                    "output": 45,
+                    "cacheRead": 1,
+                    "cacheWrite": 0
+                  }
+                ]
+              },
+              "contextWindow": 272000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "off"
+          }
+        }
+      ]
+    },
+    {
+      "name": "set-model-with-thinking-settings",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-4-8",
+        "--thinking",
+        "max"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {
+        "defaultThinkingLevel": "low",
+        "modelThinkingLevels": {
+          "anthropic/claude-sonnet-5": "xhigh"
+        }
+      },
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "max"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "anthropic",
+            "modelId": "claude-sonnet-5"
+          },
+          "events": [
+            {
+              "type": "thinking_level_changed",
+              "level": "xhigh"
+            }
+          ],
+          "response": {
+            "success": true,
+            "model": {
+              "provider": "anthropic",
+              "id": "claude-sonnet-5"
+            }
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-sonnet-5",
+              "name": "Claude Sonnet 5",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.2,
+                "cacheWrite": 2.5
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "xhigh"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "anthropic",
+            "modelId": "claude-opus-4-7"
+          },
+          "events": [
+            {
+              "type": "thinking_level_changed",
+              "level": "low"
+            }
+          ],
+          "response": {
+            "success": true,
+            "model": {
+              "provider": "anthropic",
+              "id": "claude-opus-4-7"
+            }
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-7",
+              "name": "Claude Opus 4.7",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "low"
+          }
+        }
+      ]
+    },
+    {
+      "name": "set-model-not-found",
+      "args": [
+        "--model",
+        "anthropic/claude-opus-4-8"
+      ],
+      "authenticated": [
+        "anthropic"
+      ],
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "anthropic",
+            "modelId": "no-such-model"
+          },
+          "events": [],
+          "response": {
+            "success": false,
+            "error": "Model not found: anthropic/no-such-model"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "openai",
+            "modelId": "gpt-5.5"
+          },
+          "events": [],
+          "response": {
+            "success": false,
+            "error": "Model not found: openai/gpt-5.5"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "ANTHROPIC",
+            "modelId": "claude-opus-4-8"
+          },
+          "events": [],
+          "response": {
+            "success": false,
+            "error": "Model not found: ANTHROPIC/claude-opus-4-8"
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    }
+  ]
+}
