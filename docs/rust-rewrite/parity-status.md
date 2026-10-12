@@ -52,7 +52,14 @@ The committed TypeScript parity fixtures are:
   tool-call ID normalization.
 - `mistral-tools.json`: Mistral chat-completions request shape with
   model-callable tools.
-- `model-catalog.json`: selected upstream model catalog targets.
+- `model-catalog.json`: upstream's whole built-in chat model catalog as its
+  coding agent sees it with no credentials and no network: every provider in
+  upstream's order, every model with every field, and the model each provider
+  starts on (`defaultModelPerProvider`). This file is also data: `pi-ai`
+  compiles it in as pi's built-in catalog, so regenerating it changes the
+  models pi knows. Upstream generates the catalog from the providers' listings
+  when the reference image is built, so the file is a snapshot of that moment
+  and drifts with the listings, not only with upstream's source.
 - `model-resolution.json`: how upstream picks a model, from its own functions
   on its built-in catalog: `--model`/`--provider`/`--thinking` resolution
   (`resolveCliModel`), scope patterns (`resolveModelScopeFromModels`), exact
@@ -136,8 +143,26 @@ Current Rust parity coverage includes:
 - Mistral tool-history message shape and tool-call ID normalization.
 - Auth discovery and credential redaction for supported providers.
 - CLI flags, command inventory, settings normalization, slash commands,
-  selected TUI markers, local tool inventory, session export shape, and model
-  catalog targets.
+  selected TUI markers, local tool inventory, and session export shape.
+- The model catalog, in full: every upstream model pi can run is a built-in
+  model with upstream's values for every field pi reads, in upstream's order
+  (`builtin_catalog_is_upstreams_catalog_in_full` in
+  `crates/pi-ai/src/catalog.rs`, and
+  `default_models_are_upstreams_catalog_in_full` in `crates/pi-config` for
+  what a config loads). The fields pi does not read yet are named in the
+  test, so a new upstream field fails it.
+- Thinking levels: supported levels and clamping for every case of
+  `model-thinking.json`, and every catalog model has one of the recorded
+  shapes (`thinking_levels_match_ts_for_every_catalog_model`).
+- Model resolution: every `cliModel`, `modelScope`, `exactReference`,
+  `initialModel`, and `globs` case of `model-resolution.json`, run on
+  upstream's whole catalog (`crates/pi-config/src/model_resolver.rs`).
+- Model and thinking selection end to end: every `launches` case, with pi
+  started on the same arguments, settings, and keys, answers what upstream
+  answered: the model object, the thinking level in effect, events, stderr,
+  and exit code (`crates/pi-cli/tests/model_parity.rs`).
+- Output caps: the provider request fixtures carry upstream's `maxTokens`
+  for their models, and the builders now take them from the catalog.
 - Built-in tools: every call of `tool-behavior.json` run against pi's tools in
   the same trees, with results compared exactly, and each tool's description
   and parameter schema compared exactly
@@ -202,6 +227,9 @@ Use these before accepting intentional parity changes:
 make ts-parity-update
 cargo test -p pi-parity
 cargo test -p pi-ai --lib matches_ts
+cargo test -p pi-ai --lib catalog
+cargo test -p pi-config --lib model
+cargo test -p pi-cli --test model_parity
 cargo test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
 cargo test -p pi-core --lib system_prompt_matches_ts_builder
 cargo test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery

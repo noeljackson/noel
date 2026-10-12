@@ -290,15 +290,12 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("mistral-devstral.json", "crates/pi-ai/src/lib.rs"),
         ("mistral-tool-id.json", "crates/pi-ai/src/lib.rs"),
         ("mistral-tools.json", "crates/pi-ai/src/lib.rs"),
-        ("model-catalog.json", "crates/pi-config/src/lib.rs"),
+        ("model-catalog.json", "crates/pi-ai/src/catalog.rs"),
         (
             "model-resolution.json",
-            "crates/pi-parity/tests/ts_fixtures.rs",
+            "crates/pi-config/src/model_resolver.rs",
         ),
-        (
-            "model-thinking.json",
-            "crates/pi-parity/tests/ts_fixtures.rs",
-        ),
+        ("model-thinking.json", "crates/pi-ai/src/catalog.rs"),
         ("openai-codex-chatgpt-oauth.json", "crates/pi-ai/src/lib.rs"),
         ("openai-responses-tool-id.json", "crates/pi-ai/src/lib.rs"),
         ("openai-responses-tools.json", "crates/pi-ai/src/lib.rs"),

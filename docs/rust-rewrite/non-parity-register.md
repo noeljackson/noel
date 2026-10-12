@@ -183,20 +183,159 @@ Reason: model lists are provider-owned and change out of band; a stale or
 poisoned cache must never delete working models, and the user needs a manual
 escape hatch when the background refresh cannot recover on its own.
 
-### Anthropic Output Cap Without an Output Catalog
+### Built-in Model Catalog Is a Compiled Snapshot
 
-Upstream sends each request the model's catalog `maxTokens`, lowered so the
-estimated input fits the context window. The Rust model catalog has no output
-limits, so an Anthropic Messages request without an explicit cap reads the
-Claude output limit and context window from the version in the model id (for
-example 128000 for Opus 4.6 and later, 64000 for Sonnet and Haiku 4.5, 32000
-for Opus 4.1) and applies the same context clamp. Other models served over
-the Anthropic API get upstream's 16384 default for models without a catalog
-limit instead of their upstream catalog values.
+Rust's built-in models are upstream's catalog, generated from upstream's model
+runtime into `tests/fixtures/ts-parity/model-catalog.json` and compiled in
+(`crates/pi-ai/src/catalog.rs`); tests compare every model and every field
+Rust reads with that file. These parts differ:
 
-Reason: Anthropic requires `max_tokens`, and the former fixed 4096 cut off
-long replies, thinking, and large `write` calls. Reading the limit from the id
-keeps new Claude models working without a catalog update.
+- No catalog refresh. Upstream wraps each built-in provider with a refresh
+  from its hosted catalog service (`models-store.json`, `pi update --models`)
+  and narrows OpenRouter to the models, limits, and prices of the user's key.
+  Rust has neither; its own model refresh still fetches listings for seven
+  providers (see Model Cache Refresh Defenses and the next entry). Upstream
+  itself generates the catalog from the providers' listings at build time, so
+  Rust's snapshot is as old as the last regeneration of the fixture.
+- No Radius models. Upstream's Radius gateway speaks its own `pi-messages`
+  API, for which Rust has no adapter, so its 29 models are in the file but not
+  offered: `--model radius/...` is "not found", `--model balanced` (an id only
+  Radius has) matches nothing, and the error for an id several providers
+  have does not list Radius.
+- Chat models only. Upstream's image and classifier models are not in the
+  file; Rust keeps its own short list of image models.
+- Fields Rust does not read yet: `compat`, `headers`, `inputLimits`,
+  `promptCache`, and `type`. So request details upstream takes from them
+  still come from Rust's own rules:
+  - Thinking on the chat completions API is sent only to OpenRouter. The
+    other chat completions providers (DeepSeek, Z.AI, Hugging Face, OpenCode,
+    Qwen, Moonshot, Groq, ...) and Mistral have thinking levels in the
+    catalog, and Rust tracks and clamps them, but their requests carry no
+    thinking parameter: each needs the provider's own format
+    (`compat.thinkingFormat`).
+  - Anthropic and Bedrock choose adaptive or budget thinking, and Google
+    chooses its thinking budget, from the model id, not from `compat`.
+  - The catalog's per-model headers (GitHub Copilot, NVIDIA) are not sent.
+    GitHub Copilot's Responses models use Rust's own fixed headers; its
+    models on the Anthropic Messages and chat completions APIs are listed but
+    get the plain headers of those APIs.
+
+Reason: fetching upstream's hosted catalog and OpenRouter's key listing needs
+network destinations this port has no approval for, and reading `compat` is
+its own piece of work. A compiled snapshot gives every model its limits,
+prices, and thinking levels without either.
+
+### Port-Only Providers Beside the Catalog
+
+Four providers exist only in Rust and are written by hand in
+`crates/pi-ai/src/catalog_port_models.json`, in the catalog's shape: `faux`
+(`echo`, `script`), `zai-coding`, `zai-anthropic`, and `kimi-coding-openai`.
+They come first in the model list, never redefine an upstream provider (a
+test checks), and have no thinking levels. Upstream's `zai` is the coding
+plan endpoint (`https://api.z.ai/api/coding/paas/v4`), so `zai-coding` now
+duplicates it under another id; `zai/glm-5.2` and `zai/glm-5.3`, which this
+port used to send to the general endpoint (`.../api/paas/v4`), follow
+upstream's `zai`.
+
+Reason: the faux models are how tests and offline runs work, and the three
+providers are endpoints this port's users have configured and saved as
+defaults. Keeping them in a separate file keeps the generated catalog exactly
+upstream's.
+
+### Provider Listings and `models.json` Extend the Catalog
+
+Rust's model refresh caches provider listings (`model-cache.json`), and
+`models.json` is Rust's own format, a list of model objects. Upstream's
+`models.json` (`providers` with `models` and `modelOverrides`) is not read.
+Both add to the catalog:
+
+- A cached listing says which models a provider serves. A listed id the
+  catalog has changes nothing; one it lacks is built on the provider's default
+  model, as upstream builds `--model provider/new-id`, keeping the listing's
+  name and context window. Upstream has no such listings for these providers.
+- A `models.json` entry is used as written (provider, id, name, API, base
+  URL). The fields upstream's model object has and the entry leaves out
+  (`contextWindow`, `maxTokens`, `reasoning`, `thinkingLevelMap`, `input`,
+  `cost`) come from the built-in model of the same id, else from the
+  provider's default model. Upstream gives a custom model fixed defaults
+  instead (no reasoning, 128000 context, 16384 output tokens).
+- For a provider the catalog does not know, a model has no thinking levels,
+  and requests carry no output cap unless the entry gives `maxTokens`; only
+  the Anthropic API, which requires one, gets upstream's 16384. Upstream sends
+  16384, lowered to fit the context window, on every API.
+- A base URL names the API's root for every provider, as it does upstream.
+  Earlier Rust versions appended only `/messages` to a custom `anthropic` base
+  URL and `/chat/completions` to a Mistral one; they now get `/v1/messages`
+  and `/v1/chat/completions` unless the URL already ends in `/v1`.
+
+Reason: the listings keep new models usable between catalog updates, and a
+model nobody described is safest on its provider's defaults. The `models.json`
+format, with credential syntax and offline mode, is a later piece of work; the
+model object already has upstream's field names so upstream's file can map
+onto it.
+
+### Model Scope, Picker, and Model Commands
+
+`--models` and `enabledModels` resolve as upstream's scope does (exact, fuzzy,
+and glob patterns with `:<thinking>`, over the models with credentials), and a
+scope removes no model. These parts differ:
+
+- The model picker lists the scope when there is one and every known model
+  otherwise. Upstream lists the models with credentials, with a tab to switch
+  between the scope and all of them, and cycles through the scope with a key.
+- Scope globs support `*`, `?`, `[...]`, `**`, `{a,b}`, `{1..3}`, and a
+  leading `!`, as recorded from upstream's matcher in
+  `model-resolution.json`; its extended globs (`+(a|b)`) are not supported.
+- `--list-models` lists every known model, in Rust's own format. Upstream
+  lists the models with credentials, in columns.
+- `/model <text>` switches on an exact `provider/id` or id and otherwise
+  opens the picker with the text as its search, as upstream's does. It also
+  accepts a 1-based position in the model list, and it saves the model as the
+  default; upstream's saves nothing.
+- `/thinking` alone prints the level in effect; upstream opens a selector.
+- Thinking levels also answer to the names earlier Rust versions accepted
+  (`none`, `disabled`, `min`, `med`, `extra-high`), ignoring case, in
+  `--thinking`, `/thinking`, `set_thinking_level`, and settings. A
+  `:<thinking>` suffix on `--model` or a scope pattern takes upstream's seven
+  names only, because any other suffix is part of the model id.
+- The Azure provider is `azure`, as upstream names it. The id Rust used
+  before, `azure-openai-responses`, still names it in an `auth.json` entry
+  (which stays under that key), `defaultProvider`, `enabledModels`,
+  `modelThinkingLevels`, `models.json`, the model cache, a saved session,
+  `--provider`, and `--model`.
+
+Reason: the picker's tabs, key, and authenticated-only list are separate TUI
+work. The former names cost nothing to keep and saved files hold them.
+
+### Session Model and Thinking Level
+
+Startup follows upstream's order (`--model`, the resumed session, the scope,
+the saved default, a model with credentials), and a thinking level is clamped
+to the model as upstream clamps it. These parts differ:
+
+- A resumed session keeps its model even when the model has no credentials
+  now, and when the catalog no longer lists it: the id then runs on its
+  provider's default model, as `--model provider/new-id` would. Upstream
+  falls back to its default model with a message in both cases.
+- The saved default (`defaultProvider`, `defaultModel`) is used whenever its
+  provider has credentials, listed or not, and an unlisted id runs the same
+  way. Upstream ignores a saved default its catalog does not list and starts
+  on a provider's default model. Nineteen ids this port listed by hand are
+  not in upstream's catalog (for example `openai-codex/gpt-5.4`,
+  `zai/glm-5.1`, `moonshotai/k3`), so settings and sessions that name them
+  depend on this.
+- Rust saves a thinking level in the session only once something sets one
+  (`--thinking`, a `:<thinking>` suffix, a scope pattern, `/thinking`,
+  `set_thinking_level`, a model switch). Until then the level in effect is
+  read from `modelThinkingLevels` and `defaultThinkingLevel` each time, so a
+  change to those settings reaches a session that never set a level.
+  Upstream saves the level when it creates the session.
+- A `faux` model is the startup model when it is the saved default or when
+  nothing else can run. Upstream starts without a model then.
+
+Reason: a session's model is the user's choice for that conversation, and
+switching it silently is worse than failing on the next request. The faux
+fallback keeps a fresh install usable offline.
 
 ### auth.json Lock and Mode
 
@@ -561,8 +700,8 @@ dependency (Unicode normalization) for a rare case.
 
 Upstream sends the images of a tool result (`read` of an image file) to every
 model whose catalog entry lists image input, and replaces them with a note for
-other models. Rust's model catalog has no input types, so it decides by
-provider API:
+other models. Rust's catalog records each model's `input` too, but nothing
+reads it yet, so Rust still decides by provider API:
 
 - Anthropic Messages, OpenAI Responses (OpenAI, Codex, Azure, GitHub Copilot),
   Google Gemini and Vertex, and Bedrock Converse: the image is sent in the tool
@@ -578,11 +717,12 @@ provider API:
   request, so turning the setting off later sends it; in Rust it is not saved.
 
 Reason: chat completions is the API of most text-only models, and a tool
-message there cannot hold an image. Without knowing which models accept
-images, sending one in an extra user message risks an error on every later
+message there cannot hold an image. This rule predates the catalog; sending an
+image to a model that does not accept one risks an error on every later
 request of the session, because the image stays in the conversation. The four
 APIs that carry images in tool results serve models that almost all accept
-them. Revisit when the model catalog records input types.
+them. The catalog now says which models accept images; deciding by it is
+separate work.
 
 ### No MCP Support
 
@@ -741,9 +881,8 @@ Differences in the golden records:
 - Queue modes: pi delivers everything queued at once (see Batched Queue and
   Steering Dispatch). `steeringMode` and `followUpMode` are always `all`, and
   setting `one-at-a-time` fails.
-- Model object: pi has no `input`, `cost`, or `maxTokens`, and `baseUrl` only
-  when one is configured. `reasoning` says whether pi offers thinking levels
-  for the model.
+- Model object: `faux/script` has no `baseUrl`, and its `input` and
+  `maxTokens` are upstream's faux provider's rather than the stub model's.
 - Assistant messages have no `responseId`. Usage holds the input and output
   tokens providers report to pi; cache tokens and costs are zero, and there is
   no `reasoning` count.
@@ -813,8 +952,14 @@ Other differences:
   compaction only once the engine call that ran it returns.
 - `compact` runs to completion: commands sent meanwhile wait, and `abort` does
   not cancel it.
-- `set_thinking_level` refuses a level the model does not support; upstream
-  clamps it.
+- The model object in `get_state` and `set_model` has the fields of upstream's
+  that pi's model definition has: `id`, `name`, `api`, `provider`, `baseUrl`,
+  `reasoning`, `thinkingLevelMap`, `input`, `cost`, `contextWindow`, and
+  `maxTokens`. It has no `compat`, `headers`, `inputLimits`, `promptCache`, or
+  `type`.
+- `set_thinking_level` with a name that is not a thinking level fails;
+  upstream sets the model's lowest level. A level the model lacks is clamped,
+  as upstream clamps it.
 - `new_session` refuses `parentSession`. With `--no-session` the session id
   stays `ephemeral`.
 - A prompt that is a pi tool command (`/bash ls`, `/read path`) runs the tool

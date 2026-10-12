@@ -17,7 +17,8 @@ Current Rust implementation:
 - Upstream's default system prompt, with `SYSTEM.md`, `APPEND_SYSTEM.md`,
   and `AGENTS.md`/`CLAUDE.md` context discovery
 - Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `todo`, `web_search`, `web_fetch`
-- Providers: faux test provider, OpenAI chat/responses/Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini/Vertex, OpenRouter, GitHub Copilot, Amazon Bedrock bearer-token Converse, Mistral, Cloudflare Workers AI/AI Gateway, OpenAI-compatible aliases for DeepSeek, Groq, Cerebras, xAI, Z.AI, Hugging Face, Together, Moonshot AI, and OpenCode, plus Anthropic-compatible aliases for Vercel AI Gateway, Fireworks, MiniMax, Kimi Coding, and Xiaomi MiMo
+- Models: upstream's built-in catalog (every provider and chat model upstream ships, with thinking levels, limits, and prices), plus the faux test models and three providers of this port's own
+- Provider APIs: OpenAI chat completions, OpenAI Responses, Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini and Vertex, Amazon Bedrock bearer-token Converse, and Mistral, which between them serve the catalog's providers
 
 Intentionally removed:
 
@@ -136,10 +137,19 @@ printf '%s\n' '{"id":"1","type":"prompt","message":"hello"}' \
   | cargo run -p pi-cli -- --mode rpc --model faux/echo
 ```
 
-List models:
+List models, or the ones whose provider, id, name, or API contains a text:
 
 ```bash
 cargo run -p pi-cli -- --list-models
+cargo run -p pi-cli -- --list-models opus
+```
+
+Choose a model and a thinking level (see [Models and thinking levels](#models-and-thinking-levels)):
+
+```bash
+cargo run -p pi-cli -- --model anthropic/claude-opus-4-8 --thinking high
+cargo run -p pi-cli -- --model sonnet:high
+cargo run -p pi-cli -- --provider openai --model gpt-5
 ```
 
 List image-generation models:
@@ -300,8 +310,9 @@ Environment overrides:
 {
   "defaultProvider": "faux",
   "defaultModel": "echo",
-  "defaultThinkingLevel": "xhigh",
-  "enabledModels": ["faux/echo"],
+  "defaultThinkingLevel": "high",
+  "modelThinkingLevels": { "anthropic/claude-opus-4-8": "xhigh" },
+  "enabledModels": ["faux/echo", "anthropic/claude-*:high"],
   "enabledTools": ["read", "bash", "edit", "write", "grep", "find", "ls", "todo", "web_search", "web_fetch"],
   "sessionDir": "sessions",
   "modelRefresh": {
@@ -311,12 +322,64 @@ Environment overrides:
 }
 ```
 
-At startup the model comes from `--model`/`--provider`, then the resumed
-session, then the saved default if its provider has credentials, then a model
+### Models and thinking levels
+
+pi knows the models upstream pi knows. The built-in catalog is upstream's,
+generated from upstream's own model runtime and compiled in
+(`tests/fixtures/ts-parity/model-catalog.json`; `make ts-parity-update`
+regenerates it). Each model has its API and base URL, context window, output
+cap, what it accepts (`text`, `image`), prices, and which thinking levels it
+supports. Beside it sit the providers only this port has: `faux`,
+`zai-coding`, `zai-anthropic`, and `kimi-coding-openai`. The catalog is a
+snapshot: pi does not fetch upstream's hosted catalog or OpenRouter's
+per-key listing, and it leaves out upstream's Radius gateway, whose API it
+does not speak. Provider listings fetched by the model refresh and
+`models.json` add to it (see below).
+
+`--model <pattern>` picks a model as upstream's does:
+
+- `provider/id` or a bare `id`, ignoring case. An id several providers have
+  goes to the one provider with credentials; with none or several, pi names
+  the candidates and asks for `--provider` or `provider/id`.
+- Otherwise the best match on id or name: an alias before a dated id
+  (`claude-haiku-4-5` before `claude-haiku-4-5-20251001`), then the id that
+  sorts last. The match runs over every provider unless `--provider` or a
+  `provider/` prefix narrows it, so `--model sonnet` may pick a provider you
+  have no key for.
+- `:<thinking>` at the end sets the thinking level: `--model sonnet:high`.
+  `--thinking` overrides it.
+- An id the provider does not list, as in `--model anthropic/new-id`, becomes
+  a custom model built on that provider's default model, with a warning.
+- `--provider <name>` narrows `--model` to one provider and requires it.
+
+`--models <patterns>` and the `enabledModels` setting scope model selection to
+the models with credentials that match: exact references, fuzzy matches, or
+globs over `provider/id` and over the id (`anthropic/*`, `*sonnet*`,
+`openrouter/**`; `*` does not cross a `/`), ignoring case, each optionally
+ending in `:<thinking>`. A scope removes no model: a new session starts on the
+saved default if it is in scope, else on the scope's first model, the model
+picker lists the scope, and `--model` and `--list-models` still see
+everything. A pattern that matches nothing prints a warning.
+
+At startup the model comes from `--model`, then the resumed session, then the
+scope, then the saved default if its provider has credentials, then a model
 whose provider has credentials (preferring that provider's usual model, as
-upstream does). A `faux` model is chosen only when it is requested or nothing
-else is available; with `--offline` only `faux` can run, so it is chosen
-unless `--model` names another.
+upstream does). A saved default or a session's model that the catalog no
+longer lists keeps working: it runs as a custom id on its provider's default
+model. A `faux` model is chosen only when it is requested
+or nothing else is available; with `--offline` only `faux` can run, so it is
+chosen unless `--model` names another.
+
+Thinking levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and
+`max`. Which of them a model supports comes from its catalog entry, and a
+level the model lacks becomes the nearest one it has (the next higher one
+first), as upstream clamps it; a model without reasoning is always `off`. A
+session starts on `medium` unless `--thinking`, a `:<thinking>` suffix, the
+model's entry in `modelThinkingLevels`, or `defaultThinkingLevel` says
+otherwise, in that order. Switching models keeps the level in effect, unless
+`modelThinkingLevels` or `defaultThinkingLevel` sets one for the new model.
+Requests carry the level as the model's catalog entry names it, and the
+model's output cap, lowered to fit its context window.
 
 ### System prompt
 
@@ -562,8 +625,8 @@ images in tool results:
 | Bedrock Converse | Amazon Bedrock | Sent in the tool result |
 | OpenAI chat completions | OpenAI chat models, OpenRouter, Cloudflare, Mistral, and the OpenAI-compatible aliases | Not sent; the result says the image was left out |
 
-pi's model catalog does not record which models accept images, so an image is
-sent to every model behind the first four APIs. `images.blockImages` keeps
+pi decides by API, not yet by the model's `input` in the catalog, so an image
+is sent to every model behind the first four APIs. `images.blockImages` keeps
 `read` from returning images at all, and `images.autoResize` (on by default)
 scales an image down to at most 2000 pixels a side and 4.5 MB.
 
@@ -653,7 +716,7 @@ account:
     "default": { "type": "api_key", "key": "env:ANTHROPIC_API_KEY" },
     "work": { "type": "api_key", "key": "env:WORK_ANTHROPIC_API_KEY" }
   },
-  "azure-openai-responses": { "default": { "type": "api_key", "key": "env:AZURE_OPENAI_API_KEY" } },
+  "azure": { "default": { "type": "api_key", "key": "env:AZURE_OPENAI_API_KEY" } },
   "google": { "default": { "type": "api_key", "key": "env:GEMINI_API_KEY" } },
   "google-vertex": { "default": { "type": "api_key", "key": "env:GOOGLE_CLOUD_API_KEY" } },
   "github-copilot": { "default": { "type": "api_key", "key": "env:COPILOT_GITHUB_TOKEN" } },
@@ -686,7 +749,10 @@ account:
 ```
 
 Older flat files (`{ "openai": { "type": "api_key", ... } }`) are migrated on
-read; writes always use the nested form. Without an explicit selection the
+read; writes always use the nested form. The Azure provider is `azure`, as
+upstream names it; an entry, a saved default, a session, or a `models.json`
+model under the id earlier versions used, `azure-openai-responses`, is read
+as `azure`. Without an explicit selection the
 `default` account is used, or the sole account when only one exists.
 
 `auth.json` is written atomically and owner-only (`0600`; a missing agent
@@ -768,15 +834,10 @@ Provider-specific environment:
 - Amazon Bedrock: Rust direct calls currently use Bedrock bearer-token auth via `AWS_BEARER_TOKEN_BEDROCK`.
 - Claude Code OAuth: requests identify as `claude-cli/<version>`. The version tracks the latest published Claude Code release (fetched from the npm registry during model refresh, cached in `model-cache.json`); set `PI_CLAUDE_CODE_VERSION` to pin it.
 
-`models.json` may override the built-in model list:
+`models.json` adds models to the built-in catalog or redefines them:
 
 ```json
 [
-  {
-    "provider": "openai",
-    "id": "gpt-5.4",
-    "api": "openai-responses"
-  },
   {
     "provider": "anthropic",
     "id": "claude-sonnet-4-5",
@@ -787,9 +848,36 @@ Provider-specific environment:
     "id": "moonshotai/kimi-k2.6",
     "api": "openai-completions",
     "baseUrl": "https://openrouter.ai/api/v1"
+  },
+  {
+    "provider": "local",
+    "id": "my-model",
+    "api": "openai-completions",
+    "baseUrl": "http://127.0.0.1:8080/v1",
+    "contextWindow": 32000,
+    "maxTokens": 4000,
+    "reasoning": true,
+    "thinkingLevelMap": { "minimal": null, "xhigh": "xhigh" }
   }
 ]
 ```
+
+An entry is used as written: `provider`, `id`, `name`, `api`, and `baseUrl`
+(without one, the API's own default endpoint). The fields that describe the
+model are upstream's and optional: `contextWindow`, `maxTokens` (the output
+cap), `reasoning`, `thinkingLevelMap` (`null` for a level the model lacks, a
+string for what the provider is sent for a level; `xhigh` and `max` exist only
+when named), `input`, and `cost`. What an entry leaves out comes from the
+built-in model of the same id, else from its provider's default model, as for
+`--model provider/new-id`. For a provider the catalog does not know, a model
+has no thinking levels and requests carry no output cap unless the entry says
+so (the Anthropic API requires one: 16384). The file's format is this port's
+own; upstream's `providers` format is not read.
+
+A base URL names the API's root, as it does upstream: pi appends
+`/v1/messages` (Anthropic), `/chat/completions` (OpenAI chat),
+`/responses`, or `/v1/chat/completions` (Mistral). An Anthropic or Mistral
+URL that already ends in `/v1` gets only the rest of the path.
 
 `model-cache.json` is managed by `pi`. On startup, `pi` uses built-in models,
 cached models, and explicit `models.json` entries immediately, then starts a
@@ -799,9 +887,14 @@ provider has supported auth. `/reload` also kicks a refresh. Refreshed models
 are available after `/reload` or the next startup. Refresh covers `anthropic`,
 `openai`, and `openai-codex` (API key or OAuth login), plus the
 OpenAI-compatible `zai`, `zai-coding`, `moonshotai`, and `kimi-coding-openai`
-endpoints via their API keys. Anthropic refresh paginates the official Models
-API; OAuth refresh is best-effort against the same provider auth paths used
-for model requests.
+endpoints via their API keys, each at the base URL the catalog gives the
+provider. Anthropic refresh paginates the official Models API; OAuth refresh
+is best-effort against the same provider auth paths used for model requests.
+
+A listing says which models a provider serves, not what they can do. A listed
+model the catalog has stays as the catalog defines it; one it lacks is built
+on the provider's default model, like `--model provider/new-id`, and keeps
+the listing's name and context window.
 
 Refresh is defensive about partial failures. A provider that returns an empty
 list keeps its cached models instead of wiping them, an exhausted pagination
@@ -819,11 +912,15 @@ Two slash commands manage the cache directly:
   starts from built-in models plus explicit `models.json` entries only; run
   `/models refresh` to repopulate.
 
-Thinking levels can be set with `--thinking <level>` or `/thinking <level>`.
-Supported levels are model-specific. Opus exposes `high`, `xhigh`, and `max`;
-OpenAI/Codex reasoning models expose `minimal` through `xhigh`. While the
-`/model` selector is open, left/right adjusts the pending thinking level and
-Enter applies both the model and thinking level to the session. `/new` starts
+Thinking levels can be set with `--thinking <level>` or `/thinking <level>`
+(see [Models and thinking levels](#models-and-thinking-levels)). `/thinking`
+alone shows the level in effect, and `/thinking <level>` takes one of the
+levels the model supports, naming them when it is given another. `/model
+<provider/id>` or `/model <id>` switches to that model, ignoring case; any
+other text opens the picker with it as the search. While the `/model`
+selector is open, each model shows the level selecting it would apply,
+left/right walks the model's own levels, and Enter applies the model and that
+level to the session. `/new` starts
 fresh conversation history while retaining the current model, thinking level,
 and account selection; these selections are persisted in the new session.
 `/thinking off` remains explicitly off rather than inheriting a default.
@@ -1123,8 +1220,8 @@ failing: the failure is reported in the transcript with a token breakdown
 (`system prompt`/`tools`/`persistent instructions`/`retained recent turns`),
 and re-attempts are skipped until history changes. If the provider then
 refuses the request as too large, "Run recovery" below applies.
-Known model windows come from the catalog/provider metadata; custom `models.json`
-entries can specify `contextWindow`. Unknown windows fall back to 128,000 tokens.
+Model windows come from the catalog; custom `models.json` entries can specify
+`contextWindow`. Unknown windows fall back to 128,000 tokens.
 Token counts are heuristics, not exact provider tokenization.
 
 The agent per-run round cap is configurable alongside compaction and retry:
@@ -1227,9 +1324,15 @@ messages for the next prompt. While a run is active, a `prompt` needs
 `set_thinking_level`, `set_auto_retry`, `compact`, `new_session`,
 `switch_session`, `set_session_name`, and `resume_run` are refused; and
 `get_state`, `get_messages`, and `get_last_assistant_text` answer from the
-run's current state. `set_model` changes the session's model, not the default
-model in `settings.json`; `set_auto_retry` likewise turns retries on or off
-for this process only.
+run's current state. `set_model` takes a model that can run now (its provider
+has credentials) by exact provider and id, and changes the session's model,
+not the default model in `settings.json`; the thinking level follows as it
+does for any model switch. `set_thinking_level` clamps the level to what the
+model supports. Both report a change of the level in effect with
+`thinking_level_changed`. `get_state` gives the model with the catalog's
+fields (`reasoning`, `thinkingLevelMap`, `input`, `cost`, `contextWindow`,
+`maxTokens`) and, as `thinkingLevel`, the level in effect. `set_auto_retry`
+turns retries on or off for this process only.
 
 A run that recovers (see "Run recovery") reports it as upstream does. The
 reply it drops ends its turn: `message_end` with `stopReason` `error` (or

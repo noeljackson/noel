@@ -927,6 +927,7 @@ mod tests {
                 thinking_level: None,
                 thinking_budget_tokens: None,
                 session_id: None,
+                traits: pi_ai::ModelTraits::default(),
             },
             pi_ai::provider_http_client_with_idle_timeout(Duration::from_millis(300)),
         );

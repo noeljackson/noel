@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
+pub mod catalog;
+
+pub use catalog::{ModelTraits, ThinkingLevelMap};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRef {
     pub provider: String,
@@ -75,6 +79,43 @@ pub enum ProviderApi {
     Mistral,
 }
 
+impl ProviderApi {
+    /// Upstream's name for the API, as model catalogs spell it.
+    pub fn upstream_name(&self) -> &'static str {
+        match self {
+            Self::Faux => "faux",
+            Self::OpenAi => "openai-completions",
+            Self::OpenAiResponses => "openai-responses",
+            Self::OpenAiCodexResponses => "openai-codex-responses",
+            Self::AzureOpenAiResponses => "azure-openai-responses",
+            Self::Anthropic => "anthropic-messages",
+            Self::Google => "google-generative-ai",
+            Self::GoogleVertex => "google-vertex",
+            Self::Bedrock => "bedrock-converse-stream",
+            Self::Mistral => "mistral-conversations",
+        }
+    }
+
+    /// The API with that upstream name; `None` for one pi has no adapter
+    /// for.
+    pub fn from_upstream_name(name: &str) -> Option<Self> {
+        [
+            Self::Faux,
+            Self::OpenAi,
+            Self::OpenAiResponses,
+            Self::OpenAiCodexResponses,
+            Self::AzureOpenAiResponses,
+            Self::Anthropic,
+            Self::Google,
+            Self::GoogleVertex,
+            Self::Bedrock,
+            Self::Mistral,
+        ]
+        .into_iter()
+        .find(|api| api.upstream_name() == name)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageProviderApi {
     OpenRouterImages,
@@ -86,9 +127,15 @@ pub struct ProviderConfig {
     pub api: ProviderApi,
     pub base_url: Option<String>,
     pub auth: ProviderAuth,
+    /// The thinking level requests ask for, already clamped to the model:
+    /// `off` turns thinking off where the model allows that, and `None`
+    /// sends no thinking parameter (a model without reasoning).
     pub thinking_level: Option<String>,
     pub thinking_budget_tokens: Option<u64>,
     pub session_id: Option<String>,
+    /// The model's output cap, context window, and names for the thinking
+    /// levels; empty for a model nothing is known about.
+    pub traits: ModelTraits,
 }
 
 #[derive(Debug, Clone)]
@@ -444,19 +491,15 @@ pub trait Provider: Send + Sync {
     }
 }
 
-/// The model's output limit before any clamp to the context window: upstream's
-/// catalog `maxTokens`, for the models whose limit pi knows. Those are the
-/// models whose requests carry an explicit cap: every model served over the
-/// Anthropic API, and the ones in `catalog_output_limits`.
+/// The model's output limit before any clamp to the context window: its
+/// catalog `maxTokens` ([`ModelTraits::max_tokens`]), which upstream compares
+/// a cut-off reply with (`isRecoverableLength`). A model without one that is
+/// served over the Anthropic API has the cap its requests carry; any other
+/// has no known limit.
 pub fn model_output_limit(config: &ProviderConfig) -> Option<u64> {
-    let model = &config.model;
-    match config.api {
-        ProviderApi::Anthropic => Some(
-            claude_output_limits(&model.id)
-                .map_or(ANTHROPIC_UNCATALOGED_MAX_TOKENS, |limits| limits.0),
-        ),
-        _ => catalog_output_limits(&model.provider, &model.id).map(|limits| limits.0),
-    }
+    config.traits.max_tokens.or_else(|| {
+        (config.api == ProviderApi::Anthropic).then_some(ANTHROPIC_UNCATALOGED_MAX_TOKENS)
+    })
 }
 
 pub fn create_provider(config: ProviderConfig) -> Box<dyn Provider> {
@@ -1166,6 +1209,12 @@ impl OpenAiProvider {
     }
 
     fn chat_base_url(&self) -> Result<String, ProviderError> {
+        // Azure's catalog models carry no URL: the resource comes from the
+        // environment, and without one the request must fail rather than
+        // take an Azure key to OpenAI's endpoint.
+        if is_azure_provider(&self.config.model.provider) {
+            return azure_openai_base_url(self.config.base_url.as_deref());
+        }
         resolve_env_placeholders(
             self.config
                 .base_url
@@ -1175,9 +1224,21 @@ impl OpenAiProvider {
     }
 }
 
+/// Upstream's Azure provider id, and the id this port used before it.
+pub const AZURE_PROVIDER: &str = "azure";
+pub const LEGACY_AZURE_PROVIDER: &str = "azure-openai-responses";
+
+fn is_azure_provider(provider: &str) -> bool {
+    provider == AZURE_PROVIDER || provider == LEGACY_AZURE_PROVIDER
+}
+
 fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     let mut body = json!({
-        "model": config.model.id,
+        "model": if is_azure_provider(&config.model.provider) {
+            azure_deployment_name(&config.model.id)
+        } else {
+            config.model.id.clone()
+        },
         "messages": openai_chat_messages(config, request),
         "stream": true,
     });
@@ -1191,7 +1252,7 @@ fn openai_chat_completions_body(config: &ProviderConfig, request: &ProviderReque
     if config.model.provider == "openrouter" {
         body["stream_options"] = json!({ "include_usage": true });
         body["store"] = json!(false);
-        if let Some(effort) = openrouter_reasoning_effort(config.thinking_level.as_deref()) {
+        if let Some(effort) = reasoning_effort(config) {
             body["reasoning"] = json!({ "effort": effort });
         }
     } else if matches!(
@@ -1345,46 +1406,21 @@ fn derive_mistral_tool_call_id(id: &str) -> String {
         .collect()
 }
 
-fn openrouter_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
-    match normalized_thinking_level(level)? {
-        "off" => Some("none"),
-        "minimal" | "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" | "xhigh" | "max" => Some("high"),
-        _ => None,
-    }
-}
-
-/// Upstream catalog limits `(maxTokens, contextWindow)` for the models whose
-/// requests carry an explicit output cap (TS `packages/ai/src/providers/data`).
-fn catalog_output_limits(provider: &str, id: &str) -> Option<(u64, u64)> {
-    match (provider, id) {
-        ("openai", "gpt-5.4") => Some((128_000, 272_000)),
-        ("github-copilot", "gpt-5.4") => Some((128_000, 1_000_000)),
-        ("google", "gemini-2.5-pro") => Some((65_536, 1_048_576)),
-        ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1") => Some((128_000, 1_000_000)),
-        ("mistral", "devstral-medium-latest") => Some((262_144, 262_144)),
-        ("openrouter", "moonshotai/kimi-k2.6") => Some((235_929, 262_144)),
-        ("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") => {
-            Some((256_000, 262_144))
-        }
-        _ => None,
-    }
-}
-
 /// Tokens upstream keeps free for the request beyond its estimate
 /// (`CONTEXT_SAFETY_TOKENS`).
 const CONTEXT_SAFETY_TOKENS: u64 = 4_096;
 
 /// Upstream `clampMaxTokensToContext` (`packages/ai/src/api/simple-options.ts`):
-/// the catalog `maxTokens`, lowered so the estimated input plus the answer fit
-/// the context window.
+/// the model's `maxTokens`, lowered so the estimated input plus the answer
+/// fit its context window. `None` for a model without a known output cap.
 fn provider_max_tokens(config: &ProviderConfig, request: &ProviderRequest) -> Option<u64> {
     if let Some(limit) = request.max_output_tokens {
         return Some(limit.max(1));
     }
-    let (max_tokens, context_window) =
-        catalog_output_limits(config.model.provider.as_str(), config.model.id.as_str())?;
+    let max_tokens = config.traits.max_tokens?;
+    let Some(context_window) = config.traits.context_window else {
+        return Some(max_tokens);
+    };
     let available = context_window
         .saturating_sub(estimate_request_tokens(request))
         .saturating_sub(CONTEXT_SAFETY_TOKENS)
@@ -1441,7 +1477,7 @@ fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> 
     if !request.tools.is_empty() {
         body["tools"] = json!(openai_responses_tools(&request.tools, json!(false)));
     }
-    if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
+    if let Some(effort) = reasoning_effort(config) {
         body["reasoning"] = json!({
             "effort": effort,
             "summary": "auto",
@@ -1461,7 +1497,9 @@ fn github_copilot_responses_body(config: &ProviderConfig, request: &ProviderRequ
         "store": false,
         "include": ["reasoning.encrypted_content"],
     });
-    if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
+    // Copilot is sent no reasoning parameter when thinking is off
+    // (upstream `openai-responses.ts`).
+    if let Some(effort) = reasoning_effort(config).filter(|_| !thinking_is_off(config)) {
         body["reasoning"] = json!({
             "effort": effort,
             "summary": "auto",
@@ -1494,7 +1532,7 @@ fn openai_codex_responses_body(config: &ProviderConfig, request: &ProviderReques
         "tool_choice": "auto",
         "parallel_tool_calls": true,
     });
-    if let Some(effort) = openai_reasoning_effort(config.thinking_level.as_deref()) {
+    if let Some(effort) = reasoning_effort(config) {
         body["reasoning"] = json!({
             "effort": effort,
             "summary": "auto",
@@ -1763,17 +1801,15 @@ fn anthropic_messages_url(config: &ProviderConfig) -> Result<String, ProviderErr
     if normalized.ends_with("/v1") {
         return Ok(format!("{normalized}/messages"));
     }
-    if config.model.provider == "anthropic" {
-        Ok(format!("{normalized}/messages"))
-    } else {
-        Ok(format!("{normalized}/v1/messages"))
-    }
+    // A base URL names the API root, as it does for upstream's SDK client:
+    // the catalog's `https://api.anthropic.com`, a gateway's
+    // `https://api.kimi.com/coding`.
+    Ok(format!("{normalized}/v1/messages"))
 }
 
 fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
-    let max_tokens = request
-        .max_output_tokens
-        .unwrap_or_else(|| anthropic_default_max_tokens(&config.model.id, request))
+    let max_tokens = provider_max_tokens(config, request)
+        .unwrap_or(ANTHROPIC_UNCATALOGED_MAX_TOKENS)
         .max(1);
     let mut body = json!({
         "model": config.model.id,
@@ -1806,62 +1842,9 @@ fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     body
 }
 
-/// Upstream's output cap for a model without a catalog limit.
+/// The output cap of an Anthropic Messages request for a model without a
+/// catalog limit: Anthropic requires one, and this is upstream's default.
 const ANTHROPIC_UNCATALOGED_MAX_TOKENS: u64 = 16_384;
-
-/// Output cap for an Anthropic Messages request that carries none. Upstream
-/// sends the model's catalog `maxTokens`, lowered so the estimated input fits
-/// the context window (`clampMaxTokensToContext`). The port has no output
-/// catalog, so Claude limits come from the model id; other models served over
-/// the Anthropic API get upstream's default for models without a catalog
-/// limit.
-fn anthropic_default_max_tokens(model_id: &str, request: &ProviderRequest) -> u64 {
-    let Some((max_tokens, context_window)) = claude_output_limits(model_id) else {
-        return ANTHROPIC_UNCATALOGED_MAX_TOKENS;
-    };
-    let available = context_window
-        .saturating_sub(estimate_request_tokens(request))
-        .saturating_sub(CONTEXT_SAFETY_TOKENS)
-        .max(1);
-    max_tokens.min(available)
-}
-
-/// `(max output tokens, context window)` of a Claude model, read from the
-/// version in its id: `claude-opus-4-1-20250805`, `claude-sonnet-5`,
-/// `claude-3-5-haiku-20241022`. A date suffix is not a minor version.
-fn claude_output_limits(model_id: &str) -> Option<(u64, u64)> {
-    let id = model_id
-        .to_ascii_lowercase()
-        .replace(['.', '_', ':', '@'], "-");
-    let name = id.split("claude-").nth(1)?;
-    // Claude 3 ids put the version before the family.
-    if let Some(minor) = name.strip_prefix("3-") {
-        return Some(match minor.split('-').next() {
-            Some("7") => (64_000, 200_000),
-            Some("5") => (8_192, 200_000),
-            _ => (4_096, 200_000),
-        });
-    }
-    let mut parts = name.split('-');
-    let family = parts.next()?;
-    if matches!(family, "fable" | "mythos") {
-        return Some((128_000, 1_000_000));
-    }
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor = parts
-        .next()
-        .and_then(|part| part.parse::<u32>().ok())
-        .filter(|minor| *minor < 100)
-        .unwrap_or(0);
-    match (family, major, minor) {
-        ("opus" | "sonnet" | "haiku", 5.., _) | ("opus" | "sonnet", 4, 6..) => {
-            Some((128_000, 1_000_000))
-        }
-        ("sonnet" | "haiku", 4, _) | ("opus", 4, 5) => Some((64_000, 200_000)),
-        ("opus", 4, _) => Some((32_000, 200_000)),
-        _ => None,
-    }
-}
 
 fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
     // Anthropic allows at most 4 cache_control breakpoints per request, and
@@ -1996,7 +1979,7 @@ fn anthropic_cached_text_block(text: &str) -> Value {
 }
 
 fn apply_anthropic_thinking(body: &mut Value, config: &ProviderConfig) {
-    let Some(level) = normalized_thinking_level(config.thinking_level.as_deref()) else {
+    let Some(level) = unclamped_thinking_level(config) else {
         return;
     };
     if level == "off" {
@@ -2009,7 +1992,8 @@ fn apply_anthropic_thinking(body: &mut Value, config: &ProviderConfig) {
             "display": "summarized",
         });
         body["output_config"] = json!({
-            "effort": anthropic_adaptive_effort(&config.model.id, level),
+            "effort": mapped_thinking_level(config, level)
+                .unwrap_or_else(|| anthropic_adaptive_effort(&config.model.id, level)),
         });
     } else {
         body["thinking"] = json!({
@@ -2052,17 +2036,75 @@ fn anthropic_adaptive_effort(model_id: &str, level: &str) -> &'static str {
     }
 }
 
-fn openai_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
-    match normalized_thinking_level(level)? {
-        "off" => Some("none"),
-        "minimal" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" => Some("high"),
-        "xhigh" => Some("xhigh"),
-        "max" => Some("xhigh"),
-        _ => None,
+/// The reasoning effort a request names for the configured thinking level:
+/// the model's own name for the level where its catalog entry has one
+/// (upstream `model.thinkingLevelMap?.[level] ?? level`), `none` for `off`,
+/// and otherwise the level itself. `None` without a thinking level.
+fn reasoning_effort(config: &ProviderConfig) -> Option<String> {
+    let level = request_thinking_level(config)?;
+    if let Some(mapped) = mapped_thinking_level(config, level) {
+        return Some(mapped.to_string());
     }
+    Some(
+        match level {
+            "off" => "none",
+            // Only a model whose entry names `max` is set to it; a caller
+            // that asks anyway gets the highest effort the API defines.
+            "max" => "xhigh",
+            level => level,
+        }
+        .to_string(),
+    )
+}
+
+/// The thinking level a request is built for. A model known to have no
+/// reasoning gets none, and a level a known model does not support becomes
+/// the nearest one it does (upstream `clampThinkingLevel`, which its request
+/// builders apply too). A model nothing is known about keeps the level as
+/// configured.
+fn request_thinking_level(config: &ProviderConfig) -> Option<&'static str> {
+    let level = normalized_thinking_level(config.thinking_level.as_deref())?;
+    match config.traits.reasoning {
+        Some(false) => None,
+        Some(true) => Some(catalog::clamp_thinking_level(
+            true,
+            config.traits.thinking_level_map.as_ref(),
+            level,
+        )),
+        None => Some(level),
+    }
+}
+
+/// The level for the request builders that do not clamp (Anthropic and
+/// Bedrock, as upstream's): the configured one, or none for a model known
+/// to have no reasoning or that cannot turn thinking off when asked to.
+fn unclamped_thinking_level(config: &ProviderConfig) -> Option<&'static str> {
+    let level = normalized_thinking_level(config.thinking_level.as_deref())?;
+    let cannot_turn_off = || {
+        config
+            .traits
+            .thinking_level_map
+            .as_ref()
+            .is_some_and(|map| map.get("off") == Some(&None))
+    };
+    if config.traits.reasoning == Some(false) || (level == "off" && cannot_turn_off()) {
+        return None;
+    }
+    Some(level)
+}
+
+/// The model's own name for `level`, if its catalog entry gives one.
+fn mapped_thinking_level<'a>(config: &'a ProviderConfig, level: &str) -> Option<&'a str> {
+    config
+        .traits
+        .thinking_level_map
+        .as_ref()?
+        .get(level)?
+        .as_deref()
+}
+
+fn thinking_is_off(config: &ProviderConfig) -> bool {
+    request_thinking_level(config) == Some("off")
 }
 
 fn normalized_thinking_level(level: Option<&str>) -> Option<&'static str> {
@@ -2206,7 +2248,7 @@ fn google_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 }
 
 fn google_thinking_config(config: &ProviderConfig) -> Option<Value> {
-    let level = normalized_thinking_level(config.thinking_level.as_deref())?;
+    let level = request_thinking_level(config)?;
     if level == "off" {
         return Some(json!({ "thinkingBudget": 0 }));
     }
@@ -2293,18 +2335,9 @@ struct MistralProvider {
 impl Provider for MistralProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
         let api_key = self.api_key()?;
-        let base_url = resolve_env_placeholders(
-            self.config
-                .base_url
-                .as_deref()
-                .unwrap_or("https://api.mistral.ai/v1"),
-        )?;
         let response = self
             .client
-            .post(format!(
-                "{}/chat/completions",
-                base_url.trim_end_matches('/')
-            ))
+            .post(mistral_chat_url(&self.config)?)
             .headers(mistral_headers(&self.config, &api_key)?)
             .json(&mistral_chat_body(&self.config, &request))
             .send()
@@ -2337,18 +2370,9 @@ impl Provider for MistralProvider {
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
     ) -> Result<(), ProviderError> {
         let api_key = self.api_key()?;
-        let base_url = resolve_env_placeholders(
-            self.config
-                .base_url
-                .as_deref()
-                .unwrap_or("https://api.mistral.ai/v1"),
-        )?;
         let response = self
             .client
-            .post(format!(
-                "{}/chat/completions",
-                base_url.trim_end_matches('/')
-            ))
+            .post(mistral_chat_url(&self.config)?)
             .headers(mistral_headers(&self.config, &api_key)?)
             .json(&mistral_chat_body(&self.config, &request))
             .send()
@@ -2389,6 +2413,24 @@ impl MistralProvider {
                 provider: self.config.model.provider.clone(),
             }),
         }
+    }
+}
+
+/// Mistral's chat completions URL. A base URL names the API root, as it does
+/// for upstream's SDK client (the catalog's `https://api.mistral.ai`); one
+/// that already ends in `/v1` is used as it is.
+fn mistral_chat_url(config: &ProviderConfig) -> Result<String, ProviderError> {
+    let base_url = resolve_env_placeholders(
+        config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://api.mistral.ai"),
+    )?;
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/v1") {
+        Ok(format!("{base_url}/chat/completions"))
+    } else {
+        Ok(format!("{base_url}/v1/chat/completions"))
     }
 }
 
@@ -2562,7 +2604,7 @@ fn bedrock_messages_with_cache(config: &ProviderConfig, messages: &[ChatMessage]
 }
 
 fn bedrock_additional_model_request_fields(config: &ProviderConfig) -> Option<Value> {
-    let level = normalized_thinking_level(config.thinking_level.as_deref())?;
+    let level = unclamped_thinking_level(config)?;
     if !bedrock_is_anthropic_claude(&config.model.id) || level == "off" {
         return None;
     }
@@ -2573,7 +2615,8 @@ fn bedrock_additional_model_request_fields(config: &ProviderConfig) -> Option<Va
                 "display": "summarized",
             },
             "output_config": {
-                "effort": bedrock_adaptive_effort(&config.model.id, level),
+                "effort": mapped_thinking_level(config, level)
+                    .unwrap_or_else(|| bedrock_adaptive_effort(&config.model.id, level)),
             },
         }));
     }
@@ -3477,11 +3520,13 @@ fn google_vertex_url(config: &ProviderConfig) -> Result<String, ProviderError> {
     let location = env::var("GOOGLE_CLOUD_LOCATION").map_err(|_| {
         ProviderError::Config("GOOGLE_CLOUD_LOCATION is required for google-vertex".to_string())
     })?;
+    // The catalog writes the location as `{location}`.
     let base_url = resolve_env_placeholders(
-        config
+        &config
             .base_url
             .as_deref()
-            .unwrap_or("https://{GOOGLE_CLOUD_LOCATION}-aiplatform.googleapis.com"),
+            .unwrap_or("https://{location}-aiplatform.googleapis.com")
+            .replace("{location}", &location),
     )?;
     Ok(format!(
         "{}/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
@@ -4497,6 +4542,7 @@ fn role_name(role: &ChatRole) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn request_local_output_budget_overrides_provider_defaults_without_changing_regular_requests() {
@@ -4517,6 +4563,11 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits {
+                context_window: Some(272_000),
+                max_tokens: Some(128_000),
+                ..ModelTraits::default()
+            },
         };
         assert_eq!(
             openai_chat_completions_body(&config, &request)["max_tokens"],
@@ -4556,6 +4607,11 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits {
+                context_window: Some(262_144),
+                max_tokens: Some(256_000),
+                ..ModelTraits::default()
+            },
         };
         let request = |content: &str| ProviderRequest {
             max_output_tokens: None,
@@ -4570,11 +4626,20 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        // Small input: the catalog cap.
+        // Small input: the model's cap.
         assert_eq!(
             provider_max_tokens(&config, &request("hello")),
             Some(256_000)
         );
+        // No known window: the cap as it is. No known cap: none is sent.
+        let mut unknown = config.clone();
+        unknown.traits.context_window = None;
+        assert_eq!(
+            provider_max_tokens(&unknown, &request("hello")),
+            Some(256_000)
+        );
+        unknown.traits.max_tokens = None;
+        assert_eq!(provider_max_tokens(&unknown, &request("hello")), None);
         // 300k characters estimate as 85_715 tokens; with the 4 for the system
         // prompt and the 4096 safety margin, 172_329 remain for the answer.
         let long = "x".repeat(300_000);
@@ -4715,6 +4780,7 @@ mod tests {
                 thinking_level: None,
                 thinking_budget_tokens: None,
                 session_id: None,
+                traits: ModelTraits::default(),
             },
             provider_http_client_with_idle_timeout(Duration::from_millis(300)),
         );
@@ -4756,6 +4822,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         });
 
         let events = provider
@@ -5210,12 +5277,29 @@ mod tests {
         assert!(!error.is_context_overflow("openai"));
     }
 
+    /// The limit a cut-off reply is compared with is the catalog's
+    /// `maxTokens`, for every built-in model.
     #[test]
-    fn output_limits_are_known_for_claude_and_cataloged_models() {
-        let config = |api: ProviderApi, provider: &str, id: &str| ProviderConfig {
+    fn output_limits_are_the_catalogs_for_every_built_in_model() {
+        let models = catalog::builtin_models();
+        assert!(models.len() > 1000, "{} models", models.len());
+        for model in models {
+            assert!(model.max_tokens > 0, "{}/{}", model.provider, model.id);
+            assert_eq!(
+                model_output_limit(&builtin_config(model)),
+                Some(model.max_tokens),
+                "{}/{}",
+                model.provider,
+                model.id
+            );
+        }
+
+        // A model nothing is known about, as a `models.json` entry without
+        // `maxTokens` is: the cap its Anthropic requests carry, else none.
+        let unknown = |api: ProviderApi| ProviderConfig {
             model: ModelRef {
-                provider: provider.to_string(),
-                id: id.to_string(),
+                provider: "local".to_string(),
+                id: "llama".to_string(),
             },
             api,
             base_url: None,
@@ -5223,26 +5307,23 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
-        let limit = |api, provider, id| model_output_limit(&config(api, provider, id));
         assert_eq!(
-            limit(ProviderApi::Anthropic, "anthropic", "claude-opus-4-6"),
-            Some(128_000)
-        );
-        assert_eq!(
-            limit(ProviderApi::Anthropic, "anthropic", "claude-sonnet-4-5"),
-            Some(64_000)
-        );
-        // Upstream's default for a model the Anthropic catalog does not have.
-        assert_eq!(
-            limit(ProviderApi::Anthropic, "kimi-coding", "kimi-for-coding"),
+            model_output_limit(&unknown(ProviderApi::Anthropic)),
             Some(16_384)
         );
+        assert_eq!(model_output_limit(&unknown(ProviderApi::OpenAi)), None);
         assert_eq!(
-            limit(ProviderApi::OpenAiResponses, "openai", "gpt-5.4"),
-            Some(128_000)
+            model_output_limit(&ProviderConfig {
+                traits: ModelTraits {
+                    max_tokens: Some(4_096),
+                    ..ModelTraits::default()
+                },
+                ..unknown(ProviderApi::OpenAi)
+            }),
+            Some(4_096)
         );
-        assert_eq!(limit(ProviderApi::OpenAi, "local", "llama"), None);
     }
 
     #[tokio::test]
@@ -5703,6 +5784,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
         let google = google_messages(&google_config, &request.messages);
         assert_eq!(google[0]["parts"][1]["inlineData"]["mimeType"], "image/png");
@@ -5882,6 +5964,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
 
         let mut openai = config.clone();
@@ -5938,6 +6021,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
 
         let body = openai_chat_completions_body(&config, &request);
@@ -6000,6 +6084,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
 
         let body = anthropic_body(&config, &request);
@@ -6130,6 +6215,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
 
         let body = google_body(&config, &request);
@@ -6179,6 +6265,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
 
         let gemini_2 = google_messages(&config, &messages);
@@ -6255,6 +6342,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
 
         let body = mistral_chat_body(&config, &request);
@@ -6314,6 +6402,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
 
         let body = bedrock_body(&config, &request);
@@ -6458,6 +6547,7 @@ mod tests {
                 thinking_level: None,
                 thinking_budget_tokens: None,
                 session_id: None,
+                traits: ModelTraits::default(),
             })
             .expect("anthropic compatible url"),
             "https://api.fireworks.ai/inference/v1/messages"
@@ -6476,6 +6566,384 @@ mod tests {
         );
     }
 
+    /// A request config for a built-in model as pi builds one.
+    fn builtin_config(model: &catalog::CatalogModel) -> ProviderConfig {
+        ProviderConfig {
+            model: ModelRef {
+                provider: model.provider.clone(),
+                id: model.id.clone(),
+            },
+            api: model.api.clone(),
+            base_url: model.base_url.clone(),
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+            traits: ModelTraits::from(model),
+        }
+    }
+
+    /// A request config for the model `provider` starts on.
+    fn provider_config(provider: &str) -> ProviderConfig {
+        builtin_config(
+            catalog::provider_base_model(provider)
+                .unwrap_or_else(|| panic!("{provider} has no built-in model")),
+        )
+    }
+
+    /// The catalog's base URLs are API roots, as upstream's SDK clients take
+    /// them. Every built-in model's request goes to its own base URL plus
+    /// the path its API defines; no provider is special.
+    #[test]
+    fn every_catalog_base_url_gets_its_apis_path() {
+        let mut checked = BTreeMap::new();
+        for model in catalog::builtin_models() {
+            // A URL from the environment (Azure, Cloudflare) is covered by
+            // its own test.
+            let Some(base) = model.base_url.as_deref().filter(|base| !base.contains('{')) else {
+                continue;
+            };
+            let config = builtin_config(model);
+            let (url, path) = match model.api {
+                ProviderApi::Faux => continue,
+                ProviderApi::OpenAi => {
+                    let provider = OpenAiProvider {
+                        config,
+                        client: reqwest::Client::new(),
+                    };
+                    (
+                        format!("{}/chat/completions", provider.chat_base_url().unwrap()),
+                        "/chat/completions".to_string(),
+                    )
+                }
+                ProviderApi::OpenAiResponses => {
+                    let provider = OpenAiResponsesProvider {
+                        config,
+                        endpoint: OpenAiResponsesEndpoint::OpenAi,
+                        client: reqwest::Client::new(),
+                    };
+                    (
+                        provider.request_parts(false).unwrap().0,
+                        "/responses".to_string(),
+                    )
+                }
+                ProviderApi::OpenAiCodexResponses => (
+                    codex_responses_url(base).unwrap(),
+                    "/codex/responses".to_string(),
+                ),
+                ProviderApi::Anthropic => (
+                    anthropic_messages_url(&config).unwrap(),
+                    "/v1/messages".to_string(),
+                ),
+                ProviderApi::Google => (
+                    google_url(&config).unwrap(),
+                    format!(
+                        "/models/{}:streamGenerateContent?alt=sse",
+                        encode_path_segment(&model.id)
+                    ),
+                ),
+                ProviderApi::Mistral => (
+                    mistral_chat_url(&config).unwrap(),
+                    "/v1/chat/completions".to_string(),
+                ),
+                // Bedrock and Vertex build their URLs from the region and
+                // project; Azure has no catalog URL.
+                ProviderApi::Bedrock
+                | ProviderApi::GoogleVertex
+                | ProviderApi::AzureOpenAiResponses => continue,
+            };
+            assert_eq!(
+                url,
+                format!("{base}{path}"),
+                "{}/{}",
+                model.provider,
+                model.id
+            );
+            *checked.entry(model.api.upstream_name()).or_insert(0) += 1;
+        }
+        for api in [
+            "openai-completions",
+            "openai-responses",
+            "openai-codex-responses",
+            "anthropic-messages",
+            "google-generative-ai",
+            "mistral-conversations",
+        ] {
+            assert!(
+                checked.get(api).is_some_and(|count| *count > 5),
+                "{api}: {checked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_urls_that_already_name_the_api_version_are_kept() {
+        let anthropic = |base: &str| {
+            let mut config = provider_config("anthropic");
+            config.base_url = Some(base.to_string());
+            anthropic_messages_url(&config).unwrap()
+        };
+        assert_eq!(
+            anthropic("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic("https://proxy.example/anthropic/"),
+            "https://proxy.example/anthropic/v1/messages"
+        );
+        assert_eq!(
+            anthropic("https://proxy.example/v1/messages"),
+            "https://proxy.example/v1/messages"
+        );
+        let mut mistral = provider_config("mistral");
+        mistral.base_url = Some("https://api.mistral.ai/v1".to_string());
+        assert_eq!(
+            mistral_chat_url(&mistral).unwrap(),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
+        mistral.base_url = None;
+        assert_eq!(
+            mistral_chat_url(&mistral).unwrap(),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
+    }
+
+    /// Azure's models carry no URL. A chat-completions model of Azure must
+    /// go to the Azure resource or fail, never to OpenAI's endpoint with an
+    /// Azure key.
+    #[test]
+    fn an_azure_chat_model_never_falls_back_to_openais_endpoint() {
+        let azure_chat = catalog::builtin_models()
+            .iter()
+            .find(|model| model.provider == AZURE_PROVIDER && model.api == ProviderApi::OpenAi)
+            .expect("an Azure chat-completions model");
+        assert_eq!(azure_chat.base_url, None);
+        for provider in [AZURE_PROVIDER, LEGACY_AZURE_PROVIDER] {
+            let mut config = builtin_config(azure_chat);
+            config.model.provider = provider.to_string();
+            let resolved = OpenAiProvider {
+                config: config.clone(),
+                client: reqwest::Client::new(),
+            }
+            .chat_base_url();
+            // Without AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME
+            // this is an error; with one, that resource.
+            assert!(
+                !resolved.is_ok_and(|url| url.contains("api.openai.com")),
+                "{provider}"
+            );
+            config.base_url = Some("https://example.openai.azure.com".to_string());
+            assert_eq!(
+                OpenAiProvider {
+                    config,
+                    client: reqwest::Client::new(),
+                }
+                .chat_base_url()
+                .unwrap(),
+                "https://example.openai.azure.com/openai/v1"
+            );
+        }
+        // Any other provider without a URL keeps OpenAI's default.
+        let mut openai = provider_config("openai");
+        openai.api = ProviderApi::OpenAi;
+        openai.base_url = None;
+        assert_eq!(
+            OpenAiProvider {
+                config: openai,
+                client: reqwest::Client::new(),
+            }
+            .chat_base_url()
+            .unwrap(),
+            "https://api.openai.com/v1"
+        );
+    }
+
+    fn effort_request() -> ProviderRequest {
+        ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+
+    /// A request config for a reasoning model with this thinking level map.
+    fn thinker(
+        provider: &str,
+        id: &str,
+        api: ProviderApi,
+        map: Value,
+        level: &str,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            model: ModelRef {
+                provider: provider.to_string(),
+                id: id.to_string(),
+            },
+            api,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: Some(level.to_string()),
+            thinking_budget_tokens: None,
+            session_id: None,
+            traits: ModelTraits {
+                reasoning: Some(true),
+                thinking_level_map: Some(serde_json::from_value(map).expect("level map")),
+                ..ModelTraits::default()
+            },
+        }
+    }
+
+    /// The effort a request names is the level clamped to the model and
+    /// spelled as the model's catalog entry spells it.
+    #[test]
+    fn reasoning_effort_follows_the_models_thinking_level_map() {
+        let map = json!({ "off": "none", "minimal": null, "xhigh": "xhigh" });
+        let responses = |level: &str| {
+            let config = thinker(
+                "openai",
+                "gpt-x",
+                ProviderApi::OpenAiResponses,
+                map.clone(),
+                level,
+            );
+            openai_responses_body(&config, &effort_request())["reasoning"]["effort"].clone()
+        };
+        // `off` as the model spells it; a level the model lacks becomes the
+        // nearest one it has, above first.
+        assert_eq!(responses("off"), "none");
+        assert_eq!(responses("minimal"), "low");
+        assert_eq!(responses("high"), "high");
+        assert_eq!(responses("xhigh"), "xhigh");
+        assert_eq!(responses("max"), "xhigh");
+        // A model may spell a level differently.
+        let codex = thinker(
+            "openai-codex",
+            "gpt-x",
+            ProviderApi::OpenAiCodexResponses,
+            json!({ "minimal": "low" }),
+            "minimal",
+        );
+        assert_eq!(
+            openai_codex_responses_body(&codex, &effort_request())["reasoning"]["effort"],
+            "low"
+        );
+        // OpenRouter is sent the model's own names too, not a collapsed set.
+        let openrouter = |level: &str| {
+            let config = thinker(
+                "openrouter",
+                "lab/model",
+                ProviderApi::OpenAi,
+                json!({ "off": null, "medium": null, "xhigh": "xhigh", "max": "ultra" }),
+                level,
+            );
+            openai_chat_completions_body(&config, &effort_request())["reasoning"]["effort"].clone()
+        };
+        assert_eq!(openrouter("off"), "minimal");
+        assert_eq!(openrouter("medium"), "high");
+        assert_eq!(openrouter("xhigh"), "xhigh");
+        assert_eq!(openrouter("max"), "ultra");
+        // A model known to have no reasoning is sent nothing.
+        let mut plain = thinker(
+            "openai",
+            "gpt-x",
+            ProviderApi::OpenAiResponses,
+            json!({}),
+            "high",
+        );
+        plain.traits.reasoning = Some(false);
+        assert_eq!(
+            openai_responses_body(&plain, &effort_request()).get("reasoning"),
+            None
+        );
+        // Copilot is sent nothing for `off`.
+        let copilot = |level: &str| {
+            let config = thinker(
+                "github-copilot",
+                "gpt-x",
+                ProviderApi::OpenAiResponses,
+                json!({ "off": "none" }),
+                level,
+            );
+            github_copilot_responses_body(&config, &effort_request())
+        };
+        assert_eq!(copilot("off").get("reasoning"), None);
+        assert_eq!(copilot("high")["reasoning"]["effort"], "high");
+        // Nothing known of the model: the level as configured.
+        let mut unknown = thinker(
+            "openai",
+            "gpt-x",
+            ProviderApi::OpenAiResponses,
+            json!({}),
+            "minimal",
+        );
+        unknown.traits = ModelTraits::default();
+        assert_eq!(
+            openai_responses_body(&unknown, &effort_request())["reasoning"]["effort"],
+            "minimal"
+        );
+        unknown.thinking_level = Some("max".to_string());
+        assert_eq!(
+            openai_responses_body(&unknown, &effort_request())["reasoning"]["effort"],
+            "xhigh"
+        );
+    }
+
+    #[test]
+    fn anthropic_and_bedrock_thinking_follow_the_models_thinking_level_map() {
+        let anthropic = |id: &str, map: Value, level: &str| {
+            let config = thinker("anthropic", id, ProviderApi::Anthropic, map, level);
+            anthropic_body(&config, &effort_request())
+        };
+        // The model's own names for the top levels.
+        assert_eq!(
+            anthropic("claude-sonnet-4-6", json!({ "max": "max" }), "max")["output_config"]
+                ["effort"],
+            "max"
+        );
+        assert_eq!(
+            anthropic("claude-opus-4-8", json!({ "xhigh": "xhigh" }), "xhigh")["output_config"]
+                ["effort"],
+            "xhigh"
+        );
+        // Off is said where the model can turn thinking off, and left
+        // unsaid where it cannot.
+        assert_eq!(
+            anthropic("claude-opus-4-8", json!({}), "off")["thinking"]["type"],
+            "disabled"
+        );
+        assert_eq!(
+            anthropic("claude-opus-5", json!({ "off": null }), "off").get("thinking"),
+            None
+        );
+        // A model known to have no reasoning is sent no thinking at all.
+        let mut plain = thinker(
+            "anthropic",
+            "claude-opus-4-8",
+            ProviderApi::Anthropic,
+            json!({}),
+            "high",
+        );
+        plain.traits.reasoning = Some(false);
+        assert_eq!(
+            anthropic_body(&plain, &effort_request()).get("thinking"),
+            None
+        );
+
+        let bedrock = thinker(
+            "amazon-bedrock",
+            "us.anthropic.claude-sonnet-4-6",
+            ProviderApi::Bedrock,
+            json!({ "max": "max" }),
+            "max",
+        );
+        assert_eq!(
+            bedrock_body(&bedrock, &effort_request())["additionalModelRequestFields"]
+                ["output_config"]["effort"],
+            "max"
+        );
+    }
+
     #[test]
     fn anthropic_compatible_headers_cover_kimi_static_headers() {
         let headers = anthropic_headers(&ProviderConfig {
@@ -6489,6 +6957,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         })
         .expect("headers");
 
@@ -6526,6 +6995,7 @@ mod tests {
             thinking_level: Some("max".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
         let opus_body = anthropic_body(&opus, &request);
         assert_eq!(opus_body["thinking"]["type"], "adaptive");
@@ -6542,6 +7012,7 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
         let codex_body = openai_responses_body(&codex, &request);
         assert_eq!(codex_body["reasoning"]["effort"], "xhigh");
@@ -6578,6 +7049,8 @@ mod tests {
         }
     }
 
+    /// An Anthropic request config for a model nothing is known about
+    /// beyond its id.
     fn anthropic_test_config(
         id: &str,
         thinking: Option<&str>,
@@ -6594,7 +7067,19 @@ mod tests {
             thinking_level: thinking.map(str::to_string),
             thinking_budget_tokens: budget,
             session_id: None,
+            traits: ModelTraits::default(),
         }
+    }
+
+    /// The config with the catalog's traits for its model, as pi builds
+    /// one: the output cap, the context window, and what the model supports
+    /// of thinking. The thinking level stays as the fixture asked for it;
+    /// request builders clamp it, as upstream's do.
+    fn with_catalog(mut config: ProviderConfig) -> ProviderConfig {
+        let model = catalog::builtin_model(&config.model.provider, &config.model.id)
+            .unwrap_or_else(|| panic!("{:?} is not a built-in model", config.model));
+        config.traits = ModelTraits::from(model);
+        config
     }
 
     fn uncapped_request(system_prompt: &str) -> ProviderRequest {
@@ -6616,26 +7101,26 @@ mod tests {
     #[test]
     fn anthropic_requests_without_a_cap_use_the_model_output_limit() {
         let request = uncapped_request("system");
-        for (id, expected) in [
-            ("claude-opus-4-8", 128_000),
-            ("claude-opus-5", 128_000),
-            ("claude-sonnet-4-6", 128_000),
-            ("claude-fable-5-1", 128_000),
-            ("claude-sonnet-4-5-20250929", 64_000),
-            ("claude-haiku-4-5-20251001", 64_000),
-            ("claude-opus-4-5", 64_000),
-            ("claude-sonnet-4-20250514", 64_000),
-            ("claude-opus-4-1-20250805", 32_000),
-            ("claude-opus-4-20250514", 32_000),
-            ("claude-3-7-sonnet-20250219", 64_000),
-            ("claude-3-5-haiku-20241022", 8_192),
-            ("claude-3-haiku-20240307", 4_096),
-            ("kimi-for-coding", 16_384),
-            ("MiniMax-M2.7", 16_384),
-        ] {
-            let body = anthropic_body(&anthropic_test_config(id, None, None), &request);
-            assert_eq!(body["max_tokens"], expected, "{id}");
+        // Every Anthropic model of the catalog is capped at its `maxTokens`.
+        let mut caps = BTreeSet::new();
+        for model in catalog::builtin_models() {
+            if model.provider != "anthropic" {
+                continue;
+            }
+            let config = with_catalog(anthropic_test_config(&model.id, None, None));
+            let body = anthropic_body(&config, &request);
+            assert_eq!(body["max_tokens"], model.max_tokens, "{}", model.id);
+            caps.insert(model.max_tokens);
         }
+        // The catalog tells models apart; this is not one cap for all.
+        assert!(caps.len() > 1, "{caps:?}");
+        // A model nothing is known about gets upstream's default for a
+        // model without a cap.
+        let body = anthropic_body(
+            &anthropic_test_config("claude-unlisted", None, None),
+            &request,
+        );
+        assert_eq!(body["max_tokens"], 16_384);
     }
 
     #[test]
@@ -6643,11 +7128,23 @@ mod tests {
         // The input estimates as 160_004 tokens (560k + 14 characters at 3.5
         // per token); 200k minus that and the 4096 safety margin remain.
         let request = uncapped_request(&"x".repeat(560_000));
-        let config = anthropic_test_config("claude-sonnet-4-5", None, None);
+        let with_limits = |mut config: ProviderConfig| {
+            config.traits = ModelTraits {
+                context_window: Some(200_000),
+                max_tokens: Some(64_000),
+                ..ModelTraits::default()
+            };
+            config
+        };
+        let config = with_limits(anthropic_test_config("claude-sonnet-4-5", None, None));
         assert_eq!(anthropic_body(&config, &request)["max_tokens"], 35_900);
 
         // A thinking budget stays below the cap and leaves 1024 for the answer.
-        let thinking = anthropic_test_config("claude-sonnet-4-5", Some("high"), Some(50_000));
+        let thinking = with_limits(anthropic_test_config(
+            "claude-sonnet-4-5",
+            Some("high"),
+            Some(50_000),
+        ));
         let body = anthropic_body(&thinking, &request);
         assert_eq!(body["thinking"]["budget_tokens"], 34_876);
         let body = anthropic_body(&thinking, &uncapped_request("system"));
@@ -6690,6 +7187,7 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
         let body = anthropic_body(&opus, &request);
         assert_eq!(body["thinking"]["type"], "adaptive");
@@ -6748,7 +7246,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "anthropic".to_string(),
                 id: "claude-sonnet-4-6".to_string(),
@@ -6761,7 +7259,8 @@ mod tests {
             thinking_level: Some("off".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
         let fixture_request = &fixture["request"];
 
         let headers = anthropic_headers(&config).expect("anthropic headers");
@@ -6805,7 +7304,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "anthropic".to_string(),
                 id: "claude-sonnet-4-6".to_string(),
@@ -6816,7 +7315,8 @@ mod tests {
             thinking_level: Some("off".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
         let fixture_request = &fixture["request"];
 
         let headers = anthropic_headers(&config).expect("anthropic headers");
@@ -6849,6 +7349,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
         let headers = openai_compatible_headers(&copilot, "token", true).expect("copilot headers");
         assert_eq!(
@@ -6875,6 +7376,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: Some("session-test".to_string()),
+            traits: ModelTraits::default(),
         };
         let headers =
             openai_compatible_headers(&cloudflare, "token", false).expect("cloudflare headers");
@@ -6912,7 +7414,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "openai-codex".to_string(),
                 id: "gpt-5.5".to_string(),
@@ -6926,7 +7428,8 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
         let fixture_request = &fixture["request"];
 
         let headers = codex_headers(&config.auth).expect("codex headers");
@@ -6992,7 +7495,7 @@ mod tests {
                 }),
             }],
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "openai".to_string(),
                 id: "gpt-5.4".to_string(),
@@ -7003,7 +7506,8 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
         let body = openai_responses_body(&config, &request);
         assert_eq!(body, fixture["request"]["body"]);
     }
@@ -7028,7 +7532,7 @@ mod tests {
             }],
             tools: vec![fixture_echo_tool()],
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "anthropic".to_string(),
                 id: "claude-sonnet-4-6".to_string(),
@@ -7039,7 +7543,8 @@ mod tests {
             thinking_level: Some("off".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
         let body = anthropic_body(&config, &request);
 
         assert_eq!(body, fixture["request"]["body"]);
@@ -7094,6 +7599,7 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
+            traits: ModelTraits::default(),
         };
         let body = anthropic_body(&config, &request);
 
@@ -7135,7 +7641,7 @@ mod tests {
             }],
             tools: vec![fixture_echo_tool()],
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "google".to_string(),
                 id: "gemini-2.5-pro".to_string(),
@@ -7146,7 +7652,8 @@ mod tests {
             thinking_level: Some("high".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
 
         assert_eq!(google_body(&config, &request), fixture["request"]["body"]);
     }
@@ -7170,7 +7677,7 @@ mod tests {
             }],
             tools: vec![fixture_echo_tool()],
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "mistral".to_string(),
                 id: "devstral-medium-latest".to_string(),
@@ -7181,7 +7688,8 @@ mod tests {
             thinking_level: Some("high".to_string()),
             thinking_budget_tokens: None,
             session_id: Some("session_ts_parity".to_string()),
-        };
+            traits: ModelTraits::default(),
+        });
 
         assert_eq!(
             mistral_chat_body(&config, &request),
@@ -7208,7 +7716,7 @@ mod tests {
             }],
             tools: vec![fixture_echo_tool()],
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "amazon-bedrock".to_string(),
                 id: "us.anthropic.claude-opus-4-6-v1".to_string(),
@@ -7219,7 +7727,8 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
 
         assert_eq!(bedrock_body(&config, &request), fixture["payload"]);
     }
@@ -7259,7 +7768,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "openrouter".to_string(),
                 id: "moonshotai/kimi-k2.6".to_string(),
@@ -7270,7 +7779,8 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
         let fixture_request = &fixture["request"];
 
         let headers = openai_compatible_headers(&config, "openrouter-key", false).expect("headers");
@@ -7312,7 +7822,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "github-copilot".to_string(),
                 id: "gpt-5.4".to_string(),
@@ -7323,7 +7833,8 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
         let fixture_request = &fixture["request"];
         let provider = OpenAiResponsesProvider {
             config: config.clone(),
@@ -7374,7 +7885,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "google".to_string(),
                 id: "gemini-2.5-pro".to_string(),
@@ -7385,7 +7896,8 @@ mod tests {
             thinking_level: Some("high".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
         let fixture_request = &fixture["request"];
         let headers = google_headers("google-key").expect("headers");
 
@@ -7423,7 +7935,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "amazon-bedrock".to_string(),
                 id: "us.anthropic.claude-opus-4-6-v1".to_string(),
@@ -7434,7 +7946,8 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: None,
-        };
+            traits: ModelTraits::default(),
+        });
 
         assert_eq!(bedrock_body(&config, &request), fixture["payload"]);
     }
@@ -7460,7 +7973,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "cloudflare-ai-gateway".to_string(),
                 id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
@@ -7474,7 +7987,8 @@ mod tests {
             thinking_level: Some("xhigh".to_string()),
             thinking_budget_tokens: None,
             session_id: Some("session_ts_parity".to_string()),
-        };
+            traits: ModelTraits::default(),
+        });
         let fixture_request = &fixture["request"];
         let provider = OpenAiProvider {
             config: config.clone(),
@@ -7538,7 +8052,7 @@ mod tests {
             }],
             tools: Vec::new(),
         };
-        let config = ProviderConfig {
+        let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "mistral".to_string(),
                 id: "devstral-medium-latest".to_string(),
@@ -7549,7 +8063,8 @@ mod tests {
             thinking_level: Some("high".to_string()),
             thinking_budget_tokens: None,
             session_id: Some("session_ts_parity".to_string()),
-        };
+            traits: ModelTraits::default(),
+        });
         let fixture_request = &fixture["request"];
         let headers = mistral_headers(&config, "mistral-key").expect("headers");
 
@@ -7703,6 +8218,7 @@ mod tests {
                 thinking_level: None,
                 thinking_budget_tokens: None,
                 session_id: None,
+                traits: ModelTraits::default(),
             };
             let messages = openai_chat_messages(&config, &request);
             assert_eq!(messages.len(), 1);

@@ -51,11 +51,13 @@ Implemented CLI flags include:
 - `--fork <path|id|name>`
 - `--session-dir <dir>`
 - `--no-session`
-- `--provider <name>`
-- `--model <provider/id-or-pattern>`
+- `--provider <name>` (narrows `--model`, and requires it)
+- `--model <pattern>` (exact or fuzzy, `provider/id`, `pattern:<thinking>`,
+  or a custom id of a known provider)
 - `--api-key <key>`
-- `--models <patterns>`
-- `--thinking off|minimal|low|medium|high|xhigh|max`
+- `--models <patterns>` (a scope: exact, fuzzy, or glob, each with an
+  optional `:<thinking>`)
+- `--thinking off|minimal|low|medium|high|xhigh|max` (clamped to the model)
 - `--system-prompt <text-or-path>`
 - `--append-system-prompt <text-or-path>`
 - `--no-tools`, `-nt`
@@ -153,8 +155,9 @@ Rust behavior:
 
 Current settings cover:
 
-- Default provider/model/thinking level.
-- Enabled model scopes.
+- Default provider/model/thinking level, and per-model thinking levels
+  (`modelThinkingLevels`).
+- Enabled model scopes (`enabledModels` patterns).
 - Tool selection: `defaultTools` (upstream's setting, merged across the user
   and project layers as upstream merges it) and `enabledTools` (a Rust-only
   allowlist).
@@ -294,8 +297,9 @@ Implemented built-in slash commands include:
 - `/scoped-models`
 - `/selector <kind>`
 - `/select <kind> <query>`
-- `/model <provider/id>`
-- `/thinking <level>`
+- `/model <provider/id|id>` (anything else opens the picker with it as the
+  search)
+- `/thinking [level]` (one of the levels the model supports)
 - `/multiline`
 - `/session`
 - `/changelog`
@@ -504,18 +508,53 @@ Current auth sources:
 - Codex/ChatGPT login token fallback.
 - Custom provider fallback from model config.
 
-Startup model selection (upstream `findInitialModel`):
+Model catalog:
 
-- `--model`/`--provider`, then the resumed session's model, then the saved
-  default if its provider has credentials, then a model with credentials
-  (upstream's per-provider default model first), and `faux` only when it is
-  requested or nothing else can run. Offline, only `faux` can run.
+- Upstream wraps every built-in provider and serves each model with its API,
+  base URL, limits, prices, input types, and thinking levels.
+- Rust compiles the same catalog in, generated from upstream
+  (`model-catalog.json`), and adds its own `faux`, `zai-coding`,
+  `zai-anthropic`, and `kimi-coding-openai` providers. Upstream's hosted
+  catalog refresh, OpenRouter's key-scoped listing, and the Radius gateway's
+  models are not ported (see "Built-in Model Catalog Is a Compiled Snapshot"
+  in the non-parity register).
+
+Model resolution (upstream `core/model-resolver.ts`, ported in
+`crates/pi-config/src/model_resolver.rs`):
+
+- `--model`: an exact reference ignoring case, else a fuzzy match on id or
+  name that prefers aliases, a `:<thinking>` suffix, a provider inferred from
+  a `provider/` prefix, an error for an id several providers have and for an
+  unknown provider, and a custom model for an id a known provider does not
+  list. `--provider` requires `--model`.
+- `--models` and `enabledModels`: exact, fuzzy, or glob patterns with
+  `:<thinking>`, over the models with credentials. A scope selects the
+  startup model and what the picker lists; it removes no model.
+
+Startup model selection (upstream `buildSessionOptions` and
+`findInitialModel`):
+
+- `--model`, then the resumed session's model, then the scope (the saved
+  default if it is in scope, else its first model), then the saved default
+  if its provider has credentials, then a model with credentials (upstream's
+  per-provider default model first), and `faux` only when it is requested or
+  nothing else can run. Offline, only `faux` can run.
+
+Thinking levels (upstream `getSupportedThinkingLevels`, `clampThinkingLevel`):
+
+- A model's levels come from its catalog entry; a level it lacks is clamped
+  to the nearest one it has. A session starts on `medium` unless `--thinking`,
+  a `:<thinking>` suffix, `modelThinkingLevels`, or `defaultThinkingLevel`
+  says otherwise.
+- Requests carry the clamped level, under the model's own name for it, on the
+  Responses APIs, Anthropic, Bedrock, Google, and OpenRouter. Other chat
+  completions providers and Mistral are not sent one yet.
 
 Request limits:
 
-- Anthropic Messages requests without an explicit cap send the Claude model's
-  output limit, lowered to fit the context window; other models on the
-  Anthropic API default to 16384 tokens.
+- Requests without an explicit cap send the model's catalog output limit,
+  lowered to fit its context window. A model nothing is known about gets no
+  cap, except on the Anthropic API, which requires one: 16384 tokens.
 - Tool calls in a reply cut off by the output-token limit (`max_tokens`,
   `length`) are not run; each returns an error asking the model to re-issue
   it with complete arguments.
@@ -526,7 +565,9 @@ Request limits:
 
 Model refresh:
 
-- Uses built-in models, cached models, and explicit `models.json` immediately.
+- Uses the built-in catalog, cached provider listings, and explicit
+  `models.json` entries immediately. A listed model the catalog lacks takes
+  its provider's default model's limits and thinking levels.
 - Starts a non-blocking refresh when enabled, online, stale, and authenticated.
 - Surfaces refreshed data after `/reload` or the next startup.
 

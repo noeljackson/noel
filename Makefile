@@ -120,6 +120,9 @@ docker-e2e: docker-build
 parity-check:
 	$(CARGO) test -p pi-parity
 	$(CARGO) test -p pi-ai --lib matches_ts
+	$(CARGO) test -p pi-ai --lib catalog
+	$(CARGO) test -p pi-config --lib model
+	$(CARGO) test -p pi-cli --test model_parity
 	$(CARGO) test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
 	$(CARGO) test -p pi-core --lib system_prompt_matches_ts_builder
 	$(CARGO) test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery

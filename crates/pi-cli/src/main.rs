@@ -15,6 +15,7 @@ mod auth_command;
 mod bug_report;
 mod clipboard;
 mod markdown;
+mod model_select;
 mod oauth_login;
 mod oauth_refresh;
 mod resource_commands;
@@ -23,6 +24,12 @@ mod rpc_wire;
 mod signals;
 mod transcript_view;
 mod usage;
+use model_select::{
+    configured_model, effective_thinking_level, find_selectable_model, model_definition,
+    normalized_thinking_level, provider_usable, register_cli_model, resolve_cli,
+    resolve_cli_selection, resolve_scope, select_initial_model, set_thinking_level, switch_model,
+    thinking_label,
+};
 use transcript_view::TranscriptView;
 
 use anyhow::{anyhow, Result};
@@ -45,15 +52,14 @@ use crossterm::{
     },
 };
 use pi_ai::{
-    anthropic_supports_adaptive_thinking, create_provider_with_client, generate_images,
-    set_claude_code_version, ImageGenerationInput, ImageGenerationOutput,
-    ImageProviderApi as AiImageProviderApi, ImageProviderConfig, MediaInput, ModelRef,
-    ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig, ProviderError, ProviderRequest,
-    StreamEvent,
+    create_provider_with_client, generate_images, set_claude_code_version, ImageGenerationInput,
+    ImageGenerationOutput, ImageProviderApi as AiImageProviderApi, ImageProviderConfig, MediaInput,
+    ModelRef, ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig, ProviderError,
+    ProviderRequest, StreamEvent,
 };
 use pi_config::{
-    apply_tool_modifiers, auth_for_provider, codex_client_version, has_auth_for_provider,
-    is_tool_modifier, listed_accounts_for_provider, load_config, load_config_with_project_trust,
+    apply_tool_modifiers, auth_for_provider, codex_client_version, is_tool_modifier,
+    listed_accounts_for_provider, load_config, load_config_with_project_trust,
     load_config_with_resources, project_is_trusted, read_model_cache, resolve_default_tools,
     save_project_trust, tool_list_error, write_file_atomic, write_model_cache, AccountSource,
     AuthCredential, AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
@@ -1258,7 +1264,7 @@ fn default_api_key_env(provider: &str) -> Option<&'static str> {
         "openrouter" => Some("OPENROUTER_API_KEY"),
         "mistral" => Some("MISTRAL_API_KEY"),
         "github-copilot" => Some("COPILOT_GITHUB_TOKEN"),
-        "azure-openai-responses" => Some("AZURE_OPENAI_API_KEY"),
+        "azure" | pi_config::LEGACY_AZURE_PROVIDER => Some("AZURE_OPENAI_API_KEY"),
         "cloudflare-ai-gateway" | "cloudflare-workers-ai" => Some("CLOUDFLARE_API_KEY"),
         "amazon-bedrock" => Some("AWS_BEARER_TOKEN_BEDROCK"),
         _ => None,
@@ -1382,10 +1388,11 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    let selection = resolve_cli_selection(&cli, &mut config, offline)?;
     let mut systems = ReloadableSystems::from_config(&config, 1);
     systems.offline = offline;
     let mut runtime = create_runtime_when_unlocked(&cli, &cwd, &config, systems).await?;
-    select_initial_model(&mut runtime, &config, &cli, offline)?;
+    select_initial_model(&mut runtime, &config, &selection, offline)?;
     // The tool flags apply to this run (`apply_tool_flags`). Earlier
     // versions saved them in the session as disabled tools; a resumed
     // session follows this run's flags instead.
@@ -1454,6 +1461,8 @@ impl ConfigSource {
         let resources = resource_commands::resource_options(&self.cli);
         let mut config = load_config_with_resources(paths, self.project_trusted, &resources)?;
         apply_cli_overrides(&self.cli, &self.cwd, &mut config)?;
+        // A custom model `--model provider/new-id` named stays known.
+        register_cli_model(&self.cli, &mut config, offline_enabled(self.cli.offline));
         Ok(config)
     }
 }
@@ -1534,16 +1543,6 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
     if cli.no_context_files {
         config.context_files.clear();
     }
-    if !cli.models.is_empty() {
-        config.models.retain(|model| {
-            cli.models.iter().any(|pattern| {
-                pattern == &model.id
-                    || pattern == &model.provider
-                    || pattern == &format!("{}/{}", model.provider, model.id)
-                    || model.name.as_deref() == Some(pattern.as_str())
-            })
-        });
-    }
     apply_tool_flags(cli, &mut config.settings)?;
     if cli.no_themes {
         config.settings.theme = None;
@@ -1562,9 +1561,6 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
         resolved
             .with_accent(config.settings.accent_color.as_deref())
             .map_err(|error| anyhow!(error))?;
-    }
-    if let Some(thinking) = &cli.thinking {
-        config.settings.default_thinking_level = Some(thinking.clone());
     }
     if cli.no_extensions {
         config.extensions.clear();
@@ -1590,6 +1586,9 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
             },
         );
     }
+    // `--models`, else `enabledModels`: a scope over the models that can
+    // run with the credentials now known. It removes no model.
+    config.model_scope = resolve_scope(cli, config, offline_enabled(cli.offline)).models;
     Ok(())
 }
 
@@ -1839,12 +1838,14 @@ async fn refresh_model_cache(
         report.record("openai-codex", cached_at_start.as_ref(), result);
     }
 
-    for (provider, base_url) in [
-        ("zai", "https://api.z.ai/api/paas/v4"),
-        ("zai-coding", "https://api.z.ai/api/coding/paas/v4"),
-        ("moonshotai", "https://api.moonshot.ai/v1"),
-        ("kimi-coding-openai", "https://api.kimi.com/coding/v1"),
-    ] {
+    // The OpenAI-compatible providers whose listings are fetched, each at
+    // the base URL the catalog gives its models.
+    for provider in ["zai", "zai-coding", "moonshotai", "kimi-coding-openai"] {
+        let Some(base_url) =
+            pi_ai::catalog::provider_base_model(provider).and_then(|model| model.base_url.clone())
+        else {
+            continue;
+        };
         let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, provider, None) else {
             continue;
         };
@@ -1852,7 +1853,7 @@ async fn refresh_model_cache(
         let result = fetch_openai_api_models(
             provider,
             ConfigProviderApi::OpenAi,
-            Some(base_url.to_string()),
+            Some(base_url),
             &models_url,
             &api_key,
         )
@@ -2052,7 +2053,7 @@ async fn fetch_anthropic_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinitio
             id: model.id,
             name: Some(model.display_name),
             api: ConfigProviderApi::Anthropic,
-            base_url: None,
+            ..ModelDefinition::default()
         }));
         match next {
             Some(next) => cursor = Some(next),
@@ -2162,12 +2163,12 @@ async fn fetch_openai_api_models(
         .into_iter()
         .filter(|model| model_supported_for_provider(provider, &model.id))
         .map(|model| ModelDefinition {
-            context_window: None,
             provider: provider.to_string(),
             id: model.id.clone(),
             name: Some(model_display_name(&model.id)),
             api: api.clone(),
             base_url: base_url.clone(),
+            ..ModelDefinition::default()
         })
         .collect())
 }
@@ -2256,6 +2257,7 @@ async fn fetch_chatgpt_backend_models(
             id,
             api: api.clone(),
             base_url: base_url.clone(),
+            ..ModelDefinition::default()
         })
         .collect())
 }
@@ -2357,15 +2359,16 @@ fn unix_seconds() -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
+/// The provider `--api-key` is for: the one `--model` resolves to, else
+/// `--provider`, else the saved default provider.
 fn infer_cli_provider(cli: &Cli, config: &LoadedConfig) -> Option<String> {
-    cli.provider
-        .clone()
+    resolve_cli(cli, config, offline_enabled(cli.offline))
+        .and_then(|resolved| resolved.model)
+        .map(|model| model.provider)
         .or_else(|| {
-            cli.model.as_deref().and_then(|model| {
-                model
-                    .split_once('/')
-                    .map(|(provider, _)| provider.to_string())
-            })
+            cli.provider
+                .as_deref()
+                .map(|provider| pi_config::canonical_provider(provider).to_string())
         })
         .or_else(|| config.settings.default_provider.clone())
 }
@@ -2765,143 +2768,24 @@ fn most_recent_session(session_dir: &Path, cwd: Option<&Path>) -> Result<Option<
     Ok(sessions.pop().map(|summary| summary.path))
 }
 
-fn select_initial_model(
-    runtime: &mut Runtime,
+/// The model a TUI command names: a 1-based position in the model list, or
+/// an exact `provider/id` or id among the selectable models, ignoring case.
+fn resolve_model_reference(
     config: &LoadedConfig,
-    cli: &Cli,
+    reference: &str,
     offline: bool,
-) -> Result<()> {
-    if runtime.session().active_model.is_some() && cli.provider.is_none() && cli.model.is_none() {
-        return Ok(());
-    }
-    let model = if let (Some(provider), Some(id)) = (&cli.provider, &cli.model) {
-        Some(ModelRef {
-            provider: provider.clone(),
-            id: id.clone(),
-        })
-    } else if let Some(model) = &cli.model {
-        resolve_model_reference(config, model)
-    } else {
-        default_model(config, offline)
-    };
-    runtime.set_active_model(model)?;
-    Ok(())
-}
-
-/// Upstream `defaultModelPerProvider` (core/model-resolver.ts): the model a
-/// provider with credentials starts on. Providers the catalog lacks never
-/// match.
-const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
-    ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
-    ("ant-ling", "Ring-2.6-1T"),
-    ("anthropic", "claude-opus-4-8"),
-    ("openai", "gpt-5.5"),
-    ("azure", "gpt-5.4"),
-    ("openai-codex", "gpt-6.1-sol"),
-    ("radius", "balanced"),
-    ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
-    ("deepseek", "deepseek-v4-pro"),
-    ("google", "gemini-3.1-pro-preview"),
-    ("google-vertex", "gemini-3.1-pro-preview"),
-    ("github-copilot", "gpt-5.4"),
-    ("openrouter", "moonshotai/kimi-k2.6"),
-    ("vercel-ai-gateway", "zai/glm-5.1"),
-    ("xai", "grok-4.7"),
-    ("groq", "openai/gpt-oss-120b"),
-    ("cerebras", "gpt-oss-120b"),
-    ("zai", "glm-5.3"),
-    ("zai-coding-cn", "glm-5.3"),
-    ("mistral", "devstral-medium-latest"),
-    ("minimax", "MiniMax-M2.7"),
-    ("minimax-cn", "MiniMax-M2.7"),
-    ("moonshotai", "kimi-k2.6"),
-    ("moonshotai-cn", "kimi-k2.6"),
-    ("huggingface", "moonshotai/Kimi-K2.6"),
-    ("fireworks", "accounts/fireworks/models/kimi-k3"),
-    ("together", "moonshotai/Kimi-K3"),
-    ("baseten", "zai-org/GLM-5.2"),
-    ("opencode", "kimi-k2.6"),
-    ("opencode-go", "kimi-k3"),
-    ("kimi-coding", "kimi-for-coding"),
-    ("meta", "muse-spark-1.3"),
-    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
-    (
-        "cloudflare-ai-gateway",
-        "workers-ai/@cf/moonshotai/kimi-k2.6",
-    ),
-    ("qwen-token-plan", "qwen3.7-max"),
-    ("qwen-token-plan-cn", "qwen3.7-max"),
-    ("qwen-token-plan-individual", "qwen3.8-max"),
-    ("xiaomi", "mimo-v2.5-pro"),
-    ("xiaomi-token-plan-cn", "mimo-v2.5-pro"),
-    ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
-    ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
-];
-
-/// The startup model when neither the command line nor the session names
-/// one, in upstream's order (`findInitialModel`): the saved default if its
-/// provider has credentials, then a model with credentials (a provider's
-/// usual model first), and a faux model only when nothing else can run.
-/// Offline, only faux can run.
-fn default_model(config: &LoadedConfig, offline: bool) -> Option<ModelRef> {
-    let usable = |provider: &str| {
-        provider == "faux" || (!offline && has_auth_for_provider(&config.auth, provider, None))
-    };
-    if let (Some(provider), Some(id)) = (
-        &config.settings.default_provider,
-        &config.settings.default_model,
-    ) {
-        if usable(provider) {
-            return Some(ModelRef {
-                provider: provider.clone(),
-                id: id.clone(),
-            });
-        }
-    }
-    let with_auth = config
-        .models
-        .iter()
-        .filter(|model| model.provider != "faux" && usable(&model.provider))
-        .collect::<Vec<_>>();
-    PROVIDER_DEFAULT_MODELS
-        .iter()
-        .find_map(|(provider, id)| {
-            with_auth
-                .iter()
-                .find(|model| model.provider == *provider && model.id == *id)
-        })
-        .or_else(|| with_auth.first())
-        .copied()
-        .or_else(|| config.models.iter().find(|model| model.provider == "faux"))
-        .map(|model| ModelRef {
-            provider: model.provider.clone(),
-            id: model.id.clone(),
-        })
-}
-
-fn resolve_model_reference(config: &LoadedConfig, reference: &str) -> Option<ModelRef> {
+) -> Option<ModelRef> {
     if let Ok(index) = reference.parse::<usize>() {
         if index > 0 {
-            return config.models.get(index - 1).map(|model| ModelRef {
-                provider: model.provider.clone(),
-                id: model.id.clone(),
-            });
+            return config.models.get(index - 1).map(ModelDefinition::model_ref);
         }
     }
-    if let Some((provider, id)) = reference.split_once('/') {
-        return Some(ModelRef {
-            provider: provider.to_string(),
-            id: id.to_string(),
-        });
-    }
-    config
-        .models
-        .iter()
-        .find(|model| model.id == reference || model.name.as_deref() == Some(reference))
-        .map(|model| ModelRef {
-            provider: model.provider.clone(),
-            id: model.id.clone(),
-        })
+    find_selectable_model(config, reference, offline)
+}
+
+/// The configured model a selector row names by its `provider/id` value.
+fn selector_model(config: &LoadedConfig, value: &str) -> Option<ModelRef> {
+    configured_model(config, &model_ref_from_value(value)?).map(ModelDefinition::model_ref)
 }
 
 /// A bare `pi` with no session flags used to open the resume picker here,
@@ -3297,6 +3181,14 @@ struct TuiEntry {
     text: String,
 }
 
+/// A listed model's thinking levels, lowest first, and the level selecting
+/// it gives the session when the user adjusts nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelThinking {
+    levels: Vec<&'static str>,
+    switch_level: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TuiSelectorState {
     kind: String,
@@ -3305,7 +3197,12 @@ struct TuiSelectorState {
     filtered_indices: Vec<usize>,
     selected: usize,
     query: String,
+    /// The thinking level the user adjusted to with left/right; `None`
+    /// until then, when selecting a model gives the session the level a
+    /// model switch does.
     thinking_level: Option<String>,
+    /// What each listed model supports of thinking, by row value.
+    model_thinking: BTreeMap<String, ModelThinking>,
     /// Codex-style two-layer model picker: selecting a provider pushes this
     /// selector here and shows the provider's models; leaving the model layer
     /// (esc) pops back instead of closing the whole selector.
@@ -3329,11 +3226,57 @@ impl TuiSelectorState {
             selected: 0,
             query: query.into(),
             thinking_level,
+            model_thinking: BTreeMap::new(),
             parent: None,
             provider_filter: None,
         };
         state.refresh_filter();
         state
+    }
+
+    /// Records what the listed models support of thinking, so the picker
+    /// can show and adjust the level a selection applies.
+    fn with_model_thinking(mut self, config: &LoadedConfig, runtime: &Runtime) -> Self {
+        let before = effective_thinking_level(runtime, config);
+        let by_value = config
+            .models
+            .iter()
+            .map(|model| (format!("{}/{}", model.provider, model.id), model))
+            .collect::<BTreeMap<_, _>>();
+        self.model_thinking = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                let model = by_value.get(&item.value)?;
+                // The level a switch to this model gives the session
+                // (`switch_model`).
+                let requested = [
+                    config
+                        .settings
+                        .model_thinking_level(&model.provider, &model.id),
+                    config.settings.default_thinking_level.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(normalized_thinking_level)
+                .unwrap_or(before);
+                Some((
+                    item.value.clone(),
+                    ModelThinking {
+                        levels: model.supported_thinking_levels(),
+                        switch_level: model.clamp_thinking_level(requested),
+                    },
+                ))
+            })
+            .collect();
+        self
+    }
+
+    /// The selected model's thinking, if it has levels to choose from.
+    fn selected_model_thinking(&self) -> Option<&ModelThinking> {
+        self.model_thinking
+            .get(&self.selected_item()?.value)
+            .filter(|thinking| thinking.levels.len() > 1)
     }
 
     fn refresh_filter(&mut self) {
@@ -3399,23 +3342,15 @@ impl TuiSelectorState {
     }
 
     fn cycle_thinking(&mut self, delta: isize) {
-        let Some(item) = self.selected_item() else {
+        let Some(current) = self.selected_thinking_level() else {
             return;
         };
-        let Some(model) = model_ref_from_value(&item.value) else {
+        let Some(levels) = self
+            .selected_model_thinking()
+            .map(|thinking| &thinking.levels)
+        else {
             return;
         };
-        let levels = model_thinking_levels(&model);
-        if levels.is_empty() {
-            return;
-        }
-        let current = self
-            .thinking_level
-            .as_deref()
-            .and_then(normalized_thinking_level)
-            .filter(|level| levels.contains(level))
-            .or_else(|| default_thinking_for_model(&model))
-            .unwrap_or("off");
         let current_index = levels
             .iter()
             .position(|level| *level == current)
@@ -3429,19 +3364,19 @@ impl TuiSelectorState {
         self.thinking_level = Some(levels[next_index].to_string());
     }
 
+    /// The level selecting the highlighted model applies: the one the user
+    /// adjusted to, clamped to the model, else the one a model switch
+    /// gives. `None` for a model without thinking levels.
     fn selected_thinking_level(&self) -> Option<String> {
-        let item = self.selected_item()?;
-        let model = model_ref_from_value(&item.value)?;
-        let levels = model_thinking_levels(&model);
-        if levels.is_empty() {
-            return None;
-        }
-        let level = self
+        let thinking = self.selected_model_thinking()?;
+        let level = match self
             .thinking_level
             .as_deref()
             .and_then(normalized_thinking_level)
-            .filter(|level| levels.contains(level))
-            .or_else(|| default_thinking_for_model(&model))?;
+        {
+            Some(adjusted) => pi_ai::catalog::clamp_to_supported(&thinking.levels, adjusted),
+            None => thinking.switch_level,
+        };
         Some(level.to_string())
     }
 }
@@ -3452,57 +3387,6 @@ fn model_ref_from_value(value: &str) -> Option<ModelRef> {
         provider: provider.to_string(),
         id: id.to_string(),
     })
-}
-
-fn model_thinking_levels(model: &ModelRef) -> &'static [&'static str] {
-    match model.provider.as_str() {
-        "anthropic" => {
-            if model.id.contains("opus") && anthropic_supports_adaptive_thinking(&model.id) {
-                &["off", "high", "xhigh", "max"]
-            } else if anthropic_supports_adaptive_thinking(&model.id) {
-                &["off", "low", "medium", "high", "xhigh"]
-            } else if model.id.contains("claude-") {
-                &["off", "minimal", "low", "medium", "high"]
-            } else {
-                &[]
-            }
-        }
-        "openai" | "openai-codex" | "azure-openai-responses" => {
-            if model.id.starts_with("gpt-5")
-                || model.id.starts_with("gpt-6")
-                || model.id.contains("codex")
-            {
-                &["off", "minimal", "low", "medium", "high", "xhigh"]
-            } else {
-                &[]
-            }
-        }
-        _ => &[],
-    }
-}
-
-fn default_thinking_for_model(model: &ModelRef) -> Option<&'static str> {
-    let levels = model_thinking_levels(model);
-    if levels.contains(&"xhigh") {
-        Some("xhigh")
-    } else if levels.contains(&"high") {
-        Some("high")
-    } else {
-        None
-    }
-}
-
-fn normalized_thinking_level(level: &str) -> Option<&'static str> {
-    match level.trim().to_ascii_lowercase().as_str() {
-        "off" | "none" | "disabled" => Some("off"),
-        "minimal" | "min" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" | "med" => Some("medium"),
-        "high" => Some("high"),
-        "xhigh" | "extra-high" | "extra_high" => Some("xhigh"),
-        "max" => Some("max"),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Default)]
@@ -6358,7 +6242,7 @@ fn handle_streaming_tui_key(
                             .selected_item()
                             .map(|item| item.value.clone())
                             .unwrap_or_default();
-                        let models: Vec<SelectorItem> = sorted_models(&config.models)
+                        let models: Vec<SelectorItem> = picker_models(config)
                             .into_iter()
                             .filter(|model| model.provider == provider)
                             .map(|model| {
@@ -6478,7 +6362,7 @@ fn handle_streaming_command(
         command if command == "model" || command == "models" || command == "scoped-models" => {
             let selector = Selector::new(
                 "provider",
-                provider_selector_items(&config.models, app.active_provider()),
+                provider_selector_items(&picker_models(config), app.active_provider()),
             );
             if selector.items.is_empty() {
                 app.push(TuiEntryKind::System, "no models".to_string());
@@ -6494,7 +6378,7 @@ fn handle_streaming_command(
                 || command.starts_with("scoped-models ") =>
         {
             let reference = command.split_once(' ').map(|x| x.1).unwrap_or("").trim();
-            if resolve_model_reference(config, reference).is_some() {
+            if resolve_model_reference(config, reference, false).is_some() {
                 app.push(
                     TuiEntryKind::System,
                     format!("model switch queued: {reference} (applies after this turn)"),
@@ -6874,7 +6758,7 @@ fn handle_tui_selector_key(
                     .selected_item()
                     .map(|item| item.value.clone())
                     .unwrap_or_default();
-                let models: Vec<SelectorItem> = sorted_models(&config.models)
+                let models: Vec<SelectorItem> = picker_models(config)
                     .into_iter()
                     .filter(|model| model.provider == provider)
                     .map(|model| {
@@ -6901,12 +6785,9 @@ fn handle_tui_selector_key(
                     "model",
                     Selector::new(format!("model · {provider}"), models),
                     "",
-                    runtime
-                        .session()
-                        .active_thinking_level
-                        .clone()
-                        .or_else(|| config.settings.default_thinking_level.clone()),
-                );
+                    None,
+                )
+                .with_model_thinking(config, runtime);
                 model_selector.provider_filter = Some(provider);
                 let mut model_state = model_selector;
                 model_state.parent = Some(Box::new(selector));
@@ -6939,16 +6820,8 @@ fn open_tui_selector(
         app.push(TuiEntryKind::System, format!("no {kind}"));
         return Ok(());
     }
-    let thinking_level = if matches!(kind, "model" | "models" | "scoped-models") {
-        runtime
-            .session()
-            .active_thinking_level
-            .clone()
-            .or_else(|| config.settings.default_thinking_level.clone())
-    } else {
-        None
-    };
-    let state = TuiSelectorState::new(kind, selector, query, thinking_level);
+    let state =
+        TuiSelectorState::new(kind, selector, query, None).with_model_thinking(config, runtime);
     app.push(TuiEntryKind::System, format!("{} selector", state.title));
     app.selector = Some(state);
     Ok(())
@@ -6966,15 +6839,14 @@ fn apply_tui_selector_selection(
     };
     match selector.kind.as_str() {
         "model" | "models" | "scoped-models" => {
-            let model = resolve_model_reference(config, &item.value)
+            let model = selector_model(config, &item.value)
                 .ok_or_else(|| anyhow!("model not found: {}", item.value))?;
-            let thinking = selector.selected_thinking_level();
-            runtime.set_active_model(Some(model.clone()))?;
-            runtime.set_active_thinking_level(thinking.clone())?;
+            // A level adjusted in the picker is the one to apply.
+            switch_model(runtime, config, &model, selector.thinking_level.as_deref())?;
             persist_default_model(config, &model)?;
             app.push(
                 TuiEntryKind::System,
-                format_model_selection(&model, thinking.as_deref()),
+                format_model_selection(&model, thinking_label(runtime, config).as_deref()),
             );
         }
         "theme" | "themes" => {
@@ -7315,7 +7187,7 @@ async fn handle_tui_submission(
             TuiEntryKind::System,
             format!(
                 "thinking: {}",
-                active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string())
+                thinking_label(runtime, config).unwrap_or_else(|| "-".to_string())
             ),
         ),
         "/model" | "/models" | "/scoped-models" => {
@@ -7644,33 +7516,40 @@ async fn handle_tui_submission(
             }
         }
         _ if line.starts_with("/model ") => {
+            // As upstream: an exact reference switches, and anything else
+            // opens the picker with the text as its search.
             let reference = line.trim_start_matches("/model ").trim();
-            let model = resolve_model_reference(config, reference)
-                .ok_or_else(|| anyhow!("model not found: {reference}"))?;
-            let thinking = active_thinking_level(runtime, config, &model);
-            runtime.set_active_model(Some(model.clone()))?;
-            runtime.set_active_thinking_level(thinking.clone())?;
-            persist_default_model(config, &model)?;
-            app.push(
-                TuiEntryKind::System,
-                format_model_selection(&model, thinking.as_deref()),
-            );
+            match resolve_model_reference(config, reference, offline) {
+                Some(model) => {
+                    switch_model(runtime, config, &model, None)?;
+                    persist_default_model(config, &model)?;
+                    app.push(
+                        TuiEntryKind::System,
+                        format_model_selection(&model, thinking_label(runtime, config).as_deref()),
+                    );
+                }
+                None => open_tui_selector(app, config, runtime, "model", reference)?,
+            }
         }
         _ if line.starts_with("/thinking ") => {
-            let level = line.trim_start_matches("/thinking ").trim();
-            let level = normalized_thinking_level(level)
-                .ok_or_else(|| anyhow!("unknown thinking level: {level}"))?;
-            if let Some(model) = runtime.session().active_model.clone() {
-                if !model_thinking_levels(&model).contains(&level) {
-                    return Err(anyhow!(
-                        "thinking level {level} is not supported by {}/{}",
-                        model.provider,
-                        model.id
-                    ));
-                }
-            }
-            // None means inherit defaults, not an explicit off selection.
-            runtime.set_active_thinking_level(Some(level.to_string()))?;
+            // As upstream: one of the levels the model supports, by name.
+            let requested = line.trim_start_matches("/thinking ").trim();
+            let available = runtime
+                .session()
+                .active_model
+                .as_ref()
+                .and_then(|model| model_definition(config, model))
+                .map(|model| model.supported_thinking_levels())
+                .unwrap_or_else(|| pi_config::THINKING_LEVELS.to_vec());
+            let level = normalized_thinking_level(requested)
+                .filter(|level| available.contains(level))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Unknown thinking level \"{requested}\". Available levels: {}.",
+                        available.join(", ")
+                    )
+                })?;
+            set_thinking_level(runtime, config, level)?;
             app.push(TuiEntryKind::System, format!("thinking: {level}"));
         }
         _ if line.starts_with("/extension:") => {
@@ -8115,7 +7994,7 @@ on this host), provider status, then retry; /model switches providers"
         .as_ref()
         .map(|model| format!("{}/{}", model.provider, model.id))
         .unwrap_or_else(|| "-".to_string());
-    let thinking = active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string());
+    let thinking = thinking_label(runtime, config).unwrap_or_else(|| "-".to_string());
     format!(
         "{message}\n\nAnthropic rate-limited this request for model {model} with thinking {thinking}. Try /thinking high, /thinking off, or /model anthropic/claude-sonnet-4-6. Claude Code may still work elsewhere if it is using a different model, thinking level, or quota pool."
     )
@@ -8510,13 +8389,15 @@ async fn run_turn_tui(
     // Persistence as default happens on the next explicit /model; here we
     // only switch the session's active model.
     if let Some(reference) = app.pending_model_switch.take() {
-        if let Some(model) = resolve_model_reference(config, &reference) {
-            let thinking = active_thinking_level(runtime, config, &model);
-            runtime.set_active_model(Some(model.clone()))?;
-            runtime.set_active_thinking_level(thinking.clone())?;
+        // A picker row names a configured model; a typed reference one of
+        // the selectable models.
+        let model = selector_model(config, &reference)
+            .or_else(|| resolve_model_reference(config, &reference, false));
+        if let Some(model) = model {
+            switch_model(runtime, config, &model, None)?;
             app.push(
                 TuiEntryKind::System,
-                format_model_selection(&model, thinking.as_deref()),
+                format_model_selection(&model, thinking_label(runtime, config).as_deref()),
             );
         }
     }
@@ -8907,27 +8788,28 @@ async fn provider_for_runtime(
             model.id
         ));
     }
-    let definition = config
-        .models
-        .iter()
-        .find(|candidate| candidate.provider == model.provider && candidate.id == model.id)
-        .ok_or_else(|| {
-            anyhow!(
-                "active model is not in models config: {}/{}",
-                model.provider,
-                model.id
-            )
-        })?;
-    let thinking_level = active_thinking_level(runtime, config, &model);
+    let definition = model_definition(config, &model).ok_or_else(|| {
+        anyhow!(
+            "active model is not in models config: {}/{}",
+            model.provider,
+            model.id
+        )
+    })?;
+    // The level in effect, clamped to the model; a model without reasoning
+    // is sent no thinking parameter.
+    let thinking_level = definition
+        .reasoning()
+        .then(|| effective_thinking_level(runtime, config).to_string());
     let provider = FreshAuthProvider {
         config: ProviderConfig {
             thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
             thinking_level,
-            model,
-            api: map_provider_api(&definition.api),
+            model: definition.model_ref(),
+            api: AiProviderApi::from(&definition.api),
             base_url: definition.base_url.clone(),
             auth: ProviderAuth::None,
             session_id: Some(runtime.session().session_id.clone()),
+            traits: definition.traits(),
         },
         // The client `pi_ai::create_provider` uses: its idle timeout ends a
         // stalled request instead of hanging the turn.
@@ -9018,30 +8900,6 @@ impl pi_ai::Provider for FreshAuthProvider {
     }
 }
 
-fn active_thinking_level(
-    runtime: &Runtime,
-    config: &LoadedConfig,
-    model: &ModelRef,
-) -> Option<String> {
-    let level = runtime
-        .session()
-        .active_thinking_level
-        .as_deref()
-        .or(config.settings.default_thinking_level.as_deref())
-        .and_then(normalized_thinking_level)
-        .or_else(|| default_thinking_for_model(model))?;
-    if model_thinking_levels(model).contains(&level) && level != "off" {
-        Some(level.to_string())
-    } else {
-        None
-    }
-}
-
-fn active_thinking_label(runtime: &Runtime, config: &LoadedConfig) -> Option<String> {
-    let model = runtime.session().active_model.as_ref()?;
-    active_thinking_level(runtime, config, model)
-}
-
 fn thinking_budget_tokens(config: &LoadedConfig, level: Option<&str>) -> Option<u64> {
     let budgets = config.settings.thinking_budgets.as_ref()?;
     match level {
@@ -9075,21 +8933,6 @@ fn map_provider_auth(auth: Option<ResolvedAuth>) -> ProviderAuth {
             account_id,
         },
         None => ProviderAuth::None,
-    }
-}
-
-fn map_provider_api(api: &ConfigProviderApi) -> AiProviderApi {
-    match api {
-        ConfigProviderApi::Faux => AiProviderApi::Faux,
-        ConfigProviderApi::OpenAi => AiProviderApi::OpenAi,
-        ConfigProviderApi::OpenAiResponses => AiProviderApi::OpenAiResponses,
-        ConfigProviderApi::OpenAiCodexResponses => AiProviderApi::OpenAiCodexResponses,
-        ConfigProviderApi::AzureOpenAiResponses => AiProviderApi::AzureOpenAiResponses,
-        ConfigProviderApi::Anthropic => AiProviderApi::Anthropic,
-        ConfigProviderApi::Google => AiProviderApi::Google,
-        ConfigProviderApi::GoogleVertex => AiProviderApi::GoogleVertex,
-        ConfigProviderApi::Bedrock => AiProviderApi::Bedrock,
-        ConfigProviderApi::Mistral => AiProviderApi::Mistral,
     }
 }
 
@@ -9423,7 +9266,7 @@ fn compact_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &Edito
                 None => format!("{}/{}", model.provider, model.id),
             })
             .unwrap_or_else(|| "-".to_string()),
-        active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string()),
+        thinking_label(runtime, config).unwrap_or_else(|| "-".to_string()),
         config
             .settings
             .theme
@@ -9634,13 +9477,14 @@ fn select_from_selector_message(
         .ok_or_else(|| anyhow!("selector item not found: {query}"))?;
     match kind {
         "model" | "models" | "scoped-models" => {
-            let model = resolve_model_reference(config, &item.value)
+            let model = selector_model(config, &item.value)
                 .ok_or_else(|| anyhow!("model not found: {}", item.value))?;
-            let thinking = active_thinking_level(runtime, config, &model);
-            runtime.set_active_model(Some(model.clone()))?;
-            runtime.set_active_thinking_level(thinking.clone())?;
+            switch_model(runtime, config, &model, None)?;
             persist_default_model(config, &model)?;
-            Ok(format_model_selection(&model, thinking.as_deref()))
+            Ok(format_model_selection(
+                &model,
+                thinking_label(runtime, config).as_deref(),
+            ))
         }
         "theme" | "themes" => {
             let name = persist_theme(config, &item.value)?;
@@ -9753,7 +9597,7 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
     match kind {
         "model" | "models" | "scoped-models" => Ok(Selector::new(
             "model",
-            sorted_models(&config.models)
+            picker_models(config)
                 .into_iter()
                 .map(|model| {
                     let value = format!("{}/{}", model.provider, model.id);
@@ -9776,7 +9620,7 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
         "provider" => Ok(Selector::new(
             "provider",
             provider_selector_items(
-                &config.models,
+                &picker_models(config),
                 runtime
                     .session()
                     .active_model
@@ -9849,10 +9693,29 @@ fn sorted_models(models: &[ModelDefinition]) -> Vec<&ModelDefinition> {
     models
 }
 
+/// The models a model picker lists, by provider and id: the scope's when
+/// `--models` or `enabledModels` sets one, else every known model.
+fn picker_models(config: &LoadedConfig) -> Vec<&ModelDefinition> {
+    if config.model_scope.is_empty() {
+        return sorted_models(&config.models);
+    }
+    let mut models = config
+        .model_scope
+        .iter()
+        .filter_map(|scoped| configured_model(config, &scoped.model))
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    models
+}
+
 /// Provider rows for the first layer of the model picker: provider name,
 /// model count, and whether the active model belongs to it.
 fn provider_selector_items(
-    models: &[ModelDefinition],
+    models: &[&ModelDefinition],
     active_provider: Option<&str>,
 ) -> Vec<SelectorItem> {
     let mut providers: BTreeMap<String, usize> = BTreeMap::new();
@@ -10817,6 +10680,7 @@ mod tests {
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -11256,7 +11120,16 @@ mod tests {
             paths: test_config_paths(),
             settings,
             auth: AuthData::default(),
-            models: Vec::new(),
+            models: vec![ModelDefinition {
+                provider: "openai-codex".to_string(),
+                id: "gpt-5.5".to_string(),
+                reasoning: Some(true),
+                thinking_level_map: Some(
+                    serde_json::from_value(serde_json::json!({ "xhigh": "xhigh" })).unwrap(),
+                ),
+                ..ModelDefinition::default()
+            }],
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -11296,6 +11169,7 @@ mod tests {
             settings: Settings::default(),
             auth,
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -11707,6 +11581,7 @@ mod tests {
                 ConfigProviderApi::Anthropic
             },
             base_url: None,
+            ..ModelDefinition::default()
         };
         let key = |key: &str| AuthCredential::ApiKey {
             key: key.to_string(),
@@ -11718,11 +11593,14 @@ mod tests {
             model("unkeyed", "saved"),
         ];
         let pick = |config: &LoadedConfig, args: &[&str], offline: bool| {
+            let mut config = config.clone();
             let mut runtime = account_test_runtime("faux", None);
             runtime.set_active_model(None).expect("clear model");
             let cli = Cli::try_parse_from(std::iter::once("pi").chain(args.iter().copied()))
                 .expect("parse cli");
-            select_initial_model(&mut runtime, config, &cli, offline).expect("select model");
+            let selection =
+                resolve_cli_selection(&cli, &mut config, offline).expect("read the command line");
+            select_initial_model(&mut runtime, &config, &selection, offline).expect("select model");
             runtime
                 .session()
                 .active_model
@@ -11784,6 +11662,7 @@ mod tests {
             name: None,
             api: ConfigProviderApi::Faux,
             base_url: None,
+            ..ModelDefinition::default()
         });
         let runtime = account_test_runtime("faux", Some("work"));
 
@@ -11857,6 +11736,7 @@ mod tests {
             name: None,
             api: ConfigProviderApi::OpenAi,
             base_url: Some(url),
+            ..ModelDefinition::default()
         });
         let runtime = account_test_runtime("openai", None);
         let request = || ProviderRequest {
@@ -11894,25 +11774,18 @@ mod tests {
         assert_eq!(format_model_selection(&model, None), "openai-codex/gpt-5.5");
     }
 
-    #[test]
-    fn gpt6_thinking_levels_are_available() {
-        for provider in ["openai", "openai-codex", "azure-openai-responses"] {
-            let model = ModelRef {
-                provider: provider.to_string(),
-                id: "gpt-6.1-sol".to_string(),
-            };
-            assert!(model_thinking_levels(&model).contains(&"high"));
-            assert!(model_thinking_levels(&model).contains(&"xhigh"));
-            assert_eq!(default_thinking_for_model(&model), Some("xhigh"));
-        }
-    }
-
     #[tokio::test]
     async fn new_session_keeps_persisted_selections_but_starts_fresh_history() {
         let root = std::env::temp_dir().join(format!("pi-cli-new-{}", unique_temp_suffix()));
         let mut config = minimal_test_config();
         config.paths.session_dir = root.join("sessions");
         config.settings.default_thinking_level = Some("medium".into());
+        config.models.push(ModelDefinition {
+            provider: "anthropic".to_string(),
+            id: "claude-sonnet-4-6".to_string(),
+            reasoning: Some(true),
+            ..ModelDefinition::default()
+        });
         let mut terminal = Terminal::with_options(
             CrosstermBackend::new(io::stdout()),
             TerminalOptions {
@@ -11992,10 +11865,9 @@ mod tests {
                 .unwrap();
             }
             assert_eq!(runtime.session().active_thinking_level.as_deref(), level);
-            let thinking_before = active_thinking_label(&runtime, &config);
-            if level == Some("off") {
-                assert_eq!(thinking_before, None); // Must not inherit medium.
-            }
+            let thinking_before = thinking_label(&runtime, &config);
+            // An explicit off must not inherit the configured medium.
+            assert_eq!(thinking_before.as_deref(), level.or(Some("medium")));
             let before = runtime.session().clone();
             let old_store = runtime.store().unwrap().clone();
             let systems = runtime.systems().clone();
@@ -12016,7 +11888,7 @@ mod tests {
             expected.active_account = before.active_account.clone();
             assert_eq!(runtime.session(), &expected);
             assert_eq!(runtime.systems(), &systems);
-            assert_eq!(active_thinking_label(&runtime, &config), thinking_before);
+            assert_eq!(thinking_label(&runtime, &config), thinking_before);
             assert_eq!(
                 SessionStore::open(old_store.path().to_path_buf())
                     .unwrap()
@@ -12043,6 +11915,7 @@ mod tests {
             name: None,
             api: ConfigProviderApi::Faux,
             base_url: None,
+            ..ModelDefinition::default()
         });
         let mut terminal = Terminal::with_options(
             CrosstermBackend::new(io::stdout()),
@@ -12104,34 +11977,471 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A reasoning model with this thinking level map (upstream
+    /// `thinkingLevelMap`); without entries it supports `off` to `high`.
+    fn thinking_test_model(provider: &str, id: &str, map: serde_json::Value) -> ModelDefinition {
+        ModelDefinition {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            api: ConfigProviderApi::Anthropic,
+            reasoning: Some(true),
+            thinking_level_map: Some(serde_json::from_value(map).expect("level map")),
+            ..ModelDefinition::default()
+        }
+    }
+
+    /// A config that knows `models`, with a stored key for each of their
+    /// providers. The providers are made up, so the models can run and no
+    /// other can, whatever keys the test run's environment holds.
+    fn thinking_test_config(models: Vec<ModelDefinition>) -> LoadedConfig {
+        let mut config = minimal_test_config();
+        for model in &models {
+            config.auth.insert(
+                &model.provider,
+                DEFAULT_ACCOUNT_NAME,
+                AuthCredential::ApiKey {
+                    key: "test-key".to_string(),
+                },
+            );
+        }
+        config.models = models;
+        config
+    }
+
+    fn test_model_ref(provider: &str, id: &str) -> ModelRef {
+        ModelRef {
+            provider: provider.to_string(),
+            id: id.to_string(),
+        }
+    }
+
+    fn top_levels() -> serde_json::Value {
+        serde_json::json!({ "xhigh": "xhigh", "max": "max" })
+    }
+
+    #[tokio::test]
+    async fn thinking_and_model_commands_follow_the_models_levels() {
+        let mut config = thinking_test_config(vec![
+            thinking_test_model("alpha", "flash", serde_json::json!({})),
+            thinking_test_model("beta", "haiku", serde_json::json!({})),
+            thinking_test_model("beta", "opus", top_levels()),
+            thinking_test_model(
+                "beta",
+                "opus-next",
+                serde_json::json!({ "off": null, "xhigh": "xhigh", "max": "max" }),
+            ),
+        ]);
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        runtime
+            .set_active_model(Some(test_model_ref("alpha", "flash")))
+            .unwrap();
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut viewport_height = 24;
+        let mut app = TuiApp::new(&config, &runtime);
+        let mut surface = TuiSurface {
+            terminal: &mut terminal,
+            viewport_height: &mut viewport_height,
+        };
+        macro_rules! submit {
+            ($line:expr) => {
+                handle_tui_submission(
+                    &mut app,
+                    &mut surface,
+                    &mut runtime,
+                    &mut config,
+                    false,
+                    $line.to_string(),
+                )
+                .await
+            };
+        }
+
+        // A model starts on upstream's default level.
+        submit!("/thinking").unwrap();
+        assert!(app.transcript_text().ends_with("thinking: medium"));
+        submit!("/thinking HIGH").unwrap();
+        assert_eq!(
+            runtime.session().active_thinking_level.as_deref(),
+            Some("high")
+        );
+        // A level the model lacks is refused by name, as upstream refuses it.
+        let error = submit!("/thinking xhigh").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Unknown thinking level \"xhigh\". Available levels: off, minimal, low, medium, high."
+        );
+        assert_eq!(
+            runtime.session().active_thinking_level.as_deref(),
+            Some("high")
+        );
+
+        // An exact reference switches, ignoring case, and the level in
+        // effect moves with the session, clamped to the new model.
+        submit!("/model Beta/Opus").unwrap();
+        assert_eq!(
+            runtime.session().active_model,
+            Some(test_model_ref("beta", "opus"))
+        );
+        assert!(app.transcript_text().ends_with("beta/opus high"));
+        submit!("/thinking max").unwrap();
+        submit!("/model haiku").unwrap();
+        assert!(app.transcript_text().ends_with("beta/haiku high"));
+        // This model cannot turn thinking off.
+        submit!("/model beta/opus-next").unwrap();
+        let error = submit!("/thinking off").unwrap_err().to_string();
+        assert!(
+            error.ends_with("Available levels: minimal, low, medium, high, xhigh, max."),
+            "{error}"
+        );
+
+        // Anything else opens the picker with the text as its search; the
+        // session keeps its model.
+        submit!("/model opu").unwrap();
+        let selector = app.selector.take().expect("the model picker");
+        assert_eq!(
+            (selector.kind.as_str(), selector.query.as_str()),
+            ("model", "opu")
+        );
+        assert_eq!(
+            selector
+                .filtered_indices
+                .iter()
+                .map(|index| selector.items[*index].value.as_str())
+                .collect::<Vec<_>>(),
+            ["beta/opus", "beta/opus-next"]
+        );
+        assert_eq!(
+            runtime.session().active_model,
+            Some(test_model_ref("beta", "opus-next"))
+        );
+        let _ = fs::remove_dir_all(config.paths.agent_dir.parent().unwrap());
+    }
+
     #[test]
-    fn anthropic_thinking_levels_follow_model_version() {
-        let opus_5 = ModelRef {
-            provider: "anthropic".to_string(),
-            id: "claude-opus-5-5".to_string(),
-        };
-        assert_eq!(
-            model_thinking_levels(&opus_5),
-            &["off", "high", "xhigh", "max"]
+    fn the_model_picker_shows_and_applies_the_levels_a_model_supports() {
+        let mut config = thinking_test_config(vec![
+            ModelDefinition {
+                reasoning: Some(false),
+                ..thinking_test_model("alpha", "plain", serde_json::json!({}))
+            },
+            thinking_test_model("beta", "haiku", serde_json::json!({})),
+            thinking_test_model("beta", "opus", top_levels()),
+        ]);
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
         );
+        runtime
+            .set_active_model(Some(test_model_ref("beta", "opus")))
+            .unwrap();
+        set_thinking_level(&mut runtime, &config, "max").unwrap();
+        let mut app = TuiApp::new(&config, &runtime);
+        let picker = |config: &LoadedConfig, runtime: &Runtime, query: &str| {
+            TuiSelectorState::new(
+                "model",
+                selector_for_kind(config, runtime, "model").unwrap(),
+                query,
+                None,
+            )
+            .with_model_thinking(config, runtime)
+        };
 
-        let sonnet_4_6 = ModelRef {
-            provider: "anthropic".to_string(),
-            id: "claude-sonnet-4-6".to_string(),
-        };
+        // Untouched, a row shows the level a switch to it gives: the level
+        // in effect, clamped to that model.
+        let mut selector = picker(&config, &runtime, "haiku");
+        assert_eq!(selector.selected_thinking_level().as_deref(), Some("high"));
+        // Left and right walk the model's own levels and wrap.
+        selector.cycle_thinking(1);
+        assert_eq!(selector.selected_thinking_level().as_deref(), Some("off"));
+        selector.cycle_thinking(-2);
         assert_eq!(
-            model_thinking_levels(&sonnet_4_6),
-            &["off", "low", "medium", "high", "xhigh"]
+            selector.selected_thinking_level().as_deref(),
+            Some("medium")
         );
+        apply_tui_selector_selection(&mut app, &mut runtime, &mut config, selector).unwrap();
+        assert_eq!(
+            runtime.session().active_model,
+            Some(test_model_ref("beta", "haiku"))
+        );
+        assert_eq!(thinking_label(&runtime, &config).as_deref(), Some("medium"));
+        assert!(app.transcript_text().ends_with("beta/haiku medium"));
 
-        let sonnet_4_5 = ModelRef {
-            provider: "anthropic".to_string(),
-            id: "claude-sonnet-4-5".to_string(),
+        // A model without reasoning offers no level.
+        let mut selector = picker(&config, &runtime, "plain");
+        assert_eq!(selector.selected_thinking_level(), None);
+        selector.cycle_thinking(1);
+        assert_eq!(selector.thinking_level, None);
+        apply_tui_selector_selection(&mut app, &mut runtime, &mut config, selector).unwrap();
+        assert_eq!(thinking_label(&runtime, &config), None);
+        assert!(app.transcript_text().ends_with("alpha/plain"));
+
+        // `modelThinkingLevels` decides the level an untouched row shows.
+        config
+            .settings
+            .model_thinking_levels
+            .insert("beta/opus".to_string(), "xhigh".to_string());
+        let selector = picker(&config, &runtime, "opus");
+        assert_eq!(selector.selected_thinking_level().as_deref(), Some("xhigh"));
+        assert_eq!(
+            select_from_selector_message(&mut config, &mut runtime, "/select model opus").unwrap(),
+            "beta/opus xhigh"
+        );
+        let _ = fs::remove_dir_all(config.paths.agent_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn a_model_scope_narrows_the_pickers_and_keeps_every_model_known() {
+        let mut config = thinking_test_config(vec![
+            thinking_test_model("alpha", "flash", serde_json::json!({})),
+            thinking_test_model("beta", "haiku", serde_json::json!({})),
+            thinking_test_model("beta", "opus", top_levels()),
+        ]);
+        let runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let rows = |config: &LoadedConfig, kind: &str| {
+            selector_for_kind(config, &runtime, kind)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|item| item.value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&config, "model").len(), 3);
+        let cli = Cli::try_parse_from(["pi", "--models", "beta/op*,flash:low"]).expect("parse cli");
+        apply_cli_overrides(&cli, Path::new("."), &mut config).expect("apply the scope");
+        assert_eq!(rows(&config, "model"), ["alpha/flash", "beta/opus"]);
+        assert_eq!(rows(&config, "provider"), ["alpha", "beta"]);
+        assert_eq!(config.models.len(), 3);
+        assert_eq!(config.model_scope[1].thinking_level.as_deref(), Some("low"));
+        // A model outside the scope can still be named in full.
+        assert_eq!(
+            resolve_cli(
+                &Cli::try_parse_from(["pi", "--model", "beta/haiku"]).unwrap(),
+                &config,
+                false
+            )
+            .and_then(|resolved| resolved.model)
+            .map(|model| model.id),
+            Some("haiku".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn providers_are_built_with_the_clamped_thinking_level() {
+        let config = thinking_test_config(vec![
+            ModelDefinition {
+                reasoning: Some(false),
+                ..thinking_test_model("alpha", "plain", serde_json::json!({}))
+            },
+            thinking_test_model("beta", "haiku", serde_json::json!({})),
+        ]);
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        runtime
+            .set_active_model(Some(test_model_ref("beta", "haiku")))
+            .unwrap();
+        // A saved level the model lacks reaches the provider clamped.
+        runtime
+            .set_active_thinking_level(Some("max".to_string()))
+            .unwrap();
+        let provider = provider_for_runtime(&runtime, &config, false)
+            .await
+            .expect("provider");
+        assert_eq!(provider.thinking_level().as_deref(), Some("high"));
+        // Off is a level too, where the model can turn thinking off.
+        runtime
+            .set_active_thinking_level(Some("off".to_string()))
+            .unwrap();
+        let provider = provider_for_runtime(&runtime, &config, false)
+            .await
+            .expect("provider");
+        assert_eq!(provider.thinking_level().as_deref(), Some("off"));
+        // A model without reasoning is sent no level.
+        runtime
+            .set_active_model(Some(test_model_ref("alpha", "plain")))
+            .unwrap();
+        runtime
+            .set_active_thinking_level(Some("high".to_string()))
+            .unwrap();
+        let provider = provider_for_runtime(&runtime, &config, false)
+            .await
+            .expect("provider");
+        assert_eq!(provider.thinking_level(), None);
+    }
+
+    /// From the session and the model definition to the request on the
+    /// wire: the level clamped to the model and named as the model names
+    /// it, and the model's output cap.
+    #[tokio::test]
+    async fn a_request_carries_the_models_thinking_level_and_output_cap() {
+        use std::io::BufReader;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            (0..2)
+                .map(|_| {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line.trim_end().is_empty() {
+                            break;
+                        }
+                        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length: ") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut request = vec![0; length];
+                    reader.read_exact(&mut request).unwrap();
+                    let body = r#"{"output_text":"ok"}"#;
+                    write!(
+                        reader.into_inner(),
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&request).unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut auth = AuthData::default();
+        auth.insert(
+            "local",
+            DEFAULT_ACCOUNT_NAME,
+            AuthCredential::ApiKey {
+                key: "local-key".to_string(),
+            },
+        );
+        let mut config = account_test_config(auth);
+        config.paths.auth_path = std::env::temp_dir().join(format!(
+            "pi-cli-request-traits-{}/auth.json",
+            unique_temp_suffix()
+        ));
+        let definition = |id: &str, extra: serde_json::Value| {
+            let mut model = serde_json::json!({
+                "provider": "local", "id": id, "api": "openai-responses", "baseUrl": url,
+            });
+            model
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<ModelDefinition>(model).unwrap()
+        };
+        config.models = vec![
+            definition(
+                "thinker",
+                serde_json::json!({
+                    "reasoning": true,
+                    "thinkingLevelMap": { "minimal": null, "xhigh": "extra-hard" },
+                    "contextWindow": 32000,
+                    "maxTokens": 4000,
+                }),
+            ),
+            definition("plain", serde_json::json!({})),
+        ];
+        let mut runtime = account_test_runtime("local", None);
+        let request = || ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        // `max` is above what the model supports.
+        runtime
+            .set_active_thinking_level(Some("max".to_string()))
+            .unwrap();
+        for id in ["thinker", "plain"] {
+            runtime
+                .set_active_model(Some(test_model_ref("local", id)))
+                .unwrap();
+            let provider = provider_for_runtime(&runtime, &config, false)
+                .await
+                .unwrap();
+            provider.complete(request()).await.unwrap();
+        }
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["model"], "thinker");
+        assert_eq!(requests[0]["reasoning"]["effort"], "extra-hard");
+        assert_eq!(requests[0]["max_output_tokens"], 4000);
+        // Nothing is said of thinking or a cap to a model that has neither.
+        assert_eq!(requests[1]["model"], "plain");
+        assert_eq!(requests[1].get("reasoning"), None);
+        assert_eq!(requests[1].get("max_output_tokens"), None);
+    }
+
+    #[test]
+    fn reload_keeps_the_custom_model_the_command_line_named() {
+        let root = std::env::temp_dir().join(format!("pi-cli-custom-{}", unique_temp_suffix()));
+        let agent = root.join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        let cli = Cli::try_parse_from(["pi", "--model", "anthropic/claude-next:high"]).unwrap();
+        let source = ConfigSource {
+            cli,
+            cwd: root.clone(),
+            project_trusted: false,
+        };
+        let config = source
+            .load(ConfigPaths {
+                cwd: root.clone(),
+                agent_dir: agent.clone(),
+                session_dir: agent.join("sessions"),
+                settings_path: agent.join("settings.json"),
+                project_settings_path: root.join(".pi/settings.json"),
+                auth_path: agent.join("auth.json"),
+                models_path: agent.join("models.json"),
+                model_cache_path: agent.join("model-cache.json"),
+                keybindings_path: agent.join("keybindings.json"),
+            })
+            .expect("reload config");
+        let custom = configured_model(&config, &test_model_ref("anthropic", "claude-next"))
+            .expect("the custom model");
+        let base = pi_ai::catalog::provider_base_model("anthropic").unwrap();
+        assert_eq!(custom.max_tokens, Some(base.max_tokens));
+        assert_eq!(custom.name.as_deref(), Some("claude-next"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_api_key_goes_to_the_provider_the_model_resolves_to() {
+        let mut config = minimal_test_config();
+        config.models = pi_ai::catalog::builtin_models()
+            .iter()
+            .map(ModelDefinition::from)
+            .collect();
+        let provider = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["pi"].into_iter().chain(args.iter().copied())).unwrap();
+            infer_cli_provider(&cli, &config)
         };
         assert_eq!(
-            model_thinking_levels(&sonnet_4_5),
-            &["off", "minimal", "low", "medium", "high"]
+            provider(&["--model", "anthropic/claude-opus-4-8"]).as_deref(),
+            Some("anthropic")
         );
+        // A custom id still names its provider, and so does the former
+        // Azure id.
+        assert_eq!(
+            provider(&["--model", "mistral/next"]).as_deref(),
+            Some("mistral")
+        );
+        assert_eq!(
+            provider(&["--provider", "azure-openai-responses", "--model", "gpt-5.4"]).as_deref(),
+            Some("azure")
+        );
+        assert_eq!(provider(&[]), None);
     }
 
     #[test]
@@ -12735,6 +13045,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
         let output = run_user_turn(&mut runtime, provider.as_ref(), "/read fixture.txt".into())
             .await
@@ -12787,6 +13098,7 @@ mod tests {
             api: pi_config::ProviderApi::Faux,
             base_url: None,
             context_window: None,
+            ..ModelDefinition::default()
         });
         followups.push("first follow-up".to_string());
 
@@ -13510,6 +13822,7 @@ mod tests {
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -13703,6 +14016,7 @@ mod tests {
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -13824,6 +14138,7 @@ mod tests {
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -14015,6 +14330,7 @@ mod tests {
             name: Some(id.to_string()),
             api: ConfigProviderApi::OpenAi,
             base_url: None,
+            ..ModelDefinition::default()
         }
     }
 
@@ -15428,6 +15744,7 @@ mod tests {
             name: None,
             api: ConfigProviderApi::default(),
             base_url: None,
+            ..ModelDefinition::default()
         }
     }
 
