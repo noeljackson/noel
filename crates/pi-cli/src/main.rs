@@ -1695,7 +1695,7 @@ fn apply_cached_claude_code_version(config: &LoadedConfig) {
 }
 
 fn start_model_refresh(config: &LoadedConfig, offline: bool, verbose: bool) {
-    if offline || !model_refresh_enabled(&config.settings) {
+    if !background_refresh_allowed(&config.settings, offline, pi_config::test_isolation()) {
         return;
     }
     let ttl_hours = model_refresh_ttl_hours(&config.settings);
@@ -1711,6 +1711,13 @@ fn start_model_refresh(config: &LoadedConfig, offline: bool, verbose: bool) {
             }
         }
     });
+}
+
+/// Background model refresh runs only online and when enabled, and never
+/// under the test harness (`PI_TEST_ISOLATION`), so tests never call
+/// providers with whatever credentials they can see.
+fn background_refresh_allowed(settings: &Settings, offline: bool, test_isolation: bool) -> bool {
+    !offline && !test_isolation && model_refresh_enabled(settings)
 }
 
 fn model_refresh_enabled(settings: &Settings) -> bool {
@@ -10458,17 +10465,7 @@ mod tests {
     #[test]
     fn command_completions_include_loaded_resources() {
         let config = LoadedConfig {
-            paths: ConfigPaths {
-                cwd: PathBuf::from("."),
-                agent_dir: PathBuf::from(".pi/agent"),
-                session_dir: PathBuf::from(".pi/agent/sessions"),
-                settings_path: PathBuf::from(".pi/agent/settings.json"),
-                project_settings_path: PathBuf::from(".pi/settings.json"),
-                auth_path: PathBuf::from(".pi/agent/auth.json"),
-                models_path: PathBuf::from(".pi/agent/models.json"),
-                model_cache_path: PathBuf::from(".pi/agent/model-cache.json"),
-                keybindings_path: PathBuf::from(".pi/agent/keybindings.json"),
-            },
+            paths: test_config_paths(),
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
@@ -10522,9 +10519,11 @@ mod tests {
             project_settings_path: root.join(".pi/settings.json"),
             ..test_config_paths()
         };
+        // Only the faux model is enabled, so building the runtime looks up no
+        // provider credentials in the environment or in $HOME login files.
         fs::write(
             &config.paths.settings_path,
-            r#"{"unknownSetting":123,"defaultProvider":"faux","defaultModel":"echo"}"#,
+            r#"{"unknownSetting":123,"defaultProvider":"faux","defaultModel":"echo","enabledModels":["faux/echo"]}"#,
         )
         .unwrap();
         let theme_path = root.join("themes/custom.json");
@@ -12928,17 +12927,22 @@ mod tests {
         );
     }
 
+    /// Paths in a fresh directory under the system temp dir, so a test never
+    /// reads or writes the real `~/.pi` or the repository (nothing is
+    /// created until a test writes).
     fn test_config_paths() -> ConfigPaths {
+        let root = std::env::temp_dir().join(format!("pi-cli-unit-{}", unique_temp_suffix()));
+        let agent_dir = root.join("agent");
         ConfigPaths {
             cwd: PathBuf::from("."),
-            agent_dir: PathBuf::from(".pi/agent"),
-            session_dir: PathBuf::from(".pi/agent/sessions"),
-            settings_path: PathBuf::from(".pi/agent/settings.json"),
-            project_settings_path: PathBuf::from(".pi/settings.json"),
-            auth_path: PathBuf::from(".pi/agent/auth.json"),
-            models_path: PathBuf::from(".pi/agent/models.json"),
-            model_cache_path: PathBuf::from(".pi/agent/model-cache.json"),
-            keybindings_path: PathBuf::from(".pi/agent/keybindings.json"),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: root.join("project/.pi/settings.json"),
+            auth_path: agent_dir.join("auth.json"),
+            models_path: agent_dir.join("models.json"),
+            model_cache_path: agent_dir.join("model-cache.json"),
+            keybindings_path: agent_dir.join("keybindings.json"),
+            agent_dir,
         }
     }
 
@@ -13352,6 +13356,14 @@ mod tests {
         let report = ModelRefreshReport::default();
         assert!(next_model_cache(None, &report, Some(200)).is_none());
         assert!(next_model_cache(None, &report, None).is_none());
+    }
+
+    #[test]
+    fn tests_never_refresh_models_in_the_background() {
+        let settings = Settings::default();
+        assert!(background_refresh_allowed(&settings, false, false));
+        assert!(!background_refresh_allowed(&settings, false, true));
+        assert!(!background_refresh_allowed(&settings, true, false));
     }
 
     #[test]

@@ -76,8 +76,9 @@ fmt:
 lint:
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
+# PI_TEST_ISOLATION: no test may fall back to ~/.pi/agent or refresh models.
 test:
-	$(CARGO) test --all
+	PI_TEST_ISOLATION=1 $(CARGO) test --all
 
 check: fmt lint test
 

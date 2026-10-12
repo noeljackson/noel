@@ -16,7 +16,17 @@ pub const APP_NAME: &str = "pi";
 pub const CONFIG_DIR_NAME: &str = ".pi";
 pub const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 pub const ENV_SESSION_DIR: &str = "PI_CODING_AGENT_SESSION_DIR";
+/// Set by the test harness (`make test`, and every `pi` the CLI tests run).
+/// pi then refuses to fall back to `~/.pi/agent`, so a test must name its
+/// agent dir with `PI_CODING_AGENT_DIR`, imports no Claude Code or Codex
+/// login from `$HOME`, and starts no background model refresh.
+pub const ENV_TEST_ISOLATION: &str = "PI_TEST_ISOLATION";
 pub const PROJECT_TRUST_FILE_NAME: &str = "trust.json";
+
+/// True under the test harness; see [`ENV_TEST_ISOLATION`].
+pub fn test_isolation() -> bool {
+    env::var_os(ENV_TEST_ISOLATION).is_some()
+}
 const RESOURCE_IGNORE_FILES: [&str; 3] = [".gitignore", ".ignore", ".fdignore"];
 
 #[derive(Debug, Error)]
@@ -38,6 +48,10 @@ pub enum ConfigError {
     },
     #[error("home directory is not available")]
     HomeUnavailable,
+    #[error(
+        "PI_TEST_ISOLATION is set: refusing the default agent dir ~/.pi/agent; set PI_CODING_AGENT_DIR to a test directory"
+    )]
+    DefaultAgentDirInTest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +75,7 @@ impl ConfigPaths {
         let cwd = cwd.into();
         let agent_dir = match env::var_os(ENV_AGENT_DIR) {
             Some(value) => expand_tilde(PathBuf::from(value))?,
+            None if test_isolation() => return Err(ConfigError::DefaultAgentDirInTest),
             None => home_dir()?.join(CONFIG_DIR_NAME).join("agent"),
         };
         let session_dir = match session_dir_override {
@@ -1485,6 +1500,10 @@ fn env_auth(provider: &str) -> Option<ResolvedAuth> {
 }
 
 fn login_auth(provider: &str) -> Option<ResolvedAuth> {
+    // Tests never read the developer's Claude Code or Codex login files.
+    if test_isolation() {
+        return None;
+    }
     match provider {
         "anthropic" => read_claude_code_oauth(),
         "openai" | "openai-codex" => read_codex_chatgpt_oauth(),
