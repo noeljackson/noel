@@ -1304,6 +1304,7 @@ mod tests {
             settings: pi_config::Settings::default(),
             auth,
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -1477,6 +1478,7 @@ mod tests {
                 name: None,
                 api: pi_config::ProviderApi::Faux,
                 base_url: None,
+                ..pi_config::ModelDefinition::default()
             });
         }
         let stub = spawn_stub(200, r#"{"data":{"total_credits":10.0,"total_usage":2.5}}"#);

@@ -187,7 +187,10 @@ fn parse(args: &[String]) -> Result<AuthCommand, String> {
                     .ok_or_else(|| format!("{arg} requires a value"))?
                     .to_string();
                 match arg.as_str() {
-                    "--provider" => command.provider = Some(value),
+                    // The Azure id earlier versions used names Azure still.
+                    "--provider" => {
+                        command.provider = Some(pi_config::canonical_provider(&value).to_string())
+                    }
                     "--model" => command.model = Some(value),
                     _ => command.account = Some(value),
                 }
@@ -749,6 +752,7 @@ mod tests {
             api: ProviderApi::default(),
             base_url: None,
             context_window: None,
+            ..ModelDefinition::default()
         }
     }
 

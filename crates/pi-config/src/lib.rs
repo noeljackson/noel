@@ -22,6 +22,14 @@ use thiserror::Error;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
+mod model_resolver;
+
+pub use model_resolver::{
+    custom_model, find_exact_model_reference_match, find_initial_model, resolve_cli_model,
+    resolve_model_scope, CliModel, ModelScope, ScopedModel,
+};
+pub use pi_ai::catalog::{ModelCost, ThinkingLevelMap, DEFAULT_THINKING_LEVEL, THINKING_LEVELS};
+
 pub const APP_NAME: &str = "pi";
 pub const CONFIG_DIR_NAME: &str = ".pi";
 pub const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
@@ -172,6 +180,10 @@ pub struct Settings {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub default_thinking_level: Option<String>,
+    /// The thinking level a model starts on, by `provider/id`; it ranks
+    /// above `defaultThinkingLevel`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_thinking_levels: BTreeMap<String, String>,
     pub transport: Option<String>,
     pub steering_mode: Option<String>,
     pub follow_up_mode: Option<String>,
@@ -247,6 +259,11 @@ impl Settings {
             default_thinking_level: overrides
                 .default_thinking_level
                 .or(self.default_thinking_level),
+            model_thinking_levels: {
+                let mut levels = self.model_thinking_levels;
+                levels.extend(overrides.model_thinking_levels);
+                levels
+            },
             transport: overrides.transport.or(self.transport),
             steering_mode: overrides.steering_mode.or(self.steering_mode),
             follow_up_mode: overrides.follow_up_mode.or(self.follow_up_mode),
@@ -321,6 +338,37 @@ impl Settings {
             warnings: merge_optional_settings(self.warnings, overrides.warnings),
             model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
         }
+    }
+}
+
+impl Settings {
+    /// Rewrites the Azure provider id this port used to use, wherever a
+    /// saved setting names a provider (see [`canonical_provider`]).
+    fn with_canonical_providers(mut self) -> Self {
+        let legacy_prefix = format!("{LEGACY_AZURE_PROVIDER}/");
+        let rename = |reference: String| match reference.strip_prefix(&legacy_prefix) {
+            Some(id) => format!("{}/{id}", pi_ai::AZURE_PROVIDER),
+            None => reference,
+        };
+        self.default_provider = self
+            .default_provider
+            .map(|provider| canonical_provider(&provider).to_string());
+        self.enabled_models = self
+            .enabled_models
+            .map(|patterns| patterns.into_iter().map(rename).collect());
+        self.model_thinking_levels = self
+            .model_thinking_levels
+            .into_iter()
+            .map(|(model, level)| (rename(model), level))
+            .collect();
+        self
+    }
+
+    /// The level `provider/id` starts on, if `modelThinkingLevels` sets one.
+    pub fn model_thinking_level(&self, provider: &str, id: &str) -> Option<&str> {
+        self.model_thinking_levels
+            .get(&format!("{provider}/{id}"))
+            .map(String::as_str)
     }
 }
 
@@ -743,29 +791,44 @@ pub struct AuthData {
 }
 
 impl AuthData {
+    /// The key `provider`'s accounts are stored under: its id, or for Azure
+    /// the id this port used to use, when the file still holds that one
+    /// (see [`canonical_provider`]). Either id names the same accounts.
+    fn stored_key<'a>(&self, provider: &'a str) -> &'a str {
+        let provider = canonical_provider(provider);
+        if provider == pi_ai::AZURE_PROVIDER
+            && !self.providers.contains_key(provider)
+            && self.providers.contains_key(LEGACY_AZURE_PROVIDER)
+        {
+            return LEGACY_AZURE_PROVIDER;
+        }
+        provider
+    }
+
     pub fn accounts_for_provider(&self, provider: &str) -> Vec<String> {
         self.providers
-            .get(provider)
+            .get(self.stored_key(provider))
             .map(|accounts| accounts.keys().cloned().collect())
             .unwrap_or_default()
     }
 
     pub fn credential(&self, provider: &str, account: &str) -> Option<&AuthCredential> {
-        self.providers.get(provider)?.get(account)
+        self.providers.get(self.stored_key(provider))?.get(account)
     }
 
     pub fn insert(&mut self, provider: &str, account: &str, credential: AuthCredential) {
         self.providers
-            .entry(provider.to_string())
+            .entry(self.stored_key(provider).to_string())
             .or_default()
             .insert(account.to_string(), credential);
     }
 
     pub fn remove(&mut self, provider: &str, account: &str) -> Option<AuthCredential> {
-        let accounts = self.providers.get_mut(provider)?;
+        let key = self.stored_key(provider);
+        let accounts = self.providers.get_mut(key)?;
         let removed = accounts.remove(account);
         if accounts.is_empty() {
-            self.providers.remove(provider);
+            self.providers.remove(key);
         }
         removed
     }
@@ -775,7 +838,7 @@ impl AuthData {
     }
 
     pub fn account_for_resolution(&self, provider: &str) -> Option<&str> {
-        let accounts = self.providers.get(provider)?;
+        let accounts = self.providers.get(self.stored_key(provider))?;
         if accounts.contains_key(DEFAULT_ACCOUNT_NAME) {
             return Some(DEFAULT_ACCOUNT_NAME);
         }
@@ -874,7 +937,12 @@ pub fn expires_within(expires: u64, now: u64, within_seconds: u64) -> bool {
     expires != 0 && now.saturating_add(within_seconds) >= expires
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A model pi can be pointed at. The fields are upstream's model object's
+/// and keep its names, so a built-in model, a `models.json` entry, and a
+/// cached listing all describe a model the same way. Everything past the
+/// endpoint is optional: a loaded config fills what an entry leaves out
+/// from the built-in catalog (see `merge_model_definitions`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDefinition {
     pub provider: String,
@@ -888,22 +956,111 @@ pub struct ModelDefinition {
     /// Context size in tokens. Custom models can override the compiled catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// The most output tokens one reply may have. Without it requests carry
+    /// no output cap, except where the API requires one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Whether the model has thinking levels. Absent means it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    /// Which thinking levels a reasoning model supports and what the
+    /// provider is sent for each (upstream `thinkingLevelMap`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level_map: Option<ThinkingLevelMap>,
+    /// What the model accepts: `text`, `image`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Vec<String>>,
+    /// Prices in US dollars per million tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<ModelCost>,
 }
 
-/// Unknown/custom models use a conservative fallback unless models.json
-/// supplies contextWindow explicitly. The compiled catalog remains authoritative
-/// for known models even when older cache entries omit the field.
+impl ModelDefinition {
+    pub fn model_ref(&self) -> pi_ai::ModelRef {
+        pi_ai::ModelRef {
+            provider: self.provider.clone(),
+            id: self.id.clone(),
+        }
+    }
+
+    pub fn reasoning(&self) -> bool {
+        self.reasoning.unwrap_or(false)
+    }
+
+    /// The thinking levels the model can be set to, lowest first; `off`
+    /// alone for a model without reasoning.
+    pub fn supported_thinking_levels(&self) -> Vec<&'static str> {
+        pi_ai::catalog::supported_thinking_levels(
+            self.reasoning(),
+            self.thinking_level_map.as_ref(),
+        )
+    }
+
+    /// `level` if the model supports it, else the nearest level it does
+    /// (upstream `clampThinkingLevel`).
+    pub fn clamp_thinking_level(&self, level: &str) -> &'static str {
+        pi_ai::catalog::clamp_thinking_level(
+            self.reasoning(),
+            self.thinking_level_map.as_ref(),
+            level,
+        )
+    }
+
+    /// What request builders read of the model.
+    pub fn traits(&self) -> pi_ai::ModelTraits {
+        pi_ai::ModelTraits {
+            context_window: self.context_window.filter(|window| *window > 0),
+            max_tokens: self.max_tokens.filter(|tokens| *tokens > 0),
+            reasoning: Some(self.reasoning()),
+            thinking_level_map: self.thinking_level_map.clone(),
+        }
+    }
+}
+
+impl From<&pi_ai::catalog::CatalogModel> for ModelDefinition {
+    fn from(model: &pi_ai::catalog::CatalogModel) -> Self {
+        Self {
+            provider: model.provider.clone(),
+            id: model.id.clone(),
+            name: Some(model.name.clone()),
+            api: ProviderApi::from(&model.api),
+            base_url: model.base_url.clone(),
+            context_window: Some(model.context_window),
+            max_tokens: Some(model.max_tokens),
+            reasoning: Some(model.reasoning),
+            thinking_level_map: model.thinking_level_map.clone(),
+            input: Some(model.input.clone()),
+            cost: Some(model.cost.clone()),
+        }
+    }
+}
+
+/// The context size compaction and the output cap work with: the model's
+/// own, else a conservative fallback for a model nothing is known about.
 pub fn model_context_window(model: &ModelDefinition) -> u64 {
     model
         .context_window
         .filter(|window| *window > 0)
         .or_else(|| {
-            pi_providers::builtin_models()
-                .iter()
-                .find(|candidate| candidate.provider == model.provider && candidate.id == model.id)
-                .and_then(|candidate| candidate.context_window)
+            pi_ai::catalog::builtin_model(&model.provider, &model.id)
+                .map(|builtin| builtin.context_window)
         })
         .unwrap_or(128_000)
+}
+
+/// Upstream's Azure provider id. Before the built-in catalog came from
+/// upstream this port called the provider `azure-openai-responses`; saved
+/// settings, `auth.json` entries, sessions, and `models.json` may still.
+pub const LEGACY_AZURE_PROVIDER: &str = pi_ai::LEGACY_AZURE_PROVIDER;
+
+/// `provider` as the catalog names it: the Azure id this port used to use
+/// becomes upstream's.
+pub fn canonical_provider(provider: &str) -> &str {
+    if provider == LEGACY_AZURE_PROVIDER {
+        pi_ai::AZURE_PROVIDER
+    } else {
+        provider
+    }
 }
 
 /// Caches written by older builds (or without this field) are treated as stale
@@ -984,6 +1141,40 @@ pub enum ProviderApi {
     Faux,
 }
 
+impl From<&pi_ai::ProviderApi> for ProviderApi {
+    fn from(api: &pi_ai::ProviderApi) -> Self {
+        match api {
+            pi_ai::ProviderApi::Faux => Self::Faux,
+            pi_ai::ProviderApi::OpenAi => Self::OpenAi,
+            pi_ai::ProviderApi::OpenAiResponses => Self::OpenAiResponses,
+            pi_ai::ProviderApi::OpenAiCodexResponses => Self::OpenAiCodexResponses,
+            pi_ai::ProviderApi::AzureOpenAiResponses => Self::AzureOpenAiResponses,
+            pi_ai::ProviderApi::Anthropic => Self::Anthropic,
+            pi_ai::ProviderApi::Google => Self::Google,
+            pi_ai::ProviderApi::GoogleVertex => Self::GoogleVertex,
+            pi_ai::ProviderApi::Bedrock => Self::Bedrock,
+            pi_ai::ProviderApi::Mistral => Self::Mistral,
+        }
+    }
+}
+
+impl From<&ProviderApi> for pi_ai::ProviderApi {
+    fn from(api: &ProviderApi) -> Self {
+        match api {
+            ProviderApi::Faux => Self::Faux,
+            ProviderApi::OpenAi => Self::OpenAi,
+            ProviderApi::OpenAiResponses => Self::OpenAiResponses,
+            ProviderApi::OpenAiCodexResponses => Self::OpenAiCodexResponses,
+            ProviderApi::AzureOpenAiResponses => Self::AzureOpenAiResponses,
+            ProviderApi::Anthropic => Self::Anthropic,
+            ProviderApi::Google => Self::Google,
+            ProviderApi::GoogleVertex => Self::GoogleVertex,
+            ProviderApi::Bedrock => Self::Bedrock,
+            ProviderApi::Mistral => Self::Mistral,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImageProviderApi {
     #[serde(rename = "openrouter-images")]
@@ -1038,7 +1229,15 @@ pub struct LoadedConfig {
     pub paths: ConfigPaths,
     pub settings: Settings,
     pub auth: AuthData,
+    /// Every model the config knows: built-in, listed by a provider, or
+    /// from `models.json`.
     pub models: Vec<ModelDefinition>,
+    /// What `--models` or the `enabledModels` setting selects of them: the
+    /// models startup and the model picker start from. Empty when there is
+    /// no scope. `load_config` leaves it empty: which models a scope
+    /// selects depends on credentials and the command line, so the caller
+    /// resolves it ([`resolve_model_scope`]).
+    pub model_scope: Vec<ScopedModel>,
     pub image_models: Vec<ImageModelDefinition>,
     pub keybindings: Vec<KeybindingConfig>,
     pub context_files: Vec<ContextFile>,
@@ -1091,7 +1290,10 @@ pub fn load_config_with_resources(
     };
     let global_settings = global_settings.unwrap_or_default();
     let project_settings = project_settings.unwrap_or_default();
-    let settings = global_settings.clone().merge(project_settings.clone());
+    let settings = global_settings
+        .clone()
+        .merge(project_settings.clone())
+        .with_canonical_providers();
     let auth = read_optional_json::<AuthData>(&paths.auth_path)?.unwrap_or_default();
     let mut diagnostics = Vec::new();
     let explicit_models =
@@ -1109,16 +1311,15 @@ pub fn load_config_with_resources(
     if let Some(cache) = &cache {
         diagnostics.extend(cache.diagnostics.iter().cloned());
     }
-    let models = filter_enabled_models(
-        merge_model_definitions(
-            default_models(),
-            cache
-                .as_ref()
-                .map(|cache| cache.models.clone())
-                .unwrap_or_default(),
-            explicit_models,
-        ),
-        settings.enabled_models.as_deref(),
+    // Every known model. `enabledModels` scopes model selection without
+    // removing models (`resolve_model_scope`).
+    let models = merge_model_definitions(
+        default_models(),
+        cache
+            .as_ref()
+            .map(|cache| cache.models.clone())
+            .unwrap_or_default(),
+        explicit_models,
     );
     let image_models = default_image_models();
     let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
@@ -1226,6 +1427,7 @@ pub fn load_config_with_resources(
         settings,
         auth,
         models,
+        model_scope: Vec::new(),
         image_models,
         keybindings,
         context_files,
@@ -1237,25 +1439,6 @@ pub fn load_config_with_resources(
         system_prompt,
         append_system_prompt,
     })
-}
-
-fn filter_enabled_models(
-    models: Vec<ModelDefinition>,
-    enabled_models: Option<&[String]>,
-) -> Vec<ModelDefinition> {
-    let Some(enabled_models) = enabled_models else {
-        return models;
-    };
-    models
-        .into_iter()
-        .filter(|model| {
-            enabled_models.iter().any(|enabled| {
-                enabled == &model.id
-                    || enabled == &format!("{}/{}", model.provider, model.id)
-                    || model.name.as_deref() == Some(enabled.as_str())
-            })
-        })
-        .collect()
 }
 
 pub fn api_key_for_provider(
@@ -1554,20 +1737,76 @@ pub fn write_model_cache(path: &Path, cache: &ModelCache) -> Result<(), ConfigEr
     write_file_atomic(path, format!("{content}\n").as_bytes())
 }
 
+/// The models a config knows: the built-in catalog, then the cached
+/// provider listings, then `models.json`, later entries replacing earlier
+/// ones for the same provider and id.
+///
+/// A cached listing says which models a provider serves, not how to reach
+/// them or what they can do. For a provider the catalog has, a listed id
+/// the catalog also has changes nothing, and one it lacks is built onto the
+/// provider's default model, as `--model provider/new-id` is
+/// (`custom_model`), keeping the listing's name and context window. A
+/// `models.json` entry is used as written (provider, id, name, API, and
+/// base URL), and takes what it leaves out (context window, output cap,
+/// reasoning, thinking levels, input, prices) from the built-in model of the
+/// same id, else from the provider's default model.
 fn merge_model_definitions(
     base: Vec<ModelDefinition>,
     cache: Vec<ModelDefinition>,
     explicit: Vec<ModelDefinition>,
 ) -> Vec<ModelDefinition> {
-    let mut models = Vec::new();
-    for model in base.into_iter().chain(cache).chain(explicit) {
-        if let Some(index) = models.iter().position(|existing: &ModelDefinition| {
-            existing.provider == model.provider && existing.id == model.id
-        }) {
-            models[index] = model;
-        } else {
-            models.push(model);
+    let builtin = base.clone();
+    let known = |model: &ModelDefinition| {
+        builtin
+            .iter()
+            .find(|candidate| candidate.provider == model.provider && candidate.id == model.id)
+    };
+    let mut models = base;
+    let mut upsert = |model: ModelDefinition| match models
+        .iter_mut()
+        .find(|existing| existing.provider == model.provider && existing.id == model.id)
+    {
+        Some(existing) => *existing = model,
+        None => models.push(model),
+    };
+    for mut model in cache {
+        model.provider = canonical_provider(&model.provider).to_string();
+        if known(&model).is_some() {
+            continue;
         }
+        upsert(match custom_model(&builtin, &model.provider, &model.id) {
+            Some(custom) => ModelDefinition {
+                name: model.name.or(custom.name),
+                context_window: model.context_window.or(custom.context_window),
+                ..custom
+            },
+            None => model,
+        });
+    }
+    for mut model in explicit {
+        model.provider = canonical_provider(&model.provider).to_string();
+        let same_id = known(&model).cloned();
+        let name = model
+            .name
+            .clone()
+            .or_else(|| same_id.as_ref().and_then(|builtin| builtin.name.clone()));
+        let traits = same_id.or_else(|| custom_model(&builtin, &model.provider, &model.id));
+        upsert(match traits {
+            Some(traits) => ModelDefinition {
+                name,
+                context_window: model.context_window.or(traits.context_window),
+                max_tokens: model.max_tokens.or(traits.max_tokens),
+                reasoning: model.reasoning.or(traits.reasoning),
+                thinking_level_map: model
+                    .thinking_level_map
+                    .clone()
+                    .or(traits.thinking_level_map),
+                input: model.input.clone().or(traits.input),
+                cost: model.cost.clone().or(traits.cost),
+                ..model
+            },
+            None => model,
+        });
     }
     models
 }
@@ -1576,7 +1815,9 @@ fn env_api_key(provider: &str) -> Option<String> {
     let names = match provider {
         "anthropic" => &["ANTHROPIC_API_KEY"][..],
         "amazon-bedrock" => &["AWS_BEARER_TOKEN_BEDROCK"][..],
-        "azure-openai-responses" => &["AZURE_OPENAI_API_KEY"][..],
+        "ant-ling" => &["ANT_LING_API_KEY"][..],
+        "azure" | LEGACY_AZURE_PROVIDER => &["AZURE_OPENAI_API_KEY"][..],
+        "baseten" => &["BASETEN_API_KEY"][..],
         "cloudflare-ai-gateway" | "cloudflare-workers-ai" => &["CLOUDFLARE_API_KEY"][..],
         "cerebras" => &["CEREBRAS_API_KEY"][..],
         "deepseek" => &["DEEPSEEK_API_KEY"][..],
@@ -1587,14 +1828,18 @@ fn env_api_key(provider: &str) -> Option<String> {
         "groq" => &["GROQ_API_KEY"][..],
         "huggingface" => &["HF_TOKEN"][..],
         "kimi-coding" | "kimi-coding-openai" => &["KIMI_API_KEY"][..],
+        "meta" => &["META_API_KEY"][..],
         "minimax" => &["MINIMAX_API_KEY"][..],
         "minimax-cn" => &["MINIMAX_CN_API_KEY"][..],
         "moonshotai" | "moonshotai-cn" => &["MOONSHOT_API_KEY"][..],
+        "nvidia" => &["NVIDIA_API_KEY"][..],
         "openai" => &["OPENAI_API_KEY"],
         "openai-codex" => &["CODEX_API_KEY"][..],
         "opencode" | "opencode-go" => &["OPENCODE_API_KEY"][..],
         "openrouter" => &["OPENROUTER_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
+        "qwen-token-plan" | "qwen-token-plan-individual" => &["QWEN_TOKEN_PLAN_API_KEY"][..],
+        "qwen-token-plan-cn" => &["QWEN_TOKEN_PLAN_CN_API_KEY"][..],
         "together" => &["TOGETHER_API_KEY"][..],
         "vercel-ai-gateway" => &["AI_GATEWAY_API_KEY"][..],
         "xai" => &["XAI_API_KEY"][..],
@@ -1603,6 +1848,7 @@ fn env_api_key(provider: &str) -> Option<String> {
         "xiaomi-token-plan-cn" => &["XIAOMI_TOKEN_PLAN_CN_API_KEY"][..],
         "xiaomi-token-plan-sgp" => &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"][..],
         "zai" | "zai-coding" | "zai-anthropic" => &["ZAI_API_KEY"][..],
+        "zai-coding-cn" => &["ZAI_CODING_CN_API_KEY"][..],
         _ => &[],
     };
     names.iter().find_map(|name| env::var(name).ok())
@@ -2614,430 +2860,13 @@ fn resource_name(path: &Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// The built-in catalog (`pi_ai::catalog`): this port's own providers, then
+/// upstream's.
 fn default_models() -> Vec<ModelDefinition> {
-    let mut models = pi_providers::builtin_models()
-        .into_iter()
-        .map(|model| ModelDefinition {
-            context_window: model.context_window,
-            provider: model.provider,
-            id: model.id,
-            name: Some(model.name),
-            api: match model.api {
-                pi_ai::ProviderApi::Faux => ProviderApi::Faux,
-                pi_ai::ProviderApi::OpenAi => ProviderApi::OpenAi,
-                pi_ai::ProviderApi::OpenAiResponses => ProviderApi::OpenAiResponses,
-                pi_ai::ProviderApi::OpenAiCodexResponses => ProviderApi::OpenAiCodexResponses,
-                pi_ai::ProviderApi::AzureOpenAiResponses => ProviderApi::AzureOpenAiResponses,
-                pi_ai::ProviderApi::Anthropic => ProviderApi::Anthropic,
-                pi_ai::ProviderApi::Google => ProviderApi::Google,
-                pi_ai::ProviderApi::GoogleVertex => ProviderApi::GoogleVertex,
-                pi_ai::ProviderApi::Bedrock => ProviderApi::Bedrock,
-                pi_ai::ProviderApi::Mistral => ProviderApi::Mistral,
-            },
-            base_url: model.base_url,
-        })
-        .collect::<Vec<_>>();
-    models.extend([
-        ModelDefinition {
-            context_window: None,
-            provider: "faux".to_string(),
-            id: "echo".to_string(),
-            name: Some("Faux Echo".to_string()),
-            api: ProviderApi::Faux,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "faux".to_string(),
-            id: "script".to_string(),
-            name: Some("Faux Script".to_string()),
-            api: ProviderApi::Faux,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai".to_string(),
-            id: "gpt-5.4".to_string(),
-            name: Some("OpenAI GPT 5.4".to_string()),
-            api: ProviderApi::OpenAiResponses,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai".to_string(),
-            id: "gpt-4.1".to_string(),
-            name: Some("OpenAI GPT 4.1".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.1".to_string(),
-            name: Some("GPT 5.1".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.1-codex-max".to_string(),
-            name: Some("GPT 5.1 Codex Max".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.1-codex-mini".to_string(),
-            name: Some("GPT 5.1 Codex Mini".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.2".to_string(),
-            name: Some("GPT 5.2".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.2-codex".to_string(),
-            name: Some("GPT 5.2 Codex".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.3-codex".to_string(),
-            name: Some("GPT 5.3 Codex".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.3-codex-spark".to_string(),
-            name: Some("GPT 5.3 Codex Spark".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.4".to_string(),
-            name: Some("GPT 5.4".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.4-mini".to_string(),
-            name: Some("GPT 5.4 Mini".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.5".to_string(),
-            name: Some("GPT 5.5".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "azure-openai-responses".to_string(),
-            id: "gpt-5.2".to_string(),
-            name: Some("Azure OpenAI GPT 5.2".to_string()),
-            api: ProviderApi::AzureOpenAiResponses,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-opus-4-1-20250805".to_string(),
-            name: Some("Claude Opus 4.1".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-opus-4-8".to_string(),
-            name: Some("Claude Opus 4.8".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-opus-4-7".to_string(),
-            name: Some("Claude Opus 4.7".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-opus-4-20250514".to_string(),
-            name: Some("Claude Opus 4".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-sonnet-4-5".to_string(),
-            name: Some("Claude Sonnet".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-sonnet-4-6".to_string(),
-            name: Some("Claude Sonnet 4.6".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "github-copilot".to_string(),
-            id: "gpt-5.4".to_string(),
-            name: Some("GitHub Copilot GPT 5.4".to_string()),
-            api: ProviderApi::OpenAiResponses,
-            base_url: Some("https://api.individual.githubcopilot.com".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openrouter".to_string(),
-            id: "moonshotai/kimi-k2.6".to_string(),
-            name: Some("OpenRouter Kimi K2.6".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://openrouter.ai/api/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "deepseek".to_string(),
-            id: "deepseek-v4-flash".to_string(),
-            name: Some("DeepSeek V4 Flash".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.deepseek.com".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "groq".to_string(),
-            id: "openai/gpt-oss-120b".to_string(),
-            name: Some("Groq GPT OSS 120B".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.groq.com/openai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "cerebras".to_string(),
-            id: "gpt-oss-120b".to_string(),
-            name: Some("Cerebras GPT OSS 120B".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.cerebras.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xai".to_string(),
-            id: "grok-code-fast-1".to_string(),
-            name: Some("Grok Code Fast 1".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.x.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "zai".to_string(),
-            id: "glm-5.1".to_string(),
-            name: Some("GLM 5.1".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "huggingface".to_string(),
-            id: "MiniMaxAI/MiniMax-M2.7".to_string(),
-            name: Some("Hugging Face MiniMax M2.7".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://router.huggingface.co/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "together".to_string(),
-            id: "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8".to_string(),
-            name: Some("Together Qwen3 Coder 480B".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.together.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "moonshotai".to_string(),
-            id: "kimi-k2-thinking".to_string(),
-            name: Some("Kimi K2 Thinking".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.moonshot.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "moonshotai-cn".to_string(),
-            id: "kimi-k2-thinking".to_string(),
-            name: Some("Kimi K2 Thinking CN".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.moonshot.cn/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "opencode".to_string(),
-            id: "big-pickle".to_string(),
-            name: Some("OpenCode Big Pickle".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://opencode.ai/zen/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "opencode-go".to_string(),
-            id: "deepseek-v4-flash".to_string(),
-            name: Some("OpenCode Go DeepSeek V4 Flash".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://opencode.ai/zen/go/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "fireworks".to_string(),
-            id: "accounts/fireworks/models/deepseek-v4-pro".to_string(),
-            name: Some("Fireworks DeepSeek V4 Pro".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.fireworks.ai/inference".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "minimax".to_string(),
-            id: "MiniMax-M2.7".to_string(),
-            name: Some("MiniMax M2.7".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.minimax.io/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "minimax-cn".to_string(),
-            id: "MiniMax-M2.7".to_string(),
-            name: Some("MiniMax M2.7 CN".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.minimaxi.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "kimi-coding".to_string(),
-            id: "kimi-for-coding".to_string(),
-            name: Some("Kimi For Coding".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.kimi.com/coding".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xiaomi".to_string(),
-            id: "mimo-v2.5-pro".to_string(),
-            name: Some("MiMo V2.5 Pro".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.xiaomimimo.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xiaomi-token-plan-cn".to_string(),
-            id: "mimo-v2.5-pro".to_string(),
-            name: Some("MiMo V2.5 Pro Token Plan CN".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://token-plan-cn.xiaomimimo.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xiaomi-token-plan-ams".to_string(),
-            id: "mimo-v2.5-pro".to_string(),
-            name: Some("MiMo V2.5 Pro Token Plan AMS".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://token-plan-ams.xiaomimimo.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xiaomi-token-plan-sgp".to_string(),
-            id: "mimo-v2.5-pro".to_string(),
-            name: Some("MiMo V2.5 Pro Token Plan SGP".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://token-plan-sgp.xiaomimimo.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "vercel-ai-gateway".to_string(),
-            id: "alibaba/qwen3-coder".to_string(),
-            name: Some("Vercel AI Gateway Qwen3 Coder".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://ai-gateway.vercel.sh".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "google".to_string(),
-            id: "gemini-2.5-pro".to_string(),
-            name: Some("Gemini Pro".to_string()),
-            api: ProviderApi::Google,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "google-vertex".to_string(),
-            id: "gemini-2.5-pro".to_string(),
-            name: Some("Gemini Pro Vertex".to_string()),
-            api: ProviderApi::GoogleVertex,
-            base_url: Some("https://{GOOGLE_CLOUD_LOCATION}-aiplatform.googleapis.com".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "amazon-bedrock".to_string(),
-            id: "us.anthropic.claude-opus-4-6-v1".to_string(),
-            name: Some("Bedrock Claude Opus 4.6".to_string()),
-            api: ProviderApi::Bedrock,
-            base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "mistral".to_string(),
-            id: "devstral-medium-latest".to_string(),
-            name: Some("Mistral Devstral Medium".to_string()),
-            api: ProviderApi::Mistral,
-            base_url: Some("https://api.mistral.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "cloudflare-workers-ai".to_string(),
-            id: "@cf/moonshotai/kimi-k2.6".to_string(),
-            name: Some("Cloudflare Workers AI Kimi K2.6".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some(
-                "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
-                    .to_string(),
-            ),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "cloudflare-ai-gateway".to_string(),
-            id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
-            name: Some("Cloudflare AI Gateway Kimi K2.6".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some(
-                "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat"
-                    .to_string(),
-            ),
-        },
-    ]);
-    merge_model_definitions(Vec::new(), Vec::new(), models)
+    pi_ai::catalog::builtin_models()
+        .iter()
+        .map(ModelDefinition::from)
+        .collect()
 }
 
 fn default_image_models() -> Vec<ImageModelDefinition> {
@@ -3212,9 +3041,14 @@ mod tests {
         assert_eq!(settings.reserve_tokens, Some(2048));
         assert_eq!(settings.keep_recent_tokens, Some(6000));
         assert_eq!(settings.trigger_percent, Some(80));
-        let old: ModelDefinition =
-            serde_json::from_str(r#"{"provider":"openai","id":"gpt-5.4"}"#).unwrap();
-        assert_eq!(model_context_window(&old), 1_050_000);
+        // An entry without a window (an old cache) takes the catalog's.
+        let builtin = pi_ai::catalog::provider_base_model("openai").expect("built-in model");
+        let old = ModelDefinition {
+            provider: builtin.provider.clone(),
+            id: builtin.id.clone(),
+            ..ModelDefinition::default()
+        };
+        assert_eq!(model_context_window(&old), builtin.context_window);
         let mut custom: ModelDefinition =
             serde_json::from_str(r#"{"provider":"local","id":"test","contextWindow":8192}"#)
                 .unwrap();
@@ -3226,7 +3060,7 @@ mod tests {
     }
 
     #[test]
-    fn load_config_accepts_keybinding_map_and_filters_enabled_models() {
+    fn load_config_accepts_keybinding_map_and_keeps_every_model_under_a_scope() {
         let root = test_dir("pi-config-load");
         let agent_dir = root.join("agent");
         let cwd = root.join("repo");
@@ -3278,14 +3112,30 @@ mod tests {
         .expect("load config");
 
         assert_eq!(config.system_prompt, Some("prompt".to_string()));
-        assert_eq!(
+        // `enabledModels` scopes selection; it removes no model.
+        let has = |provider: &str, id: &str| {
             config
                 .models
                 .iter()
-                .map(|model| format!("{}/{}", model.provider, model.id))
+                .any(|model| model.provider == provider && model.id == id)
+        };
+        assert!(has("faux", "echo"));
+        assert!(has("openai", "gpt-test") && has("anthropic", "claude-test"));
+        let builtin = pi_ai::catalog::provider_base_model("anthropic").expect("built-in model");
+        assert!(has("anthropic", &builtin.id));
+        let scope = resolve_model_scope(
+            config.settings.enabled_models.as_deref().unwrap(),
+            &config.models.iter().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            scope
+                .models
+                .iter()
+                .map(|scoped| format!("{}/{}", scoped.model.provider, scoped.model.id))
                 .collect::<Vec<_>>(),
             ["faux/echo", "openai/gpt-test"]
         );
+        assert!(scope.diagnostics.is_empty(), "{:?}", scope.diagnostics);
         assert_eq!(config.keybindings.len(), 2);
         assert!(config
             .keybindings
@@ -3787,20 +3637,40 @@ mod tests {
             ]"#,
         )
         .expect("write explicit models");
+        let builtin = pi_ai::catalog::provider_base_model("anthropic").expect("built-in model");
         write_model_cache(
             &agent_dir.join("model-cache.json"),
             &ModelCache {
                 refreshed_at: 123,
                 version: MODEL_CACHE_VERSION,
                 claude_code_version: None,
-                models: vec![ModelDefinition {
-                    context_window: None,
-                    provider: "anthropic".to_string(),
-                    id: "claude-opus-4-1-20250805".to_string(),
-                    name: Some("Claude Opus 4.1".to_string()),
-                    api: ProviderApi::Anthropic,
-                    base_url: None,
-                }],
+                models: vec![
+                    // A listing of a model the catalog lacks, as a refresh
+                    // writes it: no URL, the provider's name for it.
+                    ModelDefinition {
+                        provider: "anthropic".to_string(),
+                        id: "claude-listed-only".to_string(),
+                        name: Some("Claude Listed Only".to_string()),
+                        api: ProviderApi::Anthropic,
+                        ..ModelDefinition::default()
+                    },
+                    // A listing of a model the catalog has.
+                    ModelDefinition {
+                        provider: "anthropic".to_string(),
+                        id: builtin.id.clone(),
+                        name: Some("Listed Under Another Name".to_string()),
+                        api: ProviderApi::Anthropic,
+                        ..ModelDefinition::default()
+                    },
+                    // A provider the catalog lacks.
+                    ModelDefinition {
+                        provider: "elsewhere".to_string(),
+                        id: "model".to_string(),
+                        api: ProviderApi::OpenAi,
+                        base_url: Some("https://elsewhere.example/v1".to_string()),
+                        ..ModelDefinition::default()
+                    },
+                ],
                 diagnostics: vec!["model refresh warning".to_string()],
             },
         )
@@ -3826,9 +3696,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(model_ids.contains(&"faux/echo".to_string()));
         assert!(model_ids.contains(&"faux/script".to_string()));
-        assert!(model_ids.contains(&"anthropic/claude-opus-4-1-20250805".to_string()));
+        assert!(model_ids.contains(&"anthropic/claude-listed-only".to_string()));
         assert!(model_ids.contains(&"anthropic/claude-custom".to_string()));
         assert_eq!(config.diagnostics, ["model refresh warning"]);
+
+        let model = |provider: &str, id: &str| {
+            config
+                .models
+                .iter()
+                .find(|model| model.provider == provider && model.id == id)
+                .unwrap_or_else(|| panic!("{provider}/{id}"))
+        };
+        let default = model("anthropic", &builtin.id);
+        // A listed model the catalog has is the catalog's entry.
+        assert_eq!(default, &ModelDefinition::from(builtin));
+        // A listed id the catalog lacks is built onto the provider's
+        // default model and keeps its listed name.
+        let listed = model("anthropic", "claude-listed-only");
+        assert_eq!(listed.name.as_deref(), Some("Claude Listed Only"));
+        assert_eq!(
+            ModelDefinition {
+                id: default.id.clone(),
+                name: default.name.clone(),
+                ..listed.clone()
+            },
+            *default
+        );
+        // A `models.json` entry is used as written and takes the rest from
+        // the provider's default model.
+        let custom = model("anthropic", "claude-custom");
+        assert_eq!(custom.name.as_deref(), Some("Custom Claude"));
+        assert_eq!(
+            (&custom.api, &custom.base_url),
+            (&ProviderApi::Anthropic, &None)
+        );
+        assert_eq!(custom.max_tokens, default.max_tokens);
+        assert_eq!(
+            custom.supported_thinking_levels(),
+            default.supported_thinking_levels()
+        );
+        // Nothing is known about a provider the catalog lacks.
+        let elsewhere = model("elsewhere", "model");
+        assert_eq!(elsewhere.max_tokens, None);
+        assert_eq!(elsewhere.supported_thinking_levels(), ["off"]);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4192,16 +4102,31 @@ mod tests {
 
         env::remove_var("ANTHROPIC_OAUTH_TOKEN");
         env::remove_var("ANTHROPIC_API_KEY");
-        env::set_var("OPENAI_API_KEY", "openai-api-key");
-        env::set_var("AZURE_OPENAI_API_KEY", "azure-api-key");
-        assert_eq!(
-            auth_for_provider(&AuthData::default(), "openai", None),
-            Some(ResolvedAuth::ApiKey("openai-api-key".to_string()))
-        );
-        assert_eq!(
-            auth_for_provider(&AuthData::default(), "azure-openai-responses", None),
-            Some(ResolvedAuth::ApiKey("azure-api-key".to_string()))
-        );
+        // Every environment case of the fixture, under upstream's provider
+        // id: the variables it sets resolve to the credential it expects.
+        let cases = fixture["env"].as_array().expect("env cases");
+        assert!(cases.iter().any(|case| case["provider"] == "azure"));
+        for case in cases {
+            let provider = case["provider"].as_str().expect("provider");
+            let variables = case["env"].as_object().expect("env");
+            for (name, value) in variables {
+                env::set_var(name, value.as_str().expect("value"));
+            }
+            let token = match auth_for_provider(&AuthData::default(), provider, None) {
+                Some(ResolvedAuth::ApiKey(key)) => Some(key),
+                Some(ResolvedAuth::ClaudeCodeOAuth { access_token, .. })
+                | Some(ResolvedAuth::ChatGptOAuth { access_token, .. }) => Some(access_token),
+                None => None,
+            };
+            assert_eq!(
+                token.as_deref(),
+                case["expectedApiKey"].as_str(),
+                "{provider}"
+            );
+            for name in variables.keys() {
+                env::remove_var(name);
+            }
+        }
 
         for (name, value) in saved {
             restore_env(name, value);
@@ -4509,7 +4434,7 @@ mod tests {
             r#"[
                 {"provider":"openai","id":"gpt","api":"openai-responses"},
                 {"provider":"openai-codex","id":"codex","api":"openai-codex-responses"},
-                {"provider":"azure-openai-responses","id":"gpt","api":"azure-openai-responses"},
+                {"provider":"azure","id":"gpt","api":"azure-openai-responses"},
                 {"provider":"anthropic","id":"claude","api":"anthropic-messages"},
                 {"provider":"google","id":"gemini","api":"google-generative-ai"},
                 {"provider":"google-vertex","id":"gemini","api":"google-vertex"},
@@ -4529,119 +4454,216 @@ mod tests {
         assert_eq!(models[7].api, ProviderApi::Mistral);
     }
 
+    /// `model-catalog.json` in full: every upstream model pi can run is a
+    /// default model with upstream's values. (`pi_ai::catalog` compares the
+    /// catalog itself; this compares what a config loads.)
     #[test]
-    fn default_models_include_provider_parity_targets() {
-        let providers = default_models()
-            .into_iter()
-            .map(|model| model.provider)
-            .collect::<Vec<_>>();
-
-        for provider in [
-            "openai-codex",
-            "azure-openai-responses",
-            "github-copilot",
-            "openrouter",
-            "deepseek",
-            "groq",
-            "cerebras",
-            "xai",
-            "zai",
-            "huggingface",
-            "together",
-            "moonshotai",
-            "moonshotai-cn",
-            "opencode",
-            "opencode-go",
-            "fireworks",
-            "minimax",
-            "minimax-cn",
-            "kimi-coding",
-            "xiaomi",
-            "xiaomi-token-plan-cn",
-            "xiaomi-token-plan-ams",
-            "xiaomi-token-plan-sgp",
-            "vercel-ai-gateway",
-            "google-vertex",
-            "amazon-bedrock",
-            "mistral",
-            "cloudflare-workers-ai",
-            "cloudflare-ai-gateway",
-        ] {
-            assert!(providers.iter().any(|candidate| candidate == provider));
-        }
-
-        let models = default_models()
-            .into_iter()
-            .map(|model| format!("{}/{}", model.provider, model.id))
-            .collect::<Vec<_>>();
-        for model in [
-            "anthropic/claude-opus-4-1-20250805",
-            "anthropic/claude-opus-4-7",
-            "anthropic/claude-sonnet-4-6",
-            "openai-codex/gpt-5.4",
-            "openai-codex/gpt-5.4-mini",
-            "openai-codex/gpt-5.5",
-            "deepseek/deepseek-v4-flash",
-            "groq/openai/gpt-oss-120b",
-            "cerebras/gpt-oss-120b",
-            "xai/grok-code-fast-1",
-            "zai/glm-5.1",
-            "huggingface/MiniMaxAI/MiniMax-M2.7",
-            "together/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
-            "moonshotai/kimi-k2-thinking",
-            "moonshotai-cn/kimi-k2-thinking",
-            "opencode/big-pickle",
-            "opencode-go/deepseek-v4-flash",
-            "fireworks/accounts/fireworks/models/deepseek-v4-pro",
-            "minimax/MiniMax-M2.7",
-            "minimax-cn/MiniMax-M2.7",
-            "kimi-coding/kimi-for-coding",
-            "xiaomi/mimo-v2.5-pro",
-            "xiaomi-token-plan-cn/mimo-v2.5-pro",
-            "xiaomi-token-plan-ams/mimo-v2.5-pro",
-            "xiaomi-token-plan-sgp/mimo-v2.5-pro",
-            "vercel-ai-gateway/alibaba/qwen3-coder",
-        ] {
-            assert!(models.iter().any(|candidate| candidate == model));
-        }
-    }
-
-    #[test]
-    fn default_models_cover_upstream_ts_catalog_targets() {
+    fn default_models_are_upstreams_catalog_in_full() {
         let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
             "../../../tests/fixtures/ts-parity/model-catalog.json"
         ))
         .expect("parse model catalog fixture");
-        assert!(
-            fixture["providerCount"].as_u64().expect("provider count") >= 1,
-            "upstream model catalog should expose providers"
-        );
-        let rust_models = default_models()
-            .into_iter()
-            .map(|model| format!("{}/{}", model.provider, model.id))
+        let defaults = default_models();
+        let mut compared = 0;
+        let mut providers = BTreeSet::new();
+        for provider in fixture["providers"].as_array().expect("providers") {
+            for record in provider["models"].as_array().expect("models") {
+                if record["api"] == "pi-messages" {
+                    continue;
+                }
+                let model = defaults
+                    .iter()
+                    .find(|model| {
+                        record["provider"] == *model.provider && record["id"] == *model.id
+                    })
+                    .unwrap_or_else(|| panic!("missing {record}"));
+                let mut expected = serde_json::json!({});
+                for key in [
+                    "provider",
+                    "id",
+                    "name",
+                    "api",
+                    "baseUrl",
+                    "contextWindow",
+                    "maxTokens",
+                    "reasoning",
+                    "thinkingLevelMap",
+                    "input",
+                    "cost",
+                ] {
+                    if let Some(value) = record.get(key) {
+                        expected[key] = value.clone();
+                    }
+                }
+                // Azure's models have no URL.
+                if expected["baseUrl"] == "" {
+                    expected["baseUrl"] = serde_json::Value::Null;
+                }
+                assert_eq!(serde_json::to_value(model).expect("serialize"), expected);
+                providers.insert(model.provider.clone());
+                compared += 1;
+            }
+        }
+        assert!(compared > 1000, "{compared} models compared");
+        // Besides upstream's, the port's own providers and nothing else.
+        let port_only = defaults
+            .iter()
+            .map(|model| model.provider.as_str())
+            .filter(|provider| !providers.contains(*provider))
             .collect::<BTreeSet<_>>();
-        for target in fixture["targets"].as_array().expect("catalog targets") {
-            assert_eq!(target["found"], true, "upstream target missing: {target}");
-            let provider = target["provider"].as_str().expect("provider");
-            let id = target["id"].as_str().expect("id");
-            let model_ref = format!("{provider}/{id}");
-            assert!(
-                rust_models.contains(&model_ref),
-                "missing upstream model catalog target {model_ref}"
+        assert_eq!(
+            port_only,
+            BTreeSet::from(["faux", "kimi-coding-openai", "zai-anthropic", "zai-coding"])
+        );
+        assert_eq!(defaults.len(), compared + 7);
+        assert!(providers.contains("azure") && !providers.contains(LEGACY_AZURE_PROVIDER));
+    }
+
+    #[test]
+    fn the_former_azure_provider_id_still_names_azure() {
+        assert_eq!(canonical_provider("azure-openai-responses"), "azure");
+        assert_eq!(canonical_provider("azure"), "azure");
+        assert_eq!(canonical_provider("openai"), "openai");
+
+        // An auth.json entry saved under the former id answers to both ids
+        // and stays where it is; a new entry goes beside it, not under a
+        // second key.
+        let mut auth: AuthData = serde_json::from_str(
+            r#"{"azure-openai-responses":{"work":{"type":"api_key","key":"saved-key"}}}"#,
+        )
+        .expect("parse auth");
+        for provider in ["azure", "azure-openai-responses"] {
+            assert_eq!(auth.accounts_for_provider(provider), ["work"]);
+            assert_eq!(auth.account_for_resolution(provider), Some("work"));
+            assert_eq!(
+                auth_for_provider(&auth, provider, None),
+                Some(ResolvedAuth::ApiKey("saved-key".to_string()))
             );
         }
+        auth.insert("azure", "home", api_key("home-key"));
+        assert_eq!(
+            auth.providers.keys().collect::<Vec<_>>(),
+            ["azure-openai-responses"]
+        );
+        assert_eq!(auth.accounts_for_provider("azure"), ["home", "work"]);
+        assert!(auth.remove("azure", "work").is_some());
+        assert!(auth.remove("azure-openai-responses", "home").is_some());
+        assert!(auth.is_empty());
+        // Without a saved entry, logins are stored under upstream's id.
+        auth.insert("azure-openai-responses", "work", api_key("key"));
+        assert_eq!(auth.providers.keys().collect::<Vec<_>>(), ["azure"]);
 
-        let opus = fixture["targets"]
-            .as_array()
-            .expect("catalog targets")
+        // Saved settings that name the provider.
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "defaultProvider": "azure-openai-responses",
+            "defaultModel": "gpt-5.2",
+            "enabledModels": ["azure-openai-responses/gpt-5.*", "openai/*"],
+            "modelThinkingLevels": { "azure-openai-responses/gpt-5.2": "high" }
+        }))
+        .expect("parse settings");
+        let settings = settings.with_canonical_providers();
+        assert_eq!(settings.default_provider.as_deref(), Some("azure"));
+        assert_eq!(
+            settings.enabled_models.as_deref(),
+            Some(&["azure/gpt-5.*".to_string(), "openai/*".to_string()][..])
+        );
+        assert_eq!(
+            settings.model_thinking_level("azure", "gpt-5.2"),
+            Some("high")
+        );
+
+        // A models.json or cached entry under the former id.
+        let merged = merge_model_definitions(
+            default_models(),
+            Vec::new(),
+            vec![ModelDefinition {
+                provider: "azure-openai-responses".to_string(),
+                id: "my-deployment".to_string(),
+                api: ProviderApi::AzureOpenAiResponses,
+                ..ModelDefinition::default()
+            }],
+        );
+        assert!(merged
             .iter()
-            .find(|target| target["provider"] == "anthropic" && target["id"] == "claude-opus-4-7")
-            .expect("opus target");
-        assert!(opus["thinkingLevels"]
-            .as_array()
-            .expect("opus thinking levels")
+            .any(|model| model.provider == "azure" && model.id == "my-deployment"));
+        assert!(merged
             .iter()
-            .any(|level| level == "xhigh"));
+            .all(|model| model.provider != "azure-openai-responses"));
+    }
+
+    #[test]
+    fn model_thinking_levels_merge_by_model() {
+        let global: Settings = serde_json::from_value(serde_json::json!({
+            "defaultThinkingLevel": "low",
+            "modelThinkingLevels": { "anthropic/claude-opus-4-8": "xhigh", "openai/gpt-5.5": "high" }
+        }))
+        .expect("parse global");
+        let project: Settings = serde_json::from_value(serde_json::json!({
+            "modelThinkingLevels": { "openai/gpt-5.5": "low" }
+        }))
+        .expect("parse project");
+        let settings = global.merge(project);
+        assert_eq!(
+            settings.model_thinking_level("anthropic", "claude-opus-4-8"),
+            Some("xhigh")
+        );
+        assert_eq!(
+            settings.model_thinking_level("openai", "gpt-5.5"),
+            Some("low")
+        );
+        assert_eq!(settings.model_thinking_level("openai", "gpt-5.4"), None);
+        assert_eq!(settings.default_thinking_level.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn a_model_definition_answers_for_its_thinking_levels() {
+        let model = |fields: serde_json::Value| {
+            let mut definition = serde_json::json!({ "provider": "local", "id": "test" });
+            definition
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            serde_json::from_value::<ModelDefinition>(definition).expect("parse")
+        };
+        // A definition that says nothing of reasoning has none.
+        let bare = model(serde_json::json!({}));
+        assert!(!bare.reasoning());
+        assert_eq!(bare.supported_thinking_levels(), ["off"]);
+        assert_eq!(bare.clamp_thinking_level("high"), "off");
+        assert_eq!(bare.traits().max_tokens, None);
+        assert_eq!(bare.traits().reasoning, Some(false));
+        // A reasoning model without a map stops at high.
+        let plain = model(serde_json::json!({ "reasoning": true }));
+        assert_eq!(
+            plain.supported_thinking_levels(),
+            ["off", "minimal", "low", "medium", "high"]
+        );
+        assert_eq!(plain.clamp_thinking_level("max"), "high");
+        // The upstream field names a models.json entry may use.
+        let full = model(serde_json::json!({
+            "api": "openai-completions", "baseUrl": "http://127.0.0.1:1/v1", "reasoning": true,
+            "thinkingLevelMap": { "minimal": null, "xhigh": "xhigh" },
+            "input": ["text", "image"], "contextWindow": 32000, "maxTokens": 4000,
+            "cost": { "input": 0.5, "output": 1, "cacheRead": 0, "cacheWrite": 0 }
+        }));
+        assert_eq!(
+            full.supported_thinking_levels(),
+            ["off", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(full.clamp_thinking_level("minimal"), "low");
+        assert_eq!(full.traits().max_tokens, Some(4000));
+        assert_eq!(
+            full.cost.as_ref().and_then(|cost| cost.input.as_f64()),
+            Some(0.5)
+        );
+        // What a cached listing writes stays what it wrote.
+        assert_eq!(
+            serde_json::to_value(&bare).expect("serialize"),
+            serde_json::json!({
+                "provider": "local", "id": "test", "name": null,
+                "api": "openai-completions", "baseUrl": null
+            })
+        );
     }
 
     #[test]
@@ -4725,9 +4747,11 @@ mod tests {
         env::set_var("CHATGPT_ACCOUNT_ID", "account-id");
 
         assert_eq!(
-            resolve("azure-openai-responses"),
+            resolve("azure"),
             Some(ResolvedAuth::ApiKey("azure-key".to_string()))
         );
+        // The id this port used before upstream's still names the provider.
+        assert_eq!(resolve(LEGACY_AZURE_PROVIDER), resolve("azure"));
         assert_eq!(
             resolve("github-copilot"),
             Some(ResolvedAuth::ApiKey("copilot-key".to_string()))

@@ -5127,6 +5127,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
         let reply = run_user_turn(&mut runtime, provider.as_ref(), "/nope hi".to_string())
             .await
@@ -5990,6 +5991,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
 
         let response = run_user_turn(&mut runtime, provider.as_ref(), "hello".to_string())
@@ -6019,6 +6021,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
         let mut deltas = Vec::new();
 
@@ -7202,6 +7205,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
         let answer = continue_turn_streaming_events(
             &mut reopened,
@@ -7264,6 +7268,7 @@ mod tests {
             },
             auth: Default::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -7411,6 +7416,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
         let steering = SteeringMailbox::new();
         steering.send("one".to_string());
@@ -7756,6 +7762,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
 
         run_user_turn(
@@ -8366,6 +8373,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
 
         let error = run_user_turn(

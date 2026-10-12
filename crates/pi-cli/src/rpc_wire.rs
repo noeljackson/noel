@@ -6,7 +6,10 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pi_ai::{ChatToolCall, MediaInput, ModelRef, StreamEvent};
-use pi_config::{model_context_window, LoadedConfig, ProviderApi, SourceInfo};
+use pi_config::{
+    model_context_window, LoadedConfig, ModelCost, ModelDefinition, ProviderApi, SourceInfo,
+    ThinkingLevelMap,
+};
 use pi_core::{
     CompactionRecord, ConversationMessage, MessageRole, Run, RunStatus, Runtime, SessionState,
     SteeringMailbox, ToolEvent, TurnEvent, RETRY_CANCELLED, STEERING_JOIN,
@@ -456,7 +459,9 @@ impl LastRun {
     }
 }
 
-/// Upstream's model object, with the fields pi's model config has.
+/// Upstream's model object, with the fields pi's model definition has, in
+/// upstream's order. `baseUrl`, `thinkingLevelMap`, and `maxTokens` are
+/// left out for a model whose definition has none.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Model {
@@ -467,17 +472,18 @@ pub(crate) struct Model {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     pub reasoning: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level_map: Option<ThinkingLevelMap>,
+    pub input: Vec<String>,
+    pub cost: ModelCost,
     pub context_window: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
 }
 
-impl Model {
-    /// A configured model; `None` if `model` is not in the config.
-    pub fn configured(config: &LoadedConfig, model: &ModelRef) -> Option<Self> {
-        let definition = config
-            .models
-            .iter()
-            .find(|candidate| candidate.provider == model.provider && candidate.id == model.id)?;
-        Some(Self {
+impl From<&ModelDefinition> for Model {
+    fn from(definition: &ModelDefinition) -> Self {
+        Self {
             id: definition.id.clone(),
             name: definition
                 .name
@@ -486,9 +492,25 @@ impl Model {
             api: definition.api.clone(),
             provider: definition.provider.clone(),
             base_url: definition.base_url.clone(),
-            reasoning: !crate::model_thinking_levels(model).is_empty(),
+            reasoning: definition.reasoning(),
+            thinking_level_map: definition.thinking_level_map.clone(),
+            // Upstream's defaults for a model that does not say.
+            input: definition
+                .input
+                .clone()
+                .unwrap_or_else(|| vec!["text".to_owned()]),
+            cost: definition.cost.clone().unwrap_or_default(),
             context_window: model_context_window(definition),
-        })
+            max_tokens: definition.max_tokens,
+        }
+    }
+}
+
+impl Model {
+    /// The session's model as requests are built for it (see
+    /// `model_definition`); `None` if nothing is known of it.
+    pub fn configured(config: &LoadedConfig, model: &ModelRef) -> Option<Self> {
+        crate::model_definition(config, model).map(|definition| Self::from(&*definition))
     }
 }
 

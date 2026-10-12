@@ -54,202 +54,32 @@ impl ModelSpec {
     }
 }
 
-/// The catalog intentionally contains a small, curated switching set. Apps can
-/// append custom models without waiting for a Pi release.
+/// The built-in catalog: upstream's models and this port's own providers
+/// (see `pi_ai::catalog`). Apps can append custom models without waiting for
+/// a Pi release.
 pub fn builtin_models() -> Vec<ModelSpec> {
-    vec![
-        model(
-            "faux",
-            "echo",
-            "Faux Echo",
-            ProviderApi::Faux,
-            None,
-            None,
-            UsageScope::General,
-        ),
-        model(
-            "faux",
-            "script",
-            "Faux Script",
-            ProviderApi::Faux,
-            None,
-            None,
-            UsageScope::General,
-        ),
-        model(
-            "openai",
-            "gpt-5.4",
-            "OpenAI GPT 5.4",
-            ProviderApi::OpenAiResponses,
-            None,
-            Some(1_050_000),
-            UsageScope::General,
-        ),
-        model(
-            "openai",
-            "gpt-4.1",
-            "OpenAI GPT 4.1",
-            ProviderApi::OpenAi,
-            None,
-            Some(1_047_576),
-            UsageScope::General,
-        ),
-        model(
-            "openai-codex",
-            "gpt-5.4",
-            "Codex GPT 5.4",
-            ProviderApi::OpenAiCodexResponses,
-            Some("https://chatgpt.com/backend-api"),
-            Some(400_000),
-            UsageScope::CodingSubscription,
-        ),
-        model(
-            "openai-codex",
-            "gpt-5.3-codex",
-            "Codex GPT 5.3",
-            ProviderApi::OpenAiCodexResponses,
-            Some("https://chatgpt.com/backend-api"),
-            Some(400_000),
-            UsageScope::CodingSubscription,
-        ),
-        model(
-            "anthropic",
-            "claude-opus-4-8",
-            "Claude Opus 4.8",
-            ProviderApi::Anthropic,
-            None,
-            Some(200_000),
-            UsageScope::General,
-        ),
-        model(
-            "anthropic",
-            "claude-sonnet-4-6",
-            "Claude Sonnet 4.6",
-            ProviderApi::Anthropic,
-            None,
-            Some(200_000),
-            UsageScope::General,
-        ),
-        model(
-            "zai",
-            "glm-5.1",
-            "GLM 5.1",
-            ProviderApi::OpenAi,
-            Some("https://api.z.ai/api/paas/v4"),
-            Some(202_752),
-            UsageScope::General,
-        ),
-        model(
-            "zai-coding",
-            "glm-5.1",
-            "GLM 5.1 Coding Plan",
-            ProviderApi::OpenAi,
-            Some("https://api.z.ai/api/coding/paas/v4"),
-            Some(202_752),
-            UsageScope::CodingSubscription,
-        ),
-        model(
-            "zai",
-            "glm-5.2",
-            "GLM 5.2",
-            ProviderApi::OpenAi,
-            Some("https://api.z.ai/api/paas/v4"),
-            Some(1_000_000),
-            UsageScope::General,
-        ),
-        model(
-            "zai",
-            "glm-5.3",
-            "GLM 5.3",
-            ProviderApi::OpenAi,
-            Some("https://api.z.ai/api/paas/v4"),
-            Some(1_000_000),
-            UsageScope::General,
-        ),
-        model(
-            "zai-coding",
-            "glm-5.2",
-            "GLM 5.2 Coding Plan",
-            ProviderApi::OpenAi,
-            Some("https://api.z.ai/api/coding/paas/v4"),
-            Some(1_000_000),
-            UsageScope::CodingSubscription,
-        ),
-        model(
-            "zai-coding",
-            "glm-5.3",
-            "GLM 5.3 Coding Plan",
-            ProviderApi::OpenAi,
-            Some("https://api.z.ai/api/coding/paas/v4"),
-            Some(1_000_000),
-            UsageScope::CodingSubscription,
-        ),
-        model(
-            "zai-anthropic",
-            "glm-5.1",
-            "GLM 5.1 Anthropic API",
-            ProviderApi::Anthropic,
-            Some("https://api.z.ai/api/anthropic"),
-            Some(202_752),
-            UsageScope::General,
-        ),
-        model(
-            "moonshotai",
-            "k3",
-            "Kimi K3",
-            ProviderApi::OpenAi,
-            Some("https://api.moonshot.ai/v1"),
-            Some(262_144),
-            UsageScope::General,
-        ),
-        model(
-            "moonshotai",
-            "k3-256k",
-            "Kimi K3 256K",
-            ProviderApi::OpenAi,
-            Some("https://api.moonshot.ai/v1"),
-            Some(262_144),
-            UsageScope::General,
-        ),
-        model(
-            "kimi-coding-openai",
-            "kimi-for-coding",
-            "Kimi For Coding (OpenAI API)",
-            ProviderApi::OpenAi,
-            Some("https://api.kimi.com/coding/v1"),
-            Some(262_144),
-            UsageScope::CodingSubscription,
-        ),
-        model(
-            "kimi-coding",
-            "kimi-for-coding",
-            "Kimi For Coding (Anthropic API)",
-            ProviderApi::Anthropic,
-            Some("https://api.kimi.com/coding"),
-            Some(262_144),
-            UsageScope::CodingSubscription,
-        ),
-    ]
+    pi_ai::catalog::builtin_models()
+        .iter()
+        .map(|model| ModelSpec {
+            provider: model.provider.clone(),
+            id: model.id.clone(),
+            name: model.name.clone(),
+            api: model.api.clone(),
+            base_url: model.base_url.clone(),
+            context_window: Some(model.context_window),
+            max_output_tokens: Some(model.max_tokens),
+            usage_scope: usage_scope(&model.provider),
+        })
+        .collect()
 }
 
-fn model(
-    provider: &str,
-    id: &str,
-    name: &str,
-    api: ProviderApi,
-    base_url: Option<&str>,
-    context_window: Option<u64>,
-    usage_scope: UsageScope,
-) -> ModelSpec {
-    ModelSpec {
-        provider: provider.to_string(),
-        id: id.to_string(),
-        name: name.to_string(),
-        api,
-        base_url: base_url.map(str::to_string),
-        context_window,
-        max_output_tokens: None,
-        usage_scope,
+/// Providers billed through a coding subscription rather than per token.
+fn usage_scope(provider: &str) -> UsageScope {
+    match provider {
+        "openai-codex" | "zai-coding" | "kimi-coding" | "kimi-coding-openai" => {
+            UsageScope::CodingSubscription
+        }
+        _ => UsageScope::General,
     }
 }
 
@@ -427,6 +257,13 @@ pub fn create_provider(
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            // The spec's limits; what a built-in model supports of thinking
+            // comes from the catalog.
+            traits: pi_ai::ModelTraits {
+                context_window: model.context_window,
+                max_tokens: model.max_output_tokens,
+                ..pi_ai::ModelTraits::builtin(&model.provider, &model.id)
+            },
         },
         client.unwrap_or_else(pi_ai::provider_http_client),
     ))
@@ -539,14 +376,25 @@ mod tests {
     #[test]
     fn catalog_has_switching_targets_and_distinct_scopes() {
         let models = builtin_models();
-        assert!(find_model(&models, "openai-codex/gpt-5.4").is_some());
-        assert!(find_model(&models, "zai-coding/glm-5.1").is_some());
-        assert!(find_model(&models, "kimi-coding/kimi-for-coding").is_some());
+        // Upstream's providers and this port's own.
+        for provider in ["openai-codex", "anthropic", "zai-coding", "kimi-coding"] {
+            assert!(
+                models.iter().any(|model| model.provider == provider),
+                "{provider}"
+            );
+        }
+        let coding = find_model(&models, "zai-coding/glm-5.1").expect("port-only model");
+        assert_eq!(coding.usage_scope, UsageScope::CodingSubscription);
+        // The catalog's limits travel with the spec.
+        let general = models
+            .iter()
+            .find(|model| model.provider == "anthropic")
+            .expect("anthropic model");
+        assert_eq!(general.usage_scope, UsageScope::General);
+        assert!(general.context_window.is_some() && general.max_output_tokens.is_some());
         assert_eq!(
-            find_model(&models, "zai-coding/glm-5.1")
-                .unwrap()
-                .usage_scope,
-            UsageScope::CodingSubscription
+            find_model(&models, &general.qualified_name()).map(|model| &model.id),
+            Some(&general.id)
         );
     }
 

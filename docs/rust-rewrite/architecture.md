@@ -50,10 +50,11 @@ The Rust implementation uses a Cargo workspace with explicit crate boundaries:
   - Keybindings config.
   - Context file and prompt file discovery.
   - Resource/package discovery.
-  - Model cache loading.
+  - Model definitions: the catalog, the model cache, and `models.json`.
+  - Model resolution and scoping (`model_resolver.rs`).
 - `crates/pi-ai`
   - Provider request/response normalization.
-  - Model registry data.
+  - The built-in model catalog and the thinking-level rules (`catalog.rs`).
   - Credential resolution.
   - Faux provider for tests.
   - Production provider adapters.
@@ -414,21 +415,68 @@ Model refresh runs in the background when enabled, online, stale, and
 authenticated. It does not block startup. Refreshed models become visible after
 `/reload` or the next startup.
 
+## Model Catalog and Selection
+
+The built-in catalog is data, not code. `scripts/ts-parity/model-catalog-fixture.ts`
+runs upstream's model runtime in Docker and writes every provider and chat
+model it knows, with every field, to
+`tests/fixtures/ts-parity/model-catalog.json`. `pi-ai`'s `catalog.rs` compiles
+that file in (`include_str!`) and parses it once, on first use. The file is
+both the parity fixture and the product's data, so `make ts-parity-update`
+(and the drift job's pull request) updates the models pi knows, and the drift
+check reports a catalog that has moved. The providers only this port has
+(`faux`, `zai-coding`, `zai-anthropic`, `kimi-coding-openai`) are in
+`crates/pi-ai/src/catalog_port_models.json`, written by hand in the same
+shape and loaded first, so `faux/echo` stays the first model. Upstream models
+on an API pi has no adapter for are skipped at load.
+
+A catalog entry keeps the fields pi reads: provider, id, name, API, base URL,
+`reasoning`, `thinkingLevelMap`, `input`, `cost`, `contextWindow`, and
+`maxTokens`. `pi-config`'s `ModelDefinition` has the same fields under
+upstream's names, all optional past the endpoint, so a built-in model, a
+cached provider listing, and a `models.json` entry describe a model the same
+way. `load_config` merges the three (`merge_model_definitions`): the catalog
+is the base, a listed id the catalog lacks is built on its provider's default
+model, and a `models.json` entry is used as written and takes what it leaves
+out from the catalog. `LoadedConfig.models` is every known model;
+`LoadedConfig.model_scope` is what `--models` or `enabledModels` selects of
+them, resolved by the CLI because it depends on credentials.
+
+Resolution is a port of upstream's `core/model-resolver.ts` in
+`pi-config/src/model_resolver.rs`: pure functions over a list of models in
+catalog order and a predicate for which providers have credentials
+(`resolve_cli_model`, `resolve_model_scope`,
+`find_exact_model_reference_match`, `find_initial_model`, `custom_model`),
+with upstream's collation order and glob matching ported for ASCII ids.
+`pi-cli`'s `model_select.rs` applies them to a session: startup selection
+(`resolve_cli_selection`, `select_initial_model`), model switches
+(`switch_model`), and thinking-level changes (`set_thinking_level`), used
+alike by the CLI, the TUI commands, and RPC mode. The session stores a
+`ModelRef`; requests look the definition up (`model_definition`) each time.
+
 ## Thinking Architecture
 
-Thinking level is session state and can be set with `--thinking`, `/thinking`,
-or left/right while the `/model` selector is open.
+A thinking level is one of upstream's seven names, `off` to `max`. Which of
+them a model supports follows from its definition (`reasoning` and
+`thinkingLevelMap`) through two functions ported from upstream's
+`ai/src/models.ts`, `supported_thinking_levels` and `clamp_thinking_level` in
+`pi-ai`'s `catalog.rs`; there are no per-provider rules.
 
-Model-specific levels:
+The session stores a level only once something sets one. The level in effect
+(`effective_thinking_level`) is the session's, else the model's entry in
+`modelThinkingLevels`, else `defaultThinkingLevel`, else `medium`, clamped to
+the model; `get_state`, the status line, and the bash tool's
+`PI_REASONING_LEVEL` report it. Setting a level stores the clamped one, and a
+model switch carries the level in effect over unless the settings give the
+new model one.
 
-- Anthropic Opus adaptive models: `high`, `xhigh`, `max`.
-- Other Anthropic adaptive models: `high`, `xhigh`.
-- OpenAI/Codex reasoning models: `minimal`, `low`, `medium`, `high`, `xhigh`.
-- Google thinking models: mapped to provider thinking budgets.
-- Non-thinking models: no active thinking level.
-
-Provider adapters translate normalized thinking levels into provider-specific
-payloads.
+A request gets the level in effect in `ProviderConfig.thinking_level` (`None`
+for a model without reasoning) and the model's `ModelTraits`: its thinking
+level map, output cap, and context window. Request builders clamp again, as
+upstream's do, send the level under the name the map gives it, and send the
+output cap lowered to fit the context window. How a level is encoded stays
+each builder's own: a reasoning effort for the Responses APIs and OpenRouter,
+adaptive or budget thinking for Anthropic and Bedrock, a budget for Google.
 
 ## Tool Architecture
 

@@ -1778,7 +1778,6 @@ version = "0.2.1"
 dependencies = [
  "base64",
  "pi-ai",
- "pi-providers",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

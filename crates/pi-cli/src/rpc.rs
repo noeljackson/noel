@@ -500,13 +500,18 @@ impl Rpc {
         Model::configured(&self.config, model)
     }
 
+    /// The thinking level in effect: clamped to the model, `off` for a
+    /// model without reasoning.
     fn thinking_level(&self) -> String {
-        self.runtime
-            .session()
-            .active_model
-            .as_ref()
-            .and_then(|model| crate::active_thinking_level(&self.runtime, &self.config, model))
-            .unwrap_or_else(|| "off".into())
+        crate::effective_thinking_level(&self.runtime, &self.config).to_owned()
+    }
+
+    /// Reports a change of the level in effect since `before`.
+    fn report_thinking_level(&self, before: &str) {
+        let after = self.thinking_level();
+        if after != before {
+            send(&Event::ThinkingLevelChanged { level: &after });
+        }
     }
 
     fn new_session(&mut self, parent_session: Option<&str>) -> Reply {
@@ -537,42 +542,36 @@ impl Rpc {
         Ok(Some(Data::Cancelled { cancelled: false }))
     }
 
-    /// Selects the session's model; unlike the TUI's `/model`, the default
-    /// model in settings stays as it is.
+    /// Selects the session's model, as upstream does: one of the models
+    /// that can run now, by exact provider and id. The thinking level
+    /// follows the switch (`switch_model`). Unlike the TUI's `/model`, the
+    /// default model in settings stays as it is.
     fn set_model(&mut self, provider: &str, model_id: &str) -> Reply {
         let model = ModelRef {
             provider: provider.to_owned(),
             id: model_id.to_owned(),
         };
-        let info = Model::configured(&self.config, &model)
+        let info = Some(&model)
+            .filter(|model| crate::provider_usable(&self.config, &model.provider, self.offline))
+            .and_then(|model| crate::configured_model(&self.config, model))
+            .map(Model::from)
             .ok_or_else(|| format!("Model not found: {provider}/{model_id}"))?;
-        let thinking = crate::active_thinking_level(&self.runtime, &self.config, &model);
-        self.runtime
-            .set_active_model(Some(model))
-            .and_then(|()| self.runtime.set_active_thinking_level(thinking))
+        let before = self.thinking_level();
+        crate::switch_model(&mut self.runtime, &self.config, &model, None)
             .map_err(|error| error.to_string())?;
+        self.report_thinking_level(&before);
         Ok(Some(Data::Model(Box::new(info))))
     }
 
+    /// Sets the thinking level, clamped to what the model supports as
+    /// upstream clamps it.
     fn set_thinking_level(&mut self, level: &str) -> Reply {
         let level = crate::normalized_thinking_level(level)
             .ok_or_else(|| format!("Unknown thinking level: {level}"))?;
-        if let Some(model) = &self.runtime.session().active_model {
-            if level != "off" && !crate::model_thinking_levels(model).contains(&level) {
-                return Err(format!(
-                    "{}/{} does not support thinking level {level}",
-                    model.provider, model.id
-                ));
-            }
-        }
         let before = self.thinking_level();
-        self.runtime
-            .set_active_thinking_level(Some(level.to_owned()))
+        crate::set_thinking_level(&mut self.runtime, &self.config, level)
             .map_err(|error| error.to_string())?;
-        let after = self.thinking_level();
-        if after != before {
-            send(&Event::ThinkingLevelChanged { level: &after });
-        }
+        self.report_thinking_level(&before);
         Ok(None)
     }
 

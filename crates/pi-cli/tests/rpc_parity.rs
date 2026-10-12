@@ -518,8 +518,9 @@ fn normalize(records: &[Value]) -> Vec<Value> {
 /// - Messages pi does not keep: `messageCount` leaves out upstream's
 ///   system message and aborted replies.
 /// - Queue modes: pi delivers queued messages together (`all`).
-/// - Model object: pi has no `input`, `cost` or `maxTokens`, and no
-///   `baseUrl` unless one is configured.
+/// - Model object: `faux/script` has no `baseUrl`, and accepts and caps
+///   what upstream's faux provider does rather than what the stub model
+///   was declared with.
 /// - Assistant messages have no `responseId`; usage has no `reasoning`.
 /// - Tool results are text: no `structuredContent` or `details`.
 /// - `get_messages` reports what the session saves: no timestamps, and
@@ -553,9 +554,9 @@ fn expected(upstream: &[Value]) -> Vec<Value> {
                     }
                 }
                 if object.contains_key("contextWindow") {
-                    for key in ["input", "cost", "maxTokens", "baseUrl"] {
-                        object.remove(key);
-                    }
+                    object.remove("baseUrl");
+                    object.insert("input".into(), json!(["text", "image"]));
+                    object.insert("maxTokens".into(), json!(16384));
                 }
                 if object.get("role").is_some_and(|role| role == "assistant") {
                     object.remove("responseId");
