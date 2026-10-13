@@ -11730,6 +11730,129 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A final reply cut off below the model's own output limit ran out of
+    /// context: it is dropped, the session is compacted, and the request is
+    /// sent again. One cut off at that limit stands, because a smaller
+    /// context would not make it longer. The limit is the catalog's
+    /// `maxTokens`, as for upstream's `isRecoverableLength`.
+    #[tokio::test]
+    async fn a_reply_cut_off_below_the_catalogs_output_limit_is_an_overflow() {
+        use serde_json::json;
+        use std::io::BufReader;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A built-in model served over chat completions, here by a local
+        // endpoint that answers each request with the next reply.
+        let model = pi_ai::catalog::provider_base_model("deepseek").expect("a built-in model");
+        assert_eq!(model.api, AiProviderApi::OpenAi);
+        let limit = model.max_tokens;
+        let says = |text: &str| json!({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]});
+        let cut_off = |output: u64| {
+            json!({
+                "choices": [{"message": {"content": "This answer is cut"}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": output},
+            })
+        };
+        let serve = |replies: Vec<serde_json::Value>| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let served = Arc::new(AtomicUsize::new(0));
+            let count = served.clone();
+            std::thread::spawn(move || {
+                for (stream, reply) in listener.incoming().zip(replies) {
+                    let mut reader = BufReader::new(stream.unwrap());
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line.trim_end().is_empty() {
+                            break;
+                        }
+                        let line = line.to_ascii_lowercase();
+                        if let Some(value) = line.strip_prefix("content-length: ") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    reader.read_exact(&mut vec![0; length]).unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let body = reply.to_string();
+                    write!(
+                        reader.into_inner(),
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            });
+            (url, served)
+        };
+
+        // What the turn answers and how many requests it took, when its
+        // first reply stops at `length` after `output` tokens.
+        let turn = |output: u64| async move {
+            let (url, served) = serve(vec![
+                cut_off(output),
+                says("Summary of the first turn."),
+                says("The whole answer."),
+            ]);
+            let mut auth = AuthData::default();
+            auth.insert(
+                &model.provider,
+                DEFAULT_ACCOUNT_NAME,
+                AuthCredential::ApiKey {
+                    key: "test-key".to_string(),
+                },
+            );
+            let mut config = account_test_config(auth);
+            config.models.push(ModelDefinition {
+                base_url: Some(url),
+                ..ModelDefinition::from(model)
+            });
+            let mut session = SessionState::new("session-1", PathBuf::from("."));
+            session.active_model = Some(ModelRef {
+                provider: model.provider.clone(),
+                id: model.id.clone(),
+            });
+            // An older turn, long enough that its summary is shorter.
+            let mut systems = ReloadableSystems::default();
+            systems.compaction.keep_recent_tokens = 1;
+            let mut runtime = Runtime::new(session, systems);
+            let first_answer = "The migration adds a nullable column, backfills it in batches of \
+                a thousand rows, then makes it required; the rollback drops the column again, \
+                and both directions were run against a copy of the production schema.";
+            for (role, content) in [
+                (MessageRole::User, "first"),
+                (MessageRole::Assistant, first_answer),
+            ] {
+                runtime
+                    .push_message(ConversationMessage {
+                        role,
+                        content: content.into(),
+                        thinking: String::new(),
+                        media: Vec::new(),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: Vec::new(),
+                    })
+                    .unwrap();
+            }
+            let provider = provider_for_runtime(&runtime, &config, false)
+                .await
+                .unwrap();
+            assert_eq!(provider.output_limit(), Some(limit));
+            let answer = run_user_turn(&mut runtime, provider.as_ref(), "second".into())
+                .await
+                .unwrap();
+            (answer, served.load(Ordering::SeqCst))
+        };
+
+        // Below the limit: the reply, the summary, and the request again.
+        assert_eq!(turn(limit - 1).await, ("The whole answer.".to_string(), 3));
+        // At the limit the model wrote all it can.
+        assert_eq!(turn(limit).await, ("This answer is cut".to_string(), 1));
+    }
+
     #[test]
     fn model_selection_format_is_compact_and_unlabeled() {
         let model = ModelRef {

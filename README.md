@@ -1271,9 +1271,10 @@ print mode, and RPC mode alike:
 - **Context overflow.** When the provider refuses a request as too large for
   the model's context window, pi compacts and asks again, once. The same
   happens when a final reply is cut off at the output limit although the
-  model could have written more (pi knows that limit for Claude models and a
-  few others; for the rest it assumes the context was the cause): the cut-off
-  reply is dropped and the compacted request is sent again. A reply cut off
+  model could have written more, by its catalog `maxTokens` (for a
+  `models.json` model of a provider the catalog does not know that names no
+  `maxTokens`, pi assumes the context was the cause): the cut-off reply is
+  dropped and the compacted request is sent again. A reply cut off
   while calling a tool is kept instead; its calls get error results and the
   model issues them again. If there is nothing to compact, or compaction is
   off or fails, an overflow error ends the turn, and a cut-off reply stands

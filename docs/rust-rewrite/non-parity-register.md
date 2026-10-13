@@ -862,10 +862,14 @@ parts differ:
   may be the only answer the user got, so pi keeps it: saved, and sent with
   the next request.
 - Upstream decides whether a cut-off reply could have been longer from the
-  model's catalog `maxTokens`. pi knows that limit for Claude models and the
-  few models whose requests carry a cap (see Anthropic Output Cap Without an
-  Output Catalog). For any other model it takes a cut-off final reply for a
-  context overflow, and compacts once.
+  model's `maxTokens` (`isRecoverableLength`), and so does pi, with the
+  catalog's number: a final reply cut off below it is an overflow, and one
+  that reached it stands. Only a `models.json` model of a provider the catalog
+  does not know has no such number, when its entry gives no `maxTokens` and
+  it is not served over the Anthropic API (see Provider Listings and
+  `models.json` Extend the Catalog). pi takes that model's cut-off final
+  reply for a context overflow and compacts once. Upstream gives the model
+  16384 and lets a reply that reached it stand.
 - Upstream also reads a reply that completed as an overflow when the usage
   it reports exceeds the context window, and compacts right after it. pi
   compacts before the next request, when its own estimate crosses the
@@ -885,8 +889,7 @@ parts differ:
 Reason: the rules, the single compact-and-retry, and the records are
 upstream's, so a run survives what upstream's survives and a client sees the
 same protocol. The differences follow from pi's journal, which saves what the
-model will see again and nothing else; from its missing output catalog; and
-from its own HTTP stack.
+model will see again and nothing else, and from its own HTTP stack.
 
 ### RPC Mode
 

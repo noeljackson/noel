@@ -229,8 +229,8 @@ reply per round. What follows a failed request is decided in one place,
   compacts first, once (`Runtime::compact_after_overflow`, the same
   compaction the threshold uses, without the threshold). A final reply cut
   off at the output limit below the model's own limit
-  (`Provider::output_limit`) is handled as an overflow. Any other failure
-  ends the turn.
+  (`Provider::output_limit`, the catalog's `maxTokens`) is handled as an
+  overflow. Any other failure ends the turn.
 - Asking again is another round of the same loop: `RetryStarted` or
   `Overflowed` ends the round of the dropped reply, and `RoundStarted` opens
   the next. Steering queued meanwhile joins it. A dropped round does not
