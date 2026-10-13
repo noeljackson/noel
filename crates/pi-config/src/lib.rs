@@ -249,6 +249,9 @@ pub struct Settings {
     pub warnings: Option<WarningSettings>,
     #[serde(default)]
     pub model_refresh: Option<ModelRefreshSettings>,
+    /// Failover-only multi-account rotation. Disabled by default.
+    #[serde(default)]
+    pub failover: Option<FailoverSettings>,
 }
 
 impl Settings {
@@ -337,6 +340,7 @@ impl Settings {
             markdown: merge_optional_settings(self.markdown, overrides.markdown),
             warnings: merge_optional_settings(self.warnings, overrides.warnings),
             model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
+            failover: merge_optional_settings(self.failover, overrides.failover),
         }
     }
 }
@@ -763,6 +767,49 @@ impl MergeSettings for ModelRefreshSettings {
             ttl_hours: overrides.ttl_hours.or(self.ttl_hours),
         }
     }
+}
+
+/// Failover-only multi-account rotation settings.
+///
+/// One sticky account carries the session; other stored accounts are used
+/// only when the sticky one is rate limited (429/529) or its 5h usage
+/// window is at the exhaustion threshold. This is availability failover,
+/// not load balancing: requests are never spread across accounts to
+/// maximize throughput.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverSettings {
+    pub enabled: Option<bool>,
+    /// Providers that participate in failover. An empty or missing map
+    /// means every provider with two or more stored accounts.
+    #[serde(default)]
+    pub providers: BTreeMap<String, FailoverProviderSettings>,
+}
+
+impl MergeSettings for FailoverSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            enabled: overrides.enabled.or(self.enabled),
+            // Per-provider maps replace rather than deep-merge, matching the
+            // extensions/skills resource-list semantics.
+            providers: if overrides.providers.is_empty() {
+                self.providers
+            } else {
+                overrides.providers
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverProviderSettings {
+    /// Usage percentage at which an account is skipped until its 5h window
+    /// resets. Default 90.
+    pub exhaustion_threshold_pct: Option<u64>,
+    /// Minimum milliseconds between voluntary account switches. Default
+    /// 10000. Switches forced by 429/529 are not rate limited.
+    pub min_switch_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3913,6 +3960,40 @@ mod tests {
         let settings = settings.merge(serde_json::from_str(r#"{"theme":"kimi"}"#).unwrap());
         assert_eq!(settings.theme.as_deref(), Some("kimi"));
         assert_eq!(settings.accent_color.as_deref(), Some("#123456"));
+    }
+
+    /// `failover` is off unless a settings file turns it on, and merges as
+    /// the other nested settings do: a project keeps what it does not name.
+    /// Its per-provider map is replaced whole by a project that has one.
+    #[test]
+    fn failover_settings_are_off_by_default_and_merge_like_their_neighbours() {
+        assert_eq!(Settings::default().failover, None);
+        let parsed: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.failover, None);
+
+        let global: Settings = serde_json::from_str(
+            r#"{"failover":{"enabled":true,"providers":{"anthropic":{"minSwitchIntervalMs":5000}}}}"#,
+        )
+        .unwrap();
+        let unrelated: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        let kept = global.clone().merge(unrelated).failover.expect("failover");
+        assert_eq!(kept.enabled, Some(true));
+        assert_eq!(
+            kept.providers["anthropic"].min_switch_interval_ms,
+            Some(5000)
+        );
+
+        let project: Settings = serde_json::from_str(
+            r#"{"failover":{"providers":{"openai":{"exhaustionThresholdPct":80}}}}"#,
+        )
+        .unwrap();
+        let merged = global.merge(project).failover.expect("failover");
+        assert_eq!(merged.enabled, Some(true));
+        assert_eq!(merged.providers.keys().collect::<Vec<_>>(), ["openai"]);
+        assert_eq!(
+            merged.providers["openai"].exhaustion_threshold_pct,
+            Some(80)
+        );
     }
 
     #[test]
