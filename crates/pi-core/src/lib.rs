@@ -1,7 +1,18 @@
 mod compaction;
+mod input;
+#[cfg(test)]
+mod recovery_tests;
 mod session_lock;
+mod system_prompt;
+#[cfg(test)]
+mod tool_parity_tests;
+#[cfg(test)]
+mod tool_tests;
 pub use compaction::RuntimeCompactionSettings;
+pub use input::expand_input;
 use session_lock::SessionLock;
+pub use system_prompt::PRODUCT_NAME;
+use system_prompt::{PromptTool, SystemPromptInput};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
@@ -19,12 +30,15 @@ use pi_ai::{
     ChatMessage, ChatRole, ChatToolCall, MediaInput, ModelRef, Provider, ProviderError,
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
 };
-use pi_config::{has_auth_for_provider, listed_accounts_for_provider, LoadedConfig, ResourceFile};
+use pi_config::{
+    has_auth_for_provider, listed_accounts_for_provider, ContextFile, LoadedConfig, ResourceFile,
+    Skill,
+};
 /// Kills every running tool subprocess tree; for pi's fatal-signal handling.
 pub use pi_tools::kill_running_tool_groups;
 use pi_tools::{
-    builtin_tool_definitions, execute_tool, spawn_tool_process, ToolError, ToolRequest,
-    ToolRuntimeOptions,
+    builtin_tool_definitions, cap_tool_output, execute_tool, execute_tool_streaming,
+    spawn_tool_process, ToolError, ToolRequest, ToolResult, ToolRuntimeOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -418,9 +432,12 @@ pub struct BranchSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadableSystems {
     pub config_generation: u64,
+    /// Replaces the default prompt's role, tool list, and rules.
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
-    pub context_messages: Vec<String>,
+    pub context_files: Vec<ContextFile>,
+    /// The loaded skills, which the system prompt lists.
+    pub skills: Vec<Skill>,
     pub available_models: Vec<ModelRef>,
     pub configured_providers: BTreeSet<String>,
     pub available_accounts: BTreeMap<String, Vec<String>>,
@@ -430,6 +447,10 @@ pub struct ReloadableSystems {
     pub keybinding_generation: u64,
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
+    /// The `images.autoResize` and `images.blockImages` settings, for images
+    /// the `read` tool returns.
+    pub auto_resize_images: bool,
+    pub block_images: bool,
     pub retry: RuntimeRetrySettings,
     pub offline: bool,
     pub compaction: RuntimeCompactionSettings,
@@ -446,7 +467,8 @@ impl Default for ReloadableSystems {
             config_generation: 0,
             system_prompt: None,
             append_system_prompt: Vec::new(),
-            context_messages: Vec::new(),
+            context_files: Vec::new(),
+            skills: Vec::new(),
             available_models: Vec::new(),
             configured_providers: BTreeSet::new(),
             available_accounts: BTreeMap::new(),
@@ -456,6 +478,8 @@ impl Default for ReloadableSystems {
             keybinding_generation: 0,
             shell_path: None,
             shell_command_prefix: None,
+            auto_resize_images: true,
+            block_images: false,
             retry: RuntimeRetrySettings::default(),
             offline: false,
             compaction: RuntimeCompactionSettings::default(),
@@ -463,6 +487,58 @@ impl Default for ReloadableSystems {
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         }
     }
+}
+
+/// The tools a run may use, from the tool settings and the command-line
+/// flags folded into them (upstream `createAgentSession`):
+///
+/// - `enabledTools` (`--tools` with plain names) is an allowlist of names
+///   and `*` patterns over every built-in and extension tool.
+/// - Otherwise the built-in tools are those `defaultTools` selects (all of
+///   them when it is unset), and every extension tool is available.
+/// - `--exclude-tools` then removes the tools it names or matches.
+fn available_tool_names(
+    settings: &pi_config::Settings,
+    extension_tools: &BTreeMap<String, ExtensionTool>,
+) -> BTreeSet<String> {
+    let builtin = builtin_tool_definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    let selected: BTreeSet<String> = match (&settings.enabled_tools, &settings.default_tools) {
+        (Some(allowed), _) => builtin
+            .iter()
+            .chain(extension_tools.keys())
+            .filter(|name| pi_config::tool_name_matches(allowed, name))
+            .cloned()
+            .collect(),
+        (None, Some(entries)) => pi_config::resolve_default_tools(entries, &builtin)
+            .into_iter()
+            .filter(|name| builtin.contains(name))
+            .chain(extension_tools.keys().cloned())
+            .collect(),
+        (None, None) => builtin
+            .into_iter()
+            .chain(extension_tools.keys().cloned())
+            .collect(),
+    };
+    selected
+        .into_iter()
+        .filter(|name| !pi_config::tool_name_matches(&settings.excluded_tools, name))
+        .collect()
+}
+
+fn image_setting(
+    config: &LoadedConfig,
+    setting: impl Fn(&pi_config::ImageSettings) -> Option<bool>,
+    default: bool,
+) -> bool {
+    config
+        .settings
+        .images
+        .as_ref()
+        .and_then(setting)
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +552,11 @@ pub struct ExtensionTool {
     /// The manifest's `replaySafe`: a call cut off by a stop may run again
     /// when the turn continues.
     pub replay_safe: bool,
+    /// The manifest's `promptSnippet` as one line: the tool's entry in the
+    /// system prompt's tool list. A tool without one is not listed there.
+    pub prompt_snippet: Option<String>,
+    /// The manifest's `promptGuidelines`: the tool's system prompt rules.
+    pub prompt_guidelines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,25 +612,13 @@ impl ReloadableSystems {
             })
             .collect();
         let extension_tools = extension_tools_from_resources(&config.extensions);
-        let available_tool_names = match &config.settings.enabled_tools {
-            Some(enabled_tools) => enabled_tools.iter().cloned().collect(),
-            None => builtin_tool_definitions()
-                .into_iter()
-                .map(|definition| definition.name)
-                .chain(extension_tools.keys().cloned())
-                .collect(),
-        };
-        let context_messages = config
-            .context_files
-            .iter()
-            .map(|file| format!("{}:\n{}", file.path.display(), file.content))
-            .collect();
-
+        let available_tool_names = available_tool_names(&config.settings, &extension_tools);
         Self {
             config_generation: generation,
             system_prompt: config.system_prompt.clone(),
             append_system_prompt: config.append_system_prompt.clone(),
-            context_messages,
+            context_files: config.context_files.clone(),
+            skills: config.skills.clone(),
             available_models,
             configured_providers,
             model_context_windows: config
@@ -578,6 +647,8 @@ impl ReloadableSystems {
             keybinding_generation: generation,
             shell_path: config.settings.shell_path.clone(),
             shell_command_prefix: config.settings.shell_command_prefix.clone(),
+            auto_resize_images: image_setting(config, |images| images.auto_resize, true),
+            block_images: image_setting(config, |images| images.block_images, false),
             offline: std::env::var("PI_OFFLINE")
                 .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
             retry: RuntimeRetrySettings {
@@ -686,8 +757,6 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error(transparent)]
     Tool(#[from] ToolError),
-    #[error("unknown slash command: {0}")]
-    UnknownCommand(String),
     #[error("missing argument for slash command: {0}")]
     MissingCommandArgument(String),
     #[error("tool is disabled: {0}")]
@@ -1977,6 +2046,9 @@ pub struct Runtime {
     session: SessionState,
     systems: ReloadableSystems,
     store: Option<SessionStore>,
+    /// The thinking level of the current turn's provider, which bash
+    /// commands see as `PI_REASONING_LEVEL`.
+    thinking_level: Option<String>,
 }
 
 impl Runtime {
@@ -1985,6 +2057,7 @@ impl Runtime {
             session,
             systems,
             store: None,
+            thinking_level: None,
         }
     }
 
@@ -1997,6 +2070,7 @@ impl Runtime {
             session,
             systems,
             store: Some(store),
+            thinking_level: None,
         }
     }
 
@@ -2203,6 +2277,12 @@ impl Runtime {
         Ok(())
     }
 
+    /// Turns automatic retries on or off for this runtime's turns; the
+    /// settings file keeps its value.
+    pub fn set_retry_enabled(&mut self, enabled: bool) {
+        self.systems.retry.enabled = enabled;
+    }
+
     /// Whether a tool call cut off by a stop may run again when its turn
     /// continues: `read`, `grep`, `find`, `ls`, and extension tools whose
     /// manifest declares `"replaySafe": true`.
@@ -2267,10 +2347,16 @@ impl Runtime {
                 .unwrap_or(false),
             _ => true,
         };
+        // Tools the session could use before the reload and no longer can.
+        let was_available = |tool_name: &String| {
+            !self.systems.tool_scope_configured
+                || self.systems.available_tool_names.contains(tool_name)
+        };
         let removed_active_tools = self
             .session
             .active_tool_names
             .iter()
+            .filter(|tool_name| was_available(tool_name))
             .filter(|tool_name| !next.available_tool_names.contains(*tool_name))
             .cloned()
             .collect();
@@ -2381,16 +2467,55 @@ impl SteeringMailbox {
 pub const STEERING_JOIN: &str = "\n---\n";
 
 /// A caller's handles on a running turn: steering for its next provider
-/// round, and cancellation. Cancelling ends the turn with
-/// [`AgentError::Cancelled`] at once, dropping an in-flight request, backoff,
-/// compaction or tool call (a dropped tool takes its process group with it).
-/// What the turn saved stays saved: a reply whose tool calls have no results
-/// continues with the interrupted-call placeholders. Clones share both.
+/// round, cancellation, and the backoff of a retry. Cancelling ends the turn
+/// with [`AgentError::Cancelled`] at once, dropping an in-flight request,
+/// backoff, compaction or tool call (a dropped tool takes its process group
+/// with it). What the turn saved stays saved: a reply whose tool calls have
+/// no results continues with the interrupted-call placeholders. Clones share
+/// all three.
 #[derive(Debug, Clone, Default)]
 pub struct RunControl {
     pub steering: SteeringMailbox,
     pub cancellation: CancellationToken,
+    pub retry: RetryAbort,
 }
+
+/// Ends the backoff a turn is waiting out before a retry (upstream
+/// `abortRetry`): the turn then ends with the failure it would have retried.
+/// Outside a backoff there is nothing to end. Clones share the backoff.
+#[derive(Debug, Clone, Default)]
+pub struct RetryAbort(Arc<Mutex<Option<CancellationToken>>>);
+
+impl RetryAbort {
+    /// Ends the backoff in progress; `false` if there is none.
+    pub fn abort(&self) -> bool {
+        let backoff = self.0.lock().expect("retry backoff");
+        backoff.as_ref().map(CancellationToken::cancel).is_some()
+    }
+
+    /// Sleeps for `delay` unless [`RetryAbort::abort`] ends the backoff
+    /// first; `false` if it did.
+    async fn backoff(&self, delay: Duration) -> bool {
+        /// The backoff is over however it ends, a dropped turn included.
+        struct Over<'a>(&'a RetryAbort);
+        impl Drop for Over<'_> {
+            fn drop(&mut self) {
+                *self.0 .0.lock().expect("retry backoff") = None;
+            }
+        }
+        let aborted = CancellationToken::default();
+        *self.0.lock().expect("retry backoff") = Some(aborted.clone());
+        let _over = Over(self);
+        tokio::select! {
+            biased;
+            () = aborted.cancelled() => false,
+            () = tokio::time::sleep(delay) => true,
+        }
+    }
+}
+
+/// How a retry ends when its backoff is ended early, as upstream words it.
+pub const RETRY_CANCELLED: &str = "Retry cancelled";
 
 impl RunControl {
     /// Runs `step` unless the turn is cancelled first; cancelling drops it.
@@ -2430,12 +2555,18 @@ pub async fn run_user_turn_streaming_with_media(
 /// so a UI can show what the agent is doing between text blocks.
 ///
 /// Each provider round of a turn reports `RoundStarted`, its user messages
-/// (the prompt or steering), any compaction, retries and the reply's
-/// `Provider` deltas, the reply, then `ToolStarted`, `ToolOutput` and
+/// (the prompt or steering), any compaction and the reply's `Provider`
+/// deltas, the reply, then `ToolStarted`, `ToolUpdate`, `ToolOutput` and
 /// `ToolFinished` for each tool call, and `RoundFinished`. A turn that fails
 /// or is cancelled stops mid-round without further events. A continued turn
 /// whose saved reply has replay-safe calls without results first finishes
 /// that round: `RoundResumed`, those calls, `RoundFinished`.
+///
+/// A round whose reply is dropped ends there instead, and the turn asks
+/// again in a new round: after `RetryStarted`, once the backoff is over;
+/// after `Overflowed`, once its compaction (`CompactionStarted`, then
+/// `CompactionFinished`) is done. A dropped reply is never saved, so its
+/// `Provider` deltas are all that was reported of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
     /// A provider round started: one reply and the tool calls it asks for.
@@ -2448,29 +2579,51 @@ pub enum TurnEvent {
     MessageAdded(ConversationMessage),
     /// Everything the provider streams for the round's reply.
     Provider(StreamEvent),
-    /// A request failed before any output; it is retried after the delay.
+    /// The round's request failed, before or after part of its reply, with
+    /// an error a retry can fix. The reply is dropped and the request is
+    /// sent again in a new round after the delay.
     RetryStarted(RetryNotice),
-    /// A retried request ended after `attempt` retries: with its reply
-    /// (reported after the reply), or with the `error` that ends the turn.
+    /// The retries of a reply ended after `attempt` of them: with the reply
+    /// (reported after it), or with the `error` that ends the turn
+    /// ([`RETRY_CANCELLED`] if the backoff was ended early).
     RetryFinished {
         attempt: u64,
+        error: Option<String>,
+    },
+    /// The round's reply ran out of context: the provider refused the
+    /// request as too large (`error`), or cut the final reply off at the
+    /// output limit (`None`). The reply is dropped. A compaction follows; if
+    /// it succeeds the turn asks again in a new round, and otherwise the
+    /// turn ends: with the error, or with the cut-off reply saved after all.
+    Overflowed {
         error: Option<String>,
     },
     ToolStarted {
         call: ChatToolCall,
     },
+    /// What a running tool has printed so far: a `bash` command's output,
+    /// within the limits of its result. Empty when the command starts.
+    ToolUpdate {
+        call: ChatToolCall,
+        output: String,
+    },
     ToolFinished {
         name: String,
         is_error: bool,
     },
-    /// A tool call's result as saved, and how long the tool ran.
+    /// A tool call's result as saved, and how long the tool ran (`None` for
+    /// a call of a reply cut off at the output limit, which is not run).
+    /// `images` are the attachments of the result (`read` of an image).
     ToolOutput {
         call: ChatToolCall,
         output: String,
+        images: Vec<MediaInput>,
         is_error: bool,
-        duration: Duration,
+        duration: Option<Duration>,
     },
     TodosUpdated(Vec<TodoItem>),
+    /// A compaction started: because the context estimate crossed the
+    /// threshold, or after `Overflowed`.
     CompactionStarted,
     CompactionFinished(CompactionRecord),
     /// Automatic compaction could not run (nothing compactable, or the
@@ -2532,7 +2685,8 @@ pub async fn run_user_turn_streaming_events_with_media(
 /// Runs `message`, a user prompt the caller has just saved (as
 /// [`Runtime::start_run`] does): a tool command runs its tool without the
 /// model, and any other prompt runs provider rounds until a reply calls no
-/// tools.
+/// tools. The prompt is taken as it is: a caller expands typed input with
+/// [`expand_input`] first.
 pub async fn run_saved_prompt_streaming_events(
     runtime: &mut Runtime,
     provider: &dyn Provider,
@@ -2552,11 +2706,7 @@ pub async fn run_saved_prompt_streaming_events(
             .until_cancelled(execute_tool(
                 &runtime.session.cwd,
                 command.request,
-                &ToolRuntimeOptions {
-                    shell_path: runtime.systems.shell_path.clone(),
-                    shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
-                    offline: runtime.systems.offline,
-                },
+                &tool_runtime_options(runtime, Vec::new()),
             ))
             .await??;
         if let Some(path) = edited_path {
@@ -2572,7 +2722,7 @@ pub async fn run_saved_prompt_streaming_events(
             thinking: String::new(),
             role: MessageRole::Tool,
             content: result.output.clone(),
-            media: Vec::new(),
+            media: tool_result_media(result.images),
             tool_call_id: None,
             tool_name: Some(command.name.clone()),
             tool_calls: Vec::new(),
@@ -2641,6 +2791,7 @@ async fn run_model_turn_streaming_events(
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     let system_prompt = runtime_system_prompt(runtime);
+    runtime.thinking_level = provider.thinking_level();
     let mut final_text = String::new();
     let max_tool_rounds = runtime.systems.max_tool_rounds;
     // Auto-compaction that failed on unchanged history will fail again; skip
@@ -2648,7 +2799,10 @@ async fn run_model_turn_streaming_events(
     let mut failed_compaction_fingerprint: Option<(usize, Option<usize>)> = None;
     // Steering that arrived during a final reply has opened the next round.
     let mut round_open = false;
-    for _ in 0..max_tool_rounds {
+    // Replies kept so far. A round whose reply is dropped is not counted.
+    let mut rounds = 0;
+    let mut recovery = Recovery::default();
+    while rounds < max_tool_rounds {
         if !std::mem::take(&mut round_open) {
             on_event(&TurnEvent::RoundStarted);
         }
@@ -2686,14 +2840,18 @@ async fn run_model_turn_streaming_events(
             }
         }
         let request = provider_request(runtime, system_prompt.clone());
-        let (events, retries) = request_reply(
-            provider,
-            request,
-            &runtime.systems.retry,
-            &run.cancellation,
-            &mut on_event,
-        )
-        .await?;
+        let events = match request_reply(provider, request, &run.cancellation, &mut on_event).await
+        {
+            Ok(events) => events,
+            // The failed reply was never saved: recovering only asks again.
+            Err(AgentError::Provider(error)) => {
+                recovery
+                    .after_failure(runtime, provider, run, error, &mut on_event)
+                    .await?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let mut text = String::new();
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
@@ -2725,25 +2883,45 @@ async fn run_model_turn_streaming_events(
         if let Some((input, output)) = usage {
             runtime.record_usage(input, output)?;
         }
-        final_text.push_str(&text);
-        add_message(
-            runtime,
-            ConversationMessage {
-                thinking,
-                role: MessageRole::Assistant,
-                content: text,
-                media: Vec::new(),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: tool_calls.clone(),
-            },
-            &mut on_event,
-        )?;
-        if retries > 0 {
-            on_event(&TurnEvent::RetryFinished {
-                attempt: retries,
-                error: None,
-            });
+        let reply = ConversationMessage {
+            thinking,
+            role: MessageRole::Assistant,
+            content: text,
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: tool_calls.clone(),
+        };
+        // A final reply cut off below the model's own output limit ran out
+        // of context, like a refused request. (One with tool calls goes on:
+        // its calls get error results and the model issues them again.)
+        let output_tokens = usage.map_or(0, |(_, output)| output);
+        if truncated
+            && tool_calls.is_empty()
+            && provider
+                .output_limit()
+                .is_none_or(|limit| output_tokens < limit)
+            && recovery.can_compact(runtime)
+        {
+            on_event(&TurnEvent::Overflowed { error: None });
+            recovery.finish_retries(None, &mut on_event);
+            if recovery
+                .compact(runtime, provider, run, &mut on_event)
+                .await?
+            {
+                continue;
+            }
+            // Nothing replaces the reply, so it stands, already reported.
+            final_text.push_str(&reply.content);
+            runtime.push_message(reply)?;
+            return Ok(final_text);
+        }
+        rounds += 1;
+        final_text.push_str(&reply.content);
+        add_message(runtime, reply, &mut on_event)?;
+        recovery.finish_retries(None, &mut on_event);
+        if !truncated {
+            recovery.overflowed = false;
         }
 
         if tool_calls.is_empty() {
@@ -2770,6 +2948,120 @@ async fn run_model_turn_streaming_events(
     })
 }
 
+/// What a turn has done so far to recover the reply it is asking for, as
+/// upstream's agent session does after a failed run: a transient failure is
+/// retried after a backoff, and a context overflow is answered by one
+/// compaction. Both drop the failed reply and ask again.
+#[derive(Default)]
+struct Recovery {
+    /// Retries of the reply being requested.
+    retries: u64,
+    /// Whether an overflow was already answered by compaction since the
+    /// last reply that was not cut off.
+    overflowed: bool,
+}
+
+impl Recovery {
+    /// Recovers from a failed request for a reply: `Ok` when the turn may
+    /// ask again, or the error that ends it.
+    async fn after_failure(
+        &mut self,
+        runtime: &mut Runtime,
+        provider: &dyn Provider,
+        run: &RunControl,
+        error: ProviderError,
+        on_event: &mut (impl FnMut(&TurnEvent) + Send),
+    ) -> Result<(), AgentError> {
+        let model = runtime.session.active_model.as_ref();
+        let model_provider = model.map(|model| model.provider.clone());
+        if error.is_context_overflow(model_provider.as_deref().unwrap_or_default()) {
+            if self.can_compact(runtime) {
+                on_event(&TurnEvent::Overflowed {
+                    error: Some(error.to_string()),
+                });
+                self.finish_retries(Some(&error), on_event);
+                if self.compact(runtime, provider, run, on_event).await? {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+        } else if error.is_retryable() {
+            let policy = retry_policy(&runtime.systems.retry);
+            if self.retries < policy.max_retries {
+                let delay = pi_agent::retry_delay_ms(&policy, self.retries);
+                self.retries += 1;
+                on_event(&TurnEvent::RetryStarted(RetryNotice {
+                    attempt: self.retries,
+                    max_attempts: policy.max_retries,
+                    delay_ms: delay,
+                    error_message: error.to_string(),
+                }));
+                let backoff = run.retry.backoff(Duration::from_millis(delay));
+                if run.until_cancelled(backoff).await? {
+                    return Ok(());
+                }
+                on_event(&TurnEvent::RetryFinished {
+                    attempt: std::mem::take(&mut self.retries),
+                    error: Some(RETRY_CANCELLED.into()),
+                });
+                return Err(error.into());
+            }
+        }
+        self.finish_retries(Some(&error), on_event);
+        Err(error.into())
+    }
+
+    /// Reports the end of the reply's retries, if it had any: with the
+    /// reply, or with the `error` no retry follows.
+    fn finish_retries(
+        &mut self,
+        error: Option<&ProviderError>,
+        on_event: &mut impl FnMut(&TurnEvent),
+    ) {
+        let attempt = std::mem::take(&mut self.retries);
+        if attempt > 0 {
+            on_event(&TurnEvent::RetryFinished {
+                attempt,
+                error: error.map(ToString::to_string),
+            });
+        }
+    }
+
+    /// Whether an overflow can be answered by compaction: automatic
+    /// compaction is on, there is something to summarize, and the reply
+    /// before this one did not overflow too. Asking takes the one attempt.
+    fn can_compact(&mut self, runtime: &Runtime) -> bool {
+        let can = !self.overflowed && runtime.systems.compaction.enabled && runtime.can_compact();
+        self.overflowed |= can;
+        can
+    }
+
+    /// Compacts after an overflow; whether it succeeded, so that asking
+    /// again has a smaller context.
+    async fn compact(
+        &mut self,
+        runtime: &mut Runtime,
+        provider: &dyn Provider,
+        run: &RunControl,
+        on_event: &mut (impl FnMut(&TurnEvent) + Send),
+    ) -> Result<bool, AgentError> {
+        on_event(&TurnEvent::CompactionStarted);
+        // Like any compaction, this one saves its checkpoint only once
+        // complete: cancelled or failed, it leaves the history untouched.
+        let compaction = runtime.compact_after_overflow(provider);
+        match run.until_cancelled(compaction).await? {
+            Ok(record) => {
+                on_event(&TurnEvent::CompactionFinished(record));
+                Ok(true)
+            }
+            Err(error) => {
+                on_event(&TurnEvent::CompactionFailed(error.to_string()));
+                Ok(false)
+            }
+        }
+    }
+}
+
 /// Runs one tool call of a reply, saving and reporting its result. A call
 /// of a reply cut off at the output limit (`truncated`) is not run: its
 /// saved and reported result is the error asking to re-issue it.
@@ -2790,10 +3082,16 @@ async fn run_tool_call(
     let result = if truncated {
         fail_truncated_tool_call(runtime, &tool_call)
     } else {
-        run.until_cancelled(execute_model_tool_call(runtime, &tool_call))
-            .await?
+        let mut on_output = |output: &str| {
+            on_event(&TurnEvent::ToolUpdate {
+                call: tool_call.clone(),
+                output: output.to_owned(),
+            })
+        };
+        let execution = execute_model_tool_call(runtime, &tool_call, &mut on_output);
+        run.until_cancelled(execution).await?
     };
-    let duration = started.elapsed();
+    let duration = (!truncated).then(|| started.elapsed());
     let event = runtime
         .session
         .tool_history
@@ -2801,9 +3099,17 @@ async fn run_tool_call(
         .filter(|event| event.id == tool_call.id);
     let is_error = result.is_err() || event.is_some_and(|event| event.is_error);
     if let Some(event) = event {
+        let images = runtime
+            .session
+            .messages
+            .last()
+            .filter(|message| message.tool_call_id.as_deref() == Some(&tool_call.id))
+            .map(|message| message.media.clone())
+            .unwrap_or_default();
         on_event(&TurnEvent::ToolOutput {
             call: tool_call.clone(),
             output: event.result.clone(),
+            images,
             is_error,
             duration,
         });
@@ -2848,62 +3154,56 @@ fn add_message(
     Ok(())
 }
 
-/// Requests one reply, reporting its stream events and any retries as they
-/// happen. Returns the events and how many retries the reply took; when the
-/// request still fails after retries, [`TurnEvent::RetryFinished`] reports
-/// the error first.
+/// Requests one reply, reporting its stream events as they arrive. A
+/// request that fails leaves the events of its broken reply reported.
 async fn request_reply(
     provider: &dyn Provider,
     request: ProviderRequest,
-    retry: &RuntimeRetrySettings,
     cancellation: &CancellationToken,
     on_event: &mut (impl FnMut(&TurnEvent) + Send),
-) -> Result<(Vec<StreamEvent>, u64), AgentError> {
-    let mut retries = 0;
-    let reply = {
-        // Both callbacks report through `on_event`; they never run at once.
-        let report = Mutex::new(&mut *on_event);
-        pi_agent::complete_with_retry_observed(
-            provider,
-            request,
-            &retry_policy(retry),
-            cancellation,
-            |event| (*report.lock().expect("turn events"))(&TurnEvent::Provider(event.clone())),
-            |notice| {
-                retries = notice.attempt;
-                (*report.lock().expect("turn events"))(&TurnEvent::RetryStarted(notice));
-            },
-        )
-        .await
-    };
-    reply.map(|events| (events, retries)).map_err(|error| {
-        let error = AgentError::from(error);
-        if retries > 0 {
-            on_event(&TurnEvent::RetryFinished {
-                attempt: retries,
-                error: Some(error.to_string()),
-            });
-        }
-        error
+) -> Result<Vec<StreamEvent>, AgentError> {
+    let report = |event: &StreamEvent| on_event(&TurnEvent::Provider(event.clone()));
+    let reply = pi_agent::complete_once(provider, request, cancellation, report).await;
+    reply.map_err(AgentError::from)
+}
+
+/// The system prompt for the session as it is now: its tools, prompt
+/// sources, context files, and working directory.
+fn runtime_system_prompt(runtime: &Runtime) -> String {
+    system_prompt::build_system_prompt(&SystemPromptInput {
+        custom_prompt: runtime.systems.system_prompt.as_deref(),
+        tools: &prompt_tools(runtime),
+        append_system_prompt: &runtime.systems.append_system_prompt.join("\n\n"),
+        context_files: &runtime.systems.context_files,
+        skills: &runtime.systems.skills,
+        cwd: &runtime.session.cwd,
     })
 }
 
-fn runtime_system_prompt(runtime: &Runtime) -> Option<String> {
-    let mut system_prompt = runtime.systems.system_prompt.clone();
-    let mut context = runtime.systems.context_messages.clone();
-    context.extend(runtime.systems.append_system_prompt.clone());
-    if !context.is_empty() {
-        let context_text = context.join("\n\n");
-        system_prompt = Some(match system_prompt {
-            Some(prompt) => format!("{prompt}\n\n{context_text}"),
-            None => context_text,
+/// The tools [`active_tool_definitions`] declares, as the prompt presents
+/// them. Like there, an extension tool with a built-in tool's name replaces
+/// it, so each tool is presented once.
+fn prompt_tools(runtime: &Runtime) -> Vec<PromptTool> {
+    let builtin = builtin_tool_definitions()
+        .into_iter()
+        .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
+        .filter(|tool| model_tool_enabled(runtime, &tool.name))
+        .map(|tool| PromptTool::builtin(&tool.name));
+    let extension = runtime
+        .systems
+        .extension_tools
+        .values()
+        .filter(|tool| model_tool_enabled(runtime, &tool.name))
+        .map(|tool| PromptTool {
+            name: tool.name.clone(),
+            snippet: tool.prompt_snippet.clone(),
+            guidelines: tool.prompt_guidelines.clone(),
         });
-    }
-    system_prompt
+    builtin.chain(extension).collect()
 }
 
-fn provider_request(runtime: &Runtime, system_prompt: Option<String>) -> ProviderRequest {
-    let mut instructions = system_prompt.into_iter().collect::<Vec<_>>();
+fn provider_request(runtime: &Runtime, system_prompt: String) -> ProviderRequest {
+    let mut instructions = vec![system_prompt];
     instructions.extend(
         runtime
             .session
@@ -2914,14 +3214,9 @@ fn provider_request(runtime: &Runtime, system_prompt: Option<String>) -> Provide
             })
             .map(|message| message.content.clone()),
     );
-    let system_prompt = if instructions.is_empty() {
-        None
-    } else {
-        Some(instructions.join("\n\n"))
-    };
     ProviderRequest {
         max_output_tokens: None,
-        system_prompt,
+        system_prompt: Some(instructions.join("\n\n")),
         messages: provider_messages(&runtime.session.messages),
         tools: active_tool_definitions(runtime),
     }
@@ -3025,9 +3320,44 @@ fn retry_policy(retry: &RuntimeRetrySettings) -> RetryPolicy {
     }
 }
 
+/// The options every tool runs with. `bash_env` is what a bash command
+/// learns about its session: [`bash_session_env`] for a call the model
+/// makes, nothing for a command the user types (`/bash`, `!`, `!!`).
+fn tool_runtime_options(
+    runtime: &Runtime,
+    bash_env: Vec<(String, Option<String>)>,
+) -> ToolRuntimeOptions {
+    ToolRuntimeOptions {
+        shell_path: runtime.systems.shell_path.clone(),
+        shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
+        offline: runtime.systems.offline,
+        bash_env,
+        auto_resize_images: runtime.systems.auto_resize_images,
+        block_images: runtime.systems.block_images,
+    }
+}
+
+/// The images of a tool result as message attachments.
+fn tool_result_media(images: Vec<pi_tools::ToolImage>) -> Vec<MediaInput> {
+    images
+        .into_iter()
+        .map(|image| MediaInput {
+            mime_type: image.mime_type,
+            data_base64: image.data_base64,
+            path: None,
+            width: None,
+            height: None,
+        })
+        .collect()
+}
+
+/// The tools offered to the model. An extension tool with a built-in tool's
+/// name replaces it: the model is sent one definition per name, the one
+/// that runs.
 fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
     let mut definitions = builtin_tool_definitions()
         .into_iter()
+        .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
         .filter(|tool| model_tool_enabled(runtime, &tool.name))
         .filter_map(|tool| model_tool_definition(&tool.name))
         .collect::<Vec<_>>();
@@ -3056,50 +3386,77 @@ fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
             || runtime.systems.available_tool_names.contains(name))
 }
 
+/// What the model is told about a built-in tool. The definitions of
+/// upstream's tools are upstream's, word for word (`tool-behavior.json`).
 fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
     let definition = match name {
         "read" => AiToolDefinition {
             name: "read".to_string(),
-            description: "Read a UTF-8 text file from the current workspace. Returns at most 2000 lines; when truncated the output says which lines were shown — continue with offset/limit. For files larger than a few hundred lines, prefer grep to locate code first and read only the relevant range.".to_string(),
+            description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "offset": { "type": "number" },
-                    "limit": { "type": "number" }
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read (relative or absolute)"
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "Line number to start reading from (1-indexed)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of lines to read"
+                    }
                 },
                 "required": ["path"]
             }),
         },
         "bash" => AiToolDefinition {
             name: "bash".to_string(),
-            description: "Execute a shell command in the current workspace. Output is capped at 30000 characters (head kept); redirect large output to a file and read a slice, or pipe through grep/head.".to_string(),
+            description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string" },
-                    "timeout": { "type": "number" }
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute"
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Timeout in seconds (optional, no default timeout)"
+                    }
                 },
                 "required": ["command"]
             }),
         },
         "edit" => AiToolDefinition {
             name: "edit".to_string(),
-            description: "Apply exact text replacements to a file. Each edits[].oldText must match a unique, non-overlapping region of the original file; all edits apply together or none do.".to_string(),
+            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to edit (relative or absolute)"
+                    },
                     "edits": {
                         "type": "array",
                         "items": {
                             "type": "object",
+                            "required": ["oldText", "newText"],
                             "properties": {
-                                "oldText": { "type": "string" },
-                                "newText": { "type": "string" }
-                            },
-                            "required": ["oldText", "newText"]
-                        }
+                                "oldText": {
+                                    "type": "string",
+                                    "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."
+                                },
+                                "newText": {
+                                    "type": "string",
+                                    "description": "Replacement text for this targeted edit."
+                                }
+                            }
+                        },
+                        "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."
                     }
                 },
                 "required": ["path", "edits"]
@@ -3107,56 +3464,97 @@ fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
         },
         "write" => AiToolDefinition {
             name: "write".to_string(),
-            description: "Write UTF-8 text to a file in the current workspace.".to_string(),
+            description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to write (relative or absolute)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write to the file"
+                    }
                 },
                 "required": ["path", "content"]
             }),
         },
         "grep" => AiToolDefinition {
             name: "grep".to_string(),
-            description: "Search file contents in the current workspace with regex. Returns at most 200 matches with a truncation notice; narrow the path or pattern instead of reading whole large files.".to_string(),
+            description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" },
-                    "glob": { "type": "string" },
-                    "literal": { "type": "boolean" },
-                    "ignoreCase": { "type": "boolean" },
-                    "context": { "type": "number" },
-                    "limit": { "type": "number" }
+                    "pattern": {
+                        "type": "string",
+                        "description": "Search pattern (regex or literal string)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search (default: current directory)"
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'"
+                    },
+                    "ignoreCase": {
+                        "type": "boolean",
+                        "description": "Case-insensitive search (default: false)"
+                    },
+                    "literal": {
+                        "type": "boolean",
+                        "description": "Treat pattern as literal string instead of regex (default: false)"
+                    },
+                    "context": {
+                        "type": "number",
+                        "description": "Number of lines to show before and after each match (default: 0)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of matches to return (default: 100)"
+                    }
                 },
                 "required": ["pattern"]
             }),
         },
         "find" => AiToolDefinition {
             name: "find".to_string(),
-            description: "Find file paths in the current workspace. Returns at most 200 paths with a truncation notice; narrow the pattern if truncated.".to_string(),
+            description: "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string" },
-                    "path": { "type": "string" },
-                    "limit": { "type": "number" }
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search in (default: current directory)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of results (default: 1000)"
+                    }
                 },
                 "required": ["pattern"]
             }),
         },
         "ls" => AiToolDefinition {
             name: "ls".to_string(),
-            description: "List directory entries in the current workspace.".to_string(),
+            description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "limit": { "type": "number" }
-                },
-                "required": []
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to list (default: current directory)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of entries to return (default: 500)"
+                    }
+                }
             }),
         },
         "web_search" => AiToolDefinition {
@@ -3224,6 +3622,9 @@ struct ExtensionToolManifest {
     parameters: Option<Value>,
     #[serde(default)]
     replay_safe: bool,
+    prompt_snippet: Option<String>,
+    #[serde(default)]
+    prompt_guidelines: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3277,6 +3678,10 @@ fn extension_tools_from_resources(extensions: &[ResourceFile]) -> BTreeMap<Strin
                     extension_path: extension.path.clone(),
                     protocol: protocol.clone(),
                     replay_safe: tool.replay_safe,
+                    prompt_snippet: system_prompt::normalize_snippet(
+                        tool.prompt_snippet.as_deref(),
+                    ),
+                    prompt_guidelines: system_prompt::normalize_guidelines(&tool.prompt_guidelines),
                 },
             );
         }
@@ -3303,6 +3708,30 @@ fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
         paths.push(path.with_extension("json"));
     }
     paths
+}
+
+/// What a bash command the model runs learns about its session (upstream's
+/// `bash.ts`): the session, model, and thinking level as of that command.
+/// A variable with nothing to report is removed, so a pi running inside
+/// another pi's command never passes on its parent's. Commands the user
+/// types (`/bash`, `!!`) get none of this.
+fn bash_session_env(runtime: &Runtime) -> Vec<(String, Option<String>)> {
+    let model = runtime.session.active_model.as_ref();
+    let session_file = runtime.store.as_ref().map(|store| {
+        let path = std::path::absolute(store.path()).unwrap_or_else(|_| store.path().into());
+        path.display().to_string()
+    });
+    let thinking_level = runtime.thinking_level.as_deref().unwrap_or("off");
+    [
+        ("PI_SESSION_ID", Some(runtime.session.session_id.clone())),
+        ("PI_SESSION_FILE", session_file),
+        ("PI_PROVIDER", model.map(|model| model.provider.clone())),
+        ("PI_MODEL", model.map(|model| model.id.clone())),
+        ("PI_REASONING_LEVEL", Some(thinking_level.to_string())),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3335,9 +3764,12 @@ fn fail_truncated_tool_call(
     Ok(())
 }
 
+/// Runs a tool call of the model and saves its result. `on_output` gets a
+/// running `bash` command's output so far.
 async fn execute_model_tool_call(
     runtime: &mut Runtime,
     tool_call: &ChatToolCall,
+    on_output: &mut (dyn FnMut(&str) + Send),
 ) -> Result<(), AgentError> {
     let extension_tool = runtime
         .systems
@@ -3345,11 +3777,15 @@ async fn execute_model_tool_call(
         .get(&tool_call.name)
         .cloned();
     let mut is_error = false;
+    let mut images = Vec::new();
     let outputs = if let Some(extension_tool) =
         extension_tool.filter(|_| model_tool_enabled(runtime, &tool_call.name))
     {
         match execute_extension_tool(&runtime.session.cwd, &extension_tool, tool_call).await {
-            Ok(output) => vec![output],
+            Ok(result) => {
+                is_error = result.is_error;
+                vec![result.output]
+            }
             Err(error) => {
                 is_error = true;
                 vec![error.to_string()]
@@ -3386,14 +3822,11 @@ async fn execute_model_tool_call(
                         }
                         _ => None,
                     };
-                    let output = match execute_tool(
+                    let output = match execute_tool_streaming(
                         &runtime.session.cwd,
                         request,
-                        &ToolRuntimeOptions {
-                            shell_path: runtime.systems.shell_path.clone(),
-                            shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
-                            offline: runtime.systems.offline,
-                        },
+                        &tool_runtime_options(runtime, bash_session_env(runtime)),
+                        on_output,
                     )
                     .await
                     {
@@ -3402,6 +3835,7 @@ async fn execute_model_tool_call(
                             if let Some(path) = edited_path {
                                 edited_paths.push(path);
                             }
+                            images.extend(result.images);
                             result.output
                         }
                         Err(error) => {
@@ -3437,7 +3871,7 @@ async fn execute_model_tool_call(
         thinking: String::new(),
         role: MessageRole::Tool,
         content: output,
-        media: Vec::new(),
+        media: tool_result_media(images),
         tool_call_id: Some(tool_call.id.clone()),
         tool_name: Some(tool_call.name.clone()),
         tool_calls: Vec::new(),
@@ -3445,11 +3879,14 @@ async fn execute_model_tool_call(
     Ok(())
 }
 
+/// Runs an extension's tool. Its output is capped like a built-in tool's,
+/// and a non-zero exit is an error result carrying what the extension
+/// printed.
 async fn execute_extension_tool(
     cwd: &Path,
     extension: &ExtensionTool,
     tool_call: &ChatToolCall,
-) -> Result<String, AgentError> {
+) -> Result<ToolResult, AgentError> {
     let cwd_string = cwd.display().to_string();
     let request = ExtensionProtocolRequest {
         protocol_version: 1,
@@ -3504,10 +3941,10 @@ async fn execute_extension_tool(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        return Ok(format!(
+        return Ok(ToolResult::error(cap_tool_output(format!(
             "extension {} failed:\n{}{}",
             extension.extension_name, stdout, stderr
-        ));
+        ))));
     }
     let response =
         serde_json::from_str::<ExtensionCommandResponse>(stdout.trim()).map_err(|source| {
@@ -3522,12 +3959,14 @@ async fn execute_extension_tool(
             message: format!("extension {} failed: {error}", extension.extension_name),
         });
     }
-    Ok(response.output.unwrap_or_else(|| {
-        format!(
-            "extension {} tool {} completed",
-            extension.extension_name, extension.name
-        )
-    }))
+    Ok(ToolResult::text(cap_tool_output(
+        response.output.unwrap_or_else(|| {
+            format!(
+                "extension {} tool {} completed",
+                extension.extension_name, extension.name
+            )
+        }),
+    )))
 }
 
 fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, AgentError> {
@@ -3540,9 +3979,7 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "bash" => vec![ToolRequest::Bash {
             command: string_tool_arg(&args, &["command"], &tool_call.name)?,
-            timeout_ms: optional_number_tool_arg(&args, &["timeout", "timeout_ms"])
-                .map(|timeout| timeout.saturating_mul(1_000))
-                .or(Some(120_000)),
+            timeout_ms: bash_timeout_ms(&args)?,
         }],
         "write" => vec![ToolRequest::Write {
             path: string_tool_arg(&args, &["path"], &tool_call.name)?,
@@ -3550,8 +3987,9 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "edit" => edit_tool_requests(&args, &tool_call.name)?,
         "grep" => vec![ToolRequest::Grep {
-            path: optional_string_tool_arg(&args, &["path", "glob"]),
+            path: optional_string_tool_arg(&args, &["path"]),
             pattern: string_tool_arg(&args, &["pattern"], &tool_call.name)?,
+            glob: optional_string_tool_arg(&args, &["glob"]),
             literal: optional_bool_tool_arg(&args, &["literal"]),
             ignore_case: optional_bool_tool_arg(&args, &["ignoreCase", "ignore_case"]),
             context: optional_integer_tool_arg(&args, "context", &tool_call.name)?,
@@ -3559,6 +3997,8 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "find" => vec![ToolRequest::Find {
             pattern: string_tool_arg(&args, &["pattern"], &tool_call.name)?,
+            path: optional_string_tool_arg(&args, &["path"]),
+            limit: optional_integer_tool_arg(&args, "limit", &tool_call.name)?,
         }],
         "web_search" => vec![ToolRequest::WebSearch {
             query: string_tool_arg(&args, &["query"], &tool_call.name)?,
@@ -3570,6 +4010,7 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "ls" => vec![ToolRequest::Ls {
             path: optional_string_tool_arg(&args, &["path"]),
+            limit: optional_integer_tool_arg(&args, "limit", &tool_call.name)?,
         }],
         _ => {
             return Err(AgentError::InvalidToolCall {
@@ -3693,11 +4134,35 @@ fn optional_integer_tool_arg(
     }
 }
 
-fn optional_number_tool_arg(args: &serde_json::Value, names: &[&str]) -> Option<u64> {
-    names
-        .iter()
-        .find_map(|name| args.get(*name).and_then(serde_json::Value::as_u64))
+/// Largest timeout upstream accepts, in milliseconds (a 32-bit timer).
+const MAX_BASH_TIMEOUT_MS: f64 = 2_147_483_647.0;
+
+/// The bash tool's optional `timeout`, in seconds and possibly fractional.
+/// There is no default: without it a command runs until it exits or the
+/// turn is interrupted. Errors are worded as upstream words them.
+fn bash_timeout_ms(args: &Value) -> Result<Option<u64>, AgentError> {
+    let Some(timeout) = args.get("timeout").filter(|timeout| !timeout.is_null()) else {
+        return Ok(None);
+    };
+    let invalid = |message: String| AgentError::Tool(ToolError::Failed(message));
+    let milliseconds = timeout
+        .as_f64()
+        .filter(|seconds| *seconds > 0.0)
+        .map(|seconds| seconds * 1000.0)
+        .ok_or_else(|| invalid("Invalid timeout: must be a finite number of seconds".into()))?;
+    if milliseconds > MAX_BASH_TIMEOUT_MS {
+        return Err(invalid(format!(
+            "Invalid timeout: maximum is {} seconds",
+            MAX_BASH_TIMEOUT_MS / 1000.0
+        )));
+    }
+    Ok(Some(milliseconds.round() as u64))
 }
+
+/// How long a command the user runs (`!` and `/bash`) may take. Unlike a
+/// model's bash call, which has no default timeout, these have no way to
+/// set one and cannot be interrupted individually.
+const USER_BASH_TIMEOUT_MS: u64 = 120_000;
 
 pub async fn run_excluded_bash(runtime: &Runtime, command: String) -> Result<String, AgentError> {
     Ok(run_excluded_bash_result(runtime, command).await?.output)
@@ -3714,13 +4179,9 @@ pub async fn run_excluded_bash_result(
         &runtime.session.cwd,
         ToolRequest::Bash {
             command,
-            timeout_ms: Some(120_000),
+            timeout_ms: Some(USER_BASH_TIMEOUT_MS),
         },
-        &ToolRuntimeOptions {
-            shell_path: runtime.systems.shell_path.clone(),
-            shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
-            offline: runtime.systems.offline,
-        },
+        &tool_runtime_options(runtime, Vec::new()),
     )
     .await
     .map_err(Into::into)
@@ -3781,7 +4242,7 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
             name: "bash".to_string(),
             request: ToolRequest::Bash {
                 command: required_arg(command, rest)?.to_string(),
-                timeout_ms: Some(120_000),
+                timeout_ms: Some(USER_BASH_TIMEOUT_MS),
             },
         })),
         "/write" => {
@@ -3816,6 +4277,7 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
                 request: ToolRequest::Grep {
                     path: path.map(ToString::to_string),
                     pattern: pattern.to_string(),
+                    glob: None,
                     literal: None,
                     ignore_case: None,
                     context: None,
@@ -3827,6 +4289,8 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
             name: "find".to_string(),
             request: ToolRequest::Find {
                 pattern: required_arg(command, rest)?.to_string(),
+                path: None,
+                limit: None,
             },
         })),
         "/ls" => Ok(Some(ParsedToolCommand {
@@ -3837,10 +4301,12 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
                 } else {
                     Some(rest.to_string())
                 },
+                limit: None,
             },
         })),
-        "/reload" | "/quit" | "/help" => Ok(None),
-        _ => Err(AgentError::UnknownCommand(command.to_string())),
+        // As upstream, any other text is for the model, whatever it starts
+        // with: a path, or a command that names nothing.
+        _ => Ok(None),
     }
 }
 
@@ -4633,6 +5099,51 @@ mod tests {
         );
     }
 
+    /// Text that starts with a slash but is no tool command is a prompt for
+    /// the model, as upstream sends it: a path, or a command nothing defines.
+    #[tokio::test]
+    async fn a_prompt_that_is_no_tool_command_goes_to_the_model() {
+        for prompt in ["/nope hi", "/home/user/main.rs is broken", "/help", "/"] {
+            assert_eq!(parse_tool_command(prompt).unwrap(), None, "{prompt}");
+        }
+        // A tool command without its argument is still refused.
+        assert!(matches!(
+            parse_tool_command("/read"),
+            Err(AgentError::MissingCommandArgument(command)) if command == "/read"
+        ));
+
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let provider = create_provider(ProviderConfig {
+            model: ModelRef {
+                provider: "faux".to_string(),
+                id: "echo".to_string(),
+            },
+            api: ProviderApi::Faux,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+            traits: pi_ai::ModelTraits::default(),
+        });
+        let reply = run_user_turn(&mut runtime, provider.as_ref(), "/nope hi".to_string())
+            .await
+            .expect("the model answers");
+        assert_eq!(reply, "[faux/echo] /nope hi");
+        let roles = runtime
+            .session()
+            .messages
+            .iter()
+            .map(|message| &message.role);
+        assert_eq!(
+            roles.collect::<Vec<_>>(),
+            [&MessageRole::User, &MessageRole::Assistant]
+        );
+    }
+
     #[tokio::test]
     async fn web_tool_failures_return_to_model_and_persist_error_status() {
         let mut runtime = Runtime::new(
@@ -4646,6 +5157,7 @@ mod tests {
                 name: "web_fetch".into(),
                 arguments: r#"{"url":"file:///etc/passwd"}"#.into(),
             },
+            &mut |_| {},
         )
         .await
         .unwrap();
@@ -4663,6 +5175,7 @@ mod tests {
                 name: "web_search".into(),
                 arguments: r#"{"query":"rust","limit":0}"#.into(),
             },
+            &mut |_| {},
         )
         .await
         .unwrap();
@@ -4738,6 +5251,72 @@ mod tests {
         )));
         assert!(!runtime.session.tool_history[0].is_error);
         thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_bash_commands_see_the_session_model_and_thinking_level() {
+        /// Runs one bash command, then answers with what it printed.
+        struct BashProvider;
+        #[async_trait::async_trait]
+        impl Provider for BashProvider {
+            async fn complete(
+                &self,
+                request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                let last = request.messages.last().unwrap();
+                if last.role == ChatRole::Tool {
+                    return Ok(vec![StreamEvent::Text(last.content.clone())]);
+                }
+                let command = r#"printf '%s\n' "${PI_SESSION_ID-unset}" "${PI_SESSION_FILE-unset}" "${PI_PROVIDER-unset}" "${PI_MODEL-unset}" "${PI_REASONING_LEVEL-unset}""#;
+                Ok(vec![StreamEvent::ToolCall {
+                    id: "bash-1".into(),
+                    name: "bash".into(),
+                    arguments: json!({ "command": command }).to_string(),
+                }])
+            }
+
+            fn thinking_level(&self) -> Option<String> {
+                Some("high".into())
+            }
+        }
+        let base = durable_test_dir("bash-session-env");
+        let (store, mut session) =
+            SessionStore::create_with_id(&base, base.clone(), "env-session").unwrap();
+        let session_file = store.path().display().to_string();
+        session.active_model = Some(ModelRef {
+            provider: "faux".into(),
+            id: "echo".into(),
+        });
+        let mut saved = Runtime::with_store(session, ReloadableSystems::default(), store);
+        // A session without a journal or a model has neither to report.
+        let mut unsaved = Runtime::new(
+            SessionState::new("ephemeral", base.clone()),
+            ReloadableSystems::default(),
+        );
+        for (runtime, expected) in [
+            (
+                &mut saved,
+                format!("env-session\n{session_file}\nfaux\necho\nhigh\n"),
+            ),
+            (
+                &mut unsaved,
+                "ephemeral\nunset\nunset\nunset\nhigh\n".into(),
+            ),
+        ] {
+            runtime.systems.shell_path = Some("/bin/sh".into());
+            let printed = run_user_turn_streaming_events_with_media(
+                runtime,
+                &BashProvider,
+                "run it".into(),
+                Vec::new(),
+                &RunControl::default(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(printed, expected);
+        }
+        let _ = fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -4847,79 +5426,6 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, TurnEvent::CompactionFailed(_))));
-    }
-
-    #[test]
-    fn model_tool_definitions_match_ts_local_tool_schema_keys() {
-        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
-            "../../../tests/fixtures/ts-parity/local-tools.json"
-        ))
-        .expect("parse local tools fixture");
-        let expected = fixture["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .map(|tool| {
-                (
-                    tool["name"].as_str().expect("tool name").to_string(),
-                    (
-                        tool["parameters"]["properties"]
-                            .as_array()
-                            .expect("properties")
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                        tool["parameters"]["required"]
-                            .as_array()
-                            .expect("required")
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>(),
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let actual = builtin_tool_definitions()
-            .into_iter()
-            .map(|tool| {
-                let definition = model_tool_definition(&tool.name).expect("model tool definition");
-                let mut properties = definition.parameters["properties"]
-                    .as_object()
-                    .expect("properties object")
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                properties.sort();
-                let mut required = definition.parameters["required"]
-                    .as_array()
-                    .expect("required array")
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
-                required.sort();
-                (definition.name, (properties, required))
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        // Rust intentionally adds tools beyond the upstream set (see
-        // docs/rust-rewrite/non-parity-register.md); upstream tools must keep
-        // their schema keys, but rust-only tools are not in the fixture.
-        // Upstream's `powershell` tool only runs on Windows, so Rust omits it
-        // ("Windows-Only PowerShell Tool" in non-parity-register.md).
-        const WINDOWS_ONLY_UPSTREAM_TOOL: &str = "powershell";
-        for (name, keys) in &expected {
-            if name == WINDOWS_ONLY_UPSTREAM_TOOL {
-                assert!(
-                    !actual.contains_key(name),
-                    "{name} is now ported; drop its non-parity exception"
-                );
-                continue;
-            }
-            assert_eq!(actual.get(name), Some(keys), "schema keys for {name}");
-        }
     }
 
     #[test]
@@ -5485,6 +5991,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
 
         let response = run_user_turn(&mut runtime, provider.as_ref(), "hello".to_string())
@@ -5514,6 +6021,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
         let mut deltas = Vec::new();
 
@@ -6011,14 +6519,17 @@ mod tests {
         )
         .await
         .unwrap();
-        // Upstream reports auto_retry_end after the reply's message_end.
+        // Each retry asks again in a new round. Upstream reports
+        // auto_retry_end after the reply's message_end.
         assert_eq!(
             trace(&events),
             [
                 "round started",
                 r#"user "hi""#,
                 "retry 1 of 3 in 1ms: provider returned an invalid response: overloaded",
+                "round started",
                 "retry 2 of 3 in 2ms: provider returned an invalid response: overloaded",
+                "round started",
                 r#"text "ok""#,
                 r#"assistant "ok""#,
                 "retried 2: succeeded",
@@ -6046,6 +6557,7 @@ mod tests {
                 "round started",
                 r#"user "again""#,
                 "retry 1 of 1 in 1ms: provider returned an invalid response: overloaded",
+                "round started",
                 "retried 1: provider returned an invalid response: overloaded",
             ]
         );
@@ -6086,7 +6598,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert!(duration >= Duration::from_millis(200), "{duration:?}");
+        assert!(duration >= Some(Duration::from_millis(200)), "{duration:?}");
     }
 
     /// Cancels `run` after `delay`; the handle yields when it did.
@@ -6213,7 +6725,8 @@ mod tests {
             ]
         );
         assert!(lines[4].starts_with("tool bash-1 bash"), "{lines:?}");
-        assert_eq!(lines.len(), 5);
+        // The command reported that it starts; it printed nothing.
+        assert_eq!(lines[5..], [r#"update bash-1 """#]);
         // A killed process stays a zombie (state Z) until reaped.
         let running = || {
             fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -6284,7 +6797,6 @@ mod tests {
                 "round started",
                 r#"user "hi""#,
                 "retry 1 of 3 in 60000ms: provider returned an invalid response: overloaded",
-                "retried 1: turn cancelled",
             ]
         );
         assert_eq!(store.load().unwrap(), runtime.session);
@@ -6693,6 +7205,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
         let answer = continue_turn_streaming_events(
             &mut reopened,
@@ -6755,6 +7268,7 @@ mod tests {
             },
             auth: Default::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -6902,6 +7416,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
         let steering = SteeringMailbox::new();
         steering.send("one".to_string());
@@ -6992,7 +7507,7 @@ mod tests {
             .to_string(),
         };
 
-        execute_model_tool_call(&mut runtime, &tool_call)
+        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
             .await
             .expect("execute todo tool");
 
@@ -7015,7 +7530,7 @@ mod tests {
             arguments: "{\"todos\": \"not-a-list\"}".to_string(),
         };
 
-        execute_model_tool_call(&mut runtime, &tool_call)
+        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
             .await
             .expect("execute todo tool");
 
@@ -7150,10 +7665,10 @@ mod tests {
             .to_string(),
         };
 
-        execute_model_tool_call(&mut runtime, &tool_call)
+        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
             .await
             .expect("execute write tool");
-        execute_model_tool_call(&mut runtime, &tool_call)
+        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
             .await
             .expect("execute write tool again");
 
@@ -7198,7 +7713,7 @@ mod tests {
             ),
         ];
         for tool_call in &calls {
-            execute_model_tool_call(&mut runtime, tool_call)
+            execute_model_tool_call(&mut runtime, tool_call, &mut |_| {})
                 .await
                 .expect("execute tool call");
         }
@@ -7247,6 +7762,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
 
         run_user_turn(
@@ -7312,7 +7828,7 @@ mod tests {
             requests: requests.clone(),
         };
 
-        let response = run_user_turn(&mut runtime, &provider, "read outside".to_string())
+        let response = run_user_turn(&mut runtime, &provider, "read missing".to_string())
             .await
             .expect("run tool loop");
 
@@ -7320,18 +7836,17 @@ mod tests {
         assert_eq!(runtime.session().tool_history.len(), 1);
         assert_eq!(runtime.session().tool_history[0].id, "call_read_bad");
         assert_eq!(runtime.session().tool_history[0].name, "read");
-        assert_eq!(
-            runtime.session().tool_history[0].result,
-            "path escapes cwd: ../outside.txt"
+        let failure = format!(
+            "ENOENT: no such file or directory, access '{}'",
+            cwd.join("missing.txt").display()
         );
+        assert_eq!(runtime.session().tool_history[0].result, failure);
+        assert!(runtime.session().tool_history[0].is_error);
         assert_eq!(
             runtime.session().messages[2].tool_call_id.as_deref(),
             Some("call_read_bad")
         );
-        assert_eq!(
-            runtime.session().messages[2].content,
-            "path escapes cwd: ../outside.txt"
-        );
+        assert_eq!(runtime.session().messages[2].content, failure);
 
         let captured = requests.lock().expect("requests").clone();
         assert_eq!(captured.len(), 2);
@@ -7858,6 +8373,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
 
         let error = run_user_turn(
@@ -7883,7 +8399,7 @@ mod tests {
 
     /// One line per event, for exact-order assertions. Tool durations vary,
     /// so they are left out.
-    fn trace(events: &[TurnEvent]) -> Vec<String> {
+    pub(crate) fn trace(events: &[TurnEvent]) -> Vec<String> {
         let flag = |is_error: bool| if is_error { " error" } else { "" };
         let message = |message: &ConversationMessage| {
             let role = format!("{:?}", message.role).to_lowercase();
@@ -7918,9 +8434,14 @@ mod tests {
                     "retried {attempt}: {}",
                     error.as_deref().unwrap_or("succeeded")
                 ),
+                TurnEvent::Overflowed { error } => format!(
+                    "overflowed: {}",
+                    error.as_deref().unwrap_or("reply cut off")
+                ),
                 TurnEvent::ToolStarted { call } => {
                     format!("tool {} {} {}", call.id, call.name, call.arguments)
                 }
+                TurnEvent::ToolUpdate { call, output } => format!("update {} {output:?}", call.id),
                 TurnEvent::ToolOutput {
                     call,
                     output,
@@ -7947,7 +8468,7 @@ mod tests {
         Box::new(move || Ok(events))
     }
 
-    /// A failure before any output, so it is retried.
+    /// A failure a retry can fix.
     fn overloaded() -> Reply {
         Box::new(|| Err(ProviderError::InvalidResponse("overloaded".into())))
     }
@@ -8120,7 +8641,7 @@ mod tests {
                     StreamEvent::ToolCall {
                         id: "call_read_bad".to_string(),
                         name: "read".to_string(),
-                        arguments: r#"{"path":"../outside.txt"}"#.to_string(),
+                        arguments: r#"{"path":"missing.txt"}"#.to_string(),
                     },
                     StreamEvent::Stop {
                         reason: "toolUse".to_string(),
@@ -8186,7 +8707,7 @@ mod tests {
         ) -> Result<Vec<StreamEvent>, ProviderError> {
             let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
             if attempt < self.fail_before_success {
-                return Err(ProviderError::InvalidResponse("temporary".to_string()));
+                return Err(ProviderError::InvalidResponse("overloaded".to_string()));
             }
             Ok(vec![
                 StreamEvent::Text("retried".to_string()),

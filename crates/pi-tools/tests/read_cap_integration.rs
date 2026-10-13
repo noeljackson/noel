@@ -1,7 +1,7 @@
 use pi_tools::{execute_tool, ToolRequest, ToolRuntimeOptions};
 
 #[test]
-fn read_of_a_13k_line_file_is_capped_at_2000_lines_with_resume_notice() {
+fn read_of_a_13k_line_file_is_capped_at_50_kb_with_resume_notice() {
     let cwd = std::env::temp_dir().join(format!("pi-read-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&cwd).unwrap();
     let content = (1..=13_000)
@@ -23,12 +23,26 @@ fn read_of_a_13k_line_file_is_capped_at_2000_lines_with_resume_notice() {
         ))
         .unwrap();
 
+    // 50 KB is reached long before 2000 of these lines.
+    let (shown, notice) = result
+        .output
+        .rsplit_once("\n\n")
+        .expect("truncation notice");
     assert!(
-        result.output.chars().count() < 100_000,
-        "read cap failed: {} chars",
-        result.output.chars().count()
+        shown.len() <= 50 * 1024,
+        "read cap failed: {} bytes",
+        shown.len()
     );
-    assert!(result.output.contains("showing lines 1-2000 of 13000"));
-    assert!(result.output.contains("offset=2001"));
+    let lines = shown.lines().count();
+    assert!(shown.ends_with(&format!(
+        "line {lines}: padding to make a genuinely large file"
+    )));
+    assert_eq!(
+        notice,
+        format!(
+            "[Showing lines 1-{lines} of 13000 (50.0KB limit). Use offset={} to continue.]",
+            lines + 1
+        )
+    );
     std::fs::remove_dir_all(cwd).unwrap();
 }

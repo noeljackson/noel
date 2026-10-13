@@ -39,7 +39,7 @@ struct RefreshResponse {
 fn token_endpoint(provider: &str) -> Option<(&'static str, &'static str)> {
     match provider {
         "anthropic" => Some((CLAUDE_TOKEN_URL, CLAUDE_CLIENT_ID)),
-        "openai" | "openai-codex" => Some((CODEX_TOKEN_URL, CODEX_CLIENT_ID)),
+        "openai-codex" => Some((CODEX_TOKEN_URL, CODEX_CLIENT_ID)),
         _ => None,
     }
 }
@@ -406,10 +406,8 @@ mod tests {
             token_endpoint("openai-codex"),
             Some((CODEX_TOKEN_URL, CODEX_CLIENT_ID))
         );
-        assert_eq!(
-            token_endpoint("openai"),
-            Some((CODEX_TOKEN_URL, CODEX_CLIENT_ID))
-        );
+        // `openai` has an API key, which nothing refreshes.
+        assert_eq!(token_endpoint("openai"), None);
         assert_eq!(
             token_endpoint("anthropic"),
             Some((CLAUDE_TOKEN_URL, CLAUDE_CLIENT_ID))

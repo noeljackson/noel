@@ -15,13 +15,21 @@ mod auth_command;
 mod bug_report;
 mod clipboard;
 mod markdown;
+mod model_select;
 mod oauth_login;
 mod oauth_refresh;
+mod resource_commands;
 mod rpc;
 mod rpc_wire;
 mod signals;
 mod transcript_view;
 mod usage;
+use model_select::{
+    configured_model, effective_thinking_level, find_selectable_model, model_definition,
+    normalized_thinking_level, provider_usable, register_cli_model, resolve_cli,
+    resolve_cli_selection, resolve_scope, select_initial_model, set_thinking_level, switch_model,
+    thinking_label,
+};
 use transcript_view::TranscriptView;
 
 use anyhow::{anyhow, Result};
@@ -44,29 +52,29 @@ use crossterm::{
     },
 };
 use pi_ai::{
-    anthropic_supports_adaptive_thinking, create_provider_with_client, generate_images,
-    set_claude_code_version, ImageGenerationInput, ImageGenerationOutput,
-    ImageProviderApi as AiImageProviderApi, ImageProviderConfig, MediaInput, ModelRef,
-    ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig, ProviderError, ProviderRequest,
-    StreamEvent,
+    create_provider_with_client, generate_images, set_claude_code_version, ImageGenerationInput,
+    ImageGenerationOutput, ImageProviderApi as AiImageProviderApi, ImageProviderConfig, MediaInput,
+    ModelRef, ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig, ProviderError,
+    ProviderRequest, StreamEvent,
 };
 use pi_config::{
-    auth_for_provider, codex_client_version, has_auth_for_provider, listed_accounts_for_provider,
-    load_config, load_config_with_project_trust, project_is_trusted, read_model_cache,
-    save_project_trust, write_file_atomic, write_model_cache, AccountSource, AuthCredential,
-    AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
+    apply_tool_modifiers, auth_for_provider, codex_client_version, is_tool_modifier,
+    listed_accounts_for_provider, load_config, load_config_with_project_trust,
+    load_config_with_resources, project_is_trusted, read_model_cache, resolve_default_tools,
+    save_project_trust, tool_list_error, write_file_atomic, write_model_cache, AccountSource,
+    AuthCredential, AuthData, CompactionSettings, ConfigPaths, ImageModelDefinition,
     ImageProviderApi as ConfigImageProviderApi, ImageSettings, LoadedConfig, ModelCache,
     ModelDefinition, ModelRefreshSettings, PackageSource, ProviderApi as ConfigProviderApi,
     ResolvedAuth, ResourceFile, RetrySettings, Settings, TerminalSettings, WarningSettings,
     DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR, MODEL_CACHE_VERSION,
 };
 use pi_core::{
-    continue_turn_streaming_events, default_active_tool_names, format_todo_list,
+    continue_turn_streaming_events, default_active_tool_names, expand_input, format_todo_list,
     run_excluded_bash_result, run_user_turn, run_user_turn_streaming,
     run_user_turn_streaming_events_with_media, run_user_turn_streaming_with_media,
     write_session_export, AgentError, CompactionKind, ConversationMessage, FollowUpQueue,
     MessageRole, ReloadReport, ReloadableSystems, RunControl, Runtime, SessionError, SessionState,
-    SessionStore, SteeringMailbox, TodoItem, TodoStatus, TurnEvent, STEERING_JOIN,
+    SessionStore, SteeringMailbox, TodoItem, TodoStatus, TurnEvent, PRODUCT_NAME, STEERING_JOIN,
 };
 use pi_tui::{
     parse_theme_color, EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector,
@@ -160,7 +168,9 @@ struct Cli {
     #[arg(long)]
     no_tools: bool,
 
-    #[arg(short = 't', long, value_delimiter = ',')]
+    /// An allowlist of tool names and `*` patterns, or only `+name` and
+    /// `-name` entries that change the default selection.
+    #[arg(short = 't', long, value_delimiter = ',', allow_hyphen_values = true)]
     tools: Vec<String>,
 
     #[arg(long, value_delimiter = ',')]
@@ -169,15 +179,19 @@ struct Cli {
     #[arg(long)]
     no_builtin_tools: bool,
 
+    /// Load a skill file or directory (can be used multiple times).
     #[arg(long)]
     skill: Vec<PathBuf>,
 
+    /// Discover no skills; --skill paths still load.
     #[arg(long)]
     no_skills: bool,
 
+    /// Load a prompt template file or directory (can be used multiple times).
     #[arg(long)]
     prompt_template: Vec<PathBuf>,
 
+    /// Discover no prompt templates; --prompt-template paths still load.
     #[arg(long)]
     no_prompt_templates: bool,
 
@@ -586,12 +600,17 @@ async fn run_auth_login(args: &[String]) -> Result<()> {
     let account = account.unwrap_or_else(|| DEFAULT_ACCOUNT_NAME.to_string());
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd, None)?;
-    if api_key.is_none() {
-        match provider.as_str() {
-            "openai" | "openai-codex" => return run_codex_login(&paths, &account).await,
-            "anthropic" => return run_claude_login(&paths, &account).await,
-            _ => {}
+    // A ChatGPT login is `openai-codex`'s credential, and its only one; an
+    // API key is `openai`'s.
+    match (provider.as_str(), &api_key) {
+        ("openai-codex", None) => return run_codex_login(&paths, &account).await,
+        ("openai-codex", Some(_)) => {
+            return Err(anyhow!(
+                "openai-codex signs in with ChatGPT and takes no API key: run `pi login openai-codex`, or store the key with `pi login openai --api-key <key|env:VAR|->`"
+            ))
         }
+        ("anthropic", None) => return run_claude_login(&paths, &account).await,
+        _ => {}
     }
     let key = match api_key {
         Some(value) if value == "-" => {
@@ -660,18 +679,16 @@ async fn run_codex_login(paths: &ConfigPaths, account: &str) -> Result<()> {
     .await?;
     let replaced = pi_config::update_auth_file(&paths.auth_path, |auth| {
         let replaced = auth.credential("openai-codex", account).is_some();
-        for provider in ["openai", "openai-codex"] {
-            auth.insert(
-                provider,
-                account,
-                AuthCredential::OAuth {
-                    access_token: tokens.access_token.clone(),
-                    refresh_token: tokens.refresh_token.clone(),
-                    expires: tokens.expires,
-                    account_id: tokens.account_id.clone(),
-                },
-            );
-        }
+        auth.insert(
+            "openai-codex",
+            account,
+            AuthCredential::OAuth {
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                expires: tokens.expires,
+                account_id: tokens.account_id,
+            },
+        );
         replaced
     })?;
     println!(
@@ -1245,12 +1262,11 @@ fn default_api_key_env(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         "openai" => Some("OPENAI_API_KEY"),
-        "openai-codex" => Some("CODEX_API_KEY"),
         "google" => Some("GEMINI_API_KEY"),
         "openrouter" => Some("OPENROUTER_API_KEY"),
         "mistral" => Some("MISTRAL_API_KEY"),
         "github-copilot" => Some("COPILOT_GITHUB_TOKEN"),
-        "azure-openai-responses" => Some("AZURE_OPENAI_API_KEY"),
+        "azure" | pi_config::LEGACY_AZURE_PROVIDER => Some("AZURE_OPENAI_API_KEY"),
         "cloudflare-ai-gateway" | "cloudflare-workers-ai" => Some("CLOUDFLARE_API_KEY"),
         "amazon-bedrock" => Some("AWS_BEARER_TOKEN_BEDROCK"),
         _ => None,
@@ -1293,8 +1309,19 @@ fn print_auth_help(command: &str) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Upstream's process markers, inherited by every command and tool pi
+    // starts: a generic one naming the agent, and pi's own. Set before any
+    // other thread exists, because the environment is process-wide.
+    std::env::set_var("AI_AGENT", PRODUCT_NAME);
+    std::env::set_var("PI_CODING_AGENT", "true");
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     signals::install();
     if try_run_image_command().await? {
         return Ok(());
@@ -1321,7 +1348,8 @@ async fn main() -> Result<()> {
     } else {
         project_is_trusted(&paths.agent_dir, &cwd)?
     };
-    let mut config = load_config_with_project_trust(paths, project_trusted)?;
+    let resources = resource_commands::resource_options(&cli);
+    let mut config = load_config_with_resources(paths, project_trusted, &resources)?;
     if cli.session_dir.is_none() && std::env::var_os(ENV_SESSION_DIR).is_none() {
         if let Some(session_dir) = &config.settings.session_dir {
             config.paths = config.paths.with_session_dir(session_dir)?;
@@ -1362,24 +1390,16 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let selection = resolve_cli_selection(&cli, &mut config, offline)?;
     let mut systems = ReloadableSystems::from_config(&config, 1);
     systems.offline = offline;
     let mut runtime = create_runtime_when_unlocked(&cli, &cwd, &config, systems).await?;
-    select_initial_model(&mut runtime, &config, &cli, offline)?;
-    if cli.no_tools || cli.no_builtin_tools {
-        runtime.set_disabled_tools(default_active_tool_names())?;
-    } else {
-        let mut disabled: BTreeSet<String> = cli.exclude_tools.iter().cloned().collect();
-        if !cli.tools.is_empty() {
-            for name in default_active_tool_names() {
-                if !cli.tools.contains(&name) {
-                    disabled.insert(name);
-                }
-            }
-        }
-        if !disabled.is_empty() {
-            runtime.set_disabled_tools(disabled)?;
-        }
+    select_initial_model(&mut runtime, &config, &selection, offline)?;
+    // The tool flags apply to this run (`apply_tool_flags`). Earlier
+    // versions saved them in the session as disabled tools; a resumed
+    // session follows this run's flags instead.
+    if !runtime.session().disabled_tools.is_empty() {
+        runtime.set_disabled_tools(BTreeSet::new())?;
     }
     if let Some(name) = &cli.name {
         let name = name.trim();
@@ -1410,14 +1430,9 @@ async fn main() -> Result<()> {
         if initial_prompt.is_empty() {
             return Err(anyhow!("print mode requires a prompt"));
         }
-        let response = run_prompt_media(
-            &mut runtime,
-            &config,
-            initial_prompt,
-            initial_media,
-            offline,
-        )
-        .await?;
+        let prompt = expand_input(&config, &initial_prompt);
+        let response =
+            run_prompt_media(&mut runtime, &config, prompt, initial_media, offline).await?;
         if let Some(path) = &cli.export {
             export_session(&runtime, path)?;
         }
@@ -1445,8 +1460,11 @@ static CONFIG_SOURCE: std::sync::OnceLock<ConfigSource> = std::sync::OnceLock::n
 
 impl ConfigSource {
     fn load(&self, paths: ConfigPaths) -> Result<LoadedConfig> {
-        let mut config = load_config_with_project_trust(paths, self.project_trusted)?;
+        let resources = resource_commands::resource_options(&self.cli);
+        let mut config = load_config_with_resources(paths, self.project_trusted, &resources)?;
         apply_cli_overrides(&self.cli, &self.cwd, &mut config)?;
+        // A custom model `--model provider/new-id` named stays known.
+        register_cli_model(&self.cli, &mut config, offline_enabled(self.cli.offline));
         Ok(config)
     }
 }
@@ -1464,34 +1482,70 @@ fn reload_config(config: &LoadedConfig) -> Result<LoadedConfig> {
     }
 }
 
+/// Folds the tool flags into the tool settings, as upstream resolves them.
+/// `--tools` with plain names is an allowlist of names and `*` patterns;
+/// with only `+name`/`-name` entries it changes the default selection.
+/// `--no-builtin-tools` empties the default selection, which leaves the
+/// extension tools; `--no-tools` leaves only what `--tools` names. Any of
+/// the three replaces the `enabledTools` setting for the run.
+fn apply_tool_flags(cli: &Cli, settings: &mut Settings) -> Result<()> {
+    let entries = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+    };
+    let tools = entries(&cli.tools);
+    if let Some(error) = tool_list_error(&tools) {
+        return Err(anyhow!("--tools: {error}"));
+    }
+    if cli.no_tools || cli.no_builtin_tools || !tools.is_empty() {
+        // The flags decide for this run, not the saved allowlist.
+        settings.enabled_tools = None;
+    }
+    if cli.no_tools || cli.no_builtin_tools {
+        settings.default_tools = Some(Vec::new());
+    }
+    if tools.iter().any(|entry| is_tool_modifier(entry)) {
+        let builtin = default_active_tool_names().into_iter().collect::<Vec<_>>();
+        let defaults = match &settings.default_tools {
+            Some(entries) => resolve_default_tools(entries, &builtin),
+            None => builtin,
+        };
+        let selected = apply_tool_modifiers(&defaults, &tools);
+        if cli.no_tools {
+            settings.enabled_tools = Some(selected.clone());
+        }
+        settings.default_tools = Some(selected);
+    } else if !tools.is_empty() {
+        settings.enabled_tools = Some(tools);
+    } else if cli.no_tools {
+        settings.enabled_tools = Some(Vec::new());
+    }
+    settings.excluded_tools = entries(&cli.exclude_tools);
+    Ok(())
+}
+
 fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Result<()> {
     if let Some(system_prompt) = &cli.system_prompt {
-        config.system_prompt = Some(resolve_text_or_file(cwd, system_prompt)?);
+        config.system_prompt = Some(resolve_prompt_flag(cwd, system_prompt)?);
+    }
+    // As upstream, the flags replace a discovered APPEND_SYSTEM.md; they add
+    // to the `appendSystemPrompt` setting, which the config loaded instead
+    // of that file.
+    if !cli.append_system_prompt.is_empty() && config.settings.append_system_prompt.is_empty() {
+        config.append_system_prompt.clear();
     }
     for prompt in &cli.append_system_prompt {
         config
             .append_system_prompt
-            .push(resolve_text_or_file(cwd, prompt)?);
+            .push(resolve_prompt_flag(cwd, prompt)?);
     }
     if cli.no_context_files {
         config.context_files.clear();
     }
-    if !cli.models.is_empty() {
-        config.models.retain(|model| {
-            cli.models.iter().any(|pattern| {
-                pattern == &model.id
-                    || pattern == &model.provider
-                    || pattern == &format!("{}/{}", model.provider, model.id)
-                    || model.name.as_deref() == Some(pattern.as_str())
-            })
-        });
-    }
-    if cli.no_tools || cli.no_builtin_tools {
-        config.settings.enabled_tools = Some(Vec::new());
-    }
-    if !cli.tools.is_empty() {
-        config.settings.enabled_tools = Some(cli.tools.clone());
-    }
+    apply_tool_flags(cli, &mut config.settings)?;
     if cli.no_themes {
         config.settings.theme = None;
         config.settings.accent_color = None;
@@ -1509,31 +1563,6 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
         resolved
             .with_accent(config.settings.accent_color.as_deref())
             .map_err(|error| anyhow!(error))?;
-    }
-    if let Some(thinking) = &cli.thinking {
-        config.settings.default_thinking_level = Some(thinking.clone());
-    }
-    if !cli.no_skills {
-        for skill in &cli.skill {
-            if skill.is_file() {
-                config.skills.push(ResourceFile {
-                    name: resource_name(skill),
-                    path: skill.clone(),
-                    content: fs::read_to_string(skill)?,
-                });
-            }
-        }
-    }
-    if !cli.no_prompt_templates {
-        for prompt_template in &cli.prompt_template {
-            if prompt_template.is_file() {
-                config.prompt_templates.push(ResourceFile {
-                    name: resource_name(prompt_template),
-                    path: prompt_template.clone(),
-                    content: fs::read_to_string(prompt_template)?,
-                });
-            }
-        }
     }
     if cli.no_extensions {
         config.extensions.clear();
@@ -1559,6 +1588,9 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
             },
         );
     }
+    // `--models`, else `enabledModels`: a scope over the models that can
+    // run with the credentials now known. It removes no model.
+    config.model_scope = resolve_scope(cli, config, offline_enabled(cli.offline)).models;
     Ok(())
 }
 
@@ -1773,47 +1805,45 @@ async fn refresh_model_cache(
         report.record("anthropic", cached_at_start.as_ref(), result);
     }
 
-    match auth_for_provider(&auth, "openai", None) {
-        Some(ResolvedAuth::ApiKey(api_key)) => {
-            let result = fetch_openai_api_models(
-                "openai",
-                ConfigProviderApi::OpenAiResponses,
-                None,
-                OPENAI_MODELS_URL,
-                &api_key,
-            )
-            .await;
-            report.record("openai", cached_at_start.as_ref(), result);
-        }
-        Some(ResolvedAuth::ChatGptOAuth {
-            access_token,
-            account_id,
-            ..
-        }) => {
-            let result = fetch_chatgpt_backend_models(
-                "openai",
-                ConfigProviderApi::OpenAiResponses,
-                None,
-                &access_token,
-                account_id.as_deref(),
-            )
-            .await;
-            report.record("openai", cached_at_start.as_ref(), result);
-        }
-        _ => {}
+    // `openai` lists with its API key and `openai-codex` with its ChatGPT
+    // login; neither provider has the other's credential.
+    if let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, "openai", None) {
+        let result = fetch_openai_api_models(
+            "openai",
+            ConfigProviderApi::OpenAiResponses,
+            None,
+            OPENAI_MODELS_URL,
+            &api_key,
+        )
+        .await;
+        report.record("openai", cached_at_start.as_ref(), result);
     }
 
-    if let Some(auth) = auth_for_provider(&auth, "openai-codex", None) {
-        let result = fetch_codex_models(auth).await;
+    if let Some(ResolvedAuth::ChatGptOAuth {
+        access_token,
+        account_id,
+        ..
+    }) = auth_for_provider(&auth, "openai-codex", None)
+    {
+        let result = fetch_chatgpt_backend_models(
+            "openai-codex",
+            ConfigProviderApi::OpenAiCodexResponses,
+            Some("https://chatgpt.com/backend-api".to_string()),
+            &access_token,
+            account_id.as_deref(),
+        )
+        .await;
         report.record("openai-codex", cached_at_start.as_ref(), result);
     }
 
-    for (provider, base_url) in [
-        ("zai", "https://api.z.ai/api/paas/v4"),
-        ("zai-coding", "https://api.z.ai/api/coding/paas/v4"),
-        ("moonshotai", "https://api.moonshot.ai/v1"),
-        ("kimi-coding-openai", "https://api.kimi.com/coding/v1"),
-    ] {
+    // The OpenAI-compatible providers whose listings are fetched, each at
+    // the base URL the catalog gives its models.
+    for provider in ["zai", "zai-coding", "moonshotai", "kimi-coding-openai"] {
+        let Some(base_url) =
+            pi_ai::catalog::provider_base_model(provider).and_then(|model| model.base_url.clone())
+        else {
+            continue;
+        };
         let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, provider, None) else {
             continue;
         };
@@ -1821,7 +1851,7 @@ async fn refresh_model_cache(
         let result = fetch_openai_api_models(
             provider,
             ConfigProviderApi::OpenAi,
-            Some(base_url.to_string()),
+            Some(base_url),
             &models_url,
             &api_key,
         )
@@ -2021,7 +2051,7 @@ async fn fetch_anthropic_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinitio
             id: model.id,
             name: Some(model.display_name),
             api: ConfigProviderApi::Anthropic,
-            base_url: None,
+            ..ModelDefinition::default()
         }));
         match next {
             Some(next) => cursor = Some(next),
@@ -2131,44 +2161,14 @@ async fn fetch_openai_api_models(
         .into_iter()
         .filter(|model| model_supported_for_provider(provider, &model.id))
         .map(|model| ModelDefinition {
-            context_window: None,
             provider: provider.to_string(),
             id: model.id.clone(),
             name: Some(model_display_name(&model.id)),
             api: api.clone(),
             base_url: base_url.clone(),
+            ..ModelDefinition::default()
         })
         .collect())
-}
-
-async fn fetch_codex_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinition>> {
-    match auth {
-        ResolvedAuth::ApiKey(api_key) => {
-            fetch_openai_api_models(
-                "openai-codex",
-                ConfigProviderApi::OpenAiCodexResponses,
-                Some("https://chatgpt.com/backend-api".to_string()),
-                OPENAI_MODELS_URL,
-                &api_key,
-            )
-            .await
-        }
-        ResolvedAuth::ChatGptOAuth {
-            access_token,
-            account_id,
-            ..
-        } => {
-            fetch_chatgpt_backend_models(
-                "openai-codex",
-                ConfigProviderApi::OpenAiCodexResponses,
-                Some("https://chatgpt.com/backend-api".to_string()),
-                &access_token,
-                account_id.as_deref(),
-            )
-            .await
-        }
-        ResolvedAuth::ClaudeCodeOAuth { .. } => Err(anyhow!("unsupported Codex auth type")),
-    }
 }
 
 async fn fetch_chatgpt_backend_models(
@@ -2225,6 +2225,7 @@ async fn fetch_chatgpt_backend_models(
             id,
             api: api.clone(),
             base_url: base_url.clone(),
+            ..ModelDefinition::default()
         })
         .collect())
 }
@@ -2326,15 +2327,16 @@ fn unix_seconds() -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
+/// The provider `--api-key` is for: the one `--model` resolves to, else
+/// `--provider`, else the saved default provider.
 fn infer_cli_provider(cli: &Cli, config: &LoadedConfig) -> Option<String> {
-    cli.provider
-        .clone()
+    resolve_cli(cli, config, offline_enabled(cli.offline))
+        .and_then(|resolved| resolved.model)
+        .map(|model| model.provider)
         .or_else(|| {
-            cli.model.as_deref().and_then(|model| {
-                model
-                    .split_once('/')
-                    .map(|(provider, _)| provider.to_string())
-            })
+            cli.provider
+                .as_deref()
+                .map(|provider| pi_config::canonical_provider(provider).to_string())
         })
         .or_else(|| config.settings.default_provider.clone())
 }
@@ -2357,6 +2359,16 @@ fn resolve_text_or_file(cwd: &Path, value: &str) -> Result<String> {
         return fs::read_to_string(path).map_err(Into::into);
     }
     Ok(value.to_string())
+}
+
+/// A prompt flag's value: the text itself, or the file it names, read as
+/// upstream reads a prompt file (without a leading byte order mark).
+fn resolve_prompt_flag(cwd: &Path, value: &str) -> Result<String> {
+    let text = resolve_text_or_file(cwd, value)?;
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(text) => text.to_string(),
+        None => text,
+    })
 }
 
 fn expand_message_inputs(cwd: &Path, messages: &[String]) -> Result<String> {
@@ -2724,143 +2736,24 @@ fn most_recent_session(session_dir: &Path, cwd: Option<&Path>) -> Result<Option<
     Ok(sessions.pop().map(|summary| summary.path))
 }
 
-fn select_initial_model(
-    runtime: &mut Runtime,
+/// The model a TUI command names: a 1-based position in the model list, or
+/// an exact `provider/id` or id among the selectable models, ignoring case.
+fn resolve_model_reference(
     config: &LoadedConfig,
-    cli: &Cli,
+    reference: &str,
     offline: bool,
-) -> Result<()> {
-    if runtime.session().active_model.is_some() && cli.provider.is_none() && cli.model.is_none() {
-        return Ok(());
-    }
-    let model = if let (Some(provider), Some(id)) = (&cli.provider, &cli.model) {
-        Some(ModelRef {
-            provider: provider.clone(),
-            id: id.clone(),
-        })
-    } else if let Some(model) = &cli.model {
-        resolve_model_reference(config, model)
-    } else {
-        default_model(config, offline)
-    };
-    runtime.set_active_model(model)?;
-    Ok(())
-}
-
-/// Upstream `defaultModelPerProvider` (core/model-resolver.ts): the model a
-/// provider with credentials starts on. Providers the catalog lacks never
-/// match.
-const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
-    ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
-    ("ant-ling", "Ring-2.6-1T"),
-    ("anthropic", "claude-opus-4-8"),
-    ("openai", "gpt-5.5"),
-    ("azure", "gpt-5.4"),
-    ("openai-codex", "gpt-6.1-sol"),
-    ("radius", "balanced"),
-    ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
-    ("deepseek", "deepseek-v4-pro"),
-    ("google", "gemini-3.1-pro-preview"),
-    ("google-vertex", "gemini-3.1-pro-preview"),
-    ("github-copilot", "gpt-5.4"),
-    ("openrouter", "moonshotai/kimi-k2.6"),
-    ("vercel-ai-gateway", "zai/glm-5.1"),
-    ("xai", "grok-4.7"),
-    ("groq", "openai/gpt-oss-120b"),
-    ("cerebras", "gpt-oss-120b"),
-    ("zai", "glm-5.3"),
-    ("zai-coding-cn", "glm-5.3"),
-    ("mistral", "devstral-medium-latest"),
-    ("minimax", "MiniMax-M2.7"),
-    ("minimax-cn", "MiniMax-M2.7"),
-    ("moonshotai", "kimi-k2.6"),
-    ("moonshotai-cn", "kimi-k2.6"),
-    ("huggingface", "moonshotai/Kimi-K2.6"),
-    ("fireworks", "accounts/fireworks/models/kimi-k3"),
-    ("together", "moonshotai/Kimi-K3"),
-    ("baseten", "zai-org/GLM-5.2"),
-    ("opencode", "kimi-k2.6"),
-    ("opencode-go", "kimi-k3"),
-    ("kimi-coding", "kimi-for-coding"),
-    ("meta", "muse-spark-1.3"),
-    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
-    (
-        "cloudflare-ai-gateway",
-        "workers-ai/@cf/moonshotai/kimi-k2.6",
-    ),
-    ("qwen-token-plan", "qwen3.7-max"),
-    ("qwen-token-plan-cn", "qwen3.7-max"),
-    ("qwen-token-plan-individual", "qwen3.8-max"),
-    ("xiaomi", "mimo-v2.5-pro"),
-    ("xiaomi-token-plan-cn", "mimo-v2.5-pro"),
-    ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
-    ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
-];
-
-/// The startup model when neither the command line nor the session names
-/// one, in upstream's order (`findInitialModel`): the saved default if its
-/// provider has credentials, then a model with credentials (a provider's
-/// usual model first), and a faux model only when nothing else can run.
-/// Offline, only faux can run.
-fn default_model(config: &LoadedConfig, offline: bool) -> Option<ModelRef> {
-    let usable = |provider: &str| {
-        provider == "faux" || (!offline && has_auth_for_provider(&config.auth, provider, None))
-    };
-    if let (Some(provider), Some(id)) = (
-        &config.settings.default_provider,
-        &config.settings.default_model,
-    ) {
-        if usable(provider) {
-            return Some(ModelRef {
-                provider: provider.clone(),
-                id: id.clone(),
-            });
-        }
-    }
-    let with_auth = config
-        .models
-        .iter()
-        .filter(|model| model.provider != "faux" && usable(&model.provider))
-        .collect::<Vec<_>>();
-    PROVIDER_DEFAULT_MODELS
-        .iter()
-        .find_map(|(provider, id)| {
-            with_auth
-                .iter()
-                .find(|model| model.provider == *provider && model.id == *id)
-        })
-        .or_else(|| with_auth.first())
-        .copied()
-        .or_else(|| config.models.iter().find(|model| model.provider == "faux"))
-        .map(|model| ModelRef {
-            provider: model.provider.clone(),
-            id: model.id.clone(),
-        })
-}
-
-fn resolve_model_reference(config: &LoadedConfig, reference: &str) -> Option<ModelRef> {
+) -> Option<ModelRef> {
     if let Ok(index) = reference.parse::<usize>() {
         if index > 0 {
-            return config.models.get(index - 1).map(|model| ModelRef {
-                provider: model.provider.clone(),
-                id: model.id.clone(),
-            });
+            return config.models.get(index - 1).map(ModelDefinition::model_ref);
         }
     }
-    if let Some((provider, id)) = reference.split_once('/') {
-        return Some(ModelRef {
-            provider: provider.to_string(),
-            id: id.to_string(),
-        });
-    }
-    config
-        .models
-        .iter()
-        .find(|model| model.id == reference || model.name.as_deref() == Some(reference))
-        .map(|model| ModelRef {
-            provider: model.provider.clone(),
-            id: model.id.clone(),
-        })
+    find_selectable_model(config, reference, offline)
+}
+
+/// The configured model a selector row names by its `provider/id` value.
+fn selector_model(config: &LoadedConfig, value: &str) -> Option<ModelRef> {
+    configured_model(config, &model_ref_from_value(value)?).map(ModelDefinition::model_ref)
 }
 
 /// A bare `pi` with no session flags used to open the resume picker here,
@@ -3256,6 +3149,14 @@ struct TuiEntry {
     text: String,
 }
 
+/// A listed model's thinking levels, lowest first, and the level selecting
+/// it gives the session when the user adjusts nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelThinking {
+    levels: Vec<&'static str>,
+    switch_level: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TuiSelectorState {
     kind: String,
@@ -3264,7 +3165,12 @@ struct TuiSelectorState {
     filtered_indices: Vec<usize>,
     selected: usize,
     query: String,
+    /// The thinking level the user adjusted to with left/right; `None`
+    /// until then, when selecting a model gives the session the level a
+    /// model switch does.
     thinking_level: Option<String>,
+    /// What each listed model supports of thinking, by row value.
+    model_thinking: BTreeMap<String, ModelThinking>,
     /// Codex-style two-layer model picker: selecting a provider pushes this
     /// selector here and shows the provider's models; leaving the model layer
     /// (esc) pops back instead of closing the whole selector.
@@ -3288,11 +3194,57 @@ impl TuiSelectorState {
             selected: 0,
             query: query.into(),
             thinking_level,
+            model_thinking: BTreeMap::new(),
             parent: None,
             provider_filter: None,
         };
         state.refresh_filter();
         state
+    }
+
+    /// Records what the listed models support of thinking, so the picker
+    /// can show and adjust the level a selection applies.
+    fn with_model_thinking(mut self, config: &LoadedConfig, runtime: &Runtime) -> Self {
+        let before = effective_thinking_level(runtime, config);
+        let by_value = config
+            .models
+            .iter()
+            .map(|model| (format!("{}/{}", model.provider, model.id), model))
+            .collect::<BTreeMap<_, _>>();
+        self.model_thinking = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                let model = by_value.get(&item.value)?;
+                // The level a switch to this model gives the session
+                // (`switch_model`).
+                let requested = [
+                    config
+                        .settings
+                        .model_thinking_level(&model.provider, &model.id),
+                    config.settings.default_thinking_level.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(normalized_thinking_level)
+                .unwrap_or(before);
+                Some((
+                    item.value.clone(),
+                    ModelThinking {
+                        levels: model.supported_thinking_levels(),
+                        switch_level: model.clamp_thinking_level(requested),
+                    },
+                ))
+            })
+            .collect();
+        self
+    }
+
+    /// The selected model's thinking, if it has levels to choose from.
+    fn selected_model_thinking(&self) -> Option<&ModelThinking> {
+        self.model_thinking
+            .get(&self.selected_item()?.value)
+            .filter(|thinking| thinking.levels.len() > 1)
     }
 
     fn refresh_filter(&mut self) {
@@ -3358,23 +3310,15 @@ impl TuiSelectorState {
     }
 
     fn cycle_thinking(&mut self, delta: isize) {
-        let Some(item) = self.selected_item() else {
+        let Some(current) = self.selected_thinking_level() else {
             return;
         };
-        let Some(model) = model_ref_from_value(&item.value) else {
+        let Some(levels) = self
+            .selected_model_thinking()
+            .map(|thinking| &thinking.levels)
+        else {
             return;
         };
-        let levels = model_thinking_levels(&model);
-        if levels.is_empty() {
-            return;
-        }
-        let current = self
-            .thinking_level
-            .as_deref()
-            .and_then(normalized_thinking_level)
-            .filter(|level| levels.contains(level))
-            .or_else(|| default_thinking_for_model(&model))
-            .unwrap_or("off");
         let current_index = levels
             .iter()
             .position(|level| *level == current)
@@ -3388,19 +3332,19 @@ impl TuiSelectorState {
         self.thinking_level = Some(levels[next_index].to_string());
     }
 
+    /// The level selecting the highlighted model applies: the one the user
+    /// adjusted to, clamped to the model, else the one a model switch
+    /// gives. `None` for a model without thinking levels.
     fn selected_thinking_level(&self) -> Option<String> {
-        let item = self.selected_item()?;
-        let model = model_ref_from_value(&item.value)?;
-        let levels = model_thinking_levels(&model);
-        if levels.is_empty() {
-            return None;
-        }
-        let level = self
+        let thinking = self.selected_model_thinking()?;
+        let level = match self
             .thinking_level
             .as_deref()
             .and_then(normalized_thinking_level)
-            .filter(|level| levels.contains(level))
-            .or_else(|| default_thinking_for_model(&model))?;
+        {
+            Some(adjusted) => pi_ai::catalog::clamp_to_supported(&thinking.levels, adjusted),
+            None => thinking.switch_level,
+        };
         Some(level.to_string())
     }
 }
@@ -3411,57 +3355,6 @@ fn model_ref_from_value(value: &str) -> Option<ModelRef> {
         provider: provider.to_string(),
         id: id.to_string(),
     })
-}
-
-fn model_thinking_levels(model: &ModelRef) -> &'static [&'static str] {
-    match model.provider.as_str() {
-        "anthropic" => {
-            if model.id.contains("opus") && anthropic_supports_adaptive_thinking(&model.id) {
-                &["off", "high", "xhigh", "max"]
-            } else if anthropic_supports_adaptive_thinking(&model.id) {
-                &["off", "low", "medium", "high", "xhigh"]
-            } else if model.id.contains("claude-") {
-                &["off", "minimal", "low", "medium", "high"]
-            } else {
-                &[]
-            }
-        }
-        "openai" | "openai-codex" | "azure-openai-responses" => {
-            if model.id.starts_with("gpt-5")
-                || model.id.starts_with("gpt-6")
-                || model.id.contains("codex")
-            {
-                &["off", "minimal", "low", "medium", "high", "xhigh"]
-            } else {
-                &[]
-            }
-        }
-        _ => &[],
-    }
-}
-
-fn default_thinking_for_model(model: &ModelRef) -> Option<&'static str> {
-    let levels = model_thinking_levels(model);
-    if levels.contains(&"xhigh") {
-        Some("xhigh")
-    } else if levels.contains(&"high") {
-        Some("high")
-    } else {
-        None
-    }
-}
-
-fn normalized_thinking_level(level: &str) -> Option<&'static str> {
-    match level.trim().to_ascii_lowercase().as_str() {
-        "off" | "none" | "disabled" => Some("off"),
-        "minimal" | "min" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" | "med" => Some("medium"),
-        "high" => Some("high"),
-        "xhigh" | "extra-high" | "extra_high" => Some("xhigh"),
-        "max" => Some("max"),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Default)]
@@ -3498,6 +3391,13 @@ struct TuiApp {
     /// has no interior round boundary, so ctrl+s steering only lands after
     /// the response finishes and the hint must not promise a boundary.
     turn_saw_tools: bool,
+    /// True once the reply of the current provider round has streamed text.
+    /// If the turn drops that reply to ask again, the text stays where it is
+    /// and the next reply starts a new entry below it.
+    round_saw_text: bool,
+    /// True while a compaction answers a context overflow: if it fails, the
+    /// turn does not go on with the full history, it stops asking.
+    overflow_compaction: bool,
     /// Provider name of the active model, kept in sync for pickers that open
     /// while the runtime is borrowed by a streaming turn.
     active_model_provider: Option<String>,
@@ -4016,6 +3916,12 @@ impl TuiApp {
         self.live_thinking_index = None;
         self.turn_running = false;
         self.turn_saw_tools = false;
+        self.remove_live_entry();
+    }
+
+    /// Removes the entry a turn was filling, while the turn goes on or as
+    /// it ends: a placeholder that nothing filled.
+    fn remove_live_entry(&mut self) {
         let Some(index) = self.live_entry_index.take() else {
             return;
         };
@@ -6199,7 +6105,7 @@ fn handle_streaming_tui_key(
                 app.push(TuiEntryKind::System, format!("steering> {queued}"));
             }
             if !line.is_empty() {
-                steering.send(line.clone());
+                steering.send(expand_input(config, &line));
                 app.push(TuiEntryKind::System, format!("steering> {line}"));
             }
             return StreamingKeyOutcome::Changed;
@@ -6304,7 +6210,7 @@ fn handle_streaming_tui_key(
                             .selected_item()
                             .map(|item| item.value.clone())
                             .unwrap_or_default();
-                        let models: Vec<SelectorItem> = sorted_models(&config.models)
+                        let models: Vec<SelectorItem> = picker_models(config)
                             .into_iter()
                             .filter(|model| model.provider == provider)
                             .map(|model| {
@@ -6392,7 +6298,7 @@ fn handle_streaming_command(
         command if command.starts_with("queue ") => {
             let message = command.trim_start_matches("queue ").trim();
             if !message.is_empty() {
-                followups.push(message.to_string());
+                followups.push(expand_input(config, message));
             }
             StreamingKeyOutcome::Changed
         }
@@ -6424,7 +6330,7 @@ fn handle_streaming_command(
         command if command == "model" || command == "models" || command == "scoped-models" => {
             let selector = Selector::new(
                 "provider",
-                provider_selector_items(&config.models, app.active_provider()),
+                provider_selector_items(&picker_models(config), app.active_provider()),
             );
             if selector.items.is_empty() {
                 app.push(TuiEntryKind::System, "no models".to_string());
@@ -6440,7 +6346,7 @@ fn handle_streaming_command(
                 || command.starts_with("scoped-models ") =>
         {
             let reference = command.split_once(' ').map(|x| x.1).unwrap_or("").trim();
-            if resolve_model_reference(config, reference).is_some() {
+            if resolve_model_reference(config, reference, false).is_some() {
                 app.push(
                     TuiEntryKind::System,
                     format!("model switch queued: {reference} (applies after this turn)"),
@@ -6472,10 +6378,18 @@ fn handle_streaming_command(
             StreamingKeyOutcome::Changed
         }
         _ => {
-            app.push(
-                TuiEntryKind::System,
-                format!("/{command} is not available while a turn is running"),
-            );
+            // A skill command or a prompt template queues as a follow-up,
+            // like any text typed mid-turn.
+            let typed = format!("/{command}");
+            let prompt = expand_input(config, &typed);
+            if prompt == typed {
+                app.push(
+                    TuiEntryKind::System,
+                    format!("{typed} is not available while a turn is running"),
+                );
+            } else {
+                followups.push(prompt);
+            }
             StreamingKeyOutcome::Changed
         }
     }
@@ -6597,8 +6511,10 @@ fn apply_turn_event(
     event: &TurnEvent,
 ) {
     match event {
+        TurnEvent::RoundStarted => app.round_saw_text = false,
         TurnEvent::Provider(StreamEvent::Text(text)) => {
             *activity = Activity::Writing;
+            app.round_saw_text = true;
             app.live_thinking_index = None;
             // Text that follows a tool round starts a new assistant entry at
             // the bottom of the transcript instead of growing the first one
@@ -6621,11 +6537,32 @@ fn apply_turn_event(
             *activity = Activity::Tool(call.name.clone());
             app.live_thinking_index = None;
             app.turn_saw_tools = true;
+            // A reply that starts with a tool call writes nothing into the
+            // turn's placeholder: take it away, or it stays above the calls
+            // once the turn is over.
+            if !*saw_delta {
+                app.remove_live_entry();
+                *saw_delta = true;
+            }
             // Close the current text entry: the next delta opens a fresh one
             // below this tool call.
             *text_after_tool = true;
             app.live_tool_indices.push(app.entries.len());
             app.push(TuiEntryKind::Tool, format!("running {}\n\n", call.name));
+        }
+        // A running command's output so far. The collapsed preview shows
+        // its last line; ctrl+o shows all of it.
+        TurnEvent::ToolUpdate { call, output } => {
+            if let Some(index) = app.live_tool_indices.last().copied() {
+                app.replace_entry(
+                    index,
+                    format!(
+                        "running {}\n{}\n{output}",
+                        call.name,
+                        tool_call_detail(call)
+                    ),
+                );
+            }
         }
         TurnEvent::ToolOutput {
             call,
@@ -6646,15 +6583,44 @@ fn apply_turn_event(
                 );
             }
         }
+        TurnEvent::RetryStarted(notice) => {
+            *activity = Activity::Waiting;
+            let delay = match notice.delay_ms {
+                delay if delay >= 1000 => format!("{}s", delay / 1000),
+                delay => format!("{delay}ms"),
+            };
+            app.push(
+                TuiEntryKind::System,
+                format!(
+                    "retrying in {delay} (attempt {} of {}): {}",
+                    notice.attempt, notice.max_attempts, notice.error_message
+                ),
+            );
+            *text_after_tool |= std::mem::take(&mut app.round_saw_text);
+        }
+        TurnEvent::Overflowed { error } => {
+            app.push(
+                TuiEntryKind::System,
+                match error {
+                    Some(error) => format!("context overflow; compacting to ask again: {error}"),
+                    None => "reply cut off at the output limit; compacting to ask again".into(),
+                },
+            );
+            app.overflow_compaction = true;
+            *text_after_tool |= std::mem::take(&mut app.round_saw_text);
+        }
         TurnEvent::CompactionStarted => *activity = Activity::Compacting,
         TurnEvent::CompactionFailed(reason) => {
             *activity = Activity::Waiting;
-            app.push(
-                TuiEntryKind::System,
-                format!("auto-compaction skipped: {reason}; continuing with full history"),
-            );
+            let notice = if std::mem::take(&mut app.overflow_compaction) {
+                format!("compaction failed, not asking again: {reason}")
+            } else {
+                format!("auto-compaction skipped: {reason}; continuing with full history")
+            };
+            app.push(TuiEntryKind::System, notice);
         }
         TurnEvent::CompactionFinished(record) => {
+            app.overflow_compaction = false;
             *activity = Activity::Waiting;
             app.push(
                 TuiEntryKind::System,
@@ -6760,7 +6726,7 @@ fn handle_tui_selector_key(
                     .selected_item()
                     .map(|item| item.value.clone())
                     .unwrap_or_default();
-                let models: Vec<SelectorItem> = sorted_models(&config.models)
+                let models: Vec<SelectorItem> = picker_models(config)
                     .into_iter()
                     .filter(|model| model.provider == provider)
                     .map(|model| {
@@ -6787,12 +6753,9 @@ fn handle_tui_selector_key(
                     "model",
                     Selector::new(format!("model · {provider}"), models),
                     "",
-                    runtime
-                        .session()
-                        .active_thinking_level
-                        .clone()
-                        .or_else(|| config.settings.default_thinking_level.clone()),
-                );
+                    None,
+                )
+                .with_model_thinking(config, runtime);
                 model_selector.provider_filter = Some(provider);
                 let mut model_state = model_selector;
                 model_state.parent = Some(Box::new(selector));
@@ -6825,16 +6788,8 @@ fn open_tui_selector(
         app.push(TuiEntryKind::System, format!("no {kind}"));
         return Ok(());
     }
-    let thinking_level = if matches!(kind, "model" | "models" | "scoped-models") {
-        runtime
-            .session()
-            .active_thinking_level
-            .clone()
-            .or_else(|| config.settings.default_thinking_level.clone())
-    } else {
-        None
-    };
-    let state = TuiSelectorState::new(kind, selector, query, thinking_level);
+    let state =
+        TuiSelectorState::new(kind, selector, query, None).with_model_thinking(config, runtime);
     app.push(TuiEntryKind::System, format!("{} selector", state.title));
     app.selector = Some(state);
     Ok(())
@@ -6852,15 +6807,14 @@ fn apply_tui_selector_selection(
     };
     match selector.kind.as_str() {
         "model" | "models" | "scoped-models" => {
-            let model = resolve_model_reference(config, &item.value)
+            let model = selector_model(config, &item.value)
                 .ok_or_else(|| anyhow!("model not found: {}", item.value))?;
-            let thinking = selector.selected_thinking_level();
-            runtime.set_active_model(Some(model.clone()))?;
-            runtime.set_active_thinking_level(thinking.clone())?;
+            // A level adjusted in the picker is the one to apply.
+            switch_model(runtime, config, &model, selector.thinking_level.as_deref())?;
             persist_default_model(config, &model)?;
             app.push(
                 TuiEntryKind::System,
-                format_model_selection(&model, thinking.as_deref()),
+                format_model_selection(&model, thinking_label(runtime, config).as_deref()),
             );
         }
         "theme" | "themes" => {
@@ -7170,7 +7124,7 @@ async fn handle_tui_submission(
 ) -> Result<bool> {
     if let Some(lines) = app.multiline.as_mut() {
         if line == "." {
-            let prompt = lines.join("\n");
+            let prompt = TypedPrompt::expand(config, lines.join("\n"));
             app.multiline = None;
             let quit =
                 submit_tui_prompt(app, surface, runtime, config, prompt, Vec::new(), offline).await;
@@ -7201,7 +7155,7 @@ async fn handle_tui_submission(
             TuiEntryKind::System,
             format!(
                 "thinking: {}",
-                active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string())
+                thinking_label(runtime, config).unwrap_or_else(|| "-".to_string())
             ),
         ),
         "/model" | "/models" | "/scoped-models" => {
@@ -7262,11 +7216,11 @@ async fn handle_tui_submission(
         "/history" => app.push(TuiEntryKind::System, format_history(&app.editor_state)),
         "/skills" => app.push(
             TuiEntryKind::System,
-            format_resources("skills", &config.skills),
+            resource_commands::format_skills(config),
         ),
         "/prompts" => app.push(
             TuiEntryKind::System,
-            format_resources("prompts", &config.prompt_templates),
+            resource_commands::format_prompts(config),
         ),
         "/themes" => app.push(TuiEntryKind::System, format_themes(config)),
         "/extensions" => app.push(
@@ -7374,6 +7328,7 @@ async fn handle_tui_submission(
             let initial = line.trim_start_matches("/editor").trim();
             match read_external_editor_prompt(initial) {
                 Ok(prompt) if !prompt.trim().is_empty() => {
+                    let prompt = TypedPrompt::expand(config, prompt);
                     return Ok(submit_tui_prompt(
                         app,
                         surface,
@@ -7503,7 +7458,7 @@ async fn handle_tui_submission(
             }
         }
         _ if line.starts_with("/queue ") => {
-            let message = line.trim_start_matches("/queue ").trim().to_string();
+            let message = expand_input(config, line.trim_start_matches("/queue ").trim());
             runtime.queue_message(message)?;
             app.push(
                 TuiEntryKind::System,
@@ -7529,54 +7484,41 @@ async fn handle_tui_submission(
             }
         }
         _ if line.starts_with("/model ") => {
+            // As upstream: an exact reference switches, and anything else
+            // opens the picker with the text as its search.
             let reference = line.trim_start_matches("/model ").trim();
-            let model = resolve_model_reference(config, reference)
-                .ok_or_else(|| anyhow!("model not found: {reference}"))?;
-            let thinking = active_thinking_level(runtime, config, &model);
-            runtime.set_active_model(Some(model.clone()))?;
-            runtime.set_active_thinking_level(thinking.clone())?;
-            persist_default_model(config, &model)?;
-            app.push(
-                TuiEntryKind::System,
-                format_model_selection(&model, thinking.as_deref()),
-            );
+            match resolve_model_reference(config, reference, offline) {
+                Some(model) => {
+                    switch_model(runtime, config, &model, None)?;
+                    persist_default_model(config, &model)?;
+                    app.push(
+                        TuiEntryKind::System,
+                        format_model_selection(&model, thinking_label(runtime, config).as_deref()),
+                    );
+                }
+                None => open_tui_selector(app, config, runtime, "model", reference)?,
+            }
         }
         _ if line.starts_with("/thinking ") => {
-            let level = line.trim_start_matches("/thinking ").trim();
-            let level = normalized_thinking_level(level)
-                .ok_or_else(|| anyhow!("unknown thinking level: {level}"))?;
-            if let Some(model) = runtime.session().active_model.clone() {
-                if !model_thinking_levels(&model).contains(&level) {
-                    return Err(anyhow!(
-                        "thinking level {level} is not supported by {}/{}",
-                        model.provider,
-                        model.id
-                    ));
-                }
-            }
-            // None means inherit defaults, not an explicit off selection.
-            runtime.set_active_thinking_level(Some(level.to_string()))?;
+            // As upstream: one of the levels the model supports, by name.
+            let requested = line.trim_start_matches("/thinking ").trim();
+            let available = runtime
+                .session()
+                .active_model
+                .as_ref()
+                .and_then(|model| model_definition(config, model))
+                .map(|model| model.supported_thinking_levels())
+                .unwrap_or_else(|| pi_config::THINKING_LEVELS.to_vec());
+            let level = normalized_thinking_level(requested)
+                .filter(|level| available.contains(level))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Unknown thinking level \"{requested}\". Available levels: {}.",
+                        available.join(", ")
+                    )
+                })?;
+            set_thinking_level(runtime, config, level)?;
             app.push(TuiEntryKind::System, format!("thinking: {level}"));
-        }
-        _ if line.starts_with("/skill:") => {
-            let (name, input) = split_resource_command(&line, "/skill:");
-            let skill = find_resource(&config.skills, name)
-                .ok_or_else(|| anyhow!("skill not found: {name}"))?;
-            let prompt = if input.is_empty() {
-                skill.content.clone()
-            } else {
-                format!("{}\n\n{}", skill.content, input)
-            };
-            return Ok(submit_tui_prompt(
-                app,
-                surface,
-                runtime,
-                config,
-                prompt,
-                Vec::new(),
-                offline,
-            )
-            .await);
         }
         _ if line.starts_with("/extension:") => {
             let (name, input) = split_resource_command(&line, "/extension:");
@@ -7609,9 +7551,9 @@ async fn handle_tui_submission(
         _ if line.starts_with("/prompt ") => {
             let rest = line.trim_start_matches("/prompt ").trim();
             let (name, input) = split_once_text(rest);
-            let template = find_resource(&config.prompt_templates, name)
+            let template = resource_commands::find_template(config, name)
                 .ok_or_else(|| anyhow!("prompt template not found: {name}"))?;
-            let prompt = expand_prompt_template(&template.content, input);
+            let prompt = resource_commands::fill_prompt_template(&template.content, input);
             return Ok(submit_tui_prompt(
                 app,
                 surface,
@@ -7794,10 +7736,20 @@ async fn handle_tui_submission(
                 format!("share exported {}", path.display()),
             );
         }
+        // Anything else is a prompt: a skill command or a prompt template
+        // expands, and other text goes to the model as typed.
         _ => {
-            return Ok(
-                submit_tui_prompt(app, surface, runtime, config, line, Vec::new(), offline).await,
+            let prompt = TypedPrompt::expand(config, line);
+            return Ok(submit_tui_prompt(
+                app,
+                surface,
+                runtime,
+                config,
+                prompt,
+                Vec::new(),
+                offline,
             )
+            .await);
         }
     }
     Ok(false)
@@ -7896,15 +7848,40 @@ fn apply_midturn_session_resume(
     Ok(())
 }
 
+/// A prompt to submit, and the input that stands for it in history.
+struct TypedPrompt {
+    typed: String,
+    prompt: String,
+}
+
+impl TypedPrompt {
+    /// Typed input: a skill command or a prompt template expands.
+    fn expand(config: &LoadedConfig, typed: String) -> Self {
+        let prompt = expand_input(config, &typed);
+        Self { typed, prompt }
+    }
+}
+
+/// A prompt a command has built, which is sent as it is.
+impl From<String> for TypedPrompt {
+    fn from(prompt: String) -> Self {
+        Self {
+            typed: prompt.clone(),
+            prompt,
+        }
+    }
+}
+
 async fn submit_tui_prompt(
     app: &mut TuiApp,
     surface: &mut TuiSurface<'_>,
     runtime: &mut Runtime,
     config: &LoadedConfig,
-    prompt: String,
+    prompt: impl Into<TypedPrompt>,
     media: Vec<MediaInput>,
     offline: bool,
 ) -> bool {
+    let TypedPrompt { typed, prompt } = prompt.into();
     if images_blocked(config) && (!media.is_empty() || !app.input_media.is_empty()) {
         app.push(
             TuiEntryKind::Error,
@@ -7917,8 +7894,15 @@ async fn submit_tui_prompt(
     for attachment in &media {
         app.push(TuiEntryKind::System, format_media_fallback(attachment));
     }
-    app.editor_state.record_history(prompt.clone());
-    app.push(TuiEntryKind::User, prompt.clone());
+    // A template shows as the prompt it became. A skill's prompt is its
+    // whole file, so its command stands for it.
+    let shown = if typed.starts_with("/skill:") {
+        typed.clone()
+    } else {
+        prompt.clone()
+    };
+    app.editor_state.record_history(typed);
+    app.push(TuiEntryKind::User, shown);
     let control = match run_prompt_with_queue_tui(
         app, surface, runtime, config, prompt, media, offline,
     )
@@ -7978,7 +7962,7 @@ on this host), provider status, then retry; /model switches providers"
         .as_ref()
         .map(|model| format!("{}/{}", model.provider, model.id))
         .unwrap_or_else(|| "-".to_string());
-    let thinking = active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string());
+    let thinking = thinking_label(runtime, config).unwrap_or_else(|| "-".to_string());
     format!(
         "{message}\n\nAnthropic rate-limited this request for model {model} with thinking {thinking}. Try /thinking high, /thinking off, or /model anthropic/claude-sonnet-4-6. Claude Code may still work elsewhere if it is using a different model, thinking level, or quota pool."
     )
@@ -8337,7 +8321,6 @@ async fn run_turn_tui(
             } else {
                 app.drop_live_entry();
             }
-            insert_new_tool_messages(app, runtime, tool_start, entry_index);
             let control = if matches!(stream_end, StreamEnd::Interrupted) {
                 app.push(TuiEntryKind::System, "interrupted");
                 TurnControl::Interrupted
@@ -8361,7 +8344,6 @@ async fn run_turn_tui(
             } else {
                 app.drop_live_entry();
             }
-            insert_new_tool_messages(app, runtime, tool_start, entry_index);
             redraw_tui(surface.terminal, app, config)?;
             return Err(error.into());
         }
@@ -8370,19 +8352,20 @@ async fn run_turn_tui(
     if !saw_delta {
         app.replace_entry(live_text_index, response);
     }
-    insert_new_tool_messages(app, runtime, tool_start, entry_index);
     app.finish_live_entry();
     // A mid-turn /model <ref> applies now, before the next turn starts.
     // Persistence as default happens on the next explicit /model; here we
     // only switch the session's active model.
     if let Some(reference) = app.pending_model_switch.take() {
-        if let Some(model) = resolve_model_reference(config, &reference) {
-            let thinking = active_thinking_level(runtime, config, &model);
-            runtime.set_active_model(Some(model.clone()))?;
-            runtime.set_active_thinking_level(thinking.clone())?;
+        // A picker row names a configured model; a typed reference one of
+        // the selectable models.
+        let model = selector_model(config, &reference)
+            .or_else(|| resolve_model_reference(config, &reference, false));
+        if let Some(model) = model {
+            switch_model(runtime, config, &model, None)?;
             app.push(
                 TuiEntryKind::System,
-                format_model_selection(&model, thinking.as_deref()),
+                format_model_selection(&model, thinking_label(runtime, config).as_deref()),
             );
         }
     }
@@ -8390,13 +8373,14 @@ async fn run_turn_tui(
     Ok(TurnControl::Completed)
 }
 
-/// Finalize live tool previews once the turn ends. Previews are already
-/// interleaved between the per-round assistant text entries, so each is
-/// replaced in place with its durable transcript text instead of being
-/// re-inserted above the response (which would bury the newest text under
-/// the tool history). Previews without a durable record (a tool dropped by
-/// an interrupt) are removed; durable records without a preview fall back
-/// to insertion above the first text entry.
+/// Finalize live tool previews once the turn ends, however it ends. Previews
+/// are already interleaved between the per-round assistant text entries, so
+/// each is replaced in place with its durable transcript text instead of
+/// being re-inserted above the response (which would bury the newest text
+/// under the tool history). Previews without a durable record (a tool dropped
+/// by an interrupt) are removed; durable records without a preview fall back
+/// to insertion above the first text entry. This is the only place a turn's
+/// tool entries are settled: inserting them again would show each twice.
 fn settle_tool_entries(
     app: &mut TuiApp,
     runtime: &Runtime,
@@ -8447,18 +8431,6 @@ fn durable_tool_texts(runtime: &Runtime, tool_start: usize) -> Vec<String> {
             }
         })
         .collect()
-}
-
-fn insert_new_tool_messages(
-    app: &mut TuiApp,
-    runtime: &Runtime,
-    tool_start: usize,
-    assistant_entry_index: usize,
-) {
-    let tool_messages = durable_tool_texts(runtime, tool_start);
-    for (offset, text) in tool_messages.into_iter().enumerate() {
-        app.insert_entry(assistant_entry_index + offset, TuiEntryKind::Tool, text);
-    }
 }
 
 fn tool_call_detail(call: &pi_ai::ChatToolCall) -> String {
@@ -8784,27 +8756,28 @@ async fn provider_for_runtime(
             model.id
         ));
     }
-    let definition = config
-        .models
-        .iter()
-        .find(|candidate| candidate.provider == model.provider && candidate.id == model.id)
-        .ok_or_else(|| {
-            anyhow!(
-                "active model is not in models config: {}/{}",
-                model.provider,
-                model.id
-            )
-        })?;
-    let thinking_level = active_thinking_level(runtime, config, &model);
+    let definition = model_definition(config, &model).ok_or_else(|| {
+        anyhow!(
+            "active model is not in models config: {}/{}",
+            model.provider,
+            model.id
+        )
+    })?;
+    // The level in effect, clamped to the model; a model without reasoning
+    // is sent no thinking parameter.
+    let thinking_level = definition
+        .reasoning()
+        .then(|| effective_thinking_level(runtime, config).to_string());
     let provider = FreshAuthProvider {
         config: ProviderConfig {
             thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
             thinking_level,
-            model,
-            api: map_provider_api(&definition.api),
+            model: definition.model_ref(),
+            api: AiProviderApi::from(&definition.api),
             base_url: definition.base_url.clone(),
             auth: ProviderAuth::None,
             session_id: Some(runtime.session().session_id.clone()),
+            traits: definition.traits(),
         },
         // The client `pi_ai::create_provider` uses: its idle timeout ends a
         // stalled request instead of hanging the turn.
@@ -8885,30 +8858,14 @@ impl pi_ai::Provider for FreshAuthProvider {
             .complete_streaming(request, on_event)
             .await
     }
-}
 
-fn active_thinking_level(
-    runtime: &Runtime,
-    config: &LoadedConfig,
-    model: &ModelRef,
-) -> Option<String> {
-    let level = runtime
-        .session()
-        .active_thinking_level
-        .as_deref()
-        .or(config.settings.default_thinking_level.as_deref())
-        .and_then(normalized_thinking_level)
-        .or_else(|| default_thinking_for_model(model))?;
-    if model_thinking_levels(model).contains(&level) && level != "off" {
-        Some(level.to_string())
-    } else {
-        None
+    fn thinking_level(&self) -> Option<String> {
+        self.config.thinking_level.clone()
     }
-}
 
-fn active_thinking_label(runtime: &Runtime, config: &LoadedConfig) -> Option<String> {
-    let model = runtime.session().active_model.as_ref()?;
-    active_thinking_level(runtime, config, model)
+    fn output_limit(&self) -> Option<u64> {
+        pi_ai::model_output_limit(&self.config)
+    }
 }
 
 fn thinking_budget_tokens(config: &LoadedConfig, level: Option<&str>) -> Option<u64> {
@@ -8944,21 +8901,6 @@ fn map_provider_auth(auth: Option<ResolvedAuth>) -> ProviderAuth {
             account_id,
         },
         None => ProviderAuth::None,
-    }
-}
-
-fn map_provider_api(api: &ConfigProviderApi) -> AiProviderApi {
-    match api {
-        ConfigProviderApi::Faux => AiProviderApi::Faux,
-        ConfigProviderApi::OpenAi => AiProviderApi::OpenAi,
-        ConfigProviderApi::OpenAiResponses => AiProviderApi::OpenAiResponses,
-        ConfigProviderApi::OpenAiCodexResponses => AiProviderApi::OpenAiCodexResponses,
-        ConfigProviderApi::AzureOpenAiResponses => AiProviderApi::AzureOpenAiResponses,
-        ConfigProviderApi::Anthropic => AiProviderApi::Anthropic,
-        ConfigProviderApi::Google => AiProviderApi::Google,
-        ConfigProviderApi::GoogleVertex => AiProviderApi::GoogleVertex,
-        ConfigProviderApi::Bedrock => AiProviderApi::Bedrock,
-        ConfigProviderApi::Mistral => AiProviderApi::Mistral,
     }
 }
 
@@ -9292,7 +9234,7 @@ fn compact_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &Edito
                 None => format!("{}/{}", model.provider, model.id),
             })
             .unwrap_or_else(|| "-".to_string()),
-        active_thinking_label(runtime, config).unwrap_or_else(|| "-".to_string()),
+        thinking_label(runtime, config).unwrap_or_else(|| "-".to_string()),
         config
             .settings
             .theme
@@ -9371,16 +9313,13 @@ fn command_completions(config: &LoadedConfig, prefix: &str) -> Vec<String> {
         "/extension:",
         &config.extensions,
     ));
-    completions.extend(resource_command_completions(
-        prefix,
-        "/skill:",
-        &config.skills,
-    ));
-    completions.extend(resource_command_completions(
-        prefix,
-        "/prompt ",
-        &config.prompt_templates,
-    ));
+    completions.extend(resource_commands::completions(config, prefix));
+    let templates = config.prompt_templates.iter();
+    completions.extend(
+        templates
+            .map(|template| format!("/prompt {}", template.name))
+            .filter(|command| command.starts_with(prefix)),
+    );
     completions.extend(
         theme_names(config)
             .into_iter()
@@ -9506,13 +9445,14 @@ fn select_from_selector_message(
         .ok_or_else(|| anyhow!("selector item not found: {query}"))?;
     match kind {
         "model" | "models" | "scoped-models" => {
-            let model = resolve_model_reference(config, &item.value)
+            let model = selector_model(config, &item.value)
                 .ok_or_else(|| anyhow!("model not found: {}", item.value))?;
-            let thinking = active_thinking_level(runtime, config, &model);
-            runtime.set_active_model(Some(model.clone()))?;
-            runtime.set_active_thinking_level(thinking.clone())?;
+            switch_model(runtime, config, &model, None)?;
             persist_default_model(config, &model)?;
-            Ok(format_model_selection(&model, thinking.as_deref()))
+            Ok(format_model_selection(
+                &model,
+                thinking_label(runtime, config).as_deref(),
+            ))
         }
         "theme" | "themes" => {
             let name = persist_theme(config, &item.value)?;
@@ -9625,7 +9565,7 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
     match kind {
         "model" | "models" | "scoped-models" => Ok(Selector::new(
             "model",
-            sorted_models(&config.models)
+            picker_models(config)
                 .into_iter()
                 .map(|model| {
                     let value = format!("{}/{}", model.provider, model.id);
@@ -9648,7 +9588,7 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
         "provider" => Ok(Selector::new(
             "provider",
             provider_selector_items(
-                &config.models,
+                &picker_models(config),
                 runtime
                     .session()
                     .active_model
@@ -9721,10 +9661,29 @@ fn sorted_models(models: &[ModelDefinition]) -> Vec<&ModelDefinition> {
     models
 }
 
+/// The models a model picker lists, by provider and id: the scope's when
+/// `--models` or `enabledModels` sets one, else every known model.
+fn picker_models(config: &LoadedConfig) -> Vec<&ModelDefinition> {
+    if config.model_scope.is_empty() {
+        return sorted_models(&config.models);
+    }
+    let mut models = config
+        .model_scope
+        .iter()
+        .filter_map(|scoped| configured_model(config, &scoped.model))
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    models
+}
+
 /// Provider rows for the first layer of the model picker: provider name,
 /// model count, and whether the active model belongs to it.
 fn provider_selector_items(
-    models: &[ModelDefinition],
+    models: &[&ModelDefinition],
     active_provider: Option<&str>,
 ) -> Vec<SelectorItem> {
     let mut providers: BTreeMap<String, usize> = BTreeMap::new();
@@ -10097,17 +10056,6 @@ fn split_once_text(value: &str) -> (&str, &str) {
     (first, rest)
 }
 
-fn expand_prompt_template(template: &str, input: &str) -> String {
-    if template.contains("{{input}}") {
-        return template.replace("{{input}}", input);
-    }
-    if input.is_empty() {
-        template.to_string()
-    } else {
-        format!("{template}\n\n{input}")
-    }
-}
-
 fn format_login_status(config: &LoadedConfig, provider: &str) -> String {
     let providers = if provider.is_empty() {
         config
@@ -10241,7 +10189,86 @@ fn remove_stored_auth(config: &mut LoadedConfig, provider: &str, account: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_config::{PromptTemplate, Skill, SourceInfo, SourceScope};
     use std::io::BufRead;
+
+    /// The tool settings a command line leaves, starting from `settings`.
+    fn tool_flags(arguments: &[&str], settings: serde_json::Value) -> Result<Settings> {
+        let arguments = std::iter::once("pi").chain(arguments.iter().copied());
+        let cli = Cli::try_parse_from(normalized_cli_args(arguments.map(String::from)))?;
+        let mut settings: Settings = serde_json::from_value(settings)?;
+        apply_tool_flags(&cli, &mut settings)?;
+        Ok(settings)
+    }
+
+    #[test]
+    fn tool_flags_select_tools_as_upstream_does() {
+        let names =
+            |names: &[&str]| Some(names.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let none = serde_json::json!({});
+
+        // Plain names and patterns are an allowlist.
+        let settings = tool_flags(&["--tools", "read, grep,mcp_*"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, names(&["read", "grep", "mcp_*"]));
+        assert_eq!(settings.default_tools, None);
+
+        // Only +name/-name entries change the default selection instead.
+        let settings = tool_flags(&["-t", "-bash,+grep,-write"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, None);
+        let defaults = settings.default_tools.expect("default selection");
+        assert!(defaults.contains(&"grep".to_string()) && defaults.contains(&"read".to_string()));
+        assert!(
+            !defaults.contains(&"bash".to_string()) && !defaults.contains(&"write".to_string())
+        );
+        let settings = tool_flags(
+            &["--tools", "+ls"],
+            serde_json::json!({ "defaultTools": ["read", "-read", "grep"] }),
+        )
+        .unwrap();
+        assert_eq!(settings.default_tools, names(&["grep", "ls"]));
+
+        // --no-builtin-tools empties the default selection; extension tools
+        // are not part of it, so they stay.
+        let settings =
+            tool_flags(&["-nbt"], serde_json::json!({ "defaultTools": ["read"] })).unwrap();
+        assert_eq!(
+            (settings.default_tools, settings.enabled_tools),
+            (names(&[]), None)
+        );
+        let settings = tool_flags(&["-nbt"], serde_json::json!({ "enabledTools": ["read"] }));
+        assert_eq!(settings.unwrap().enabled_tools, None);
+        let settings =
+            tool_flags(&["--no-builtin-tools", "--tools", "+read"], none.clone()).unwrap();
+        assert_eq!(
+            (settings.default_tools, settings.enabled_tools),
+            (names(&["read"]), None)
+        );
+
+        // --no-tools leaves only what --tools names.
+        let settings = tool_flags(&["--no-tools"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, names(&[]));
+        let settings = tool_flags(&["-nt", "--tools", "+read"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, names(&["read"]));
+        let settings = tool_flags(&["--no-tools", "--tools", "read,ext_*"], none.clone()).unwrap();
+        assert_eq!(settings.enabled_tools, names(&["read", "ext_*"]));
+
+        let settings = tool_flags(&["-xt", "web_*,todo"], none.clone()).unwrap();
+        assert_eq!(settings.excluded_tools, ["web_*", "todo"]);
+
+        for (tools, error) in [
+            (
+                "read,+grep",
+                "--tools: tool names cannot be mixed with +name or -name entries",
+            ),
+            (
+                "+re*",
+                "--tools: +name and -name entries take exact tool names, not patterns: +re*",
+            ),
+        ] {
+            let failure = tool_flags(&["--tools", tools], none.clone()).unwrap_err();
+            assert_eq!(failure.to_string(), error);
+        }
+    }
 
     #[test]
     fn diff_panel_lists_files_under_cwd_relative_to_it() {
@@ -10621,12 +10648,18 @@ mod tests {
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
             extensions: vec![test_resource("json-ext")],
-            skills: vec![test_resource("review")],
-            prompt_templates: vec![test_resource("fix")],
+            skills: vec![test_skill("review", "Review code.\nCarefully.")],
+            prompt_templates: vec![test_template(
+                "fix",
+                "Fix a bug",
+                Some("<issue>"),
+                "Fix $1.",
+            )],
             themes: vec![test_resource("dark")],
             diagnostics: Vec::new(),
             system_prompt: None,
@@ -10637,9 +10670,114 @@ mod tests {
             command_completions(&config, "/extension:j"),
             ["/extension:json-ext"]
         );
-        assert!(command_completions(&config, "/skill:r").contains(&"/skill:review".to_string()));
-        assert!(command_completions(&config, "/prompt f").contains(&"/prompt fix".to_string()));
+        // A skill and a template complete with what upstream shows: the
+        // argument hint, the scope, and the description on one line.
+        let skill = "/skill:review  [u] Review code. Carefully.";
+        assert_eq!(command_completions(&config, "/skill:r"), [skill]);
+        assert_eq!(command_completions(&config, "/rev"), [skill]);
+        assert_eq!(
+            command_completions(&config, "/fix"),
+            ["/fix  <issue> \u{2014} [u] Fix a bug"]
+        );
+        assert_eq!(command_completions(&config, "/prompt f"), ["/prompt fix"]);
         assert!(command_completions(&config, "/theme d").contains(&"/theme dark".to_string()));
+
+        assert_eq!(
+            resource_commands::format_skills(&config),
+            "/skill:review\t[u] Review code. Carefully.\t/skills/review/SKILL.md"
+        );
+        assert_eq!(
+            resource_commands::format_prompts(&config),
+            "/fix\t<issue> \u{2014} [u] Fix a bug\t/prompts/fix.md"
+        );
+        let empty = minimal_test_config();
+        assert_eq!(resource_commands::format_skills(&empty), "no skills");
+        assert_eq!(resource_commands::format_prompts(&empty), "no prompts");
+    }
+
+    /// pi's own `/prompt <name> [input]`: `{{input}}` stands for the input,
+    /// which otherwise follows the template.
+    #[test]
+    fn prompt_command_fills_the_input_placeholder() {
+        let fill = resource_commands::fill_prompt_template;
+        assert_eq!(fill("fix {{input}} now", "the bug"), "fix the bug now");
+        assert_eq!(fill("fix {{input}}", ""), "fix ");
+        assert_eq!(fill("review", "the diff"), "review\n\nthe diff");
+        assert_eq!(fill("review $1", ""), "review $1");
+    }
+
+    /// Typed input expands before it is submitted: history keeps what was
+    /// typed, and a skill's command stands for its file in the transcript.
+    #[test]
+    fn typed_prompts_expand_skills_and_templates() {
+        let root = std::env::temp_dir().join(format!("pi-cli-typed-{}", unique_temp_suffix()));
+        fs::create_dir_all(root.join("review")).unwrap();
+        let skill_file = root.join("review/SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\ndescription: Review code.\n---\nCheck it.\n",
+        )
+        .unwrap();
+        let mut config = minimal_test_config();
+        config.skills = vec![Skill {
+            file_path: skill_file.clone(),
+            base_dir: root.join("review"),
+            ..test_skill("review", "Review code.")
+        }];
+        config.prompt_templates = vec![test_template("fix", "Fix a bug", None, "Fix $1.")];
+
+        let template = TypedPrompt::expand(&config, "/fix 42".into());
+        assert_eq!(
+            (template.typed.as_str(), template.prompt.as_str()),
+            ("/fix 42", "Fix 42.")
+        );
+        let skill = TypedPrompt::expand(&config, "/skill:review the parser".into());
+        assert_eq!(skill.typed, "/skill:review the parser");
+        assert_eq!(
+            skill.prompt,
+            format!(
+                "<skill name=\"review\" location=\"{}\">\nReferences are relative to {}.\n\nCheck it.\n</skill>\n\nthe parser",
+                skill_file.display(),
+                root.join("review").display()
+            )
+        );
+        for text in ["/skill:nope x", "/nope x", "plain", "/read notes.txt"] {
+            assert_eq!(TypedPrompt::expand(&config, text.into()).prompt, text);
+        }
+        // A prompt a command built is sent as it is.
+        assert_eq!(TypedPrompt::from("/fix 42".to_string()).prompt, "/fix 42");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Mid-turn, a skill command or a template queues expanded: steering
+    /// with the steer key, a follow-up with Enter or `/queue`.
+    #[test]
+    fn streaming_input_expands_templates_into_the_queues() {
+        let mut config = minimal_test_config();
+        config.prompt_templates = vec![test_template("fix", "Fix a bug", None, "Fix $1.")];
+        let followups = FollowUpQueue::default();
+        let steering = SteeringMailbox::default();
+        let mut app = TuiApp::default();
+        let press = |app: &mut TuiApp, input: &str, key: KeyEvent| {
+            app.set_input(input);
+            handle_streaming_tui_key(key, app, &followups, &steering, &config)
+        };
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let steer = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        press(&mut app, "/fix 1", steer);
+        assert_eq!(steering.drain(), ["Fix 1."]);
+        assert_eq!(app.entries[0].text, "steering> /fix 1");
+        press(&mut app, "/fix 2", enter);
+        press(&mut app, "/queue /fix 3", enter);
+        assert_eq!(followups.list(), ["Fix 2.", "Fix 3."]);
+        // A command that names no template is still refused mid-turn.
+        press(&mut app, "/nope", enter);
+        assert_eq!(followups.pending(), 2);
+        assert_eq!(
+            app.entries.last().unwrap().text,
+            "/nope is not available while a turn is running"
+        );
     }
 
     #[test]
@@ -10950,7 +11088,16 @@ mod tests {
             paths: test_config_paths(),
             settings,
             auth: AuthData::default(),
-            models: Vec::new(),
+            models: vec![ModelDefinition {
+                provider: "openai-codex".to_string(),
+                id: "gpt-5.5".to_string(),
+                reasoning: Some(true),
+                thinking_level_map: Some(
+                    serde_json::from_value(serde_json::json!({ "xhigh": "xhigh" })).unwrap(),
+                ),
+                ..ModelDefinition::default()
+            }],
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -10990,6 +11137,7 @@ mod tests {
             settings: Settings::default(),
             auth,
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -11112,8 +11260,8 @@ mod tests {
             expires,
             account_id: None,
         };
-        let codex = AuthCredential::ApiKey {
-            key: "codex-key".to_string(),
+        let openai = AuthCredential::ApiKey {
+            key: "openai-key".to_string(),
         };
         // auth.json now holds tokens another process refreshed since startup.
         let mut current = AuthData::default();
@@ -11122,13 +11270,13 @@ mod tests {
             DEFAULT_ACCOUNT_NAME,
             oauth("rotated", 4_000_000_000),
         );
-        current.insert("openai-codex", DEFAULT_ACCOUNT_NAME, codex.clone());
+        current.insert("openai", DEFAULT_ACCOUNT_NAME, openai.clone());
         pi_config::write_auth_file(&auth_path, &current).expect("seed auth.json");
         // This session's startup snapshot: the stale tokens plus a value that
         // came from `--api-key` and must stay in memory.
         let mut snapshot = AuthData::default();
         snapshot.insert("anthropic", DEFAULT_ACCOUNT_NAME, oauth("stale", 1));
-        snapshot.insert("openai-codex", DEFAULT_ACCOUNT_NAME, codex);
+        snapshot.insert("openai", DEFAULT_ACCOUNT_NAME, openai);
         snapshot.insert(
             "google",
             DEFAULT_ACCOUNT_NAME,
@@ -11139,7 +11287,7 @@ mod tests {
         let mut config = account_test_config(snapshot);
         config.paths.auth_path = auth_path.clone();
 
-        assert!(remove_stored_auth(&mut config, "openai-codex", DEFAULT_ACCOUNT_NAME).unwrap());
+        assert!(remove_stored_auth(&mut config, "openai", DEFAULT_ACCOUNT_NAME).unwrap());
 
         let content = fs::read_to_string(&auth_path).expect("read auth.json");
         assert!(!content.contains("cli-only-key"), "{content}");
@@ -11149,12 +11297,10 @@ mod tests {
             stored.credential("anthropic", DEFAULT_ACCOUNT_NAME),
             Some(&oauth("rotated", 4_000_000_000))
         );
-        assert!(stored
-            .credential("openai-codex", DEFAULT_ACCOUNT_NAME)
-            .is_none());
+        assert!(stored.credential("openai", DEFAULT_ACCOUNT_NAME).is_none());
         assert!(config
             .auth
-            .credential("openai-codex", DEFAULT_ACCOUNT_NAME)
+            .credential("openai", DEFAULT_ACCOUNT_NAME)
             .is_none());
         let _ = fs::remove_dir_all(root);
     }
@@ -11178,12 +11324,17 @@ mod tests {
         )
         .expect("write project extension");
         fs::write(project.join("AGENTS.md"), "project rules").expect("write context file");
-        let resource = |name: &str| {
+        let resource = |name: &str, content: &str| {
             let path = root.join(format!("{name}.md"));
-            fs::write(&path, format!("cli {name}")).expect("write cli resource");
+            fs::write(&path, content).expect("write cli resource");
             path.display().to_string()
         };
-        let (extension, skill, template) = (resource("ext"), resource("skill"), resource("tpl"));
+        let extension = resource("ext", "cli ext");
+        let skill = resource(
+            "skill",
+            "---\nname: cli-skill\ndescription: From a flag.\n---\n",
+        );
+        let template = resource("tpl", "cli tpl");
         let cli = Cli::try_parse_from([
             "pi",
             "--system-prompt",
@@ -11232,8 +11383,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(contents(&config.extensions), ["cli ext"]);
-        assert_eq!(contents(&config.skills), ["cli skill"]);
-        assert_eq!(contents(&config.prompt_templates), ["cli tpl"]);
+        assert_eq!(config.skills.len(), 1);
+        assert_eq!(config.skills[0].name, "cli-skill");
+        assert_eq!(config.prompt_templates.len(), 1);
+        assert_eq!(config.prompt_templates[0].name, "tpl");
+        assert_eq!(config.prompt_templates[0].content, "cli tpl");
         assert_eq!(config.system_prompt.as_deref(), Some("cli system"));
         assert_eq!(config.append_system_prompt, ["cli append"]);
         assert!(config.context_files.is_empty());
@@ -11244,6 +11398,136 @@ mod tests {
         assert_eq!(
             auth_for_provider(&config.auth, "anthropic", None),
             Some(ResolvedAuth::ApiKey("cli-key".to_string()))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every `discovery` case of `system-prompt.json`: from the same files,
+    /// trust decision, and flags, startup gives the prompt builder what
+    /// upstream's resource loader gives its own.
+    #[test]
+    fn prompt_and_context_files_match_ts_discovery() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/system-prompt.json"
+        ))
+        .expect("parse TS parity fixture");
+        let cases = fixture["discovery"].as_array().expect("discovery cases");
+        assert_eq!(cases.len(), 15);
+        for case in cases {
+            let name = case["name"].as_str().expect("case name");
+            let root =
+                std::env::temp_dir().join(format!("pi-cli-discovery-{}", unique_temp_suffix()));
+            let text = |value: &serde_json::Value| {
+                let text = value.as_str().expect("fixture string");
+                text.replace("<tmp>", &root.display().to_string())
+                    .replace("<bom>", "\u{feff}")
+            };
+            let (agent, cwd) = (root.join("agent"), root.join(text(&case["cwd"])));
+            let dirs = case["dirs"].as_array().expect("dirs").iter().map(text);
+            for dir in dirs.chain(["agent".to_string(), text(&case["cwd"])]) {
+                fs::create_dir_all(root.join(dir)).expect("create dir");
+            }
+            for (path, content) in case["files"].as_object().expect("files") {
+                let path = root.join(path);
+                fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+                fs::write(path, text(content)).expect("write file");
+            }
+
+            let flags = &case["flags"];
+            let mut args = vec!["pi".to_string()];
+            if !flags["systemPrompt"].is_null() {
+                args.extend(["--system-prompt".to_string(), text(&flags["systemPrompt"])]);
+            }
+            for value in flags["appendSystemPrompt"].as_array().expect("flags") {
+                args.extend(["--append-system-prompt".to_string(), text(value)]);
+            }
+            if flags["noContextFiles"] == true {
+                args.push("--no-context-files".to_string());
+            }
+            let source = ConfigSource {
+                cli: Cli::try_parse_from(args).expect("parse cli"),
+                cwd: cwd.clone(),
+                project_trusted: case["trusted"].as_bool().expect("trusted"),
+            };
+            let config = source
+                .load(ConfigPaths {
+                    cwd: cwd.clone(),
+                    agent_dir: agent.clone(),
+                    session_dir: agent.join("sessions"),
+                    settings_path: agent.join("settings.json"),
+                    project_settings_path: cwd.join(".pi/settings.json"),
+                    auth_path: agent.join("auth.json"),
+                    models_path: agent.join("models.json"),
+                    model_cache_path: agent.join("model-cache.json"),
+                    keybindings_path: agent.join("keybindings.json"),
+                })
+                .expect("load config");
+
+            let result = &case["result"];
+            assert_eq!(
+                config.system_prompt.as_deref(),
+                result["customPrompt"].as_str(),
+                "{name}: custom prompt"
+            );
+            assert_eq!(
+                config.append_system_prompt.join("\n\n"),
+                text(&result["appendSystemPrompt"]),
+                "{name}: appended prompt"
+            );
+            // Directories above the case's tree are not part of the case.
+            let context_files = config
+                .context_files
+                .iter()
+                .filter(|file| file.path.starts_with(&root))
+                .map(|file| (file.path.display().to_string(), file.content.clone()))
+                .collect::<Vec<_>>();
+            let expected = result["contextFiles"].as_array().expect("context files");
+            let expected = expected
+                .iter()
+                .map(|file| (text(&file["path"]), text(&file["content"])))
+                .collect::<Vec<_>>();
+            assert_eq!(context_files, expected, "{name}: context files");
+            assert_eq!(config.diagnostics, Vec::<String>::new(), "{name}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn append_flags_add_to_the_setting() {
+        // The fixture above covers upstream: flags replace APPEND_SYSTEM.md.
+        // The `appendSystemPrompt` setting is pi's own, and flags add to it.
+        let root =
+            std::env::temp_dir().join(format!("pi-cli-append-setting-{}", unique_temp_suffix()));
+        let agent = root.join("agent");
+        fs::create_dir_all(&agent).expect("create agent dir");
+        fs::write(agent.join("APPEND_SYSTEM.md"), "from the file").expect("write append file");
+        fs::write(
+            agent.join("settings.json"),
+            r#"{"appendSystemPrompt":["from the setting"]}"#,
+        )
+        .expect("write settings");
+        let source = ConfigSource {
+            cli: Cli::try_parse_from(["pi", "--append-system-prompt", "from the flag"])
+                .expect("parse cli"),
+            cwd: root.clone(),
+            project_trusted: false,
+        };
+        let config = source
+            .load(ConfigPaths {
+                cwd: root.clone(),
+                agent_dir: agent.clone(),
+                session_dir: agent.join("sessions"),
+                settings_path: agent.join("settings.json"),
+                project_settings_path: root.join(".pi/settings.json"),
+                auth_path: agent.join("auth.json"),
+                models_path: agent.join("models.json"),
+                model_cache_path: agent.join("model-cache.json"),
+                keybindings_path: agent.join("keybindings.json"),
+            })
+            .expect("load config");
+        assert_eq!(
+            config.append_system_prompt,
+            ["from the setting", "from the flag"]
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -11263,6 +11547,7 @@ mod tests {
                 ConfigProviderApi::Anthropic
             },
             base_url: None,
+            ..ModelDefinition::default()
         };
         let key = |key: &str| AuthCredential::ApiKey {
             key: key.to_string(),
@@ -11274,11 +11559,14 @@ mod tests {
             model("unkeyed", "saved"),
         ];
         let pick = |config: &LoadedConfig, args: &[&str], offline: bool| {
+            let mut config = config.clone();
             let mut runtime = account_test_runtime("faux", None);
             runtime.set_active_model(None).expect("clear model");
             let cli = Cli::try_parse_from(std::iter::once("pi").chain(args.iter().copied()))
                 .expect("parse cli");
-            select_initial_model(&mut runtime, config, &cli, offline).expect("select model");
+            let selection =
+                resolve_cli_selection(&cli, &mut config, offline).expect("read the command line");
+            select_initial_model(&mut runtime, &config, &selection, offline).expect("select model");
             runtime
                 .session()
                 .active_model
@@ -11340,6 +11628,7 @@ mod tests {
             name: None,
             api: ConfigProviderApi::Faux,
             base_url: None,
+            ..ModelDefinition::default()
         });
         let runtime = account_test_runtime("faux", Some("work"));
 
@@ -11362,7 +11651,11 @@ mod tests {
         };
         let save = |access_token: &str| {
             let mut auth = AuthData::default();
-            auth.insert("openai", "default", credential(access_token, 4_000_000_000));
+            auth.insert(
+                "openai-codex",
+                "default",
+                credential(access_token, 4_000_000_000),
+            );
             fs::write(&auth_path, serde_json::to_string(&auth).unwrap()).unwrap();
         };
         // The model endpoint records the bearer token of each request.
@@ -11403,18 +11696,19 @@ mod tests {
         });
         // The startup snapshot predates a refresh: its token long expired.
         let mut snapshot = AuthData::default();
-        snapshot.insert("openai", "default", credential("startup-access", 1));
+        snapshot.insert("openai-codex", "default", credential("startup-access", 1));
         let mut config = account_test_config(snapshot);
         config.paths.auth_path = auth_path.clone();
         config.models.push(ModelDefinition {
             context_window: None,
-            provider: "openai".to_string(),
+            provider: "openai-codex".to_string(),
             id: "echo".to_string(),
             name: None,
             api: ConfigProviderApi::OpenAi,
             base_url: Some(url),
+            ..ModelDefinition::default()
         });
-        let runtime = account_test_runtime("openai", None);
+        let runtime = account_test_runtime("openai-codex", None);
         let request = || ProviderRequest {
             max_output_tokens: None,
             system_prompt: None,
@@ -11436,6 +11730,129 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A final reply cut off below the model's own output limit ran out of
+    /// context: it is dropped, the session is compacted, and the request is
+    /// sent again. One cut off at that limit stands, because a smaller
+    /// context would not make it longer. The limit is the catalog's
+    /// `maxTokens`, as for upstream's `isRecoverableLength`.
+    #[tokio::test]
+    async fn a_reply_cut_off_below_the_catalogs_output_limit_is_an_overflow() {
+        use serde_json::json;
+        use std::io::BufReader;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A built-in model served over chat completions, here by a local
+        // endpoint that answers each request with the next reply.
+        let model = pi_ai::catalog::provider_base_model("deepseek").expect("a built-in model");
+        assert_eq!(model.api, AiProviderApi::OpenAi);
+        let limit = model.max_tokens;
+        let says = |text: &str| json!({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]});
+        let cut_off = |output: u64| {
+            json!({
+                "choices": [{"message": {"content": "This answer is cut"}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": output},
+            })
+        };
+        let serve = |replies: Vec<serde_json::Value>| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let served = Arc::new(AtomicUsize::new(0));
+            let count = served.clone();
+            std::thread::spawn(move || {
+                for (stream, reply) in listener.incoming().zip(replies) {
+                    let mut reader = BufReader::new(stream.unwrap());
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line.trim_end().is_empty() {
+                            break;
+                        }
+                        let line = line.to_ascii_lowercase();
+                        if let Some(value) = line.strip_prefix("content-length: ") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    reader.read_exact(&mut vec![0; length]).unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let body = reply.to_string();
+                    write!(
+                        reader.into_inner(),
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            });
+            (url, served)
+        };
+
+        // What the turn answers and how many requests it took, when its
+        // first reply stops at `length` after `output` tokens.
+        let turn = |output: u64| async move {
+            let (url, served) = serve(vec![
+                cut_off(output),
+                says("Summary of the first turn."),
+                says("The whole answer."),
+            ]);
+            let mut auth = AuthData::default();
+            auth.insert(
+                &model.provider,
+                DEFAULT_ACCOUNT_NAME,
+                AuthCredential::ApiKey {
+                    key: "test-key".to_string(),
+                },
+            );
+            let mut config = account_test_config(auth);
+            config.models.push(ModelDefinition {
+                base_url: Some(url),
+                ..ModelDefinition::from(model)
+            });
+            let mut session = SessionState::new("session-1", PathBuf::from("."));
+            session.active_model = Some(ModelRef {
+                provider: model.provider.clone(),
+                id: model.id.clone(),
+            });
+            // An older turn, long enough that its summary is shorter.
+            let mut systems = ReloadableSystems::default();
+            systems.compaction.keep_recent_tokens = 1;
+            let mut runtime = Runtime::new(session, systems);
+            let first_answer = "The migration adds a nullable column, backfills it in batches of \
+                a thousand rows, then makes it required; the rollback drops the column again, \
+                and both directions were run against a copy of the production schema.";
+            for (role, content) in [
+                (MessageRole::User, "first"),
+                (MessageRole::Assistant, first_answer),
+            ] {
+                runtime
+                    .push_message(ConversationMessage {
+                        role,
+                        content: content.into(),
+                        thinking: String::new(),
+                        media: Vec::new(),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: Vec::new(),
+                    })
+                    .unwrap();
+            }
+            let provider = provider_for_runtime(&runtime, &config, false)
+                .await
+                .unwrap();
+            assert_eq!(provider.output_limit(), Some(limit));
+            let answer = run_user_turn(&mut runtime, provider.as_ref(), "second".into())
+                .await
+                .unwrap();
+            (answer, served.load(Ordering::SeqCst))
+        };
+
+        // Below the limit: the reply, the summary, and the request again.
+        assert_eq!(turn(limit - 1).await, ("The whole answer.".to_string(), 3));
+        // At the limit the model wrote all it can.
+        assert_eq!(turn(limit).await, ("This answer is cut".to_string(), 1));
+    }
+
     #[test]
     fn model_selection_format_is_compact_and_unlabeled() {
         let model = ModelRef {
@@ -11450,25 +11867,18 @@ mod tests {
         assert_eq!(format_model_selection(&model, None), "openai-codex/gpt-5.5");
     }
 
-    #[test]
-    fn gpt6_thinking_levels_are_available() {
-        for provider in ["openai", "openai-codex", "azure-openai-responses"] {
-            let model = ModelRef {
-                provider: provider.to_string(),
-                id: "gpt-6.1-sol".to_string(),
-            };
-            assert!(model_thinking_levels(&model).contains(&"high"));
-            assert!(model_thinking_levels(&model).contains(&"xhigh"));
-            assert_eq!(default_thinking_for_model(&model), Some("xhigh"));
-        }
-    }
-
     #[tokio::test]
     async fn new_session_keeps_persisted_selections_but_starts_fresh_history() {
         let root = std::env::temp_dir().join(format!("pi-cli-new-{}", unique_temp_suffix()));
         let mut config = minimal_test_config();
         config.paths.session_dir = root.join("sessions");
         config.settings.default_thinking_level = Some("medium".into());
+        config.models.push(ModelDefinition {
+            provider: "anthropic".to_string(),
+            id: "claude-sonnet-4-6".to_string(),
+            reasoning: Some(true),
+            ..ModelDefinition::default()
+        });
         let mut terminal = Terminal::with_options(
             CrosstermBackend::new(io::stdout()),
             TerminalOptions {
@@ -11548,10 +11958,9 @@ mod tests {
                 .unwrap();
             }
             assert_eq!(runtime.session().active_thinking_level.as_deref(), level);
-            let thinking_before = active_thinking_label(&runtime, &config);
-            if level == Some("off") {
-                assert_eq!(thinking_before, None); // Must not inherit medium.
-            }
+            let thinking_before = thinking_label(&runtime, &config);
+            // An explicit off must not inherit the configured medium.
+            assert_eq!(thinking_before.as_deref(), level.or(Some("medium")));
             let before = runtime.session().clone();
             let old_store = runtime.store().unwrap().clone();
             let systems = runtime.systems().clone();
@@ -11572,7 +11981,7 @@ mod tests {
             expected.active_account = before.active_account.clone();
             assert_eq!(runtime.session(), &expected);
             assert_eq!(runtime.systems(), &systems);
-            assert_eq!(active_thinking_label(&runtime, &config), thinking_before);
+            assert_eq!(thinking_label(&runtime, &config), thinking_before);
             assert_eq!(
                 SessionStore::open(old_store.path().to_path_buf())
                     .unwrap()
@@ -11599,6 +12008,7 @@ mod tests {
             name: None,
             api: ConfigProviderApi::Faux,
             base_url: None,
+            ..ModelDefinition::default()
         });
         let mut terminal = Terminal::with_options(
             CrosstermBackend::new(io::stdout()),
@@ -11660,34 +12070,471 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A reasoning model with this thinking level map (upstream
+    /// `thinkingLevelMap`); without entries it supports `off` to `high`.
+    fn thinking_test_model(provider: &str, id: &str, map: serde_json::Value) -> ModelDefinition {
+        ModelDefinition {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            api: ConfigProviderApi::Anthropic,
+            reasoning: Some(true),
+            thinking_level_map: Some(serde_json::from_value(map).expect("level map")),
+            ..ModelDefinition::default()
+        }
+    }
+
+    /// A config that knows `models`, with a stored key for each of their
+    /// providers. The providers are made up, so the models can run and no
+    /// other can, whatever keys the test run's environment holds.
+    fn thinking_test_config(models: Vec<ModelDefinition>) -> LoadedConfig {
+        let mut config = minimal_test_config();
+        for model in &models {
+            config.auth.insert(
+                &model.provider,
+                DEFAULT_ACCOUNT_NAME,
+                AuthCredential::ApiKey {
+                    key: "test-key".to_string(),
+                },
+            );
+        }
+        config.models = models;
+        config
+    }
+
+    fn test_model_ref(provider: &str, id: &str) -> ModelRef {
+        ModelRef {
+            provider: provider.to_string(),
+            id: id.to_string(),
+        }
+    }
+
+    fn top_levels() -> serde_json::Value {
+        serde_json::json!({ "xhigh": "xhigh", "max": "max" })
+    }
+
+    #[tokio::test]
+    async fn thinking_and_model_commands_follow_the_models_levels() {
+        let mut config = thinking_test_config(vec![
+            thinking_test_model("alpha", "flash", serde_json::json!({})),
+            thinking_test_model("beta", "haiku", serde_json::json!({})),
+            thinking_test_model("beta", "opus", top_levels()),
+            thinking_test_model(
+                "beta",
+                "opus-next",
+                serde_json::json!({ "off": null, "xhigh": "xhigh", "max": "max" }),
+            ),
+        ]);
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        runtime
+            .set_active_model(Some(test_model_ref("alpha", "flash")))
+            .unwrap();
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut viewport_height = 24;
+        let mut app = TuiApp::new(&config, &runtime);
+        let mut surface = TuiSurface {
+            terminal: &mut terminal,
+            viewport_height: &mut viewport_height,
+        };
+        macro_rules! submit {
+            ($line:expr) => {
+                handle_tui_submission(
+                    &mut app,
+                    &mut surface,
+                    &mut runtime,
+                    &mut config,
+                    false,
+                    $line.to_string(),
+                )
+                .await
+            };
+        }
+
+        // A model starts on upstream's default level.
+        submit!("/thinking").unwrap();
+        assert!(app.transcript_text().ends_with("thinking: medium"));
+        submit!("/thinking HIGH").unwrap();
+        assert_eq!(
+            runtime.session().active_thinking_level.as_deref(),
+            Some("high")
+        );
+        // A level the model lacks is refused by name, as upstream refuses it.
+        let error = submit!("/thinking xhigh").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Unknown thinking level \"xhigh\". Available levels: off, minimal, low, medium, high."
+        );
+        assert_eq!(
+            runtime.session().active_thinking_level.as_deref(),
+            Some("high")
+        );
+
+        // An exact reference switches, ignoring case, and the level in
+        // effect moves with the session, clamped to the new model.
+        submit!("/model Beta/Opus").unwrap();
+        assert_eq!(
+            runtime.session().active_model,
+            Some(test_model_ref("beta", "opus"))
+        );
+        assert!(app.transcript_text().ends_with("beta/opus high"));
+        submit!("/thinking max").unwrap();
+        submit!("/model haiku").unwrap();
+        assert!(app.transcript_text().ends_with("beta/haiku high"));
+        // This model cannot turn thinking off.
+        submit!("/model beta/opus-next").unwrap();
+        let error = submit!("/thinking off").unwrap_err().to_string();
+        assert!(
+            error.ends_with("Available levels: minimal, low, medium, high, xhigh, max."),
+            "{error}"
+        );
+
+        // Anything else opens the picker with the text as its search; the
+        // session keeps its model.
+        submit!("/model opu").unwrap();
+        let selector = app.selector.take().expect("the model picker");
+        assert_eq!(
+            (selector.kind.as_str(), selector.query.as_str()),
+            ("model", "opu")
+        );
+        assert_eq!(
+            selector
+                .filtered_indices
+                .iter()
+                .map(|index| selector.items[*index].value.as_str())
+                .collect::<Vec<_>>(),
+            ["beta/opus", "beta/opus-next"]
+        );
+        assert_eq!(
+            runtime.session().active_model,
+            Some(test_model_ref("beta", "opus-next"))
+        );
+        let _ = fs::remove_dir_all(config.paths.agent_dir.parent().unwrap());
+    }
+
     #[test]
-    fn anthropic_thinking_levels_follow_model_version() {
-        let opus_5 = ModelRef {
-            provider: "anthropic".to_string(),
-            id: "claude-opus-5-5".to_string(),
-        };
-        assert_eq!(
-            model_thinking_levels(&opus_5),
-            &["off", "high", "xhigh", "max"]
+    fn the_model_picker_shows_and_applies_the_levels_a_model_supports() {
+        let mut config = thinking_test_config(vec![
+            ModelDefinition {
+                reasoning: Some(false),
+                ..thinking_test_model("alpha", "plain", serde_json::json!({}))
+            },
+            thinking_test_model("beta", "haiku", serde_json::json!({})),
+            thinking_test_model("beta", "opus", top_levels()),
+        ]);
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
         );
+        runtime
+            .set_active_model(Some(test_model_ref("beta", "opus")))
+            .unwrap();
+        set_thinking_level(&mut runtime, &config, "max").unwrap();
+        let mut app = TuiApp::new(&config, &runtime);
+        let picker = |config: &LoadedConfig, runtime: &Runtime, query: &str| {
+            TuiSelectorState::new(
+                "model",
+                selector_for_kind(config, runtime, "model").unwrap(),
+                query,
+                None,
+            )
+            .with_model_thinking(config, runtime)
+        };
 
-        let sonnet_4_6 = ModelRef {
-            provider: "anthropic".to_string(),
-            id: "claude-sonnet-4-6".to_string(),
-        };
+        // Untouched, a row shows the level a switch to it gives: the level
+        // in effect, clamped to that model.
+        let mut selector = picker(&config, &runtime, "haiku");
+        assert_eq!(selector.selected_thinking_level().as_deref(), Some("high"));
+        // Left and right walk the model's own levels and wrap.
+        selector.cycle_thinking(1);
+        assert_eq!(selector.selected_thinking_level().as_deref(), Some("off"));
+        selector.cycle_thinking(-2);
         assert_eq!(
-            model_thinking_levels(&sonnet_4_6),
-            &["off", "low", "medium", "high", "xhigh"]
+            selector.selected_thinking_level().as_deref(),
+            Some("medium")
         );
+        apply_tui_selector_selection(&mut app, &mut runtime, &mut config, selector).unwrap();
+        assert_eq!(
+            runtime.session().active_model,
+            Some(test_model_ref("beta", "haiku"))
+        );
+        assert_eq!(thinking_label(&runtime, &config).as_deref(), Some("medium"));
+        assert!(app.transcript_text().ends_with("beta/haiku medium"));
 
-        let sonnet_4_5 = ModelRef {
-            provider: "anthropic".to_string(),
-            id: "claude-sonnet-4-5".to_string(),
+        // A model without reasoning offers no level.
+        let mut selector = picker(&config, &runtime, "plain");
+        assert_eq!(selector.selected_thinking_level(), None);
+        selector.cycle_thinking(1);
+        assert_eq!(selector.thinking_level, None);
+        apply_tui_selector_selection(&mut app, &mut runtime, &mut config, selector).unwrap();
+        assert_eq!(thinking_label(&runtime, &config), None);
+        assert!(app.transcript_text().ends_with("alpha/plain"));
+
+        // `modelThinkingLevels` decides the level an untouched row shows.
+        config
+            .settings
+            .model_thinking_levels
+            .insert("beta/opus".to_string(), "xhigh".to_string());
+        let selector = picker(&config, &runtime, "opus");
+        assert_eq!(selector.selected_thinking_level().as_deref(), Some("xhigh"));
+        assert_eq!(
+            select_from_selector_message(&mut config, &mut runtime, "/select model opus").unwrap(),
+            "beta/opus xhigh"
+        );
+        let _ = fs::remove_dir_all(config.paths.agent_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn a_model_scope_narrows_the_pickers_and_keeps_every_model_known() {
+        let mut config = thinking_test_config(vec![
+            thinking_test_model("alpha", "flash", serde_json::json!({})),
+            thinking_test_model("beta", "haiku", serde_json::json!({})),
+            thinking_test_model("beta", "opus", top_levels()),
+        ]);
+        let runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let rows = |config: &LoadedConfig, kind: &str| {
+            selector_for_kind(config, &runtime, kind)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|item| item.value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&config, "model").len(), 3);
+        let cli = Cli::try_parse_from(["pi", "--models", "beta/op*,flash:low"]).expect("parse cli");
+        apply_cli_overrides(&cli, Path::new("."), &mut config).expect("apply the scope");
+        assert_eq!(rows(&config, "model"), ["alpha/flash", "beta/opus"]);
+        assert_eq!(rows(&config, "provider"), ["alpha", "beta"]);
+        assert_eq!(config.models.len(), 3);
+        assert_eq!(config.model_scope[1].thinking_level.as_deref(), Some("low"));
+        // A model outside the scope can still be named in full.
+        assert_eq!(
+            resolve_cli(
+                &Cli::try_parse_from(["pi", "--model", "beta/haiku"]).unwrap(),
+                &config,
+                false
+            )
+            .and_then(|resolved| resolved.model)
+            .map(|model| model.id),
+            Some("haiku".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn providers_are_built_with_the_clamped_thinking_level() {
+        let config = thinking_test_config(vec![
+            ModelDefinition {
+                reasoning: Some(false),
+                ..thinking_test_model("alpha", "plain", serde_json::json!({}))
+            },
+            thinking_test_model("beta", "haiku", serde_json::json!({})),
+        ]);
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        runtime
+            .set_active_model(Some(test_model_ref("beta", "haiku")))
+            .unwrap();
+        // A saved level the model lacks reaches the provider clamped.
+        runtime
+            .set_active_thinking_level(Some("max".to_string()))
+            .unwrap();
+        let provider = provider_for_runtime(&runtime, &config, false)
+            .await
+            .expect("provider");
+        assert_eq!(provider.thinking_level().as_deref(), Some("high"));
+        // Off is a level too, where the model can turn thinking off.
+        runtime
+            .set_active_thinking_level(Some("off".to_string()))
+            .unwrap();
+        let provider = provider_for_runtime(&runtime, &config, false)
+            .await
+            .expect("provider");
+        assert_eq!(provider.thinking_level().as_deref(), Some("off"));
+        // A model without reasoning is sent no level.
+        runtime
+            .set_active_model(Some(test_model_ref("alpha", "plain")))
+            .unwrap();
+        runtime
+            .set_active_thinking_level(Some("high".to_string()))
+            .unwrap();
+        let provider = provider_for_runtime(&runtime, &config, false)
+            .await
+            .expect("provider");
+        assert_eq!(provider.thinking_level(), None);
+    }
+
+    /// From the session and the model definition to the request on the
+    /// wire: the level clamped to the model and named as the model names
+    /// it, and the model's output cap.
+    #[tokio::test]
+    async fn a_request_carries_the_models_thinking_level_and_output_cap() {
+        use std::io::BufReader;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            (0..2)
+                .map(|_| {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line.trim_end().is_empty() {
+                            break;
+                        }
+                        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length: ") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut request = vec![0; length];
+                    reader.read_exact(&mut request).unwrap();
+                    let body = r#"{"output_text":"ok"}"#;
+                    write!(
+                        reader.into_inner(),
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&request).unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut auth = AuthData::default();
+        auth.insert(
+            "local",
+            DEFAULT_ACCOUNT_NAME,
+            AuthCredential::ApiKey {
+                key: "local-key".to_string(),
+            },
+        );
+        let mut config = account_test_config(auth);
+        config.paths.auth_path = std::env::temp_dir().join(format!(
+            "pi-cli-request-traits-{}/auth.json",
+            unique_temp_suffix()
+        ));
+        let definition = |id: &str, extra: serde_json::Value| {
+            let mut model = serde_json::json!({
+                "provider": "local", "id": id, "api": "openai-responses", "baseUrl": url,
+            });
+            model
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<ModelDefinition>(model).unwrap()
+        };
+        config.models = vec![
+            definition(
+                "thinker",
+                serde_json::json!({
+                    "reasoning": true,
+                    "thinkingLevelMap": { "minimal": null, "xhigh": "extra-hard" },
+                    "contextWindow": 32000,
+                    "maxTokens": 4000,
+                }),
+            ),
+            definition("plain", serde_json::json!({})),
+        ];
+        let mut runtime = account_test_runtime("local", None);
+        let request = || ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        // `max` is above what the model supports.
+        runtime
+            .set_active_thinking_level(Some("max".to_string()))
+            .unwrap();
+        for id in ["thinker", "plain"] {
+            runtime
+                .set_active_model(Some(test_model_ref("local", id)))
+                .unwrap();
+            let provider = provider_for_runtime(&runtime, &config, false)
+                .await
+                .unwrap();
+            provider.complete(request()).await.unwrap();
+        }
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["model"], "thinker");
+        assert_eq!(requests[0]["reasoning"]["effort"], "extra-hard");
+        assert_eq!(requests[0]["max_output_tokens"], 4000);
+        // Nothing is said of thinking or a cap to a model that has neither.
+        assert_eq!(requests[1]["model"], "plain");
+        assert_eq!(requests[1].get("reasoning"), None);
+        assert_eq!(requests[1].get("max_output_tokens"), None);
+    }
+
+    #[test]
+    fn reload_keeps_the_custom_model_the_command_line_named() {
+        let root = std::env::temp_dir().join(format!("pi-cli-custom-{}", unique_temp_suffix()));
+        let agent = root.join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        let cli = Cli::try_parse_from(["pi", "--model", "anthropic/claude-next:high"]).unwrap();
+        let source = ConfigSource {
+            cli,
+            cwd: root.clone(),
+            project_trusted: false,
+        };
+        let config = source
+            .load(ConfigPaths {
+                cwd: root.clone(),
+                agent_dir: agent.clone(),
+                session_dir: agent.join("sessions"),
+                settings_path: agent.join("settings.json"),
+                project_settings_path: root.join(".pi/settings.json"),
+                auth_path: agent.join("auth.json"),
+                models_path: agent.join("models.json"),
+                model_cache_path: agent.join("model-cache.json"),
+                keybindings_path: agent.join("keybindings.json"),
+            })
+            .expect("reload config");
+        let custom = configured_model(&config, &test_model_ref("anthropic", "claude-next"))
+            .expect("the custom model");
+        let base = pi_ai::catalog::provider_base_model("anthropic").unwrap();
+        assert_eq!(custom.max_tokens, Some(base.max_tokens));
+        assert_eq!(custom.name.as_deref(), Some("claude-next"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_api_key_goes_to_the_provider_the_model_resolves_to() {
+        let mut config = minimal_test_config();
+        config.models = pi_ai::catalog::builtin_models()
+            .iter()
+            .map(ModelDefinition::from)
+            .collect();
+        let provider = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["pi"].into_iter().chain(args.iter().copied())).unwrap();
+            infer_cli_provider(&cli, &config)
         };
         assert_eq!(
-            model_thinking_levels(&sonnet_4_5),
-            &["off", "minimal", "low", "medium", "high"]
+            provider(&["--model", "anthropic/claude-opus-4-8"]).as_deref(),
+            Some("anthropic")
         );
+        // A custom id still names its provider, and so does the former
+        // Azure id.
+        assert_eq!(
+            provider(&["--model", "mistral/next"]).as_deref(),
+            Some("mistral")
+        );
+        assert_eq!(
+            provider(&["--provider", "azure-openai-responses", "--model", "gpt-5.4"]).as_deref(),
+            Some("azure")
+        );
+        assert_eq!(provider(&[]), None);
     }
 
     #[test]
@@ -12291,6 +13138,7 @@ mod tests {
             thinking_level: None,
             thinking_budget_tokens: None,
             session_id: None,
+            traits: pi_ai::ModelTraits::default(),
         });
         let output = run_user_turn(&mut runtime, provider.as_ref(), "/read fixture.txt".into())
             .await
@@ -12343,6 +13191,7 @@ mod tests {
             api: pi_config::ProviderApi::Faux,
             base_url: None,
             context_window: None,
+            ..ModelDefinition::default()
         });
         followups.push("first follow-up".to_string());
 
@@ -12491,7 +13340,7 @@ mod tests {
             is_error: true,
         });
         let runtime = Runtime::new(session, ReloadableSystems::default());
-        insert_new_tool_messages(&mut app, &runtime, 1, entry);
+        settle_tool_entries(&mut app, &runtime, 1, entry);
         assert_eq!(app.entries[entry].text, "failed bash\n\ntest failed");
         assert_eq!(app.entries[entry + 1].text, "done");
     }
@@ -13066,6 +13915,7 @@ mod tests {
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -13135,7 +13985,7 @@ mod tests {
         });
         let runtime = Runtime::new(session, ReloadableSystems::default());
 
-        insert_new_tool_messages(&mut app, &runtime, 0, assistant_index);
+        settle_tool_entries(&mut app, &runtime, 0, assistant_index);
 
         assert_eq!(app.entries[1].kind, TuiEntryKind::Tool);
         assert_eq!(app.entries[1].text, "completed read\n\nfile contents");
@@ -13259,6 +14109,7 @@ mod tests {
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -13380,6 +14231,7 @@ mod tests {
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
+            model_scope: Vec::new(),
             image_models: Vec::new(),
             keybindings: Vec::new(),
             context_files: Vec::new(),
@@ -13571,6 +14423,7 @@ mod tests {
             name: Some(id.to_string()),
             api: ConfigProviderApi::OpenAi,
             base_url: None,
+            ..ModelDefinition::default()
         }
     }
 
@@ -14072,8 +14925,9 @@ mod tests {
             TurnEvent::ToolOutput {
                 call,
                 output: output.clone(),
+                images: Vec::new(),
                 is_error: false,
-                duration: Duration::ZERO,
+                duration: Some(Duration::ZERO),
             },
         ] {
             let mut live_text_index = assistant_index;
@@ -14111,8 +14965,9 @@ mod tests {
                 assert!(screen.contains("live-file-line-11"));
                 assert_eq!(screen.contains("live-file-line-00"), expanded);
                 assert_eq!(screen.contains("11 more lines"), !expanded);
+                // The tool entry took the place of the turn's placeholder.
                 assert_eq!(
-                    app.entries[3].text,
+                    app.entries[assistant_index].text,
                     format!("completed read\nlarge.rs\n{output}")
                 );
             }
@@ -14190,7 +15045,7 @@ mod tests {
         let mut failed = Vec::new();
         push_tool_lines(
             &mut failed,
-            "failed bash\n$ false\nexit status: 1",
+            "failed bash\n$ false\n(no output)\n\nCommand exited with code 1",
             &palette,
         );
         assert_eq!(failed[0].spans[0].content, "✗ ");
@@ -14232,12 +15087,16 @@ mod tests {
             &TurnEvent::ToolOutput {
                 call,
                 output: "HTTP 403".into(),
+                images: Vec::new(),
                 is_error: true,
-                duration: Duration::ZERO,
+                duration: Some(Duration::ZERO),
             },
         );
+        // The reply began with the call: the tool entry took the place of
+        // the turn's placeholder.
+        assert_eq!(app.entries.len(), 2);
         assert_eq!(
-            app.entries[2].text,
+            app.entries[index].text,
             "failed web_fetch\nhttps://example.org\nHTTP 403"
         );
         let todos = vec![TodoItem {
@@ -14370,8 +15229,9 @@ mod tests {
             &TurnEvent::ToolOutput {
                 call: read,
                 output: "file body".into(),
+                images: Vec::new(),
                 is_error: false,
-                duration: Duration::ZERO,
+                duration: Some(Duration::ZERO),
             },
         );
         send(
@@ -14422,6 +15282,256 @@ mod tests {
         // The live pointer tracks the newest text entry, not the original.
         assert_eq!(live_text_index, app.entries.len() - 1);
         assert_eq!(app.live_entry_index, Some(app.entries.len() - 1));
+    }
+
+    /// Applies `events` to a new turn's entries (its thinking entry, then
+    /// its reply's placeholder) and returns them.
+    fn entries_after(events: &[TurnEvent]) -> Vec<(TuiEntryKind, String)> {
+        let mut app = TuiApp::default();
+        let thinking = app.push_placeholder(TuiEntryKind::Thinking, "");
+        let mut live_text_index = app.push_placeholder(TuiEntryKind::Assistant, "Working...");
+        let (mut saw_delta, mut text_after_tool) = (false, false);
+        for event in events {
+            apply_turn_event(
+                &mut app,
+                &mut live_text_index,
+                &mut text_after_tool,
+                thinking,
+                &mut saw_delta,
+                &mut Activity::Waiting,
+                event,
+            );
+        }
+        let entries = app.entries.into_iter();
+        entries.map(|entry| (entry.kind, entry.text)).collect()
+    }
+
+    #[test]
+    fn a_reply_that_starts_with_a_tool_call_leaves_no_placeholder() {
+        let call = |id: &str| pi_ai::ChatToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: r#"{"path":"a.txt"}"#.into(),
+        };
+        let started = |id: &str| TurnEvent::ToolStarted { call: call(id) };
+        let output = |id: &str| TurnEvent::ToolOutput {
+            call: call(id),
+            output: "file body".into(),
+            images: Vec::new(),
+            is_error: false,
+            duration: Some(Duration::ZERO),
+        };
+        let text = |text: &str| TurnEvent::Provider(StreamEvent::Text(text.into()));
+        let thinking = (TuiEntryKind::Thinking, String::new());
+        let tool = (
+            TuiEntryKind::Tool,
+            "completed read\na.txt\nfile body".to_string(),
+        );
+        let assistant = |text: &str| (TuiEntryKind::Assistant, text.to_string());
+
+        // Two calls, then the answer: nothing is left of "Working...".
+        let events = [
+            TurnEvent::RoundStarted,
+            started("1"),
+            output("1"),
+            started("2"),
+            output("2"),
+            TurnEvent::RoundStarted,
+            text("done"),
+        ];
+        assert_eq!(
+            entries_after(&events),
+            [
+                thinking.clone(),
+                tool.clone(),
+                tool.clone(),
+                assistant("done")
+            ]
+        );
+        // Text before the call took the placeholder's place, as before.
+        let events = [TurnEvent::RoundStarted, text("Let me look."), started("1")];
+        assert_eq!(
+            entries_after(&events)[..2],
+            [thinking.clone(), assistant("Let me look.")]
+        );
+        // Until a reply says or calls something, the placeholder stands.
+        assert_eq!(
+            entries_after(&[TurnEvent::RoundStarted]),
+            [thinking, assistant("Working...")]
+        );
+    }
+
+    #[test]
+    fn a_running_command_shows_its_output_so_far() {
+        use ratatui::backend::TestBackend;
+        let call = pi_ai::ChatToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"make test"}"#.into(),
+        };
+        let update = |output: &str| TurnEvent::ToolUpdate {
+            call: call.clone(),
+            output: output.into(),
+        };
+        let started = TurnEvent::ToolStarted { call: call.clone() };
+        let tool = |events: &[TurnEvent]| entries_after(events)[1].clone().1;
+        // The command starts, prints, prints more, and ends.
+        assert_eq!(tool(std::slice::from_ref(&started)), "running bash\n\n");
+        assert_eq!(
+            tool(&[started.clone(), update("")]),
+            "running bash\n$ make test\n"
+        );
+        let running = [
+            started.clone(),
+            update(""),
+            update("one\n"),
+            update("one\ntwo\nthree\n"),
+        ];
+        assert_eq!(
+            tool(&running),
+            "running bash\n$ make test\none\ntwo\nthree\n"
+        );
+        let mut finished = running.to_vec();
+        finished.push(TurnEvent::ToolOutput {
+            call: call.clone(),
+            output: "one\ntwo\nthree\nfour\n".into(),
+            images: Vec::new(),
+            is_error: false,
+            duration: Some(Duration::ZERO),
+        });
+        assert_eq!(
+            tool(&finished),
+            "completed bash\n$ make test\none\ntwo\nthree\nfour\n"
+        );
+
+        // On screen the running command shows its latest line, and all of
+        // its output once previews are expanded.
+        let config = minimal_test_config();
+        let mut app = TuiApp {
+            owned_screen: true,
+            turn_running: true,
+            ..Default::default()
+        };
+        app.push(TuiEntryKind::Tool, tool(&running));
+        app.live_tool_indices.push(0);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        let screen = buffer_rows(terminal.backend().buffer()).join("\n");
+        assert!(
+            screen.contains("Running a command · $ make test · 2 more lines"),
+            "{screen}"
+        );
+        assert!(screen.contains("… three"), "{screen}");
+        assert!(!screen.contains("one"), "{screen}");
+        app.previews_expanded = true;
+        redraw_tui(&mut terminal, &mut app, &config).unwrap();
+        let screen = buffer_rows(terminal.backend().buffer()).join("\n");
+        for line in ["  one", "  two", "  three"] {
+            assert!(screen.contains(line), "{line}: {screen}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_reply_stays_above_a_notice_and_the_next_reply_starts_below() {
+        let text = |text: &str| TurnEvent::Provider(StreamEvent::Text(text.into()));
+        let retry = TurnEvent::RetryStarted(pi_core::RetryNotice {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 2_000,
+            error_message: "request failed with status 503 Service Unavailable: overloaded".into(),
+        });
+        let notice = (
+            TuiEntryKind::System,
+            "retrying in 2s (attempt 1 of 3): request failed with status 503 Service Unavailable: overloaded".to_string(),
+        );
+        let thinking = (TuiEntryKind::Thinking, String::new());
+        let assistant = |text: &str| (TuiEntryKind::Assistant, text.to_string());
+
+        // The reply broke off after some text: the text stays, and the
+        // reply that replaces it is a new entry below the notice.
+        let events = [
+            TurnEvent::RoundStarted,
+            text("Hel"),
+            retry.clone(),
+            TurnEvent::RoundStarted,
+            text("Hello "),
+            text("again."),
+        ];
+        assert_eq!(
+            entries_after(&events),
+            [
+                thinking.clone(),
+                assistant("Hel"),
+                notice.clone(),
+                assistant("Hello again.")
+            ]
+        );
+        // The request failed before any text: the placeholder still waits
+        // for the reply.
+        let events = [
+            TurnEvent::RoundStarted,
+            retry.clone(),
+            TurnEvent::RoundStarted,
+            text("Hello again."),
+        ];
+        assert_eq!(
+            entries_after(&events),
+            [thinking.clone(), assistant("Hello again."), notice]
+        );
+        // A reply cut off at the output limit is dropped the same way once
+        // a compaction makes room to ask again.
+        let events = [
+            TurnEvent::RoundStarted,
+            text("This answer is cut"),
+            TurnEvent::Overflowed { error: None },
+            TurnEvent::CompactionStarted,
+            TurnEvent::CompactionFinished(pi_core::CompactionRecord {
+                kind: pi_core::CompactionKind::Automatic,
+                omitted_messages: 4,
+                retained_messages: 1,
+                summary: "Summary.".into(),
+            }),
+            TurnEvent::RoundStarted,
+            text("The whole answer."),
+        ];
+        assert_eq!(
+            entries_after(&events),
+            [
+                thinking,
+                assistant("This answer is cut"),
+                (
+                    TuiEntryKind::System,
+                    "reply cut off at the output limit; compacting to ask again".to_string()
+                ),
+                (
+                    TuiEntryKind::System,
+                    "auto-compacted: omitted 4 message(s)".to_string()
+                ),
+                assistant("The whole answer.")
+            ]
+        );
+        // If that compaction fails, the turn does not ask again.
+        let events = [
+            TurnEvent::RoundStarted,
+            TurnEvent::Overflowed {
+                error: Some("too large".into()),
+            },
+            TurnEvent::CompactionStarted,
+            TurnEvent::CompactionFailed("nothing to compact".into()),
+        ];
+        assert_eq!(
+            entries_after(&events)[2..],
+            [
+                (
+                    TuiEntryKind::System,
+                    "context overflow; compacting to ask again: too large".to_string()
+                ),
+                (
+                    TuiEntryKind::System,
+                    "compaction failed, not asking again: nothing to compact".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -14727,6 +15837,7 @@ mod tests {
             name: None,
             api: ConfigProviderApi::default(),
             base_url: None,
+            ..ModelDefinition::default()
         }
     }
 
@@ -14873,6 +15984,48 @@ mod tests {
             name: name.to_string(),
             path: PathBuf::from(name),
             content: String::new(),
+        }
+    }
+
+    fn test_source(path: &Path) -> SourceInfo {
+        SourceInfo {
+            path: path.to_path_buf(),
+            source: "auto".into(),
+            scope: SourceScope::User,
+            from_package: false,
+            base_dir: None,
+        }
+    }
+
+    /// A user skill at `/skills/<name>/SKILL.md`.
+    fn test_skill(name: &str, description: &str) -> Skill {
+        let base_dir = PathBuf::from(format!("/skills/{name}"));
+        let file_path = base_dir.join("SKILL.md");
+        Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            source_info: test_source(&file_path),
+            file_path,
+            base_dir,
+            disable_model_invocation: false,
+        }
+    }
+
+    /// A user prompt template at `/prompts/<name>.md`.
+    fn test_template(
+        name: &str,
+        description: &str,
+        argument_hint: Option<&str>,
+        content: &str,
+    ) -> PromptTemplate {
+        let file_path = PathBuf::from(format!("/prompts/{name}.md"));
+        PromptTemplate {
+            name: name.to_string(),
+            description: description.to_string(),
+            argument_hint: argument_hint.map(str::to_string),
+            content: content.to_string(),
+            source_info: test_source(&file_path),
+            file_path,
         }
     }
 

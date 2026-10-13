@@ -78,6 +78,39 @@ the same v2 accounts and refresh machinery. The official CLIs' flows are
 public, documented in their shipped binaries, and produce tokens for the same
 upstream services.
 
+### Credentials That Make a Provider Available
+
+Rust keeps upstream's rule that a credential belongs to the provider it is
+stored for, and that a provider takes only its own kinds: `openai-codex` a
+ChatGPT login and no API key, `openai` an API key. A stored credential of the
+other kind is not a credential. The two Cloudflare providers share one key,
+and each also needs the ids its URLs are built from (`CLOUDFLARE_ACCOUNT_ID`,
+and `CLOUDFLARE_GATEWAY_ID` for the gateway). The models of a provider
+without what it needs are not available: startup does not take one, and a
+scope pattern, `/model <reference>`, or `set_model` does not reach one
+(`credentials` and the last `launches` of `model-resolution.json`). These
+parts differ:
+
+- Upstream's `openai` also has a ChatGPT sign-in of its own, whose tokens its
+  Responses API takes. Rust has no such flow, so a login stored under
+  `openai` does not count. It is the Codex login earlier versions of
+  `pi login` stored there as well, which that API does not take; it is
+  ignored wherever credentials are read, and `pi logout openai` removes it.
+- Rust also reads the Codex CLI's own credentials, each for the provider it
+  can serve: `CODEX_ACCESS_TOKEN` and `~/.codex/auth.json` for
+  `openai-codex`, and `CODEX_API_KEY` as a second name for `openai`'s API
+  key. Upstream reads neither.
+- `pi login openai` without `--api-key` stores `env:OPENAI_API_KEY` when that
+  variable is set and otherwise prints the usage; `pi login openai-codex
+  --api-key` is refused.
+- Upstream also takes the Cloudflare ids from a stored credential's `env`.
+  Rust reads them from the process environment only, and `pi auth check`
+  reports on the key alone.
+
+Reason: a ChatGPT login cannot authenticate `openai`'s Responses models, and
+counting it made a user with only that login start on a model that fails
+with a missing API key. A Cloudflare key without the ids fails the same way.
+
 ### Todo Tool and Edited-Files Panel
 
 Rust adds a `todo` builtin tool (checklist with `pending`/`in_progress`/
@@ -183,20 +216,159 @@ Reason: model lists are provider-owned and change out of band; a stale or
 poisoned cache must never delete working models, and the user needs a manual
 escape hatch when the background refresh cannot recover on its own.
 
-### Anthropic Output Cap Without an Output Catalog
+### Built-in Model Catalog Is a Compiled Snapshot
 
-Upstream sends each request the model's catalog `maxTokens`, lowered so the
-estimated input fits the context window. The Rust model catalog has no output
-limits, so an Anthropic Messages request without an explicit cap reads the
-Claude output limit and context window from the version in the model id (for
-example 128000 for Opus 4.6 and later, 64000 for Sonnet and Haiku 4.5, 32000
-for Opus 4.1) and applies the same context clamp. Other models served over
-the Anthropic API get upstream's 16384 default for models without a catalog
-limit instead of their upstream catalog values.
+Rust's built-in models are upstream's catalog, generated from upstream's model
+runtime into `tests/fixtures/ts-parity/model-catalog.json` and compiled in
+(`crates/pi-ai/src/catalog.rs`); tests compare every model and every field
+Rust reads with that file. These parts differ:
 
-Reason: Anthropic requires `max_tokens`, and the former fixed 4096 cut off
-long replies, thinking, and large `write` calls. Reading the limit from the id
-keeps new Claude models working without a catalog update.
+- No catalog refresh. Upstream wraps each built-in provider with a refresh
+  from its hosted catalog service (`models-store.json`, `pi update --models`)
+  and narrows OpenRouter to the models, limits, and prices of the user's key.
+  Rust has neither; its own model refresh still fetches listings for seven
+  providers (see Model Cache Refresh Defenses and the next entry). Upstream
+  itself generates the catalog from the providers' listings at build time, so
+  Rust's snapshot is as old as the last regeneration of the fixture.
+- No Radius models. Upstream's Radius gateway speaks its own `pi-messages`
+  API, for which Rust has no adapter, so its 29 models are in the file but not
+  offered: `--model radius/...` is "not found", `--model balanced` (an id only
+  Radius has) matches nothing, and the error for an id several providers
+  have does not list Radius.
+- Chat models only. Upstream's image and classifier models are not in the
+  file; Rust keeps its own short list of image models.
+- Fields Rust does not read yet: `compat`, `headers`, `inputLimits`,
+  `promptCache`, and `type`. So request details upstream takes from them
+  still come from Rust's own rules:
+  - Thinking on the chat completions API is sent only to OpenRouter. The
+    other chat completions providers (DeepSeek, Z.AI, Hugging Face, OpenCode,
+    Qwen, Moonshot, Groq, ...) and Mistral have thinking levels in the
+    catalog, and Rust tracks and clamps them, but their requests carry no
+    thinking parameter: each needs the provider's own format
+    (`compat.thinkingFormat`).
+  - Anthropic and Bedrock choose adaptive or budget thinking, and Google
+    chooses its thinking budget, from the model id, not from `compat`.
+  - The catalog's per-model headers (GitHub Copilot, NVIDIA) are not sent.
+    GitHub Copilot's Responses models use Rust's own fixed headers; its
+    models on the Anthropic Messages and chat completions APIs are listed but
+    get the plain headers of those APIs.
+
+Reason: fetching upstream's hosted catalog and OpenRouter's key listing needs
+network destinations this port has no approval for, and reading `compat` is
+its own piece of work. A compiled snapshot gives every model its limits,
+prices, and thinking levels without either.
+
+### Port-Only Providers Beside the Catalog
+
+Four providers exist only in Rust and are written by hand in
+`crates/pi-ai/src/catalog_port_models.json`, in the catalog's shape: `faux`
+(`echo`, `script`), `zai-coding`, `zai-anthropic`, and `kimi-coding-openai`.
+They come first in the model list, never redefine an upstream provider (a
+test checks), and have no thinking levels. Upstream's `zai` is the coding
+plan endpoint (`https://api.z.ai/api/coding/paas/v4`), so `zai-coding` now
+duplicates it under another id; `zai/glm-5.2` and `zai/glm-5.3`, which this
+port used to send to the general endpoint (`.../api/paas/v4`), follow
+upstream's `zai`.
+
+Reason: the faux models are how tests and offline runs work, and the three
+providers are endpoints this port's users have configured and saved as
+defaults. Keeping them in a separate file keeps the generated catalog exactly
+upstream's.
+
+### Provider Listings and `models.json` Extend the Catalog
+
+Rust's model refresh caches provider listings (`model-cache.json`), and
+`models.json` is Rust's own format, a list of model objects. Upstream's
+`models.json` (`providers` with `models` and `modelOverrides`) is not read.
+Both add to the catalog:
+
+- A cached listing says which models a provider serves. A listed id the
+  catalog has changes nothing; one it lacks is built on the provider's default
+  model, as upstream builds `--model provider/new-id`, keeping the listing's
+  name and context window. Upstream has no such listings for these providers.
+- A `models.json` entry is used as written (provider, id, name, API, base
+  URL). The fields upstream's model object has and the entry leaves out
+  (`contextWindow`, `maxTokens`, `reasoning`, `thinkingLevelMap`, `input`,
+  `cost`) come from the built-in model of the same id, else from the
+  provider's default model. Upstream gives a custom model fixed defaults
+  instead (no reasoning, 128000 context, 16384 output tokens).
+- For a provider the catalog does not know, a model has no thinking levels,
+  and requests carry no output cap unless the entry gives `maxTokens`; only
+  the Anthropic API, which requires one, gets upstream's 16384. Upstream sends
+  16384, lowered to fit the context window, on every API.
+- A base URL names the API's root for every provider, as it does upstream.
+  Earlier Rust versions appended only `/messages` to a custom `anthropic` base
+  URL and `/chat/completions` to a Mistral one; they now get `/v1/messages`
+  and `/v1/chat/completions` unless the URL already ends in `/v1`.
+
+Reason: the listings keep new models usable between catalog updates, and a
+model nobody described is safest on its provider's defaults. The `models.json`
+format, with credential syntax and offline mode, is a later piece of work; the
+model object already has upstream's field names so upstream's file can map
+onto it.
+
+### Model Scope, Picker, and Model Commands
+
+`--models` and `enabledModels` resolve as upstream's scope does (exact, fuzzy,
+and glob patterns with `:<thinking>`, over the models with credentials), and a
+scope removes no model. These parts differ:
+
+- The model picker lists the scope when there is one and every known model
+  otherwise. Upstream lists the models with credentials, with a tab to switch
+  between the scope and all of them, and cycles through the scope with a key.
+- Scope globs support `*`, `?`, `[...]`, `**`, `{a,b}`, `{1..3}`, and a
+  leading `!`, as recorded from upstream's matcher in
+  `model-resolution.json`; its extended globs (`+(a|b)`) are not supported.
+- `--list-models` lists every known model, in Rust's own format. Upstream
+  lists the models with credentials, in columns.
+- `/model <text>` switches on an exact `provider/id` or id and otherwise
+  opens the picker with the text as its search, as upstream's does. It also
+  accepts a 1-based position in the model list, and it saves the model as the
+  default; upstream's saves nothing.
+- `/thinking` alone prints the level in effect; upstream opens a selector.
+- Thinking levels also answer to the names earlier Rust versions accepted
+  (`none`, `disabled`, `min`, `med`, `extra-high`), ignoring case, in
+  `--thinking`, `/thinking`, `set_thinking_level`, and settings. A
+  `:<thinking>` suffix on `--model` or a scope pattern takes upstream's seven
+  names only, because any other suffix is part of the model id.
+- The Azure provider is `azure`, as upstream names it. The id Rust used
+  before, `azure-openai-responses`, still names it in an `auth.json` entry
+  (which stays under that key), `defaultProvider`, `enabledModels`,
+  `modelThinkingLevels`, `models.json`, the model cache, a saved session,
+  `--provider`, and `--model`.
+
+Reason: the picker's tabs, key, and authenticated-only list are separate TUI
+work. The former names cost nothing to keep and saved files hold them.
+
+### Session Model and Thinking Level
+
+Startup follows upstream's order (`--model`, the resumed session, the scope,
+the saved default, a model with credentials), and a thinking level is clamped
+to the model as upstream clamps it. These parts differ:
+
+- A resumed session keeps its model even when the model has no credentials
+  now, and when the catalog no longer lists it: the id then runs on its
+  provider's default model, as `--model provider/new-id` would. Upstream
+  falls back to its default model with a message in both cases.
+- The saved default (`defaultProvider`, `defaultModel`) is used whenever its
+  provider has credentials, listed or not, and an unlisted id runs the same
+  way. Upstream ignores a saved default its catalog does not list and starts
+  on a provider's default model. Nineteen ids this port listed by hand are
+  not in upstream's catalog (for example `openai-codex/gpt-5.4`,
+  `zai/glm-5.1`, `moonshotai/k3`), so settings and sessions that name them
+  depend on this.
+- Rust saves a thinking level in the session only once something sets one
+  (`--thinking`, a `:<thinking>` suffix, a scope pattern, `/thinking`,
+  `set_thinking_level`, a model switch). Until then the level in effect is
+  read from `modelThinkingLevels` and `defaultThinkingLevel` each time, so a
+  change to those settings reaches a session that never set a level.
+  Upstream saves the level when it creates the session.
+- A `faux` model is the startup model when it is the saved default or when
+  nothing else can run. Upstream starts without a model then.
+
+Reason: a session's model is the user's choice for that conversation, and
+switching it silently is worse than failing on the next request. The faux
+fallback keeps a fresh install usable offline.
 
 ### auth.json Lock and Mode
 
@@ -258,8 +430,8 @@ indefinitely, consuming resources and confusing later turns that found them
 still alive.
 
 Reason: `kill_on_drop` on the tokio child kills one pid; shells spawn trees.
-The shell runs under `process_group(0)` and the timeout path issues `killpg`,
-so the tree dies with the call.
+The shell leads its own session and process group and the timeout path issues
+`killpg`, so the tree dies with the call.
 
 ### Interactive Session Picker
 
@@ -275,6 +447,144 @@ the industry CLIs also gate the picker behind an explicit resume action.
 Reason: the previous flat `/resume` list showed only ids and names, which
 made picking the right session impossible without opening journals by hand.
 
+### Default System Prompt
+
+Rust sends upstream's system prompt (`core/system-prompt.ts`) and reads the
+files upstream builds it from. `system_prompt_matches_ts_builder` compares
+the text with `system-prompt.json` to the byte, and
+`prompt_and_context_files_match_ts_discovery` compares the files chosen. The
+differences:
+
+- No `<docs>` section. Upstream's points at the README, docs, and examples
+  its package installs, and tells the model to read them for questions about
+  pi. Rust installs one binary and no documentation, so a path would dangle;
+  a link to this repository would need network access and a model that
+  fetches it. The parity test drops exactly this section from upstream's
+  text.
+- The `<skills>` section is upstream's, and present while `read` or `bash`
+  is active. Upstream also keeps it, naming no tool, when an extension hides
+  the reader from the model; Rust has no hidden tools.
+- Rust enables every builtin tool by default; upstream starts with `read`,
+  `bash`, `edit`, and `write`. So the default prompt also lists `grep`,
+  `find`, and `ls`, and leaves out the rule "Use bash for file operations
+  like ls, rg, find", as upstream's does once those tools are on (the
+  fixture's `all-tools` case).
+- `todo`, `web_search`, and `web_fetch` exist only in Rust, so their lines in
+  the tool list are Rust's own: "Track multi-step work as a checklist",
+  "Search the web for current information", and "Fetch a web page as
+  readable text". They add no rules.
+- Extension tools are listed in name order, the order Rust declares them in a
+  request. Upstream lists them in the order extensions registered them.
+- The `systemPrompt` and `appendSystemPrompt` settings are Rust's own.
+  `systemPrompt` ranks below `--system-prompt` and above `SYSTEM.md`.
+  `appendSystemPrompt` entries come before the `--append-system-prompt` text,
+  and either of the two replaces `APPEND_SYSTEM.md`. Upstream has only the
+  flags and the files.
+- Extensions cannot change the prompt beyond a tool's `promptSnippet` and
+  `promptGuidelines`. Upstream's `before_agent_start` handlers can replace
+  the prompt, add rules and sections, and hide tools.
+- The prompt is not a transcript message. Upstream records it as the leading
+  system message and sends later changes as section updates (upstream
+  #9548); Rust rebuilds the prompt each turn and sends it whole (see RPC
+  Mode).
+- A `SYSTEM.md`, `APPEND_SYSTEM.md`, or context file that cannot be read is
+  listed in `/diagnostics` and skipped. Upstream prints a warning, and for
+  the two prompt files uses the file's path as the prompt text.
+- With `--no-session`, bash's `PI_SESSION_ID` is `ephemeral`, Rust's id for a
+  session without a journal; upstream generates an id for it.
+- The rules for the `powershell` tool are not ported (see Windows-Only
+  PowerShell Tool).
+
+Reason: the prompt is how the model learns its role, its tools, and the
+project's instructions, so Rust keeps upstream's text and order and diverges
+only where it has nothing to point at (documentation, extension hooks) or has
+something upstream lacks (its own tools and settings).
+
+### Skills and Prompt Templates
+
+Rust loads, lists, and expands skills and prompt templates as upstream does
+(`core/skills.ts`, `core/prompt-templates.ts`, and the session's expansion
+in `core/agent-session.ts`). `skills.json` holds upstream's results, and
+`discovery_matches_ts_resource_loader`, `frontmatter_matches_ts_parser`,
+`skills_listing_matches_ts_formatter`, `template_arguments_match_ts`,
+`input_expansion_matches_ts_session`, and `get_commands_matches_upstream`
+compare with them exactly. The differences:
+
+Loading:
+
+- Frontmatter is read by a parser for the part of YAML the Agent Skills
+  specification uses: one mapping of plain or quoted scalars, booleans, and
+  `|` / `>` block scalars. A nested mapping, a sequence, or a flow collection
+  is accepted as a value that is not a string. Anchors, aliases, tags,
+  complex keys, directives, and a frontmatter that is one flow mapping are
+  malformed here and load in upstream. A file with malformed frontmatter is
+  reported and not loaded, as in upstream; the message is Rust's, not the
+  YAML library's (the fixture records it as `<yaml-error>`).
+- A directory's entries are read by name. Upstream reads them in the order
+  the filesystem lists them, so which of two same-named skills in one
+  directory wins is not defined there. The fixture script lists directories
+  by name to record a stable order.
+- Ignore files (`.gitignore`, `.ignore`, `.fdignore`) use Rust's matcher: `*`
+  and `?`, a trailing `/` for directories, and `!` to negate; a pattern with
+  a slash matches the path below the top directory and one without matches a
+  name at any depth. Upstream applies full gitignore rules (`**`, character
+  classes, escapes).
+- The `skills` and `prompts` settings name paths. Upstream also reads
+  pattern entries there (`!pattern`, `+path`, `-path`, and globs), which
+  narrow the named paths and switch discovered resources on and off. Rust
+  reads none; it has `disabledResources` and `pi config enable|disable`,
+  applied after loading, so disabling the skill that won a name does not
+  load the one it beat. A setting's path that does not exist is listed in
+  `/diagnostics`; upstream passes over it.
+- Packages are Rust's local package directories. The project's `packages`
+  setting replaces the user's instead of adding to it, so package resources
+  are the project's when the project lists packages and the user's
+  otherwise. Upstream's extensions can add skill and template paths
+  (`resources_discover`, and packages given with `-e`); Rust's cannot.
+- A `file://` URL as a resource path is not resolved.
+- Under the test harness (`PI_TEST_ISOLATION`), `~/.agents/skills` is not
+  read.
+- Diagnostics appear in `/diagnostics` and the footer's count, all alike.
+  Upstream prints skill and prompt conflicts at startup, a
+  `--prompt-template` path that does not exist as an error and the rest as
+  warnings.
+
+Use:
+
+- Input is expanded where each mode takes it (`pi_core::expand_input`): the
+  TUI on submit, on steering, and on queueing, print mode for its prompt, and
+  RPC mode for `prompt`, `steer`, and `follow_up`. Upstream expands in its
+  session, after extension commands and `input` handlers, which Rust lacks.
+- Rust's slash-tool prompts (`/read <path>`, `/bash <command>`, `/write`,
+  `/edit`, `/grep`, `/find`, `/ls`, `/web-search`, `/web-fetch`) come before
+  skills and templates in every mode, so a template with one of those names
+  is not reachable by its command. A template's expansion is submitted as
+  typed text: one that begins with a slash-tool command runs that tool.
+  Upstream has no slash-tool prompts.
+- A skill whose file can no longer be read when its command is used is sent
+  as the command's text, as in upstream, without upstream's error event.
+- Print mode joins its arguments into one prompt, so `pi -p /fix 42` is the
+  command `/fix 42`. Upstream sends each argument as its own prompt.
+- TUI: `/skills`, `/prompts`, and `/prompt <name> [input]` are Rust's own.
+  `/prompt` sends the template's text without its frontmatter, with
+  `{{input}}` replaced by the input or the input appended; it substitutes no
+  `$1` placeholders. A template named like a TUI command is reachable only in
+  print and RPC modes, as with upstream's built-in commands.
+- TUI: a skill command or template entered while a turn runs is queued as a
+  follow-up, as any text entered then is, or as steering with the steer key.
+  Upstream steers it. Other unknown commands are refused mid-turn.
+- TUI: the transcript shows a submitted skill command as it was typed, and a
+  resumed session shows the saved `<skill>` block as text. Upstream renders
+  the block collapsed in both.
+- TUI: completion matches commands by prefix, a skill also by its bare name;
+  upstream matches fuzzily. Skill commands always complete: upstream's
+  `enableSkillCommands` setting is not read.
+
+Reason: a skill or template written for upstream, or for another Agent
+Skills tool, should load and read the same here, so the loading order, the
+listing, and the expansions are upstream's to the byte. Rust differs where it
+has no YAML library, no extension runtime, and its own commands and queue.
+
 ### Windows-Only PowerShell Tool
 
 Rust does not ship upstream's `powershell` builtin tool. Upstream registers it
@@ -282,14 +592,170 @@ on every platform, so `local-tools.json` lists it, but leaves it out of the
 default tool selection and executes it only on Windows: `getPowerShellConfig()`
 throws "The powershell tool is only available on Windows." elsewhere, and the
 CLI help describes it as "Execute PowerShell commands on Windows". The
-`local-tools.json` parity tests (`builtin_tools_cover_upstream_ts_names`,
-`model_tool_definitions_match_ts_local_tool_schema_keys`) exempt exactly this
-tool and fail once Rust defines it, so the exemption and this entry go together.
+`local-tools.json` parity test (`builtin_tools_cover_upstream_ts_names`)
+exempts exactly this tool and fails once Rust defines it, so the exemption and
+this entry go together.
 
 Reason: pi targets Linux and macOS terminals, where the upstream tool can only
 fail, and Rust enables every builtin tool by default, so porting it would offer
 the model a tool that cannot run. `bash` covers shell execution on the supported
 platforms. Revisit if pi adds Windows support.
+
+### All Built-in Tools Enabled by Default
+
+Upstream enables `read`, `bash`, `edit`, and `write` at startup and leaves
+`grep`, `find`, and `ls` off until `--tools` or `defaultTools` names them. Rust
+enables every built-in tool it has: those seven and its own `todo`,
+`web_search`, and `web_fetch`. So a `defaultTools` or `--tools` list of only
+`+name`/`-name` entries starts from ten tools in Rust and four upstream, and
+`-grep` removes a tool that upstream never had on.
+
+Reason: this is how the Rust port has always started, recorded here rather
+than chosen in this entry. Which tools are on by default is a product decision
+for the owner; the selection settings and flags already follow upstream, so
+changing the default set is a one-line change to that list.
+
+### Tool Selection Is Computed From Settings and Flags
+
+`defaultTools`, `--tools` (an allowlist with `*` patterns, or `+name`/`-name`
+entries), `--exclude-tools`, `--no-builtin-tools`, and `--no-tools` select
+tools as upstream's do, and `settings.json` layers merge `defaultTools` as
+upstream merges them (`settings.json` fixture). These parts differ:
+
+- Rust computes the selection from the settings and the flags at startup and
+  again on `/reload`. Upstream keeps an active-tool list in the session: its
+  `/reload` only adds tools newly named in `defaultTools`, and extensions can
+  change the list with `setActiveTools()`. In Rust a tool removed from
+  `defaultTools` is gone after `/reload`.
+- `enabledTools` is a Rust-only setting: a persistent allowlist, like `--tools`
+  with plain names.
+- Upstream's `defaultActive: false` extension tools (`codemode`,
+  `tool_search`) and its MCP rules for `--tools` do not exist in Rust; every
+  extension tool is on unless an allowlist or `--exclude-tools` leaves it out.
+- Tool flags are not saved with the session. Earlier Rust versions saved them
+  as the session's disabled tools; a saved list is cleared when the session is
+  opened, so a resumed session follows the flags of the run that resumes it.
+- Rust declares the built-in tools in its own fixed order, then the extension
+  tools by name, whatever order `--tools` or `defaultTools` names them in.
+  Upstream declares tools in the order the selection names them. The system
+  prompt lists tools in the declared order, so its list differs the same way.
+
+Reason: Rust's reloadable systems are rebuilt from configuration, and durable
+session state is kept apart from them (see the reload rules in `AGENTS.md`).
+A selection computed from settings and flags needs no session record, and the
+flags mean the same on every run.
+
+### Built-in Tools Run In-Process
+
+Upstream's `grep` runs ripgrep and its `find` runs fd, downloading them when
+they are missing. Rust searches in-process with ripgrep's own `ignore` and
+`globset` crates and the `regex` crate, passing the options upstream passes
+(`rg --hidden [--ignore-case] [--fixed-strings] [--glob]`, `fd --glob
+--hidden`). `tool-behavior.json` records upstream's results for 93 calls and
+`crates/pi-core/src/tool_parity_tests.rs` requires Rust's to be identical.
+Outside those calls these differences are known:
+
+- Order. ripgrep and fd walk in parallel, so upstream's results have no fixed
+  order and a `find` limit keeps whichever results arrived first. Rust lists
+  files in path order and a limit keeps the first in that order. (The fixture
+  runs ripgrep with `--sort=path` and sorts or counts fd's lines.)
+- Configuration of the binaries does not apply: `RIPGREP_CONFIG_PATH` and
+  fd's global ignore file. `.gitignore`, `.ignore`, `.rgignore`, `.fdignore`,
+  `.git/info/exclude`, and git's global excludes file do.
+- Binary files. ripgrep reads a file in 64 KB blocks and stops at a block
+  holding a NUL byte; Rust searches the lines before the 64 KB block that
+  holds the first NUL, which is the same file prefix only approximately.
+- UTF-16 files are not transcoded; ripgrep recognizes their byte order mark.
+- A file or directory that cannot be read is skipped. ripgrep reports it and
+  exits with status 2, which makes upstream fail the whole call.
+- Error text is Rust's: an invalid pattern gives the `regex` crate's message
+  without ripgrep's `rg:` prefix, a pattern containing a newline gives a
+  one-line error, and a `find` path that does not exist gives `Path not found`
+  rather than fd's message.
+- `find` ignores case when the glob has no uppercase character; fd decides
+  from the regular expression the glob compiles to.
+- `ls` sorts ASCII names in upstream's collation order; names with other
+  characters sort after them by code point, where upstream uses the locale's
+  collation.
+
+Reason: a native binary should not download or depend on other binaries, and
+the two crates are the ones ripgrep and fd walk with, so ignore rules and globs
+behave the same. Path order makes results repeatable.
+
+### Shell Tool Differences
+
+The `bash` tool follows upstream's (`bash -c`, no default timeout, the last
+2000 lines or 50 KB with the whole output saved to a temp file, a timeout that
+keeps the output). These parts differ:
+
+- stdout and stderr share one pipe, so the output is in the order the command
+  wrote it. Upstream reads two pipes and appends chunks as they arrive, which
+  can reorder writes that come close together.
+- A running command's output is reported as upstream reports it (all of it
+  so far, within the result's limits, at most every 100 ms), but without
+  upstream's `details`: the truncation data and the path of the saved output
+  come with the result only.
+- Upstream puts its managed tool directory (`~/.pi/agent/bin`) on the
+  command's `PATH`. Rust has no such directory.
+- A timeout is kept in milliseconds, so the notice prints at most three
+  decimals of the seconds the model gave.
+- `!` and `/bash` in the TUI run through the same tool with a 120 second
+  timeout, show their output when they end, and cannot be interrupted on
+  their own. Upstream runs them without a timeout, shows their output while
+  they run, strips terminal escapes from it, and lets Esc cancel them.
+
+Reason: one pipe is the only way to keep the order exact, and it makes results
+repeatable. The TUI's command UX is separate work; the timeout keeps a command
+that never ends from blocking the TUI until then.
+
+### File Tool Differences
+
+`read`, `write`, and `edit` resolve paths and word their results as upstream
+does, including the common failures (`ENOENT: no such file or directory,
+access '<path>'`, `Could not edit file: <path>. Error code: ENOENT.`). These
+parts differ:
+
+- Other I/O failures are worded by Rust (`failed to access <path>: <error>`),
+  not by Node.
+- `read` tries the macOS screenshot spellings of a missing path (a narrow
+  no-break space before AM/PM, a curly apostrophe) but not the decomposed
+  Unicode (NFD) spelling upstream also tries.
+- Images are resized with the `image` crate rather than upstream's Photon, so
+  a resized image is not byte-identical; the limits (2000 pixels a side, 4.5 MB
+  of base64), the PNG-then-JPEG candidates, and the notes are the same.
+- `edit` matches exactly (see Exact-Match edit Tool) and, like `write`,
+  returns no diff: tool results are text.
+
+Reason: the remaining differences are either invisible to the model or need a
+dependency (Unicode normalization) for a rare case.
+
+### Tool Result Images Depend on the Provider API
+
+Upstream sends the images of a tool result (`read` of an image file) to every
+model whose catalog entry lists image input, and replaces them with a note for
+other models. Rust's catalog records each model's `input` too, but nothing
+reads it yet, so Rust still decides by provider API:
+
+- Anthropic Messages, OpenAI Responses (OpenAI, Codex, Azure, GitHub Copilot),
+  Google Gemini and Vertex, and Bedrock Converse: the image is sent in the tool
+  result (for Gemini 2, in a user turn after it), to every model.
+- OpenAI chat completions and Mistral: the image is not sent. The tool result
+  text ends with `(tool image omitted: this provider API does not accept images
+  in tool results)`. Upstream sends it in a user message after the tool
+  results.
+- Upstream adds `[Current model does not support images. ...]` to the `read`
+  result for a model without image input. Rust never does.
+- With `images.blockImages`, `read` returns `Image reading is disabled.` in
+  place of the image. Upstream returns the image and removes it from each
+  request, so turning the setting off later sends it; in Rust it is not saved.
+
+Reason: chat completions is the API of most text-only models, and a tool
+message there cannot hold an image. This rule predates the catalog; sending an
+image to a model that does not accept one risks an error on every later
+request of the session, because the image stays in the conversation. The four
+APIs that carry images in tool results serve models that almost all accept
+them. The catalog now says which models accept images; deciding by it is
+separate work.
 
 ### No MCP Support
 
@@ -368,6 +834,63 @@ sign the user out of Claude Code or Codex. After pi refreshes such a login it
 keeps its own `claude-import`/`codex-import` account, which refreshes early
 like any stored account.
 
+### Run Recovery
+
+pi retries a failed model request and answers a context overflow with one
+compaction and one more request, as upstream's agent session does after a
+failed run. `error-classification.json` holds upstream's rules and
+`rpc-protocol.json` its records for both; pi is compared with each. These
+parts differ:
+
+- Upstream's patterns read the error text, and pi applies them to its own
+  text for what the provider answered: an HTTP status with its body, or a
+  response pi could not use. A transport failure (no connection, a timeout, a
+  stream that broke) is retried by its kind instead, because its text is the
+  HTTP library's and not the one the patterns expect. pi's own errors (no
+  credential, an invalid header, its configuration, a faux script that ran
+  out) are never retried, whatever their text contains.
+- A reply the run drops is not saved. Upstream saves the failed or cut-off
+  attempt and hides it from the model with a `context_edit` journal entry, so
+  its history and exports still show it. pi saves a reply only once it
+  stands: a retried or overflowed attempt leaves no record, and a pi killed
+  during a recovery resumes from the prompt, or from the compaction
+  checkpoint once that is written.
+- A final reply cut off at the output limit stands when nothing replaces it:
+  there is nothing to compact, compaction is off, or the compaction fails.
+  Upstream hides the reply from the model in those cases too, so its next
+  request no longer contains it. pi could only drop it altogether, and it
+  may be the only answer the user got, so pi keeps it: saved, and sent with
+  the next request.
+- Upstream decides whether a cut-off reply could have been longer from the
+  model's `maxTokens` (`isRecoverableLength`), and so does pi, with the
+  catalog's number: a final reply cut off below it is an overflow, and one
+  that reached it stands. Only a `models.json` model of a provider the catalog
+  does not know has no such number, when its entry gives no `maxTokens` and
+  it is not served over the Anthropic API (see Provider Listings and
+  `models.json` Extend the Catalog). pi takes that model's cut-off final
+  reply for a context overflow and compacts once. Upstream gives the model
+  16384 and lets a reply that reached it stand.
+- Upstream also reads a reply that completed as an overflow when the usage
+  it reports exceeds the context window, and compacts right after it. pi
+  compacts before the next request, when its own estimate crosses the
+  threshold.
+- After a second overflow in a row upstream also reports a failed compaction
+  ("recovery failed after one compact-and-retry attempt"). pi ends the turn
+  with the provider's error alone.
+- `retry.provider.timeoutMs`, `retry.provider.maxRetries`, and
+  `retry.provider.maxRetryDelayMs` are read and not used: pi has no retries
+  inside one provider request and does not follow `Retry-After`. Only the
+  retry above applies.
+- In the TUI a retry or an overflow is a system line, text the dropped reply
+  had streamed stays above it (thinking included), and Esc during a backoff
+  interrupts the turn. Upstream shows a retry indicator with the attempt and
+  the delay, and Esc during the backoff cancels only the retry.
+
+Reason: the rules, the single compact-and-retry, and the records are
+upstream's, so a run survives what upstream's survives and a client sees the
+same protocol. The differences follow from pi's journal, which saves what the
+model will see again and nothing else, and from its own HTTP stack.
+
 ### RPC Mode
 
 `pi --mode rpc` speaks upstream's RPC protocol, with four additions listed in
@@ -378,39 +901,59 @@ repeats a `requestId` gets the run the first one started), and `resume-run`
 (`get_state.lastRun`, and `resume_run` to continue an interrupted run).
 `crates/pi-cli/tests/rpc_parity.rs` compares every scenario of
 `rpc-protocol.json` with pi's records and allows exactly the differences in
-the first list; its `normalize`, `expected`, and `without_extensions`
-functions name them, so the two lists change together. The extensions' keys
+the first list; its `normalize`, `expected`, and `without_own` functions
+name them, so the two lists change together. The extensions' keys
 (`runId`, `requestId`, `lastRun`, `rpcExtensions`) are the allowed extras.
 
 Differences in the golden records:
 
 - No system messages: upstream's transcript starts with a system message
   (upstream #9548, which pi has not ported), reported by `message_start` and
-  `message_end` and kept in `agent_end` and `get_messages`. pi reports none.
+  `message_end` and kept in `agent_end` and `get_messages`. pi reports none:
+  it sends its system prompt with every request and keeps it out of the
+  transcript.
 - `messageCount` counts the messages pi keeps: not upstream's system message,
   and not an aborted reply (see below).
 - Queue modes: pi delivers everything queued at once (see Batched Queue and
   Steering Dispatch). `steeringMode` and `followUpMode` are always `all`, and
   setting `one-at-a-time` fails.
-- Model object: pi has no `input`, `cost`, or `maxTokens`, and `baseUrl` only
-  when one is configured. `reasoning` says whether pi offers thinking levels
-  for the model.
+- Model object: `faux/script` has no `baseUrl`, and its `input` and
+  `maxTokens` are upstream's faux provider's rather than the stub model's.
 - Assistant messages have no `responseId`. Usage holds the input and output
   tokens providers report to pi; cache tokens and costs are zero, and there is
   no `reasoning` count.
-- Tool results are text: no `structuredContent` or `details`.
+- Tool results are text, and for a `read` of an image the image: no
+  `structuredContent` or `details`, in a `tool_execution_update`'s
+  `partialResult` either.
+- No `entry_appended` records: they report the journal entry with which
+  upstream hides a dropped reply from the model, and pi never saves that
+  reply (see Run Recovery).
+- A provider error is in pi's words, in an error reply's `errorMessage` and
+  in `auto_retry_start` and `auto_retry_end`: `request failed with status 503
+  Service Unavailable: <body>` where upstream has `503: <body>`.
+- A compaction's `result` is `{summary, details: {omittedMessages,
+  retainedMessages}}`, not upstream's entry ids and token estimates. What a
+  compaction summarizes is pi's choice (see Clipboard Drafts, Conversation
+  Undo, and Session Usage), so after an overflow the summary request and the
+  request that asks again are not upstream's.
+- A final reply cut off at the output limit stays in the conversation when
+  no compaction replaces it, so the next request contains it (see Run
+  Recovery).
 - `get_messages` returns what the session saves: no timestamps, and assistant
   messages with their content and `stopReason` (`toolUse` or `stop`) but no
   model, usage, raw stop reason, or timings.
 
 Other differences:
 
-- While a run is active, `set_model`, `set_thinking_level`, `compact`,
-  `new_session`, `switch_session`, and `set_session_name` are refused.
+- While a run is active, `set_model`, `set_thinking_level`, `set_auto_retry`,
+  `compact`, `new_session`, `switch_session`, and `set_session_name` are
+  refused. Upstream takes `set_auto_retry` at any time and saves it in
+  `settings.json`; pi's lasts for the process.
 - An aborted reply, and the `Operation aborted` result of a tool call the
   abort interrupted, are reported but not saved, so `get_messages` and later
   model requests leave them out. Upstream keeps the aborted reply in the
-  session but also leaves it out of model requests.
+  session but also leaves it out of model requests. The same goes for a reply
+  a run drops to ask again (see Run Recovery).
 - Closing stdin during a run stops it where it is, kills its tool processes,
   and exits without `agent_end` or `agent_settled`; what the run saved stays
   in the session, and the run stays interrupted for `resume_run`. A signal
@@ -430,40 +973,43 @@ Other differences:
   `new_session` starts empty. Upstream's queue lives in memory.
 - A queued prompt (`streamingBehavior` during a run) cannot have a
   `requestId`, which names runs.
-- Retries happen inside the request, before the reply's first record:
-  `auto_retry_start` comes before the reply's `message_start`, and
-  `auto_retry_end` after its `message_end`. Upstream ends the turn with an
-  error reply and retries in a new low-level run.
 - Steering queued together arrives as one user message, its parts joined by
   `---`, and so do follow-ups. Queued messages are text only: `steer`,
   `follow_up`, and a queued `prompt` with images fail.
 - Tool calls arrive whole, so `toolcall_delta` carries all of the arguments
   at once. A tool call that fails before its tool runs (unknown tool, invalid
-  arguments) still has a `durationMs`.
-- Stop reasons: a reply with tool calls is `toolUse`, a token limit `length`,
-  and anything else `stop`, with the provider's reason in `rawStopReason`.
-  A reply cut off at a token limit that has tool calls is `toolUse` too (its
-  calls get error results instead of running); upstream reports `length`.
-  Upstream treats content-filter and refusal reasons as errors.
+  arguments) still has a `durationMs`; a call of a reply cut off at a token
+  limit has none, as upstream's.
+- Stop reasons: a reply cut off at a token limit is `length`, another reply
+  with tool calls `toolUse`, and anything else `stop`, with the provider's
+  reason in `rawStopReason`. Upstream treats content-filter and refusal
+  reasons as errors.
 - During a run, `get_messages` and `messageCount` show an automatic
   compaction only once the engine call that ran it returns.
 - `compact` runs to completion: commands sent meanwhile wait, and `abort` does
-  not cancel it. Its result is `{summary, details: {omittedMessages,
-  retainedMessages}}`, not upstream's entry ids and token estimates.
-- `set_thinking_level` refuses a level the model does not support; upstream
-  clamps it.
+  not cancel it.
+- The model object in `get_state` and `set_model` has the fields of upstream's
+  that pi's model definition has: `id`, `name`, `api`, `provider`, `baseUrl`,
+  `reasoning`, `thinkingLevelMap`, `input`, `cost`, `contextWindow`, and
+  `maxTokens`. It has no `compat`, `headers`, `inputLimits`, `promptCache`, or
+  `type`.
+- `set_thinking_level` with a name that is not a thinking level fails;
+  upstream sets the model's lowest level. A level the model lacks is clamped,
+  as upstream clamps it.
 - `new_session` refuses `parentSession`. With `--no-session` the session id
   stays `ephemeral`.
 - A prompt that is a pi tool command (`/bash ls`, `/read path`) runs the tool
   without the model; the run reports its user message and tool result, but no
   turn.
 - Upstream commands pi does not implement answer `Unsupported command:
-  <type>`: `bash`, `abort_bash`, `abort_retry`, `set_auto_retry`,
-  `set_auto_compaction`, `cycle_model`, `get_available_models`,
-  `cycle_thinking_level`, `get_available_thinking_levels`,
-  `get_session_stats`, `export_html`, `fork`, `clone`, `get_fork_messages`,
-  `get_entries`, `get_tree`, and `get_commands`. pi has no extension UI
-  requests.
+  <type>`: `bash`, `abort_bash`, `set_auto_compaction`, `cycle_model`,
+  `get_available_models`, `cycle_thinking_level`,
+  `get_available_thinking_levels`, `get_session_stats`, `export_html`,
+  `fork`, `clone`, `get_fork_messages`, `get_entries`, and `get_tree`. pi has
+  no extension UI requests.
+- `get_commands` lists prompt templates, then skills. pi has no extension
+  commands to list before them, and its own `/extension:<name>` commands
+  exist only in the TUI.
 - `--mode rpc` takes no prompt arguments; upstream ignores them.
 
 Reason: pi's run engine, session journal, and queue are its own (see Batched

@@ -14,9 +14,11 @@ Current Rust implementation:
 - Append-only JSONL sessions
 - Context-safe `/reload`
 - Config/auth/model loading from `~/.pi/agent`
-- `AGENTS.md` and `CLAUDE.md` context discovery
+- Upstream's default system prompt, with `SYSTEM.md`, `APPEND_SYSTEM.md`,
+  and `AGENTS.md`/`CLAUDE.md` context discovery
 - Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `todo`, `web_search`, `web_fetch`
-- Providers: faux test provider, OpenAI chat/responses/Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini/Vertex, OpenRouter, GitHub Copilot, Amazon Bedrock bearer-token Converse, Mistral, Cloudflare Workers AI/AI Gateway, OpenAI-compatible aliases for DeepSeek, Groq, Cerebras, xAI, Z.AI, Hugging Face, Together, Moonshot AI, and OpenCode, plus Anthropic-compatible aliases for Vercel AI Gateway, Fireworks, MiniMax, Kimi Coding, and Xiaomi MiMo
+- Models: upstream's built-in catalog (every provider and chat model upstream ships, with thinking levels, limits, and prices), plus the faux test models and three providers of this port's own
+- Provider APIs: OpenAI chat completions, OpenAI Responses, Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini and Vertex, Amazon Bedrock bearer-token Converse, and Mistral, which between them serve the catalog's providers
 
 Intentionally removed:
 
@@ -135,10 +137,19 @@ printf '%s\n' '{"id":"1","type":"prompt","message":"hello"}' \
   | cargo run -p pi-cli -- --mode rpc --model faux/echo
 ```
 
-List models:
+List models, or the ones whose provider, id, name, or API contains a text:
 
 ```bash
 cargo run -p pi-cli -- --list-models
+cargo run -p pi-cli -- --list-models opus
+```
+
+Choose a model and a thinking level (see [Models and thinking levels](#models-and-thinking-levels)):
+
+```bash
+cargo run -p pi-cli -- --model anthropic/claude-opus-4-8 --thinking high
+cargo run -p pi-cli -- --model sonnet:high
+cargo run -p pi-cli -- --provider openai --model gpt-5
 ```
 
 List image-generation models:
@@ -175,8 +186,11 @@ Useful CLI scope flags:
 
 ```bash
 cargo run -p pi-cli -- --models faux/echo --tools read,write -p "hello"
+cargo run -p pi-cli -- --tools -bash,-write -p "everything but bash and write"
+cargo run -p pi-cli -- --no-builtin-tools -p "extension tools only"
 cargo run -p pi-cli -- --no-tools -p "no tools"
 cargo run -p pi-cli -- --system-prompt prompt.md --append-system-prompt extra.md -p "hello"
+cargo run -p pi-cli -- --skill ./skills/review -p "/skill:review src/"
 cargo run -p pi-cli -- --image screenshot.png -p "describe this"
 cargo run -p pi-cli -- --export session.json -p "hello"
 cargo run -p pi-cli -- --export session.html -p "hello"
@@ -223,8 +237,11 @@ and each step is an object with one key:
 - `{"usage": {"input": 120, "output": 9}}` reports token usage.
 - `{"stop": "..."}` sets the stop reason. Without it, a response ends with
   `tool_use` after a tool call and `stop` otherwise.
-- `{"error": "..."}` fails the request with a provider error (status 503).
-  Before any output the agent retries it, and the retry gets the next response.
+- `{"error": "..."}` fails the request with a provider error (status 503),
+  which the agent retries: the retry gets the next response. After other
+  steps it breaks the reply off where it is. `{"error": {"status": 401,
+  "body": "..."}}` fails the request with another status and body; whether
+  that is retried follows the rules for a real provider's error.
 - `{"delay_ms": 200}` pauses the response.
 - `{"wait_for_file": "path"}` holds the response until the file exists, for
   example while a test steers or kills pi. Relative paths resolve against the
@@ -237,8 +254,8 @@ JSON line and fsynced before the response starts. A line holds the
 of the offered `tools`. The number of requests already in the log selects the
 response, so a restarted pi continues the script where the previous process
 stopped. Without a log, a counter in the process selects it. A request past the
-end of the script fails with a provider error, which is retried like any other;
-set `"retry": {"enabled": false}` in `settings.json` to fail at once.
+end of the script fails at once with a configuration error, which is never
+retried.
 
 ```bash
 PI_FAUX_SCRIPT=script.json PI_FAUX_SCRIPT_LOG=requests.jsonl \
@@ -261,20 +278,23 @@ Supported files:
 - `model-cache.json`
 - `usage-cache.json`
 - `keybindings.json`
+- `SYSTEM.md`, `APPEND_SYSTEM.md`, and a context file (see
+  [System prompt](#system-prompt))
 - `extensions/`
 - `skills/`
 - `prompts/`
 - `themes/`
 - `sessions/`
 
-Project skills are also discovered from `.agents/skills` directories from the
-current working directory up to the git root. `SKILL.md` files are named by
-their containing directory.
+Skills are also read from `.agents/skills` directories; see [Skills](#skills)
+and [Prompt templates](#prompt-templates) for what `skills/` and `prompts/`
+hold.
 
-Project resources (`.pi/settings.json`, `.pi/extensions`, `.pi/skills`,
-`.pi/prompts`, `.pi/themes`, and `.agents/skills`) load only for a trusted
-project: pass `-a`/`--approve` (or `--no-approve` to refuse) or save a
-decision with `/trust`. `AGENTS.md` and `CLAUDE.md` from the agent directory
+Project resources (`.pi/settings.json`, `.pi/SYSTEM.md`,
+`.pi/APPEND_SYSTEM.md`, `.pi/extensions`, `.pi/skills`, `.pi/prompts`,
+`.pi/themes`, and `.agents/skills`) load only for a trusted project: pass
+`-a`/`--approve` (or `--no-approve` to refuse) or save a decision with
+`/trust`. Context files (`AGENTS.md`, `CLAUDE.md`) from the agent directory
 and from the current directory and its ancestors load whatever the trust
 decision, as upstream does; treat a repository's instructions as untrusted
 input.
@@ -290,8 +310,9 @@ Environment overrides:
 {
   "defaultProvider": "faux",
   "defaultModel": "echo",
-  "defaultThinkingLevel": "xhigh",
-  "enabledModels": ["faux/echo"],
+  "defaultThinkingLevel": "high",
+  "modelThinkingLevels": { "anthropic/claude-opus-4-8": "xhigh" },
+  "enabledModels": ["faux/echo", "anthropic/claude-*:high"],
   "enabledTools": ["read", "bash", "edit", "write", "grep", "find", "ls", "todo", "web_search", "web_fetch"],
   "sessionDir": "sessions",
   "modelRefresh": {
@@ -301,19 +322,321 @@ Environment overrides:
 }
 ```
 
-At startup the model comes from `--model`/`--provider`, then the resumed
-session, then the saved default if its provider has credentials, then a model
+### Models and thinking levels
+
+pi knows the models upstream pi knows. The built-in catalog is upstream's,
+generated from upstream's own model runtime and compiled in
+(`tests/fixtures/ts-parity/model-catalog.json`; `make ts-parity-update`
+regenerates it). Each model has its API and base URL, context window, output
+cap, what it accepts (`text`, `image`), prices, and which thinking levels it
+supports. Beside it sit the providers only this port has: `faux`,
+`zai-coding`, `zai-anthropic`, and `kimi-coding-openai`. The catalog is a
+snapshot: pi does not fetch upstream's hosted catalog or OpenRouter's
+per-key listing, and it leaves out upstream's Radius gateway, whose API it
+does not speak. Provider listings fetched by the model refresh and
+`models.json` add to it (see below).
+
+`--model <pattern>` picks a model as upstream's does:
+
+- `provider/id` or a bare `id`, ignoring case. An id several providers have
+  goes to the one provider with credentials; with none or several, pi names
+  the candidates and asks for `--provider` or `provider/id`.
+- Otherwise the best match on id or name: an alias before a dated id
+  (`claude-haiku-4-5` before `claude-haiku-4-5-20251001`), then the id that
+  sorts last. The match runs over every provider unless `--provider` or a
+  `provider/` prefix narrows it, so `--model sonnet` may pick a provider you
+  have no key for.
+- `:<thinking>` at the end sets the thinking level: `--model sonnet:high`.
+  `--thinking` overrides it.
+- An id the provider does not list, as in `--model anthropic/new-id`, becomes
+  a custom model built on that provider's default model, with a warning.
+- `--provider <name>` narrows `--model` to one provider and requires it.
+
+`--models <patterns>` and the `enabledModels` setting scope model selection to
+the models with credentials that match: exact references, fuzzy matches, or
+globs over `provider/id` and over the id (`anthropic/*`, `*sonnet*`,
+`openrouter/**`; `*` does not cross a `/`), ignoring case, each optionally
+ending in `:<thinking>`. A scope removes no model: a new session starts on the
+saved default if it is in scope, else on the scope's first model, the model
+picker lists the scope, and `--model` and `--list-models` still see
+everything. A pattern that matches nothing prints a warning.
+
+At startup the model comes from `--model`, then the resumed session, then the
+scope, then the saved default if its provider has credentials, then a model
 whose provider has credentials (preferring that provider's usual model, as
-upstream does). A `faux` model is chosen only when it is requested or nothing
-else is available; with `--offline` only `faux` can run, so it is chosen
-unless `--model` names another.
+upstream does). A saved default or a session's model that the catalog no
+longer lists keeps working: it runs as a custom id on its provider's default
+model. A `faux` model is chosen only when it is requested
+or nothing else is available; with `--offline` only `faux` can run, so it is
+chosen unless `--model` names another.
+
+Thinking levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and
+`max`. Which of them a model supports comes from its catalog entry, and a
+level the model lacks becomes the nearest one it has (the next higher one
+first), as upstream clamps it; a model without reasoning is always `off`. A
+session starts on `medium` unless `--thinking`, a `:<thinking>` suffix, the
+model's entry in `modelThinkingLevels`, or `defaultThinkingLevel` says
+otherwise, in that order. Switching models keeps the level in effect, unless
+`modelThinkingLevels` or `defaultThinkingLevel` sets one for the new model.
+Requests carry the level as the model's catalog entry names it, and the
+model's output cap, lowered to fit its context window.
+
+### System prompt
+
+Every model request starts with pi's system prompt, in every mode. It is
+upstream's prompt, word for word: one sentence naming the role, then tagged
+sections.
+
+- `<tools>`: the active tools, one line each. An extension tool is listed
+  when its manifest has a `promptSnippet`.
+- `<rules>`: each active tool's guidelines, then two general rules. Without
+  `grep`, `find`, and `ls`, a rule sends file operations to `bash`.
+- `<addendum>`: appended text, when there is any.
+- `<project_context>`: the context files, each inside
+  `<project_instructions path="...">`.
+- `<skills>`: the loaded skills, while `read` or `bash` is active (see
+  [Skills](#skills)).
+- `<cwd>`: the working directory.
+
+The tool list and rules follow the tools the request declares, so
+`defaultTools`, `enabledTools`, `--tools`, `--exclude-tools`,
+`--no-builtin-tools`, `--no-tools`, and `--offline` (which removes the web
+tools) change them. An extension tool named like a built-in tool replaces it
+here too: the tool appears once, with the extension's snippet and guidelines. Upstream's `<docs>` section, which
+points at its installed documentation, is left out: pi installs none.
+
+A custom prompt replaces the role, `<tools>`, and `<rules>`. The appended
+text, context files, skills, and working directory still follow it. It is the
+first of these that exists:
+
+1. `--system-prompt <text-or-path>`
+2. the `systemPrompt` setting
+3. `.pi/SYSTEM.md` in the working directory, if the project is trusted
+4. `SYSTEM.md` in the agent directory
+
+Appended text is the `appendSystemPrompt` setting's entries followed by each
+`--append-system-prompt <text-or-path>`. Without either, it is
+`.pi/APPEND_SYSTEM.md` of a trusted project, else `APPEND_SYSTEM.md` in the
+agent directory. Files with the same name are not combined: the project's
+replaces the agent directory's.
+
+Context files come from the agent directory, then from each directory from
+the filesystem root down to the working directory. A directory contributes
+one file: `AGENTS.override.md`, else `AGENTS.md`, else `CLAUDE.md`. An
+override replaces only its own directory's file. In a linked git worktree
+checked out inside its main checkout, the worktree's file replaces the main
+checkout's file of the same name instead of adding to it.
+`--no-context-files` (`-nc`) loads none.
+
+### Skills
+
+A skill is a directory with a `SKILL.md`: frontmatter with a `description`,
+then instructions. pi loads and uses skills as upstream does (its
+`docs/skills.md`, and the Agent Skills specification).
+
+```markdown
+---
+name: pdf-tools
+description: Extract text and tables from PDF files. Use when reading PDFs.
+---
+# PDF tools
+
+Read `references/formats.md` before converting a document.
+```
+
+Where skills come from, in the order they load:
+
+1. The `skills` setting of a trusted project, then `.pi/skills`, then
+   `.agents/skills` in each directory from the working directory up to the
+   repository root.
+2. The user's `skills` setting, then `skills/` in the agent directory, then
+   `~/.agents/skills`.
+3. Packages.
+4. Each `--skill <path>`, a file or a directory. `--no-skills` (`-ns`) turns
+   everything above off and keeps these.
+
+In a directory, every `SKILL.md` below it is a skill, and nothing below a
+skill's own directory is searched, so its scripts and references are not
+skills. A Markdown file with a `description` is a skill too when it sits
+directly in `skills/` (in `.agents/skills`, when it sits below it). A skill is
+named by its frontmatter `name`, else by its directory. A `SKILL.md` without
+a `description`, or with frontmatter pi cannot read, is not loaded.
+Frontmatter is read as the YAML the Agent Skills specification uses: plain
+and quoted values, `true`/`false`, and `|` or `>` blocks; a nested mapping or
+a list is accepted and ignored.
+
+When two skills have one name, the first loaded wins. `/diagnostics` reports
+the others, and names and descriptions that break the specification's rules
+(those still load).
+
+The system prompt lists each skill's name, description, and file, and tells
+the model to load the file with `read` (with `bash` when `read` is off) when
+a task matches. A skill with `disable-model-invocation: true` is not listed.
+
+`/skill:<name> [arguments]` sends the skill itself, in every mode: the file's
+text without its frontmatter, in a `<skill>` block that names the file and
+the directory its relative paths start from, followed by the arguments.
+`/skills` lists the loaded skills.
+
+### Prompt templates
+
+A Markdown file `name.md` is the command `/name`, as in upstream's
+`docs/prompt-templates.md`. Templates come from the `prompts` setting and
+`.pi/prompts` of a trusted project, the user's `prompts` setting and
+`prompts/` in the agent directory, packages, and each
+`--prompt-template <path>` (a file or a directory), in that order; the first
+of a name wins. `--no-prompt-templates` (`-np`) keeps only the
+`--prompt-template` paths. A prompts directory gives the Markdown files
+directly in it; a directory named by a setting or a package gives every
+Markdown file below it.
+
+```markdown
+---
+description: Review staged git changes
+argument-hint: "[focus]"
+---
+Review the staged changes. Focus on ${1:-correctness}.
+```
+
+`/review concurrency` sends the file's text without its frontmatter, with the
+command's arguments substituted:
+
+| Placeholder | Stands for |
+|---|---|
+| `$1`, `$2`, ... | one argument |
+| `$@`, `$ARGUMENTS` | all arguments, joined by spaces |
+| `${1:-default}`, `${@:-default}` | the argument, or all of them, or the default |
+| `${@:N}`, `${@:N:L}` | the arguments from the Nth on, or `L` of them |
+
+Quotes keep spaces in an argument: `/review "API compatibility"`. `/prompts`
+lists the templates, and command completion shows each one's argument hint
+and description.
+
+Skill commands and templates expand wherever input enters: a prompt in the
+TUI, in print mode, and in RPC mode, and steering and follow-ups in the TUI
+and in RPC mode. A command that names neither is sent to the model as text.
+The TUI's own commands come first, then pi's slash-tool prompts (`/read
+<path>`, `/bash <command>`, ...), then skills, then templates.
+
+pi also keeps `/prompt <name> [input]` in the TUI: `{{input}}` in the
+template stands for the input, which otherwise follows the template's text.
+
+### Session variables
+
+Commands the model runs with `bash` see the session they belong to:
+
+| Variable | Value |
+|---|---|
+| `PI_SESSION_ID` | The session id (`ephemeral` with `--no-session`) |
+| `PI_SESSION_FILE` | Absolute path of the session journal; unset with `--no-session` |
+| `PI_PROVIDER` | The active model's provider |
+| `PI_MODEL` | The active model's id |
+| `PI_REASONING_LEVEL` | The reasoning level the turn's requests use: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
+
+They are set for each command as it starts, and the system prompt tells the
+model they exist. A variable with nothing to report is removed rather than
+inherited, so a pi started from another pi's command never reports its
+parent's session. Commands you type (`/bash`, `!`, `!!`) are not given them.
+
+pi also marks its own process, and so every command and tool it starts:
+`AI_AGENT=pi` names the agent for any tool that asks, and
+`PI_CODING_AGENT=true` is pi's own marker.
+
+### Tool selection
+
+Every built-in tool is enabled by default. Upstream pi enables only `read`,
+`bash`, `edit`, and `write`; apart from that default set, selection works as
+upstream's does:
+
+- `defaultTools` in `settings.json` selects the built-in tools. Plain names
+  replace the default set; `+name` adds a tool and `-name` removes one, in
+  list order. A project list of only `+name`/`-name` entries changes the
+  user's list instead of replacing it. `[]` disables every built-in tool.
+  Extension tools are not part of this selection and stay enabled.
+- `--tools` with plain names is an allowlist over built-in and extension
+  tools; `*` matches any characters (`--tools 'read,web_*'`). With only
+  `+name`/`-name` entries it changes the default selection for one run
+  (`--tools -bash,+grep`). The two forms cannot be mixed.
+- `--exclude-tools` removes tools by name or pattern.
+- `--no-builtin-tools` disables the built-in tools and keeps extension tools.
+  `--no-tools` disables every tool `--tools` does not name.
+- `enabledTools` in `settings.json` is a persistent allowlist, like `--tools`
+  with plain names; `--tools`, `--no-builtin-tools`, and `--no-tools` replace
+  it for the run. Upstream has no such setting.
+
+The flags apply to the run they are given to and are not saved with the
+session. `/reload` selects again from the reloaded settings and the same flags.
+
+### File and shell tools
+
+`read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls` take upstream pi's
+arguments and return upstream's results: limits, notices, and wording are
+compared with results recorded from upstream's tools
+(`tests/fixtures/ts-parity/tool-behavior.json`). A path may be relative to the
+working directory, absolute, or under `~/`; as in upstream, tools are not
+confined to the working directory. Differences from upstream are listed in
+`docs/rust-rewrite/non-parity-register.md`.
+
+- `read` returns at most 2000 lines or 50 KB of a text file, whichever comes
+  first, and says which `offset` continues. `offset` is the first line
+  (1-based) and `limit` the number of lines; an `offset` past the end is an
+  error. A line longer than 50 KB is not returned: the result gives a `sed`
+  command for it. An image (PNG, JPEG, GIF, WebP, or BMP, recognized by its
+  content) is attached to the result; see below.
+- `bash` runs `bash -c` in its own session with empty stdin: `/bin/bash`, else
+  `bash` on `PATH`, else `sh`. The `shellPath` setting names another shell and
+  `shellCommandPrefix` is put before every command. It is not a login shell.
+  stdout and stderr come back as one stream in the order written. The model
+  gets the last 2000 lines or 50 KB; longer output is also saved whole to
+  `pi-bash-<random>.log` in the temp directory (readable only by you), and
+  the result names that file. There is no default timeout. With `timeout`
+  (seconds) the command and its process group are killed when it passes, and
+  the result is the output so far followed by `Command timed out after N
+  seconds`. A non-zero exit is an error result ending in `Command exited with
+  code N`. While a command the model called runs, its output so far (within
+  the same limits) is reported at most every 100 ms: the TUI shows the latest
+  line under the running command (`ctrl+o` shows all of it), and RPC mode
+  sends `tool_execution_update` records.
+- `edit` replaces exact text: every `oldText` must occur once, the edits must
+  not overlap, and all apply or none do.
+- `write` creates or replaces a file, creating its parent directories.
+- `grep` searches like `rg --hidden`: hidden files are searched, `.ignore` and
+  `.rgignore` files apply, and so does `.gitignore` inside a git repository.
+  `glob` filters the files, `ignoreCase` and `literal` change matching, and
+  `context` adds lines around each match. It returns at most 100 matches
+  (`limit`) or 50 KB, cuts lines at 500 characters, and lists files in path
+  order. `.git/` is searched like any hidden directory.
+- `find` matches a glob like `fd --glob --hidden`: against the file name, or
+  against the path when the glob contains `/`. It lists files and directories
+  (directories end in `/`) below `path`, applies `.gitignore`, `.ignore`, and
+  `.fdignore`, ignores case unless the glob has an uppercase letter, and
+  returns at most 1000 results (`limit`) or 50 KB in path order.
+- `ls` lists a directory, dotfiles included and directories ending in `/`,
+  sorted without regard to case, up to 500 entries (`limit`) or 50 KB.
+
+Images that `read` returns reach the model only where the provider API carries
+images in tool results:
+
+| Provider API | Providers | Image in a `read` result |
+|---|---|---|
+| Anthropic Messages | Anthropic, Claude Code OAuth, Anthropic-compatible aliases | Sent in the tool result |
+| OpenAI Responses | OpenAI, Codex, Azure OpenAI, GitHub Copilot | Sent in the tool result |
+| Google Gemini / Vertex | Google | Sent in the tool result (Gemini 3) or the next user turn |
+| Bedrock Converse | Amazon Bedrock | Sent in the tool result |
+| OpenAI chat completions | OpenAI chat models, OpenRouter, Cloudflare, Mistral, and the OpenAI-compatible aliases | Not sent; the result says the image was left out |
+
+pi decides by API, not yet by the model's `input` in the catalog, so an image
+is sent to every model behind the first four APIs. `images.blockImages` keeps
+`read` from returning images at all, and `images.autoResize` (on by default)
+scales an image down to at most 2000 pixels a side and 4.5 MB.
 
 ### Web tools
 
 `web_search` returns numbered titles, URLs, and snippets; `web_fetch` retrieves
 readable HTML/text/JSON/XML, retaining source URLs and links. They are enabled
-by default unless `enabledTools`, `--tools`, `--exclude-tools`, or `--no-tools`
-restricts them. `--offline` / `PI_OFFLINE=1` blocks both, including after reload.
+by default unless `defaultTools`, `enabledTools`, `--tools`, `--exclude-tools`,
+`--no-builtin-tools`, or `--no-tools` leaves them out. `--offline` /
+`PI_OFFLINE=1` blocks both, including after reload.
 
 Search uses DuckDuckGo HTML without an API key by default. For a more reliable
 backend, set `BRAVE_SEARCH_API_KEY`, or set `PI_SEARXNG_URL` to the complete
@@ -393,7 +716,7 @@ account:
     "default": { "type": "api_key", "key": "env:ANTHROPIC_API_KEY" },
     "work": { "type": "api_key", "key": "env:WORK_ANTHROPIC_API_KEY" }
   },
-  "azure-openai-responses": { "default": { "type": "api_key", "key": "env:AZURE_OPENAI_API_KEY" } },
+  "azure": { "default": { "type": "api_key", "key": "env:AZURE_OPENAI_API_KEY" } },
   "google": { "default": { "type": "api_key", "key": "env:GEMINI_API_KEY" } },
   "google-vertex": { "default": { "type": "api_key", "key": "env:GOOGLE_CLOUD_API_KEY" } },
   "github-copilot": { "default": { "type": "api_key", "key": "env:COPILOT_GITHUB_TOKEN" } },
@@ -426,7 +749,10 @@ account:
 ```
 
 Older flat files (`{ "openai": { "type": "api_key", ... } }`) are migrated on
-read; writes always use the nested form. Without an explicit selection the
+read; writes always use the nested form. The Azure provider is `azure`, as
+upstream names it; an entry, a saved default, a session, or a `models.json`
+model under the id earlier versions used, `azure-openai-responses`, is read
+as `azure`. Without an explicit selection the
 `default` account is used, or the sole account when only one exists.
 
 `auth.json` is written atomically and owner-only (`0600`; a missing agent
@@ -456,9 +782,16 @@ pi login anthropic                 # PKCE authorize + paste-code flow
 pi login anthropic --account work
 ```
 
-`pi login openai-codex` stores the OAuth credential for both `openai` and
-`openai-codex` (mirroring the codex import mapping); `pi login anthropic`
-stores it for `anthropic`. Expiry and `account_id` come from the issued token
+`pi login openai-codex` stores the login for `openai-codex`, and
+`pi login anthropic` stores it for `anthropic`. A ChatGPT login is
+`openai-codex`'s credential and its only one; `openai` takes an API key
+(`pi login openai --api-key ...`, `OPENAI_API_KEY`, or the Codex CLI's
+`CODEX_API_KEY`). Neither provider's models count as available on the
+strength of the other's credential: with only a ChatGPT login pi starts on an
+`openai-codex` model, and a `--models` pattern, `/model <reference>`, or
+`set_model` does not reach `openai`'s. Earlier versions stored the ChatGPT
+login under `openai` as well; that copy is ignored and `pi logout openai`
+removes it. Expiry and `account_id` come from the issued token
 (JWT `exp` for Codex, `expires_in` for Claude), and the stored credentials
 refresh automatically when they expire, also in the middle of a turn: every
 model request resolves them anew. Importing credentials from
@@ -469,7 +802,7 @@ account replaces it.
 When no explicit API key is configured, `pi` can reuse existing CLI login credentials:
 
 - Claude Code: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or `~/.claude/.credentials.json`
-- Codex/ChatGPT: `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json` for `openai` and `openai-codex`
+- Codex/ChatGPT: `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json` for `openai-codex`
 
 Explicit API keys still take precedence over login tokens. Imported OAuth
 credentials are refreshed automatically when they expire; refreshed tokens are
@@ -504,19 +837,14 @@ Provider-specific environment:
 
 - Azure OpenAI: set `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`; optionally set `AZURE_OPENAI_DEPLOYMENT_NAME`, `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`, and `AZURE_OPENAI_API_VERSION`.
 - Google Vertex: set `GOOGLE_CLOUD_PROJECT` or `GCLOUD_PROJECT`, plus `GOOGLE_CLOUD_LOCATION`.
-- Cloudflare: set `CLOUDFLARE_ACCOUNT_ID`; AI Gateway also needs `CLOUDFLARE_GATEWAY_ID`.
+- Cloudflare: set `CLOUDFLARE_ACCOUNT_ID`; AI Gateway also needs `CLOUDFLARE_GATEWAY_ID`. Without them the provider's models do not count as available, whatever key is set.
 - Amazon Bedrock: Rust direct calls currently use Bedrock bearer-token auth via `AWS_BEARER_TOKEN_BEDROCK`.
 - Claude Code OAuth: requests identify as `claude-cli/<version>`. The version tracks the latest published Claude Code release (fetched from the npm registry during model refresh, cached in `model-cache.json`); set `PI_CLAUDE_CODE_VERSION` to pin it.
 
-`models.json` may override the built-in model list:
+`models.json` adds models to the built-in catalog or redefines them:
 
 ```json
 [
-  {
-    "provider": "openai",
-    "id": "gpt-5.4",
-    "api": "openai-responses"
-  },
   {
     "provider": "anthropic",
     "id": "claude-sonnet-4-5",
@@ -527,21 +855,53 @@ Provider-specific environment:
     "id": "moonshotai/kimi-k2.6",
     "api": "openai-completions",
     "baseUrl": "https://openrouter.ai/api/v1"
+  },
+  {
+    "provider": "local",
+    "id": "my-model",
+    "api": "openai-completions",
+    "baseUrl": "http://127.0.0.1:8080/v1",
+    "contextWindow": 32000,
+    "maxTokens": 4000,
+    "reasoning": true,
+    "thinkingLevelMap": { "minimal": null, "xhigh": "xhigh" }
   }
 ]
 ```
+
+An entry is used as written: `provider`, `id`, `name`, `api`, and `baseUrl`
+(without one, the API's own default endpoint). The fields that describe the
+model are upstream's and optional: `contextWindow`, `maxTokens` (the output
+cap), `reasoning`, `thinkingLevelMap` (`null` for a level the model lacks, a
+string for what the provider is sent for a level; `xhigh` and `max` exist only
+when named), `input`, and `cost`. What an entry leaves out comes from the
+built-in model of the same id, else from its provider's default model, as for
+`--model provider/new-id`. For a provider the catalog does not know, a model
+has no thinking levels and requests carry no output cap unless the entry says
+so (the Anthropic API requires one: 16384). The file's format is this port's
+own; upstream's `providers` format is not read.
+
+A base URL names the API's root, as it does upstream: pi appends
+`/v1/messages` (Anthropic), `/chat/completions` (OpenAI chat),
+`/responses`, or `/v1/chat/completions` (Mistral). An Anthropic or Mistral
+URL that already ends in `/v1` gets only the rest of the path.
 
 `model-cache.json` is managed by `pi`. On startup, `pi` uses built-in models,
 cached models, and explicit `models.json` entries immediately, then starts a
 non-blocking background refresh when `modelRefresh.enabled` is not false,
 `PI_OFFLINE`/`--offline` is not set, the cache is older than `ttlHours`, and a
 provider has supported auth. `/reload` also kicks a refresh. Refreshed models
-are available after `/reload` or the next startup. Refresh covers `anthropic`,
-`openai`, and `openai-codex` (API key or OAuth login), plus the
-OpenAI-compatible `zai`, `zai-coding`, `moonshotai`, and `kimi-coding-openai`
-endpoints via their API keys. Anthropic refresh paginates the official Models
-API; OAuth refresh is best-effort against the same provider auth paths used
-for model requests.
+are available after `/reload` or the next startup. Refresh covers `anthropic`
+(API key or Claude login), `openai` (API key), and `openai-codex` (ChatGPT
+login), plus the OpenAI-compatible `zai`, `zai-coding`, `moonshotai`, and `kimi-coding-openai`
+endpoints via their API keys, each at the base URL the catalog gives the
+provider. Anthropic refresh paginates the official Models API; OAuth refresh
+is best-effort against the same provider auth paths used for model requests.
+
+A listing says which models a provider serves, not what they can do. A listed
+model the catalog has stays as the catalog defines it; one it lacks is built
+on the provider's default model, like `--model provider/new-id`, and keeps
+the listing's name and context window.
 
 Refresh is defensive about partial failures. A provider that returns an empty
 list keeps its cached models instead of wiping them, an exhausted pagination
@@ -559,11 +919,15 @@ Two slash commands manage the cache directly:
   starts from built-in models plus explicit `models.json` entries only; run
   `/models refresh` to repopulate.
 
-Thinking levels can be set with `--thinking <level>` or `/thinking <level>`.
-Supported levels are model-specific. Opus exposes `high`, `xhigh`, and `max`;
-OpenAI/Codex reasoning models expose `minimal` through `xhigh`. While the
-`/model` selector is open, left/right adjusts the pending thinking level and
-Enter applies both the model and thinking level to the session. `/new` starts
+Thinking levels can be set with `--thinking <level>` or `/thinking <level>`
+(see [Models and thinking levels](#models-and-thinking-levels)). `/thinking`
+alone shows the level in effect, and `/thinking <level>` takes one of the
+levels the model supports, naming them when it is given another. `/model
+<provider/id>` or `/model <id>` switches to that model, ignoring case; any
+other text opens the picker with it as the search. While the `/model`
+selector is open, each model shows the level selecting it would apply,
+left/right walks the model's own levels, and Enter applies the model and that
+level to the session. `/new` starts
 fresh conversation history while retaining the current model, thinking level,
 and account selection; these selections are persisted in the new session.
 `/thinking off` remains explicitly off rather than inheriting a default.
@@ -588,7 +952,7 @@ resources by convention through `extensions/`, `skills/`, `prompts/`, and
 {
   "pi": {
     "extensions": ["extensions/assist"],
-    "skills": ["skills/review.md"],
+    "skills": ["skills/review"],
     "prompts": ["prompts/fix.md"],
     "themes": ["themes/dark.json"]
   }
@@ -621,9 +985,15 @@ Executable extensions can opt into the JSON protocol with an adjacent
 tools; Pi sends `kind: "tool"` JSON requests on stdin and expects a JSON
 response with `output` or `error`. Like `bash`, a tool process has no
 controlling terminal, and an interrupted call kills its process group. A
+non-zero exit is a failed call: the model gets what the extension printed as
+an error result. Output beyond 2000 lines or 50 KB is cut there and saved
+whole to a temp file the result names. A tool named like a built-in tool
+replaces it: the model is offered the extension's definition only. A
 call that a stop cut off never runs again when its turn continues unless the
 tool declares `"replaySafe": true` (it only reads, so running it twice is
-harmless):
+harmless). `promptSnippet` is the tool's line in the system prompt's tool
+list, and `promptGuidelines` are rules added to the prompt while the tool is
+active; both are optional, and a tool without a snippet is not listed:
 
 ```json
 {
@@ -637,7 +1007,9 @@ harmless):
         "properties": { "text": { "type": "string" } },
         "required": ["text"]
       },
-      "replaySafe": true
+      "replaySafe": true,
+      "promptSnippet": "Echo text back",
+      "promptGuidelines": ["Use fixture_echo only in tests."]
     }
   ]
 }
@@ -672,8 +1044,9 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/image-models [search]`
 - `/generate-image <output> <prompt>`
 - `/skills`
-- `/skill:<name> [input]`
+- `/skill:<name> [arguments]` (see [Skills](#skills))
 - `/prompts`
+- `/<template> [arguments]` (see [Prompt templates](#prompt-templates))
 - `/prompt <name> [input]`
 - `/themes`
 - `/theme <name>`
@@ -726,8 +1099,8 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/read <path>`
 - `/write <path> <text>`
 - `/edit <path> <find> <replace>`
-- `/grep <text> [path]`
-- `/find <text>`
+- `/grep <pattern> [path]`
+- `/find <glob>`
 - `/ls [path]`
 - `/bash <command>`
 - `! <command>`
@@ -755,7 +1128,7 @@ Collapsed thinking and tool blocks use at most three terminal rows (excluding th
 
 Queued follow-ups are visible immediately above the editor, one truncated line per message (the newest four when the queue overflows). Up with an empty editor recalls the newest queued message for editing (otherwise prompt-history navigation is unchanged). Mid-turn `ctrl+s` steers queued messages followed by the draft at the next provider boundary (a prose-only response has no interior boundary, so steering is delivered after it finishes and the queue hint says so); the existing steering mode still controls batch size. Queue edits are journaled during streaming and survive reload/resume.
 
-Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Shell commands (`!`, `/bash`, and the model's `bash` tool) are non-interactive: stdin is empty and the command runs in its own session without a controlling terminal, so a program that prompts for input fails instead of waiting. A command that times out (120s by default) or whose turn is interrupted is killed together with its whole process group; background jobs started by a command that finished normally keep running. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
+Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. A skill command or a prompt template typed mid-turn is queued expanded: as a follow-up with Enter, as steering with ctrl+s. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Shell commands (`!`, `/bash`, and the model's `bash` tool) are non-interactive: stdin is empty and the command runs in its own session without a controlling terminal, so a program that prompts for input fails instead of waiting. A command that times out or whose turn is interrupted is killed together with its whole process group, and a timeout returns the output so far; background jobs started by a command that finished normally keep running, and the command returns without waiting for them. `!` and `/bash` commands time out after 120 seconds; the model's `bash` calls have no timeout unless the model sets one. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
 
 The TUI defaults to an owned alternate-screen transcript with a fixed composer. Mouse wheel and PageUp/PageDown scroll only the conversation; Up/Down retain prompt-history/queue navigation. At the bottom, new output follows automatically. Scrolling up anchors the reader to logical text: streaming, resizing, panel changes, and reload do not steal the reading position. `↓ Scroll to bottom · Esc` appears while reading (with `new output` when text arrives); click it, press Esc, or scroll down to resume following. Live thinking-tail previews are frozen while reading; returning to latest refreshes them. Esc dismisses an open selector/diff panel first, otherwise returns to latest without clearing the draft/attachments or interrupting generation. At latest it retains the existing clear/interrupt behavior. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 
@@ -852,10 +1225,10 @@ system prompt, tool set, or persistent instructions, or a single turn larger
 than the window), the turn continues with the original history instead of
 failing: the failure is reported in the transcript with a token breakdown
 (`system prompt`/`tools`/`persistent instructions`/`retained recent turns`),
-and re-attempts are skipped until history changes. The provider still returns
-a real error if the request genuinely exceeds its window.
-Known model windows come from the catalog/provider metadata; custom `models.json`
-entries can specify `contextWindow`. Unknown windows fall back to 128,000 tokens.
+and re-attempts are skipped until history changes. If the provider then
+refuses the request as too large, "Run recovery" below applies.
+Model windows come from the catalog; custom `models.json` entries can specify
+`contextWindow`. Unknown windows fall back to 128,000 tokens.
 Token counts are heuristics, not exact provider tokenization.
 
 The agent per-run round cap is configurable alongside compaction and retry:
@@ -868,19 +1241,49 @@ The agent per-run round cap is configurable alongside compaction and retry:
 }
 ```
 
-Provider requests retry automatically on transient transport errors
-(default 3 retries, exponential backoff from 2s; `retry.enabled`,
-`retry.maxRetries`, `retry.baseDelayMs` in settings). When retries are
-exhausted the error names the likely causes — including a local firewall
-that denies connections from a freshly built binary until its prompt is
-approved — because on default-deny hosts an unanswered prompt is
-indistinguishable from an outage.
-```
-
 `agent.maxToolRounds` bounds provider rounds per user run, including steering
 rounds. The default is 200; values are clamped to at least 1. When the cap is
 reached the turn stops with a round-limit error, all work stays saved, and
 sending any prompt (or restarting, which auto-continues) gets a fresh budget.
+A request that is retried, or asked again after an overflow, is one round.
+
+### Run recovery
+
+A model request that fails is handled as upstream pi handles it, in the TUI,
+print mode, and RPC mode alike:
+
+- **Retry.** A failure that a retry can fix is retried, whether the request
+  failed before any output or broke off mid-reply: a connection that cannot
+  be made or drops, a timeout, HTTP 408, 429, 500, 502, 503, 504, 520, and
+  524, and any answer that says the provider is overloaded or rate limited.
+  The reply that broke off is dropped: it is not saved and not sent back to
+  the model. Defaults are 3 retries with exponential backoff from
+  2 s, capped at 60 s (`retry.enabled`, `retry.maxRetries`,
+  `retry.baseDelayMs`, `retry.maxAgentDelayMs`). Other failures end the turn
+  at once: 400, 401, 403, and 404 responses, other statuses whose body names
+  nothing transient, a missing credential, and quota or billing limits even
+  when they arrive as a 429. The rules are upstream's
+  patterns over the error text (`error-classification.json`). When retries
+  run out, the error names the likely causes, including a local firewall
+  that denies connections from a freshly built binary until its prompt is
+  approved, because on default-deny hosts an unanswered prompt is
+  indistinguishable from an outage.
+- **Context overflow.** When the provider refuses a request as too large for
+  the model's context window, pi compacts and asks again, once. The same
+  happens when a final reply is cut off at the output limit although the
+  model could have written more, by its catalog `maxTokens` (for a
+  `models.json` model of a provider the catalog does not know that names no
+  `maxTokens`, pi assumes the context was the cause): the cut-off reply is
+  dropped and the compacted request is sent again. A reply cut off
+  while calling a tool is kept instead; its calls get error results and the
+  model issues them again. If there is nothing to compact, or compaction is
+  off or fails, an overflow error ends the turn, and a cut-off reply stands
+  as the turn's answer. A second overflow in a row is not compacted again.
+
+In the TUI a retry or an overflow appears as a system line (`retrying in 2s
+(attempt 1 of 3): …`); text the dropped reply had streamed stays above it,
+and the reply that replaces it starts below. Esc during a backoff interrupts
+the turn.
 
 The original transcript remains in the session journal. A validated, smaller
 checkpoint and its replacement context are committed together through an atomic
@@ -903,11 +1306,19 @@ go to stderr. RPC mode starts when stdin is not a terminal and takes no prompt
 arguments.
 
 Commands: `prompt` (with `images`, `streamingBehavior`, and `requestId`),
-`steer`, `follow_up`, `abort`, `resume_run`, `clear_queue`, `get_state`,
-`get_messages`, `get_last_assistant_text`, `new_session`, `switch_session`,
-`set_model`, `set_thinking_level`, `set_steering_mode`, `set_follow_up_mode`,
-`compact`, and `set_session_name`. Other upstream commands answer
+`steer`, `follow_up`, `abort`, `abort_retry`, `set_auto_retry`, `resume_run`,
+`clear_queue`, `get_state`, `get_messages`, `get_last_assistant_text`,
+`get_commands`, `new_session`, `switch_session`, `set_model`,
+`set_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`,
+and `set_session_name`. Other upstream commands answer
 `Unsupported command: <type>`, and unknown types `Unknown command: <type>`.
+
+A `prompt`, `steer`, or `follow_up` whose message is a skill command or a
+prompt template is expanded when it arrives, so the queue and the session
+hold the expansion. `get_commands` lists the templates and the skills (as
+`skill:<name>`) with their descriptions and where each was loaded from. A
+message that starts with `/` and names neither goes to the model as text,
+except pi's slash-tool prompts, which run their tool.
 
 A `prompt` that starts a run answers `{"disposition":"started","runId":"…"}`,
 then the run reports `agent_start`, its turns (`turn_start` … `turn_end`),
@@ -918,11 +1329,34 @@ delivered in it, after the turn that would otherwise end it. `abort` answers
 once the run has settled, or at once when no run is active, and leaves queued
 messages for the next prompt. While a run is active, a `prompt` needs
 `streamingBehavior` (`steer` or `followUp`); `set_model`,
-`set_thinking_level`, `compact`, `new_session`, `switch_session`,
-`set_session_name`, and `resume_run` are refused; and `get_state`,
-`get_messages`, and `get_last_assistant_text` answer from the run's current
-state. `set_model` changes the session's model, not the default model in
-`settings.json`.
+`set_thinking_level`, `set_auto_retry`, `compact`, `new_session`,
+`switch_session`, `set_session_name`, and `resume_run` are refused; and
+`get_state`, `get_messages`, and `get_last_assistant_text` answer from the
+run's current state. `set_model` takes a model that can run now (its provider
+has credentials) by exact provider and id, and changes the session's model,
+not the default model in `settings.json`; the thinking level follows as it
+does for any model switch. `set_thinking_level` clamps the level to what the
+model supports. Both report a change of the level in effect with
+`thinking_level_changed`. `get_state` gives the model with the catalog's
+fields (`reasoning`, `thinkingLevelMap`, `input`, `cost`, `contextWindow`,
+`maxTokens`) and, as `thinkingLevel`, the level in effect. `set_auto_retry`
+turns retries on or off for this process only.
+
+A run that recovers (see "Run recovery") reports it as upstream does. The
+reply it drops ends its turn: `message_end` with `stopReason` `error` (or
+`length` for a reply cut off at the output limit), `turn_end`, and
+`agent_end`, whose `willRetry` is true before a retry. Then come
+`auto_retry_start` and the backoff, or `compaction_start` and
+`compaction_end` with reason `overflow` (`willRetry` true when the run asks
+again). The run then starts over with another `agent_start`, under the same
+`runId`, and still settles exactly once. `auto_retry_end` follows the reply
+that succeeded, or the `agent_end` of the last failure. `abort_retry` ends a
+backoff in progress: the run settles with the failure it would have retried,
+and `auto_retry_end` reports `Retry cancelled`.
+
+While a `bash` call runs, `tool_execution_update` records carry its output so
+far in `partialResult.content`: none when the command starts, then all of it
+(within the result's limits) each time more arrives, at most every 100 ms.
 
 pi adds four extensions, listed in `get_state.rpcExtensions`:
 
@@ -1031,7 +1465,16 @@ CLI flags, slash commands, settings normalization, and session/export shape
 where Rust intentionally supports compatibility or analogous behavior. The RPC
 protocol fixture records every stdout record of upstream `pi --mode rpc` for
 scripted runs against a local stub model, and pi's RPC mode is compared with it
-record by record. Secrets are redacted. Rust tests
+record by record. The system prompt fixture records upstream's prompt text
+for fixed tools, prompt sources, context files, and skills, and which prompt
+and context files upstream picks from a directory tree; pi's prompt is
+compared with it to the byte. The skills fixture records which skills and
+prompt templates upstream loads from directory trees, settings, and flags,
+how it reads their frontmatter, and what it sends for `/skill:name` and
+`/template` input; pi is compared with each. The error classification
+fixture records which failed requests upstream retries and which it reads as
+a context overflow: its pattern lists, which pi keeps verbatim, and its
+verdicts for sample error messages. Secrets are redacted. Rust tests
 compare covered behavior against those fixtures, so upstream changes become
 visible as fixture diffs and test failures.
 

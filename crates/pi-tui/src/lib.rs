@@ -147,8 +147,12 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "list prompt templates",
     },
     CommandHelp {
+        command: "/<template> [arguments]",
+        description: "invoke a prompt template by its name",
+    },
+    CommandHelp {
         command: "/prompt <name> [input]",
-        description: "invoke a prompt template",
+        description: "invoke a prompt template, filling {{input}}",
     },
     CommandHelp {
         command: "/themes",
@@ -331,12 +335,12 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "replace text",
     },
     CommandHelp {
-        command: "/grep <text> [path]",
+        command: "/grep <pattern> [path]",
         description: "search files",
     },
     CommandHelp {
-        command: "/find <text>",
-        description: "find files by substring",
+        command: "/find <glob>",
+        description: "find files by glob",
     },
     CommandHelp {
         command: "/ls [path]",

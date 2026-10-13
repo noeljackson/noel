@@ -11,9 +11,10 @@ import { fileURLToPath } from "node:url";
  * stub and records every stdout record in order, per scenario.
  *
  * Record order is deterministic because the fixture sends a command only while
- * pi is idle or blocked on a stub reply the fixture holds, and because the stub
- * streams in lock-step: it sends one chunk, then waits for pi's record of it.
- * Volatile values are replaced by placeholders; see PLACEHOLDERS.
+ * pi is idle, blocked on a stub reply the fixture holds, or waiting out a long
+ * retry backoff, and because the stub streams in lock-step: it sends one chunk,
+ * then waits for pi's record of it. Volatile values are replaced by
+ * placeholders; see PLACEHOLDERS.
  */
 
 const CLI = "/ts-reference/packages/coding-agent/src/cli.ts";
@@ -34,11 +35,13 @@ const STUB_MODEL = {
 };
 
 const PLACEHOLDERS = {
-	"<timestamp>": "Message and event timestamps (milliseconds since the epoch).",
+	"<timestamp>": "Message and event timestamps (milliseconds since the epoch), and entry timestamps (ISO 8601).",
 	"<duration-ms>": "durationMs of assistant messages and tool executions.",
+	"<seconds>": "wall_time_seconds of a bash result.",
 	"<tokens>": "Token counts in usage objects.",
 	"<cost>": "Cost amounts in usage objects.",
 	"<session-id>": "Session ids pi generates.",
+	"<entry-id>": "Session entry ids pi generates (id, parentId, targetId, firstKeptEntryId).",
 	"<tmp>": "The scenario's temporary directory (cwd, agent dir, and session dir live below it).",
 	"<session-file>": "Session file name (timestamp and session id).",
 	"<stub-url>": "Base URL of the local OpenAI-compatible stub model.",
@@ -50,12 +53,20 @@ const PLACEHOLDERS = {
 type Json = Record<string, any>;
 type Gate = { promise: Promise<void>; open: () => void };
 
-/** One scripted model reply: text deltas or one tool call. */
+/** One scripted model reply: text deltas or one tool call, or a failure. */
 type Reply = {
 	text?: string[];
 	toolCall?: { id: string; name: string; arguments: Json };
 	/** "headers": answer only after release(n). "stream": send the first delta, then hang until pi disconnects. */
 	hold?: "headers" | "stream";
+	/** Answer with this HTTP status and an OpenAI error body instead of a stream. */
+	error?: { status: number; message: string; type: string; code?: string };
+	/** Close the connection after the deltas, before the stream finishes. */
+	drop?: true;
+	/** The last chunk's finish_reason; "stop", or "tool_calls" after a tool call, by default. */
+	finish?: string;
+	/** A reply pi records no assistant message for (a compaction summary): streamed without lock-step. */
+	unrecorded?: true;
 };
 
 function gate(): Gate {
@@ -134,10 +145,20 @@ class ModelStub {
 		this.arrivals[index].open();
 		if (reply.hold === "headers") await this.gates[index].promise;
 		const pi = this.pi!;
+		if (reply.error) {
+			const { status, ...error } = reply.error;
+			response.writeHead(status, { "content-type": "application/json" });
+			response.end(JSON.stringify({ error: { param: null, code: null, ...error } }));
+			return;
+		}
 
 		response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
 		response.flushHeaders();
-		const start = await pi.waitForNth(`assistant message_start ${index + 1}`, isAssistantStart, index + 1);
+		// pi records an assistant message for every reply before this one, except the unrecorded ones.
+		const recorded = this.replies.slice(0, index).filter((earlier) => !earlier.unrecorded).length;
+		const start = reply.unrecorded
+			? 0
+			: await pi.waitForNth(`assistant message_start ${recorded + 1}`, isAssistantStart, recorded + 1);
 		const id = `chatcmpl-stub-${index + 1}`;
 		const send = (delta: Json, finish: string | null = null, usage?: Json) =>
 			response.write(
@@ -164,13 +185,22 @@ class ModelStub {
 		// Lock-step: each chunk produces exactly one *_delta record; wait for it before sending the next.
 		for (const [position, delta] of deltas.entries()) {
 			send(delta);
+			if (reply.unrecorded) continue;
 			await pi.waitForNth(`delta ${position + 1} of reply ${index + 1}`, isDelta, position + 1, start + 1);
 			if (reply.hold === "stream") {
 				await new Promise<void>((resolve) => (response.destroyed ? resolve() : response.on("close", resolve)));
 				return;
 			}
 		}
-		send({}, reply.toolCall ? "tool_calls" : "stop", { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
+		if (reply.drop) {
+			response.destroy();
+			return;
+		}
+		send({}, reply.finish ?? (reply.toolCall ? "tool_calls" : "stop"), {
+			prompt_tokens: 10,
+			completion_tokens: 5,
+			total_tokens: 15,
+		});
 		response.end("data: [DONE]\n\n");
 	}
 }
@@ -257,6 +287,12 @@ class RpcPi {
 		return this.waitFor(`response ${id}`, (record) => record.type === "response" && record.id === id);
 	}
 
+	/** Waits until pi is waiting out a retry's backoff: it announced the retry and left the failed attempt out. */
+	async backingOff(): Promise<void> {
+		const start = await this.waitFor("auto_retry_start", (record) => record.type === "auto_retry_start");
+		await this.waitForNth("entry_appended", (record) => record.type === "entry_appended", 1, start);
+	}
+
 	/** Waits for the nth agent_settled event. */
 	settled(nth = 1): Promise<number> {
 		return this.waitForNth(`agent_settled ${nth}`, (record) => record.type === "agent_settled", nth);
@@ -294,11 +330,19 @@ type Scenario = {
 	description: string;
 	/** Session flags; defaults to --no-session. */
 	session?: "none" | "dir";
+	/** Settings added to SETTINGS in <tmp>/agent/settings.json. */
+	settings?: Json;
 	replies: Reply[];
 	run: (pi: RpcPi, stub: ModelStub) => Promise<void>;
 };
 
 const text = (...deltas: string[]): Reply => ({ text: deltas });
+
+const OVERLOADED: Reply = { error: { status: 503, message: "The server is overloaded.", type: "server_error" } };
+const OVERFLOW =
+	"This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens. Please reduce the length of the messages.";
+/** The pause is several times upstream's 100 ms update throttle, so each line is one update. */
+const BASH_COMMAND = "printf 'one\\n'; sleep 1; printf 'two\\n'";
 
 const scenarios: Scenario[] = [
 	{
@@ -475,6 +519,159 @@ const scenarios: Scenario[] = [
 			await pi.response("3");
 		},
 	},
+	{
+		name: "retry-then-success",
+		description:
+			"A request that fails with a retryable error (HTTP 503) is retried after a backoff and then answered.",
+		settings: { retry: { baseDelayMs: 10 } },
+		replies: [OVERLOADED, text("Recovered.")],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "hello" });
+			await pi.settled();
+		},
+	},
+	{
+		name: "retry-exhausted",
+		description:
+			"Every attempt fails with a retryable error: after maxRetries retries the run ends with the last error.",
+		settings: { retry: { maxRetries: 1, baseDelayMs: 10 } },
+		replies: [OVERLOADED, OVERLOADED],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "hello" });
+			await pi.settled();
+		},
+	},
+	{
+		name: "abort-during-retry",
+		description: "An abort during a retry's backoff ends the run without another request.",
+		settings: { retry: { baseDelayMs: 60000 } },
+		replies: [OVERLOADED],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "hello" });
+			await pi.backingOff();
+			pi.send({ id: "2", type: "abort" });
+			await pi.response("2");
+			await pi.settled();
+		},
+	},
+	{
+		name: "abort-retry",
+		description: "abort_retry during a retry's backoff cancels the retry: the run ends with the failed attempt.",
+		settings: { retry: { baseDelayMs: 60000 } },
+		replies: [OVERLOADED],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "hello" });
+			await pi.backingOff();
+			pi.send({ id: "2", type: "abort_retry" });
+			await pi.response("2");
+			await pi.settled();
+		},
+	},
+	{
+		name: "auto-retry-off",
+		description: "After set_auto_retry turns retries off, a retryable failure ends the run at once.",
+		settings: { retry: { baseDelayMs: 10 } },
+		replies: [OVERLOADED],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "set_auto_retry", enabled: false });
+			await pi.response("1");
+			pi.send({ id: "2", type: "prompt", message: "hello" });
+			await pi.settled();
+		},
+	},
+	{
+		name: "no-retry",
+		description: "A request that fails with an error that is not retryable (HTTP 401) ends the run at once.",
+		settings: { retry: { baseDelayMs: 10 } },
+		replies: [
+			{
+				error: {
+					status: 401,
+					message: "Incorrect API key provided.",
+					type: "invalid_request_error",
+					code: "invalid_api_key",
+				},
+			},
+		],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "hello" });
+			await pi.settled();
+		},
+	},
+	{
+		name: "mid-stream-drop",
+		description:
+			"The connection drops after the reply's first delta: the partial reply is left out and the request is retried. Then get_state and get_messages.",
+		settings: { retry: { baseDelayMs: 10 } },
+		replies: [{ ...text("Hel"), drop: true }, text("Hello again.")],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "hello" });
+			await pi.settled();
+			pi.send({ id: "2", type: "get_state" });
+			await pi.response("2");
+			pi.send({ id: "3", type: "get_messages" });
+			await pi.response("3");
+		},
+	},
+	{
+		name: "overflow-recovery",
+		description:
+			"The third prompt's request fails with a context overflow: pi leaves the attempt out, compacts with reason overflow (the first turn; keepRecentTokens covers the rest), and retries once.",
+		settings: { compaction: { keepRecentTokens: 8 } },
+		replies: [
+			text("First answer."),
+			text("Second answer."),
+			{ error: { status: 400, message: OVERFLOW, type: "invalid_request_error", code: "context_length_exceeded" } },
+			{ ...text("Summary of the first turn."), unrecorded: true },
+			text("Third answer."),
+		],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "first" });
+			await pi.settled();
+			pi.send({ id: "2", type: "prompt", message: "second" });
+			await pi.settled(2);
+			pi.send({ id: "3", type: "prompt", message: "third" });
+			await pi.settled(3);
+		},
+	},
+	{
+		name: "length-stop",
+		description:
+			"A reply cut off at the output limit (finish_reason length) with nothing to compact, then another prompt.",
+		replies: [{ ...text("This answer is cut"), finish: "length" }, text("Next answer.")],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "write a lot" });
+			await pi.settled();
+			pi.send({ id: "2", type: "prompt", message: "next" });
+			await pi.settled(2);
+		},
+	},
+	{
+		name: "length-with-tool-call",
+		description:
+			"A reply cut off at the output limit while calling a tool: the call is not run, and the model is asked again.",
+		replies: [
+			{ toolCall: { id: "call_read_1", name: "read", arguments: { path: "notes.txt" } }, finish: "length" },
+			text("The call was cut off."),
+		],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "read notes.txt" });
+			await pi.settled();
+		},
+	},
+	{
+		name: "bash-streamed-output",
+		description:
+			"The model calls bash with a command that prints, waits, and prints again: its output arrives while it runs.",
+		replies: [
+			{ toolCall: { id: "call_bash_1", name: "bash", arguments: { command: BASH_COMMAND } } },
+			text("Both lines printed."),
+		],
+		run: async (pi) => {
+			pi.send({ id: "1", type: "prompt", message: "run it" });
+			await pi.settled();
+		},
+	},
 ];
 
 function messageText(message: Json): string {
@@ -503,6 +700,8 @@ function normalize(value: unknown, volatile: Volatile, key = ""): unknown {
 		const replaced = value.split(volatile.stubUrl).join("<stub-url>").split(volatile.tmp).join("<tmp>");
 		if (key === "sessionFile") return replaced.replace(/[^/]+\.jsonl$/, "<session-file>");
 		if (key === "sessionId") return "<session-id>";
+		if (key === "firstKeptEntryId") return "<entry-id>";
+		if (key === "timestamp") return "<timestamp>";
 		if (key === "error" && replaced.startsWith("Failed to parse command: ")) {
 			return "Failed to parse command: <parse-error>";
 		}
@@ -511,12 +710,14 @@ function normalize(value: unknown, volatile: Volatile, key = ""): unknown {
 	if (typeof value === "number") {
 		if (key === "timestamp") return "<timestamp>";
 		if (key === "durationMs") return "<duration-ms>";
+		if (key === "wall_time_seconds") return "<seconds>";
 		return value;
 	}
 	if (Array.isArray(value)) return value.map((item) => normalize(item, volatile));
 	if (value === null || typeof value !== "object") return value;
 	const object = value as Json;
 	if (key === "usage") return normalizeUsage(object);
+	if (key === "entry") return normalizeEntry(object, volatile);
 	if (object.role === "system" && object.sections) return normalizeSystemMessage(object, volatile);
 	return Object.fromEntries(Object.entries(object).map(([name, item]) => [name, normalize(item, volatile, name)]));
 }
@@ -530,6 +731,18 @@ function normalizeUsage(usage: Json): Json {
 				: typeof item === "number"
 					? "<tokens>"
 					: item,
+		]),
+	);
+}
+
+/** A session entry of an entry_appended record: its ids are random. */
+function normalizeEntry(entry: Json, volatile: Volatile): Json {
+	return Object.fromEntries(
+		Object.entries(entry).map(([name, item]) => [
+			name,
+			["id", "parentId", "targetId"].includes(name) && typeof item === "string"
+				? "<entry-id>"
+				: normalize(item, volatile, name),
 		]),
 	);
 }
@@ -574,7 +787,7 @@ async function runScenario(scenario: Scenario) {
 			},
 		}),
 	);
-	await writeFile(join(dir, "agent", "settings.json"), JSON.stringify(SETTINGS));
+	await writeFile(join(dir, "agent", "settings.json"), JSON.stringify({ ...SETTINGS, ...scenario.settings }));
 	const args = [
 		"--model",
 		"stub/stub-model",
@@ -601,6 +814,7 @@ async function runScenario(scenario: Scenario) {
 	return {
 		name: scenario.name,
 		description: scenario.description,
+		...(scenario.settings ? { settings: scenario.settings } : {}),
 		args: ["--mode", "rpc", ...args].map((arg) => normalize(arg, volatile)),
 		commands: normalize(pi.commands, volatile),
 		records: normalize(pi.records, volatile),

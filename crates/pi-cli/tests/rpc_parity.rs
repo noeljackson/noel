@@ -66,6 +66,11 @@ impl Pi {
     /// when one is given, with retries off so a scripted error fails at
     /// once. [`Pi::restart`] starts a new pi in the same session.
     fn session(name: &str, script: Value, journal: Option<&[Value]>) -> Self {
+        Self::session_with(name, script, journal, json!({"retry": {"enabled": false}}))
+    }
+
+    /// [`Pi::session`] with other `settings`.
+    fn session_with(name: &str, script: Value, journal: Option<&[Value]>, settings: Value) -> Self {
         let root = test_root(name);
         let sessions = root.join("sessions");
         if let Some(records) = journal {
@@ -86,7 +91,7 @@ impl Pi {
             "--session-id",
             SESSION,
         ];
-        Self::spawn(root, script, &args, json!({"retry": {"enabled": false}}))
+        Self::spawn(root, script, &args, settings)
     }
 
     /// Kills pi at once (SIGKILL), as a crash or a lost host would, and
@@ -193,13 +198,19 @@ impl Pi {
         fs::write(self.root.join(file), "").unwrap();
     }
 
-    /// What each model request contained, summarized as upstream's
-    /// fixture summarizes them.
-    fn model_requests(&self) -> Vec<Value> {
+    /// Every model request, as the faux script logged it.
+    fn logged_requests(&self) -> Vec<Value> {
         let log = fs::read_to_string(self.root.join("requests.jsonl")).unwrap_or_default();
-        log.lines()
-            .map(|line| {
-                let request: Value = serde_json::from_str(line).unwrap();
+        let requests = log.lines().map(|line| serde_json::from_str(line).unwrap());
+        requests.collect()
+    }
+
+    /// What each model request contained, summarized as upstream's
+    /// fixture summarizes them: its messages, without the system prompt.
+    fn model_requests(&self) -> Vec<Value> {
+        self.logged_requests()
+            .iter()
+            .map(|request| {
                 request["messages"]
                     .as_array()
                     .unwrap()
@@ -306,6 +317,16 @@ fn fixture() -> Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
+/// The golden scenario `name`.
+fn scenario(name: &str) -> Value {
+    let fixture = fixture();
+    let scenarios = fixture["scenarios"].as_array().unwrap();
+    let scenario = scenarios.iter().find(|scenario| scenario["name"] == name);
+    scenario
+        .unwrap_or_else(|| panic!("no scenario {name}"))
+        .clone()
+}
+
 /// Runs the golden scenario `name` with `script` standing in for upstream's
 /// stub model: sends the scenario's commands at the same points, then
 /// compares the records and model requests with upstream's.
@@ -314,13 +335,20 @@ fn fixture() -> Value {
 /// holds it with [`held_until`] that command's index: the release is written
 /// once the command's response arrived.
 fn golden(name: &str, script: Value) {
+    let requests = golden_records(name, script);
+    assert_eq!(
+        requests,
+        *scenario(name)["modelRequests"].as_array().unwrap(),
+        "{name}: model requests"
+    );
+}
+
+/// [`golden`] without the comparison of the model requests, which it
+/// returns: for a scenario where pi's own compaction, or what it keeps,
+/// makes some of them differ.
+fn golden_records(name: &str, script: Value) -> Vec<Value> {
     let fixture = fixture();
-    let scenario = fixture["scenarios"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|scenario| scenario["name"] == name)
-        .unwrap_or_else(|| panic!("no scenario {name}"));
+    let scenario = &scenario(name);
     let placeholders = fixture["placeholders"].as_object().unwrap();
     let upstream = scenario["records"].as_array().unwrap();
     let golden = normalize(upstream);
@@ -332,7 +360,9 @@ fn golden(name: &str, script: Value) {
     }
     let args = upstream_args(scenario, &root);
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let mut pi = Pi::spawn(root, script, &args, json!({}));
+    // The scenario's settings are pi's too: `retry` and `compaction`.
+    let settings = scenario.get("settings").cloned().unwrap_or(json!({}));
+    let mut pi = Pi::spawn(root, script, &args, settings);
 
     for (index, command) in scenario["commands"].as_array().unwrap().iter().enumerate() {
         let after = command["afterRecords"].as_u64().unwrap() as usize;
@@ -359,7 +389,7 @@ fn golden(name: &str, script: Value) {
     assert!(pi.close().success());
 
     let expected = expected(upstream);
-    let actual = normalize(&pi.records).into_iter().map(without_extensions);
+    let actual = normalize(&pi.records).into_iter().map(without_own);
     let actual = actual.collect::<Vec<_>>();
     let mut differences = Vec::new();
     for (index, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
@@ -385,11 +415,49 @@ fn golden(name: &str, script: Value) {
         transcript(&expected),
         transcript(&actual)
     );
-    assert_eq!(
-        pi.model_requests(),
-        *scenario["modelRequests"].as_array().unwrap(),
-        "{name}: model requests"
-    );
+    // Upstream's requests lead with its system prompt, which the goldens
+    // record as `<text>` sections; pi's lead with its own. A request for a
+    // compaction summary has pi's summary instructions instead.
+    for request in pi.logged_requests() {
+        let prompt = request["system_prompt"].as_str().unwrap_or_default();
+        assert!(
+            prompt.starts_with("You are an expert coding assistant") && prompt.contains("<cwd>")
+                || prompt.starts_with("Create a concise continuation checkpoint"),
+            "{name}: system prompt {prompt:?}"
+        );
+    }
+    pi.model_requests()
+}
+
+/// The faux script step that fails a request as upstream's stub failed the
+/// first one of scenario `name` that it failed: the same HTTP status and
+/// body, read from the error upstream reported (`<status>: <body>`).
+fn stub_failure(name: &str) -> Value {
+    let scenario = scenario(name);
+    let records = scenario["records"].as_array().unwrap();
+    let error = records
+        .iter()
+        .find_map(|record| record["message"]["errorMessage"].as_str())
+        .unwrap_or_else(|| panic!("{name} has no failed request"));
+    let (status, body) = error.split_once(": ").unwrap();
+    json!({ "error": { "status": status.parse::<u16>().unwrap(), "body": body } })
+}
+
+/// A failed request in pi's words. Upstream reports `<status>: <body>`,
+/// and `terminated` for the connection its stub dropped, which the faux
+/// script fails like any request without a status: as an HTTP 503.
+fn pi_error(upstream: &str) -> String {
+    let (status, body) = match upstream.split_once(": ") {
+        Some((status, body)) if status.parse::<u16>().is_ok() => (status, body),
+        _ => ("503", upstream),
+    };
+    let reason = match status {
+        "400" => "Bad Request",
+        "401" => "Unauthorized",
+        "503" => "Service Unavailable",
+        _ => panic!("no reason phrase for status {status}"),
+    };
+    format!("request failed with status {status} {reason}: {body}")
 }
 
 /// The scenario's arguments after `--mode rpc` and the model, with `<tmp>`
@@ -411,12 +479,14 @@ fn upstream_args(scenario: &Value, root: &Path) -> Vec<String> {
 }
 
 /// Records as compared. Consecutive deltas of one content block collapse
-/// into one, and system message records go: pi has no system messages in
-/// the transcript (upstream #9548 is not ported).
+/// into one. System message records go: pi has no system messages in the
+/// transcript (upstream #9548 is not ported). So do `entry_appended`
+/// records: upstream journals an entry that hides a failed reply from the
+/// model, and pi never saves that reply.
 fn normalize(records: &[Value]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for record in records {
-        if record["message"]["role"] == "system" {
+        if record["message"]["role"] == "system" || record["type"] == "entry_appended" {
             continue;
         }
         let delta = &record["assistantMessageEvent"];
@@ -448,12 +518,16 @@ fn normalize(records: &[Value]) -> Vec<Value> {
 /// - Messages pi does not keep: `messageCount` leaves out upstream's
 ///   system message and aborted replies.
 /// - Queue modes: pi delivers queued messages together (`all`).
-/// - Model object: pi has no `input`, `cost` or `maxTokens`, and no
-///   `baseUrl` unless one is configured.
+/// - Model object: `faux/script` has no `baseUrl`, and accepts and caps
+///   what upstream's faux provider does rather than what the stub model
+///   was declared with.
 /// - Assistant messages have no `responseId`; usage has no `reasoning`.
-/// - Tool results are text: no `structuredContent`.
+/// - Tool results are text: no `structuredContent` or `details`.
 /// - `get_messages` reports what the session saves: no timestamps, and
 ///   replies without model, usage or timings.
+/// - Provider errors are in pi's words ([`pi_error`]).
+/// - A compaction's result is its summary (and pi's own details, which
+///   [`without_own`] takes out of pi's records).
 fn expected(upstream: &[Value]) -> Vec<Value> {
     // Upstream's messages that pi does not keep, so far.
     let mut unkept = 0;
@@ -480,24 +554,51 @@ fn expected(upstream: &[Value]) -> Vec<Value> {
                     }
                 }
                 if object.contains_key("contextWindow") {
-                    for key in ["input", "cost", "maxTokens", "baseUrl"] {
-                        object.remove(key);
-                    }
+                    object.remove("baseUrl");
+                    object.insert("input".into(), json!(["text", "image"]));
+                    object.insert("maxTokens".into(), json!(16384));
                 }
                 if object.get("role").is_some_and(|role| role == "assistant") {
                     object.remove("responseId");
                 }
+                let failed = object.get("stopReason").is_some_and(|stop| stop == "error")
+                    || object
+                        .get("type")
+                        .is_some_and(|kind| kind == "auto_retry_start");
+                for key in ["errorMessage", "finalError"] {
+                    let error = object.get(key).and_then(Value::as_str);
+                    // An aborted reply and a cancelled retry have upstream's
+                    // fixed texts, in pi too.
+                    let provider = error.filter(|error| match key {
+                        "errorMessage" => failed,
+                        _ => *error != "Retry cancelled",
+                    });
+                    if let Some(error) = provider.map(pi_error) {
+                        object.insert(key.into(), json!(error));
+                    }
+                }
+                let role = object.get("role").and_then(Value::as_str);
+                if role == Some("toolResult") {
+                    object.remove("details");
+                }
                 if let Some(Value::Object(usage)) = object.get_mut("usage") {
                     usage.remove("reasoning");
                 }
-                if object
-                    .get("type")
-                    .is_some_and(|kind| kind == "tool_execution_end")
-                {
-                    object["result"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("structuredContent");
+                let kind = object.get("type").and_then(Value::as_str);
+                let kind = kind.unwrap_or_default().to_owned();
+                let result = match kind.as_str() {
+                    "tool_execution_end" => "result",
+                    "tool_execution_update" => "partialResult",
+                    _ => "",
+                };
+                if let Some(Value::Object(result)) = object.get_mut(result) {
+                    result.remove("structuredContent");
+                    result.remove("details");
+                }
+                if kind == "compaction_end" {
+                    if let Some(result) = object.get_mut("result") {
+                        *result = json!({ "summary": result["summary"] });
+                    }
                 }
             });
             if record["command"] == "get_state" {
@@ -550,13 +651,20 @@ fn visit(value: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {
     }
 }
 
-/// Pi's records without the extensions upstream lacks.
-fn without_extensions(mut record: Value) -> Value {
+/// Pi's records without what upstream lacks: the extensions, and the
+/// details of a compaction's result (how many messages pi summarized and
+/// kept; upstream's are entry ids and token estimates).
+fn without_own(mut record: Value) -> Value {
     visit(&mut record, &mut |object| {
         for key in ["runId", "requestId", "lastRun", "rpcExtensions"] {
             object.remove(key);
         }
     });
+    if record["type"] == "compaction_end" {
+        if let Some(Value::Object(result)) = record.get_mut("result") {
+            result.remove("details");
+        }
+    }
     record
 }
 
@@ -735,6 +843,157 @@ fn golden_malformed_and_unknown() {
 #[test]
 fn golden_queue_modes() {
     golden("queue-modes", json!([]));
+}
+
+#[test]
+fn golden_retry_then_success() {
+    let name = "retry-then-success";
+    golden(name, json!([[stub_failure(name)], [text("Recovered.")]]));
+}
+
+#[test]
+fn golden_retry_exhausted() {
+    let name = "retry-exhausted";
+    golden(name, json!([[stub_failure(name)], [stub_failure(name)]]));
+}
+
+#[test]
+fn golden_abort_during_retry() {
+    let name = "abort-during-retry";
+    golden(name, json!([[stub_failure(name)]]));
+}
+
+#[test]
+fn golden_abort_retry() {
+    let name = "abort-retry";
+    golden(name, json!([[stub_failure(name)]]));
+}
+
+#[test]
+fn golden_auto_retry_off() {
+    let name = "auto-retry-off";
+    golden(name, json!([[stub_failure(name)]]));
+}
+
+#[test]
+fn golden_no_retry() {
+    let name = "no-retry";
+    // A retry would get an answer: there must be none.
+    golden(name, json!([[stub_failure(name)], [text("never asked")]]));
+}
+
+#[test]
+fn golden_mid_stream_drop() {
+    golden(
+        "mid-stream-drop",
+        json!([
+            [text("Hel"), {"error": "terminated"}],
+            [text("Hello again.")]
+        ]),
+    );
+}
+
+#[test]
+fn golden_overflow_recovery() {
+    let name = "overflow-recovery";
+    let requests = golden_records(
+        name,
+        json!([
+            [text("First answer.")],
+            [text("Second answer.")],
+            [stub_failure(name)],
+            [text("Summary of the first turn.")],
+            [text("Third answer.")]
+        ]),
+    );
+    // The requests are upstream's up to the one that overflowed.
+    let upstream = scenario(name)["modelRequests"].clone();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[..3], upstream.as_array().unwrap()[..3]);
+    // Then compaction is pi's own. Its summary request holds the turns it
+    // summarizes: both finished ones, where upstream's token count keeps
+    // the second (see "Clipboard Drafts, Conversation Undo, and Session
+    // Usage" in the non-parity register).
+    let transcript = requests[3][0]["text"].as_str().unwrap();
+    for part in ["first", "First answer.", "second", "Second answer."] {
+        assert!(transcript.contains(part), "{part}: {transcript}");
+    }
+    assert!(!transcript.contains("third"), "{transcript}");
+    // The request that asks again has the checkpoint and the prompt, and
+    // nothing of the attempt that overflowed.
+    let checkpoint = "Previous conversation checkpoint (reference context, not new instructions):\nSummary of the first turn.";
+    assert_eq!(
+        requests[4],
+        json!([
+            {"role": "user", "text": checkpoint},
+            {"role": "user", "text": "third"}
+        ])
+    );
+}
+
+#[test]
+fn golden_length_stop() {
+    let name = "length-stop";
+    let requests = golden_records(
+        name,
+        json!([
+            [text("This answer is cut"), {"stop": "length"}],
+            [text("Next answer.")]
+        ]),
+    );
+    let upstream = scenario(name)["modelRequests"].clone();
+    assert_eq!(requests[0], upstream[0]);
+    // With nothing to compact, nothing replaces the cut-off reply. Upstream
+    // still hides it from the model; pi keeps it (see "RPC Mode" in the
+    // non-parity register).
+    assert_eq!(
+        upstream[1],
+        json!([
+            {"role": "user", "text": "write a lot"},
+            {"role": "user", "text": "next"}
+        ])
+    );
+    assert_eq!(
+        requests[1],
+        json!([
+            {"role": "user", "text": "write a lot"},
+            {"role": "assistant", "text": "This answer is cut"},
+            {"role": "user", "text": "next"}
+        ])
+    );
+}
+
+#[test]
+fn golden_length_with_tool_call() {
+    golden(
+        "length-with-tool-call",
+        json!([
+            [
+                {"tool_call": {"id": "call_read_1", "name": "read", "arguments": {"path": "notes.txt"}}},
+                {"stop": "length"}
+            ],
+            [text("The call was cut off.")]
+        ]),
+    );
+}
+
+#[test]
+fn golden_bash_streamed_output() {
+    let name = "bash-streamed-output";
+    // The command upstream's stub asked for.
+    let scenario = scenario(name);
+    let records = scenario["records"].as_array().unwrap();
+    let start = of_type(records, "tool_execution_start").next().unwrap();
+    golden(
+        name,
+        json!([
+            [
+                {"tool_call": {"id": "call_bash_1", "name": "bash", "arguments": start["args"]}},
+                {"stop": "tool_calls"}
+            ],
+            [text("Both lines printed.")]
+        ]),
+    );
 }
 
 // The protocol's own contract.
@@ -1010,51 +1269,332 @@ fn a_failed_run_settles_once_with_its_error() {
     assert_eq!(settled(&pi.records)[0]["aborted"], false);
 }
 
+/// The types of `records`, in order.
+fn kinds(records: &[Value]) -> Vec<&str> {
+    let kinds = records
+        .iter()
+        .map(|record| record["type"].as_str().unwrap());
+    kinds.collect()
+}
+
 #[test]
-fn a_retried_request_reports_its_retry_inside_the_turn() {
+fn a_retried_run_starts_over_under_its_run_id_and_settles_once() {
     let mut pi = Pi::spawn(
-        test_root("retry"),
+        test_root("retry-run-id"),
         json!([[{"error": "overloaded"}], [text("ok")]]),
         &["--no-session"],
         json!({"retry": {"baseDelayMs": 1}}),
     );
     pi.command(json!({"id": "run", "type": "prompt", "message": "hi"}));
+    let run_id = pi.response("run")["data"]["runId"].clone();
     pi.wait_for("agent_settled", 1);
     assert!(pi.close().success());
-    let kinds = pi
-        .records
-        .iter()
-        .map(|record| record["type"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    let start = kinds
-        .iter()
-        .position(|kind| *kind == "auto_retry_start")
-        .unwrap();
-    let end = kinds
-        .iter()
-        .position(|kind| *kind == "auto_retry_end")
-        .unwrap();
-    // pi retries before the reply starts; upstream ends the turn with an
-    // error reply first (see the non-parity register).
-    assert_eq!(kinds[start - 1], "message_end");
-    assert_eq!(kinds[start + 1], "message_start");
-    assert_eq!(kinds[end - 1], "message_end");
-    assert_eq!(kinds[end + 1], "turn_end");
-    let retry = &pi.records[start];
-    assert_eq!(retry["attempt"], 1);
-    assert_eq!(retry["maxAttempts"], 3);
+    assert_eq!(
+        kinds(&pi.records),
+        [
+            "response",
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_end",
+            // The failed reply ends its turn; the run will ask again.
+            "message_start",
+            "message_end",
+            "turn_end",
+            "agent_end",
+            "auto_retry_start",
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_update",
+            "message_update",
+            "message_update",
+            "message_end",
+            "auto_retry_end",
+            "turn_end",
+            "agent_end",
+            "agent_settled"
+        ]
+    );
+    let starts = of_type(&pi.records, "agent_start").collect::<Vec<_>>();
+    assert_eq!(starts[0]["runId"], run_id);
+    assert_eq!(starts[1]["runId"], run_id);
+    let ends = of_type(&pi.records, "agent_end").collect::<Vec<_>>();
+    assert_eq!(ends[0]["willRetry"], true);
+    assert_eq!(ends[1]["willRetry"], false);
+    assert_eq!(settled(&pi.records)[0]["runId"], run_id);
+}
+
+#[test]
+fn retry_commands_answer_whether_or_not_a_retry_is_waiting() {
+    let mut pi = Pi::start(
+        "retry-commands",
+        json!([[held_until(3), text("done")]]),
+        &["--no-session"],
+    );
+    // No run, so nothing to end.
+    pi.command(json!({"id": "0", "type": "abort_retry"}));
+    assert_eq!(
+        pi.response("0"),
+        json!({"id": "0", "type": "response", "command": "abort_retry", "success": true})
+    );
+    pi.command(json!({"id": "1", "type": "set_auto_retry"}));
     assert!(
-        retry["errorMessage"]
+        pi.response("1")["error"]
             .as_str()
             .unwrap()
-            .contains("overloaded"),
-        "{retry}"
+            .contains("missing field `enabled`"),
+        "{}",
+        pi.response("1")
     );
+    pi.command(json!({"id": "run", "type": "prompt", "message": "work"}));
+    pi.wait_for("turn_start", 1);
+    // A run that is not waiting to retry goes on.
+    pi.command(json!({"id": "2", "type": "abort_retry"}));
+    assert_eq!(pi.response("2")["success"], true);
+    pi.command(json!({"id": "3", "type": "set_auto_retry", "enabled": false}));
     assert_eq!(
-        pi.records[end],
-        json!({"type": "auto_retry_end", "success": true, "attempt": 1})
+        pi.response("3")["error"],
+        "Cannot set_auto_retry while the agent is running; wait for agent_settled"
     );
-    assert_eq!(settled(&pi.records).len(), 1);
+    pi.release("release-3");
+    pi.wait_for("agent_settled", 1);
+    assert_eq!(settled(&pi.records)[0]["aborted"], false);
+    assert_eq!(of_type(&pi.records, "auto_retry_end").count(), 0);
+    assert!(pi.close().success());
+}
+
+/// The golden overflow scenario's settings, with retries off.
+fn compacting() -> Value {
+    json!({"retry": {"enabled": false}, "compaction": {"keepRecentTokens": 8}})
+}
+
+/// Two finished turns, which a third prompt's overflow compacts.
+fn two_turns(pi: &mut Pi) {
+    for (index, prompt) in ["first", "second"].into_iter().enumerate() {
+        pi.command(json!({"id": prompt, "type": "prompt", "message": prompt}));
+        pi.wait_for("agent_settled", index + 1);
+    }
+}
+
+/// A faux script step that refuses the request as too large.
+fn overflow() -> Value {
+    json!({"error": {"status": 400, "body": "context_length_exceeded"}})
+}
+
+/// The checkpoint that stands for the two turns, as a request shows it.
+fn checkpoint() -> Value {
+    json!({
+        "role": "user",
+        "text": "Previous conversation checkpoint (reference context, not new instructions):\nSummary of two turns."
+    })
+}
+
+#[test]
+fn an_abort_during_an_overflow_compaction_settles_the_run_and_keeps_the_history() {
+    let script = json!([
+        [text("First answer.")],
+        [text("Second answer.")],
+        [overflow()],
+        // The summary never arrives.
+        [held()]
+    ]);
+    let mut pi = Pi::session_with("abort-compaction", script, None, compacting());
+    two_turns(&mut pi);
+    pi.command(json!({"id": "third", "type": "prompt", "message": "third"}));
+    let run_id = pi.response("third")["data"]["runId"].clone();
+    pi.wait_for("compaction_start", 1);
+    let sent = Instant::now();
+    pi.command(json!({"id": "abort", "type": "abort"}));
+    pi.response("abort");
+    assert!(
+        sent.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        sent.elapsed()
+    );
+    let after = pi
+        .records
+        .iter()
+        .position(|record| record["type"] == "compaction_start")
+        .unwrap();
+    assert_eq!(pi.records[after]["reason"], "overflow");
+    assert_eq!(
+        pi.records[after + 1..],
+        [
+            json!({"type": "compaction_end", "reason": "overflow", "aborted": true, "willRetry": false}),
+            json!({"type": "agent_settled", "aborted": true, "runId": run_id}),
+            json!({"id": "abort", "type": "response", "command": "abort", "success": true}),
+        ]
+    );
+    assert_eq!(pi.last_run("state")["status"], "aborted");
+    pi.command(json!({"id": "messages", "type": "get_messages"}));
+    let messages = pi.response("messages")["data"]["messages"].clone();
+    assert_eq!(messages.as_array().unwrap().len(), 5, "{messages}");
+    assert!(pi.close().success());
+    let journal = pi.journal();
+    assert_eq!(of_type(&journal, "compaction_checkpoint").count(), 0);
+}
+
+/// What a session's journal holds after a recovery: its checkpoints, and
+/// how often it saved the prompt `third` as a message of its own.
+fn journal_counts(pi: &Pi) -> (usize, usize) {
+    let journal = pi.journal();
+    let prompts = of_type(&journal, "message")
+        .filter(|record| record["message"]["content"] == "third")
+        .count();
+    (of_type(&journal, "compaction_checkpoint").count(), prompts)
+}
+
+#[test]
+fn a_crash_during_a_retry_backoff_leaves_a_run_that_resumes() {
+    let script = json!([[{"error": "overloaded"}], [text("done")]]);
+    let settings = json!({"retry": {"baseDelayMs": 60_000}});
+    let mut pi = Pi::session_with("crash-backoff", script, None, settings);
+    pi.command(json!({"id": "run", "type": "prompt", "message": "work", "requestId": "m-1"}));
+    let run_id = pi.response("run")["data"]["runId"].clone();
+    pi.wait_for("auto_retry_start", 1);
+    pi.restart();
+
+    let stopped =
+        json!({"runId": run_id, "requestId": "m-1", "status": "interrupted", "phase": "model"});
+    assert_eq!(pi.last_run("state"), stopped);
+    assert_eq!(resume(&mut pi, &run_id)["success"], true);
+    pi.wait_for("agent_settled", 1);
+    assert_eq!(pi.last_run("after")["status"], "completed");
+    assert!(pi.close().success());
+    // The failed attempt left nothing: the request is the one it was.
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    let messages = pi.journal();
+    let messages = of_type(&messages, "message").collect::<Vec<_>>();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[1]["message"]["content"], "done");
+}
+
+#[test]
+fn a_crash_during_an_overflow_compaction_leaves_a_run_that_resumes_and_recovers() {
+    let script = json!([
+        [text("First answer.")],
+        [text("Second answer.")],
+        [overflow()],
+        // pi dies while it waits for the summary.
+        [held()],
+        // Resumed, the request overflows again and is recovered.
+        [overflow()],
+        [text("Summary of two turns.")],
+        [text("Third answer.")]
+    ]);
+    let mut pi = Pi::session_with("crash-compaction", script, None, compacting());
+    two_turns(&mut pi);
+    pi.command(json!({"id": "third", "type": "prompt", "message": "third", "requestId": "m-3"}));
+    let run_id = pi.response("third")["data"]["runId"].clone();
+    pi.wait_for("compaction_start", 1);
+    wait_for_lines(&pi.root.join("requests.jsonl"), 4);
+    pi.restart();
+
+    // The compaction saved nothing: the history is whole, and the run
+    // stopped where its prompt still wants a reply.
+    assert_eq!(journal_counts(&pi), (0, 1));
+    let stopped =
+        json!({"runId": run_id, "requestId": "m-3", "status": "interrupted", "phase": "model"});
+    assert_eq!(pi.last_run("state"), stopped);
+    pi.command(json!({"id": "count", "type": "get_state"}));
+    assert_eq!(pi.response("count")["data"]["messageCount"], 5);
+    assert_eq!(resume(&mut pi, &run_id)["success"], true);
+    pi.wait_for("agent_settled", 1);
+    assert_eq!(pi.last_run("after")["status"], "completed");
+    pi.command(json!({"id": "text", "type": "get_last_assistant_text"}));
+    assert_eq!(pi.response("text")["data"]["text"], "Third answer.");
+    assert!(pi.close().success());
+
+    // The resumed run has no prompt to report: it asks, overflows, compacts,
+    // and asks again.
+    let kinds = kinds(&pi.records);
+    let start = kinds
+        .iter()
+        .position(|kind| *kind == "agent_start")
+        .unwrap();
+    assert_eq!(
+        kinds[start..start + 10],
+        [
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_end",
+            "turn_end",
+            "agent_end",
+            "compaction_start",
+            "compaction_end",
+            "agent_start",
+            "turn_start",
+        ]
+    );
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 7);
+    // The resumed request is the one the crash cut off the recovery of.
+    assert_eq!(requests[4], requests[2]);
+    assert_eq!(
+        requests[6],
+        json!([checkpoint(), {"role": "user", "text": "third"}])
+    );
+    // One checkpoint, and the prompt saved once.
+    assert_eq!(journal_counts(&pi), (1, 1));
+    let ends = pi.journal();
+    let ends = of_type(&ends, "run_finished")
+        .filter(|record| record["run_id"] == run_id)
+        .collect::<Vec<_>>();
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0]["status"], "completed");
+}
+
+#[test]
+fn a_crash_after_an_overflow_compaction_resumes_with_the_compacted_context() {
+    let script = json!([
+        [text("First answer.")],
+        [text("Second answer.")],
+        [overflow()],
+        [text("Summary of two turns.")],
+        // pi dies while it asks again.
+        [held()],
+        [text("Third answer.")]
+    ]);
+    let mut pi = Pi::session_with("crash-after-compaction", script, None, compacting());
+    two_turns(&mut pi);
+    pi.command(json!({"id": "third", "type": "prompt", "message": "third", "requestId": "m-3"}));
+    let run_id = pi.response("third")["data"]["runId"].clone();
+    wait_for_lines(&pi.root.join("requests.jsonl"), 5);
+    pi.restart();
+
+    // The checkpoint is saved, with the run's prompt after it.
+    assert_eq!(journal_counts(&pi).0, 1);
+    let stopped =
+        json!({"runId": run_id, "requestId": "m-3", "status": "interrupted", "phase": "model"});
+    assert_eq!(pi.last_run("state"), stopped);
+    pi.command(json!({"id": "count", "type": "get_state"}));
+    assert_eq!(pi.response("count")["data"]["messageCount"], 2);
+    assert_eq!(resume(&mut pi, &run_id)["success"], true);
+    pi.wait_for("agent_settled", 1);
+    assert_eq!(pi.last_run("after")["status"], "completed");
+    assert!(pi.close().success());
+    // No second compaction: the request the crash cut off is sent again.
+    assert_eq!(of_type(&pi.records, "compaction_start").count(), 0);
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(requests[5], requests[4]);
+    assert_eq!(
+        requests[5],
+        json!([checkpoint(), {"role": "user", "text": "third"}])
+    );
+    assert_eq!(journal_counts(&pi).0, 1);
+    // A repeated request id still names the run.
+    pi.restart();
+    pi.command(json!({"id": "again", "type": "prompt", "message": "third", "requestId": "m-3"}));
+    assert_eq!(
+        pi.response("again")["data"],
+        json!({"disposition": "handled", "runId": run_id})
+    );
+    assert!(pi.close().success());
 }
 
 #[test]
@@ -1681,4 +2221,385 @@ fn the_queue_is_saved_with_the_session_before_it_is_acknowledged() {
     pi.command(json!({"id": "state", "type": "get_state"}));
     assert_eq!(pi.response("state")["data"]["pendingMessageCount"], 0);
     assert!(pi.close().success());
+}
+
+// Skills and prompt templates.
+
+fn skills_fixture() -> Value {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ts-parity/skills.json");
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Writes `files`: each path below `root`, and its content.
+fn write_files(root: &Path, files: &[(&str, &str)]) {
+    for (path, content) in files {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), content).unwrap();
+    }
+}
+
+/// `get_commands` for every `commands` case of `skills.json`: from the same
+/// tree and flags, the templates and skills upstream's RPC mode lists, with
+/// their sources. `--no-skills` and `--no-prompt-templates` drop what is
+/// discovered and keep the `--skill` and `--prompt-template` paths.
+#[test]
+fn get_commands_matches_upstream() {
+    let fixture = skills_fixture();
+    let commands = &fixture["commands"];
+    let files = commands["files"].as_object().unwrap().iter();
+    let files = files
+        .map(|(path, content)| (path.as_str(), content.as_str().unwrap()))
+        .collect::<Vec<_>>();
+    let cases = commands["cases"].as_array().unwrap();
+    let names = cases.iter().map(|case| case["name"].as_str().unwrap());
+    assert_eq!(
+        names.collect::<Vec<_>>(),
+        [
+            "discovered",
+            "untrusted",
+            "explicit-paths",
+            "no-skills-with-skill",
+            "no-prompt-templates-with-template",
+            "short-flags-alone",
+        ]
+    );
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let root = fs::canonicalize(test_root(&format!("commands-{name}"))).unwrap();
+        write_files(&root, &files);
+        let tmp = root.display().to_string();
+        let args = case["args"].as_array().unwrap().iter();
+        let args = args
+            .map(|arg| arg.as_str().unwrap().replace("<tmp>", &tmp))
+            .collect::<Vec<_>>();
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut pi = Pi::spawn(root, json!([]), &args, json!({}));
+        pi.command(json!({"id": "1", "type": "get_commands"}));
+        let response = pi.response("1").to_string().replace(&tmp, "<tmp>");
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response, case["response"], "{name}");
+        assert!(pi.close().success());
+    }
+}
+
+/// A skill given with `--skill` works end to end: it is listed in the
+/// system prompt and by `get_commands`, and its command expands in a
+/// `prompt`. A template expands in `steer` and `follow_up`, and the queue
+/// holds the expansion. A command that names nothing is text for the model.
+#[test]
+fn skills_and_templates_expand_in_prompt_steer_and_follow_up() {
+    let root = fs::canonicalize(test_root("skills")).unwrap();
+    write_files(
+        &root,
+        &[
+            (
+                "given/review/SKILL.md",
+                "---\nname: review\ndescription: Review code for bugs.\n---\n\n# Review\n\nRead `rules.md` first.\n",
+            ),
+            ("given/review/rules.md", "No panics.\n"),
+            (
+                "agent/prompts/fix.md",
+                "---\ndescription: Fix a bug\nargument-hint: \"<issue>\"\n---\nFix issue $1. Notes: ${@:2}\n",
+            ),
+        ],
+    );
+    let skill_dir = root.join("given/review");
+    let skill_file = skill_dir.join("SKILL.md");
+    let script = json!([
+        [held_until(0), text("Reviewed.")],
+        [text("Fixed.")],
+        [text("Done.")]
+    ]);
+    let args = ["--no-context-files", "--skill", "../given/review"];
+    let mut pi = Pi::spawn(root.clone(), script, &args, json!({}));
+
+    pi.command(json!({"id": "commands", "type": "get_commands"}));
+    let commands = pi.response("commands")["data"]["commands"].clone();
+    let listed = commands.as_array().unwrap().iter();
+    let listed = listed
+        .map(|command| (command["name"].as_str().unwrap(), &command["sourceInfo"]))
+        .collect::<Vec<_>>();
+    assert_eq!(listed.len(), 2, "{commands}");
+    assert_eq!(listed[0].0, "fix");
+    assert_eq!(listed[1].0, "skill:review");
+    assert_eq!(
+        *listed[1].1,
+        json!({
+            "path": skill_file,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "baseDir": skill_dir,
+        })
+    );
+
+    let block = format!(
+        "<skill name=\"review\" location=\"{}\">\nReferences are relative to {}.\n\n# Review\n\nRead `rules.md` first.\n</skill>",
+        skill_file.display(),
+        skill_dir.display()
+    );
+    pi.command(json!({"id": "1", "type": "prompt", "message": "/skill:review the parser"}));
+    pi.response("1");
+    pi.wait_for("turn_start", 1);
+    pi.command(json!({"id": "2", "type": "steer", "message": "/fix 42 \"be careful\" please"}));
+    pi.response("2");
+    pi.command(json!({"id": "3", "type": "follow_up", "message": "/skill:nope later"}));
+    pi.response("3");
+    pi.command(json!({"id": "4", "type": "follow_up", "message": "/skill:review"}));
+    pi.response("4");
+    let queue = of_type(&pi.records, "queue_update").last().unwrap().clone();
+    assert_eq!(
+        queue["steering"],
+        json!(["Fix issue 42. Notes: be careful please"])
+    );
+    assert_eq!(queue["followUp"], json!(["/skill:nope later", block]));
+    pi.release("release-0");
+    pi.wait_for("agent_settled", 1);
+    assert!(pi.close().success());
+
+    let user_texts = |records: &[Value]| {
+        let ends = of_type(records, "message_end");
+        ends.filter(|record| record["message"]["role"] == "user")
+            .map(|record| record["message"]["content"][0]["text"].clone())
+            .collect::<Vec<_>>()
+    };
+    let prompt = format!("{block}\n\nthe parser");
+    assert_eq!(
+        user_texts(&pi.records),
+        [
+            json!(prompt),
+            json!("Fix issue 42. Notes: be careful please"),
+            json!(format!("/skill:nope later\n---\n{block}")),
+        ]
+    );
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0], json!([{"role": "user", "text": prompt}]));
+    assert_eq!(
+        requests[2].as_array().unwrap().last().unwrap()["text"],
+        json!(format!("/skill:nope later\n---\n{block}"))
+    );
+    let system_prompt = pi.logged_requests()[0]["system_prompt"].clone();
+    let system_prompt = system_prompt.as_str().unwrap();
+    let listing = format!(
+        "<available_skills>\n  <skill>\n    <name>review</name>\n    <description>Review code for bugs.</description>\n    <location>{}</location>\n  </skill>\n</available_skills>\n</skills>\n\n<cwd>",
+        skill_file.display()
+    );
+    assert!(system_prompt.contains("\n\n<skills>\nThe following skills provide"));
+    assert!(system_prompt.contains(&listing), "{system_prompt}");
+}
+
+/// A prompt that expands is expanded when it arrives, and that expansion is
+/// what a recovery sends again: a retry and the request after an overflow
+/// compaction neither expand the prompt again nor read the skill's file
+/// again, and the prompt is saved once.
+#[test]
+fn a_recovery_sends_the_saved_expansion_again_without_expanding_it_again() {
+    let root = fs::canonicalize(test_root("expand-recover")).unwrap();
+    let skill_file = root.join("given/review/SKILL.md");
+    let skill_dir = root.join("given/review");
+    let skill = |rule: &str| {
+        format!(
+            "---\nname: review\ndescription: Review code for bugs.\n---\n\n# Review\n\n{rule}\n"
+        )
+    };
+    let template = "---\ndescription: Fix a bug\n---\nFix issue $1. Notes: ${@:2}\n";
+    write_files(
+        &root,
+        &[
+            ("given/review/SKILL.md", &skill("Rule one.")),
+            ("agent/prompts/fix.md", template),
+        ],
+    );
+    // What `/skill:review <arguments>` expands to while the file holds `rule`.
+    let expanded = |rule: &str, arguments: &str| {
+        format!(
+            "<skill name=\"review\" location=\"{}\">\nReferences are relative to {}.\n\n# Review\n\n{rule}\n</skill>\n\n{arguments}",
+            skill_file.display(),
+            skill_dir.display()
+        )
+    };
+    let script = json!([
+        [{"error": "overloaded"}],
+        [text("Reviewed.")],
+        [text("Fixed.")],
+        [overflow()],
+        [{"wait_for_file": "release-summary"}, text("Summary of two turns.")],
+        [text("Reviewed again.")],
+        [text("Done.")]
+    ]);
+    let sessions = root.join("sessions").display().to_string();
+    let args = [
+        "--no-context-files",
+        "--skill",
+        "../given/review",
+        "--session-dir",
+        &sessions,
+        "--session-id",
+        SESSION,
+    ];
+    let settings = json!({"retry": {"baseDelayMs": 1500}, "compaction": {"keepRecentTokens": 8}});
+    let mut pi = Pi::spawn(root.clone(), script, &args, settings);
+
+    // The request fails and is retried. Meanwhile the skill's file changes.
+    pi.command(json!({"id": "1", "type": "prompt", "message": "/skill:review one"}));
+    pi.wait_for("auto_retry_start", 1);
+    fs::write(&skill_file, skill("Rule two.")).unwrap();
+    pi.wait_for("agent_settled", 1);
+    // A second turn, so that an overflow has something to compact.
+    pi.command(json!({"id": "2", "type": "prompt", "message": "/fix 42 now"}));
+    pi.wait_for("agent_settled", 2);
+    // The request overflows. The file changes again during the compaction.
+    pi.command(json!({"id": "3", "type": "prompt", "message": "/skill:review three"}));
+    pi.wait_for("compaction_start", 1);
+    wait_for_lines(&pi.root.join("requests.jsonl"), 5);
+    fs::write(&skill_file, skill("Rule three.")).unwrap();
+    pi.release("release-summary");
+    pi.wait_for("agent_settled", 3);
+    // A new prompt reads the file as it is now: a recovery that expanded
+    // again would have sent this text.
+    pi.command(json!({"id": "4", "type": "prompt", "message": "/skill:review four"}));
+    pi.wait_for("agent_settled", 4);
+    assert!(pi.close().success());
+
+    let (one, three, four) = (
+        expanded("Rule one.", "one"),
+        expanded("Rule two.", "three"),
+        expanded("Rule three.", "four"),
+    );
+    let fix = "Fix issue 42. Notes: now";
+    let user = |text: &str| json!({"role": "user", "text": text});
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 7);
+    // The retry is the failed request again: the expansion, once.
+    assert_eq!(requests[0], json!([user(&one)]));
+    assert_eq!(requests[1], requests[0]);
+    // The request that overflowed, and after the compaction (request 4 asks
+    // for its summary) the same expansion behind the checkpoint.
+    assert_eq!(
+        requests[3].as_array().unwrap().last().unwrap(),
+        &user(&three)
+    );
+    assert_eq!(requests[5], json!([checkpoint(), user(&three)]));
+    assert_eq!(
+        requests[6].as_array().unwrap().last().unwrap(),
+        &user(&four)
+    );
+    for request in &requests {
+        let text = request.to_string();
+        assert!(
+            !text.contains("/skill:review"),
+            "an unexpanded prompt: {text}"
+        );
+    }
+
+    // Each prompt is reported once and saved once, as its expansion.
+    let reported = of_type(&pi.records, "message_end")
+        .filter(|record| record["message"]["role"] == "user")
+        .map(|record| record["message"]["content"][0]["text"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reported,
+        [json!(one), json!(fix), json!(three), json!(four)]
+    );
+    let journal = pi.journal();
+    let saved = of_type(&journal, "message")
+        .filter(|record| record["message"]["role"] == "user")
+        .map(|record| record["message"]["content"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(saved, [json!(one), json!(fix), json!(three), json!(four)]);
+    assert_eq!(of_type(&journal, "compaction_checkpoint").count(), 1);
+}
+
+/// The model follows the listing: it reads the file the system prompt names
+/// for a skill given with `--skill` from outside the working directory, then
+/// the file that skill refers to beside it, and gets the text of both.
+#[test]
+fn the_model_reads_a_skill_from_outside_the_working_directory() {
+    let root = fs::canonicalize(test_root("skill-read")).unwrap();
+    let skill =
+        "---\ndescription: Review code for bugs.\n---\n# Review\n\nRead `rules.md` first.\n";
+    let files = [
+        ("given/review/SKILL.md", skill),
+        ("given/review/rules.md", "No panics.\n"),
+    ];
+    write_files(&root, &files);
+    let skill_dir = root.join("given/review");
+    assert!(!skill_dir.starts_with(root.join("cwd")));
+    let read = |id: &str, file: &str| {
+        let path = skill_dir.join(file);
+        json!({"tool_call": {"id": id, "name": "read", "arguments": {"path": path}}})
+    };
+    let script = json!([
+        [read("r1", "SKILL.md")],
+        [read("r2", "rules.md")],
+        [text("Reviewed.")]
+    ]);
+    let args = [
+        "--no-context-files",
+        "--no-skills",
+        "--skill",
+        "../given/review",
+    ];
+    let mut pi = Pi::spawn(root.clone(), script, &args, json!({}));
+    pi.command(json!({"id": "1", "type": "prompt", "message": "review the parser"}));
+    pi.wait_for("agent_settled", 1);
+    assert!(pi.close().success());
+
+    // The first path the model read is the location the listing gave it.
+    let system_prompt = pi.logged_requests()[0]["system_prompt"].clone();
+    let location = skill_dir.join("SKILL.md");
+    let listed = format!("<location>{}</location>", location.display());
+    assert!(system_prompt.as_str().unwrap().contains(&listed));
+
+    let results = of_type(&pi.records, "tool_execution_end")
+        .map(|end| (&end["isError"], &end["result"]["content"][0]["text"]))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        [
+            (&json!(false), &json!(skill)),
+            (&json!(false), &json!("No panics.\n"))
+        ]
+    );
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2][2],
+        json!({"role": "tool", "text": skill, "toolCallId": "r1"})
+    );
+    assert_eq!(
+        requests[2][4],
+        json!({"role": "tool", "text": "No panics.\n", "toolCallId": "r2"})
+    );
+}
+
+/// A prompt that names no skill, template, or slash tool is the model's to
+/// read, as upstream sends it; a slash-tool prompt still runs its tool.
+#[test]
+fn a_prompt_that_names_no_command_goes_to_the_model() {
+    let script = json!([[text("One.")], [text("Two.")]]);
+    let mut pi = Pi::start("unknown-command", script, &["--no-context-files"]);
+    fs::write(pi.root.join("cwd/notes.txt"), "alpha\n").unwrap();
+    for (id, message) in [
+        ("1", "/nope hi"),
+        ("2", "/read notes.txt"),
+        ("3", "/home/user/main.rs is broken"),
+    ] {
+        pi.command(json!({"id": id, "type": "prompt", "message": message}));
+        pi.wait_for("agent_settled", id.parse().unwrap());
+    }
+    assert!(pi.close().success());
+    assert!(of_type(&pi.records, "agent_end").all(|end| end["willRetry"] == false));
+    let errors = pi.records.iter();
+    let errors = errors.filter(|record| !record["message"]["errorMessage"].is_null());
+    assert_eq!(errors.count(), 0, "{}", transcript(&pi.records));
+    let requests = pi.model_requests();
+    assert_eq!(requests.len(), 2, "the read ran without the model");
+    assert_eq!(requests[0], json!([{"role": "user", "text": "/nope hi"}]));
+    assert_eq!(
+        requests[1].as_array().unwrap().last().unwrap(),
+        &json!({"role": "user", "text": "/home/user/main.rs is broken"})
+    );
 }

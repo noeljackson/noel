@@ -8,6 +8,10 @@
 //! how the session's last run ended, and `resume_run` continues it if a
 //! stop interrupted it.
 //!
+//! A `prompt`, `steer` or `follow_up` that is a skill command or a prompt
+//! template expands when it arrives, as upstream's does: the queue and the
+//! session hold the expansion.
+//!
 //! One task reads commands and drives the active run, so records keep the
 //! order things happen in. While a run is active, commands that change the
 //! session are refused and reads answer from a copy of the session that the
@@ -26,10 +30,10 @@ use base64::Engine;
 use pi_ai::ModelRef;
 use pi_config::LoadedConfig;
 use pi_core::{
-    continue_turn_streaming_events, run_saved_prompt_streaming_events,
+    continue_turn_streaming_events, expand_input, run_saved_prompt_streaming_events,
     run_user_turn_streaming_events_with_media, AgentError, CancellationToken, CompactionKind,
-    ConversationMessage, MessageRole, RunControl, RunStart, RunStatus, Runtime, SessionState,
-    SessionStore, ToolEvent, TurnEvent,
+    ConversationMessage, MessageRole, RetryAbort, RunControl, RunStart, RunStatus, Runtime,
+    SessionState, SessionStore, ToolEvent, TurnEvent,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -138,12 +142,16 @@ struct Shared {
 struct Run {
     recorder: Recorder,
     cancellation: CancellationToken,
+    retry: RetryAbort,
     /// The session as the run has left it so far, for reads.
     session: SessionState,
     /// What `get_state` reports while the run cannot change it.
     state: State,
     /// Aborts to answer once the run settles.
     aborts: Vec<Option<Value>>,
+    /// `abort_retry` commands to answer once the retry they ended is
+    /// reported as ended.
+    retry_aborts: Vec<Option<Value>>,
 }
 
 /// A run accepted to start, or to continue.
@@ -204,11 +212,15 @@ impl Rpc {
                     Err(error) => Err(error),
                 }
             }
-            Ok(Command::Steer(input)) => self.shared().enqueue(StreamingBehavior::Steer, input),
-            Ok(Command::FollowUp(input)) => {
-                self.shared().enqueue(StreamingBehavior::FollowUp, input)
-            }
+            Ok(Command::Steer(input)) => self.enqueue(StreamingBehavior::Steer, input),
+            Ok(Command::FollowUp(input)) => self.enqueue(StreamingBehavior::FollowUp, input),
             Ok(Command::Abort { expected_run_id }) => self.abort(expected_run_id),
+            // No run, so no retry is waiting.
+            Ok(Command::AbortRetry) => Ok(None),
+            Ok(Command::SetAutoRetry { enabled }) => {
+                self.runtime.set_retry_enabled(*enabled);
+                Ok(None)
+            }
             Ok(Command::ClearQueue) => self.shared().clear_queue(),
             Ok(Command::NewSession { parent_session }) => {
                 self.new_session(parent_session.as_deref())
@@ -219,6 +231,7 @@ impl Rpc {
             Ok(Command::GetLastAssistantText) => {
                 Ok(Some(Data::last_assistant_text(self.runtime.session())))
             }
+            Ok(Command::GetCommands) => Ok(Some(Data::commands(&self.config))),
             Ok(Command::SetModel { provider, model_id }) => self.set_model(provider, model_id),
             Ok(Command::SetThinkingLevel { level }) => self.set_thinking_level(level),
             Ok(Command::SetSteeringMode { mode } | Command::SetFollowUpMode { mode }) => {
@@ -232,6 +245,12 @@ impl Rpc {
         };
         send(&Response::to(&request, reply));
         None
+    }
+
+    /// Queues a message while no run is active.
+    fn enqueue(&mut self, behavior: StreamingBehavior, input: &Input) -> Reply {
+        let shared = self.shared.get_mut().expect("rpc state");
+        shared.enqueue(behavior, input, &self.config)
     }
 
     /// The reply to a prompt whose `requestId` already started a run.
@@ -265,9 +284,10 @@ impl Rpc {
             request_id: input.request_id.clone(),
         };
         let run_id = run.id.clone();
+        let message = expand_input(&self.config, &input.message);
         let prompt = self
             .runtime
-            .start_run(run, input.message.clone(), media)
+            .start_run(run, message, media)
             .map_err(|error| error.to_string())?;
         Ok(Start {
             run_id,
@@ -334,7 +354,7 @@ impl Rpc {
         } = start;
         let control = RunControl {
             steering: self.shared().queue.steering.clone(),
-            cancellation: CancellationToken::default(),
+            ..RunControl::default()
         };
         let mut state = self.state();
         state.is_streaming = true;
@@ -346,16 +366,21 @@ impl Rpc {
         let run = Run {
             recorder: Recorder::start(run_id.clone(), source, &mut |record| send(&record)),
             cancellation: control.cancellation.clone(),
+            retry: control.retry.clone(),
             session,
             state,
             aborts: Vec::new(),
+            retry_aborts: Vec::new(),
         };
         self.shared().run = Some(run);
 
         let Rpc {
-            runtime, shared, ..
+            runtime,
+            shared,
+            config,
+            ..
         } = self;
-        let shared = &*shared;
+        let (shared, config) = (&*shared, &*config);
         let mut next = Some(call);
         let outcome = loop {
             let Some(call) = next.take() else {
@@ -392,7 +417,7 @@ impl Rpc {
                     }
                 }
             };
-            let Some(result) = drive(turn, lines, shared).await else {
+            let Some(result) = drive(turn, lines, shared, config).await else {
                 return false;
             };
             let mut guard = lock(shared);
@@ -475,13 +500,18 @@ impl Rpc {
         Model::configured(&self.config, model)
     }
 
+    /// The thinking level in effect: clamped to the model, `off` for a
+    /// model without reasoning.
     fn thinking_level(&self) -> String {
-        self.runtime
-            .session()
-            .active_model
-            .as_ref()
-            .and_then(|model| crate::active_thinking_level(&self.runtime, &self.config, model))
-            .unwrap_or_else(|| "off".into())
+        crate::effective_thinking_level(&self.runtime, &self.config).to_owned()
+    }
+
+    /// Reports a change of the level in effect since `before`.
+    fn report_thinking_level(&self, before: &str) {
+        let after = self.thinking_level();
+        if after != before {
+            send(&Event::ThinkingLevelChanged { level: &after });
+        }
     }
 
     fn new_session(&mut self, parent_session: Option<&str>) -> Reply {
@@ -512,42 +542,36 @@ impl Rpc {
         Ok(Some(Data::Cancelled { cancelled: false }))
     }
 
-    /// Selects the session's model; unlike the TUI's `/model`, the default
-    /// model in settings stays as it is.
+    /// Selects the session's model, as upstream does: one of the models
+    /// that can run now, by exact provider and id. The thinking level
+    /// follows the switch (`switch_model`). Unlike the TUI's `/model`, the
+    /// default model in settings stays as it is.
     fn set_model(&mut self, provider: &str, model_id: &str) -> Reply {
         let model = ModelRef {
             provider: provider.to_owned(),
             id: model_id.to_owned(),
         };
-        let info = Model::configured(&self.config, &model)
+        let info = Some(&model)
+            .filter(|model| crate::provider_usable(&self.config, &model.provider, self.offline))
+            .and_then(|model| crate::configured_model(&self.config, model))
+            .map(Model::from)
             .ok_or_else(|| format!("Model not found: {provider}/{model_id}"))?;
-        let thinking = crate::active_thinking_level(&self.runtime, &self.config, &model);
-        self.runtime
-            .set_active_model(Some(model))
-            .and_then(|()| self.runtime.set_active_thinking_level(thinking))
+        let before = self.thinking_level();
+        crate::switch_model(&mut self.runtime, &self.config, &model, None)
             .map_err(|error| error.to_string())?;
+        self.report_thinking_level(&before);
         Ok(Some(Data::Model(Box::new(info))))
     }
 
+    /// Sets the thinking level, clamped to what the model supports as
+    /// upstream clamps it.
     fn set_thinking_level(&mut self, level: &str) -> Reply {
         let level = crate::normalized_thinking_level(level)
             .ok_or_else(|| format!("Unknown thinking level: {level}"))?;
-        if let Some(model) = &self.runtime.session().active_model {
-            if level != "off" && !crate::model_thinking_levels(model).contains(&level) {
-                return Err(format!(
-                    "{}/{} does not support thinking level {level}",
-                    model.provider, model.id
-                ));
-            }
-        }
         let before = self.thinking_level();
-        self.runtime
-            .set_active_thinking_level(Some(level.to_owned()))
+        crate::set_thinking_level(&mut self.runtime, &self.config, level)
             .map_err(|error| error.to_string())?;
-        let after = self.thinking_level();
-        if after != before {
-            send(&Event::ThinkingLevelChanged { level: &after });
-        }
+        self.report_thinking_level(&before);
         Ok(None)
     }
 
@@ -595,13 +619,14 @@ async fn drive<T>(
     turn: impl Future<Output = T>,
     lines: &mut Lines,
     shared: &Mutex<Shared>,
+    config: &LoadedConfig,
 ) -> Option<T> {
     tokio::pin!(turn);
     loop {
         tokio::select! {
             biased;
             result = &mut turn => return Some(result),
-            line = lines.recv() => lock(shared).command(&line?),
+            line = lines.recv() => lock(shared).command(&line?, config),
         }
     }
 }
@@ -616,7 +641,7 @@ impl Shared {
     }
 
     /// Handles a command while a run is active.
-    fn command(&mut self, line: &str) {
+    fn command(&mut self, line: &str, config: &LoadedConfig) {
         let request = match Request::parse(line) {
             Ok(request) => request,
             Err(error) => return send(&Response::parse_error(error)),
@@ -632,11 +657,13 @@ impl Shared {
                     (Some(data), _) => Ok(Some(data)),
                     (None, None) => Err(BUSY.into()),
                     (None, Some(_)) if request_id.is_some() => Err(QUEUED_REQUEST.into()),
-                    (None, Some(behavior)) => self.enqueue(behavior, input),
+                    (None, Some(behavior)) => self.enqueue(behavior, input, config),
                 }
             }
-            Ok(Command::Steer(input)) => self.enqueue(StreamingBehavior::Steer, input),
-            Ok(Command::FollowUp(input)) => self.enqueue(StreamingBehavior::FollowUp, input),
+            Ok(Command::Steer(input)) => self.enqueue(StreamingBehavior::Steer, input, config),
+            Ok(Command::FollowUp(input)) => {
+                self.enqueue(StreamingBehavior::FollowUp, input, config)
+            }
             Ok(Command::Abort { expected_run_id }) => match self.fence(expected_run_id) {
                 // Answered once the run settles.
                 Ok(()) => {
@@ -647,6 +674,15 @@ impl Shared {
                 }
                 Err(error) => Err(error),
             },
+            Ok(Command::AbortRetry) => {
+                let run = self.active();
+                if run.retry.abort() {
+                    // Answered once the retry is reported as ended.
+                    run.retry_aborts.push(request.id.clone());
+                    return;
+                }
+                Ok(None)
+            }
             Ok(Command::ClearQueue) => self.clear_queue(),
             Ok(Command::GetState) => {
                 let pending_message_count = self.queue.pending();
@@ -663,11 +699,13 @@ impl Shared {
             Ok(Command::GetLastAssistantText) => {
                 Ok(Some(Data::last_assistant_text(&self.active().session)))
             }
+            Ok(Command::GetCommands) => Ok(Some(Data::commands(config))),
             Ok(Command::SetSteeringMode { mode } | Command::SetFollowUpMode { mode }) => {
                 mode.reply()
             }
             Ok(
                 Command::ResumeRun { .. }
+                | Command::SetAutoRetry { .. }
                 | Command::NewSession { .. }
                 | Command::SwitchSession { .. }
                 | Command::SetModel { .. }
@@ -700,18 +738,25 @@ impl Shared {
         }
     }
 
-    /// Queues a message, as steering or a follow-up, once it is saved.
-    fn enqueue(&mut self, behavior: StreamingBehavior, input: &Input) -> Reply {
+    /// Queues a message, as steering or a follow-up, once it is saved. A
+    /// skill command or a prompt template is queued expanded.
+    fn enqueue(
+        &mut self,
+        behavior: StreamingBehavior,
+        input: &Input,
+        config: &LoadedConfig,
+    ) -> Reply {
         self.fence(&input.expected_run_id)?;
         if !input.images.is_empty() {
             return Err(
                 "queued messages are text only; send images with a prompt that starts a run".into(),
             );
         }
+        let message = expand_input(config, &input.message);
         let (mut steering, mut follow_ups) = self.queue.contents();
         match behavior {
-            StreamingBehavior::Steer => steering.push(input.message.clone()),
-            StreamingBehavior::FollowUp => follow_ups.push(input.message.clone()),
+            StreamingBehavior::Steer => steering.push(message),
+            StreamingBehavior::FollowUp => follow_ups.push(message),
         }
         self.set_queue((steering, follow_ups))?;
         Ok(Some(Data::queued()))
@@ -784,6 +829,9 @@ impl Shared {
         run.mirror(event);
         run.recorder
             .record(event, queue, &mut |record| send(&record));
+        if matches!(event, TurnEvent::RetryFinished { .. }) {
+            run.answer_retry_aborts();
+        }
         if matches!(event, TurnEvent::MessageAdded(message) if message.role == MessageRole::User) {
             self.save_delivered();
         }
@@ -805,9 +853,10 @@ impl Shared {
 
     /// Ends the active run's records and answers the aborts it waited for.
     fn settle(&mut self, outcome: Outcome) {
-        let Some(run) = self.run.take() else {
+        let Some(mut run) = self.run.take() else {
             return;
         };
+        run.answer_retry_aborts();
         run.recorder.finish(outcome, &mut |record| send(&record));
         for id in run.aborts {
             send(&Response::new(id.as_ref(), Some("abort"), Ok(None)));
@@ -816,6 +865,12 @@ impl Shared {
 }
 
 impl Run {
+    fn answer_retry_aborts(&mut self) {
+        for id in self.retry_aborts.drain(..) {
+            send(&Response::new(id.as_ref(), Some("abort_retry"), Ok(None)));
+        }
+    }
+
     /// Keeps the session copy in step with what the engine saves.
     fn mirror(&mut self, event: &TurnEvent) {
         match event {
@@ -823,6 +878,7 @@ impl Run {
             TurnEvent::ToolOutput {
                 call,
                 output,
+                images,
                 is_error,
                 ..
             } => {
@@ -836,7 +892,7 @@ impl Run {
                     role: MessageRole::Tool,
                     content: output.clone(),
                     thinking: String::new(),
-                    media: Vec::new(),
+                    media: images.clone(),
                     tool_call_id: Some(call.id.clone()),
                     tool_name: Some(call.name.clone()),
                     tool_calls: Vec::new(),

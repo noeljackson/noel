@@ -38,6 +38,7 @@ The Rust implementation uses a Cargo workspace with explicit crate boundaries:
   - Package/config CLI commands.
 - `crates/pi-core`
   - Agent loop.
+  - System prompt.
   - Session state.
   - Conversation orchestration.
   - Session persistence and export/import.
@@ -47,11 +48,13 @@ The Rust implementation uses a Cargo workspace with explicit crate boundaries:
   - Settings loading.
   - Auth loading.
   - Keybindings config.
+  - Context file and prompt file discovery.
   - Resource/package discovery.
-  - Model cache loading.
+  - Model definitions: the catalog, the model cache, and `models.json`.
+  - Model resolution and scoping (`model_resolver.rs`).
 - `crates/pi-ai`
   - Provider request/response normalization.
-  - Model registry data.
+  - The built-in model catalog and the thinking-level rules (`catalog.rs`).
   - Credential resolution.
   - Faux provider for tests.
   - Production provider adapters.
@@ -99,6 +102,7 @@ Reloadable runtime state owns replaceable wiring:
 - Tool definitions.
 - Prompt templates.
 - Skills.
+- Custom and appended system prompt text.
 - Context files.
 - Extensions.
 - Keybinding map.
@@ -165,9 +169,12 @@ README's RPC Mode and the non-parity register). It lives in two modules of
 - `rpc_wire.rs` holds the protocol: serde types for commands, responses,
   events, and messages in upstream's field order, and `Recorder`, which turns
   one run's `TurnEvent`s into upstream's records. A run is one upstream run
-  (one `agent_start`, one `agent_end`, one `agent_settled`) however many
-  engine calls it takes; the recorder closes whatever an abort or a failure
-  left open, ending the run's last turn with an aborted or error reply.
+  (`agent_start`, its turns, `agent_end`, and one `agent_settled`) however
+  many engine calls it takes; the recorder closes whatever an abort or a
+  failure left open, ending the run's last turn with an aborted or error
+  reply. When the engine drops a reply to ask again (see Run Recovery), the
+  recorder ends that reply's turn with `agent_end` and starts over with
+  another `agent_start` under the same run id, as upstream does.
 - `rpc.rs` holds the mode: a reader thread that splits stdin on LF only, one
   writer that prints each record as one line, and the command loop. While a
   run is active one task polls the engine call and handles commands that
@@ -177,8 +184,9 @@ README's RPC Mode and the non-parity register). It lives in two modules of
   never contended.
 
 Each run builds its provider at the prompt (so `set_model` applies to the next
-run) and gets a `RunControl`: the shared steering mailbox and its own
-cancellation token, which `abort` cancels. Follow-ups need no engine support:
+run) and gets a `RunControl`: the shared steering mailbox, its own
+cancellation token, which `abort` cancels, and the handle `abort_retry` ends
+a backoff with. Follow-ups need no engine support:
 when an engine call returns with follow-ups queued, the run makes another
 engine call with them as its prompt. While the engine holds the runtime,
 reads answer from a copy of the session that the run's events keep current,
@@ -207,6 +215,43 @@ An enqueue or `clear_queue` is saved before it is applied and acknowledged; a
 delivered message leaves the saved queue once its user message is saved, so a
 crash between the two delivers it again unless the queue is cleared.
 
+## Run Recovery
+
+The run loop (`run_model_turn_streaming_events` in `pi-core`) asks for one
+reply per round. What follows a failed request is decided in one place,
+`Recovery`, the counterpart of upstream's `_handlePostAgentRun`:
+
+- `pi-ai` classifies the failure: `ProviderError::is_retryable` and
+  `is_context_overflow` apply upstream's patterns (kept verbatim, and checked
+  against `error-classification.json`) to what the provider answered, and
+  treat a transport failure as retryable by its kind.
+- A retryable failure waits out a backoff and asks again; a context overflow
+  compacts first, once (`Runtime::compact_after_overflow`, the same
+  compaction the threshold uses, without the threshold). A final reply cut
+  off at the output limit below the model's own limit
+  (`Provider::output_limit`, the catalog's `maxTokens`) is handled as an
+  overflow. Any other failure ends the turn.
+- Asking again is another round of the same loop: `RetryStarted` or
+  `Overflowed` ends the round of the dropped reply, and `RoundStarted` opens
+  the next. Steering queued meanwhile joins it. A dropped round does not
+  count toward `agent.maxToolRounds`.
+
+A reply is saved only when it stands, after its request succeeded. So a
+dropped reply is never in the session or its journal: the request that asks
+again is built from the same saved messages, and there is nothing to remove.
+The only journal write of a recovery is the compaction checkpoint, which is
+atomic. A pi killed during a backoff or a compaction resumes from the saved
+prompt and recovers again; killed after the checkpoint, it resumes with the
+compacted context.
+
+A turn's cancellation ends a backoff or an overflow compaction at once, like
+any other step. `RunControl::retry` ends a backoff only, and the turn then
+fails with the error it would have retried.
+
+`pi-agent` keeps a self-contained retry (`complete_with_retry`) with the same
+classification for requests that are not a turn's reply: a compaction's
+summary.
+
 ## Config Model
 
 Default root:
@@ -229,12 +274,23 @@ File names:
 Project-local roots:
 
 - `.pi/`
-- `.agents/skills`
+- `.agents/skills`, in each directory from the cwd up to the repository root
 
-Context discovery:
+User skills are also read from `~/.agents/skills`.
 
-- Load global `AGENTS.md`/`CLAUDE.md` from the agent dir.
-- Load cwd ancestor `AGENTS.md`/`CLAUDE.md` in root-to-leaf order.
+Context discovery, whatever the project trust decision:
+
+- One context file per directory: `AGENTS.override.md`, else `AGENTS.md`,
+  else `CLAUDE.md`.
+- Load the agent dir's, then the cwd ancestors' in root-to-leaf order.
+- In a linked worktree nested inside its main checkout, skip the main
+  checkout's file that the worktree's own file of the same name replaces.
+
+Prompt files:
+
+- `SYSTEM.md` and `APPEND_SYSTEM.md`: the trusted project's `.pi/` copy, else
+  the agent dir's. The `systemPrompt`/`appendSystemPrompt` settings and the
+  `--system-prompt`/`--append-system-prompt` flags come before the files.
 
 Validation rules:
 
@@ -243,6 +299,40 @@ Validation rules:
 - Invalid resources produce diagnostics.
 - Missing optional resource paths produce diagnostics.
 - Missing required session cwd blocks session resume outside interactive recovery.
+
+## System Prompt
+
+`crates/pi-core/src/system_prompt.rs` builds the prompt every model request
+starts with. It is a port of upstream's `buildSystemPrompt`: a pure function
+from the active tools, the custom and appended prompt text, the context
+files, the skills, and the working directory to the text, with no runtime
+behind it.
+`system-prompt.json` holds upstream's output and the module's tests compare
+against it to the byte.
+
+The prompt is a one-sentence role followed by tagged sections joined by blank
+lines: `tools`, `rules`, `addendum`, `project_context`, `skills`, and `cwd`. A
+custom prompt replaces the role, `tools`, and `rules`; the rest still follow
+it. `skills` is the listing of the loaded skills
+(`pi_config::format_skills_for_prompt`), present while `read` or `bash` is
+active.
+
+The runtime builds the prompt once per turn (`runtime_system_prompt`) from
+what the session and the reloadable systems hold at that moment:
+
+- The tools are the ones the request declares (`active_tool_definitions`), so
+  the tool list and rules always match the request. A builtin tool's line and
+  rules come from `PromptTool::builtin`; an extension tool's come from its
+  manifest's `promptSnippet` and `promptGuidelines`.
+- The custom prompt, appended text, context files, and skills come from the
+  loaded config, so `/reload` picks up edited files.
+- Session `System` messages follow the prompt in the same request field.
+
+The context estimate counts the same text, so automatic compaction and the
+output cap include the prompt.
+
+`PRODUCT_NAME` is the one place the product's name is written for the prompt
+and for the `AI_AGENT` process marker.
 
 ## Session Model
 
@@ -316,7 +406,10 @@ Implemented providers:
 Credential resolution supports runtime API keys, named multi-account
 `auth.json` entries, environment variables, Claude Code login token fallback,
 Codex/ChatGPT login token fallback, and provider-specific environment
-settings. Imported Claude Code and Codex/ChatGPT OAuth tokens are refreshed
+settings. A credential serves the provider it is stored for and only if the
+provider takes its kind: a ChatGPT login is `openai-codex`'s and an API key is
+`openai`'s (`provider_takes` in `pi-config`). A Cloudflare provider is
+offered only with the ids its URLs need (`has_auth_for_provider`). Imported Claude Code and Codex/ChatGPT OAuth tokens are refreshed
 automatically when they expire; refreshed credentials persist to pi's own
 `auth.json`. Per-account quota probes feed `pi accounts status` and are cached
 in `usage-cache.json`.
@@ -325,26 +418,74 @@ Model refresh runs in the background when enabled, online, stale, and
 authenticated. It does not block startup. Refreshed models become visible after
 `/reload` or the next startup.
 
+## Model Catalog and Selection
+
+The built-in catalog is data, not code. `scripts/ts-parity/model-catalog-fixture.ts`
+runs upstream's model runtime in Docker and writes every provider and chat
+model it knows, with every field, to
+`tests/fixtures/ts-parity/model-catalog.json`. `pi-ai`'s `catalog.rs` compiles
+that file in (`include_str!`) and parses it once, on first use. The file is
+both the parity fixture and the product's data, so `make ts-parity-update`
+(and the drift job's pull request) updates the models pi knows, and the drift
+check reports a catalog that has moved. The providers only this port has
+(`faux`, `zai-coding`, `zai-anthropic`, `kimi-coding-openai`) are in
+`crates/pi-ai/src/catalog_port_models.json`, written by hand in the same
+shape and loaded first, so `faux/echo` stays the first model. Upstream models
+on an API pi has no adapter for are skipped at load.
+
+A catalog entry keeps the fields pi reads: provider, id, name, API, base URL,
+`reasoning`, `thinkingLevelMap`, `input`, `cost`, `contextWindow`, and
+`maxTokens`. `pi-config`'s `ModelDefinition` has the same fields under
+upstream's names, all optional past the endpoint, so a built-in model, a
+cached provider listing, and a `models.json` entry describe a model the same
+way. `load_config` merges the three (`merge_model_definitions`): the catalog
+is the base, a listed id the catalog lacks is built on its provider's default
+model, and a `models.json` entry is used as written and takes what it leaves
+out from the catalog. `LoadedConfig.models` is every known model;
+`LoadedConfig.model_scope` is what `--models` or `enabledModels` selects of
+them, resolved by the CLI because it depends on credentials.
+
+Resolution is a port of upstream's `core/model-resolver.ts` in
+`pi-config/src/model_resolver.rs`: pure functions over a list of models in
+catalog order and a predicate for which providers have credentials
+(`resolve_cli_model`, `resolve_model_scope`,
+`find_exact_model_reference_match`, `find_initial_model`, `custom_model`),
+with upstream's collation order and glob matching ported for ASCII ids.
+`pi-cli`'s `model_select.rs` applies them to a session: startup selection
+(`resolve_cli_selection`, `select_initial_model`), model switches
+(`switch_model`), and thinking-level changes (`set_thinking_level`), used
+alike by the CLI, the TUI commands, and RPC mode. The session stores a
+`ModelRef`; requests look the definition up (`model_definition`) each time.
+
 ## Thinking Architecture
 
-Thinking level is session state and can be set with `--thinking`, `/thinking`,
-or left/right while the `/model` selector is open.
+A thinking level is one of upstream's seven names, `off` to `max`. Which of
+them a model supports follows from its definition (`reasoning` and
+`thinkingLevelMap`) through two functions ported from upstream's
+`ai/src/models.ts`, `supported_thinking_levels` and `clamp_thinking_level` in
+`pi-ai`'s `catalog.rs`; there are no per-provider rules.
 
-Model-specific levels:
+The session stores a level only once something sets one. The level in effect
+(`effective_thinking_level`) is the session's, else the model's entry in
+`modelThinkingLevels`, else `defaultThinkingLevel`, else `medium`, clamped to
+the model; `get_state`, the status line, and the bash tool's
+`PI_REASONING_LEVEL` report it. Setting a level stores the clamped one, and a
+model switch carries the level in effect over unless the settings give the
+new model one.
 
-- Anthropic Opus adaptive models: `high`, `xhigh`, `max`.
-- Other Anthropic adaptive models: `high`, `xhigh`.
-- OpenAI/Codex reasoning models: `minimal`, `low`, `medium`, `high`, `xhigh`.
-- Google thinking models: mapped to provider thinking budgets.
-- Non-thinking models: no active thinking level.
-
-Provider adapters translate normalized thinking levels into provider-specific
-payloads.
+A request gets the level in effect in `ProviderConfig.thinking_level` (`None`
+for a model without reasoning) and the model's `ModelTraits`: its thinking
+level map, output cap, and context window. Request builders clamp again, as
+upstream's do, send the level under the name the map gives it, and send the
+output cap lowered to fit the context window. How a level is encoded stays
+each builder's own: a reasoning effort for the Responses APIs and OpenRouter,
+adaptive or budget thinking for Anthropic and Bedrock, a budget for Google.
 
 ## Tool Architecture
 
-Tool definitions live in `pi-tools`; active tool selection lives in session
-state.
+Tool definitions live in `pi-tools`. The tools a run may use are computed
+from the tool settings and command-line flags whenever the reloadable systems
+are built; the session does not record a selection.
 
 Built-ins:
 
@@ -358,11 +499,27 @@ Built-ins:
 
 Rules:
 
-- Tools receive an explicit cwd.
+- Tools receive an explicit cwd. Paths resolve against it but, as in
+  upstream, are not confined to it.
 - File mutation tools must protect unrelated user changes.
 - Search/list tools are read-only.
 - Tool tests do not call providers.
 - Shell execution supports configured shell path and command prefix.
+- A `bash` call from the model runs with the session's variables
+  (`PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`,
+  `PI_REASONING_LEVEL`), set per call by `pi-core` through
+  `ToolRuntimeOptions::bash_env`; a variable with nothing to report is
+  removed from the inherited environment. The reasoning level is the turn's
+  provider's thinking level (`Provider::thinking_level`). Commands the user
+  types get none.
+- `pi-cli` sets the process markers `AI_AGENT` and `PI_CODING_AGENT` before
+  starting any thread, so every child process inherits them.
+- A `bash` call reports its output while it runs: `pi-tools`
+  (`execute_tool_streaming`) passes what the command has printed so far,
+  within the limits of the result, to a callback, at most every 100 ms;
+  `pi-core` reports it as `TurnEvent::ToolUpdate`, which the TUI shows in the
+  running tool's entry and RPC mode sends as `tool_execution_update`. The
+  result is unchanged.
 - TUI progress rendering is controlled by `terminal.showTerminalProgress`.
 
 Patch/edit behavior uses structured local logic rather than provider-specific
@@ -394,6 +551,45 @@ Keybindings:
 - Support reload without recreating `SessionState`.
 - Keep action checks routed through the keybinding layer where user-configurable behavior is required.
 
+## Skills and Prompt Templates
+
+Skills and prompt templates are ports of upstream's modules, kept file for
+file so each can be read against its source:
+
+- `crates/pi-config/src/frontmatter.rs` (`utils/frontmatter.ts`): the
+  frontmatter and body of a Markdown file. Upstream uses a YAML library;
+  this is a parser for the YAML the Agent Skills specification uses.
+- `crates/pi-config/src/resources.rs` (the skill and prompt parts of
+  `core/package-manager.ts` and `core/resource-loader.ts`): which files to
+  load, in the order that decides a name collision: project setting, project
+  directories, user setting, user directories, packages, then the command
+  line's paths. `--no-skills` and `--no-prompt-templates` keep only the last.
+- `crates/pi-config/src/skills.rs` (`core/skills.ts`): a skill from its file,
+  the Agent Skills name and description rules, first-wins collisions, and the
+  system prompt's listing.
+- `crates/pi-config/src/prompt_templates.rs` (`core/prompt-templates.ts`): a
+  template from its file, argument splitting, and placeholder substitution.
+- `crates/pi-core/src/input.rs` (the session's expansion in
+  `core/agent-session.ts`): `expand_input`, which turns `/skill:name` and
+  `/template` input into the prompt it stands for.
+
+`LoadedConfig` holds the loaded skills and templates, so `/reload` replaces
+them with the rest of the configuration. Their diagnostics join the
+configuration's. `ReloadableSystems` copies the skills for the system prompt.
+
+`expand_input` is applied where input enters a mode, as upstream's session
+applies it in `prompt`, `steer`, and `followUp`: the TUI when a line is
+submitted, queued, or sent as steering; print mode for its prompt; RPC mode
+for `prompt`, `steer`, and `follow_up`. The engine takes the text it is
+given, so a queued message is expanded once, when it is queued, and the queue
+and the session hold the expansion. Rust's slash-tool prompts are checked
+first: `/read notes.txt` stays a tool command whatever templates exist. Text
+that is none of these goes to the model.
+
+`skills.json` holds upstream's results for each step (what loads from a
+tree, the listing, the expansions, the argument table, and `get_commands`),
+and each module's tests compare with it exactly.
+
 ## Extension and Package Resource Architecture
 
 Rust package/resource support is local and git based.
@@ -413,7 +609,8 @@ Extension execution supports:
 - JSON lifecycle events for `reload` and `shutdown`.
 - JSON model-tool registration from adjacent `.pi-extension.json` manifests.
   Registered tools receive `kind: "tool"` protocol requests and return JSON
-  command responses.
+  command responses. A tool's optional `promptSnippet` and `promptGuidelines`
+  become its line and rules in the system prompt.
 - Diagnostics for manifest and lifecycle failures.
 
 Intentionally unsupported:
@@ -464,7 +661,10 @@ Rust `pi-ai` tests compare local builders against those captures.
 `rpc-protocol.json` is a protocol transcript instead: upstream `pi --mode rpc`
 driven against a local stub model, with every stdout record in order and
 volatile values replaced by placeholders. `pi-cli`'s `rpc_parity` test replays
-each scenario against `faux/script` and compares the records. When upstream
+each scenario against `faux/script` and compares the records.
+`error-classification.json` holds the patterns upstream classifies a failed
+request with and its verdicts for sample errors; `pi-ai` keeps the same
+patterns and is checked against both. When upstream
 changes, the drift harness produces both a raw diff and an agent-oriented brief
 that states the constraints: no host npm, TypeScript only in Docker, keep Rust
 changes scoped to parity behavior, and rerun Rust validation before committing.

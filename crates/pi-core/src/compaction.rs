@@ -140,8 +140,7 @@ impl Runtime {
     /// Includes reloadable instructions, tool schemas, attachments, and calls.
     /// Billed session totals are deliberately not used as active-context size.
     pub fn estimated_context_tokens(&self) -> u64 {
-        let prompt = runtime_system_prompt(self);
-        let system = prompt.as_deref().map(text_tokens).unwrap_or(0);
+        let system = text_tokens(&runtime_system_prompt(self));
         let tools = active_tool_definitions(self)
             .iter()
             .map(|tool| {
@@ -197,11 +196,29 @@ impl Runtime {
         if !self.needs_auto_compaction() {
             return Ok(None);
         }
+        self.compact_turns_or_rounds(provider).await.map(Some)
+    }
+
+    /// Compacts whatever the estimate says: the provider refused the
+    /// context as too large, or cut a reply short for lack of room. Older
+    /// complete turns are summarized, or the completed rounds of a single
+    /// turn, as in [`Runtime::auto_compact_midturn`].
+    pub async fn compact_after_overflow(
+        &mut self,
+        provider: &dyn Provider,
+    ) -> Result<CompactionRecord, AgentError> {
+        self.compact_turns_or_rounds(provider).await
+    }
+
+    async fn compact_turns_or_rounds(
+        &mut self,
+        provider: &dyn Provider,
+    ) -> Result<CompactionRecord, AgentError> {
         let record = self
             .compact_messages(provider, CompactionKind::Automatic, "")
             .await?;
         if record.omitted_messages > 0 {
-            return Ok(Some(record));
+            return Ok(record);
         }
         let record = self.compact_midturn(provider).await?;
         if record.omitted_messages == 0 {
@@ -210,18 +227,38 @@ impl Runtime {
                     .into(),
             ));
         }
-        Ok(Some(record))
+        Ok(record)
+    }
+
+    /// Whether a compaction has anything to summarize: an older complete
+    /// turn, or completed rounds of a single turn. (Upstream's
+    /// `prepareCompaction` answers the same question.)
+    pub fn can_compact(&self) -> bool {
+        let messages = &self.session.messages;
+        let keep = self.keep_recent_tokens();
+        let summarizable = |older: &[ConversationMessage]| {
+            older
+                .iter()
+                .any(|message| message.role != MessageRole::System && !is_checkpoint(message))
+        };
+        summarizable(&messages[..retained_start(messages, keep)])
+            || midturn_retained_start(messages, keep)
+                .is_some_and(|start| summarizable(&messages[1..start]))
+    }
+
+    /// The recent messages a compaction keeps, in tokens.
+    fn keep_recent_tokens(&self) -> u64 {
+        self.systems
+            .compaction
+            .keep_recent_tokens
+            .min(self.context_window() / 4)
     }
 
     pub async fn compact_midturn(
         &mut self,
         provider: &dyn Provider,
     ) -> Result<CompactionRecord, AgentError> {
-        let keep = self
-            .systems
-            .compaction
-            .keep_recent_tokens
-            .min(self.context_window() / 4);
+        let keep = self.keep_recent_tokens();
         let Some(start) = midturn_retained_start(&self.session.messages, keep) else {
             return Ok(CompactionRecord {
                 kind: CompactionKind::Automatic,
@@ -289,13 +326,7 @@ impl Runtime {
         kind: CompactionKind,
         focus: &str,
     ) -> Result<CompactionRecord, AgentError> {
-        let start = retained_start(
-            &self.session.messages,
-            self.systems
-                .compaction
-                .keep_recent_tokens
-                .min(self.context_window() / 4),
-        );
+        let start = retained_start(&self.session.messages, self.keep_recent_tokens());
         // Persistent system messages are retained verbatim, never rewritten by
         // the summarizer. Old deterministic checkpoints are the sole exception.
         let older = self.session.messages[..start]
@@ -349,8 +380,7 @@ impl Runtime {
             .saturating_sub(messages_tokens(&self.session.messages))
             .saturating_add(messages_tokens(&messages));
         if kind == CompactionKind::Automatic && self.exceeds_compaction_budget(projected_tokens) {
-            let prompt = runtime_system_prompt(self);
-            let system = prompt.as_deref().map(text_tokens).unwrap_or(0);
+            let system = text_tokens(&runtime_system_prompt(self));
             let tools = active_tool_definitions(self)
                 .iter()
                 .map(|tool| {
@@ -612,10 +642,10 @@ mod tests {
     async fn semantic_checkpoint_sees_middle_focus_calls_and_preserves_state_and_instructions() {
         let mut runtime = runtime();
         runtime.systems.system_prompt = Some("persistent safety rule".into());
-        runtime
-            .systems
-            .context_messages
-            .push("AGENTS.md: project conventions".into());
+        runtime.systems.context_files.push(ContextFile {
+            path: "AGENTS.md".into(),
+            content: "project conventions".into(),
+        });
         runtime
             .session
             .messages
