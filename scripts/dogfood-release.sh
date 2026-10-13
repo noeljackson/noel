@@ -87,15 +87,34 @@ send_line "dogfood after reload"
 send_line "/queue dogfood queued"
 send_line "dogfood trigger queue"
 send_line "/queue"
+# /model opens a two-layer picker: the providers, then the chosen provider's
+# models, where left/right adjust the thinking level a switch will set.
 send_line "/model"
 sleep 0.5
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/selector-pane.txt"
-grep -Fq "model selector" "${work_dir}/selector-pane.txt"
+grep -Fq "provider selector" "${work_dir}/selector-pane.txt"
+tmux send-keys -t "${session_name}" -l "anthropic"
+sleep 0.25
+send_key Enter
 tmux send-keys -t "${session_name}" -l "anthropic/claude-opus-4-7"
 sleep 0.25
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/selector-filtered-pane.txt"
+grep -Fq "model · anthropic selector" "${work_dir}/selector-filtered-pane.txt"
 grep -Fq "left/right to adjust" "${work_dir}/selector-filtered-pane.txt"
+# The level the picker shows for the selected model; which levels a model has
+# comes from the catalog, so the check reads it instead of naming one.
+selector_thinking() {
+  tmux capture-pane -t "${session_name}" -p \
+    | sed -n 's/.*thinking \([a-z]*\)  left\/right to adjust.*/\1/p' | tail -n 1
+}
+thinking_before="$(selector_thinking)"
 send_key Right
+thinking_after="$(selector_thinking)"
+if [ -z "${thinking_after}" ] || [ "${thinking_after}" = "${thinking_before}" ]; then
+  tmux capture-pane -t "${session_name}" -p >&2
+  echo "right did not adjust the thinking level: ${thinking_before} -> ${thinking_after}" >&2
+  exit 1
+fi
 send_key Enter
 sleep 0.35
 send_line "/thinking"
@@ -111,7 +130,7 @@ send_line "/copy"
 send_line "/quit"
 sleep 0.5
 
-pane_output="$(tmux capture-pane -t "${session_name}" -p -S -2000 2>/dev/null || true)"
+pane_output="$(tmux capture-pane -J -t "${session_name}" -p -S -2000 2>/dev/null || true)"
 printf '%s\n' "${pane_output}" > "${work_dir}/pane.txt"
 
 require_output() {
@@ -133,8 +152,8 @@ require_output "[faux/echo] dogfood after reload"
 require_output "queued: 1"
 require_output "[faux/echo] dogfood queued"
 require_output "queue is empty"
-require_output "model selector"
-require_output "anthropic/claude-opus-4-7 max"
+require_output "provider selector"
+require_output "anthropic/claude-opus-4-7 ${thinking_after}"
 require_output "faux/echo"
 require_output "[faux/echo] dogfood back on faux"
 require_output "exported ${work_dir}/session-export.json"
