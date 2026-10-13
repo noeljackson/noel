@@ -7,15 +7,15 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-pi_bin="${PI_BIN:-${repo_root}/target/release/pi}"
+noel_bin="${NOEL_BIN:-${repo_root}/target/release/noel}"
 
-if [ ! -x "${pi_bin}" ]; then
-  echo "release binary is not executable: ${pi_bin}" >&2
-  echo "run make release first, or set PI_BIN" >&2
+if [ ! -x "${noel_bin}" ]; then
+  echo "release binary is not executable: ${noel_bin}" >&2
+  echo "run make release first, or set NOEL_BIN" >&2
   exit 1
 fi
 
-session_name="pi-dogfood-${$}"
+session_name="noel-dogfood-${$}"
 session_dir="${repo_root}/target/dogfood-release-sessions"
 work_dir="${repo_root}/target/dogfood-release-work"
 cwd_dir="${work_dir}/cwd"
@@ -39,12 +39,12 @@ cat > "${agent_dir}/settings.json" <<'JSON'
 }
 JSON
 
-"${pi_bin}" --version > "${work_dir}/version.txt"
-grep -Eq '^pi [0-9]+' "${work_dir}/version.txt"
+"${noel_bin}" --version > "${work_dir}/version.txt"
+grep -Eq '^noel [0-9]+' "${work_dir}/version.txt"
 
 tmux new-session -d -s "${session_name}" -x 110 -y 34
 tmux send-keys -t "${session_name}" \
-  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' '${pi_bin}' --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' NOEL_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' '${noel_bin}' --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -57,12 +57,12 @@ done
 
 if [ ! -f "${prompt_file}" ]; then
   tmux capture-pane -t "${session_name}" -p -S -2000 >&2
-  echo "pi prompt did not appear in release dogfood" >&2
+  echo "noel prompt did not appear in release dogfood" >&2
   exit 1
 fi
 
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/initial-pane.txt"
-grep -Fq "pi rust cli" "${work_dir}/initial-pane.txt"
+grep -Fq "noel rust cli" "${work_dir}/initial-pane.txt"
 grep -Fq "│ >" "${work_dir}/initial-pane.txt"
 grep -Fq "faux/echo" "${work_dir}/initial-pane.txt"
 
@@ -142,7 +142,7 @@ require_output() {
   fi
 }
 
-require_output "pi rust cli"
+require_output "noel rust cli"
 require_output "assistant>"
 require_output "[faux/echo] dogfood release prompt"
 require_output "Successfully wrote to ${cwd_dir}/note.txt"

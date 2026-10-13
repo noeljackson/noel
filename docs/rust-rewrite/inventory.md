@@ -1,8 +1,8 @@
 # Rust Rewrite Inventory
 
-Original tracking issue: https://github.com/noeljackson/pi/issues/3
+Original tracking issue: https://github.com/noeljackson/noel/issues/3
 
-Current doc refresh: https://github.com/noeljackson/pi/issues/38
+Current doc refresh: https://github.com/noeljackson/noel/issues/38
 
 This document records the TypeScript reference behavior that the Rust rewrite
 preserved, replaced, or intentionally dropped. The TypeScript reference is the
@@ -13,7 +13,7 @@ implementation is Rust-only.
 
 Current target:
 
-- Native Rust CLI/TUI application named `pi`.
+- Native Rust CLI/TUI application named `noel`.
 - No web UI.
 - No npm, Node.js, TypeScript, Vite, React, or browser runtime in the product path.
 - Normal explicit reload of runtime systems without clearing the active conversation.
@@ -29,7 +29,7 @@ Reference packages from the checked-out upstream TypeScript repository:
 
 ## CLI Surface
 
-The Rust executable is `pi` from `crates/pi-cli`.
+The Rust executable is `noel` from `crates/noel-cli`.
 
 Primary modes:
 
@@ -83,29 +83,29 @@ Implemented CLI flags include:
 
 Rust package/config commands:
 
-- `pi install <path-or-git-url>`
-- `pi remove|uninstall <source-or-name>`
-- `pi update [source|self|pi]`
-- `pi list`
-- `pi config show`
-- `pi config disable <extension|skill|prompt|theme> <name>`
-- `pi config enable <extension|skill|prompt|theme> <name>`
+- `noel install <path-or-git-url>`
+- `noel remove|uninstall <source-or-name>`
+- `noel update [source|self|noel]`
+- `noel list`
+- `noel config show`
+- `noel config disable <extension|skill|prompt|theme> <name>`
+- `noel config enable <extension|skill|prompt|theme> <name>`
 
 Package commands are Rust-path only. They do not run npm, install npm packages,
-or load a Node runtime. `pi update` fast-forwards local git package sources and
+or load a Node runtime. `noel update` fast-forwards local git package sources and
 does not self-update the Rust binary.
 
 ## Config, Auth, and Data Paths
 
 Default config root:
 
-- `~/.pi/agent`
+- `~/.noel`
 
 Environment overrides:
 
-- `PI_CODING_AGENT_DIR`
-- `PI_CODING_AGENT_SESSION_DIR`
-- `PI_OFFLINE`
+- `NOEL_DIR`
+- `NOEL_SESSION_DIR`
+- `NOEL_OFFLINE`
 
 Current user files:
 
@@ -120,21 +120,21 @@ Current user files:
 - `prompts/`
 - `themes/`
 - `sessions/`
-- `pi-debug.log`
+- `noel-debug.log`
 
 Project-local files:
 
-- `.pi/settings.json`
-- `.pi/SYSTEM.md` and `.pi/APPEND_SYSTEM.md`, which replace the agent dir's
+- `.noel/settings.json`
+- `.noel/SYSTEM.md` and `.noel/APPEND_SYSTEM.md`, which replace the agent dir's
   `SYSTEM.md` and `APPEND_SYSTEM.md`
-- `.pi/extensions`
-- `.pi/skills`
-- `.pi/prompts`
-- `.pi/themes`
+- `.noel/extensions`
+- `.noel/skills`
+- `.noel/prompts`
+- `.noel/themes`
 - `.agents/skills`, in each directory from the cwd up to the repository root
 - `AGENTS.override.md`, `AGENTS.md`, or `CLAUDE.md` (one per directory, in
   that order) discovered from the global agent dir and cwd ancestors,
-  whatever the project trust decision; trust gates only the `.pi` resources
+  whatever the project trust decision; trust gates only the `.noel` resources
   and `.agents/skills` above. A linked worktree nested in its main checkout
   replaces the main checkout's same-named file.
 
@@ -181,7 +181,7 @@ Rust behavior:
 - Settings reload is validated before replacing runtime systems.
 - Invalid reloads preserve the old runtime systems and active conversation.
 - `terminal.showTerminalProgress` controls visible running/completed tool and shell entries.
-- `disabledResources` and `pi config enable|disable` filter loaded extensions, skills, prompts, and themes.
+- `disabledResources` and `noel config enable|disable` filter loaded extensions, skills, prompts, and themes.
 - npm-specific package settings are not preserved.
 
 ## Run Recovery
@@ -266,7 +266,7 @@ Rust TUI parity includes:
 Keybinding behavior:
 
 - Defaults live in Rust.
-- User overrides load from `~/.pi/agent/keybindings.json`.
+- User overrides load from `~/.noel/keybindings.json`.
 - Reload refreshes keybindings without resetting `SessionState`.
 
 ## Slash Commands
@@ -314,7 +314,7 @@ Implemented built-in slash commands include:
 - `/delete <id|name|path>` (bare `/delete` shows usage; it never deletes)
 - `/name [name]` (bare `/name` shows the current name)
 - `/labels <labels...>`
-- `/export [file]` (default `pi-session-<session id>.html` in the session cwd)
+- `/export [file]` (default `noel-session-<session id>.html` in the session cwd)
 - `/import <file>`
 - `/copy`
 - `/share [file]`
@@ -360,9 +360,9 @@ Rust behavior:
 - The Rust-only tools (`todo`, `web_search`, `web_fetch`) have snippets in
   upstream's style. JSON extension tools supply `promptSnippet` and
   `promptGuidelines` in their manifest.
-- The model's `bash` commands get `PI_SESSION_ID`, `PI_SESSION_FILE`,
-  `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`, and the prompt's bash
-  rule says so. The process carries `AI_AGENT` and `PI_CODING_AGENT`.
+- The model's `bash` commands get `NOEL_SESSION_ID`, `NOEL_SESSION_FILE`,
+  `NOEL_PROVIDER`, `NOEL_MODEL`, and `NOEL_REASONING_LEVEL`, and the prompt's bash
+  rule says so. The process carries `AI_AGENT` and `NOEL_CODING_AGENT`.
 - The skills listing is upstream's `formatSkillsForPrompt` text, present
   while `read` or `bash` is active and without the skills that set
   `disable-model-invocation`.
@@ -378,7 +378,7 @@ input in its session (`core/agent-session.ts`).
 
 Rust behavior, compared with upstream's results in `skills.json`:
 
-- Discovery: `skills/` in the agent dir and a trusted project's `.pi/skills`
+- Discovery: `skills/` in the agent dir and a trusted project's `.noel/skills`
   (every `SKILL.md` below, and described Markdown files directly in them);
   `~/.agents/skills` and a trusted project's `.agents/skills` from the cwd up
   to the repository root; the `skills` and `prompts` settings; packages;
@@ -399,7 +399,7 @@ Rust behavior, compared with upstream's results in `skills.json`:
   `${1:-default}`, `${@:N}`, and `${@:N:L}` substituted; quotes keep spaces
   in an argument.
 - Expansion applies to prompts in the TUI, print mode, and RPC mode, and to
-  steering and follow-ups in the TUI and RPC mode (`pi_core::expand_input`).
+  steering and follow-ups in the TUI and RPC mode (`noel_core::expand_input`).
   A command that names no skill or template is text for the model.
 - RPC `get_commands` lists templates and skills with `source` and
   `sourceInfo`.
@@ -440,7 +440,7 @@ Rust behavior:
 
 - `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls` return what
   upstream's tools return for the calls recorded in `tool-behavior.json`
-  (`crates/pi-core/src/tool_parity_tests.rs` compares them exactly), and send
+  (`crates/noel-core/src/tool_parity_tests.rs` compares them exactly), and send
   the model upstream's descriptions and parameter schemas.
 - Paths resolve as upstream's do: relative to the working directory, absolute,
   or under `~/`, with a leading `@` dropped. They are not confined to the
@@ -522,7 +522,7 @@ Model catalog:
   in the non-parity register).
 
 Model resolution (upstream `core/model-resolver.ts`, ported in
-`crates/pi-config/src/model_resolver.rs`):
+`crates/noel-config/src/model_resolver.rs`):
 
 - `--model`: an exact reference ignoring case, else a fuzzy match on id or
   name that prefers aliases, a `:<thinking>` suffix, a provider inferred from
@@ -583,7 +583,7 @@ Rust supports:
 - Local package sources by path.
 - Git package sources.
 - Package resource discovery by convention.
-- Package resource discovery through `package.json` under the `pi` key.
+- Package resource discovery through `package.json` under the `noel` key.
 - Resource include/exclude filters.
 - `.gitignore`, `.ignore`, and `.fdignore` handling in resource directories.
 - Resource enable/disable state.
@@ -592,7 +592,7 @@ Rust supports:
 - JSON extension lifecycle notifications for reload and shutdown.
 - JSON executable extension model tools. An executable extension can declare
   `protocol: "json"` and a `tools` array in its adjacent
-  `.pi-extension.json`; those tools are exposed to providers and receive
+  `.noel-extension.json`; those tools are exposed to providers and receive
   `kind: "tool"` JSON requests on stdin. A non-zero exit is an error result,
   output is capped at 2000 lines or 50 KB with the whole output saved to a
   temp file, and a tool named like a built-in tool replaces it.
@@ -631,23 +631,23 @@ runs npm inside Docker only. It defaults to the upstream TypeScript repository
 `https://github.com/earendil-works/pi` on `main`. `make ts-parity-update`
 refreshes fixtures from the moving TypeScript reference. `make ts-parity-drift` writes
 `target/ts-parity-drift/brief.md` and fails on fixture drift. `make
-ts-parity-agent` can dispatch that brief through `PI_PARITY_AGENT_COMMAND`,
+ts-parity-agent` can dispatch that brief through `NOEL_PARITY_AGENT_COMMAND`,
 including a Codewire command such as `cw exec --name ts-parity-agent -- claude`.
 
 Parity fixtures are sanitized upstream provider request captures. They document
 URL, method, selected headers, body, and payload shape for covered providers.
 Rust tests compare local provider request builders against those captures.
 `rpc-protocol.json` records upstream RPC mode instead: every stdout record, in
-order, for scripted runs against a local stub model; `pi-cli`'s `rpc_parity`
-test compares pi's RPC mode with it record by record. `skills.json` records
+order, for scripted runs against a local stub model; `noel-cli`'s `rpc_parity`
+test compares noel's RPC mode with it record by record. `skills.json` records
 what upstream loads, lists, and expands for skills and prompt templates;
-`pi-config`, `pi-core`, and the `rpc_parity` test compare with it.
+`noel-config`, `noel-core`, and the `rpc_parity` test compare with it.
 `error-classification.json` records how upstream classifies failed requests
-(retryable, context overflow); `pi-ai` is compared with it. Drift
+(retryable, context overflow); `noel-ai` is compared with it. Drift
 is handled by updating Rust behavior and committed fixtures together, then
 running `make parity-check` and `make check`.
 
-The `pi-parity` crate keeps the fixture inventory, source metadata,
+The `noel-parity` crate keeps the fixture inventory, source metadata,
 script-output mapping, redaction checks, and parity documentation coverage in
 sync.
 

@@ -10,10 +10,10 @@
 # isolation, and the suite that created it removes it on exit through
 # e2e_isolation_cleanup.
 
-if [ -z "${PI_E2E_ROOT:-}" ]; then
-  e2e_scratch="${PI_E2E_TMPDIR:-/var/tmp}"
+if [ -z "${NOEL_E2E_ROOT:-}" ]; then
+  e2e_scratch="${NOEL_E2E_TMPDIR:-/var/tmp}"
   [ -d "${e2e_scratch}" ] && [ -w "${e2e_scratch}" ] || e2e_scratch="${TMPDIR:-/tmp}"
-  e2e_new_root="$(mktemp -d "${e2e_scratch}/pi-e2e.XXXXXX")"
+  e2e_new_root="$(mktemp -d "${e2e_scratch}/noel-e2e.XXXXXX")"
   mkdir -p "${e2e_new_root}/home" "${e2e_new_root}/tmux"
   e2e_env=(
     "PATH=${PATH}"
@@ -27,8 +27,8 @@ if [ -z "${PI_E2E_ROOT:-}" ]; then
     # bash runs no first-run wizard (zsh's newuser setup swallows sent keys).
     "SHELL=$(command -v bash)"
     "TMUX_TMPDIR=${e2e_new_root}/tmux"
-    "PI_E2E_ROOT=${e2e_new_root}"
-    "PI_E2E_OWNER_PID=$$"
+    "NOEL_E2E_ROOT=${e2e_new_root}"
+    "NOEL_E2E_OWNER_PID=$$"
   )
   # Keep the build configuration (CARGO_INCREMENTAL, RUSTFLAGS, linker and
   # target settings) so panes reuse the outer build instead of recompiling;
@@ -37,22 +37,22 @@ if [ -z "${PI_E2E_ROOT:-}" ]; then
     case "${e2e_var}" in
       *TOKEN* | *SECRET* | *PASSWORD* | *KEY*) ;;
       CARGO_HOME | RUSTUP_HOME) ;;
-      CARGO_* | RUST* | PI_BIN | TMPDIR) e2e_env+=("${e2e_var}=${!e2e_var}") ;;
+      CARGO_* | RUST* | NOEL_BIN | TMPDIR) e2e_env+=("${e2e_var}=${!e2e_var}") ;;
     esac
   done
   exec env -i "${e2e_env[@]}" bash "$0" "$@"
 fi
-e2e_root="${PI_E2E_ROOT}"
+e2e_root="${NOEL_E2E_ROOT}"
 
 # Takes the suite's exit status: a failed run keeps its artifacts for inspection.
 e2e_isolation_cleanup() {
   local status="${1:-0}"
-  if [ "${PI_E2E_OWNER_PID:-}" = "$$" ]; then
+  if [ "${NOEL_E2E_OWNER_PID:-}" = "$$" ]; then
     tmux kill-server >/dev/null 2>&1 || true
     if [ "${status}" -eq 0 ]; then
-      rm -rf "${PI_E2E_ROOT}"
+      rm -rf "${NOEL_E2E_ROOT}"
     else
-      echo "e2e artifacts kept in ${PI_E2E_ROOT}" >&2
+      echo "e2e artifacts kept in ${NOEL_E2E_ROOT}" >&2
     fi
   fi
 }

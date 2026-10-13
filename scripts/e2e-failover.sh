@@ -8,14 +8,14 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e-isolate.sh
 source "${repo_root}/scripts/e2e-isolate.sh"
-pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
+noel_bin="${NOEL_BIN:-${repo_root}/target/debug/noel}"
 # Anchor to an absolute path so the cd inside tmux cannot break the lookup.
-case "${pi_bin}" in
+case "${noel_bin}" in
   /*) ;;
-  *) pi_bin="${repo_root}/${pi_bin}" ;;
+  *) noel_bin="${repo_root}/${noel_bin}" ;;
 esac
 work_dir="$(mktemp -d "${e2e_root}/e2e-failover.XXXXXX")"
-session="pi-e2e-failover-${$}"
+session="noel-e2e-failover-${$}"
 trap 'e2e_status=$?; tmux kill-session -t "${session}" >/dev/null 2>&1 || true; e2e_isolation_cleanup "${e2e_status}"' EXIT
 mkdir -p "${work_dir}/agent"
 printf '{"modelRefresh":{"enabled":false},"compaction":{"enabled":false},"retry":{"baseDelayMs":1},"failover":{"enabled":true}}\n' > "${work_dir}/agent/settings.json"
@@ -33,7 +33,7 @@ EOF
 tmux new-session -d -s "${session}" -x 110 -y 30
 tmux pipe-pane -t "${session}" -o "cat > '${work_dir}/terminal.raw'"
 tmux send-keys -t "${session}" \
-  "cd '${work_dir}' && env -u PI_TUI_E2E_DUMP PI_CODING_AGENT_DIR='${work_dir}/agent' PI_FAUX_SCRIPT='${work_dir}/script.json' PI_FAUX_SCRIPT_LOG='${work_dir}/requests.jsonl' '${pi_bin}' --no-session --no-context-files --model faux/script --offline" Enter
+  "cd '${work_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${work_dir}/agent' NOEL_FAUX_SCRIPT='${work_dir}/script.json' NOEL_FAUX_SCRIPT_LOG='${work_dir}/requests.jsonl' '${noel_bin}' --no-session --no-context-files --model faux/script --offline" Enter
 capture() { tmux capture-pane -t "${session}" -p > "${work_dir}/pane.txt"; }
 fail() { cat "${work_dir}/pane.txt" >&2; echo "$* (artifacts: ${work_dir})" >&2; exit 1; }
 wait_for() {

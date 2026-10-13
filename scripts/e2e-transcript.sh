@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Owned-screen behavior must be checked live, never via PI_TUI_E2E_DUMP.
+# Owned-screen behavior must be checked live, never via NOEL_TUI_E2E_DUMP.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e-isolate.sh
 source "${repo_root}/scripts/e2e-isolate.sh"
-pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
+noel_bin="${NOEL_BIN:-${repo_root}/target/debug/noel}"
 work_dir="$(mktemp -d "${e2e_root}/e2e-transcript.XXXXXX")"
-session="pi-e2e-transcript-${$}"
+session="noel-e2e-transcript-${$}"
 trap 'e2e_status=$?; tmux kill-session -t "${session}" >/dev/null 2>&1 || true; e2e_isolation_cleanup "${e2e_status}"' EXIT
 mkdir -p "${work_dir}/agent"
 printf '{"modelRefresh":{"enabled":false},"compaction":{"enabled":false}}\n' > "${work_dir}/agent/settings.json"
@@ -21,7 +21,7 @@ tmux new-session -d -s "${session}" -x 80 -y 20
 # Capture raw terminal transitions as well as pane content for teardown checks.
 tmux pipe-pane -t "${session}" -o "cat > '${work_dir}/terminal.raw'"
 tmux send-keys -t "${session}" \
-  "cd '${work_dir}' && printf 'shell-scrollback-before-owned\\n'; for _ in {1..40}; do printf '\\n'; done; printf 'shell-before-owned\\n' && env -u PI_TUI_E2E_DUMP PI_CODING_AGENT_DIR='${work_dir}/agent' PI_FAUX_STREAM_DELAY_MS=2 PI_FAUX_STREAM_CHARS=1 '${pi_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline; stty -a; printf 'shell-after-owned\\n'" Enter
+  "cd '${work_dir}' && printf 'shell-scrollback-before-owned\\n'; for _ in {1..40}; do printf '\\n'; done; printf 'shell-before-owned\\n' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${work_dir}/agent' NOEL_FAUX_STREAM_DELAY_MS=2 NOEL_FAUX_STREAM_CHARS=1 '${noel_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline; stty -a; printf 'shell-after-owned\\n'" Enter
 capture() { tmux capture-pane -t "${session}" -p > "${work_dir}/pane.txt"; }
 fail() { cat "${work_dir}/pane.txt" >&2; echo "$* (artifacts: ${work_dir})" >&2; exit 1; }
 wait_for() {
@@ -174,7 +174,7 @@ restart_fixture() {
   tmux kill-session -t "${session}" >/dev/null 2>&1 || true
   tmux new-session -d -s "${session}" -x 100 -y 24
   tmux send-keys -t "${session}" \
-    "cd '${work_dir}' && env -u PI_TUI_E2E_DUMP PI_DOGFOOD_AUTO_RESTART='${3:-0}' PI_DOGFOOD_RESTART_EXE='${work_dir}/watched-restart' PI_FAUX_STREAM_DELAY_MS='${2:-0}' PI_FAUX_STREAM_CHARS=1 PI_CODING_AGENT_DIR='${work_dir}/agent' '${pi_bin}' --session '$1' --session-dir '${work_dir}' --model faux/echo --offline; printf 'resume-fixture-shell\\n'" Enter
+    "cd '${work_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_DOGFOOD_AUTO_RESTART='${3:-0}' NOEL_DOGFOOD_RESTART_EXE='${work_dir}/watched-restart' NOEL_FAUX_STREAM_DELAY_MS='${2:-0}' NOEL_FAUX_STREAM_CHARS=1 NOEL_DIR='${work_dir}/agent' '${noel_bin}' --session '$1' --session-dir '${work_dir}' --model faux/echo --offline; printf 'resume-fixture-shell\\n'" Enter
   wait_for '│ >'
 }
 printf 'completed-direct-read-marker\n' > "${work_dir}/direct.txt"
@@ -269,11 +269,11 @@ capture
 wait_for '❯ after-offline-error'
 tmux send-keys -t "${session}" '/quit' Enter
 wait_for resume-fixture-shell
-# A session another pi process holds is refused in place: an error line, and
+# A session another noel process holds is refused in place: an error line, and
 # the TUI keeps working.
 printf '{"type":"started","session_id":"held","cwd":"."}\n' > "${work_dir}/held.jsonl"
 mkfifo "${work_dir}/holder.in"
-env PI_CODING_AGENT_DIR="${work_dir}/agent" "${pi_bin}" --mode rpc --session "${work_dir}/held.jsonl" --model faux/echo --offline < "${work_dir}/holder.in" > /dev/null 2>&1 &
+env NOEL_DIR="${work_dir}/agent" "${noel_bin}" --mode rpc --session "${work_dir}/held.jsonl" --model faux/echo --offline < "${work_dir}/holder.in" > /dev/null 2>&1 &
 holder_pid=$!
 exec 9> "${work_dir}/holder.in"
 for _ in $(seq 1 100); do
@@ -289,7 +289,7 @@ tmux resize-window -t "${session}" -x 240 -y 24
 # at the new width.
 wait_for "╭$(printf '─%.0s' $(seq 1 238))╮"
 tmux send-keys -t "${session}" "/resume ${work_dir}/held.jsonl" Enter
-wait_for "held.jsonl is in use by another pi process (pid ${holder_pid})"
+wait_for "held.jsonl is in use by another noel process (pid ${holder_pid})"
 tmux send-keys -t "${session}" 'after-locked-resume' Enter
 wait_for '[faux/echo] after-locked-resume'
 grep -Fq '"content":"[faux/echo] after-locked-resume"' "${work_dir}/direct.jsonl" || fail 'refused resume changed the open session'
@@ -300,7 +300,7 @@ exec 9>&-
 wait "${holder_pid}" 2>/dev/null || true
 # The dogfood exec-restart reopens the session it had open with --session: the
 # lock is close-on-exec, so the new image is not refused by its predecessor.
-printf '#!/bin/sh\nexec %s "$@"\n' "'${pi_bin}'" > "${work_dir}/watched-restart"
+printf '#!/bin/sh\nexec %s "$@"\n' "'${noel_bin}'" > "${work_dir}/watched-restart"
 chmod +x "${work_dir}/watched-restart"
 restart_fixture "${work_dir}/direct.jsonl" 0 1
 # /todos prints a line that is not journaled, so only a new image clears it.
@@ -313,12 +313,12 @@ for _ in $(seq 1 150); do
   if ! grep -Fq 'no todos' "${work_dir}/pane.txt" && grep -Fq '│ >' "${work_dir}/pane.txt"; then restarted=1; break; fi
   sleep 0.1
 done
-[ -n "${restarted}" ] || fail 'touching the watched binary did not restart pi'
+[ -n "${restarted}" ] || fail 'touching the watched binary did not restart noel'
 absent 'resume-fixture-shell'
 tmux send-keys -t "${session}" 'after-exec-restart' Enter
 wait_for '[faux/echo] after-exec-restart'
 grep -Fq '"content":"[faux/echo] after-exec-restart"' "${work_dir}/direct.jsonl" || fail 'exec-restart did not reopen its session'
-absent 'in use by another pi process'
+absent 'in use by another noel process'
 tmux send-keys -t "${session}" '/quit' Enter
 wait_for resume-fixture-shell
 echo "owned transcript e2e passed (artifacts: ${work_dir})"

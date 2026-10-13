@@ -7,19 +7,19 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-pi_bin="${PI_BIN:-${repo_root}/target/release/pi}"
+noel_bin="${NOEL_BIN:-${repo_root}/target/release/noel}"
 
-if [ ! -x "${pi_bin}" ]; then
-  echo "release binary is not executable: ${pi_bin}" >&2
-  echo "run make release first, or set PI_BIN" >&2
+if [ ! -x "${noel_bin}" ]; then
+  echo "release binary is not executable: ${noel_bin}" >&2
+  echo "run make release first, or set NOEL_BIN" >&2
   exit 1
 fi
 
-providers="${PI_DOGFOOD_REAL_PROVIDERS:-claude codex}"
-claude_model="${PI_DOGFOOD_CLAUDE_MODEL:-anthropic/claude-sonnet-4-6}"
-claude_thinking="${PI_DOGFOOD_CLAUDE_THINKING:-high}"
-codex_model="${PI_DOGFOOD_CODEX_MODEL:-openai-codex/gpt-5.4-mini}"
-codex_thinking="${PI_DOGFOOD_CODEX_THINKING:-low}"
+providers="${NOEL_DOGFOOD_REAL_PROVIDERS:-claude codex}"
+claude_model="${NOEL_DOGFOOD_CLAUDE_MODEL:-anthropic/claude-sonnet-4-6}"
+claude_thinking="${NOEL_DOGFOOD_CLAUDE_THINKING:-high}"
+codex_model="${NOEL_DOGFOOD_CODEX_MODEL:-openai-codex/gpt-5.4-mini}"
+codex_thinking="${NOEL_DOGFOOD_CODEX_THINKING:-low}"
 
 has_claude_auth() {
   [[ -n "${ANTHROPIC_OAUTH_TOKEN:-}" ]] ||
@@ -56,7 +56,7 @@ run_provider() {
   local model="$2"
   local thinking="$3"
   local marker="$4"
-  local session_name="pi-real-${label}-${$}"
+  local session_name="noel-real-${label}-${$}"
   local root="${repo_root}/target/dogfood-real-tty-${label}"
   local session_dir="${root}/sessions"
   local work_dir="${root}/work"
@@ -86,7 +86,7 @@ JSON
 
   tmux new-session -d -s "${session_name}" -x 120 -y 36
   tmux send-keys -t "${session_name}" \
-    "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${pi_bin}' --session-dir '${session_dir}' --model '${model}' --thinking '${thinking}'" \
+    "cd '${cwd_dir}' && NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' '${noel_bin}' --session-dir '${session_dir}' --model '${model}' --thinking '${thinking}'" \
     Enter
 
   for _ in $(seq 1 120); do
@@ -156,7 +156,7 @@ if provider_requested claude; then
     echo "Claude real TTY dogfood requires ANTHROPIC_OAUTH_TOKEN, ANTHROPIC_AUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, or ~/.claude/.credentials.json" >&2
     exit 2
   fi
-  run_provider claude "${claude_model}" "${claude_thinking}" "PI_TTY_CLAUDE_SMOKE"
+  run_provider claude "${claude_model}" "${claude_thinking}" "NOEL_TTY_CLAUDE_SMOKE"
 fi
 
 if provider_requested codex; then
@@ -164,5 +164,5 @@ if provider_requested codex; then
     echo "Codex real TTY dogfood requires CODEX_ACCESS_TOKEN, CODEX_API_KEY, or ~/.codex/auth.json" >&2
     exit 2
   fi
-  run_provider codex "${codex_model}" "${codex_thinking}" "PI_TTY_CODEX_SMOKE"
+  run_provider codex "${codex_model}" "${codex_thinking}" "NOEL_TTY_CODEX_SMOKE"
 fi
