@@ -852,6 +852,16 @@ throughput. Per-provider tuning: `failover.providers.anthropic.exhaustionThresho
 and `minSwitchIntervalMs`. Pinning an account with `/account name` disables
 rotation for that session; run `pi help failover` for the summary.
 
+Four statements in that paragraph describe the design and are not wired yet:
+
+- The 5h usage window and `exhaustionThresholdPct` are not consulted. An
+  account at or over the threshold still serves until it answers 429 or 529.
+- A rate-limited account cools down for a fixed 300 seconds. No reset
+  timestamp is read.
+- The switch-rate limit and `minSwitchIntervalMs` have no effect: the pool is
+  built for each request, and its clock with it.
+- `pi help failover` is not a command.
+
 A switch is made inside the request, before [run recovery](#run-recovery)
 sees a failure: it is not a retry and waits for no backoff. When every account
 is rate limited the turn ends at once with each account's error, and until a
