@@ -3962,6 +3962,40 @@ mod tests {
         assert_eq!(settings.accent_color.as_deref(), Some("#123456"));
     }
 
+    /// `failover` is off unless a settings file turns it on, and merges as
+    /// the other nested settings do: a project keeps what it does not name.
+    /// Its per-provider map is replaced whole by a project that has one.
+    #[test]
+    fn failover_settings_are_off_by_default_and_merge_like_their_neighbours() {
+        assert_eq!(Settings::default().failover, None);
+        let parsed: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.failover, None);
+
+        let global: Settings = serde_json::from_str(
+            r#"{"failover":{"enabled":true,"providers":{"anthropic":{"minSwitchIntervalMs":5000}}}}"#,
+        )
+        .unwrap();
+        let unrelated: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        let kept = global.clone().merge(unrelated).failover.expect("failover");
+        assert_eq!(kept.enabled, Some(true));
+        assert_eq!(
+            kept.providers["anthropic"].min_switch_interval_ms,
+            Some(5000)
+        );
+
+        let project: Settings = serde_json::from_str(
+            r#"{"failover":{"providers":{"openai":{"exhaustionThresholdPct":80}}}}"#,
+        )
+        .unwrap();
+        let merged = global.merge(project).failover.expect("failover");
+        assert_eq!(merged.enabled, Some(true));
+        assert_eq!(merged.providers.keys().collect::<Vec<_>>(), ["openai"]);
+        assert_eq!(
+            merged.providers["openai"].exhaustion_threshold_pct,
+            Some(80)
+        );
+    }
+
     #[test]
     fn nested_settings_deep_merge_like_ts_reference() {
         let root = test_dir("pi-config-nested-settings");

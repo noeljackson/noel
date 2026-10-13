@@ -222,10 +222,10 @@ fn monotonic_ms() -> u64 {
     monotonic_base().elapsed().as_millis() as u64
 }
 
-/// Process-wide failover memory. Providers are reconstructed every turn, so
-/// stickiness (which account carried the session) and learned cooldowns must
-/// live outside any single wrapper instance. Scoped to this process, which
-/// is the session lifetime for `pi`.
+/// Process-wide failover memory. Providers are reconstructed for every
+/// request, so stickiness (which account carried the session) and learned
+/// cooldowns must live outside any single wrapper instance. Scoped to this
+/// process, which is the session lifetime for `pi`.
 #[derive(Default)]
 struct FailoverMemory {
     /// provider -> account that last served a request.
@@ -309,9 +309,9 @@ impl FailoverProviderBuilder {
         }
     }
 
-    /// Seed the sticky account from process memory (previous turn's
-    /// choice). Without this, per-turn provider reconstruction would reset
-    /// stickiness to storage order.
+    /// Seed the sticky account from process memory (the previous request's
+    /// choice). Without this, per-request provider reconstruction would
+    /// reset stickiness to storage order.
     pub fn remember(mut self, account: Option<String>) -> Self {
         self.initial_current = account;
         self
