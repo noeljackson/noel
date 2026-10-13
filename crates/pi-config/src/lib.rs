@@ -1,3 +1,13 @@
+mod frontmatter;
+mod prompt_templates;
+mod resources;
+mod skills;
+
+pub use frontmatter::{js_trim, strip_frontmatter};
+pub use prompt_templates::{expand_prompt_template, PromptTemplate};
+pub use resources::{ResourceOptions, SourceInfo, SourceScope};
+pub use skills::{format_skills_for_prompt, Skill, SkillReader};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
@@ -12,6 +22,14 @@ use thiserror::Error;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
+mod model_resolver;
+
+pub use model_resolver::{
+    custom_model, find_exact_model_reference_match, find_initial_model, resolve_cli_model,
+    resolve_model_scope, CliModel, ModelScope, ScopedModel,
+};
+pub use pi_ai::catalog::{ModelCost, ThinkingLevelMap, DEFAULT_THINKING_LEVEL, THINKING_LEVELS};
+
 pub const APP_NAME: &str = "pi";
 pub const CONFIG_DIR_NAME: &str = ".pi";
 pub const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
@@ -19,7 +37,8 @@ pub const ENV_SESSION_DIR: &str = "PI_CODING_AGENT_SESSION_DIR";
 /// Set by the test harness (`make test`, and every `pi` the CLI tests run).
 /// pi then refuses to fall back to `~/.pi/agent`, so a test must name its
 /// agent dir with `PI_CODING_AGENT_DIR`, imports no Claude Code or Codex
-/// login from `$HOME`, and starts no background model refresh.
+/// login from `$HOME`, reads no `~/.agents/skills`, and starts no background
+/// model refresh.
 pub const ENV_TEST_ISOLATION: &str = "PI_TEST_ISOLATION";
 pub const PROJECT_TRUST_FILE_NAME: &str = "trust.json";
 
@@ -161,6 +180,10 @@ pub struct Settings {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub default_thinking_level: Option<String>,
+    /// The thinking level a model starts on, by `provider/id`; it ranks
+    /// above `defaultThinkingLevel`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_thinking_levels: BTreeMap<String, String>,
     pub transport: Option<String>,
     pub steering_mode: Option<String>,
     pub follow_up_mode: Option<String>,
@@ -170,8 +193,17 @@ pub struct Settings {
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
     pub hide_thinking_block: Option<bool>,
+    /// An allowlist of tool names and `*` patterns: only matching tools are
+    /// available. `--tools` with plain names sets it for one run.
     #[serde(default)]
     pub enabled_tools: Option<Vec<String>>,
+    /// The built-in tools enabled at startup; see [`resolve_default_tools`].
+    #[serde(default)]
+    pub default_tools: Option<Vec<String>>,
+    /// Tool names and `*` patterns `--exclude-tools` removes for one run.
+    /// Not a settings file key.
+    #[serde(skip)]
+    pub excluded_tools: Vec<String>,
     #[serde(default)]
     pub enabled_models: Option<Vec<String>>,
     pub theme: Option<String>,
@@ -227,6 +259,11 @@ impl Settings {
             default_thinking_level: overrides
                 .default_thinking_level
                 .or(self.default_thinking_level),
+            model_thinking_levels: {
+                let mut levels = self.model_thinking_levels;
+                levels.extend(overrides.model_thinking_levels);
+                levels
+            },
             transport: overrides.transport.or(self.transport),
             steering_mode: overrides.steering_mode.or(self.steering_mode),
             follow_up_mode: overrides.follow_up_mode.or(self.follow_up_mode),
@@ -240,6 +277,12 @@ impl Settings {
             shell_command_prefix: overrides.shell_command_prefix.or(self.shell_command_prefix),
             hide_thinking_block: overrides.hide_thinking_block.or(self.hide_thinking_block),
             enabled_tools: overrides.enabled_tools.or(self.enabled_tools),
+            default_tools: merge_default_tools(self.default_tools, overrides.default_tools),
+            excluded_tools: if overrides.excluded_tools.is_empty() {
+                self.excluded_tools
+            } else {
+                overrides.excluded_tools
+            },
             enabled_models: overrides.enabled_models.or(self.enabled_models),
             theme: overrides.theme.or(self.theme),
             accent_color: overrides.accent_color.or(self.accent_color),
@@ -295,6 +338,37 @@ impl Settings {
             warnings: merge_optional_settings(self.warnings, overrides.warnings),
             model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
         }
+    }
+}
+
+impl Settings {
+    /// Rewrites the Azure provider id this port used to use, wherever a
+    /// saved setting names a provider (see [`canonical_provider`]).
+    fn with_canonical_providers(mut self) -> Self {
+        let legacy_prefix = format!("{LEGACY_AZURE_PROVIDER}/");
+        let rename = |reference: String| match reference.strip_prefix(&legacy_prefix) {
+            Some(id) => format!("{}/{id}", pi_ai::AZURE_PROVIDER),
+            None => reference,
+        };
+        self.default_provider = self
+            .default_provider
+            .map(|provider| canonical_provider(&provider).to_string());
+        self.enabled_models = self
+            .enabled_models
+            .map(|patterns| patterns.into_iter().map(rename).collect());
+        self.model_thinking_levels = self
+            .model_thinking_levels
+            .into_iter()
+            .map(|(model, level)| (rename(model), level))
+            .collect();
+        self
+    }
+
+    /// The level `provider/id` starts on, if `modelThinkingLevels` sets one.
+    pub fn model_thinking_level(&self, provider: &str, id: &str) -> Option<&str> {
+        self.model_thinking_levels
+            .get(&format!("{provider}/{id}"))
+            .map(String::as_str)
     }
 }
 
@@ -373,6 +447,110 @@ pub struct PackageSourceConfig {
     pub prompts: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub themes: Option<Vec<String>>,
+}
+
+/// Whether a tool selection entry is a `+name` or `-name` modifier.
+pub fn is_tool_modifier(entry: &str) -> bool {
+    entry.starts_with(['+', '-'])
+}
+
+/// What is wrong with a `--tools` list, if anything. It is either an
+/// allowlist of names and `*` patterns, or only `+name`/`-name` entries with
+/// exact names.
+pub fn tool_list_error(entries: &[String]) -> Option<String> {
+    let modifiers = entries
+        .iter()
+        .filter(|entry| is_tool_modifier(entry))
+        .collect::<Vec<_>>();
+    if modifiers.is_empty() {
+        return None;
+    }
+    if modifiers.len() < entries.len() {
+        return Some("tool names cannot be mixed with +name or -name entries".to_string());
+    }
+    modifiers
+        .into_iter()
+        .find(|entry| entry.contains('*'))
+        .map(|pattern| {
+            format!("+name and -name entries take exact tool names, not patterns: {pattern}")
+        })
+}
+
+/// Applies the `+name` and `-name` entries to `base` in order: `+name` adds
+/// a tool and `-name` removes one. Other entries are ignored.
+pub fn apply_tool_modifiers(base: &[String], entries: &[String]) -> Vec<String> {
+    let mut tools = base.to_vec();
+    for entry in entries.iter().filter(|entry| is_tool_modifier(entry)) {
+        let name = &entry[1..];
+        let position = tools.iter().position(|tool| tool == name);
+        match (entry.starts_with('+'), position) {
+            (true, None) if !name.is_empty() => tools.push(name.to_string()),
+            (false, Some(position)) => {
+                tools.remove(position);
+            }
+            _ => {}
+        }
+    }
+    tools
+}
+
+/// The tools a merged `defaultTools` list selects: its plain names replace
+/// `defaults`, then `+name` adds and `-name` removes a tool, in list order.
+/// An empty list selects nothing.
+pub fn resolve_default_tools(entries: &[String], defaults: &[String]) -> Vec<String> {
+    let plain = entries
+        .iter()
+        .filter(|entry| !is_tool_modifier(entry))
+        .cloned()
+        .collect::<Vec<_>>();
+    let base = if plain.is_empty() && !entries.is_empty() {
+        defaults
+    } else {
+        &plain
+    };
+    apply_tool_modifiers(base, entries)
+}
+
+/// Whether a tool name is one of `entries`, each an exact name or a pattern
+/// where `*` matches any characters.
+pub fn tool_name_matches(entries: &[String], name: &str) -> bool {
+    entries.iter().any(|entry| {
+        let mut parts = entry.split('*');
+        let Some(rest) = parts.next().and_then(|first| name.strip_prefix(first)) else {
+            return false;
+        };
+        let Some(last) = parts.next_back() else {
+            // No `*`: an exact name.
+            return rest.is_empty();
+        };
+        let mut rest = rest;
+        for part in parts {
+            let Some(found) = rest.find(part) else {
+                return false;
+            };
+            rest = &rest[found + part.len()..];
+        }
+        rest.ends_with(last)
+    })
+}
+
+/// Merges `defaultTools` of two settings layers. A list with plain tool
+/// names replaces the inherited one; a list of only `+name`/`-name` entries
+/// is appended, so it modifies the inherited selection.
+fn merge_default_tools(
+    base: Option<Vec<String>>,
+    overrides: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    match (base, overrides) {
+        (base, None) => base,
+        (Some(mut base), Some(overrides))
+            if overrides.iter().all(|entry| is_tool_modifier(entry)) =>
+        {
+            base.extend(overrides);
+            Some(base)
+        }
+        (_, overrides) => overrides,
+    }
 }
 
 trait MergeSettings {
@@ -607,35 +785,85 @@ pub enum AuthCredential {
 
 pub const DEFAULT_ACCOUNT_NAME: &str = "default";
 
+/// Whether `provider`'s requests can carry `credential`. Upstream keeps
+/// credentials per provider, and each provider names what it takes:
+/// `openai-codex` a ChatGPT login and no API key, `openai` an API key. A
+/// stored credential of the other kind is no credential, so nothing offers
+/// the provider's models on the strength of it.
+///
+/// Upstream's `openai` also has a ChatGPT sign-in of its own, whose tokens
+/// its Responses API takes. pi has no such flow: a login stored under
+/// `openai` is the Codex login `pi login` used to save there as well, which
+/// that API does not take.
+fn provider_takes(provider: &str, credential: &AuthCredential) -> bool {
+    !matches!(
+        (provider, credential),
+        ("openai", AuthCredential::OAuth { .. }) | ("openai-codex", AuthCredential::ApiKey { .. })
+    )
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthData {
     pub providers: BTreeMap<String, BTreeMap<String, AuthCredential>>,
 }
 
 impl AuthData {
-    pub fn accounts_for_provider(&self, provider: &str) -> Vec<String> {
+    /// The key `provider`'s accounts are stored under: its id, or for Azure
+    /// the id this port used to use, when the file still holds that one
+    /// (see [`canonical_provider`]). Either id names the same accounts.
+    fn stored_key<'a>(&self, provider: &'a str) -> &'a str {
+        let provider = canonical_provider(provider);
+        if provider == pi_ai::AZURE_PROVIDER
+            && !self.providers.contains_key(provider)
+            && self.providers.contains_key(LEGACY_AZURE_PROVIDER)
+        {
+            return LEGACY_AZURE_PROVIDER;
+        }
+        provider
+    }
+
+    /// `provider`'s stored accounts, less those whose credential it does
+    /// not take (see [`provider_takes`]).
+    fn accounts<'a, 'p>(
+        &'a self,
+        provider: &'p str,
+    ) -> impl Iterator<Item = (&'a str, &'a AuthCredential)> + 'p
+    where
+        'a: 'p,
+    {
         self.providers
-            .get(provider)
-            .map(|accounts| accounts.keys().cloned().collect())
-            .unwrap_or_default()
+            .get(self.stored_key(provider))
+            .into_iter()
+            .flatten()
+            .filter(move |(_, credential)| provider_takes(provider, credential))
+            .map(|(account, credential)| (account.as_str(), credential))
+    }
+
+    pub fn accounts_for_provider(&self, provider: &str) -> Vec<String> {
+        self.accounts(provider)
+            .map(|(account, _)| account.to_string())
+            .collect()
     }
 
     pub fn credential(&self, provider: &str, account: &str) -> Option<&AuthCredential> {
-        self.providers.get(provider)?.get(account)
+        self.accounts(provider)
+            .find(|(name, _)| *name == account)
+            .map(|(_, credential)| credential)
     }
 
     pub fn insert(&mut self, provider: &str, account: &str, credential: AuthCredential) {
         self.providers
-            .entry(provider.to_string())
+            .entry(self.stored_key(provider).to_string())
             .or_default()
             .insert(account.to_string(), credential);
     }
 
     pub fn remove(&mut self, provider: &str, account: &str) -> Option<AuthCredential> {
-        let accounts = self.providers.get_mut(provider)?;
+        let key = self.stored_key(provider);
+        let accounts = self.providers.get_mut(key)?;
         let removed = accounts.remove(account);
         if accounts.is_empty() {
-            self.providers.remove(provider);
+            self.providers.remove(key);
         }
         removed
     }
@@ -645,12 +873,15 @@ impl AuthData {
     }
 
     pub fn account_for_resolution(&self, provider: &str) -> Option<&str> {
-        let accounts = self.providers.get(provider)?;
-        if accounts.contains_key(DEFAULT_ACCOUNT_NAME) {
+        let accounts = self
+            .accounts(provider)
+            .map(|(account, _)| account)
+            .collect::<Vec<_>>();
+        if accounts.contains(&DEFAULT_ACCOUNT_NAME) {
             return Some(DEFAULT_ACCOUNT_NAME);
         }
-        match accounts.len() {
-            1 => accounts.keys().next().map(String::as_str),
+        match accounts[..] {
+            [only] => Some(only),
             _ => None,
         }
     }
@@ -744,7 +975,12 @@ pub fn expires_within(expires: u64, now: u64, within_seconds: u64) -> bool {
     expires != 0 && now.saturating_add(within_seconds) >= expires
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A model pi can be pointed at. The fields are upstream's model object's
+/// and keep its names, so a built-in model, a `models.json` entry, and a
+/// cached listing all describe a model the same way. Everything past the
+/// endpoint is optional: a loaded config fills what an entry leaves out
+/// from the built-in catalog (see `merge_model_definitions`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDefinition {
     pub provider: String,
@@ -758,22 +994,111 @@ pub struct ModelDefinition {
     /// Context size in tokens. Custom models can override the compiled catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// The most output tokens one reply may have. Without it requests carry
+    /// no output cap, except where the API requires one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Whether the model has thinking levels. Absent means it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    /// Which thinking levels a reasoning model supports and what the
+    /// provider is sent for each (upstream `thinkingLevelMap`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level_map: Option<ThinkingLevelMap>,
+    /// What the model accepts: `text`, `image`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Vec<String>>,
+    /// Prices in US dollars per million tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<ModelCost>,
 }
 
-/// Unknown/custom models use a conservative fallback unless models.json
-/// supplies contextWindow explicitly. The compiled catalog remains authoritative
-/// for known models even when older cache entries omit the field.
+impl ModelDefinition {
+    pub fn model_ref(&self) -> pi_ai::ModelRef {
+        pi_ai::ModelRef {
+            provider: self.provider.clone(),
+            id: self.id.clone(),
+        }
+    }
+
+    pub fn reasoning(&self) -> bool {
+        self.reasoning.unwrap_or(false)
+    }
+
+    /// The thinking levels the model can be set to, lowest first; `off`
+    /// alone for a model without reasoning.
+    pub fn supported_thinking_levels(&self) -> Vec<&'static str> {
+        pi_ai::catalog::supported_thinking_levels(
+            self.reasoning(),
+            self.thinking_level_map.as_ref(),
+        )
+    }
+
+    /// `level` if the model supports it, else the nearest level it does
+    /// (upstream `clampThinkingLevel`).
+    pub fn clamp_thinking_level(&self, level: &str) -> &'static str {
+        pi_ai::catalog::clamp_thinking_level(
+            self.reasoning(),
+            self.thinking_level_map.as_ref(),
+            level,
+        )
+    }
+
+    /// What request builders read of the model.
+    pub fn traits(&self) -> pi_ai::ModelTraits {
+        pi_ai::ModelTraits {
+            context_window: self.context_window.filter(|window| *window > 0),
+            max_tokens: self.max_tokens.filter(|tokens| *tokens > 0),
+            reasoning: Some(self.reasoning()),
+            thinking_level_map: self.thinking_level_map.clone(),
+        }
+    }
+}
+
+impl From<&pi_ai::catalog::CatalogModel> for ModelDefinition {
+    fn from(model: &pi_ai::catalog::CatalogModel) -> Self {
+        Self {
+            provider: model.provider.clone(),
+            id: model.id.clone(),
+            name: Some(model.name.clone()),
+            api: ProviderApi::from(&model.api),
+            base_url: model.base_url.clone(),
+            context_window: Some(model.context_window),
+            max_tokens: Some(model.max_tokens),
+            reasoning: Some(model.reasoning),
+            thinking_level_map: model.thinking_level_map.clone(),
+            input: Some(model.input.clone()),
+            cost: Some(model.cost.clone()),
+        }
+    }
+}
+
+/// The context size compaction and the output cap work with: the model's
+/// own, else a conservative fallback for a model nothing is known about.
 pub fn model_context_window(model: &ModelDefinition) -> u64 {
     model
         .context_window
         .filter(|window| *window > 0)
         .or_else(|| {
-            pi_providers::builtin_models()
-                .iter()
-                .find(|candidate| candidate.provider == model.provider && candidate.id == model.id)
-                .and_then(|candidate| candidate.context_window)
+            pi_ai::catalog::builtin_model(&model.provider, &model.id)
+                .map(|builtin| builtin.context_window)
         })
         .unwrap_or(128_000)
+}
+
+/// Upstream's Azure provider id. Before the built-in catalog came from
+/// upstream this port called the provider `azure-openai-responses`; saved
+/// settings, `auth.json` entries, sessions, and `models.json` may still.
+pub const LEGACY_AZURE_PROVIDER: &str = pi_ai::LEGACY_AZURE_PROVIDER;
+
+/// `provider` as the catalog names it: the Azure id this port used to use
+/// becomes upstream's.
+pub fn canonical_provider(provider: &str) -> &str {
+    if provider == LEGACY_AZURE_PROVIDER {
+        pi_ai::AZURE_PROVIDER
+    } else {
+        provider
+    }
 }
 
 /// Caches written by older builds (or without this field) are treated as stale
@@ -854,6 +1179,40 @@ pub enum ProviderApi {
     Faux,
 }
 
+impl From<&pi_ai::ProviderApi> for ProviderApi {
+    fn from(api: &pi_ai::ProviderApi) -> Self {
+        match api {
+            pi_ai::ProviderApi::Faux => Self::Faux,
+            pi_ai::ProviderApi::OpenAi => Self::OpenAi,
+            pi_ai::ProviderApi::OpenAiResponses => Self::OpenAiResponses,
+            pi_ai::ProviderApi::OpenAiCodexResponses => Self::OpenAiCodexResponses,
+            pi_ai::ProviderApi::AzureOpenAiResponses => Self::AzureOpenAiResponses,
+            pi_ai::ProviderApi::Anthropic => Self::Anthropic,
+            pi_ai::ProviderApi::Google => Self::Google,
+            pi_ai::ProviderApi::GoogleVertex => Self::GoogleVertex,
+            pi_ai::ProviderApi::Bedrock => Self::Bedrock,
+            pi_ai::ProviderApi::Mistral => Self::Mistral,
+        }
+    }
+}
+
+impl From<&ProviderApi> for pi_ai::ProviderApi {
+    fn from(api: &ProviderApi) -> Self {
+        match api {
+            ProviderApi::Faux => Self::Faux,
+            ProviderApi::OpenAi => Self::OpenAi,
+            ProviderApi::OpenAiResponses => Self::OpenAiResponses,
+            ProviderApi::OpenAiCodexResponses => Self::OpenAiCodexResponses,
+            ProviderApi::AzureOpenAiResponses => Self::AzureOpenAiResponses,
+            ProviderApi::Anthropic => Self::Anthropic,
+            ProviderApi::Google => Self::Google,
+            ProviderApi::GoogleVertex => Self::GoogleVertex,
+            ProviderApi::Bedrock => Self::Bedrock,
+            ProviderApi::Mistral => Self::Mistral,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImageProviderApi {
     #[serde(rename = "openrouter-images")]
@@ -908,13 +1267,22 @@ pub struct LoadedConfig {
     pub paths: ConfigPaths,
     pub settings: Settings,
     pub auth: AuthData,
+    /// Every model the config knows: built-in, listed by a provider, or
+    /// from `models.json`.
     pub models: Vec<ModelDefinition>,
+    /// What `--models` or the `enabledModels` setting selects of them: the
+    /// models startup and the model picker start from. Empty when there is
+    /// no scope. `load_config` leaves it empty: which models a scope
+    /// selects depends on credentials and the command line, so the caller
+    /// resolves it ([`resolve_model_scope`]).
+    pub model_scope: Vec<ScopedModel>,
     pub image_models: Vec<ImageModelDefinition>,
     pub keybindings: Vec<KeybindingConfig>,
     pub context_files: Vec<ContextFile>,
     pub extensions: Vec<ResourceFile>,
-    pub skills: Vec<ResourceFile>,
-    pub prompt_templates: Vec<ResourceFile>,
+    /// In the order they loaded; the first of a name won.
+    pub skills: Vec<Skill>,
+    pub prompt_templates: Vec<PromptTemplate>,
     pub themes: Vec<ResourceFile>,
     pub diagnostics: Vec<String>,
     pub system_prompt: Option<String>,
@@ -942,6 +1310,16 @@ pub fn load_config_with_project_trust(
     paths: ConfigPaths,
     project_trusted: bool,
 ) -> Result<LoadedConfig, ConfigError> {
+    load_config_with_resources(paths, project_trusted, &ResourceOptions::from_env())
+}
+
+/// Loads the configuration with the command line's skill and prompt
+/// template flags, which decide what is discovered and what loads after it.
+pub fn load_config_with_resources(
+    paths: ConfigPaths,
+    project_trusted: bool,
+    resource_options: &ResourceOptions,
+) -> Result<LoadedConfig, ConfigError> {
     let global_settings = read_optional_settings(&paths.settings_path)?;
     let project_settings = if project_trusted {
         read_optional_settings(&paths.project_settings_path)?
@@ -950,7 +1328,10 @@ pub fn load_config_with_project_trust(
     };
     let global_settings = global_settings.unwrap_or_default();
     let project_settings = project_settings.unwrap_or_default();
-    let settings = global_settings.clone().merge(project_settings.clone());
+    let settings = global_settings
+        .clone()
+        .merge(project_settings.clone())
+        .with_canonical_providers();
     let auth = read_optional_json::<AuthData>(&paths.auth_path)?.unwrap_or_default();
     let mut diagnostics = Vec::new();
     let explicit_models =
@@ -968,44 +1349,28 @@ pub fn load_config_with_project_trust(
     if let Some(cache) = &cache {
         diagnostics.extend(cache.diagnostics.iter().cloned());
     }
-    let models = filter_enabled_models(
-        merge_model_definitions(
-            default_models(),
-            cache
-                .as_ref()
-                .map(|cache| cache.models.clone())
-                .unwrap_or_default(),
-            explicit_models,
-        ),
-        settings.enabled_models.as_deref(),
+    // Every known model. `enabledModels` scopes model selection without
+    // removing models (`resolve_model_scope`).
+    let models = merge_model_definitions(
+        default_models(),
+        cache
+            .as_ref()
+            .map(|cache| cache.models.clone())
+            .unwrap_or_default(),
+        explicit_models,
     );
     let image_models = default_image_models();
     let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
         .map(KeybindingsFile::into_keybindings)
         .unwrap_or_default();
-    let context_files = load_context_files(&paths.cwd, &paths.agent_dir)?;
+    let context_files = load_context_files(&paths.cwd, &paths.agent_dir, &mut diagnostics);
     let mut extensions =
         load_resource_files(&paths, "extensions", project_trusted, &mut diagnostics);
-    let mut skills = load_skill_resource_files(&paths, project_trusted, &mut diagnostics);
-    let mut prompt_templates =
-        load_resource_files(&paths, "prompts", project_trusted, &mut diagnostics);
     let mut themes = load_resource_files(&paths, "themes", project_trusted, &mut diagnostics);
     extend_resource_files(
         &mut extensions,
         &paths.agent_dir,
         &global_settings.extensions,
-        &mut diagnostics,
-    );
-    extend_resource_files(
-        &mut skills,
-        &paths.agent_dir,
-        &global_settings.skills,
-        &mut diagnostics,
-    );
-    extend_resource_files(
-        &mut prompt_templates,
-        &paths.agent_dir,
-        &global_settings.prompts,
         &mut diagnostics,
     );
     extend_resource_files(
@@ -1023,18 +1388,6 @@ pub fn load_config_with_project_trust(
             &mut diagnostics,
         );
         extend_resource_files(
-            &mut skills,
-            &project_base,
-            &project_settings.skills,
-            &mut diagnostics,
-        );
-        extend_resource_files(
-            &mut prompt_templates,
-            &project_base,
-            &project_settings.prompts,
-            &mut diagnostics,
-        );
-        extend_resource_files(
             &mut themes,
             &project_base,
             &project_settings.themes,
@@ -1045,33 +1398,52 @@ pub fn load_config_with_project_trust(
         &paths.cwd,
         &settings.packages,
         &mut extensions,
-        &mut skills,
-        &mut prompt_templates,
         &mut themes,
         &mut diagnostics,
     );
-    filter_disabled_resource_files(
-        &mut extensions,
-        PackageResourceType::Extensions,
-        settings.disabled_resources.as_ref(),
+    let resources::LoadedResources {
+        mut skills,
+        skill_diagnostics,
+        mut prompt_templates,
+        prompt_diagnostics,
+    } = resources::load_resources(
+        &resources::ResourceSources {
+            paths: &paths,
+            project_trusted,
+            user_settings: &global_settings,
+            project_settings: &project_settings,
+            packages: &settings.packages,
+            options: resource_options,
+        },
+        &mut diagnostics,
     );
-    filter_disabled_resource_files(
-        &mut skills,
-        PackageResourceType::Skills,
-        settings.disabled_resources.as_ref(),
+    diagnostics.extend(skill_diagnostics.iter().map(|d| d.describe("skill")));
+    diagnostics.extend(
+        prompt_diagnostics
+            .iter()
+            .map(|d| d.describe("prompt template")),
     );
-    filter_disabled_resource_files(
-        &mut prompt_templates,
-        PackageResourceType::Prompts,
-        settings.disabled_resources.as_ref(),
-    );
-    filter_disabled_resource_files(
-        &mut themes,
-        PackageResourceType::Themes,
-        settings.disabled_resources.as_ref(),
-    );
-    let system_prompt = resolve_prompt_input(settings.system_prompt.as_deref())?;
-    let append_system_prompt = settings
+    let disabled = settings.disabled_resources.as_ref();
+    let enabled = |resource_type, name: &str, path: &Path| {
+        !resource_disabled(disabled, resource_type, name, path)
+    };
+    extensions.retain(|file| enabled(PackageResourceType::Extensions, &file.name, &file.path));
+    skills.retain(|skill| enabled(PackageResourceType::Skills, &skill.name, &skill.file_path));
+    prompt_templates.retain(|template| {
+        enabled(
+            PackageResourceType::Prompts,
+            &template.name,
+            &template.file_path,
+        )
+    });
+    themes.retain(|file| enabled(PackageResourceType::Themes, &file.name, &file.path));
+    // The `systemPrompt` and `appendSystemPrompt` settings stand where
+    // upstream's flags do: a discovered file applies only without them.
+    let system_prompt = match resolve_prompt_input(settings.system_prompt.as_deref())? {
+        Some(prompt) => Some(prompt),
+        None => discovered_prompt_file(&paths, "SYSTEM.md", project_trusted, &mut diagnostics),
+    };
+    let mut append_system_prompt = settings
         .append_system_prompt
         .iter()
         .map(|source| {
@@ -1079,12 +1451,21 @@ pub fn load_config_with_project_trust(
                 .map(|content| content.unwrap_or_else(|| source.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if append_system_prompt.is_empty() {
+        append_system_prompt.extend(discovered_prompt_file(
+            &paths,
+            "APPEND_SYSTEM.md",
+            project_trusted,
+            &mut diagnostics,
+        ));
+    }
 
     Ok(LoadedConfig {
         paths,
         settings,
         auth,
         models,
+        model_scope: Vec::new(),
         image_models,
         keybindings,
         context_files,
@@ -1096,25 +1477,6 @@ pub fn load_config_with_project_trust(
         system_prompt,
         append_system_prompt,
     })
-}
-
-fn filter_enabled_models(
-    models: Vec<ModelDefinition>,
-    enabled_models: Option<&[String]>,
-) -> Vec<ModelDefinition> {
-    let Some(enabled_models) = enabled_models else {
-        return models;
-    };
-    models
-        .into_iter()
-        .filter(|model| {
-            enabled_models.iter().any(|enabled| {
-                enabled == &model.id
-                    || enabled == &format!("{}/{}", model.provider, model.id)
-                    || model.name.as_deref() == Some(enabled.as_str())
-            })
-        })
-        .collect()
 }
 
 pub fn api_key_for_provider(
@@ -1157,8 +1519,18 @@ pub fn auth_for_provider(
     env_auth(provider).or_else(|| login_auth(provider))
 }
 
+/// Whether `provider`'s models can be offered: it has a credential, and, for
+/// the Cloudflare providers, the ids their URLs are built from. Upstream
+/// counts neither on the key alone (`cloudflare-auth.ts`), and one key
+/// serves both.
 pub fn has_auth_for_provider(auth: &AuthData, provider: &str, account: Option<&str>) -> bool {
-    auth_for_provider(auth, provider, account).is_some()
+    let ids: &[&str] = match provider {
+        "cloudflare-workers-ai" => &["CLOUDFLARE_ACCOUNT_ID"],
+        "cloudflare-ai-gateway" => &["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"],
+        _ => &[],
+    };
+    ids.iter().all(|name| read_non_empty_env(name).is_some())
+        && auth_for_provider(auth, provider, account).is_some()
 }
 
 pub fn import_account_name(provider: &str) -> &'static str {
@@ -1413,20 +1785,76 @@ pub fn write_model_cache(path: &Path, cache: &ModelCache) -> Result<(), ConfigEr
     write_file_atomic(path, format!("{content}\n").as_bytes())
 }
 
+/// The models a config knows: the built-in catalog, then the cached
+/// provider listings, then `models.json`, later entries replacing earlier
+/// ones for the same provider and id.
+///
+/// A cached listing says which models a provider serves, not how to reach
+/// them or what they can do. For a provider the catalog has, a listed id
+/// the catalog also has changes nothing, and one it lacks is built onto the
+/// provider's default model, as `--model provider/new-id` is
+/// (`custom_model`), keeping the listing's name and context window. A
+/// `models.json` entry is used as written (provider, id, name, API, and
+/// base URL), and takes what it leaves out (context window, output cap,
+/// reasoning, thinking levels, input, prices) from the built-in model of the
+/// same id, else from the provider's default model.
 fn merge_model_definitions(
     base: Vec<ModelDefinition>,
     cache: Vec<ModelDefinition>,
     explicit: Vec<ModelDefinition>,
 ) -> Vec<ModelDefinition> {
-    let mut models = Vec::new();
-    for model in base.into_iter().chain(cache).chain(explicit) {
-        if let Some(index) = models.iter().position(|existing: &ModelDefinition| {
-            existing.provider == model.provider && existing.id == model.id
-        }) {
-            models[index] = model;
-        } else {
-            models.push(model);
+    let builtin = base.clone();
+    let known = |model: &ModelDefinition| {
+        builtin
+            .iter()
+            .find(|candidate| candidate.provider == model.provider && candidate.id == model.id)
+    };
+    let mut models = base;
+    let mut upsert = |model: ModelDefinition| match models
+        .iter_mut()
+        .find(|existing| existing.provider == model.provider && existing.id == model.id)
+    {
+        Some(existing) => *existing = model,
+        None => models.push(model),
+    };
+    for mut model in cache {
+        model.provider = canonical_provider(&model.provider).to_string();
+        if known(&model).is_some() {
+            continue;
         }
+        upsert(match custom_model(&builtin, &model.provider, &model.id) {
+            Some(custom) => ModelDefinition {
+                name: model.name.or(custom.name),
+                context_window: model.context_window.or(custom.context_window),
+                ..custom
+            },
+            None => model,
+        });
+    }
+    for mut model in explicit {
+        model.provider = canonical_provider(&model.provider).to_string();
+        let same_id = known(&model).cloned();
+        let name = model
+            .name
+            .clone()
+            .or_else(|| same_id.as_ref().and_then(|builtin| builtin.name.clone()));
+        let traits = same_id.or_else(|| custom_model(&builtin, &model.provider, &model.id));
+        upsert(match traits {
+            Some(traits) => ModelDefinition {
+                name,
+                context_window: model.context_window.or(traits.context_window),
+                max_tokens: model.max_tokens.or(traits.max_tokens),
+                reasoning: model.reasoning.or(traits.reasoning),
+                thinking_level_map: model
+                    .thinking_level_map
+                    .clone()
+                    .or(traits.thinking_level_map),
+                input: model.input.clone().or(traits.input),
+                cost: model.cost.clone().or(traits.cost),
+                ..model
+            },
+            None => model,
+        });
     }
     models
 }
@@ -1435,7 +1863,9 @@ fn env_api_key(provider: &str) -> Option<String> {
     let names = match provider {
         "anthropic" => &["ANTHROPIC_API_KEY"][..],
         "amazon-bedrock" => &["AWS_BEARER_TOKEN_BEDROCK"][..],
-        "azure-openai-responses" => &["AZURE_OPENAI_API_KEY"][..],
+        "ant-ling" => &["ANT_LING_API_KEY"][..],
+        "azure" | LEGACY_AZURE_PROVIDER => &["AZURE_OPENAI_API_KEY"][..],
+        "baseten" => &["BASETEN_API_KEY"][..],
         "cloudflare-ai-gateway" | "cloudflare-workers-ai" => &["CLOUDFLARE_API_KEY"][..],
         "cerebras" => &["CEREBRAS_API_KEY"][..],
         "deepseek" => &["DEEPSEEK_API_KEY"][..],
@@ -1446,14 +1876,17 @@ fn env_api_key(provider: &str) -> Option<String> {
         "groq" => &["GROQ_API_KEY"][..],
         "huggingface" => &["HF_TOKEN"][..],
         "kimi-coding" | "kimi-coding-openai" => &["KIMI_API_KEY"][..],
+        "meta" => &["META_API_KEY"][..],
         "minimax" => &["MINIMAX_API_KEY"][..],
         "minimax-cn" => &["MINIMAX_CN_API_KEY"][..],
         "moonshotai" | "moonshotai-cn" => &["MOONSHOT_API_KEY"][..],
+        "nvidia" => &["NVIDIA_API_KEY"][..],
         "openai" => &["OPENAI_API_KEY"],
-        "openai-codex" => &["CODEX_API_KEY"][..],
         "opencode" | "opencode-go" => &["OPENCODE_API_KEY"][..],
         "openrouter" => &["OPENROUTER_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
+        "qwen-token-plan" | "qwen-token-plan-individual" => &["QWEN_TOKEN_PLAN_API_KEY"][..],
+        "qwen-token-plan-cn" => &["QWEN_TOKEN_PLAN_CN_API_KEY"][..],
         "together" => &["TOGETHER_API_KEY"][..],
         "vercel-ai-gateway" => &["AI_GATEWAY_API_KEY"][..],
         "xai" => &["XAI_API_KEY"][..],
@@ -1462,6 +1895,7 @@ fn env_api_key(provider: &str) -> Option<String> {
         "xiaomi-token-plan-cn" => &["XIAOMI_TOKEN_PLAN_CN_API_KEY"][..],
         "xiaomi-token-plan-sgp" => &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"][..],
         "zai" | "zai-coding" | "zai-anthropic" => &["ZAI_API_KEY"][..],
+        "zai-coding-cn" => &["ZAI_CODING_CN_API_KEY"][..],
         _ => &[],
     };
     names.iter().find_map(|name| env::var(name).ok())
@@ -1478,19 +1912,11 @@ fn env_auth(provider: &str) -> Option<ResolvedAuth> {
                 expires: 0,
             })
             .or_else(|| env_api_key(provider).map(ResolvedAuth::ApiKey)),
+        // An API key, under OpenAI's name for it or the Codex CLI's. A
+        // ChatGPT login is `openai-codex`'s credential (see `provider_takes`).
         "openai" => env_api_key(provider)
-            .map(ResolvedAuth::ApiKey)
-            .or_else(|| read_non_empty_env("CODEX_API_KEY").map(ResolvedAuth::ApiKey))
-            .or_else(|| {
-                read_non_empty_env("CODEX_ACCESS_TOKEN").map(|access_token| {
-                    ResolvedAuth::ChatGptOAuth {
-                        access_token,
-                        refresh_token: None,
-                        expires: 0,
-                        account_id: read_non_empty_env("CHATGPT_ACCOUNT_ID"),
-                    }
-                })
-            }),
+            .or_else(|| read_non_empty_env("CODEX_API_KEY"))
+            .map(ResolvedAuth::ApiKey),
         "openai-codex" => read_non_empty_env("CODEX_ACCESS_TOKEN").map(|access_token| {
             ResolvedAuth::ChatGptOAuth {
                 access_token,
@@ -1510,7 +1936,7 @@ fn login_auth(provider: &str) -> Option<ResolvedAuth> {
     }
     match provider {
         "anthropic" => read_claude_code_oauth(),
-        "openai" | "openai-codex" => read_codex_chatgpt_oauth(),
+        "openai-codex" => read_codex_chatgpt_oauth(),
         _ => None,
     }
 }
@@ -1527,12 +1953,6 @@ fn oauth_for_provider(
             access_token,
             refresh_token,
             expires,
-        },
-        "openai" => ResolvedAuth::ChatGptOAuth {
-            access_token,
-            refresh_token,
-            expires,
-            account_id,
         },
         "openai-codex" => ResolvedAuth::ChatGptOAuth {
             access_token,
@@ -1728,7 +2148,7 @@ fn resolve_prompt_input(input: Option<&str>) -> Result<Option<String>, ConfigErr
     };
     let path = Path::new(input);
     if path.exists() {
-        return fs::read_to_string(path)
+        return read_text(path)
             .map(Some)
             .map_err(|source| ConfigError::Read {
                 path: path.to_path_buf(),
@@ -1738,40 +2158,151 @@ fn resolve_prompt_input(input: Option<&str>) -> Result<Option<String>, ConfigErr
     Ok(Some(input.to_string()))
 }
 
-/// AGENTS.md / CLAUDE.md from the agent dir, then from the outermost ancestor
-/// of `cwd` down to `cwd`. Like upstream, these load whatever the project
-/// trust decision: trust gates only `.pi` resources and `.agents/skills`.
-fn load_context_files(cwd: &Path, agent_dir: &Path) -> Result<Vec<ContextFile>, ConfigError> {
-    let mut result = Vec::new();
-    if let Some(file) = load_context_file_from_dir(agent_dir)? {
-        result.push(file);
-    }
+/// A prompt or context file's text, as upstream reads one: invalid UTF-8 is
+/// replaced and a leading byte order mark is dropped.
+fn read_text(path: &Path) -> std::io::Result<String> {
+    let text = String::from_utf8_lossy(&fs::read(path)?).into_owned();
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(text) => text.to_string(),
+        None => text,
+    })
+}
 
+/// `SYSTEM.md` or `APPEND_SYSTEM.md`: the trusted project's `.pi/<name>`,
+/// else the agent dir's. As upstream, same-named files are not combined.
+fn discovered_prompt_file(
+    paths: &ConfigPaths,
+    name: &str,
+    project_trusted: bool,
+    diagnostics: &mut Vec<String>,
+) -> Option<String> {
+    let project = paths.cwd.join(CONFIG_DIR_NAME).join(name);
+    let path = if project_trusted && project.exists() {
+        project
+    } else {
+        paths.agent_dir.join(name)
+    };
+    if !path.exists() {
+        return None;
+    }
+    match read_text(&path) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            diagnostics.push(format!("failed to read {}: {error}", path.display()));
+            None
+        }
+    }
+}
+
+/// Context file names, first match wins: one file per directory.
+/// `AGENTS.override.md` replaces only its own directory's file.
+const CONTEXT_FILE_NAMES: [&str; 5] = [
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+];
+
+/// Context files from the agent dir, then from the outermost ancestor of
+/// `cwd` down to `cwd`. Like upstream, these load whatever the project trust
+/// decision: trust gates only `.pi` resources and `.agents/skills`.
+fn load_context_files(
+    cwd: &Path,
+    agent_dir: &Path,
+    diagnostics: &mut Vec<String>,
+) -> Vec<ContextFile> {
+    let global = load_context_file_from_dir(agent_dir, diagnostics);
+    let shadowed = shadowed_context_file(cwd);
     let mut ancestors = Vec::new();
     let mut current = Some(cwd);
     while let Some(dir) = current {
-        if let Some(file) = load_context_file_from_dir(dir)? {
-            ancestors.push(file);
+        if let Some(file) = load_context_file_from_dir(dir, diagnostics) {
+            // Compare the directory's real path, not the file's: a worktree
+            // file that links to the main checkout's would resolve to the
+            // shadowed file itself.
+            let is_shadowed = file.path.file_name().is_some_and(|name| {
+                shadowed.as_deref() == Some(canonical_path(dir).join(name).as_path())
+            });
+            // The agent dir can also be an ancestor of `cwd`.
+            let is_global = global
+                .as_ref()
+                .is_some_and(|global| global.path == file.path);
+            if !is_shadowed && !is_global {
+                ancestors.push(file);
+            }
         }
         current = dir.parent();
     }
     ancestors.reverse();
-    result.extend(ancestors);
-    Ok(result)
+    global.into_iter().chain(ancestors).collect()
 }
 
-fn load_context_file_from_dir(dir: &Path) -> Result<Option<ContextFile>, ConfigError> {
-    for filename in ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"] {
+fn load_context_file_from_dir(dir: &Path, diagnostics: &mut Vec<String>) -> Option<ContextFile> {
+    for filename in CONTEXT_FILE_NAMES {
         let path = dir.join(filename);
-        if path.exists() {
-            let content = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-                path: path.clone(),
-                source,
-            })?;
-            return Ok(Some(ContextFile { path, content }));
+        if !path.is_file() {
+            continue;
+        }
+        match read_text(&path) {
+            Ok(content) => return Some(ContextFile { path, content }),
+            Err(error) => diagnostics.push(format!("failed to read {}: {error}", path.display())),
         }
     }
-    Ok(None)
+    None
+}
+
+/// The main checkout's context file that a linked worktree nested inside that
+/// checkout replaces with its own: both describe the same repository, so
+/// loading both would apply its instructions twice. `None` for an ordinary
+/// repository, a worktree beside its main checkout, a bare layout, and a
+/// submodule, where ancestors load as usual.
+fn shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
+    let (worktree_root, common_git_dir) = git_paths(cwd)?;
+    let worktree_root = canonical_path(&worktree_root);
+    let common_git_dir = canonical_path(&common_git_dir);
+    let main_root = common_git_dir.parent()?;
+    if worktree_root == main_root || !worktree_root.starts_with(main_root) {
+        return None;
+    }
+    // The common git dir's parent is the main checkout only when that dir is
+    // its `.git`: not `proj/.bare`, and not a submodule's `.git/modules/x`.
+    if canonical_path(&main_root.join(".git")) != common_git_dir {
+        return None;
+    }
+    let file = load_context_file_from_dir(&worktree_root, &mut Vec::new())?;
+    Some(main_root.join(file.path.file_name()?))
+}
+
+/// The work tree root and common git dir of the repository holding `cwd`:
+/// `.git` is a directory, or a linked worktree's `gitdir:` file.
+fn git_paths(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        let git = dir.join(".git");
+        if git.is_dir() {
+            return git.join("HEAD").exists().then(|| (dir.to_path_buf(), git));
+        }
+        let pointer = fs::read_to_string(&git).unwrap_or_default();
+        if let Some(target) = pointer.trim().strip_prefix("gitdir: ") {
+            let git_dir = dir.join(target.trim());
+            if !git_dir.join("HEAD").exists() {
+                return None;
+            }
+            let common_git_dir = match fs::read_to_string(git_dir.join("commondir")) {
+                Ok(common) => git_dir.join(common.trim()),
+                Err(_) => git_dir,
+            };
+            return Some((dir.to_path_buf(), common_git_dir));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// `path` with symlinks resolved, or as given when it cannot be resolved.
+fn canonical_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn load_resource_files(
@@ -1820,39 +2351,6 @@ fn load_resource_files(
     resources.into_values().collect()
 }
 
-fn load_skill_resource_files(
-    paths: &ConfigPaths,
-    project_trusted: bool,
-    diagnostics: &mut Vec<String>,
-) -> Vec<ResourceFile> {
-    let resources = load_resource_files(paths, "skills", project_trusted, diagnostics);
-    let mut map = resources
-        .into_iter()
-        .map(|resource| (resource.name.clone(), resource))
-        .collect::<BTreeMap<_, _>>();
-    if project_trusted {
-        for dir in ancestor_agents_skill_dirs(&paths.cwd) {
-            collect_agent_skill_path(&mut map, &dir, diagnostics);
-        }
-    }
-    map.into_values().collect()
-}
-
-fn ancestor_agents_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let git_root = find_git_root(cwd);
-    let mut dirs = Vec::new();
-    let mut current = Some(cwd);
-    while let Some(dir) = current {
-        dirs.push(dir.join(".agents").join("skills"));
-        if git_root.as_deref() == Some(dir) {
-            break;
-        }
-        current = dir.parent();
-    }
-    dirs.reverse();
-    dirs
-}
-
 fn find_git_root(cwd: &Path) -> Option<PathBuf> {
     let mut current = Some(cwd);
     while let Some(dir) = current {
@@ -1862,54 +2360,6 @@ fn find_git_root(cwd: &Path) -> Option<PathBuf> {
         current = dir.parent();
     }
     None
-}
-
-fn collect_agent_skill_path(
-    resources: &mut BTreeMap<String, ResourceFile>,
-    path: &Path,
-    diagnostics: &mut Vec<String>,
-) {
-    if !path.exists() {
-        return;
-    }
-    if path.is_file() {
-        if path.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
-            push_resource_file(resources, path, diagnostics);
-        }
-        return;
-    }
-    if !path.is_dir() {
-        return;
-    }
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(error) => {
-            diagnostics.push(format!("failed to read {}: {error}", path.display()));
-            return;
-        }
-    };
-    let ignore_patterns = read_resource_ignore_patterns(path, diagnostics);
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                diagnostics.push(format!(
-                    "failed to read entry in {}: {error}",
-                    path.display()
-                ));
-                continue;
-            }
-        };
-        let child = entry.path();
-        if resource_path_ignored(&child, path, &ignore_patterns) {
-            continue;
-        }
-        if child.is_dir() {
-            collect_agent_skill_path(resources, &child, diagnostics);
-        } else if child.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
-            push_resource_file(resources, &child, diagnostics);
-        }
-    }
 }
 
 fn extend_resource_files(
@@ -1935,12 +2385,12 @@ fn extend_resource_files(
     resources.extend(map.into_values());
 }
 
+/// The extensions and themes of the packages. Their skills and prompt
+/// templates load with the others, in `resources`.
 fn load_package_resources(
     cwd: &Path,
     packages: &[PackageSource],
     extensions: &mut Vec<ResourceFile>,
-    skills: &mut Vec<ResourceFile>,
-    prompts: &mut Vec<ResourceFile>,
     themes: &mut Vec<ResourceFile>,
     diagnostics: &mut Vec<String>,
 ) {
@@ -1971,15 +2421,7 @@ fn load_package_resources(
             ));
             continue;
         }
-        load_package_root_resources(
-            &package_root,
-            package,
-            extensions,
-            skills,
-            prompts,
-            themes,
-            diagnostics,
-        );
+        load_package_root_resources(&package_root, package, extensions, themes, diagnostics);
     }
 }
 
@@ -1987,8 +2429,6 @@ fn load_package_root_resources(
     package_root: &Path,
     package: &PackageSource,
     extensions: &mut Vec<ResourceFile>,
-    skills: &mut Vec<ResourceFile>,
-    prompts: &mut Vec<ResourceFile>,
     themes: &mut Vec<ResourceFile>,
     diagnostics: &mut Vec<String>,
 ) {
@@ -1997,12 +2437,6 @@ fn load_package_root_resources(
         manifest.as_ref().map(|manifest| &manifest.extensions),
         "extensions",
     );
-    let skill_entries =
-        package_resource_entries(manifest.as_ref().map(|manifest| &manifest.skills), "skills");
-    let prompt_entries = package_resource_entries(
-        manifest.as_ref().map(|manifest| &manifest.prompts),
-        "prompts",
-    );
     let theme_entries =
         package_resource_entries(manifest.as_ref().map(|manifest| &manifest.themes), "themes");
     extend_package_resource_files(
@@ -2010,20 +2444,6 @@ fn load_package_root_resources(
         package_root,
         &extension_entries,
         package.filters(PackageResourceType::Extensions),
-        diagnostics,
-    );
-    extend_package_resource_files(
-        skills,
-        package_root,
-        &skill_entries,
-        package.filters(PackageResourceType::Skills),
-        diagnostics,
-    );
-    extend_package_resource_files(
-        prompts,
-        package_root,
-        &prompt_entries,
-        package.filters(PackageResourceType::Prompts),
         diagnostics,
     );
     extend_package_resource_files(
@@ -2160,13 +2580,16 @@ impl PackageResourceType {
     }
 }
 
-fn filter_disabled_resource_files(
-    resources: &mut Vec<ResourceFile>,
-    resource_type: PackageResourceType,
+/// Whether `disabledResources` in settings names this resource: by name,
+/// as `skills/<name>` or `skill:<name>`, or by path. Wildcards apply.
+fn resource_disabled(
     disabled_resources: Option<&ResourceStateSettings>,
-) {
+    resource_type: PackageResourceType,
+    name: &str,
+    path: &Path,
+) -> bool {
     let Some(disabled_resources) = disabled_resources else {
-        return;
+        return false;
     };
     let patterns = match resource_type {
         PackageResourceType::Extensions => &disabled_resources.extensions,
@@ -2174,29 +2597,16 @@ fn filter_disabled_resource_files(
         PackageResourceType::Prompts => &disabled_resources.prompts,
         PackageResourceType::Themes => &disabled_resources.themes,
     };
-    if patterns.is_empty() {
-        return;
-    }
-    resources.retain(|resource| {
-        !patterns
-            .iter()
-            .any(|pattern| resource_state_pattern_matches(resource, resource_type, pattern))
-    });
-}
-
-fn resource_state_pattern_matches(
-    resource: &ResourceFile,
-    resource_type: PackageResourceType,
-    pattern: &str,
-) -> bool {
-    let pattern = normalize_pattern(pattern);
-    let path = normalize_resource_path(&resource.path);
+    let path = normalize_resource_path(path);
     let key = resource_type.key();
     let singular = resource_type.singular();
-    wildcard_matches(&pattern, &resource.name)
-        || wildcard_matches(&pattern, &format!("{key}/{}", resource.name))
-        || wildcard_matches(&pattern, &format!("{singular}:{}", resource.name))
-        || wildcard_matches(&pattern, &path)
+    patterns.iter().any(|pattern| {
+        let pattern = normalize_pattern(pattern);
+        wildcard_matches(&pattern, name)
+            || wildcard_matches(&pattern, &format!("{key}/{name}"))
+            || wildcard_matches(&pattern, &format!("{singular}:{name}"))
+            || wildcard_matches(&pattern, &path)
+    })
 }
 
 fn resolve_resource_path(base_dir: &Path, entry: &str) -> Result<PathBuf, ConfigError> {
@@ -2478,442 +2888,18 @@ fn push_resource_file(
 }
 
 fn resource_name(path: &Path) -> Option<String> {
-    if path.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
-        return path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|value| value.to_str())
-            .map(ToString::to_string);
-    }
     path.file_stem()
         .and_then(|value| value.to_str())
         .map(ToString::to_string)
 }
 
+/// The built-in catalog (`pi_ai::catalog`): this port's own providers, then
+/// upstream's.
 fn default_models() -> Vec<ModelDefinition> {
-    let mut models = pi_providers::builtin_models()
-        .into_iter()
-        .map(|model| ModelDefinition {
-            context_window: model.context_window,
-            provider: model.provider,
-            id: model.id,
-            name: Some(model.name),
-            api: match model.api {
-                pi_ai::ProviderApi::Faux => ProviderApi::Faux,
-                pi_ai::ProviderApi::OpenAi => ProviderApi::OpenAi,
-                pi_ai::ProviderApi::OpenAiResponses => ProviderApi::OpenAiResponses,
-                pi_ai::ProviderApi::OpenAiCodexResponses => ProviderApi::OpenAiCodexResponses,
-                pi_ai::ProviderApi::AzureOpenAiResponses => ProviderApi::AzureOpenAiResponses,
-                pi_ai::ProviderApi::Anthropic => ProviderApi::Anthropic,
-                pi_ai::ProviderApi::Google => ProviderApi::Google,
-                pi_ai::ProviderApi::GoogleVertex => ProviderApi::GoogleVertex,
-                pi_ai::ProviderApi::Bedrock => ProviderApi::Bedrock,
-                pi_ai::ProviderApi::Mistral => ProviderApi::Mistral,
-            },
-            base_url: model.base_url,
-        })
-        .collect::<Vec<_>>();
-    models.extend([
-        ModelDefinition {
-            context_window: None,
-            provider: "faux".to_string(),
-            id: "echo".to_string(),
-            name: Some("Faux Echo".to_string()),
-            api: ProviderApi::Faux,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "faux".to_string(),
-            id: "script".to_string(),
-            name: Some("Faux Script".to_string()),
-            api: ProviderApi::Faux,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai".to_string(),
-            id: "gpt-5.4".to_string(),
-            name: Some("OpenAI GPT 5.4".to_string()),
-            api: ProviderApi::OpenAiResponses,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai".to_string(),
-            id: "gpt-4.1".to_string(),
-            name: Some("OpenAI GPT 4.1".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.1".to_string(),
-            name: Some("GPT 5.1".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.1-codex-max".to_string(),
-            name: Some("GPT 5.1 Codex Max".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.1-codex-mini".to_string(),
-            name: Some("GPT 5.1 Codex Mini".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.2".to_string(),
-            name: Some("GPT 5.2".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.2-codex".to_string(),
-            name: Some("GPT 5.2 Codex".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.3-codex".to_string(),
-            name: Some("GPT 5.3 Codex".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.3-codex-spark".to_string(),
-            name: Some("GPT 5.3 Codex Spark".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.4".to_string(),
-            name: Some("GPT 5.4".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.4-mini".to_string(),
-            name: Some("GPT 5.4 Mini".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openai-codex".to_string(),
-            id: "gpt-5.5".to_string(),
-            name: Some("GPT 5.5".to_string()),
-            api: ProviderApi::OpenAiCodexResponses,
-            base_url: Some("https://chatgpt.com/backend-api".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "azure-openai-responses".to_string(),
-            id: "gpt-5.2".to_string(),
-            name: Some("Azure OpenAI GPT 5.2".to_string()),
-            api: ProviderApi::AzureOpenAiResponses,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-opus-4-1-20250805".to_string(),
-            name: Some("Claude Opus 4.1".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-opus-4-8".to_string(),
-            name: Some("Claude Opus 4.8".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-opus-4-7".to_string(),
-            name: Some("Claude Opus 4.7".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-opus-4-20250514".to_string(),
-            name: Some("Claude Opus 4".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-sonnet-4-5".to_string(),
-            name: Some("Claude Sonnet".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "anthropic".to_string(),
-            id: "claude-sonnet-4-6".to_string(),
-            name: Some("Claude Sonnet 4.6".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "github-copilot".to_string(),
-            id: "gpt-5.4".to_string(),
-            name: Some("GitHub Copilot GPT 5.4".to_string()),
-            api: ProviderApi::OpenAiResponses,
-            base_url: Some("https://api.individual.githubcopilot.com".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "openrouter".to_string(),
-            id: "moonshotai/kimi-k2.6".to_string(),
-            name: Some("OpenRouter Kimi K2.6".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://openrouter.ai/api/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "deepseek".to_string(),
-            id: "deepseek-v4-flash".to_string(),
-            name: Some("DeepSeek V4 Flash".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.deepseek.com".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "groq".to_string(),
-            id: "openai/gpt-oss-120b".to_string(),
-            name: Some("Groq GPT OSS 120B".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.groq.com/openai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "cerebras".to_string(),
-            id: "gpt-oss-120b".to_string(),
-            name: Some("Cerebras GPT OSS 120B".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.cerebras.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xai".to_string(),
-            id: "grok-code-fast-1".to_string(),
-            name: Some("Grok Code Fast 1".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.x.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "zai".to_string(),
-            id: "glm-5.1".to_string(),
-            name: Some("GLM 5.1".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "huggingface".to_string(),
-            id: "MiniMaxAI/MiniMax-M2.7".to_string(),
-            name: Some("Hugging Face MiniMax M2.7".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://router.huggingface.co/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "together".to_string(),
-            id: "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8".to_string(),
-            name: Some("Together Qwen3 Coder 480B".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.together.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "moonshotai".to_string(),
-            id: "kimi-k2-thinking".to_string(),
-            name: Some("Kimi K2 Thinking".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.moonshot.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "moonshotai-cn".to_string(),
-            id: "kimi-k2-thinking".to_string(),
-            name: Some("Kimi K2 Thinking CN".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://api.moonshot.cn/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "opencode".to_string(),
-            id: "big-pickle".to_string(),
-            name: Some("OpenCode Big Pickle".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://opencode.ai/zen/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "opencode-go".to_string(),
-            id: "deepseek-v4-flash".to_string(),
-            name: Some("OpenCode Go DeepSeek V4 Flash".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some("https://opencode.ai/zen/go/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "fireworks".to_string(),
-            id: "accounts/fireworks/models/deepseek-v4-pro".to_string(),
-            name: Some("Fireworks DeepSeek V4 Pro".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.fireworks.ai/inference".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "minimax".to_string(),
-            id: "MiniMax-M2.7".to_string(),
-            name: Some("MiniMax M2.7".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.minimax.io/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "minimax-cn".to_string(),
-            id: "MiniMax-M2.7".to_string(),
-            name: Some("MiniMax M2.7 CN".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.minimaxi.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "kimi-coding".to_string(),
-            id: "kimi-for-coding".to_string(),
-            name: Some("Kimi For Coding".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.kimi.com/coding".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xiaomi".to_string(),
-            id: "mimo-v2.5-pro".to_string(),
-            name: Some("MiMo V2.5 Pro".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://api.xiaomimimo.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xiaomi-token-plan-cn".to_string(),
-            id: "mimo-v2.5-pro".to_string(),
-            name: Some("MiMo V2.5 Pro Token Plan CN".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://token-plan-cn.xiaomimimo.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xiaomi-token-plan-ams".to_string(),
-            id: "mimo-v2.5-pro".to_string(),
-            name: Some("MiMo V2.5 Pro Token Plan AMS".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://token-plan-ams.xiaomimimo.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "xiaomi-token-plan-sgp".to_string(),
-            id: "mimo-v2.5-pro".to_string(),
-            name: Some("MiMo V2.5 Pro Token Plan SGP".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://token-plan-sgp.xiaomimimo.com/anthropic".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "vercel-ai-gateway".to_string(),
-            id: "alibaba/qwen3-coder".to_string(),
-            name: Some("Vercel AI Gateway Qwen3 Coder".to_string()),
-            api: ProviderApi::Anthropic,
-            base_url: Some("https://ai-gateway.vercel.sh".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "google".to_string(),
-            id: "gemini-2.5-pro".to_string(),
-            name: Some("Gemini Pro".to_string()),
-            api: ProviderApi::Google,
-            base_url: None,
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "google-vertex".to_string(),
-            id: "gemini-2.5-pro".to_string(),
-            name: Some("Gemini Pro Vertex".to_string()),
-            api: ProviderApi::GoogleVertex,
-            base_url: Some("https://{GOOGLE_CLOUD_LOCATION}-aiplatform.googleapis.com".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "amazon-bedrock".to_string(),
-            id: "us.anthropic.claude-opus-4-6-v1".to_string(),
-            name: Some("Bedrock Claude Opus 4.6".to_string()),
-            api: ProviderApi::Bedrock,
-            base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "mistral".to_string(),
-            id: "devstral-medium-latest".to_string(),
-            name: Some("Mistral Devstral Medium".to_string()),
-            api: ProviderApi::Mistral,
-            base_url: Some("https://api.mistral.ai/v1".to_string()),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "cloudflare-workers-ai".to_string(),
-            id: "@cf/moonshotai/kimi-k2.6".to_string(),
-            name: Some("Cloudflare Workers AI Kimi K2.6".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some(
-                "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
-                    .to_string(),
-            ),
-        },
-        ModelDefinition {
-            context_window: None,
-            provider: "cloudflare-ai-gateway".to_string(),
-            id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
-            name: Some("Cloudflare AI Gateway Kimi K2.6".to_string()),
-            api: ProviderApi::OpenAi,
-            base_url: Some(
-                "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat"
-                    .to_string(),
-            ),
-        },
-    ]);
-    merge_model_definitions(Vec::new(), Vec::new(), models)
+    pi_ai::catalog::builtin_models()
+        .iter()
+        .map(ModelDefinition::from)
+        .collect()
 }
 
 fn default_image_models() -> Vec<ImageModelDefinition> {
@@ -3037,6 +3023,12 @@ mod tests {
             "steeringMode": settings.steering_mode.as_deref().unwrap_or("one-at-a-time"),
             "followUpMode": settings.follow_up_mode.as_deref().unwrap_or("one-at-a-time"),
             "enabledModels": settings.enabled_models.as_ref(),
+            // Resolved against upstream's default tools, which the fixture
+            // records; pi's own default set is larger.
+            "defaultTools": settings.default_tools.as_ref().map(|entries| {
+                let upstream_defaults = ["read", "bash", "edit", "write"].map(String::from);
+                resolve_default_tools(entries, &upstream_defaults)
+            }),
             "compaction": {
                 "enabled": compaction.and_then(|compaction| compaction.enabled).unwrap_or(true),
                 "reserveTokens": compaction.and_then(|compaction| compaction.reserve_tokens).unwrap_or(16384),
@@ -3082,9 +3074,14 @@ mod tests {
         assert_eq!(settings.reserve_tokens, Some(2048));
         assert_eq!(settings.keep_recent_tokens, Some(6000));
         assert_eq!(settings.trigger_percent, Some(80));
-        let old: ModelDefinition =
-            serde_json::from_str(r#"{"provider":"openai","id":"gpt-5.4"}"#).unwrap();
-        assert_eq!(model_context_window(&old), 1_050_000);
+        // An entry without a window (an old cache) takes the catalog's.
+        let builtin = pi_ai::catalog::provider_base_model("openai").expect("built-in model");
+        let old = ModelDefinition {
+            provider: builtin.provider.clone(),
+            id: builtin.id.clone(),
+            ..ModelDefinition::default()
+        };
+        assert_eq!(model_context_window(&old), builtin.context_window);
         let mut custom: ModelDefinition =
             serde_json::from_str(r#"{"provider":"local","id":"test","contextWindow":8192}"#)
                 .unwrap();
@@ -3096,7 +3093,7 @@ mod tests {
     }
 
     #[test]
-    fn load_config_accepts_keybinding_map_and_filters_enabled_models() {
+    fn load_config_accepts_keybinding_map_and_keeps_every_model_under_a_scope() {
         let root = test_dir("pi-config-load");
         let agent_dir = root.join("agent");
         let cwd = root.join("repo");
@@ -3121,11 +3118,15 @@ mod tests {
             r#"{"submit":["enter"],"cancel":["escape"]}"#,
         )
         .expect("write keybindings");
-        fs::create_dir_all(agent_dir.join("skills")).expect("create skills");
+        fs::create_dir_all(agent_dir.join("skills/review")).expect("create skills");
         fs::create_dir_all(agent_dir.join("prompts")).expect("create prompts");
         fs::create_dir_all(agent_dir.join("extensions")).expect("create extensions");
         fs::create_dir_all(cwd.join(".pi/themes")).expect("create project themes");
-        fs::write(agent_dir.join("skills/review.md"), "review skill").expect("write skill");
+        fs::write(
+            agent_dir.join("skills/review/SKILL.md"),
+            "---\ndescription: Review code.\n---\nreview skill",
+        )
+        .expect("write skill");
         fs::write(agent_dir.join("prompts/fix.md"), "fix {{input}}").expect("write prompt");
         fs::write(agent_dir.join("extensions/plan.md"), "plan extension").expect("write extension");
         fs::write(cwd.join(".pi/themes/dark.json"), r#"{"name":"dark"}"#).expect("write theme");
@@ -3144,14 +3145,30 @@ mod tests {
         .expect("load config");
 
         assert_eq!(config.system_prompt, Some("prompt".to_string()));
-        assert_eq!(
+        // `enabledModels` scopes selection; it removes no model.
+        let has = |provider: &str, id: &str| {
             config
                 .models
                 .iter()
-                .map(|model| format!("{}/{}", model.provider, model.id))
+                .any(|model| model.provider == provider && model.id == id)
+        };
+        assert!(has("faux", "echo"));
+        assert!(has("openai", "gpt-test") && has("anthropic", "claude-test"));
+        let builtin = pi_ai::catalog::provider_base_model("anthropic").expect("built-in model");
+        assert!(has("anthropic", &builtin.id));
+        let scope = resolve_model_scope(
+            config.settings.enabled_models.as_deref().unwrap(),
+            &config.models.iter().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            scope
+                .models
+                .iter()
+                .map(|scoped| format!("{}/{}", scoped.model.provider, scoped.model.id))
                 .collect::<Vec<_>>(),
             ["faux/echo", "openai/gpt-test"]
         );
+        assert!(scope.diagnostics.is_empty(), "{:?}", scope.diagnostics);
         assert_eq!(config.keybindings.len(), 2);
         assert!(config
             .keybindings
@@ -3160,8 +3177,9 @@ mod tests {
         assert_eq!(config.extensions[0].name, "plan");
         assert_eq!(config.extensions[0].content, "plan extension");
         assert_eq!(config.skills[0].name, "review");
-        assert_eq!(config.skills[0].content, "review skill");
+        assert_eq!(config.skills[0].description, "Review code.");
         assert_eq!(config.prompt_templates[0].name, "fix");
+        assert_eq!(config.prompt_templates[0].content, "fix {{input}}");
         assert_eq!(config.themes[0].name, "dark");
         assert!(config.diagnostics.is_empty(), "{:?}", config.diagnostics);
 
@@ -3202,7 +3220,11 @@ mod tests {
         .expect("write package manifest");
         fs::write(package_dir.join("extensions/pkg.md"), "package extension")
             .expect("write package extension");
-        fs::write(package_dir.join("skills/pkg.md"), "package skill").expect("write package skill");
+        fs::write(
+            package_dir.join("skills/pkg.md"),
+            "---\nname: pkg\ndescription: A package skill.\n---\npackage skill",
+        )
+        .expect("write package skill");
 
         let config = load_config(ConfigPaths {
             cwd: cwd.clone(),
@@ -3228,7 +3250,7 @@ mod tests {
         assert!(config
             .skills
             .iter()
-            .any(|resource| resource.name == "pkg" && resource.content == "package skill"));
+            .any(|skill| skill.name == "pkg" && skill.source_info.from_package));
         assert!(config
             .prompt_templates
             .iter()
@@ -3336,14 +3358,17 @@ mod tests {
         fs::write(repo.join(".git"), "").expect("mark git root");
         fs::write(
             cwd.join(".agents/skills/local/SKILL.md"),
-            "local skill body",
+            "---\ndescription: The local skill.\n---\nlocal skill body",
         )
         .expect("write local skill");
-        fs::write(repo.join(".agents/skills/repo/SKILL.md"), "repo skill body")
-            .expect("write repo skill");
+        fs::write(
+            repo.join(".agents/skills/repo/SKILL.md"),
+            "---\ndescription: The repo skill.\n---\nrepo skill body",
+        )
+        .expect("write repo skill");
         fs::write(
             cwd.join(".agents/skills/ignored.md"),
-            "ignored root markdown",
+            "---\nname: ignored\ndescription: Directly in .agents/skills.\n---\n",
         )
         .expect("write ignored root markdown");
 
@@ -3360,18 +3385,11 @@ mod tests {
         })
         .expect("load config");
 
-        assert!(config
-            .skills
-            .iter()
-            .any(|resource| resource.name == "repo" && resource.content == "repo skill body"));
-        assert!(config
-            .skills
-            .iter()
-            .any(|resource| resource.name == "local" && resource.content == "local skill body"));
-        assert!(!config
-            .skills
-            .iter()
-            .any(|resource| resource.name == "ignored"));
+        // Nearest first; a Markdown file directly in .agents/skills is no skill.
+        let names = config.skills.iter().map(|skill| skill.name.as_str());
+        assert_eq!(names.collect::<Vec<_>>(), ["local", "repo"]);
+        assert_eq!(config.skills[1].description, "The repo skill.");
+        assert_eq!(config.skills[1].base_dir, repo.join(".agents/skills/repo"));
         assert!(config.diagnostics.is_empty());
 
         let _ = fs::remove_dir_all(root);
@@ -3397,8 +3415,11 @@ mod tests {
         .expect("write project settings");
         fs::write(cwd.join(".pi/extensions/local.md"), "project extension")
             .expect("write project extension");
-        fs::write(repo.join(".agents/skills/repo/SKILL.md"), "repo skill")
-            .expect("write repo skill");
+        fs::write(
+            repo.join(".agents/skills/repo/SKILL.md"),
+            "---\ndescription: The repo skill.\n---\nrepo skill",
+        )
+        .expect("write repo skill");
 
         let config = load_config_with_project_trust(
             ConfigPaths {
@@ -3425,6 +3446,68 @@ mod tests {
         assert_eq!(config.settings.shell_command_prefix, None);
         assert!(config.extensions.is_empty());
         assert!(config.skills.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_settings_come_before_discovered_prompt_files() {
+        let root = test_dir("pi-config-prompt-files");
+        let agent_dir = root.join("agent");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        fs::write(agent_dir.join("SYSTEM.md"), "file system").expect("write SYSTEM.md");
+        fs::write(agent_dir.join("APPEND_SYSTEM.md"), "file append").expect("write append");
+        let load = || {
+            load_config(ConfigPaths {
+                cwd: cwd.clone(),
+                agent_dir: agent_dir.clone(),
+                session_dir: agent_dir.join("sessions"),
+                settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".pi/settings.json"),
+                auth_path: root.join("missing-auth.json"),
+                models_path: root.join("missing-models.json"),
+                model_cache_path: root.join("missing-model-cache.json"),
+                keybindings_path: root.join("missing-keybindings.json"),
+            })
+            .expect("load config")
+        };
+
+        let config = load();
+        assert_eq!(config.system_prompt.as_deref(), Some("file system"));
+        assert_eq!(config.append_system_prompt, ["file append"]);
+
+        // The settings are explicit, as upstream's flags are: each replaces
+        // its discovered file.
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"systemPrompt":"setting system","appendSystemPrompt":["one","two"]}"#,
+        )
+        .expect("write settings");
+        let config = load();
+        assert_eq!(config.system_prompt.as_deref(), Some("setting system"));
+        assert_eq!(config.append_system_prompt, ["one", "two"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_context_file_that_is_not_utf8_still_loads() {
+        let root = test_dir("pi-config-context-bytes");
+        let agent_dir = root.join("agent");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::write(agent_dir.join("AGENTS.md"), b"caf\xe9 rules").expect("write context file");
+
+        let mut diagnostics = Vec::new();
+        let files = load_context_files(&root, &agent_dir, &mut diagnostics);
+        let contents = files
+            .iter()
+            .filter(|file| file.path.starts_with(&root))
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["caf\u{fffd} rules"]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3587,20 +3670,40 @@ mod tests {
             ]"#,
         )
         .expect("write explicit models");
+        let builtin = pi_ai::catalog::provider_base_model("anthropic").expect("built-in model");
         write_model_cache(
             &agent_dir.join("model-cache.json"),
             &ModelCache {
                 refreshed_at: 123,
                 version: MODEL_CACHE_VERSION,
                 claude_code_version: None,
-                models: vec![ModelDefinition {
-                    context_window: None,
-                    provider: "anthropic".to_string(),
-                    id: "claude-opus-4-1-20250805".to_string(),
-                    name: Some("Claude Opus 4.1".to_string()),
-                    api: ProviderApi::Anthropic,
-                    base_url: None,
-                }],
+                models: vec![
+                    // A listing of a model the catalog lacks, as a refresh
+                    // writes it: no URL, the provider's name for it.
+                    ModelDefinition {
+                        provider: "anthropic".to_string(),
+                        id: "claude-listed-only".to_string(),
+                        name: Some("Claude Listed Only".to_string()),
+                        api: ProviderApi::Anthropic,
+                        ..ModelDefinition::default()
+                    },
+                    // A listing of a model the catalog has.
+                    ModelDefinition {
+                        provider: "anthropic".to_string(),
+                        id: builtin.id.clone(),
+                        name: Some("Listed Under Another Name".to_string()),
+                        api: ProviderApi::Anthropic,
+                        ..ModelDefinition::default()
+                    },
+                    // A provider the catalog lacks.
+                    ModelDefinition {
+                        provider: "elsewhere".to_string(),
+                        id: "model".to_string(),
+                        api: ProviderApi::OpenAi,
+                        base_url: Some("https://elsewhere.example/v1".to_string()),
+                        ..ModelDefinition::default()
+                    },
+                ],
                 diagnostics: vec!["model refresh warning".to_string()],
             },
         )
@@ -3626,9 +3729,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(model_ids.contains(&"faux/echo".to_string()));
         assert!(model_ids.contains(&"faux/script".to_string()));
-        assert!(model_ids.contains(&"anthropic/claude-opus-4-1-20250805".to_string()));
+        assert!(model_ids.contains(&"anthropic/claude-listed-only".to_string()));
         assert!(model_ids.contains(&"anthropic/claude-custom".to_string()));
         assert_eq!(config.diagnostics, ["model refresh warning"]);
+
+        let model = |provider: &str, id: &str| {
+            config
+                .models
+                .iter()
+                .find(|model| model.provider == provider && model.id == id)
+                .unwrap_or_else(|| panic!("{provider}/{id}"))
+        };
+        let default = model("anthropic", &builtin.id);
+        // A listed model the catalog has is the catalog's entry.
+        assert_eq!(default, &ModelDefinition::from(builtin));
+        // A listed id the catalog lacks is built onto the provider's
+        // default model and keeps its listed name.
+        let listed = model("anthropic", "claude-listed-only");
+        assert_eq!(listed.name.as_deref(), Some("Claude Listed Only"));
+        assert_eq!(
+            ModelDefinition {
+                id: default.id.clone(),
+                name: default.name.clone(),
+                ..listed.clone()
+            },
+            *default
+        );
+        // A `models.json` entry is used as written and takes the rest from
+        // the provider's default model.
+        let custom = model("anthropic", "claude-custom");
+        assert_eq!(custom.name.as_deref(), Some("Custom Claude"));
+        assert_eq!(
+            (&custom.api, &custom.base_url),
+            (&ProviderApi::Anthropic, &None)
+        );
+        assert_eq!(custom.max_tokens, default.max_tokens);
+        assert_eq!(
+            custom.supported_thinking_levels(),
+            default.supported_thinking_levels()
+        );
+        // Nothing is known about a provider the catalog lacks.
+        let elsewhere = model("elsewhere", "model");
+        assert_eq!(elsewhere.max_tokens, None);
+        assert_eq!(elsewhere.supported_thinking_levels(), ["off"]);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3654,6 +3797,48 @@ mod tests {
 
         assert_eq!(next.session_dir, cwd.join("local-sessions"));
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn tool_lists_validate_and_match_like_upstream() {
+        let list = |entries: &[&str]| entries.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(tool_list_error(&list(&["read", "mcp_*"])), None);
+        assert_eq!(tool_list_error(&list(&["+grep", "-bash"])), None);
+        assert_eq!(
+            tool_list_error(&list(&["read", "+grep"])).as_deref(),
+            Some("tool names cannot be mixed with +name or -name entries")
+        );
+        assert_eq!(
+            tool_list_error(&list(&["+grep", "-web_*"])).as_deref(),
+            Some("+name and -name entries take exact tool names, not patterns: -web_*")
+        );
+
+        let patterns = list(&["read", "web_*", "*_tool", "a*b*c"]);
+        for name in [
+            "read",
+            "web_",
+            "web_search",
+            "my_tool",
+            "abc",
+            "a-b-c",
+            "axxbyybc",
+        ] {
+            assert!(tool_name_matches(&patterns, name), "{name}");
+        }
+        // A pattern covers the whole name, and a plain entry is exact.
+        for name in [
+            "reader",
+            "xread",
+            "the_web_search",
+            "tool_x",
+            "ab",
+            "acb",
+            "abcd",
+        ] {
+            assert!(!tool_name_matches(&patterns, name), "{name}");
+        }
+        assert!(tool_name_matches(&list(&["*"]), "anything"));
+        assert!(!tool_name_matches(&[], "read"));
     }
 
     #[test]
@@ -3841,7 +4026,7 @@ mod tests {
                 },
             ),
             (
-                "openai".to_string(),
+                "openai-codex".to_string(),
                 AuthCredential::OAuth {
                     access_token: "codex-token".to_string(),
                     refresh_token: Some("codex-refresh".to_string()),
@@ -3860,7 +4045,7 @@ mod tests {
             })
         );
         assert_eq!(
-            auth_for_provider(&auth, "openai", None),
+            auth_for_provider(&auth, "openai-codex", None),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "codex-token".to_string(),
                 refresh_token: Some("codex-refresh".to_string()),
@@ -3868,6 +4053,165 @@ mod tests {
                 account_id: Some("account-id".to_string())
             })
         );
+    }
+
+    /// The variables that can give `anthropic`, `openai`, `openai-codex`, or
+    /// a Cloudflare provider a credential.
+    const LOGIN_ENV: [&str; 11] = [
+        "CLOUDFLARE_API_KEY",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_GATEWAY_ID",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CHATGPT_ACCOUNT_ID",
+    ];
+
+    /// Runs `test` with none of [`LOGIN_ENV`] set and no login file read, so
+    /// those providers have only the credentials the test gives them.
+    fn without_ambient_logins(test: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let saved = LOGIN_ENV.map(save_env);
+        let isolation = save_env(ENV_TEST_ISOLATION);
+        for name in LOGIN_ENV {
+            env::remove_var(name);
+        }
+        env::set_var(ENV_TEST_ISOLATION, "1");
+        test();
+        for (name, value) in saved {
+            restore_env(name, value);
+        }
+        restore_env(isolation.0, isolation.1);
+    }
+
+    /// Which credentials make a provider's models available, and the model
+    /// startup then takes, against upstream's real model runtime
+    /// (`credentials` in `model-resolution.json`).
+    #[test]
+    fn credentials_offer_the_same_models_as_upstream() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/model-resolution.json"
+        ))
+        .expect("parse model-resolution.json");
+        let cases = fixture["credentials"].as_array().expect("credentials");
+        assert!(cases.len() >= 16, "{} cases", cases.len());
+        let models = default_models();
+        let models = models.iter().collect::<Vec<_>>();
+        without_ambient_logins(|| {
+            for case in cases {
+                let name = case["name"].as_str().expect("name");
+                let input = &case["input"];
+                // Upstream's `auth.json`, read as pi reads the file.
+                let auth = serde_json::from_value::<AuthData>(input["auth"].clone())
+                    .expect("parse auth.json");
+                let variables = input["env"].as_object().expect("env");
+                for (variable, value) in variables {
+                    env::set_var(variable, value.as_str().expect("value"));
+                }
+                let asked = input["providers"]
+                    .as_array()
+                    .expect("providers")
+                    .iter()
+                    .map(|provider| provider.as_str().expect("provider"))
+                    .collect::<Vec<_>>();
+                let has_auth = |provider: &str| {
+                    asked.contains(&provider) && has_auth_for_provider(&auth, provider, None)
+                };
+                let configured = asked
+                    .iter()
+                    .copied()
+                    .filter(|provider| has_auth(provider))
+                    .collect::<Vec<_>>();
+                let start = find_initial_model(&models, None, None, &has_auth);
+                let answered = serde_json::json!({
+                    "configured": configured,
+                    "initialModel": start.map(|model| {
+                        serde_json::json!({ "provider": model.provider, "id": model.id })
+                    }),
+                });
+                for variable in variables.keys() {
+                    env::remove_var(variable);
+                }
+
+                let mut expected = case["expected"].clone();
+                // The one case pi answers differently, on purpose: upstream's
+                // own ChatGPT sign-in for `openai`, a flow pi does not have
+                // ("Credentials That Make a Provider Available" in the
+                // non-parity register).
+                if name == "chatgpt-sign-in-stored-for-openai" {
+                    assert_eq!(expected["configured"], serde_json::json!(["openai"]));
+                    expected = serde_json::json!({ "configured": [], "initialModel": null });
+                }
+                assert_eq!(answered, expected, "{name}");
+            }
+        });
+    }
+
+    /// The states only pi can be in: the Codex CLI's variables, and the
+    /// login `pi login` used to store under `openai` as well.
+    #[test]
+    fn a_chatgpt_login_serves_openai_codex_and_an_api_key_serves_openai() {
+        let login = || AuthCredential::OAuth {
+            access_token: "login-token".to_string(),
+            refresh_token: Some("login-refresh".to_string()),
+            expires: 0,
+            account_id: None,
+        };
+        let key = |key: &str| AuthCredential::ApiKey {
+            key: key.to_string(),
+        };
+        let is_login = |auth: &AuthData, provider: &str| {
+            matches!(
+                auth_for_provider(auth, provider, None),
+                Some(ResolvedAuth::ChatGptOAuth { .. })
+            )
+        };
+        without_ambient_logins(|| {
+            let mut auth = AuthData::default();
+            auth.insert("openai", DEFAULT_ACCOUNT_NAME, login());
+            auth.insert("openai-codex", DEFAULT_ACCOUNT_NAME, login());
+            assert!(is_login(&auth, "openai-codex"));
+            assert_eq!(auth.accounts_for_provider("openai-codex"), ["default"]);
+            assert!(!has_auth_for_provider(&auth, "openai", None));
+            assert!(auth.accounts_for_provider("openai").is_empty());
+            // The login is not in the way of a key, in the environment or
+            // stored beside it.
+            env::set_var("OPENAI_API_KEY", "env-key");
+            assert_eq!(
+                auth_for_provider(&auth, "openai", None),
+                Some(ResolvedAuth::ApiKey("env-key".to_string()))
+            );
+            env::remove_var("OPENAI_API_KEY");
+            auth.insert("openai", "work", key("work-key"));
+            assert_eq!(auth.account_for_resolution("openai"), Some("work"));
+            assert_eq!(
+                auth_for_provider(&auth, "openai", None),
+                Some(ResolvedAuth::ApiKey("work-key".to_string()))
+            );
+
+            let mut auth = AuthData::default();
+            auth.insert("openai-codex", DEFAULT_ACCOUNT_NAME, key("stored-key"));
+            assert!(!has_auth_for_provider(&auth, "openai-codex", None));
+            assert!(auth.accounts_for_provider("openai-codex").is_empty());
+
+            // The Codex CLI's login token and its API key.
+            let nothing = AuthData::default();
+            env::set_var("CODEX_ACCESS_TOKEN", "codex-token");
+            assert!(is_login(&nothing, "openai-codex"));
+            assert!(!has_auth_for_provider(&nothing, "openai", None));
+            env::remove_var("CODEX_ACCESS_TOKEN");
+            env::set_var("CODEX_API_KEY", "codex-key");
+            assert_eq!(
+                auth_for_provider(&nothing, "openai", None),
+                Some(ResolvedAuth::ApiKey("codex-key".to_string()))
+            );
+            assert!(!has_auth_for_provider(&nothing, "openai-codex", None));
+            env::remove_var("CODEX_API_KEY");
+        });
     }
 
     #[test]
@@ -3950,16 +4294,31 @@ mod tests {
 
         env::remove_var("ANTHROPIC_OAUTH_TOKEN");
         env::remove_var("ANTHROPIC_API_KEY");
-        env::set_var("OPENAI_API_KEY", "openai-api-key");
-        env::set_var("AZURE_OPENAI_API_KEY", "azure-api-key");
-        assert_eq!(
-            auth_for_provider(&AuthData::default(), "openai", None),
-            Some(ResolvedAuth::ApiKey("openai-api-key".to_string()))
-        );
-        assert_eq!(
-            auth_for_provider(&AuthData::default(), "azure-openai-responses", None),
-            Some(ResolvedAuth::ApiKey("azure-api-key".to_string()))
-        );
+        // Every environment case of the fixture, under upstream's provider
+        // id: the variables it sets resolve to the credential it expects.
+        let cases = fixture["env"].as_array().expect("env cases");
+        assert!(cases.iter().any(|case| case["provider"] == "azure"));
+        for case in cases {
+            let provider = case["provider"].as_str().expect("provider");
+            let variables = case["env"].as_object().expect("env");
+            for (name, value) in variables {
+                env::set_var(name, value.as_str().expect("value"));
+            }
+            let token = match auth_for_provider(&AuthData::default(), provider, None) {
+                Some(ResolvedAuth::ApiKey(key)) => Some(key),
+                Some(ResolvedAuth::ClaudeCodeOAuth { access_token, .. })
+                | Some(ResolvedAuth::ChatGptOAuth { access_token, .. }) => Some(access_token),
+                None => None,
+            };
+            assert_eq!(
+                token.as_deref(),
+                case["expectedApiKey"].as_str(),
+                "{provider}"
+            );
+            for name in variables.keys() {
+                env::remove_var(name);
+            }
+        }
 
         for (name, value) in saved {
             restore_env(name, value);
@@ -4267,7 +4626,7 @@ mod tests {
             r#"[
                 {"provider":"openai","id":"gpt","api":"openai-responses"},
                 {"provider":"openai-codex","id":"codex","api":"openai-codex-responses"},
-                {"provider":"azure-openai-responses","id":"gpt","api":"azure-openai-responses"},
+                {"provider":"azure","id":"gpt","api":"azure-openai-responses"},
                 {"provider":"anthropic","id":"claude","api":"anthropic-messages"},
                 {"provider":"google","id":"gemini","api":"google-generative-ai"},
                 {"provider":"google-vertex","id":"gemini","api":"google-vertex"},
@@ -4287,119 +4646,216 @@ mod tests {
         assert_eq!(models[7].api, ProviderApi::Mistral);
     }
 
+    /// `model-catalog.json` in full: every upstream model pi can run is a
+    /// default model with upstream's values. (`pi_ai::catalog` compares the
+    /// catalog itself; this compares what a config loads.)
     #[test]
-    fn default_models_include_provider_parity_targets() {
-        let providers = default_models()
-            .into_iter()
-            .map(|model| model.provider)
-            .collect::<Vec<_>>();
-
-        for provider in [
-            "openai-codex",
-            "azure-openai-responses",
-            "github-copilot",
-            "openrouter",
-            "deepseek",
-            "groq",
-            "cerebras",
-            "xai",
-            "zai",
-            "huggingface",
-            "together",
-            "moonshotai",
-            "moonshotai-cn",
-            "opencode",
-            "opencode-go",
-            "fireworks",
-            "minimax",
-            "minimax-cn",
-            "kimi-coding",
-            "xiaomi",
-            "xiaomi-token-plan-cn",
-            "xiaomi-token-plan-ams",
-            "xiaomi-token-plan-sgp",
-            "vercel-ai-gateway",
-            "google-vertex",
-            "amazon-bedrock",
-            "mistral",
-            "cloudflare-workers-ai",
-            "cloudflare-ai-gateway",
-        ] {
-            assert!(providers.iter().any(|candidate| candidate == provider));
-        }
-
-        let models = default_models()
-            .into_iter()
-            .map(|model| format!("{}/{}", model.provider, model.id))
-            .collect::<Vec<_>>();
-        for model in [
-            "anthropic/claude-opus-4-1-20250805",
-            "anthropic/claude-opus-4-7",
-            "anthropic/claude-sonnet-4-6",
-            "openai-codex/gpt-5.4",
-            "openai-codex/gpt-5.4-mini",
-            "openai-codex/gpt-5.5",
-            "deepseek/deepseek-v4-flash",
-            "groq/openai/gpt-oss-120b",
-            "cerebras/gpt-oss-120b",
-            "xai/grok-code-fast-1",
-            "zai/glm-5.1",
-            "huggingface/MiniMaxAI/MiniMax-M2.7",
-            "together/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
-            "moonshotai/kimi-k2-thinking",
-            "moonshotai-cn/kimi-k2-thinking",
-            "opencode/big-pickle",
-            "opencode-go/deepseek-v4-flash",
-            "fireworks/accounts/fireworks/models/deepseek-v4-pro",
-            "minimax/MiniMax-M2.7",
-            "minimax-cn/MiniMax-M2.7",
-            "kimi-coding/kimi-for-coding",
-            "xiaomi/mimo-v2.5-pro",
-            "xiaomi-token-plan-cn/mimo-v2.5-pro",
-            "xiaomi-token-plan-ams/mimo-v2.5-pro",
-            "xiaomi-token-plan-sgp/mimo-v2.5-pro",
-            "vercel-ai-gateway/alibaba/qwen3-coder",
-        ] {
-            assert!(models.iter().any(|candidate| candidate == model));
-        }
-    }
-
-    #[test]
-    fn default_models_cover_upstream_ts_catalog_targets() {
+    fn default_models_are_upstreams_catalog_in_full() {
         let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
             "../../../tests/fixtures/ts-parity/model-catalog.json"
         ))
         .expect("parse model catalog fixture");
-        assert!(
-            fixture["providerCount"].as_u64().expect("provider count") >= 1,
-            "upstream model catalog should expose providers"
-        );
-        let rust_models = default_models()
-            .into_iter()
-            .map(|model| format!("{}/{}", model.provider, model.id))
+        let defaults = default_models();
+        let mut compared = 0;
+        let mut providers = BTreeSet::new();
+        for provider in fixture["providers"].as_array().expect("providers") {
+            for record in provider["models"].as_array().expect("models") {
+                if record["api"] == "pi-messages" {
+                    continue;
+                }
+                let model = defaults
+                    .iter()
+                    .find(|model| {
+                        record["provider"] == *model.provider && record["id"] == *model.id
+                    })
+                    .unwrap_or_else(|| panic!("missing {record}"));
+                let mut expected = serde_json::json!({});
+                for key in [
+                    "provider",
+                    "id",
+                    "name",
+                    "api",
+                    "baseUrl",
+                    "contextWindow",
+                    "maxTokens",
+                    "reasoning",
+                    "thinkingLevelMap",
+                    "input",
+                    "cost",
+                ] {
+                    if let Some(value) = record.get(key) {
+                        expected[key] = value.clone();
+                    }
+                }
+                // Azure's models have no URL.
+                if expected["baseUrl"] == "" {
+                    expected["baseUrl"] = serde_json::Value::Null;
+                }
+                assert_eq!(serde_json::to_value(model).expect("serialize"), expected);
+                providers.insert(model.provider.clone());
+                compared += 1;
+            }
+        }
+        assert!(compared > 1000, "{compared} models compared");
+        // Besides upstream's, the port's own providers and nothing else.
+        let port_only = defaults
+            .iter()
+            .map(|model| model.provider.as_str())
+            .filter(|provider| !providers.contains(*provider))
             .collect::<BTreeSet<_>>();
-        for target in fixture["targets"].as_array().expect("catalog targets") {
-            assert_eq!(target["found"], true, "upstream target missing: {target}");
-            let provider = target["provider"].as_str().expect("provider");
-            let id = target["id"].as_str().expect("id");
-            let model_ref = format!("{provider}/{id}");
-            assert!(
-                rust_models.contains(&model_ref),
-                "missing upstream model catalog target {model_ref}"
+        assert_eq!(
+            port_only,
+            BTreeSet::from(["faux", "kimi-coding-openai", "zai-anthropic", "zai-coding"])
+        );
+        assert_eq!(defaults.len(), compared + 7);
+        assert!(providers.contains("azure") && !providers.contains(LEGACY_AZURE_PROVIDER));
+    }
+
+    #[test]
+    fn the_former_azure_provider_id_still_names_azure() {
+        assert_eq!(canonical_provider("azure-openai-responses"), "azure");
+        assert_eq!(canonical_provider("azure"), "azure");
+        assert_eq!(canonical_provider("openai"), "openai");
+
+        // An auth.json entry saved under the former id answers to both ids
+        // and stays where it is; a new entry goes beside it, not under a
+        // second key.
+        let mut auth: AuthData = serde_json::from_str(
+            r#"{"azure-openai-responses":{"work":{"type":"api_key","key":"saved-key"}}}"#,
+        )
+        .expect("parse auth");
+        for provider in ["azure", "azure-openai-responses"] {
+            assert_eq!(auth.accounts_for_provider(provider), ["work"]);
+            assert_eq!(auth.account_for_resolution(provider), Some("work"));
+            assert_eq!(
+                auth_for_provider(&auth, provider, None),
+                Some(ResolvedAuth::ApiKey("saved-key".to_string()))
             );
         }
+        auth.insert("azure", "home", api_key("home-key"));
+        assert_eq!(
+            auth.providers.keys().collect::<Vec<_>>(),
+            ["azure-openai-responses"]
+        );
+        assert_eq!(auth.accounts_for_provider("azure"), ["home", "work"]);
+        assert!(auth.remove("azure", "work").is_some());
+        assert!(auth.remove("azure-openai-responses", "home").is_some());
+        assert!(auth.is_empty());
+        // Without a saved entry, logins are stored under upstream's id.
+        auth.insert("azure-openai-responses", "work", api_key("key"));
+        assert_eq!(auth.providers.keys().collect::<Vec<_>>(), ["azure"]);
 
-        let opus = fixture["targets"]
-            .as_array()
-            .expect("catalog targets")
+        // Saved settings that name the provider.
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "defaultProvider": "azure-openai-responses",
+            "defaultModel": "gpt-5.2",
+            "enabledModels": ["azure-openai-responses/gpt-5.*", "openai/*"],
+            "modelThinkingLevels": { "azure-openai-responses/gpt-5.2": "high" }
+        }))
+        .expect("parse settings");
+        let settings = settings.with_canonical_providers();
+        assert_eq!(settings.default_provider.as_deref(), Some("azure"));
+        assert_eq!(
+            settings.enabled_models.as_deref(),
+            Some(&["azure/gpt-5.*".to_string(), "openai/*".to_string()][..])
+        );
+        assert_eq!(
+            settings.model_thinking_level("azure", "gpt-5.2"),
+            Some("high")
+        );
+
+        // A models.json or cached entry under the former id.
+        let merged = merge_model_definitions(
+            default_models(),
+            Vec::new(),
+            vec![ModelDefinition {
+                provider: "azure-openai-responses".to_string(),
+                id: "my-deployment".to_string(),
+                api: ProviderApi::AzureOpenAiResponses,
+                ..ModelDefinition::default()
+            }],
+        );
+        assert!(merged
             .iter()
-            .find(|target| target["provider"] == "anthropic" && target["id"] == "claude-opus-4-7")
-            .expect("opus target");
-        assert!(opus["thinkingLevels"]
-            .as_array()
-            .expect("opus thinking levels")
+            .any(|model| model.provider == "azure" && model.id == "my-deployment"));
+        assert!(merged
             .iter()
-            .any(|level| level == "xhigh"));
+            .all(|model| model.provider != "azure-openai-responses"));
+    }
+
+    #[test]
+    fn model_thinking_levels_merge_by_model() {
+        let global: Settings = serde_json::from_value(serde_json::json!({
+            "defaultThinkingLevel": "low",
+            "modelThinkingLevels": { "anthropic/claude-opus-4-8": "xhigh", "openai/gpt-5.5": "high" }
+        }))
+        .expect("parse global");
+        let project: Settings = serde_json::from_value(serde_json::json!({
+            "modelThinkingLevels": { "openai/gpt-5.5": "low" }
+        }))
+        .expect("parse project");
+        let settings = global.merge(project);
+        assert_eq!(
+            settings.model_thinking_level("anthropic", "claude-opus-4-8"),
+            Some("xhigh")
+        );
+        assert_eq!(
+            settings.model_thinking_level("openai", "gpt-5.5"),
+            Some("low")
+        );
+        assert_eq!(settings.model_thinking_level("openai", "gpt-5.4"), None);
+        assert_eq!(settings.default_thinking_level.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn a_model_definition_answers_for_its_thinking_levels() {
+        let model = |fields: serde_json::Value| {
+            let mut definition = serde_json::json!({ "provider": "local", "id": "test" });
+            definition
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            serde_json::from_value::<ModelDefinition>(definition).expect("parse")
+        };
+        // A definition that says nothing of reasoning has none.
+        let bare = model(serde_json::json!({}));
+        assert!(!bare.reasoning());
+        assert_eq!(bare.supported_thinking_levels(), ["off"]);
+        assert_eq!(bare.clamp_thinking_level("high"), "off");
+        assert_eq!(bare.traits().max_tokens, None);
+        assert_eq!(bare.traits().reasoning, Some(false));
+        // A reasoning model without a map stops at high.
+        let plain = model(serde_json::json!({ "reasoning": true }));
+        assert_eq!(
+            plain.supported_thinking_levels(),
+            ["off", "minimal", "low", "medium", "high"]
+        );
+        assert_eq!(plain.clamp_thinking_level("max"), "high");
+        // The upstream field names a models.json entry may use.
+        let full = model(serde_json::json!({
+            "api": "openai-completions", "baseUrl": "http://127.0.0.1:1/v1", "reasoning": true,
+            "thinkingLevelMap": { "minimal": null, "xhigh": "xhigh" },
+            "input": ["text", "image"], "contextWindow": 32000, "maxTokens": 4000,
+            "cost": { "input": 0.5, "output": 1, "cacheRead": 0, "cacheWrite": 0 }
+        }));
+        assert_eq!(
+            full.supported_thinking_levels(),
+            ["off", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(full.clamp_thinking_level("minimal"), "low");
+        assert_eq!(full.traits().max_tokens, Some(4000));
+        assert_eq!(
+            full.cost.as_ref().and_then(|cost| cost.input.as_f64()),
+            Some(0.5)
+        );
+        // What a cached listing writes stays what it wrote.
+        assert_eq!(
+            serde_json::to_value(&bare).expect("serialize"),
+            serde_json::json!({
+                "provider": "local", "id": "test", "name": null,
+                "api": "openai-completions", "baseUrl": null
+            })
+        );
     }
 
     #[test]
@@ -4483,9 +4939,11 @@ mod tests {
         env::set_var("CHATGPT_ACCOUNT_ID", "account-id");
 
         assert_eq!(
-            resolve("azure-openai-responses"),
+            resolve("azure"),
             Some(ResolvedAuth::ApiKey("azure-key".to_string()))
         );
+        // The id this port used before upstream's still names the provider.
+        assert_eq!(resolve(LEGACY_AZURE_PROVIDER), resolve("azure"));
         assert_eq!(
             resolve("github-copilot"),
             Some(ResolvedAuth::ApiKey("copilot-key".to_string()))

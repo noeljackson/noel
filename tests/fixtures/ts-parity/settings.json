@@ -76,6 +76,7 @@
         "enabledModels": [
           "anthropic/claude-*"
         ],
+        "defaultTools": null,
         "compaction": {
           "enabled": true,
           "reserveTokens": 100,
@@ -131,6 +132,7 @@
         "steeringMode": "all",
         "followUpMode": "one-at-a-time",
         "enabledModels": null,
+        "defaultTools": null,
         "compaction": {
           "enabled": true,
           "reserveTokens": 16384,
@@ -174,6 +176,340 @@
         "steeringMode": "one-at-a-time",
         "followUpMode": "one-at-a-time",
         "enabledModels": null,
+        "defaultTools": null,
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000,
+          "maxAgentDelayMs": 60000
+        },
+        "providerRetry": {
+          "maxRetryDelayMs": 60000
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 60,
+          "clearOnShrink": false,
+          "showTerminalProgress": false
+        },
+        "images": {
+          "autoResize": true,
+          "blockImages": false
+        },
+        "thinkingBudgets": null,
+        "doubleEscapeAction": "tree",
+        "treeFilterMode": "default",
+        "quietStartup": false,
+        "hideThinkingBlock": false
+      }
+    },
+    {
+      "name": "default-tools-plain-names-replace",
+      "globalSettings": {
+        "defaultTools": [
+          "read",
+          "grep"
+        ]
+      },
+      "projectSettings": {
+        "defaultTools": [
+          "bash"
+        ]
+      },
+      "expected": {
+        "defaultProvider": null,
+        "defaultModel": null,
+        "defaultThinkingLevel": null,
+        "transport": "auto",
+        "steeringMode": "one-at-a-time",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": null,
+        "defaultTools": [
+          "bash"
+        ],
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000,
+          "maxAgentDelayMs": 60000
+        },
+        "providerRetry": {
+          "maxRetryDelayMs": 60000
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 60,
+          "clearOnShrink": false,
+          "showTerminalProgress": false
+        },
+        "images": {
+          "autoResize": true,
+          "blockImages": false
+        },
+        "thinkingBudgets": null,
+        "doubleEscapeAction": "tree",
+        "treeFilterMode": "default",
+        "quietStartup": false,
+        "hideThinkingBlock": false
+      }
+    },
+    {
+      "name": "default-tools-modifiers-change-the-inherited-list",
+      "globalSettings": {
+        "defaultTools": [
+          "read",
+          "grep"
+        ]
+      },
+      "projectSettings": {
+        "defaultTools": [
+          "+ls",
+          "-read",
+          "-absent",
+          "+grep"
+        ]
+      },
+      "expected": {
+        "defaultProvider": null,
+        "defaultModel": null,
+        "defaultThinkingLevel": null,
+        "transport": "auto",
+        "steeringMode": "one-at-a-time",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": null,
+        "defaultTools": [
+          "grep",
+          "ls"
+        ],
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000,
+          "maxAgentDelayMs": 60000
+        },
+        "providerRetry": {
+          "maxRetryDelayMs": 60000
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 60,
+          "clearOnShrink": false,
+          "showTerminalProgress": false
+        },
+        "images": {
+          "autoResize": true,
+          "blockImages": false
+        },
+        "thinkingBudgets": null,
+        "doubleEscapeAction": "tree",
+        "treeFilterMode": "default",
+        "quietStartup": false,
+        "hideThinkingBlock": false
+      }
+    },
+    {
+      "name": "default-tools-modifiers-change-the-defaults",
+      "globalSettings": {},
+      "projectSettings": {
+        "defaultTools": [
+          "-bash",
+          "+grep"
+        ]
+      },
+      "expected": {
+        "defaultProvider": null,
+        "defaultModel": null,
+        "defaultThinkingLevel": null,
+        "transport": "auto",
+        "steeringMode": "one-at-a-time",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": null,
+        "defaultTools": [
+          "read",
+          "edit",
+          "write",
+          "grep"
+        ],
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000,
+          "maxAgentDelayMs": 60000
+        },
+        "providerRetry": {
+          "maxRetryDelayMs": 60000
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 60,
+          "clearOnShrink": false,
+          "showTerminalProgress": false
+        },
+        "images": {
+          "autoResize": true,
+          "blockImages": false
+        },
+        "thinkingBudgets": null,
+        "doubleEscapeAction": "tree",
+        "treeFilterMode": "default",
+        "quietStartup": false,
+        "hideThinkingBlock": false
+      }
+    },
+    {
+      "name": "default-tools-modifiers-in-both-layers",
+      "globalSettings": {
+        "defaultTools": [
+          "+grep",
+          "-write"
+        ]
+      },
+      "projectSettings": {
+        "defaultTools": [
+          "-edit",
+          "+write"
+        ]
+      },
+      "expected": {
+        "defaultProvider": null,
+        "defaultModel": null,
+        "defaultThinkingLevel": null,
+        "transport": "auto",
+        "steeringMode": "one-at-a-time",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": null,
+        "defaultTools": [
+          "read",
+          "bash",
+          "grep",
+          "write"
+        ],
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000,
+          "maxAgentDelayMs": 60000
+        },
+        "providerRetry": {
+          "maxRetryDelayMs": 60000
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 60,
+          "clearOnShrink": false,
+          "showTerminalProgress": false
+        },
+        "images": {
+          "autoResize": true,
+          "blockImages": false
+        },
+        "thinkingBudgets": null,
+        "doubleEscapeAction": "tree",
+        "treeFilterMode": "default",
+        "quietStartup": false,
+        "hideThinkingBlock": false
+      }
+    },
+    {
+      "name": "default-tools-plain-names-and-modifiers-in-one-list",
+      "globalSettings": {
+        "defaultTools": [
+          "read",
+          "+grep",
+          "-read",
+          "find"
+        ]
+      },
+      "projectSettings": {},
+      "expected": {
+        "defaultProvider": null,
+        "defaultModel": null,
+        "defaultThinkingLevel": null,
+        "transport": "auto",
+        "steeringMode": "one-at-a-time",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": null,
+        "defaultTools": [
+          "find",
+          "grep"
+        ],
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000,
+          "maxAgentDelayMs": 60000
+        },
+        "providerRetry": {
+          "maxRetryDelayMs": 60000
+        },
+        "terminal": {
+          "showImages": true,
+          "imageWidthCells": 60,
+          "clearOnShrink": false,
+          "showTerminalProgress": false
+        },
+        "images": {
+          "autoResize": true,
+          "blockImages": false
+        },
+        "thinkingBudgets": null,
+        "doubleEscapeAction": "tree",
+        "treeFilterMode": "default",
+        "quietStartup": false,
+        "hideThinkingBlock": false
+      }
+    },
+    {
+      "name": "default-tools-empty-list",
+      "globalSettings": {
+        "defaultTools": [
+          "read"
+        ]
+      },
+      "projectSettings": {
+        "defaultTools": []
+      },
+      "expected": {
+        "defaultProvider": null,
+        "defaultModel": null,
+        "defaultThinkingLevel": null,
+        "transport": "auto",
+        "steeringMode": "one-at-a-time",
+        "followUpMode": "one-at-a-time",
+        "enabledModels": null,
+        "defaultTools": [
+          "read"
+        ],
         "compaction": {
           "enabled": true,
           "reserveTokens": 16384,

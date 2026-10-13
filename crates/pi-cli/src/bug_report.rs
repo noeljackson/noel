@@ -18,7 +18,7 @@ use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::{active_thinking_label, format_diagnostics, TuiApp, TuiEntryKind};
+use crate::{format_diagnostics, thinking_label, TuiApp, TuiEntryKind};
 
 /// Where this port's bugs are filed.
 const ISSUES_URL: &str = "https://github.com/noeljackson/pi/issues";
@@ -132,7 +132,7 @@ impl BugReport {
             session_id: session.session_id.clone(),
             message_count: session.messages.len(),
             model,
-            thinking: active_thinking_label(runtime, config),
+            thinking: thinking_label(runtime, config),
             extensions: config
                 .extensions
                 .iter()
@@ -884,6 +884,7 @@ mod tests {
             api: ProviderApi::default(),
             base_url: Some("https://user:hunter2@faux.test/v1?token=abc".to_string()),
             context_window: Some(4096),
+            ..ModelDefinition::default()
         }];
         config.extensions = vec![ResourceFile {
             name: "assist".to_string(),

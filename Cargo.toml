@@ -25,7 +25,7 @@ base64 = "0.22.1"
 clap = { version = "4.5.38", features = ["derive"] }
 crossterm = "0.29.0"
 getrandom = "0.2.17"
-image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+image = { version = "0.25.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 ratatui = { version = "0.30.0", features = ["scrolling-regions"] }
 reqwest = { version = "0.12.15", default-features = false, features = ["json", "stream"] }
 serde = { version = "1.0.219", features = ["derive"] }

@@ -16,6 +16,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "bedrock-tools.json",
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
+    "error-classification.json",
     "github-copilot-gpt-5.4.json",
     "google-gemini-2.5-pro.json",
     "google-tool-image-routing.json",
@@ -25,6 +26,8 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "mistral-tool-id.json",
     "mistral-tools.json",
     "model-catalog.json",
+    "model-resolution.json",
+    "model-thinking.json",
     "openai-codex-chatgpt-oauth.json",
     "openai-responses-tool-id.json",
     "openai-responses-tools.json",
@@ -32,7 +35,10 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "rpc-protocol.json",
     "session-export.json",
     "settings.json",
+    "skills.json",
     "slash-commands.json",
+    "system-prompt.json",
+    "tool-behavior.json",
     "tui-transcripts.json",
 ];
 
@@ -45,16 +51,22 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "cloudflare-fixture.ts",
     "codex-oauth-fixture.ts",
     "copilot-fixture.ts",
+    "error-classification-fixture.ts",
     "google-fixture.ts",
     "local-tools-fixture.ts",
     "mistral-fixture.ts",
     "model-catalog-fixture.ts",
+    "model-resolution-fixture.ts",
+    "model-thinking-fixture.ts",
     "openai-tools-fixture.ts",
     "openrouter-fixture.ts",
     "rpc-protocol-fixture.ts",
     "session-export-fixture.ts",
     "settings-fixture.ts",
+    "skills-fixture.ts",
     "slash-command-fixture.ts",
+    "system-prompt-fixture.ts",
+    "tool-behavior-fixture.ts",
     "tui-transcript-fixture.ts",
 ];
 
@@ -148,6 +160,10 @@ fn every_script_output_is_committed() {
             fixture_set(&["github-copilot-gpt-5.4.json"]),
         ),
         (
+            "error-classification-fixture.ts",
+            fixture_set(&["error-classification.json"]),
+        ),
+        (
             "google-fixture.ts",
             fixture_set(&[
                 "google-gemini-2.5-pro.json",
@@ -169,6 +185,14 @@ fn every_script_output_is_committed() {
             fixture_set(&["model-catalog.json"]),
         ),
         (
+            "model-resolution-fixture.ts",
+            fixture_set(&["model-resolution.json"]),
+        ),
+        (
+            "model-thinking-fixture.ts",
+            fixture_set(&["model-thinking.json"]),
+        ),
+        (
             "openai-tools-fixture.ts",
             fixture_set(&[
                 "openai-responses-tool-id.json",
@@ -188,9 +212,18 @@ fn every_script_output_is_committed() {
             fixture_set(&["session-export.json"]),
         ),
         ("settings-fixture.ts", fixture_set(&["settings.json"])),
+        ("skills-fixture.ts", fixture_set(&["skills.json"])),
         (
             "slash-command-fixture.ts",
             fixture_set(&["slash-commands.json"]),
+        ),
+        (
+            "system-prompt-fixture.ts",
+            fixture_set(&["system-prompt.json"]),
+        ),
+        (
+            "tool-behavior-fixture.ts",
+            fixture_set(&["tool-behavior.json"]),
         ),
         (
             "tui-transcript-fixture.ts",
@@ -248,6 +281,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("bedrock-tools.json", "crates/pi-ai/src/lib.rs"),
         ("cli-contract.json", "crates/pi-cli/src/main.rs"),
         ("cloudflare-ai-gateway-kimi.json", "crates/pi-ai/src/lib.rs"),
+        ("error-classification.json", "crates/pi-ai/src/lib.rs"),
         ("github-copilot-gpt-5.4.json", "crates/pi-ai/src/lib.rs"),
         ("google-gemini-2.5-pro.json", "crates/pi-ai/src/lib.rs"),
         ("google-tool-image-routing.json", "crates/pi-ai/src/lib.rs"),
@@ -256,7 +290,12 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("mistral-devstral.json", "crates/pi-ai/src/lib.rs"),
         ("mistral-tool-id.json", "crates/pi-ai/src/lib.rs"),
         ("mistral-tools.json", "crates/pi-ai/src/lib.rs"),
-        ("model-catalog.json", "crates/pi-config/src/lib.rs"),
+        ("model-catalog.json", "crates/pi-ai/src/catalog.rs"),
+        (
+            "model-resolution.json",
+            "crates/pi-config/src/model_resolver.rs",
+        ),
+        ("model-thinking.json", "crates/pi-ai/src/catalog.rs"),
         ("openai-codex-chatgpt-oauth.json", "crates/pi-ai/src/lib.rs"),
         ("openai-responses-tool-id.json", "crates/pi-ai/src/lib.rs"),
         ("openai-responses-tools.json", "crates/pi-ai/src/lib.rs"),
@@ -264,7 +303,13 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("rpc-protocol.json", "crates/pi-cli/tests/rpc_parity.rs"),
         ("session-export.json", "crates/pi-core/src/lib.rs"),
         ("settings.json", "crates/pi-config/src/lib.rs"),
+        ("skills.json", "crates/pi-config/src/skills.rs"),
         ("slash-commands.json", "crates/pi-tui/src/lib.rs"),
+        ("system-prompt.json", "crates/pi-core/src/system_prompt.rs"),
+        (
+            "tool-behavior.json",
+            "crates/pi-core/src/tool_parity_tests.rs",
+        ),
         ("tui-transcripts.json", "crates/pi-tui/src/lib.rs"),
     ]
     .into_iter()

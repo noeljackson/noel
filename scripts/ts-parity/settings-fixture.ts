@@ -69,6 +69,34 @@ const cases: Array<{
 	{
 		name: "empty-defaults",
 	},
+	{
+		name: "default-tools-plain-names-replace",
+		globalSettings: { defaultTools: ["read", "grep"] },
+		projectSettings: { defaultTools: ["bash"] },
+	},
+	{
+		name: "default-tools-modifiers-change-the-inherited-list",
+		globalSettings: { defaultTools: ["read", "grep"] },
+		projectSettings: { defaultTools: ["+ls", "-read", "-absent", "+grep"] },
+	},
+	{
+		name: "default-tools-modifiers-change-the-defaults",
+		projectSettings: { defaultTools: ["-bash", "+grep"] },
+	},
+	{
+		name: "default-tools-modifiers-in-both-layers",
+		globalSettings: { defaultTools: ["+grep", "-write"] },
+		projectSettings: { defaultTools: ["-edit", "+write"] },
+	},
+	{
+		name: "default-tools-plain-names-and-modifiers-in-one-list",
+		globalSettings: { defaultTools: ["read", "+grep", "-read", "find"] },
+	},
+	{
+		name: "default-tools-empty-list",
+		globalSettings: { defaultTools: ["read"] },
+		projectSettings: { defaultTools: [] },
+	},
 ];
 
 function summarize(manager: SettingsManager) {
@@ -80,6 +108,7 @@ function summarize(manager: SettingsManager) {
 		steeringMode: manager.getSteeringMode(),
 		followUpMode: manager.getFollowUpMode(),
 		enabledModels: manager.getEnabledModels() ?? null,
+		defaultTools: manager.getDefaultTools() ?? null,
 		compaction: manager.getCompactionSettings(),
 		retry: manager.getRetrySettings(),
 		providerRetry: manager.getProviderRetrySettings(),

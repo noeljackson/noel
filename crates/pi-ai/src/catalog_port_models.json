@@ -1,0 +1,41 @@
+{
+  "defaultModels": [
+    {"provider":"faux","id":"echo"},
+    {"provider":"zai-coding","id":"glm-5.3"},
+    {"provider":"zai-anthropic","id":"glm-5.1"},
+    {"provider":"kimi-coding-openai","id":"kimi-for-coding"}
+  ],
+  "providers": [
+    {
+      "id": "faux",
+      "name": "Faux",
+      "models": [
+        {"id":"echo","name":"Faux Echo","api":"faux","provider":"faux","baseUrl":"","reasoning":false,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":128000,"maxTokens":16384},
+        {"id":"script","name":"Faux Script","api":"faux","provider":"faux","baseUrl":"","reasoning":false,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":128000,"maxTokens":16384}
+      ]
+    },
+    {
+      "id": "zai-coding",
+      "name": "Z.AI Coding Plan",
+      "models": [
+        {"id":"glm-5.1","name":"GLM 5.1 Coding Plan","api":"openai-completions","provider":"zai-coding","baseUrl":"https://api.z.ai/api/coding/paas/v4","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":202752,"maxTokens":131072},
+        {"id":"glm-5.2","name":"GLM 5.2 Coding Plan","api":"openai-completions","provider":"zai-coding","baseUrl":"https://api.z.ai/api/coding/paas/v4","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000000,"maxTokens":131072},
+        {"id":"glm-5.3","name":"GLM 5.3 Coding Plan","api":"openai-completions","provider":"zai-coding","baseUrl":"https://api.z.ai/api/coding/paas/v4","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1000000,"maxTokens":131072}
+      ]
+    },
+    {
+      "id": "zai-anthropic",
+      "name": "Z.AI Anthropic API",
+      "models": [
+        {"id":"glm-5.1","name":"GLM 5.1 Anthropic API","api":"anthropic-messages","provider":"zai-anthropic","baseUrl":"https://api.z.ai/api/anthropic","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":202752,"maxTokens":16384}
+      ]
+    },
+    {
+      "id": "kimi-coding-openai",
+      "name": "Kimi For Coding (OpenAI API)",
+      "models": [
+        {"id":"kimi-for-coding","name":"Kimi For Coding (OpenAI API)","api":"openai-completions","provider":"kimi-coding-openai","baseUrl":"https://api.kimi.com/coding/v1","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":262144,"maxTokens":32768}
+      ]
+    }
+  ]
+}

@@ -126,7 +126,7 @@ require_output() {
 require_output "pi rust cli"
 require_output "assistant>"
 require_output "[faux/echo] dogfood release prompt"
-require_output "wrote ${cwd_dir}/note.txt"
+require_output "Successfully wrote to ${cwd_dir}/note.txt"
 require_output "dogfood-ok"
 require_output "reloaded"
 require_output "[faux/echo] dogfood after reload"
