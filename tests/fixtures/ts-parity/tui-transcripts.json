@@ -8,6 +8,7 @@
     {
       "name": "help",
       "requiredMarkers": [
+        "/bug",
         "/changelog",
         "/clone",
         "/compact",
@@ -28,6 +29,7 @@
         "/session",
         "/settings",
         "/share",
+        "/thinking",
         "/tree",
         "/trust"
       ]

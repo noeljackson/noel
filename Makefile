@@ -2,6 +2,7 @@ CARGO ?= cargo
 DOCKER ?= docker
 E2E_IMAGE ?= pi-e2e
 TS_PARITY_IMAGE ?= pi-ts-parity
+RUST_CI_IMAGE ?= pi-rust-ci:1.99.0
 TS_REFERENCE_REPO ?= https://github.com/earendil-works/pi.git
 TS_REFERENCE_REF ?= main
 TS_PARITY_TRACKING_REF ?= main
@@ -16,7 +17,7 @@ INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -31,6 +32,7 @@ help:
 		'  lint         Run clippy with warnings denied' \
 		'  test         Run all Rust tests' \
 		'  check        Run fmt, lint, and test' \
+		'  check-ci     Run check with the pinned CI toolchain inside Docker' \
 		'  ci           Run check and local tmux e2e' \
 		'  e2e          Run tmux TTY e2e' \
 		'  dogfood-release Run release-binary tmux dogfood smoke' \
@@ -80,6 +82,15 @@ test:
 	$(CARGO) test --all
 
 check: fmt lint test
+
+check-ci:
+	$(DOCKER) build -q -f Dockerfile.ci -t $(RUST_CI_IMAGE) .
+	mkdir -p "$(HOME)/.cache/pi-ci-cargo"
+	$(DOCKER) run --rm --user "$$(id -u):$$(id -g)" \
+		-v "$(CURDIR):/src" -w /src \
+		-v "$(HOME)/.cache/pi-ci-cargo:/cargo" -e CARGO_HOME=/cargo -e HOME=/tmp \
+		-e CARGO_TARGET_DIR=/src/target/ci \
+		$(RUST_CI_IMAGE) make check
 
 ci: check e2e
 

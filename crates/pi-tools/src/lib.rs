@@ -949,7 +949,17 @@ mod tests {
         // Rust intentionally adds tools beyond the upstream set (see
         // docs/rust-rewrite/non-parity-register.md); upstream names must all
         // be covered, but equality is not required.
+        // Upstream's `powershell` tool only runs on Windows, so Rust omits it
+        // ("Windows-Only PowerShell Tool" in non-parity-register.md).
+        const WINDOWS_ONLY_UPSTREAM_TOOL: &str = "powershell";
         for name in &upstream_names {
+            if name == WINDOWS_ONLY_UPSTREAM_TOOL {
+                assert!(
+                    !rust_names.contains(name),
+                    "{name} is now ported; drop its non-parity exception"
+                );
+                continue;
+            }
             assert!(rust_names.contains(name), "missing upstream tool {name}");
         }
 

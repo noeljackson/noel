@@ -13,10 +13,15 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::time::sleep;
 
+/// Default cap for one backoff delay, as upstream's `DEFAULT_MAX_AGENT_RETRY_DELAY_MS`.
+pub const DEFAULT_MAX_RETRY_DELAY_MS: u64 = 60_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
     pub max_retries: u64,
     pub base_delay_ms: u64,
+    /// Caps each computed backoff delay (settings `retry.maxAgentDelayMs`).
+    pub max_delay_ms: u64,
 }
 
 impl Default for RetryPolicy {
@@ -24,8 +29,19 @@ impl Default for RetryPolicy {
         Self {
             max_retries: 3,
             base_delay_ms: 2_000,
+            max_delay_ms: DEFAULT_MAX_RETRY_DELAY_MS,
         }
     }
+}
+
+/// Backoff before retry `attempt` (0-based): `base_delay_ms * 2^attempt`,
+/// capped at `max_delay_ms`, matching upstream `retryDelayMs`.
+pub fn retry_delay_ms(retry: &RetryPolicy, attempt: u64) -> u64 {
+    let shift = attempt.min(16) as u32;
+    retry
+        .base_delay_ms
+        .saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX))
+        .min(retry.max_delay_ms)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -279,10 +295,7 @@ pub async fn complete_with_retry(
             Err(error) if is_context_overflow(&error) => return Err(error.into()),
             Err(error) if attempt + 1 >= max_attempts => return Err(error.into()),
             Err(_) => {
-                let shift = attempt.min(16) as u32;
-                let delay = retry
-                    .base_delay_ms
-                    .saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX));
+                let delay = retry_delay_ms(retry, attempt);
                 if delay > 0 {
                     sleep(Duration::from_millis(delay)).await;
                 }
@@ -322,6 +335,23 @@ pub enum AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_delay_doubles_and_is_capped() {
+        let retry = RetryPolicy {
+            max_retries: 10,
+            base_delay_ms: 2_000,
+            max_delay_ms: 10_000,
+        };
+        let delays: Vec<u64> = (0..5)
+            .map(|attempt| retry_delay_ms(&retry, attempt))
+            .collect();
+        assert_eq!(delays, vec![2_000, 4_000, 8_000, 10_000, 10_000]);
+        assert_eq!(
+            RetryPolicy::default().max_delay_ms,
+            DEFAULT_MAX_RETRY_DELAY_MS
+        );
+    }
 
     struct FixedProvider(Vec<StreamEvent>);
 

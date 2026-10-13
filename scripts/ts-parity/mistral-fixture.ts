@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "/ts-reference/packages/ai/src/index.ts";
+import { stableUserAgent } from "./user-agent.ts";
 
 type CapturedRequest = {
 	url: string;
@@ -149,6 +150,9 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 	const sanitized = { ...headers };
 	if (sanitized.authorization) {
 		sanitized.authorization = "Bearer <redacted>";
+	}
+	if (sanitized["user-agent"]) {
+		sanitized["user-agent"] = stableUserAgent(sanitized["user-agent"]);
 	}
 	return sanitized;
 }

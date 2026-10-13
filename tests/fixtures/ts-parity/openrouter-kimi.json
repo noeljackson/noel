@@ -13,14 +13,14 @@
       "accept": "application/json",
       "authorization": "Bearer <redacted>",
       "content-type": "application/json",
-      "user-agent": "OpenAI/JS 6.26.0",
+      "user-agent": "pi (linux <kernel>; x64)",
       "x-stainless-arch": "x64",
       "x-stainless-lang": "js",
       "x-stainless-os": "Linux",
-      "x-stainless-package-version": "6.26.0",
+      "x-stainless-package-version": "7.19.0",
       "x-stainless-retry-count": "0",
       "x-stainless-runtime": "node",
-      "x-stainless-runtime-version": "v24.16.0"
+      "x-stainless-runtime-version": "v24.21.0"
     },
     "body": {
       "model": "moonshotai/kimi-k2.6",
@@ -39,7 +39,7 @@
         "include_usage": true
       },
       "store": false,
-      "max_completion_tokens": 258043,
+      "max_completion_tokens": 235929,
       "reasoning": {
         "effort": "high"
       }

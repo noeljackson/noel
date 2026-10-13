@@ -94,7 +94,7 @@
       "apiKey": "openai-api-key"
     },
     {
-      "provider": "azure-openai-responses",
+      "provider": "azure",
       "env": {
         "AZURE_OPENAI_API_KEY": "azure-api-key"
       },

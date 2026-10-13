@@ -3,10 +3,12 @@ set -euo pipefail
 
 # Check live tool previews, not the exit-time transcript dump or paid providers.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/e2e-isolate.sh
+source "${repo_root}/scripts/e2e-isolate.sh"
 pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
-work_dir="$(mktemp -d "${repo_root}/target/e2e-tool-output.XXXXXX")"
+work_dir="$(mktemp -d "${e2e_root}/e2e-tool-output.XXXXXX")"
 session="pi-e2e-tool-output-${$}"
-trap 'tmux kill-session -t "${session}" >/dev/null 2>&1 || true' EXIT
+trap 'e2e_status=$?; tmux kill-session -t "${session}" >/dev/null 2>&1 || true; e2e_isolation_cleanup "${e2e_status}"' EXIT
 mkdir -p "${work_dir}/agent" "${work_dir}/sessions"
 printf '{"modelRefresh":{"enabled":false},"compaction":{"enabled":false}}\n' > "${work_dir}/agent/settings.json"
 awk 'BEGIN { for (i = 1; i <= 12; i++) printf "tool-file-line-%03d\n", i }' > "${work_dir}/tool-fixture.txt"
