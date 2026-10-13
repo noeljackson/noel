@@ -456,12 +456,17 @@ impl Runtime {
                     media: Vec::new(), tool_call_id: None, tool_name: None, tool_calls: Vec::new(),
                 }],
             };
-            let events =
-                complete_with_retry_streaming(provider, request, &self.systems.retry, |_| {})
-                    .await
-                    .map_err(|error| {
-                        AgentError::Compaction(format!("{error}; original history retained"))
-                    })?;
+            let events = complete_with_retry_streaming(
+                provider,
+                request,
+                &self.systems.retry,
+                &CancellationToken::default(),
+                |_| {},
+            )
+            .await
+            .map_err(|error| {
+                AgentError::Compaction(format!("{error}; original history retained"))
+            })?;
             let usage = events.iter().rev().find_map(|event| match event {
                 StreamEvent::Usage {
                     input_tokens,
@@ -1008,7 +1013,7 @@ mod tests {
             &provider,
             "continue".into(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
@@ -1242,7 +1247,10 @@ mod tests {
         }
         // A directory cannot be replaced by the checkpoint file.
         let mut runtime = self::runtime();
-        runtime.set_store(SessionStore { path: base.clone() });
+        runtime.set_store(SessionStore {
+            lock: crate::session_lock::acquire(&base).unwrap(),
+            path: base.clone(),
+        });
         let before = runtime.session.clone();
         assert!(runtime
             .compact_messages(

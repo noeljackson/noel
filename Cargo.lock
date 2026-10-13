@@ -1685,11 +1685,13 @@ name = "pi-cli"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "clap",
  "crossterm",
  "getrandom 0.2.17",
  "image",
+ "nix",
  "pi-ai",
  "pi-config",
  "pi-core",

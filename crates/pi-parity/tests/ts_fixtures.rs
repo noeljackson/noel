@@ -29,6 +29,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "openai-responses-tool-id.json",
     "openai-responses-tools.json",
     "openrouter-kimi.json",
+    "rpc-protocol.json",
     "session-export.json",
     "settings.json",
     "slash-commands.json",
@@ -50,6 +51,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "model-catalog-fixture.ts",
     "openai-tools-fixture.ts",
     "openrouter-fixture.ts",
+    "rpc-protocol-fixture.ts",
     "session-export-fixture.ts",
     "settings-fixture.ts",
     "slash-command-fixture.ts",
@@ -178,6 +180,10 @@ fn every_script_output_is_committed() {
             fixture_set(&["openrouter-kimi.json"]),
         ),
         (
+            "rpc-protocol-fixture.ts",
+            fixture_set(&["rpc-protocol.json"]),
+        ),
+        (
             "session-export-fixture.ts",
             fixture_set(&["session-export.json"]),
         ),
@@ -255,6 +261,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("openai-responses-tool-id.json", "crates/pi-ai/src/lib.rs"),
         ("openai-responses-tools.json", "crates/pi-ai/src/lib.rs"),
         ("openrouter-kimi.json", "crates/pi-ai/src/lib.rs"),
+        ("rpc-protocol.json", "crates/pi-cli/tests/rpc_parity.rs"),
         ("session-export.json", "crates/pi-core/src/lib.rs"),
         ("settings.json", "crates/pi-config/src/lib.rs"),
         ("slash-commands.json", "crates/pi-tui/src/lib.rs"),
@@ -293,4 +300,39 @@ fn parity_docs_track_every_fixture_and_non_parity_decisions() {
     let non_parity = fs::read_to_string(docs_dir().join("non-parity-register.md"))
         .expect("read non-parity register");
     assert!(non_parity.contains("## Active Non-Parity Decisions"));
+}
+
+/// Light sanity check of the upstream RPC goldens. The record-by-record
+/// comparison with pi's RPC mode is `crates/pi-cli/tests/rpc_parity.rs`.
+#[test]
+fn rpc_protocol_fixture_parses_and_every_run_settles() {
+    let fixture = load_fixture("rpc-protocol.json");
+    let scenarios = fixture["scenarios"].as_array().expect("scenarios");
+    assert!(!scenarios.is_empty());
+    for scenario in scenarios {
+        let name = scenario["name"].as_str().expect("scenario name");
+        let records = scenario["records"].as_array().expect("records");
+        let commands = scenario["commands"].as_array().expect("commands");
+        assert!(!commands.is_empty(), "{name} sends no commands");
+        for command in commands {
+            let after = command["afterRecords"].as_u64().expect("afterRecords");
+            assert!(after as usize <= records.len(), "{name}: {command}");
+        }
+        let types = records
+            .iter()
+            .map(|record| record["type"].as_str().expect("record type"))
+            .collect::<Vec<_>>();
+        if !types.contains(&"agent_start") {
+            continue;
+        }
+        let last_lifecycle = types
+            .iter()
+            .rev()
+            .find(|kind| matches!(**kind, "agent_start" | "agent_end" | "agent_settled"));
+        assert_eq!(
+            last_lifecycle,
+            Some(&"agent_settled"),
+            "{name} starts a run that never settles"
+        );
+    }
 }

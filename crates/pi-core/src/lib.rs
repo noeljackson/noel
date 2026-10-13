@@ -1,23 +1,30 @@
 mod compaction;
+mod session_lock;
 pub use compaction::RuntimeCompactionSettings;
+use session_lock::SessionLock;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pi_agent::{CancellationToken, RetryPolicy};
+use pi_agent::RetryPolicy;
+pub use pi_agent::{CancellationToken, RetryNotice};
 use pi_ai::{
     ChatMessage, ChatRole, ChatToolCall, MediaInput, ModelRef, Provider, ProviderError,
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
 };
 use pi_config::{has_auth_for_provider, listed_accounts_for_provider, LoadedConfig, ResourceFile};
+/// Kills every running tool subprocess tree; for pi's fatal-signal handling.
+pub use pi_tools::kill_running_tool_groups;
 use pi_tools::{
-    builtin_tool_definitions, execute_tool, ToolError, ToolRequest, ToolRuntimeOptions,
+    builtin_tool_definitions, execute_tool, spawn_tool_process, ToolError, ToolRequest,
+    ToolRuntimeOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -101,6 +108,45 @@ pub struct SessionUsage {
     pub requests: u64,
 }
 
+/// A run's identity, saved on the record of the prompt that starts it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStart {
+    pub id: String,
+    /// The client's id for the prompt; a prompt that repeats it gets this
+    /// run instead of starting another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+/// A run: a prompt and the work it caused, until it settled. RPC mode
+/// starts runs; the journal keeps their identity apart from the messages,
+/// which compaction and `/undo` rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Run {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub status: RunStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    /// Started by this process, which has not finished it yet.
+    Running,
+    /// Started by a process that stopped before finishing it.
+    Interrupted,
+    Completed,
+    Failed,
+    Aborted,
+}
+
+impl RunStatus {
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Aborted)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
     pub session_id: String,
@@ -111,6 +157,11 @@ pub struct SessionState {
     pub messages: Vec<ConversationMessage>,
     pub tool_history: Vec<ToolEvent>,
     pub queued_messages: Vec<String>,
+    /// How many of `queued_messages`, from the front, are steering for a
+    /// run's next provider round; the rest are follow-ups. Only RPC mode
+    /// queues steering: the TUI turns leftover steering into follow-ups.
+    #[serde(default)]
+    pub queued_steering: usize,
     #[serde(default)]
     pub compactions: Vec<CompactionRecord>,
     #[serde(default)]
@@ -129,9 +180,62 @@ pub struct SessionState {
     pub edited_files: Vec<String>,
     #[serde(default)]
     pub usage: SessionUsage,
+    /// The session's runs, oldest first.
+    #[serde(default)]
+    pub runs: Vec<Run>,
 }
 
 impl SessionState {
+    /// The saved queue: its steering, then its follow-ups.
+    pub fn saved_queue(&self) -> (&[String], &[String]) {
+        let steering = self.queued_steering.min(self.queued_messages.len());
+        self.queued_messages.split_at(steering)
+    }
+
+    /// The run a prompt with `request_id` started, if one did.
+    pub fn run_for_request(&self, request_id: &str) -> Option<&Run> {
+        self.runs
+            .iter()
+            .rev()
+            .find(|run| run.request_id.as_deref() == Some(request_id))
+    }
+
+    fn set_run_status(&mut self, run_id: &str, status: RunStatus) {
+        if let Some(run) = self.runs.iter_mut().rev().find(|run| run.id == run_id) {
+            run.status = status;
+        }
+    }
+
+    /// The tool calls of the last reply that have no saved result, with
+    /// that reply, when only tool results follow it: what a turn stopped
+    /// during its tool calls still owes.
+    pub fn pending_tool_calls(&self) -> Option<(&ConversationMessage, Vec<&ChatToolCall>)> {
+        let results = self
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| message.role == MessageRole::Tool)
+            .count();
+        let reply_index = self.messages.len().checked_sub(results + 1)?;
+        let (reply, results) = (
+            &self.messages[reply_index],
+            &self.messages[reply_index + 1..],
+        );
+        if reply.role != MessageRole::Assistant {
+            return None;
+        }
+        let pending = reply
+            .tool_calls
+            .iter()
+            .filter(|call| {
+                !results
+                    .iter()
+                    .any(|result| result.tool_call_id.as_deref() == Some(call.id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        (!pending.is_empty()).then_some((reply, pending))
+    }
+
     /// Model work awaiting a reply. Direct slash-tool results complete their
     /// turn without an assistant reply and have no model tool-call id.
     pub fn has_unfinished_turn(&self) -> bool {
@@ -155,6 +259,7 @@ impl SessionState {
             messages: Vec::new(),
             tool_history: Vec::new(),
             queued_messages: Vec::new(),
+            queued_steering: 0,
             compactions: Vec::new(),
             branch_summaries: Vec::new(),
             active_model: None,
@@ -165,6 +270,7 @@ impl SessionState {
             todos: Vec::new(),
             edited_files: Vec::new(),
             usage: SessionUsage::default(),
+            runs: Vec::new(),
         }
     }
 }
@@ -268,7 +374,9 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         parent_session_id: export.parent_session_id,
         messages: export.messages,
         tool_history: export.tool_history,
+        // An imported session has no run for steering to join.
         queued_messages: export.queued_messages,
+        queued_steering: 0,
         compactions: export.compactions,
         branch_summaries: export.branch_summaries,
         active_model: export.active_model,
@@ -279,6 +387,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         todos: export.todos,
         edited_files: export.edited_files,
         usage: export.usage,
+        // Runs belong to the session that ran them.
+        runs: Vec::new(),
     }
 }
 
@@ -363,6 +473,9 @@ pub struct ExtensionTool {
     pub extension_name: String,
     pub extension_path: PathBuf,
     pub protocol: String,
+    /// The manifest's `replaySafe`: a call cut off by a stop may run again
+    /// when the turn continues.
+    pub replay_safe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,6 +661,19 @@ pub enum SessionError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    /// Another process holds the session for writing; `pid` names the holder
+    /// when its lock file says so.
+    #[error("session {path} is in use by another pi process{}", lock_holder(.pid))]
+    Locked { path: PathBuf, pid: Option<u32> },
+    #[error("failed to lock session {path}: {source}")]
+    Lock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+fn lock_holder(pid: &Option<u32>) -> String {
+    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
 }
 
 #[derive(Debug, Error)]
@@ -570,6 +696,18 @@ pub enum AgentError {
     InvalidToolCall { tool: String, message: String },
     #[error("turn reached the {max_rounds} provider-round limit (including steering); work is saved; send a prompt to continue, or set agent.maxToolRounds in settings.json to raise the limit")]
     RoundLimitReached { max_rounds: usize },
+    #[error("turn cancelled")]
+    Cancelled,
+}
+
+impl From<pi_agent::AgentError> for AgentError {
+    fn from(error: pi_agent::AgentError) -> Self {
+        match error {
+            pi_agent::AgentError::Provider(error) => Self::Provider(error),
+            pi_agent::AgentError::Cancelled => Self::Cancelled,
+            other => Self::Provider(ProviderError::Config(other.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -586,6 +724,10 @@ enum SessionRecord {
     },
     Message {
         message: ConversationMessage,
+        /// Set on the prompt that starts a run: one record, so a run is
+        /// never saved without its prompt. Older versions ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<RunStart>,
     },
     MessagesSnapshot {
         messages: Vec<ConversationMessage>,
@@ -617,8 +759,12 @@ enum SessionRecord {
     QueuedMessage {
         message: String,
     },
+    /// The whole queue. The first `steering` messages are steering; older
+    /// versions read them all as follow-ups, as the TUI does.
     QueuedMessagesSnapshot {
         messages: Vec<String>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        steering: usize,
     },
     Compaction {
         record: CompactionRecord,
@@ -630,14 +776,29 @@ enum SessionRecord {
     BranchSummary {
         summary: BranchSummary,
     },
+    /// How a run ended: completed, failed, or aborted. A run that started
+    /// without one was interrupted.
+    RunFinished {
+        run_id: String,
+        status: RunStatus,
+    },
     /// Records written by other binary versions are ignored on load.
     #[serde(other)]
     Unknown,
 }
 
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
+/// A session journal opened for writing. Every constructor takes the session
+/// lock (see [`SessionError::Locked`]) and repairs a torn tail before the
+/// first append; clones share the lock and serialize their writes. Read-only
+/// access goes through [`SessionStore::read`], which never locks or repairs.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     path: PathBuf,
+    lock: Arc<SessionLock>,
 }
 
 impl SessionStore {
@@ -656,7 +817,7 @@ impl SessionStore {
         })?;
         let session_id = session_id.into();
         let path = session_dir.join(format!("{session_id}.jsonl"));
-        let store = Self { path };
+        let store = Self::writer(path)?;
         let state = SessionState::new(session_id.clone(), cwd.clone());
         store.append(&SessionRecord::Started { session_id, cwd })?;
         Ok((store, state))
@@ -673,9 +834,11 @@ impl SessionStore {
         })?;
         let session_id = new_session_id();
         let path = session_dir.join(format!("{session_id}.jsonl"));
-        let store = Self { path };
+        let store = Self::writer(path)?;
         let mut state = source.clone();
         state.session_id = session_id.clone();
+        // A fork is a new session: the source's runs stay with the source.
+        state.runs.clear();
         state.parent_session_id = if clone_parent {
             source.parent_session_id.clone()
         } else {
@@ -704,16 +867,65 @@ impl SessionStore {
             export.session_id.clone()
         };
         let path = session_dir.join(format!("{session_id}.jsonl"));
-        let store = Self { path };
+        // Importing over an existing id rewrites that journal, so it takes the
+        // lock first and refuses while another process holds the session.
+        let store = Self::writer(path)?;
         let state = session_state_from_export(export, session_id);
         store.write_full_state(&state)?;
         Ok((store, state))
     }
 
+    /// Opens an existing session for writing: takes the session lock, repairs
+    /// a torn tail, then loads it.
     pub fn open(path: PathBuf) -> Result<(Self, SessionState), SessionError> {
-        let store = Self { path };
+        fs::metadata(&path).map_err(|source| SessionError::Open {
+            path: path.clone(),
+            source,
+        })?;
+        let store = Self::writer(path)?;
         let state = store.load()?;
         Ok((store, state))
+    }
+
+    /// Loads a session without locking or repairing it, for listing, pickers,
+    /// fork and clone sources, and import sources. A torn final segment left
+    /// by an interrupted append is ignored; a bad line before it is an error.
+    pub fn read(path: &Path) -> Result<SessionState, SessionError> {
+        let content = read_journal_bytes(path)?;
+        if jsonl_is_ts_session_export(&content) {
+            let export = read_ts_jsonl_export(path, &content)?;
+            let session_id = if export.session_id.trim().is_empty() {
+                "recovered".to_string()
+            } else {
+                export.session_id.clone()
+            };
+            return Ok(session_state_from_export(export, session_id));
+        }
+        read_rust_journal(path, &content)
+    }
+
+    /// Deletes a session journal. Refuses with [`SessionError::Locked`] while
+    /// another process holds the session; this process may delete a session
+    /// it holds itself, whose lock file goes away with its last handle.
+    pub fn delete(path: &Path) -> Result<(), SessionError> {
+        let lock = session_lock::acquire(path)?;
+        let _writer = lock.writer();
+        fs::remove_file(path).map_err(|source| SessionError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn writer(path: PathBuf) -> Result<Self, SessionError> {
+        let store = Self {
+            lock: session_lock::acquire(&path)?,
+            path,
+        };
+        {
+            let _writer = store.lock.writer();
+            pi_session::repair_jsonl_tail(&store.path)?;
+        }
+        Ok(store)
     }
 
     pub fn path(&self) -> &Path {
@@ -721,7 +933,7 @@ impl SessionStore {
     }
 
     pub fn record_message(&self, message: ConversationMessage) -> Result<(), SessionError> {
-        self.append(&SessionRecord::Message { message })
+        self.append(&SessionRecord::Message { message, run: None })
     }
 
     pub fn record_messages_snapshot(
@@ -764,22 +976,29 @@ impl SessionStore {
     }
 
     pub fn record_metadata(&self, state: &SessionState) -> Result<(), SessionError> {
-        self.append(&SessionRecord::Metadata {
-            name: state.name.clone(),
-            labels: state.labels.iter().cloned().collect(),
-            parent_session_id: state.parent_session_id.clone(),
-        })
+        self.append(&metadata_record(state))
     }
 
     pub fn record_queued_message(&self, message: String) -> Result<(), SessionError> {
         self.append(&SessionRecord::QueuedMessage { message })
     }
 
+    /// Saves the whole queue as follow-ups.
     pub fn record_queued_messages_snapshot(
         &self,
         messages: Vec<String>,
     ) -> Result<(), SessionError> {
-        self.append(&SessionRecord::QueuedMessagesSnapshot { messages })
+        self.record_queue(Vec::new(), messages)
+    }
+
+    /// Saves the whole queue: steering for a run's next provider round,
+    /// then follow-ups.
+    pub fn record_queue(
+        &self,
+        steering: Vec<String>,
+        follow_ups: Vec<String>,
+    ) -> Result<(), SessionError> {
+        self.append(&queue_record(steering, follow_ups))
     }
 
     pub fn record_compaction(&self, record: CompactionRecord) -> Result<(), SessionError> {
@@ -791,10 +1010,6 @@ impl SessionStore {
         record: CompactionRecord,
         messages: Vec<ConversationMessage>,
     ) -> Result<(), SessionError> {
-        let mut journal = fs::read(&self.path).map_err(|source| SessionError::Read {
-            path: self.path.clone(),
-            source,
-        })?;
         let checkpoint =
             serde_json::to_vec(&SessionRecord::CompactionCheckpoint { record, messages }).map_err(
                 |source| SessionError::Parse {
@@ -802,13 +1017,22 @@ impl SessionStore {
                     source,
                 },
             )?;
-        if !journal.ends_with(b"\n") {
-            journal.push(b'\n');
-        }
+        // No append from another handle may land between the read and the
+        // rename, or the rewrite would drop it.
+        let _writer = self.lock.writer();
+        let mut journal = fs::read(&self.path).map_err(|source| SessionError::Read {
+            path: self.path.clone(),
+            source,
+        })?;
+        // A torn final segment is dropped, never patched with a newline into
+        // a corrupt interior line; a complete record that only lost its
+        // newline is terminated.
+        pi_session::repair_jsonl_tail_bytes(&mut journal);
         journal.extend(checkpoint);
         journal.push(b'\n');
         // Rename a synced temporary file: a failed write leaves the old
         // journal and active context unchanged, with no partial checkpoint.
+        // The session lock lives in a separate file, so the rename keeps it.
         pi_config::write_file_atomic(&self.path, &journal)?;
         Ok(())
     }
@@ -826,15 +1050,12 @@ impl SessionStore {
         path: &Path,
     ) -> Result<(Self, SessionState), SessionError> {
         let export = if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
-            let content = fs::read_to_string(path).map_err(|source| SessionError::Read {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            // The source is only read: importing never locks or repairs it.
+            let content = read_journal_bytes(path)?;
             if jsonl_is_ts_session_export(&content) {
                 read_ts_jsonl_export(path, &content)?
             } else {
-                let (_store, state) = Self::open(path.to_path_buf())?;
-                SessionExport::from(&state)
+                SessionExport::from(&read_rust_journal(path, &content)?)
             }
         } else {
             let content = fs::read_to_string(path).map_err(|source| SessionError::Read {
@@ -851,6 +1072,9 @@ impl SessionStore {
         Self::import(session_dir, export)
     }
 
+    /// Summarizes every readable session, oldest first. A journal that fails
+    /// to load is skipped, so one damaged file never hides the others from
+    /// the resume picker, `--continue`, `--resume`, `/tree`, or `resolve`.
     pub fn list(session_dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
         if !session_dir.exists() {
             return Ok(Vec::new());
@@ -860,10 +1084,9 @@ impl SessionStore {
             path: session_dir.to_path_buf(),
             source,
         })? {
-            let entry = entry.map_err(|source| SessionError::Read {
-                path: session_dir.to_path_buf(),
-                source,
-            })?;
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
@@ -872,8 +1095,9 @@ impl SessionStore {
                 .metadata()
                 .ok()
                 .and_then(|metadata| metadata.modified().ok());
-            let store = Self { path: path.clone() };
-            let state = store.load()?;
+            let Ok(state) = Self::read(&path) else {
+                continue;
+            };
             let branch_summary = state
                 .branch_summaries
                 .iter()
@@ -946,174 +1170,214 @@ impl SessionStore {
     }
 
     fn load(&self) -> Result<SessionState, SessionError> {
-        let mut file = File::open(&self.path).map_err(|source| SessionError::Open {
-            path: self.path.clone(),
-            source,
-        })?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)
-            .map_err(|source| SessionError::Read {
+        Self::read(&self.path)
+    }
+
+    /// Replaces the journal with the full state in one atomic rename, so a
+    /// crash leaves either the previous journal or the complete new one.
+    fn write_full_state(&self, state: &SessionState) -> Result<(), SessionError> {
+        let mut records = vec![
+            SessionRecord::Started {
+                session_id: state.session_id.clone(),
+                cwd: state.cwd.clone(),
+            },
+            metadata_record(state),
+            SessionRecord::ActiveModel {
+                model: state.active_model.clone(),
+            },
+            SessionRecord::ActiveAccount {
+                account: state.active_account.clone(),
+            },
+            SessionRecord::ActiveThinkingLevel {
+                level: state.active_thinking_level.clone(),
+            },
+            SessionRecord::DisabledTools {
+                tools: state.disabled_tools.iter().cloned().collect(),
+            },
+            SessionRecord::Todos {
+                todos: state.todos.clone(),
+            },
+            SessionRecord::EditedFiles {
+                paths: state.edited_files.clone(),
+            },
+            SessionRecord::Usage {
+                usage: state.usage.clone(),
+            },
+        ];
+        // Fork and import start new sessions, which have no runs yet.
+        records.extend(
+            state
+                .messages
+                .iter()
+                .cloned()
+                .map(|message| SessionRecord::Message { message, run: None }),
+        );
+        records.extend(
+            state
+                .tool_history
+                .iter()
+                .cloned()
+                .map(|event| SessionRecord::Tool { event }),
+        );
+        if !state.queued_messages.is_empty() {
+            let (steering, follow_ups) = state.saved_queue();
+            records.push(queue_record(steering.to_vec(), follow_ups.to_vec()));
+        }
+        records.extend(
+            state
+                .compactions
+                .iter()
+                .cloned()
+                .map(|record| SessionRecord::Compaction { record }),
+        );
+        records.extend(
+            state
+                .branch_summaries
+                .iter()
+                .cloned()
+                .map(|summary| SessionRecord::BranchSummary { summary }),
+        );
+        let mut journal = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut journal, record).map_err(|source| SessionError::Parse {
                 path: self.path.clone(),
                 source,
             })?;
-        if jsonl_is_ts_session_export(&content) {
-            let export = read_ts_jsonl_export(&self.path, &content)?;
-            let session_id = if export.session_id.trim().is_empty() {
-                "recovered".to_string()
-            } else {
-                export.session_id.clone()
-            };
-            return Ok(session_state_from_export(export, session_id));
+            journal.push(b'\n');
         }
-        let mut state: Option<SessionState> = None;
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record = serde_json::from_str::<SessionRecord>(line).map_err(|source| {
-                SessionError::Parse {
-                    path: self.path.clone(),
-                    source,
-                }
-            })?;
-            match record {
-                SessionRecord::Started { session_id, cwd } => {
-                    state = Some(SessionState::new(session_id, cwd));
-                }
-                SessionRecord::Metadata {
-                    name,
-                    labels,
-                    parent_session_id,
-                } => {
-                    if let Some(state) = &mut state {
-                        state.name = name;
-                        state.labels = labels.into_iter().collect();
-                        state.parent_session_id = parent_session_id;
-                    }
-                }
-                SessionRecord::Message { message } => {
-                    if let Some(state) = &mut state {
-                        state.messages.push(message);
-                    }
-                }
-                SessionRecord::MessagesSnapshot { messages } => {
-                    if let Some(state) = &mut state {
-                        state.messages = messages;
-                    }
-                }
-                SessionRecord::Tool { event } => {
-                    if let Some(state) = &mut state {
-                        state.tool_history.push(event);
-                    }
-                }
-                SessionRecord::ActiveModel { model } => {
-                    if let Some(state) = &mut state {
-                        state.active_model = model;
-                    }
-                }
-                SessionRecord::ActiveAccount { account } => {
-                    if let Some(state) = &mut state {
-                        state.active_account = account;
-                    }
-                }
-                SessionRecord::ActiveThinkingLevel { level } => {
-                    if let Some(state) = &mut state {
-                        state.active_thinking_level = level;
-                    }
-                }
-                SessionRecord::DisabledTools { tools } => {
-                    if let Some(state) = &mut state {
-                        state.disabled_tools = tools.into_iter().collect();
-                        state.active_tool_names = active_tools_with(&state.disabled_tools);
-                    }
-                }
-                SessionRecord::Todos { todos } => {
-                    if let Some(state) = &mut state {
-                        state.todos = todos;
-                    }
-                }
-                SessionRecord::EditedFiles { paths } => {
-                    if let Some(state) = &mut state {
-                        state.edited_files = paths;
-                    }
-                }
-                SessionRecord::QueuedMessage { message } => {
-                    if let Some(state) = &mut state {
-                        state.queued_messages.push(message);
-                    }
-                }
-                SessionRecord::QueuedMessagesSnapshot { messages } => {
-                    if let Some(state) = &mut state {
-                        state.queued_messages = messages;
-                    }
-                }
-                SessionRecord::Compaction { record } => {
-                    if let Some(state) = &mut state {
-                        state.compactions.push(record);
-                    }
-                }
-                SessionRecord::CompactionCheckpoint { record, messages } => {
-                    if let Some(state) = &mut state {
-                        state.messages = messages;
-                        state.compactions.push(record);
-                    }
-                }
-                SessionRecord::BranchSummary { summary } => {
-                    if let Some(state) = &mut state {
-                        state.branch_summaries.push(summary);
-                    }
-                }
-                SessionRecord::Usage { usage } => {
-                    if let Some(state) = &mut state {
-                        state.usage = usage;
-                    }
-                }
-                SessionRecord::Unknown => {}
-            }
-        }
-        Ok(state.unwrap_or_else(|| SessionState::new("recovered", PathBuf::from("."))))
-    }
-
-    fn write_full_state(&self, state: &SessionState) -> Result<(), SessionError> {
-        File::create(&self.path).map_err(|source| SessionError::Write {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.append(&SessionRecord::Started {
-            session_id: state.session_id.clone(),
-            cwd: state.cwd.clone(),
-        })?;
-        self.record_metadata(state)?;
-        self.record_active_model(state.active_model.clone())?;
-        self.record_active_account(state.active_account.clone())?;
-        self.record_active_thinking_level(state.active_thinking_level.clone())?;
-        self.record_disabled_tools(state.disabled_tools.iter().cloned().collect())?;
-        self.record_todos(state.todos.clone())?;
-        self.record_edited_files(state.edited_files.clone())?;
-        self.record_usage(state.usage.clone())?;
-        for message in &state.messages {
-            self.record_message(message.clone())?;
-        }
-        for event in &state.tool_history {
-            self.record_tool(event.clone())?;
-        }
-        for message in &state.queued_messages {
-            self.append(&SessionRecord::QueuedMessage {
-                message: message.clone(),
-            })?;
-        }
-        for record in &state.compactions {
-            self.record_compaction(record.clone())?;
-        }
-        for summary in &state.branch_summaries {
-            self.record_branch_summary(summary.clone())?;
-        }
+        let _writer = self.lock.writer();
+        pi_config::write_file_atomic(&self.path, &journal)?;
         Ok(())
     }
 
     fn append(&self, record: &SessionRecord) -> Result<(), SessionError> {
+        let _writer = self.lock.writer();
         pi_session::append_jsonl_record(&self.path, record)?;
         Ok(())
+    }
+}
+
+fn metadata_record(state: &SessionState) -> SessionRecord {
+    SessionRecord::Metadata {
+        name: state.name.clone(),
+        labels: state.labels.iter().cloned().collect(),
+        parent_session_id: state.parent_session_id.clone(),
+    }
+}
+
+fn queue_record(steering: Vec<String>, follow_ups: Vec<String>) -> SessionRecord {
+    let count = steering.len();
+    let mut messages = steering;
+    messages.extend(follow_ups);
+    SessionRecord::QueuedMessagesSnapshot {
+        messages,
+        steering: count,
+    }
+}
+
+fn read_journal_bytes(path: &Path) -> Result<Vec<u8>, SessionError> {
+    let mut file = File::open(path).map_err(|source| SessionError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)
+        .map_err(|source| SessionError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(content)
+}
+
+fn is_blank_line(line: &[u8]) -> bool {
+    std::str::from_utf8(line).is_ok_and(|line| line.trim().is_empty())
+}
+
+/// Replays a Rust session journal. Only an unterminated final segment that is
+/// not a whole JSON value counts as an interrupted append and is ignored; any
+/// other unreadable line, including a corrupt line in the middle, is an error.
+fn read_rust_journal(path: &Path, content: &[u8]) -> Result<SessionState, SessionError> {
+    let parse_error = |source| SessionError::Parse {
+        path: path.to_path_buf(),
+        source,
+    };
+    let (records, tail) = pi_session::split_jsonl_tail(content);
+    let records = std::str::from_utf8(records).map_err(|error| SessionError::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+    })?;
+    let mut state = None;
+    for line in records.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<SessionRecord>(line).map_err(parse_error)?;
+        apply_session_record(&mut state, record);
+    }
+    if !is_blank_line(tail) {
+        match serde_json::from_slice::<SessionRecord>(tail) {
+            Ok(record) => apply_session_record(&mut state, record),
+            Err(_) if !pi_session::is_complete_jsonl_record(tail) => {}
+            Err(source) => return Err(parse_error(source)),
+        }
+    }
+    Ok(state.unwrap_or_else(|| SessionState::new("recovered", PathBuf::from("."))))
+}
+
+fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord) {
+    if let SessionRecord::Started { session_id, cwd } = record {
+        *state = Some(SessionState::new(session_id, cwd));
+        return;
+    }
+    // Records before the first `started` have no session to apply to.
+    let Some(state) = state else {
+        return;
+    };
+    match record {
+        SessionRecord::Started { .. } | SessionRecord::Unknown => {}
+        SessionRecord::Metadata {
+            name,
+            labels,
+            parent_session_id,
+        } => {
+            state.name = name;
+            state.labels = labels.into_iter().collect();
+            state.parent_session_id = parent_session_id;
+        }
+        SessionRecord::Message { message, run } => {
+            state.messages.push(message);
+            // Whatever started a run, a load did not: it was interrupted
+            // unless a `run_finished` record follows.
+            state.runs.extend(run.map(|run| Run {
+                id: run.id,
+                request_id: run.request_id,
+                status: RunStatus::Interrupted,
+            }));
+        }
+        SessionRecord::MessagesSnapshot { messages } => state.messages = messages,
+        SessionRecord::Tool { event } => state.tool_history.push(event),
+        SessionRecord::ActiveModel { model } => state.active_model = model,
+        SessionRecord::ActiveAccount { account } => state.active_account = account,
+        SessionRecord::ActiveThinkingLevel { level } => state.active_thinking_level = level,
+        SessionRecord::DisabledTools { tools } => {
+            state.disabled_tools = tools.into_iter().collect();
+            state.active_tool_names = active_tools_with(&state.disabled_tools);
+        }
+        SessionRecord::Todos { todos } => state.todos = todos,
+        SessionRecord::EditedFiles { paths } => state.edited_files = paths,
+        SessionRecord::QueuedMessage { message } => state.queued_messages.push(message),
+        SessionRecord::QueuedMessagesSnapshot { messages, steering } => {
+            state.queued_messages = messages;
+            state.queued_steering = steering;
+        }
+        SessionRecord::Compaction { record } => state.compactions.push(record),
+        SessionRecord::CompactionCheckpoint { record, messages } => {
+            state.messages = messages;
+            state.compactions.push(record);
+        }
+        SessionRecord::BranchSummary { summary } => state.branch_summaries.push(summary),
+        SessionRecord::Usage { usage } => state.usage = usage,
+        SessionRecord::RunFinished { run_id, status } => state.set_run_status(&run_id, status),
     }
 }
 
@@ -1285,11 +1549,11 @@ fn ts_jsonl_message(message: &ConversationMessage) -> Value {
     })
 }
 
-fn jsonl_is_ts_session_export(content: &str) -> bool {
+fn jsonl_is_ts_session_export(content: &[u8]) -> bool {
     content
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .split(|byte| *byte == b'\n')
+        .find(|line| !is_blank_line(line))
+        .and_then(|line| serde_json::from_slice::<Value>(line).ok())
         .and_then(|value| {
             value
                 .get("type")
@@ -1300,17 +1564,23 @@ fn jsonl_is_ts_session_export(content: &str) -> bool {
         == Some("session")
 }
 
-fn read_ts_jsonl_export(path: &Path, content: &str) -> Result<SessionExport, SessionError> {
-    let records = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
+/// Reads a TS-style JSONL session. As for Rust journals, an unterminated final
+/// segment that does not parse is an interrupted write and is ignored.
+fn read_ts_jsonl_export(path: &Path, content: &[u8]) -> Result<SessionExport, SessionError> {
+    let (complete, tail) = pi_session::split_jsonl_tail(content);
+    let mut records = complete
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !is_blank_line(line))
         .map(|line| {
-            serde_json::from_str::<Value>(line).map_err(|source| SessionError::Parse {
+            serde_json::from_slice::<Value>(line).map_err(|source| SessionError::Parse {
                 path: path.to_path_buf(),
                 source,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if let Ok(record) = serde_json::from_slice::<Value>(tail) {
+        records.push(record);
+    }
     let header = records.first().ok_or_else(|| SessionError::Open {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, "missing session header"),
@@ -1863,11 +2133,13 @@ impl Runtime {
         Ok(())
     }
 
+    /// Replaces the queue with `messages`, all follow-ups.
     pub fn replace_queued_messages(&mut self, messages: Vec<String>) -> Result<(), SessionError> {
         if let Some(store) = &self.store {
             store.record_queued_messages_snapshot(messages.clone())?;
         }
         self.session.queued_messages = messages;
+        self.session.queued_steering = 0;
         Ok(())
     }
 
@@ -1875,6 +2147,70 @@ impl Runtime {
         let count = self.session.queued_messages.len();
         self.replace_queued_messages(Vec::new())?;
         Ok(count)
+    }
+
+    /// Starts run `start`: saves its prompt as a user message, together
+    /// with the run's start, and returns the message for
+    /// [`run_saved_prompt_streaming_events`]. An interrupted last run is
+    /// recorded as aborted first.
+    pub fn start_run(
+        &mut self,
+        start: RunStart,
+        prompt: String,
+        media: Vec<MediaInput>,
+    ) -> Result<ConversationMessage, SessionError> {
+        let interrupted = self
+            .session
+            .runs
+            .last()
+            .filter(|run| run.status == RunStatus::Interrupted)
+            .map(|run| run.id.clone());
+        if let Some(run_id) = interrupted {
+            self.finish_run(&run_id, RunStatus::Aborted)?;
+        }
+        let message = user_message(prompt, media);
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::Message {
+                message: message.clone(),
+                run: Some(start.clone()),
+            })?;
+        }
+        self.session.messages.push(message.clone());
+        self.session.runs.push(Run {
+            id: start.id,
+            request_id: start.request_id,
+            status: RunStatus::Running,
+        });
+        Ok(message)
+    }
+
+    /// This process continues the interrupted run `run_id`. Nothing is
+    /// saved: if this process stops too, the run is interrupted again.
+    pub fn resume_run(&mut self, run_id: &str) {
+        self.session.set_run_status(run_id, RunStatus::Running);
+    }
+
+    /// Records how run `run_id` ended. The status changes even if saving
+    /// it fails, since this process is no longer running the run.
+    pub fn finish_run(&mut self, run_id: &str, status: RunStatus) -> Result<(), SessionError> {
+        self.session.set_run_status(run_id, status);
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::RunFinished {
+                run_id: run_id.to_owned(),
+                status,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Whether a tool call cut off by a stop may run again when its turn
+    /// continues: `read`, `grep`, `find`, `ls`, and extension tools whose
+    /// manifest declares `"replaySafe": true`.
+    pub fn replay_safe(&self, tool: &str) -> bool {
+        match self.systems.extension_tools.get(tool) {
+            Some(extension) => extension.replay_safe,
+            None => matches!(tool, "read" | "grep" | "find" | "ls"),
+        }
     }
 
     /// Removes the latest user message and everything following it. Files,
@@ -2044,6 +2380,30 @@ impl SteeringMailbox {
 /// separate interruptions.
 pub const STEERING_JOIN: &str = "\n---\n";
 
+/// A caller's handles on a running turn: steering for its next provider
+/// round, and cancellation. Cancelling ends the turn with
+/// [`AgentError::Cancelled`] at once, dropping an in-flight request, backoff,
+/// compaction or tool call (a dropped tool takes its process group with it).
+/// What the turn saved stays saved: a reply whose tool calls have no results
+/// continues with the interrupted-call placeholders. Clones share both.
+#[derive(Debug, Clone, Default)]
+pub struct RunControl {
+    pub steering: SteeringMailbox,
+    pub cancellation: CancellationToken,
+}
+
+impl RunControl {
+    /// Runs `step` unless the turn is cancelled first; cancelling drops it.
+    async fn until_cancelled<T>(&self, step: impl Future<Output = T>) -> Result<T, AgentError> {
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(AgentError::Cancelled),
+            output = step => Ok(output),
+        }
+    }
+}
+
+/// A turn that reports only text deltas; it can be steered, not cancelled.
 pub async fn run_user_turn_streaming_with_media(
     runtime: &mut Runtime,
     provider: &dyn Provider,
@@ -2052,7 +2412,11 @@ pub async fn run_user_turn_streaming_with_media(
     steering: &SteeringMailbox,
     mut on_text: impl FnMut(&str) + Send,
 ) -> Result<String, AgentError> {
-    run_user_turn_streaming_events_with_media(runtime, provider, prompt, media, steering, |event| {
+    let run = RunControl {
+        steering: steering.clone(),
+        ..RunControl::default()
+    };
+    run_user_turn_streaming_events_with_media(runtime, provider, prompt, media, &run, |event| {
         if let TurnEvent::Provider(StreamEvent::Text(delta)) = event {
             on_text(delta);
         }
@@ -2064,20 +2428,47 @@ pub async fn run_user_turn_streaming_with_media(
 /// persisted separately and never added to the next provider request.
 /// Live progress of a streaming turn: provider deltas plus tool lifecycle,
 /// so a UI can show what the agent is doing between text blocks.
+///
+/// Each provider round of a turn reports `RoundStarted`, its user messages
+/// (the prompt or steering), any compaction, retries and the reply's
+/// `Provider` deltas, the reply, then `ToolStarted`, `ToolOutput` and
+/// `ToolFinished` for each tool call, and `RoundFinished`. A turn that fails
+/// or is cancelled stops mid-round without further events. A continued turn
+/// whose saved reply has replay-safe calls without results first finishes
+/// that round: `RoundResumed`, those calls, `RoundFinished`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
+    /// A provider round started: one reply and the tool calls it asks for.
+    RoundStarted,
+    /// A continued turn finishes the round a stop cut off: this is the
+    /// round's saved reply, whose replay-safe calls run next.
+    RoundResumed(ConversationMessage),
+    /// A message was saved: the prompt or steering that opens a round, or
+    /// the round's reply after its deltas. Tool results are `ToolOutput`.
+    MessageAdded(ConversationMessage),
+    /// Everything the provider streams for the round's reply.
     Provider(StreamEvent),
+    /// A request failed before any output; it is retried after the delay.
+    RetryStarted(RetryNotice),
+    /// A retried request ended after `attempt` retries: with its reply
+    /// (reported after the reply), or with the `error` that ends the turn.
+    RetryFinished {
+        attempt: u64,
+        error: Option<String>,
+    },
     ToolStarted {
-        name: String,
+        call: ChatToolCall,
     },
     ToolFinished {
         name: String,
         is_error: bool,
     },
+    /// A tool call's result as saved, and how long the tool ran.
     ToolOutput {
         call: ChatToolCall,
         output: String,
         is_error: bool,
+        duration: Duration,
     },
     TodosUpdated(Vec<TodoItem>),
     CompactionStarted,
@@ -2087,6 +2478,8 @@ pub enum TurnEvent {
     /// original history so the session stays usable; the provider surfaces
     /// a real error only if the request genuinely exceeds its window.
     CompactionFailed(String),
+    /// The round's reply and its tool calls' results are saved.
+    RoundFinished,
 }
 
 /// Follow-up prompts typed while a turn streams. Shared between the key
@@ -2128,20 +2521,26 @@ pub async fn run_user_turn_streaming_events_with_media(
     provider: &dyn Provider,
     prompt: String,
     media: Vec<MediaInput>,
-    steering: &SteeringMailbox,
+    run: &RunControl,
     on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
-    runtime.push_message(ConversationMessage {
-        thinking: String::new(),
-        role: MessageRole::User,
-        content: prompt.clone(),
-        media,
-        tool_call_id: None,
-        tool_name: None,
-        tool_calls: Vec::new(),
-    })?;
+    let message = user_message(prompt, media);
+    runtime.push_message(message.clone())?;
+    run_saved_prompt_streaming_events(runtime, provider, message, run, on_event).await
+}
 
-    if let Some(command) = parse_tool_command(&prompt)? {
+/// Runs `message`, a user prompt the caller has just saved (as
+/// [`Runtime::start_run`] does): a tool command runs its tool without the
+/// model, and any other prompt runs provider rounds until a reply calls no
+/// tools.
+pub async fn run_saved_prompt_streaming_events(
+    runtime: &mut Runtime,
+    provider: &dyn Provider,
+    message: ConversationMessage,
+    run: &RunControl,
+    on_event: impl FnMut(&TurnEvent) + Send,
+) -> Result<String, AgentError> {
+    if let Some(command) = parse_tool_command(&message.content)? {
         if !model_tool_enabled(runtime, &command.name) {
             return Err(AgentError::DisabledTool(command.name));
         }
@@ -2149,16 +2548,17 @@ pub async fn run_user_turn_streaming_events_with_media(
             ToolRequest::Edit { path, .. } | ToolRequest::Write { path, .. } => Some(path.clone()),
             _ => None,
         };
-        let result = execute_tool(
-            &runtime.session.cwd,
-            command.request,
-            &ToolRuntimeOptions {
-                shell_path: runtime.systems.shell_path.clone(),
-                shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
-                offline: runtime.systems.offline,
-            },
-        )
-        .await?;
+        let result = run
+            .until_cancelled(execute_tool(
+                &runtime.session.cwd,
+                command.request,
+                &ToolRuntimeOptions {
+                    shell_path: runtime.systems.shell_path.clone(),
+                    shell_command_prefix: runtime.systems.shell_command_prefix.clone(),
+                    offline: runtime.systems.offline,
+                },
+            ))
+            .await??;
         if let Some(path) = edited_path {
             runtime.note_edited_files(vec![path])?;
         }
@@ -2180,29 +2580,64 @@ pub async fn run_user_turn_streaming_events_with_media(
         return Ok(result.output);
     }
 
-    run_model_turn_streaming_events(runtime, provider, steering, on_event).await
+    run_model_turn_streaming_events(runtime, provider, run, Some(message), on_event).await
 }
 
-/// Continue saved model context without adding a user prompt or replaying
-/// saved tool calls. Completed results are sent back to the provider; missing
-/// results use the existing interrupted-call placeholders so uncertain file
-/// edits/commands are never silently executed twice.
+/// Continues an unfinished turn from its saved context, without adding a
+/// user prompt. Saved results go back to the provider. A tool call without
+/// a result runs again only if it is replay-safe ([`Runtime::replay_safe`]);
+/// any other call never runs again and is reported to the provider as
+/// interrupted, so an uncertain edit or command never runs twice. A request
+/// the stop cut off is simply sent again.
 pub async fn continue_turn_streaming_events(
     runtime: &mut Runtime,
     provider: &dyn Provider,
-    steering: &SteeringMailbox,
-    on_event: impl FnMut(&TurnEvent) + Send,
+    run: &RunControl,
+    mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     if !runtime.session().has_unfinished_turn() {
         return Ok(String::new());
     }
-    run_model_turn_streaming_events(runtime, provider, steering, on_event).await
+    rerun_replay_safe_calls(runtime, run, &mut on_event).await?;
+    run_model_turn_streaming_events(runtime, provider, run, None, on_event).await
 }
 
+/// Runs the replay-safe calls the last reply still owes results for, as the
+/// end of that reply's round.
+async fn rerun_replay_safe_calls(
+    runtime: &mut Runtime,
+    run: &RunControl,
+    on_event: &mut (impl FnMut(&TurnEvent) + Send),
+) -> Result<(), AgentError> {
+    let Some((reply, pending)) = runtime.session.pending_tool_calls() else {
+        return Ok(());
+    };
+    let calls = pending
+        .into_iter()
+        .filter(|call| runtime.replay_safe(&call.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if calls.is_empty() {
+        return Ok(());
+    }
+    on_event(&TurnEvent::RoundResumed(reply.clone()));
+    for call in calls {
+        // The journal does not record how the reply stopped. A reply cut
+        // off at the output limit gets its calls' error results right after
+        // it is saved, so its calls are not left for here; these only read.
+        run_tool_call(runtime, run, call, false, on_event).await?;
+    }
+    on_event(&TurnEvent::RoundFinished);
+    Ok(())
+}
+
+/// Runs provider rounds until a reply calls no tools. `prompt` is the user
+/// message the caller just saved; it is reported as the first round's.
 async fn run_model_turn_streaming_events(
     runtime: &mut Runtime,
     provider: &dyn Provider,
-    steering: &SteeringMailbox,
+    run: &RunControl,
+    mut prompt: Option<ConversationMessage>,
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     let system_prompt = runtime_system_prompt(runtime);
@@ -2211,15 +2646,30 @@ async fn run_model_turn_streaming_events(
     // Auto-compaction that failed on unchanged history will fail again; skip
     // re-attempts (and repeated summarizer calls) until history changes.
     let mut failed_compaction_fingerprint: Option<(usize, Option<usize>)> = None;
+    // Steering that arrived during a final reply has opened the next round.
+    let mut round_open = false;
     for _ in 0..max_tool_rounds {
-        inject_steering_messages(runtime, steering)?;
+        if !std::mem::take(&mut round_open) {
+            on_event(&TurnEvent::RoundStarted);
+        }
+        if let Some(prompt) = prompt.take() {
+            on_event(&TurnEvent::MessageAdded(prompt));
+        }
+        if let Some(message) = steering_message(&run.steering) {
+            add_message(runtime, message, &mut on_event)?;
+        }
         let fingerprint = (
             runtime.session.messages.len(),
             runtime.session.messages.last().map(|m| m.content.len()),
         );
         if runtime.needs_auto_compaction() && failed_compaction_fingerprint != Some(fingerprint) {
             on_event(&TurnEvent::CompactionStarted);
-            match runtime.auto_compact_midturn(provider).await {
+            // Compaction saves its checkpoint only once complete, so a
+            // cancelled one leaves the history untouched.
+            match run
+                .until_cancelled(runtime.auto_compact_midturn(provider))
+                .await?
+            {
                 Ok(Some(record)) => {
                     failed_compaction_fingerprint = None;
                     on_event(&TurnEvent::CompactionFinished(record));
@@ -2236,13 +2686,14 @@ async fn run_model_turn_streaming_events(
             }
         }
         let request = provider_request(runtime, system_prompt.clone());
-        let events =
-            complete_with_retry_streaming(provider, request, &runtime.systems.retry, |event| {
-                if matches!(event, StreamEvent::Text(_) | StreamEvent::Thinking(_)) {
-                    on_event(&TurnEvent::Provider(event.clone()));
-                }
-            })
-            .await?;
+        let (events, retries) = request_reply(
+            provider,
+            request,
+            &runtime.systems.retry,
+            &run.cancellation,
+            &mut on_event,
+        )
+        .await?;
         let mut text = String::new();
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
@@ -2275,56 +2726,43 @@ async fn run_model_turn_streaming_events(
             runtime.record_usage(input, output)?;
         }
         final_text.push_str(&text);
-        runtime.push_message(ConversationMessage {
-            thinking,
-            role: MessageRole::Assistant,
-            content: text,
-            media: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: tool_calls.clone(),
-        })?;
+        add_message(
+            runtime,
+            ConversationMessage {
+                thinking,
+                role: MessageRole::Assistant,
+                content: text,
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: tool_calls.clone(),
+            },
+            &mut on_event,
+        )?;
+        if retries > 0 {
+            on_event(&TurnEvent::RetryFinished {
+                attempt: retries,
+                error: None,
+            });
+        }
 
         if tool_calls.is_empty() {
+            on_event(&TurnEvent::RoundFinished);
             // A steering message that arrived while the final response was
             // streaming keeps the turn going instead of being dropped.
-            if inject_steering_messages(runtime, steering)? == 0 {
+            let Some(message) = steering_message(&run.steering) else {
                 return Ok(final_text);
-            }
+            };
+            on_event(&TurnEvent::RoundStarted);
+            add_message(runtime, message, &mut on_event)?;
+            round_open = true;
             continue;
         }
 
         for tool_call in tool_calls {
-            on_event(&TurnEvent::ToolStarted {
-                name: tool_call.name.clone(),
-            });
-            let result = if truncated {
-                fail_truncated_tool_call(runtime, &tool_call)
-            } else {
-                execute_model_tool_call(runtime, &tool_call).await
-            };
-            let event = runtime
-                .session
-                .tool_history
-                .last()
-                .filter(|event| event.id == tool_call.id);
-            let is_error = result.is_err() || event.is_some_and(|event| event.is_error);
-            if let Some(event) = event {
-                on_event(&TurnEvent::ToolOutput {
-                    call: tool_call.clone(),
-                    output: event.result.clone(),
-                    is_error,
-                });
-            }
-            if tool_call.name == "todo" {
-                on_event(&TurnEvent::TodosUpdated(runtime.session.todos.clone()));
-            }
-            on_event(&TurnEvent::ToolFinished {
-                name: tool_call.name.clone(),
-                is_error,
-            });
-            result?;
+            run_tool_call(runtime, run, tool_call, truncated, &mut on_event).await?;
         }
+        on_event(&TurnEvent::RoundFinished);
     }
 
     Err(AgentError::RoundLimitReached {
@@ -2332,39 +2770,122 @@ async fn run_model_turn_streaming_events(
     })
 }
 
-fn inject_steering_messages(
+/// Runs one tool call of a reply, saving and reporting its result. A call
+/// of a reply cut off at the output limit (`truncated`) is not run: its
+/// saved and reported result is the error asking to re-issue it.
+async fn run_tool_call(
     runtime: &mut Runtime,
-    steering: &SteeringMailbox,
-) -> Result<usize, AgentError> {
+    run: &RunControl,
+    tool_call: ChatToolCall,
+    truncated: bool,
+    on_event: &mut (impl FnMut(&TurnEvent) + Send),
+) -> Result<(), AgentError> {
+    if run.cancellation.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    on_event(&TurnEvent::ToolStarted {
+        call: tool_call.clone(),
+    });
+    let started = Instant::now();
+    let result = if truncated {
+        fail_truncated_tool_call(runtime, &tool_call)
+    } else {
+        run.until_cancelled(execute_model_tool_call(runtime, &tool_call))
+            .await?
+    };
+    let duration = started.elapsed();
+    let event = runtime
+        .session
+        .tool_history
+        .last()
+        .filter(|event| event.id == tool_call.id);
+    let is_error = result.is_err() || event.is_some_and(|event| event.is_error);
+    if let Some(event) = event {
+        on_event(&TurnEvent::ToolOutput {
+            call: tool_call.clone(),
+            output: event.result.clone(),
+            is_error,
+            duration,
+        });
+    }
+    if tool_call.name == "todo" {
+        on_event(&TurnEvent::TodosUpdated(runtime.session.todos.clone()));
+    }
+    on_event(&TurnEvent::ToolFinished {
+        name: tool_call.name,
+        is_error,
+    });
+    result
+}
+
+fn user_message(prompt: String, media: Vec<MediaInput>) -> ConversationMessage {
+    ConversationMessage {
+        thinking: String::new(),
+        role: MessageRole::User,
+        content: prompt,
+        media,
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+    }
+}
+
+/// Pending steering as one user message: a burst reads as one instruction
+/// (joined with [`STEERING_JOIN`]), not several interruptions.
+fn steering_message(steering: &SteeringMailbox) -> Option<ConversationMessage> {
     let messages = steering.take_batch();
-    let count = messages.len();
-    if count > 1 {
-        // A burst of queued steering reads as one instruction, not N
-        // separate interruptions: combine into a single user message.
-        let combined = messages.join(STEERING_JOIN);
-        runtime.push_message(ConversationMessage {
-            thinking: String::new(),
-            role: MessageRole::User,
-            content: combined,
-            media: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: Vec::new(),
-        })?;
-        return Ok(count);
-    }
-    for message in messages {
-        runtime.push_message(ConversationMessage {
-            thinking: String::new(),
-            role: MessageRole::User,
-            content: message,
-            media: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: Vec::new(),
-        })?;
-    }
-    Ok(count)
+    (!messages.is_empty()).then(|| user_message(messages.join(STEERING_JOIN), Vec::new()))
+}
+
+/// Saves `message` to the session and reports it.
+fn add_message(
+    runtime: &mut Runtime,
+    message: ConversationMessage,
+    on_event: &mut impl FnMut(&TurnEvent),
+) -> Result<(), AgentError> {
+    runtime.push_message(message.clone())?;
+    on_event(&TurnEvent::MessageAdded(message));
+    Ok(())
+}
+
+/// Requests one reply, reporting its stream events and any retries as they
+/// happen. Returns the events and how many retries the reply took; when the
+/// request still fails after retries, [`TurnEvent::RetryFinished`] reports
+/// the error first.
+async fn request_reply(
+    provider: &dyn Provider,
+    request: ProviderRequest,
+    retry: &RuntimeRetrySettings,
+    cancellation: &CancellationToken,
+    on_event: &mut (impl FnMut(&TurnEvent) + Send),
+) -> Result<(Vec<StreamEvent>, u64), AgentError> {
+    let mut retries = 0;
+    let reply = {
+        // Both callbacks report through `on_event`; they never run at once.
+        let report = Mutex::new(&mut *on_event);
+        pi_agent::complete_with_retry_observed(
+            provider,
+            request,
+            &retry_policy(retry),
+            cancellation,
+            |event| (*report.lock().expect("turn events"))(&TurnEvent::Provider(event.clone())),
+            |notice| {
+                retries = notice.attempt;
+                (*report.lock().expect("turn events"))(&TurnEvent::RetryStarted(notice));
+            },
+        )
+        .await
+    };
+    reply.map(|events| (events, retries)).map_err(|error| {
+        let error = AgentError::from(error);
+        if retries > 0 {
+            on_event(&TurnEvent::RetryFinished {
+                attempt: retries,
+                error: Some(error.to_string()),
+            });
+        }
+        error
+    })
 }
 
 fn runtime_system_prompt(runtime: &Runtime) -> Option<String> {
@@ -2479,18 +3000,14 @@ async fn complete_with_retry_streaming(
     provider: &dyn Provider,
     request: ProviderRequest,
     retry: &RuntimeRetrySettings,
+    cancellation: &CancellationToken,
     mut on_event: impl FnMut(&StreamEvent) + Send,
 ) -> Result<Vec<StreamEvent>, ProviderError> {
-    let retry = RetryPolicy {
-        max_retries: if retry.enabled { retry.max_retries } else { 0 },
-        base_delay_ms: retry.base_delay_ms,
-        max_delay_ms: retry.max_agent_delay_ms,
-    };
     pi_agent::complete_with_retry(
         provider,
         request,
-        &retry,
-        &CancellationToken::default(),
+        &retry_policy(retry),
+        cancellation,
         |event| on_event(event),
     )
     .await
@@ -2498,6 +3015,14 @@ async fn complete_with_retry_streaming(
         pi_agent::AgentError::Provider(error) => error,
         other => ProviderError::Config(other.to_string()),
     })
+}
+
+fn retry_policy(retry: &RuntimeRetrySettings) -> RetryPolicy {
+    RetryPolicy {
+        max_retries: if retry.enabled { retry.max_retries } else { 0 },
+        base_delay_ms: retry.base_delay_ms,
+        max_delay_ms: retry.max_agent_delay_ms,
+    }
 }
 
 fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
@@ -2697,6 +3222,8 @@ struct ExtensionToolManifest {
     name: String,
     description: Option<String>,
     parameters: Option<Value>,
+    #[serde(default)]
+    replay_safe: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2749,6 +3276,7 @@ fn extension_tools_from_resources(extensions: &[ResourceFile]) -> BTreeMap<Strin
                     extension_name: extension.name.clone(),
                     extension_path: extension.path.clone(),
                     protocol: protocol.clone(),
+                    replay_safe: tool.replay_safe,
                 },
             );
         }
@@ -2931,7 +3459,8 @@ async fn execute_extension_tool(
         cwd: &cwd_string,
         tool_call_id: Some(&tool_call.id),
     };
-    let mut child = Command::new(&extension.extension_path)
+    let mut command = Command::new(&extension.extension_path);
+    command
         .current_dir(cwd)
         .env("PI_EXTENSION_NAME", &extension.extension_name)
         .env("PI_EXTENSION_PATH", &extension.extension_path)
@@ -2939,15 +3468,15 @@ async fn execute_extension_tool(
         .env("PI_EXTENSION_TOOL", &extension.name)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|source| {
-            AgentError::Tool(ToolError::Io {
-                path: extension.extension_path.clone(),
-                source,
-            })
-        })?;
+        .stderr(Stdio::piped());
+    // Like bash: no controlling terminal, and an interrupted call (this
+    // future dropped) kills the extension's whole process group.
+    let (mut child, group) = spawn_tool_process(&mut command).map_err(|source| {
+        AgentError::Tool(ToolError::Io {
+            path: extension.extension_path.clone(),
+            source,
+        })
+    })?;
     if let Some(mut stdin) = child.stdin.take() {
         let input = format!(
             "{}\n",
@@ -2971,6 +3500,7 @@ async fn execute_extension_tool(
             source,
         })
     })?;
+    group.finish();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -4193,7 +4723,7 @@ mod tests {
             &WebProvider { url },
             "verify source".into(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
@@ -4208,6 +4738,79 @@ mod tests {
         )));
         assert!(!runtime.session.tool_history[0].is_error);
         thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_an_in_flight_turn_kills_the_model_bash_process_group() {
+        // The TUI interrupts a turn (Esc, ctrl+c, /interrupt) by dropping its
+        // future; a model bash call running at that moment must take its
+        // whole process group with it, including background children.
+        struct BashProvider(String);
+        #[async_trait::async_trait]
+        impl Provider for BashProvider {
+            async fn complete(
+                &self,
+                _request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                Ok(vec![StreamEvent::ToolCall {
+                    id: "bash-1".into(),
+                    name: "bash".into(),
+                    arguments: json!({ "command": self.0 }).to_string(),
+                }])
+            }
+        }
+        let pid_file = std::env::temp_dir().join(format!("pi-turn-drop-{}.pid", new_session_id()));
+        let provider = BashProvider(format!(
+            "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; wait",
+            pid_file.display()
+        ));
+        let mut runtime = Runtime::new(
+            SessionState::new("turn-drop", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        runtime.systems.shell_path = Some("/bin/sh".into());
+        let run = RunControl::default();
+        let mut turn = Box::pin(run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "run it".into(),
+            Vec::new(),
+            &run,
+            |_| {},
+        ));
+        let published_pid = async {
+            loop {
+                if let Ok(pid) = fs::read_to_string(&pid_file) {
+                    return pid.trim().parse::<i32>().unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut turn => panic!("turn ended before the interrupt: {result:?}"),
+                pid = published_pid => pid,
+            }
+        })
+        .await
+        .expect("bash published its background pid");
+        drop(turn);
+        let _ = fs::remove_file(&pid_file);
+        // A killed process stays a zombie (state Z) until reaped.
+        let running = || {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, fields)| !fields.trim_start().starts_with('Z'))
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cfg!(target_os = "linux") && running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background child {pid} outlived the interrupted turn"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
@@ -4235,7 +4838,7 @@ mod tests {
             &EchoProvider,
             "huge ".repeat(120_000),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
@@ -4460,6 +5063,411 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    const STARTED_LINE: &str =
+        "{\"type\":\"started\",\"session_id\":\"durable\",\"cwd\":\"/repo\"}\n";
+    const TORN_RECORD: &str = "{\"type\":\"message\",\"message\":{\"role\":\"us";
+
+    fn durable_test_dir(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("pi-{name}-{}", new_session_id()));
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn user_line(content: &str) -> String {
+        format!(
+            "{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"{content}\"}}}}"
+        )
+    }
+
+    fn message_texts(state: &SessionState) -> Vec<&str> {
+        state
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect()
+    }
+
+    fn assert_every_line_is_a_record(path: &Path) -> usize {
+        let content = fs::read_to_string(path).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "journal ends mid-record: {content:?}"
+        );
+        for line in content.lines() {
+            serde_json::from_str::<SessionRecord>(line)
+                .unwrap_or_else(|error| panic!("corrupt journal line {line:?}: {error}"));
+        }
+        content.lines().count()
+    }
+
+    /// Takes a session's lock file the way a second pi process would: through
+    /// its own open file description, outside this process's registry.
+    fn hold_lock_elsewhere(journal: &Path, pid: u32) -> File {
+        let lock_path = journal.with_file_name(format!(
+            "{}.lock",
+            journal.file_name().unwrap().to_string_lossy()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        file.try_lock().unwrap();
+        file.set_len(0).unwrap();
+        writeln!(file, "{pid}").unwrap();
+        file
+    }
+
+    #[test]
+    fn readers_ignore_a_torn_final_segment_without_touching_the_journal() {
+        let base = durable_test_dir("torn-read");
+        let path = base.join("torn.jsonl");
+        let content = format!("{STARTED_LINE}{}\n{TORN_RECORD}", user_line("kept"));
+        fs::write(&path, &content).unwrap();
+
+        let state = SessionStore::read(&path).unwrap();
+        assert_eq!(state.session_id, "durable");
+        assert_eq!(message_texts(&state), ["kept"]);
+        let listed = SessionStore::list(&base).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        assert!(!base.join("torn.jsonl.lock").exists());
+
+        // A complete final record that only lost its newline still counts.
+        let unterminated = format!("{STARTED_LINE}{}\n{}", user_line("one"), user_line("two"));
+        fs::write(&path, &unterminated).unwrap();
+        assert_eq!(
+            message_texts(&SessionStore::read(&path).unwrap()),
+            ["one", "two"]
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), unterminated);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_line_before_the_end_stays_a_hard_error() {
+        let base = durable_test_dir("corrupt-middle");
+        let path = base.join("corrupt.jsonl");
+        fs::write(
+            &path,
+            format!("{STARTED_LINE}{TORN_RECORD}\n{}\n", user_line("after")),
+        )
+        .unwrap();
+        assert!(matches!(
+            SessionStore::read(&path),
+            Err(SessionError::Parse { .. })
+        ));
+        assert!(matches!(
+            SessionStore::open(path.clone()),
+            Err(SessionError::Parse { .. })
+        ));
+        // A whole JSON value that is not a valid record is not a torn write.
+        fs::write(
+            &path,
+            format!("{STARTED_LINE}{{\"type\":\"message\",\"message\":7}}"),
+        )
+        .unwrap();
+        assert!(matches!(
+            SessionStore::read(&path),
+            Err(SessionError::Parse { .. })
+        ));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn writers_repair_torn_and_unterminated_tails_before_appending() {
+        let base = durable_test_dir("tail-repair");
+        let path = base.join("durable.jsonl");
+        let kept = format!("{STARTED_LINE}{}\n", user_line("kept"));
+        fs::write(&path, format!("{kept}{TORN_RECORD}")).unwrap();
+        let (store, state) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(message_texts(&state), ["kept"]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), kept);
+        store
+            .record_message(test_message(MessageRole::User, "next"))
+            .unwrap();
+        assert_eq!(assert_every_line_is_a_record(&path), 3);
+        assert_eq!(
+            message_texts(&SessionStore::read(&path).unwrap()),
+            ["kept", "next"]
+        );
+        drop(store);
+
+        fs::write(&path, format!("{STARTED_LINE}{}", user_line("last"))).unwrap();
+        let (store, state) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(message_texts(&state), ["last"]);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{STARTED_LINE}{}\n", user_line("last"))
+        );
+        drop(store);
+
+        // Creating over an existing torn journal repairs it the same way.
+        fs::write(&path, format!("{kept}{TORN_RECORD}")).unwrap();
+        let (store, _) =
+            SessionStore::create_with_id(&base, PathBuf::from("/repo"), "durable").unwrap();
+        assert_eq!(assert_every_line_is_a_record(store.path()), 3);
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn listing_skips_a_session_that_fails_to_load() {
+        let base = durable_test_dir("list-skip");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let good = store.path().to_path_buf();
+        drop(store);
+        fs::write(
+            base.join("broken.jsonl"),
+            format!("{STARTED_LINE}{TORN_RECORD}\n{STARTED_LINE}"),
+        )
+        .unwrap();
+        let listed = SessionStore::list(&base).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, good);
+        assert_eq!(SessionStore::resolve(&base, "1").unwrap(), Some(good));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_session_held_by_another_process_is_refused_with_its_pid() {
+        let base = durable_test_dir("locked");
+        let (store, state) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let path = store.path().to_path_buf();
+        drop(store);
+        let journal = fs::read_to_string(&path).unwrap();
+        let other = hold_lock_elsewhere(&path, 4242);
+
+        match SessionStore::open(path.clone()) {
+            Err(SessionError::Locked {
+                path: locked,
+                pid: Some(4242),
+            }) => assert!(locked.ends_with(path.file_name().unwrap())),
+            other => panic!("expected the session to be locked, got {other:?}"),
+        }
+        let message = SessionStore::open(path.clone()).unwrap_err().to_string();
+        assert!(message.contains("in use by another pi process (pid 4242)"));
+        assert!(message.contains(&state.session_id));
+        assert!(matches!(
+            SessionStore::delete(&path),
+            Err(SessionError::Locked { .. })
+        ));
+        assert!(matches!(
+            SessionStore::import(&base, SessionExport::from(&state)),
+            Err(SessionError::Locked { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), journal);
+
+        // Like a crashed holder, `other` leaves its lock file behind.
+        drop(other);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (store, reopened) = loop {
+            match SessionStore::open(path.clone()) {
+                // A fork on another test thread holds a copy of every open
+                // descriptor until its exec; wait that out.
+                Err(SessionError::Locked { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => break result.unwrap(),
+            }
+        };
+        assert_eq!(reopened.session_id, state.session_id);
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn this_process_can_reopen_a_session_it_holds() {
+        let base = durable_test_dir("same-process");
+        let (store, state) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let (again, _) = SessionStore::open(store.path().to_path_buf()).unwrap();
+        assert!(Arc::ptr_eq(&store.lock, &again.lock));
+        let spelled = base.join(".").join(store.path().file_name().unwrap());
+        let (spelled, _) = SessionStore::open(spelled).unwrap();
+        assert!(Arc::ptr_eq(&store.lock, &spelled.lock));
+        // Importing onto the id this process holds rewrites it in place.
+        let (imported, _) = SessionStore::import(&base, SessionExport::from(&state)).unwrap();
+        assert!(Arc::ptr_eq(&store.lock, &imported.lock));
+
+        let lock_path = store.lock.lock_path().to_path_buf();
+        assert!(lock_path.exists());
+        drop((store, again, spelled));
+        assert!(lock_path.exists(), "a live handle keeps the lock");
+        drop(imported);
+        assert!(!lock_path.exists(), "the last handle removes the lock file");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn the_lock_survives_a_compaction_checkpoint_rename() {
+        let base = durable_test_dir("checkpoint-lock");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        store
+            .record_message(test_message(MessageRole::User, "before"))
+            .unwrap();
+        #[cfg(unix)]
+        let inode = || std::os::unix::fs::MetadataExt::ino(&fs::metadata(store.path()).unwrap());
+        #[cfg(unix)]
+        let before = inode();
+        store
+            .record_compaction_checkpoint(
+                CompactionRecord {
+                    kind: CompactionKind::Manual,
+                    omitted_messages: 1,
+                    retained_messages: 1,
+                    summary: "summary".into(),
+                },
+                vec![test_message(MessageRole::Assistant, "checkpoint")],
+            )
+            .unwrap();
+        #[cfg(unix)]
+        assert_ne!(inode(), before, "the checkpoint replaces the journal");
+
+        let probe = File::open(store.lock.lock_path()).unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        store
+            .record_message(test_message(MessageRole::User, "after"))
+            .unwrap();
+        assert_eq!(
+            message_texts(&SessionStore::read(store.path()).unwrap()),
+            ["checkpoint", "after"]
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_checkpoint_drops_a_torn_tail_instead_of_patching_it() {
+        let base = durable_test_dir("checkpoint-torn");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        store
+            .record_message(test_message(MessageRole::User, "kept"))
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.path())
+            .unwrap()
+            .write_all(TORN_RECORD.as_bytes())
+            .unwrap();
+        store
+            .record_compaction_checkpoint(
+                CompactionRecord {
+                    kind: CompactionKind::Manual,
+                    omitted_messages: 1,
+                    retained_messages: 0,
+                    summary: "summary".into(),
+                },
+                vec![test_message(MessageRole::Assistant, "checkpoint")],
+            )
+            .unwrap();
+        assert_eq!(assert_every_line_is_a_record(store.path()), 3);
+        assert_eq!(
+            message_texts(&SessionStore::read(store.path()).unwrap()),
+            ["checkpoint"]
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn appends_from_store_clones_never_interleave() {
+        let base = durable_test_dir("concurrent-appends");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let writers = (0..2)
+            .map(|writer| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for index in 0..200 {
+                        let content = format!("{writer}-{index}-{}", "x".repeat(8192));
+                        store
+                            .record_message(test_message(MessageRole::User, &content))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(assert_every_line_is_a_record(store.path()), 401);
+        assert_eq!(
+            SessionStore::read(store.path()).unwrap().messages.len(),
+            400
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_closes_the_lock_so_children_never_keep_a_session() {
+        let base = durable_test_dir("cloexec");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        // A second description of the same lock inode, to observe the OS lock
+        // after the store unlinks the path on drop.
+        let probe = File::open(store.lock.lock_path()).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(store);
+        // A fork on another test thread copies every descriptor until its
+        // exec, so allow a moment; an inherited lock would last 30 s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let released = loop {
+            match probe.try_lock() {
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => break result,
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            released.is_ok(),
+            "an exec'd child inherited the session lock: {released:?}"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_session_takes_its_lock_and_cleans_up() {
+        let base = durable_test_dir("delete");
+        let missing = base.join("missing.jsonl");
+        assert!(matches!(
+            SessionStore::open(missing),
+            Err(SessionError::Open { .. })
+        ));
+        assert!(!base.join("missing.jsonl.lock").exists());
+
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let path = store.path().to_path_buf();
+        let lock_path = store.lock.lock_path().to_path_buf();
+        drop(store);
+        SessionStore::delete(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!lock_path.exists());
+
+        // The session this process holds can be deleted; its lock file goes
+        // away with the last handle.
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let lock_path = store.lock.lock_path().to_path_buf();
+        SessionStore::delete(store.path()).unwrap();
+        assert!(!store.path().exists());
+        assert!(lock_path.exists());
+        drop(store);
+        assert!(!lock_path.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[tokio::test]
     async fn run_user_turn_records_user_and_assistant_messages() {
         let mut runtime = Runtime::new(
@@ -4606,7 +5614,7 @@ mod tests {
             &provider,
             "read everything".to_string(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
@@ -4659,37 +5667,629 @@ mod tests {
             &provider,
             "read the file".to_string(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
         .expect("run tool loop");
 
         assert_eq!(answer, "done");
+        // Upstream's order: tool_execution_end, then the tool-result
+        // message, then turn_end.
         assert_eq!(
-            events,
-            vec![
-                TurnEvent::ToolStarted {
-                    name: "read".to_string()
+            trace(&events),
+            [
+                "round started",
+                r#"user "read the file""#,
+                "call call_read_1 read",
+                "stop toolUse",
+                r#"assistant "" -> call_read_1"#,
+                r#"tool call_read_1 read {"path":"a.txt"}"#,
+                r#"output call_read_1 "file contents""#,
+                "finished read",
+                "round finished",
+                "round started",
+                r#"text "done""#,
+                "stop stop",
+                r#"assistant "done""#,
+                "round finished",
+            ]
+        );
+        assert!(events.contains(&TurnEvent::MessageAdded(
+            runtime.session.messages[1].clone()
+        )));
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn a_text_reply_is_one_round_reporting_its_saved_messages() {
+        let mut runtime = Runtime::new(
+            SessionState::new("text-round", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let provider = Script::new([reply(vec![
+            StreamEvent::Thinking("plan".into()),
+            StreamEvent::Text("hel".into()),
+            StreamEvent::Text("lo".into()),
+            StreamEvent::Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            },
+            stop("stop"),
+        ])]);
+        let mut events = Vec::new();
+        let answer = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "hi".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "hello");
+        // Upstream's turn_start comes before the prompt's message events and
+        // the reply's message_end after its last delta.
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "hi""#,
+                r#"thinking "plan""#,
+                r#"text "hel""#,
+                r#"text "lo""#,
+                "usage 3/2",
+                "stop stop",
+                r#"assistant "hello""#,
+                "round finished",
+            ]
+        );
+        let added = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::MessageAdded(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(added, runtime.session.messages);
+        assert_eq!(added[1].thinking, "plan");
+    }
+
+    #[tokio::test]
+    async fn steering_is_reported_after_the_start_of_the_round_it_joins() {
+        let cwd = std::env::temp_dir().join(format!("pi-steering-events-{}", new_session_id()));
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(cwd.join("a.txt"), "file contents").unwrap();
+        let mut runtime = Runtime::new(
+            SessionState::new("steering-events", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let run = RunControl::default();
+        let (during_tools, during_reply) = (run.steering.clone(), run.steering.clone());
+        let provider = Script::new([
+            Box::new(move || {
+                during_tools.send("also b.txt".into());
+                Ok(vec![tool_call("read-a", "read", json!({"path": "a.txt"}))])
+            }) as Reply,
+            // Steering that arrives during a final reply keeps the turn going.
+            Box::new(move || {
+                during_reply.send("one more".into());
+                Ok(vec![StreamEvent::Text("read".into())])
+            }),
+            reply(vec![StreamEvent::Text("done".into())]),
+        ]);
+        let mut events = Vec::new();
+        let answer = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "read a.txt".into(),
+            Vec::new(),
+            &run,
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "readdone");
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "read a.txt""#,
+                "call read-a read",
+                r#"assistant "" -> read-a"#,
+                r#"tool read-a read {"path":"a.txt"}"#,
+                r#"output read-a "file contents""#,
+                "finished read",
+                "round finished",
+                "round started",
+                r#"user "also b.txt""#,
+                r#"text "read""#,
+                r#"assistant "read""#,
+                "round finished",
+                "round started",
+                r#"user "one more""#,
+                r#"text "done""#,
+                r#"assistant "done""#,
+                "round finished",
+            ]
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn the_round_limit_ends_the_turn_after_its_last_round() {
+        let cwd = std::env::temp_dir().join(format!("pi-round-limit-events-{}", new_session_id()));
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(cwd.join("a.txt"), "file contents").unwrap();
+        let mut runtime = Runtime::new(
+            SessionState::new("round-limit-events", cwd.clone()),
+            ReloadableSystems {
+                max_tool_rounds: 2,
+                ..Default::default()
+            },
+        );
+        let provider = Script::new((0..2).map(|round| {
+            reply(vec![tool_call(
+                &format!("read-{round}"),
+                "read",
+                json!({"path": "a.txt"}),
+            )])
+        }));
+        let mut events = Vec::new();
+        let error = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "read forever".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::RoundLimitReached { max_rounds: 2 }
+        ));
+        let round = |id: &str| {
+            [
+                "round started".to_string(),
+                format!("call {id} read"),
+                format!(r#"assistant "" -> {id}"#),
+                format!(r#"tool {id} read {{"path":"a.txt"}}"#),
+                format!(r#"output {id} "file contents""#),
+                "finished read".to_string(),
+                "round finished".to_string(),
+            ]
+        };
+        let mut expected = round("read-0").to_vec();
+        expected.insert(1, r#"user "read forever""#.into());
+        expected.extend(round("read-1"));
+        assert_eq!(trace(&events), expected);
+
+        // Steering that arrives during the last allowed reply is still saved;
+        // it opens a round that the limit then ends.
+        let mut runtime = Runtime::new(
+            SessionState::new("round-limit-steering", cwd.clone()),
+            ReloadableSystems {
+                max_tool_rounds: 1,
+                ..Default::default()
+            },
+        );
+        let run = RunControl::default();
+        let steering = run.steering.clone();
+        let provider = Script::new([Box::new(move || {
+            steering.send("keep going".into());
+            Ok(vec![StreamEvent::Text("done".into())])
+        }) as Reply]);
+        let mut events = Vec::new();
+        let error = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "hi".into(),
+            Vec::new(),
+            &run,
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::RoundLimitReached { max_rounds: 1 }
+        ));
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "hi""#,
+                r#"text "done""#,
+                r#"assistant "done""#,
+                "round finished",
+                "round started",
+                r#"user "keep going""#,
+            ]
+        );
+        assert_eq!(
+            runtime.session.messages.last().unwrap().content,
+            "keep going"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn mid_turn_compaction_is_reported_inside_its_round() {
+        struct Summarizing;
+        #[async_trait::async_trait]
+        impl Provider for Summarizing {
+            async fn complete(
+                &self,
+                request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                // Only summary requests come without tools.
+                let text = if request.tools.is_empty() {
+                    "Goals: finish the task."
+                } else {
+                    "done"
+                };
+                Ok(vec![StreamEvent::Text(text.into())])
+            }
+        }
+        let mut state = SessionState::new("compaction-events", PathBuf::from("."));
+        state.active_model = Some(ModelRef {
+            provider: "faux".into(),
+            id: "echo".into(),
+        });
+        state.messages = vec![
+            test_message(MessageRole::User, &"old ".repeat(6_000)),
+            test_message(MessageRole::Assistant, "old answer"),
+        ];
+        let mut runtime = Runtime::new(
+            state,
+            ReloadableSystems {
+                compaction: RuntimeCompactionSettings {
+                    keep_recent_tokens: 0,
+                    reserve_tokens: 0,
+                    ..Default::default()
                 },
-                TurnEvent::ToolOutput {
-                    call: ChatToolCall {
-                        id: "call_read_1".to_string(),
-                        name: "read".to_string(),
-                        arguments: "{\"path\":\"a.txt\"}".to_string()
-                    },
-                    output: "file contents".to_string(),
-                    is_error: false,
+                model_context_windows: BTreeMap::from([("faux/echo".to_string(), 8_000)]),
+                ..Default::default()
+            },
+        );
+        let mut events = Vec::new();
+        run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &Summarizing,
+            "continue".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "continue""#,
+                "compaction started",
+                "compacted 2 messages",
+                r#"text "done""#,
+                r#"assistant "done""#,
+                "round finished",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_are_reported_before_each_backoff_and_when_the_request_ends() {
+        let mut runtime = Runtime::new(
+            SessionState::new("retry-events", PathBuf::from(".")),
+            ReloadableSystems {
+                retry: RuntimeRetrySettings {
+                    enabled: true,
+                    max_retries: 3,
+                    base_delay_ms: 1,
+                    max_agent_delay_ms: 2,
                 },
-                TurnEvent::ToolFinished {
-                    name: "read".to_string(),
-                    is_error: false,
-                },
-                TurnEvent::Provider(StreamEvent::Text("done".to_string())),
+                ..Default::default()
+            },
+        );
+        let provider = Script::new([
+            overloaded(),
+            overloaded(),
+            reply(vec![StreamEvent::Text("ok".into())]),
+        ]);
+        let mut events = Vec::new();
+        run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "hi".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        // Upstream reports auto_retry_end after the reply's message_end.
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "hi""#,
+                "retry 1 of 3 in 1ms: provider returned an invalid response: overloaded",
+                "retry 2 of 3 in 2ms: provider returned an invalid response: overloaded",
+                r#"text "ok""#,
+                r#"assistant "ok""#,
+                "retried 2: succeeded",
+                "round finished",
             ]
         );
 
-        let _ = fs::remove_dir_all(cwd);
+        runtime.systems.retry.max_retries = 1;
+        let provider = Script::new([overloaded(), overloaded()]);
+        let mut events = Vec::new();
+        let error = run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "again".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentError::Provider(_)));
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "again""#,
+                "retry 1 of 1 in 1ms: provider returned an invalid response: overloaded",
+                "retried 1: provider returned an invalid response: overloaded",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_reports_how_long_the_tool_ran() {
+        let mut runtime = Runtime::new(
+            SessionState::new("tool-duration", PathBuf::from(".")),
+            ReloadableSystems {
+                shell_path: Some("/bin/sh".into()),
+                ..Default::default()
+            },
+        );
+        let provider = Script::new([
+            reply(vec![tool_call(
+                "bash-1",
+                "bash",
+                json!({"command": "sleep 0.2"}),
+            )]),
+            reply(vec![StreamEvent::Text("done".into())]),
+        ]);
+        let mut events = Vec::new();
+        run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            &provider,
+            "wait".into(),
+            Vec::new(),
+            &RunControl::default(),
+            |event| events.push(event.clone()),
+        )
+        .await
+        .unwrap();
+        let duration = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::ToolOutput { duration, .. } => Some(*duration),
+                _ => None,
+            })
+            .unwrap();
+        assert!(duration >= Duration::from_millis(200), "{duration:?}");
+    }
+
+    /// Cancels `run` after `delay`; the handle yields when it did.
+    fn cancel_after(run: &RunControl, delay: Duration) -> tokio::task::JoinHandle<Instant> {
+        let cancellation = run.cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            cancellation.cancel();
+            Instant::now()
+        })
+    }
+
+    fn assert_ended_promptly(cancelled_at: Instant) {
+        let latency = cancelled_at.elapsed();
+        assert!(
+            latency < Duration::from_secs(1),
+            "the turn ended {latency:?} after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_model_call_ends_the_turn_with_its_prompt_saved() {
+        struct Pending;
+        #[async_trait::async_trait]
+        impl Provider for Pending {
+            async fn complete(
+                &self,
+                _request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                std::future::pending().await
+            }
+        }
+        let base = std::env::temp_dir().join(format!("pi-cancel-request-{}", new_session_id()));
+        let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store.clone());
+        let run = RunControl::default();
+        let cancelled = cancel_after(&run, Duration::from_millis(20));
+        let mut events = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_user_turn_streaming_events_with_media(
+                &mut runtime,
+                &Pending,
+                "wait".into(),
+                Vec::new(),
+                &run,
+                |event| events.push(event.clone()),
+            ),
+        )
+        .await
+        .expect("cancellation ends the request");
+        assert_ended_promptly(cancelled.await.unwrap());
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(trace(&events), ["round started", r#"user "wait""#]);
+        // The saved prompt is a turn the next run continues.
+        assert_eq!(store.load().unwrap(), runtime.session);
+        assert!(runtime.session.has_unfinished_turn());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_tool_call_kills_its_process_group_and_keeps_the_call_unanswered() {
+        let base = std::env::temp_dir().join(format!("pi-cancel-tool-{}", new_session_id()));
+        fs::create_dir_all(&base).unwrap();
+        let pid_file = base.join("child.pid");
+        let (store, state) = SessionStore::create(&base.join("sessions"), base.clone()).unwrap();
+        let mut runtime = Runtime::with_store(
+            state,
+            ReloadableSystems {
+                shell_path: Some("/bin/sh".into()),
+                ..Default::default()
+            },
+            store.clone(),
+        );
+        let command = format!(
+            "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; wait",
+            pid_file.display()
+        );
+        let provider = Script::new([reply(vec![tool_call(
+            "bash-1",
+            "bash",
+            json!({ "command": command }),
+        )])]);
+        let run = RunControl::default();
+        // Cancel once the tool's background child runs.
+        let cancelled = {
+            let (run, pid_file) = (run.clone(), pid_file.clone());
+            tokio::spawn(async move {
+                let pid = loop {
+                    if let Ok(pid) = fs::read_to_string(&pid_file) {
+                        break pid.trim().parse::<i32>().unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                run.cancellation.cancel();
+                (pid, Instant::now())
+            })
+        };
+        let mut events = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_user_turn_streaming_events_with_media(
+                &mut runtime,
+                &provider,
+                "run it".into(),
+                Vec::new(),
+                &run,
+                |event| events.push(event.clone()),
+            ),
+        )
+        .await
+        .expect("cancellation ends the tool call");
+        let (pid, cancelled_at) = cancelled.await.unwrap();
+        assert_ended_promptly(cancelled_at);
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        let lines = trace(&events);
+        assert_eq!(
+            lines[..4],
+            [
+                "round started",
+                r#"user "run it""#,
+                "call bash-1 bash",
+                r#"assistant "" -> bash-1"#,
+            ]
+        );
+        assert!(lines[4].starts_with("tool bash-1 bash"), "{lines:?}");
+        assert_eq!(lines.len(), 5);
+        // A killed process stays a zombie (state Z) until reaped.
+        let running = || {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, fields)| !fields.trim_start().starts_with('Z'))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cfg!(target_os = "linux") && running() {
+            assert!(
+                Instant::now() < deadline,
+                "background child {pid} outlived the cancelled turn"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The journal keeps the reply and its unanswered call, which the
+        // next request answers with the interrupted-call placeholder.
+        assert_eq!(store.load().unwrap(), runtime.session);
+        assert!(runtime.session.tool_history.is_empty());
+        let request = provider_messages(&runtime.session.messages);
+        assert_eq!(
+            request.last().unwrap().tool_call_id.as_deref(),
+            Some("bash-1")
+        );
+        assert!(request.last().unwrap().content.contains("did not complete"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_retry_backoff_ends_the_turn() {
+        let base = std::env::temp_dir().join(format!("pi-cancel-backoff-{}", new_session_id()));
+        let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+        let mut runtime = Runtime::with_store(
+            state,
+            ReloadableSystems {
+                retry: RuntimeRetrySettings {
+                    enabled: true,
+                    max_retries: 3,
+                    base_delay_ms: 60_000,
+                    max_agent_delay_ms: 60_000,
+                },
+                ..Default::default()
+            },
+            store.clone(),
+        );
+        let provider = Script::new([overloaded()]);
+        let run = RunControl::default();
+        let cancelled = cancel_after(&run, Duration::from_millis(50));
+        let mut events = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_user_turn_streaming_events_with_media(
+                &mut runtime,
+                &provider,
+                "hi".into(),
+                Vec::new(),
+                &run,
+                |event| events.push(event.clone()),
+            ),
+        )
+        .await
+        .expect("cancellation ends the backoff");
+        assert_ended_promptly(cancelled.await.unwrap());
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(
+            trace(&events),
+            [
+                "round started",
+                r#"user "hi""#,
+                "retry 1 of 3 in 60000ms: provider returned an invalid response: overloaded",
+                "retried 1: turn cancelled",
+            ]
+        );
+        assert_eq!(store.load().unwrap(), runtime.session);
+        assert_eq!(runtime.session.messages.len(), 1);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
@@ -4717,13 +6317,16 @@ mod tests {
             &ThinkingProvider,
             "hello".into(),
             Vec::new(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
         .unwrap();
         assert_eq!(
-            events,
+            events
+                .into_iter()
+                .filter(|event| matches!(event, TurnEvent::Provider(_)))
+                .collect::<Vec<_>>(),
             vec![
                 TurnEvent::Provider(StreamEvent::Thinking("summary".into())),
                 TurnEvent::Provider(StreamEvent::Text("answer".into()))
@@ -4770,7 +6373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuation_uses_saved_results_and_missing_call_placeholders_without_replay() {
+    async fn continuation_reruns_replay_safe_calls_and_reports_the_rest_as_interrupted() {
         struct ContinuationProvider {
             requests: Arc<Mutex<Vec<ProviderRequest>>>,
         }
@@ -4796,6 +6399,7 @@ mod tests {
         let cwd = std::env::temp_dir().join(format!("pi-continuation-{}", new_session_id()));
         fs::create_dir_all(&cwd).unwrap();
         fs::write(cwd.join("new.txt"), "new result").unwrap();
+        fs::write(cwd.join("again.txt"), "read again").unwrap();
         let (store, state) = SessionStore::create(&cwd.join("sessions"), cwd.clone()).unwrap();
         let path = store.path().to_path_buf();
         let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
@@ -4808,17 +6412,23 @@ mod tests {
             tool_name: None,
             tool_calls,
         };
+        let call = |id: &str, name: &str, arguments: &str| ChatToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        };
         let calls = vec![
-            ChatToolCall {
-                id: "saved".into(),
-                name: "write".into(),
-                arguments: r#"{"path":"saved.txt","content":"must not replay"}"#.into(),
-            },
-            ChatToolCall {
-                id: "missing".into(),
-                name: "write".into(),
-                arguments: r#"{"path":"missing.txt","content":"uncertain side effect"}"#.into(),
-            },
+            call(
+                "saved",
+                "write",
+                r#"{"path":"saved.txt","content":"must not replay"}"#,
+            ),
+            call(
+                "missing",
+                "write",
+                r#"{"path":"missing.txt","content":"uncertain side effect"}"#,
+            ),
+            call("again", "read", r#"{"path":"again.txt"}"#),
         ];
         let mut user = message(MessageRole::User, "finish the work", None, vec![]);
         user.media.push(MediaInput {
@@ -4862,6 +6472,11 @@ mod tests {
         let before = runtime.session().clone();
         let (store, state) = SessionStore::open(path.clone()).unwrap();
         let mut reopened = Runtime::with_store(state, ReloadableSystems::default(), store);
+        let pending = reopened.session().pending_tool_calls().unwrap().1;
+        assert_eq!(
+            pending.iter().map(|call| &call.id).collect::<Vec<_>>(),
+            ["missing", "again"]
+        );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = ContinuationProvider {
             requests: requests.clone(),
@@ -4870,7 +6485,7 @@ mod tests {
         let answer = continue_turn_streaming_events(
             &mut reopened,
             &provider,
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |event| events.push(event.clone()),
         )
         .await
@@ -4896,16 +6511,28 @@ mod tests {
             reopened.session().active_thinking_level,
             before.active_thinking_level
         );
+        // The interrupted writes never run again; the read does, in the
+        // round its saved reply started.
         assert!(!cwd.join("saved.txt").exists());
         assert!(!cwd.join("missing.txt").exists());
-        assert_eq!(reopened.session().tool_history.len(), 2);
+        assert_eq!(
+            trace(&events[..5]),
+            [
+                r#"round resumed: assistant "working" -> saved -> missing -> again"#,
+                r#"tool again read {"path":"again.txt"}"#,
+                r#"output again "read again""#,
+                "finished read",
+                "round finished",
+            ]
+        );
         assert_eq!(
             events
                 .iter()
                 .filter(|event| matches!(event, TurnEvent::ToolStarted { .. }))
                 .count(),
-            1
+            2
         );
+        assert_eq!(reopened.session().tool_history.len(), 3);
         let captured = requests.lock().unwrap().clone();
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0].messages[0].media, before.messages[0].media);
@@ -4915,6 +6542,11 @@ mod tests {
             Some("missing")
         );
         assert!(captured[0].messages[3].content.contains("did not complete"));
+        assert_eq!(
+            captured[0].messages[4].tool_call_id.as_deref(),
+            Some("again")
+        );
+        assert_eq!(captured[0].messages[4].content, "read again");
         assert_eq!(captured[1].messages.last().unwrap().content, "new result");
         assert!(!reopened.session().has_unfinished_turn());
         assert_eq!(SessionStore::open(path).unwrap().1, *reopened.session());
@@ -4923,7 +6555,7 @@ mod tests {
             continue_turn_streaming_events(
                 &mut reopened,
                 &provider,
-                &SteeringMailbox::default(),
+                &RunControl::default(),
                 |_| {}
             )
             .await
@@ -4961,7 +6593,7 @@ mod tests {
         assert!(continue_turn_streaming_events(
             &mut runtime,
             &provider,
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |_| {}
         )
         .await
@@ -5065,7 +6697,7 @@ mod tests {
         let answer = continue_turn_streaming_events(
             &mut reopened,
             provider.as_ref(),
-            &SteeringMailbox::default(),
+            &RunControl::default(),
             |_| {},
         )
         .await
@@ -6012,6 +7644,182 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn the_saved_queue_keeps_steering_ahead_of_follow_ups() {
+        let base = durable_test_dir("queue-kinds");
+        let (store, _) = SessionStore::create(&base, base.clone()).unwrap();
+        let path = store.path().to_path_buf();
+        store
+            .record_queue(vec!["steer".into()], vec!["follow".into()])
+            .unwrap();
+        let last_line = |path: &Path| {
+            let journal = fs::read_to_string(path).unwrap();
+            journal.lines().last().unwrap().to_owned()
+        };
+        // An older pi reads the same record as two follow-ups.
+        assert_eq!(
+            last_line(&path),
+            r#"{"type":"queued_messages_snapshot","messages":["steer","follow"],"steering":1}"#
+        );
+        let loaded = SessionStore::read(&path).unwrap();
+        let queue = (vec!["steer".to_owned()], vec!["follow".to_owned()]);
+        let saved = |state: &SessionState| {
+            let (steering, follow_ups) = state.saved_queue();
+            (steering.to_vec(), follow_ups.to_vec())
+        };
+        assert_eq!(saved(&loaded), queue);
+        let (fork, _) = SessionStore::fork(&base, &loaded, false).unwrap();
+        assert_eq!(saved(&SessionStore::read(fork.path()).unwrap()), queue);
+
+        // The TUI queues everything as follow-ups, in the same record.
+        let mut runtime = Runtime::with_store(loaded, ReloadableSystems::default(), store);
+        runtime
+            .replace_queued_messages(vec!["steer".into(), "follow".into()])
+            .unwrap();
+        assert_eq!(
+            last_line(&path),
+            r#"{"type":"queued_messages_snapshot","messages":["steer","follow"]}"#
+        );
+        assert_eq!(
+            saved(&SessionStore::read(&path).unwrap()),
+            (vec![], vec!["steer".to_owned(), "follow".to_owned()])
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn runs_are_saved_with_their_prompts_and_outlive_compaction_undo_and_restarts() {
+        let base = durable_test_dir("runs");
+        let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+        let path = store.path().to_path_buf();
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store.clone());
+        let start = |id: &str, request_id: &str| RunStart {
+            id: id.into(),
+            request_id: Some(request_id.into()),
+        };
+        let run = |id: &str, request_id: &str, status| Run {
+            id: id.into(),
+            request_id: Some(request_id.into()),
+            status,
+        };
+        let runs = || SessionStore::read(&path).unwrap().runs;
+
+        // The prompt and the run's start are one record: a load that sees
+        // the run sees its prompt, and the run is interrupted until it ends.
+        let prompt = runtime
+            .start_run(start("run-1", "m-1"), "first".into(), Vec::new())
+            .unwrap();
+        assert_eq!(prompt, test_message(MessageRole::User, "first"));
+        assert_eq!(
+            runtime.session().runs,
+            [run("run-1", "m-1", RunStatus::Running)]
+        );
+        let loaded = SessionStore::read(&path).unwrap();
+        assert_eq!(message_texts(&loaded), ["first"]);
+        assert_eq!(loaded.runs, [run("run-1", "m-1", RunStatus::Interrupted)]);
+        runtime.finish_run("run-1", RunStatus::Completed).unwrap();
+        assert_eq!(runs(), [run("run-1", "m-1", RunStatus::Completed)]);
+
+        // A mid-turn compaction checkpoint and an undo snapshot rewrite the
+        // messages, not the runs.
+        runtime
+            .start_run(start("run-2", "m-2"), "second".into(), Vec::new())
+            .unwrap();
+        let checkpoint = CompactionRecord {
+            kind: CompactionKind::Automatic,
+            omitted_messages: 1,
+            retained_messages: 1,
+            summary: "earlier".into(),
+        };
+        store
+            .record_compaction_checkpoint(
+                checkpoint,
+                vec![
+                    test_message(MessageRole::Assistant, "summary"),
+                    test_message(MessageRole::User, "second"),
+                ],
+            )
+            .unwrap();
+        runtime.undo_last_turn().unwrap();
+        assert_eq!(
+            runs(),
+            [
+                run("run-1", "m-1", RunStatus::Completed),
+                run("run-2", "m-2", RunStatus::Interrupted)
+            ]
+        );
+
+        // After a restart, a new run first ends the interrupted one.
+        let (store, state) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(state.run_for_request("m-2").unwrap().id, "run-2");
+        let mut restarted = Runtime::with_store(state, ReloadableSystems::default(), store);
+        restarted
+            .start_run(start("run-3", "m-3"), "third".into(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            runs(),
+            [
+                run("run-1", "m-1", RunStatus::Completed),
+                run("run-2", "m-2", RunStatus::Aborted),
+                run("run-3", "m-3", RunStatus::Interrupted)
+            ]
+        );
+
+        // Runs stay with the session that ran them: forks and imports, new
+        // sessions, start without any.
+        let source = SessionStore::read(&path).unwrap();
+        let (fork, forked) = SessionStore::fork(&base, &source, false).unwrap();
+        assert!(forked.runs.is_empty());
+        assert!(SessionStore::read(fork.path()).unwrap().runs.is_empty());
+        let (_, imported) =
+            SessionStore::import(&base.join("imported"), SessionExport::from(&source)).unwrap();
+        assert!(imported.runs.is_empty());
+
+        // Journals from before runs load without any.
+        let old = base.join("old.jsonl");
+        fs::write(&old, format!("{STARTED_LINE}{}\n", user_line("old prompt"))).unwrap();
+        let loaded = SessionStore::read(&old).unwrap();
+        assert_eq!(message_texts(&loaded), ["old prompt"]);
+        assert!(loaded.runs.is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn replay_safe_tools_are_the_read_only_file_tools_and_marked_extension_tools() {
+        let base = durable_test_dir("replay-safe");
+        let extension = base.join("tools");
+        fs::write(&extension, "").unwrap();
+        fs::write(
+            base.join("tools.pi-extension.json"),
+            r#"{"protocol":"json","tools":[{"name":"lookup","replaySafe":true},{"name":"deploy"}]}"#,
+        )
+        .unwrap();
+        let mut runtime = Runtime::new(
+            SessionState::new("replay", base.clone()),
+            ReloadableSystems::default(),
+        );
+        runtime.systems.extension_tools = extension_tools_from_resources(&[ResourceFile {
+            name: "tools".into(),
+            path: extension,
+            content: String::new(),
+        }]);
+        for tool in ["read", "grep", "find", "ls", "lookup"] {
+            assert!(runtime.replay_safe(tool), "{tool}");
+        }
+        for tool in [
+            "bash",
+            "edit",
+            "write",
+            "todo",
+            "web_search",
+            "web_fetch",
+            "deploy",
+        ] {
+            assert!(!runtime.replay_safe(tool), "{tool}");
+        }
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[tokio::test]
     async fn excluded_bash_does_not_enter_context() {
         let cwd = std::env::temp_dir().join(format!("pi-excluded-bash-test-{}", new_session_id()));
@@ -6071,6 +7879,112 @@ mod tests {
         let second = new_session_id();
 
         assert_ne!(first, second);
+    }
+
+    /// One line per event, for exact-order assertions. Tool durations vary,
+    /// so they are left out.
+    fn trace(events: &[TurnEvent]) -> Vec<String> {
+        let flag = |is_error: bool| if is_error { " error" } else { "" };
+        let message = |message: &ConversationMessage| {
+            let role = format!("{:?}", message.role).to_lowercase();
+            let calls = message
+                .tool_calls
+                .iter()
+                .map(|call| format!(" -> {}", call.id))
+                .collect::<String>();
+            format!("{role} {:?}{calls}", message.content)
+        };
+        events
+            .iter()
+            .map(|event| match event {
+                TurnEvent::RoundStarted => "round started".to_string(),
+                TurnEvent::RoundResumed(reply) => format!("round resumed: {}", message(reply)),
+                TurnEvent::MessageAdded(saved) => message(saved),
+                TurnEvent::Provider(StreamEvent::Text(text)) => format!("text {text:?}"),
+                TurnEvent::Provider(StreamEvent::Thinking(text)) => format!("thinking {text:?}"),
+                TurnEvent::Provider(StreamEvent::ToolCall { id, name, .. }) => {
+                    format!("call {id} {name}")
+                }
+                TurnEvent::Provider(StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                }) => format!("usage {input_tokens}/{output_tokens}"),
+                TurnEvent::Provider(StreamEvent::Stop { reason }) => format!("stop {reason}"),
+                TurnEvent::RetryStarted(notice) => format!(
+                    "retry {} of {} in {}ms: {}",
+                    notice.attempt, notice.max_attempts, notice.delay_ms, notice.error_message
+                ),
+                TurnEvent::RetryFinished { attempt, error } => format!(
+                    "retried {attempt}: {}",
+                    error.as_deref().unwrap_or("succeeded")
+                ),
+                TurnEvent::ToolStarted { call } => {
+                    format!("tool {} {} {}", call.id, call.name, call.arguments)
+                }
+                TurnEvent::ToolOutput {
+                    call,
+                    output,
+                    is_error,
+                    ..
+                } => format!("output {} {output:?}{}", call.id, flag(*is_error)),
+                TurnEvent::ToolFinished { name, is_error } => {
+                    format!("finished {name}{}", flag(*is_error))
+                }
+                TurnEvent::TodosUpdated(todos) => format!("todos {}", todos.len()),
+                TurnEvent::CompactionStarted => "compaction started".to_string(),
+                TurnEvent::CompactionFinished(record) => {
+                    format!("compacted {} messages", record.omitted_messages)
+                }
+                TurnEvent::CompactionFailed(_) => "compaction failed".to_string(),
+                TurnEvent::RoundFinished => "round finished".to_string(),
+            })
+            .collect()
+    }
+
+    type Reply = Box<dyn FnOnce() -> Result<Vec<StreamEvent>, ProviderError> + Send>;
+
+    fn reply(events: Vec<StreamEvent>) -> Reply {
+        Box::new(move || Ok(events))
+    }
+
+    /// A failure before any output, so it is retried.
+    fn overloaded() -> Reply {
+        Box::new(|| Err(ProviderError::InvalidResponse("overloaded".into())))
+    }
+
+    /// Answers each request with the next scripted reply, which may also act
+    /// (steer, fail) when its request arrives.
+    struct Script(Mutex<VecDeque<Reply>>);
+
+    impl Script {
+        fn new(replies: impl IntoIterator<Item = Reply>) -> Self {
+            Self(Mutex::new(replies.into_iter().collect()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Script {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            let reply = self.0.lock().unwrap().pop_front();
+            reply.expect("a request the script did not expect")()
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: Value) -> StreamEvent {
+        StreamEvent::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    fn stop(reason: &str) -> StreamEvent {
+        StreamEvent::Stop {
+            reason: reason.into(),
+        }
     }
 
     struct CheckpointProvider;

@@ -127,10 +127,11 @@ Print mode:
 cargo run -p pi-cli -- -p --model faux/echo "hello"
 ```
 
-JSON-line RPC mode:
+RPC mode (see [RPC Mode](#rpc-mode)). `faux/echo` answers at once; with a real
+model, keep stdin open until `agent_settled`, since closing it stops the run:
 
 ```bash
-printf '{"jsonrpc":"2.0","id":1,"method":"prompt","params":{"prompt":"hello"}}\n' \
+printf '%s\n' '{"id":"1","type":"prompt","message":"hello"}' \
   | cargo run -p pi-cli -- --mode rpc --model faux/echo
 ```
 
@@ -161,6 +162,15 @@ cargo run -p pi-cli -- --session <id-prefix|name|path>
 cargo run -p pi-cli -- --fork <id-prefix|name|path>
 ```
 
+A session has one writer at a time: opening it for writing takes a lock on
+`<session>.jsonl.lock` beside the journal. Startup waits up to 5 seconds for
+another pi process to release the session, then exits with status 75, naming
+the session path and the holder's pid. In the TUI, `/resume`, the picker,
+`/import` onto that session id, and `/delete` report the conflict and keep
+running. Listing, `--fork`, `/fork`, and `/clone` only read. A crash during an
+append leaves at most a torn final line, which readers ignore and the next
+writer drops; a journal that fails to load is left out of listings.
+
 Useful CLI scope flags:
 
 ```bash
@@ -177,6 +187,62 @@ Prompt arguments starting with `@` are expanded from files:
 
 ```bash
 cargo run -p pi-cli -- -p --model faux/echo @prompt.txt
+```
+
+### Faux models
+
+The `faux` provider needs no credentials and is the only provider `--offline`
+allows.
+
+`faux/echo` answers `[faux/echo] ` followed by the last user message.
+`PI_FAUX_STREAM_DELAY_MS` sleeps before each streamed event, and
+`PI_FAUX_STREAM_CHARS=1` streams its text one character at a time.
+
+`faux/script` replays scripted responses for tests. `PI_FAUX_SCRIPT` names a
+JSON file that holds an array of responses. Each response is an array of steps,
+and each step is an object with one key:
+
+```json
+[
+  [
+    {"thinking": "Check the notes first."},
+    {"tool_call": {"name": "read", "arguments": {"path": "notes.txt"}}}
+  ],
+  [{"error": "overloaded"}],
+  [
+    {"delay_ms": 200},
+    {"text": "The notes list alpha and beta."},
+    {"usage": {"input": 120, "output": 9}}
+  ]
+]
+```
+
+- `{"text": "..."}` and `{"thinking": "..."}` stream text or thinking.
+- `{"tool_call": {"id": "...", "name": "...", "arguments": {...}}}` calls a
+  tool. `id` defaults to `call_<response>_<n>` and `arguments` to `{}`.
+- `{"usage": {"input": 120, "output": 9}}` reports token usage.
+- `{"stop": "..."}` sets the stop reason. Without it, a response ends with
+  `tool_use` after a tool call and `stop` otherwise.
+- `{"error": "..."}` fails the request with a provider error (status 503).
+  Before any output the agent retries it, and the retry gets the next response.
+- `{"delay_ms": 200}` pauses the response.
+- `{"wait_for_file": "path"}` holds the response until the file exists, for
+  example while a test steers or kills pi. Relative paths resolve against the
+  script's directory.
+
+If `PI_FAUX_SCRIPT_LOG` names a file, every request is appended to it as one
+JSON line and fsynced before the response starts. A line holds the
+`system_prompt`, the `messages` (`role`, `content`, and when present
+`tool_calls`, `tool_call_id`, `tool_name`, and a `media` count), and the names
+of the offered `tools`. The number of requests already in the log selects the
+response, so a restarted pi continues the script where the previous process
+stopped. Without a log, a counter in the process selects it. A request past the
+end of the script fails with a provider error, which is retried like any other;
+set `"retry": {"enabled": false}` in `settings.json` to fail at once.
+
+```bash
+PI_FAUX_SCRIPT=script.json PI_FAUX_SCRIPT_LOG=requests.jsonl \
+  cargo run -p pi-cli -- --offline --no-session -p --model faux/script "read notes.txt"
 ```
 
 ## Configuration
@@ -394,7 +460,8 @@ pi login anthropic --account work
 `openai-codex` (mirroring the codex import mapping); `pi login anthropic`
 stores it for `anthropic`. Expiry and `account_id` come from the issued token
 (JWT `exp` for Codex, `expires_in` for Claude), and the stored credentials
-refresh automatically when they expire. Importing credentials from
+refresh automatically when they expire, also in the middle of a turn: every
+model request resolves them anew. Importing credentials from
 `~/.codex/auth.json` and `~/.claude/.credentials.json` still works as a
 fallback when no stored account exists. Re-running login for an existing
 account replaces it.
@@ -552,7 +619,11 @@ scanned resource directories.
 Executable extensions can opt into the JSON protocol with an adjacent
 `.pi-extension.json` manifest. A manifest `tools` array registers model-callable
 tools; Pi sends `kind: "tool"` JSON requests on stdin and expects a JSON
-response with `output` or `error`:
+response with `output` or `error`. Like `bash`, a tool process has no
+controlling terminal, and an interrupted call kills its process group. A
+call that a stop cut off never runs again when its turn continues unless the
+tool declares `"replaySafe": true` (it only reads, so running it twice is
+harmless):
 
 ```json
 {
@@ -565,7 +636,8 @@ response with `output` or `error`:
         "type": "object",
         "properties": { "text": { "type": "string" } },
         "required": ["text"]
-      }
+      },
+      "replaySafe": true
     }
   ]
 }
@@ -662,7 +734,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `!!`
 - `/quit`
 
-`/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state. It keeps the session's project trust decision and command-line overrides (such as `--system-prompt`, `-e`, `--tools`, and `--api-key`), as do `/models refresh`, `/models reset`, and RPC `reload`.
+`/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state. It keeps the session's project trust decision and command-line overrides (such as `--system-prompt`, `-e`, `--tools`, and `--api-key`), as do `/models refresh` and `/models reset`. RPC mode has no reload: it keeps the config startup built.
 
 The editor uses a rounded box with a `>` prompt. A labeled Todo section and
 queued-message previews sit above it, separated by muted rules. Drafts wrap
@@ -683,7 +755,7 @@ Collapsed thinking and tool blocks use at most three terminal rows (excluding th
 
 Queued follow-ups are visible immediately above the editor, one truncated line per message (the newest four when the queue overflows). Up with an empty editor recalls the newest queued message for editing (otherwise prompt-history navigation is unchanged). Mid-turn `ctrl+s` steers queued messages followed by the draft at the next provider boundary (a prose-only response has no interior boundary, so steering is delivered after it finishes and the queue hint says so); the existing steering mode still controls batch size. Queue edits are journaled during streaming and survive reload/resume.
 
-Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
+Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Shell commands (`!`, `/bash`, and the model's `bash` tool) are non-interactive: stdin is empty and the command runs in its own session without a controlling terminal, so a program that prompts for input fails instead of waiting. A command that times out (120s by default) or whose turn is interrupted is killed together with its whole process group; background jobs started by a command that finished normally keep running. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
 
 The TUI defaults to an owned alternate-screen transcript with a fixed composer. Mouse wheel and PageUp/PageDown scroll only the conversation; Up/Down retain prompt-history/queue navigation. At the bottom, new output follows automatically. Scrolling up anchors the reader to logical text: streaming, resizing, panel changes, and reload do not steal the reading position. `↓ Scroll to bottom · Esc` appears while reading (with `new output` when text arrives); click it, press Esc, or scroll down to resume following. Live thinking-tail previews are frozen while reading; returning to latest refreshes them. Esc dismisses an open selector/diff panel first, otherwise returns to latest without clearing the draft/attachments or interrupting generation. At latest it retains the existing clear/interrupt behavior. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 
@@ -715,6 +787,13 @@ Print/JSON/RPC modes are unchanged.
 Owned mode restores the previous screen, mouse reporting, paste, and raw mode
 on exit. This viewport is an intentional Rust UI divergence; upstream parity
 fixtures are not rewritten.
+
+SIGTERM and SIGHUP end pi in every mode, as does SIGINT outside the TUI (print,
+JSON, RPC, and login); in the TUI ctrl+c stays a key and an outside SIGINT is
+ignored. pi first kills running tool commands with their process groups and
+restores the terminal, then exits like upstream pi: with status 128 + the
+signal number for SIGTERM and SIGHUP, and by the signal itself for SIGINT, so
+ctrl+c also stops a shell loop that runs pi.
 
 Ctrl+V reads a clipboard **image** into the current draft; type a prompt and
 press Enter to send it. Image-only drafts use “Describe this image.” Esc or
@@ -813,15 +892,100 @@ requests count toward `/usage`. `/export` exports the current checkpoint and
 retained context, not the pre-compaction journal transcript.
 
 
-## RPC Methods
+## RPC Mode
 
-`--mode rpc` reads one JSON object per line from stdin and writes one JSON object per line to stdout.
+`pi --mode rpc` speaks upstream pi's RPC protocol (upstream's `docs/rpc.md`,
+`docs/rpc-commands.md` and `docs/json.md`): one JSON command per line on
+stdin, and responses and session events as one JSON object per line on stdout.
+Lines split on LF only: a trailing CR is dropped, and U+2028 or U+2029 inside a
+string is not a line break. stdout carries only protocol records; diagnostics
+go to stderr. RPC mode starts when stdin is not a terminal and takes no prompt
+arguments.
 
-- `prompt` with `{ "prompt": "..." }`
-- `compact` with optional `{ "focus": "..." }`
-- `reload`
-- `session`
-- `model` with `{ "model": "provider/id" }`
+Commands: `prompt` (with `images`, `streamingBehavior`, and `requestId`),
+`steer`, `follow_up`, `abort`, `resume_run`, `clear_queue`, `get_state`,
+`get_messages`, `get_last_assistant_text`, `new_session`, `switch_session`,
+`set_model`, `set_thinking_level`, `set_steering_mode`, `set_follow_up_mode`,
+`compact`, and `set_session_name`. Other upstream commands answer
+`Unsupported command: <type>`, and unknown types `Unknown command: <type>`.
+
+A `prompt` that starts a run answers `{"disposition":"started","runId":"…"}`,
+then the run reports `agent_start`, its turns (`turn_start` … `turn_end`),
+`agent_end`, and exactly one `agent_settled` with `aborted` and the `runId`,
+after an abort or a failure too; a failed request ends with an assistant
+message whose `stopReason` is `error`. Follow-ups queued during a run are
+delivered in it, after the turn that would otherwise end it. `abort` answers
+once the run has settled, or at once when no run is active, and leaves queued
+messages for the next prompt. While a run is active, a `prompt` needs
+`streamingBehavior` (`steer` or `followUp`); `set_model`,
+`set_thinking_level`, `compact`, `new_session`, `switch_session`,
+`set_session_name`, and `resume_run` are refused; and `get_state`,
+`get_messages`, and `get_last_assistant_text` answer from the run's current
+state. `set_model` changes the session's model, not the default model in
+`settings.json`.
+
+pi adds four extensions, listed in `get_state.rpcExtensions`:
+
+- `run-id`: every run has a `runId` (a UUID), given in the `prompt` response,
+  `agent_start`, `agent_settled`, and `get_state` while the run is active.
+- `expected-run-id`: `steer`, `follow_up`, and `abort` take an optional
+  `expectedRunId`. Unless it names the active run, the command fails and
+  changes nothing.
+- `request-id`: `prompt` takes an optional `requestId`. A prompt that repeats
+  one the session knows starts nothing and answers with that run's `runId`:
+  `{"disposition":"started"}` while the run is running or interrupted, and
+  `{"disposition":"handled"}` once it completed, failed, or was aborted. A
+  queued prompt (`streamingBehavior` during a run) cannot have one.
+- `resume-run`: `get_state.lastRun` describes the session's last run, and
+  `resume_run` continues it after a stop interrupted it.
+
+Runs are saved in the session journal: a run's start together with its
+prompt before `prompt` answers, and how it ended before `agent_settled`. A run
+that started and never ended is `interrupted`: pi crashed, was killed or
+ended by a signal, or saw stdin close mid-run. pi never resumes a run by
+itself.
+
+`get_state.lastRun` is `{runId, requestId, status, phase, pendingTools}`,
+without the fields that do not apply, and absent while the session has no run.
+`status` is `running`, `interrupted`, `completed`, `failed`, or `aborted`. For
+an interrupted run, `phase` is `model` when the saved context needs a model
+request and `tools` when the last reply has tool calls without results, which
+`pendingTools` lists as `{id, name, replaySafe}`. Without a `phase`, the run
+stopped after its last reply was saved, and resuming it just completes it.
+
+`resume_run {expectedRunId}` fails unless `expectedRunId` names the last run
+and that run is interrupted. It answers `{"disposition":"started","runId":…}`,
+and the run reports `agent_start` through `agent_settled` under the same
+`runId`. A tool call without a result runs again only if it is replay-safe:
+`read`, `grep`, `find`, `ls`, and extension tools whose manifest declares
+`"replaySafe": true`. Those run first, in the turn of the reply that called
+them, which is reported again as saved. Every other call (`bash`, `edit`,
+`write`, `todo`, the web tools, other extension tools) never runs again, and
+the model is told it was interrupted. A model request the stop cut off is sent
+again, and billed again. So a prompt is applied once, a call that is not
+replay-safe runs at most once, and a replay-safe one at least once.
+
+With no run active, `abort` ends an interrupted last run as `aborted` (with
+`expectedRunId`, only the run it names), and a new `prompt` ends it the same
+way before it starts. So a supervisor that restarts reads `lastRun`, then
+resumes the run it started, aborts it, or reads how it ended.
+
+The queue is saved with the session. `steer`, `follow_up`, and queued
+prompts are saved before they are acknowledged; a delivered message leaves
+the saved queue once its user message is saved; `clear_queue` saves the empty
+queue. RPC mode loads the saved queue at startup and on `switch_session`, so
+`pendingMessageCount` counts it; `new_session` starts empty. The TUI shares
+the saved queue and delivers saved steering as follow-ups.
+
+Closing stdin while no run is active exits with status 0. Closing it during a
+run stops the run where it is, kills its tool processes, and exits with status
+0 without `agent_settled`; the run stays interrupted.
+
+Differences from upstream are listed under "RPC Mode" in
+`docs/rust-rewrite/non-parity-register.md`.
+`crates/pi-cli/tests/rpc_parity.rs` runs every scenario of
+`tests/fixtures/ts-parity/rpc-protocol.json` and compares the records with
+upstream's, allowing exactly those differences.
 
 ## Validation
 
@@ -864,9 +1028,12 @@ The parity harness captures sanitized fixtures from upstream TypeScript code
 under `tests/fixtures/ts-parity/`. Provider fixtures record request shape:
 URL, method, selected headers, request body, or payload. Contract fixtures cover
 CLI flags, slash commands, settings normalization, and session/export shape
-where Rust intentionally supports compatibility or analogous behavior. Secrets
-are redacted. Rust tests compare covered behavior against those fixtures, so
-upstream changes become visible as fixture diffs and test failures.
+where Rust intentionally supports compatibility or analogous behavior. The RPC
+protocol fixture records every stdout record of upstream `pi --mode rpc` for
+scripted runs against a local stub model, and pi's RPC mode is compared with it
+record by record. Secrets are redacted. Rust tests
+compare covered behavior against those fixtures, so upstream changes become
+visible as fixture diffs and test failures.
 
 Generate fixtures from the configured reference:
 
@@ -962,14 +1129,19 @@ make test-smoke
 
 `make dogfood` runs the development TUI with `--continue --model faux/echo`.
 It also starts a quiet background `cargo build -p pi-cli` watcher; successful
-rebuilds restart the running TUI process, and the continued session restores
-conversation messages from disk. Restarts wait until the active turn and its
+rebuilds restart the running TUI process into the session it had open
+(`--session <file>` replaces the original session flags, so a restart never
+jumps to a newer session or forks again), which restores conversation
+messages from disk. Restarts wait until the active turn and its
 follow-ups finish — or until you are idle between prompts with nothing
 streaming — so a rebuild never interrupts work or lands under your fingers
 while typing. Interactive startup and `/resume` automatically continue
 unfinished model turns from saved context, then drain queued follow-ups. No
-synthetic user prompt is added and saved tool calls are not replayed; missing
-results are reported to the provider as interrupted calls. Completed direct
+synthetic user prompt is added, and saved results are reused. A tool call
+without a result runs again only if it is replay-safe (`read`, `grep`, `find`,
+`ls`, and extension tools whose manifest declares `"replaySafe": true`); any
+other call never runs again and is reported to the provider as interrupted.
+Completed direct
 slash tools do not trigger continuation. Ctrl+C/Esc, `/quit`, and errors still
 stop the active run; rebuild restarts wait for a completed boundary so a stop
 cannot turn into an automatic restart/retry loop. The agent safety limit is
