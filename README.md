@@ -833,6 +833,29 @@ own accounts, including saved `claude-import`/`codex-import` copies, refresh
 early. pi has no MCP support, so `--no-mcp` is accepted and does
 nothing, and `pi mcp` exits with an error.
 
+### Account failover
+
+With more than one stored account for a provider, `pi` can fail over between
+them instead of stopping at the first rate limit:
+
+```json
+{ "failover": { "enabled": true } }
+```
+
+Failover is availability-only, not load balancing: one sticky account carries
+the session and the others are used only when it returns 429/529 with no
+streamed output, or when its 5h usage window is at/above the exhaustion
+threshold (default 90%). Cooldowns come from the provider's own reset
+timestamps, and voluntary switches are rate-limited (default one per 10s) so
+the pool never flaps. Requests are never spread across accounts to maximize
+throughput. Per-provider tuning: `failover.providers.anthropic.exhaustionThresholdPct`
+and `minSwitchIntervalMs`. Pinning an account with `/account name` disables
+rotation for that session; run `pi help failover` for the summary.
+
+Pooled subscriptions remain subject to each provider's terms: failover is
+intended for accounts you are individually entitled to use, and the sticky
+behavior exists so the client does not multiply quota by rotation.
+
 Provider-specific environment:
 
 - Azure OpenAI: set `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`; optionally set `AZURE_OPENAI_DEPLOYMENT_NAME`, `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`, and `AZURE_OPENAI_API_VERSION`.

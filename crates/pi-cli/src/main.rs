@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod account_failover;
 mod auth_command;
 mod bug_report;
 mod clipboard;
@@ -1304,6 +1305,9 @@ fn print_auth_help(command: &str) {
         ),
         "accounts" => println!(
             "usage: pi accounts status [--refresh]\n\nShow auth and quota status for every configured account. --refresh bypasses the 15-minute usage cache."
+        ),
+        "failover" => println!(
+            "usage: settings.json {{ \"failover\": {{ \"enabled\": true }} }}\n\nEnable failover-only account rotation for providers with multiple stored accounts. One sticky account carries the session; others are used only when it is rate limited (429/529) or its 5h usage window passes the exhaustion threshold. Pinning an account with /account disables rotation for that session."
         ),
         _ => {}
     }
@@ -8311,6 +8315,11 @@ async fn run_turn_tui(
     )?;
 
     app.refresh_chrome(config, runtime);
+    // Failover notices (account switches and cooldowns) are surfaced as
+    // system entries rather than injected into the assistant stream.
+    for notice in account_failover::drain_notices() {
+        app.push(TuiEntryKind::System, notice);
+    }
     // Interrupt and quit drop the in-flight turn future, which cancels the
     // provider request; whatever already streamed stays visible.
     let turn_result = match stream_end {
@@ -8736,6 +8745,9 @@ async fn run_prompt_once(
     } else if !response.is_empty() {
         println!("{response}");
     }
+    for notice in account_failover::drain_notices() {
+        eprintln!("{notice}");
+    }
     Ok(response)
 }
 
@@ -8768,6 +8780,16 @@ async fn provider_for_runtime(
     let thinking_level = definition
         .reasoning()
         .then(|| effective_thinking_level(runtime, config).to_string());
+    let refresh_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let now = unix_seconds().unwrap_or(0);
+    if let Some(pool) =
+        failover_pool(runtime, config, &model.provider, &refresh_client, now).await?
+    {
+        return Ok(pool);
+    }
     let provider = FreshAuthProvider {
         config: ProviderConfig {
             thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
@@ -8782,10 +8804,7 @@ async fn provider_for_runtime(
         // The client `pi_ai::create_provider` uses: its idle timeout ends a
         // stalled request instead of hanging the turn.
         client: pi_ai::provider_http_client(),
-        refresh_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new()),
+        refresh_client,
         auth_path: config.paths.auth_path.clone(),
         auth: config.auth.clone(),
         account: runtime.session().active_account.clone(),
@@ -8793,6 +8812,121 @@ async fn provider_for_runtime(
     // Fail before the turn starts when there is no usable credential.
     provider.auth().await?;
     Ok(Box::new(provider))
+}
+
+/// Build a failover pool for the provider when failover is enabled and more
+/// than one stored account exists, and no explicit account is pinned for the
+/// session. Returns `None` when the single-account path should be used.
+/// Whether failover rotation is active for a provider: globally enabled,
+/// provider allowed (empty map means all), and more than one stored account.
+/// An explicitly pinned session account always disables rotation for that
+/// session.
+fn failover_enabled_for(config: &LoadedConfig, provider: &str) -> bool {
+    let Some(settings) = config.settings.failover.as_ref() else {
+        return false;
+    };
+    if !settings.enabled.unwrap_or(false) {
+        return false;
+    }
+    if !settings.providers.is_empty() && !settings.providers.contains_key(provider) {
+        return false;
+    }
+    config.auth.accounts_for_provider(provider).len() > 1
+}
+
+async fn failover_pool(
+    runtime: &Runtime,
+    config: &LoadedConfig,
+    provider: &str,
+    refresh_client: &reqwest::Client,
+    now: u64,
+) -> Result<Option<Box<dyn pi_ai::Provider>>> {
+    let settings = config.settings.failover.as_ref();
+    if !failover_enabled_for(config, provider) || runtime.session().active_account.is_some() {
+        return Ok(None);
+    }
+    let provider_settings = settings
+        .and_then(|settings| settings.providers.get(provider))
+        .cloned()
+        .unwrap_or_default();
+    let min_switch_interval_ms = provider_settings
+        .min_switch_interval_ms
+        .unwrap_or(account_failover::MIN_SWITCH_INTERVAL_MS);
+    let usage_cache = pi_config::read_usage_cache(&config.paths.agent_dir.join("usage-cache.json"))
+        .ok()
+        .flatten();
+    let failover_config = account_failover::FailoverConfig {
+        enabled: true,
+        cooldowns: BTreeMap::new(),
+        min_switch_interval_ms,
+    };
+    let candidates = account_failover::failover_candidates(
+        &config.auth,
+        usage_cache.as_ref(),
+        provider,
+        &failover_config,
+        now as i64,
+    );
+    if candidates.len() < 2 {
+        return Ok(None);
+    }
+    // Refresh each account's OAuth tokens before constructing providers so
+    // every account in the pool starts with usable credentials.
+    let mut resolved: Vec<(String, ResolvedAuth)> = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        let auth = oauth_refresh::refresh_expiring_auth(
+            refresh_client,
+            &config.paths.auth_path,
+            &config.auth,
+            provider,
+            Some(&candidate.account),
+            None,
+            now,
+        )
+        .await?;
+        let Some(auth) = auth else {
+            continue;
+        };
+        resolved.push((candidate.account.clone(), auth));
+    }
+    if resolved.len() < 2 {
+        return Ok(None);
+    }
+    let model = runtime
+        .session()
+        .active_model
+        .clone()
+        .expect("active model");
+    let definition = model_definition(config, &model).expect("model definition");
+    let thinking_level = definition
+        .reasoning()
+        .then(|| effective_thinking_level(runtime, config).to_string());
+    let session_id = runtime.session().session_id.clone();
+    let (remembered, remembered_cooldowns) = account_failover::remembered_state(provider);
+    let pool = account_failover::FailoverProviderBuilder::new(provider.to_string())
+        .min_switch_interval_ms(min_switch_interval_ms)
+        .remember(remembered);
+    let pool = remembered_cooldowns
+        .into_iter()
+        .fold(pool, |pool, (account, until)| pool.cooldown(account, until));
+    let pool = resolved
+        .into_iter()
+        .fold(pool, |pool, (account, auth)| {
+            pool.account(account, map_provider_auth(Some(auth)))
+        })
+        .build(move |auth| {
+            pi_ai::create_provider(ProviderConfig {
+                thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
+                thinking_level: thinking_level.clone(),
+                model: definition.model_ref(),
+                api: AiProviderApi::from(&definition.api),
+                base_url: definition.base_url.clone(),
+                auth,
+                session_id: Some(session_id.clone()),
+                traits: definition.traits(),
+            })
+        });
+    Ok(Some(Box::new(pool)))
 }
 
 /// A provider that resolves its credentials for every request, so a turn
@@ -9711,9 +9845,20 @@ fn account_selector_items(config: &LoadedConfig, runtime: &Runtime) -> Vec<Selec
     let Some(model) = runtime.session().active_model.clone() else {
         return Vec::new();
     };
+    let failover = failover_enabled_for(config, &model.provider);
+    let pinned_note = if failover {
+        " (pins account; failover disabled while pinned)"
+    } else {
+        ""
+    };
     let active = runtime.session().active_account.as_deref();
+    let failover = failover_enabled_for(config, &model.provider);
     let mut items = vec![SelectorItem {
-        label: "auto (default resolution)".to_string(),
+        label: if failover {
+            "auto (failover: sticky account, switches on limits)".to_string()
+        } else {
+            "auto (default resolution)".to_string()
+        },
         value: String::new(),
         active: active.is_none(),
     }];
@@ -9722,8 +9867,10 @@ fn account_selector_items(config: &LoadedConfig, runtime: &Runtime) -> Vec<Selec
             .into_iter()
             .map(|(account, source)| SelectorItem {
                 label: match source {
-                    AccountSource::Stored => account.clone(),
-                    AccountSource::Environment => format!("{account} (environment, read-only)"),
+                    AccountSource::Stored => format!("{account}{pinned_note}"),
+                    AccountSource::Environment => {
+                        format!("{account} (environment, read-only)")
+                    }
                     AccountSource::ImportedFile => {
                         format!("{account} (imported login file, read-only)")
                     }
