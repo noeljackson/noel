@@ -31,6 +31,26 @@ pub enum StreamEvent {
     },
 }
 
+/// True when a stop reason means the reply was cut off by the output-token
+/// or context limit, so tool-call arguments in it may be truncated:
+/// Anthropic and Bedrock `max_tokens`, OpenAI-compatible `length`, Gemini
+/// `MAX_TOKENS`, and Anthropic `model_context_window_exceeded`.
+pub fn is_output_limit_stop(reason: &str) -> bool {
+    matches!(
+        reason.to_ascii_lowercase().as_str(),
+        "max_tokens" | "length" | "max_output_tokens" | "model_context_window_exceeded"
+    )
+}
+
+/// Tool result for a call that came in a reply cut off by the output limit
+/// (upstream `failToolCallsFromTruncatedMessage`). The call is not run, so
+/// the model can re-issue it with complete arguments.
+pub fn truncated_tool_call_error(tool_name: &str) -> String {
+    format!(
+        "Tool call \"{tool_name}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments."
+    )
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderApi {
@@ -186,7 +206,10 @@ pub struct ToolDefinition {
 pub enum ProviderError {
     #[error("provider {provider} requires an API key")]
     MissingApiKey { provider: String },
-    #[error("request failed: {0}")]
+    #[error(
+        "request failed: {0}{timed_out}",
+        timed_out = if .0.is_timeout() { " (timed out)" } else { "" }
+    )]
     Request(#[from] reqwest::Error),
     #[error("request failed with status {status}: {body}")]
     Status {
@@ -218,7 +241,28 @@ pub trait Provider: Send + Sync {
 }
 
 pub fn create_provider(config: ProviderConfig) -> Box<dyn Provider> {
-    create_provider_with_client(config, reqwest::Client::new())
+    create_provider_with_client(config, provider_http_client())
+}
+
+/// Upstream's HTTP idle timeout (`DEFAULT_HTTP_IDLE_TIMEOUT_MS`): the longest
+/// a provider request waits for response headers, or for the next read of
+/// the body or stream.
+pub const PROVIDER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The client [`create_provider`] uses: a stalled request fails after
+/// [`PROVIDER_IDLE_TIMEOUT`] without progress with a timed-out
+/// [`ProviderError::Request`], which callers retry like any network error,
+/// instead of hanging the turn forever.
+pub fn provider_http_client() -> reqwest::Client {
+    provider_http_client_with_idle_timeout(PROVIDER_IDLE_TIMEOUT)
+}
+
+/// [`provider_http_client`] with another idle bound (tests use a short one).
+pub fn provider_http_client_with_idle_timeout(idle_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .read_timeout(idle_timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Builds a provider with a caller-owned client, allowing applications to set
@@ -284,7 +328,7 @@ async fn generate_openrouter_images(
             .as_deref()
             .unwrap_or("https://openrouter.ai/api/v1"),
     )?;
-    let response = reqwest::Client::new()
+    let response = provider_http_client()
         .post(format!(
             "{}/chat/completions",
             base_url.trim_end_matches('/')
@@ -1233,9 +1277,13 @@ fn anthropic_messages_url(config: &ProviderConfig) -> Result<String, ProviderErr
 }
 
 fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let max_tokens = request
+        .max_output_tokens
+        .unwrap_or_else(|| anthropic_default_max_tokens(&config.model.id, request))
+        .max(1);
     let mut body = json!({
         "model": config.model.id,
-        "max_tokens": request.max_output_tokens.unwrap_or(4096).max(1),
+        "max_tokens": max_tokens,
         "stream": true,
         "system": anthropic_system(config, request),
         "messages": anthropic_messages_with_cache_control(&request.messages, true),
@@ -1244,20 +1292,79 @@ fn anthropic_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
         body["tools"] = json!(anthropic_tools(&request.tools));
     }
     apply_anthropic_thinking(&mut body, config);
-    if request.max_output_tokens.is_some()
-        && body.pointer("/thinking/type").and_then(Value::as_str) == Some("enabled")
-    {
-        let limit = request.max_output_tokens.unwrap_or(4096);
-        if limit <= 1024 {
+    // A thinking budget must stay below max_tokens. An explicit cap keeps half
+    // of it for the answer; the model default keeps upstream's 1024 tokens.
+    if body.pointer("/thinking/type").and_then(Value::as_str) == Some("enabled") {
+        let answer_room = if request.max_output_tokens.is_some() {
+            max_tokens / 2
+        } else {
+            max_tokens.saturating_sub(1024)
+        };
+        if max_tokens <= 1024 {
             body["thinking"] = json!({"type":"disabled"});
         } else if let Some(budget) = body
             .pointer("/thinking/budget_tokens")
             .and_then(Value::as_u64)
         {
-            body["thinking"]["budget_tokens"] = json!(budget.min((limit / 2).max(1024)));
+            body["thinking"]["budget_tokens"] = json!(budget.min(answer_room.max(1024)));
         }
     }
     body
+}
+
+/// Output cap for an Anthropic Messages request that carries none. Upstream
+/// sends the model's catalog `maxTokens`, lowered so the estimated input fits
+/// the context window (`clampMaxTokensToContext`). The port has no output
+/// catalog, so Claude limits come from the model id; other models served over
+/// the Anthropic API get upstream's default for models without a catalog
+/// limit.
+fn anthropic_default_max_tokens(model_id: &str, request: &ProviderRequest) -> u64 {
+    const UNCATALOGED_MAX_TOKENS: u64 = 16_384;
+    let Some((max_tokens, context_window)) = claude_output_limits(model_id) else {
+        return UNCATALOGED_MAX_TOKENS;
+    };
+    let available = context_window
+        .saturating_sub(estimate_request_tokens(request))
+        .saturating_sub(CONTEXT_SAFETY_TOKENS)
+        .max(1);
+    max_tokens.min(available)
+}
+
+/// `(max output tokens, context window)` of a Claude model, read from the
+/// version in its id: `claude-opus-4-1-20250805`, `claude-sonnet-5`,
+/// `claude-3-5-haiku-20241022`. A date suffix is not a minor version.
+fn claude_output_limits(model_id: &str) -> Option<(u64, u64)> {
+    let id = model_id
+        .to_ascii_lowercase()
+        .replace(['.', '_', ':', '@'], "-");
+    let name = id.split("claude-").nth(1)?;
+    // Claude 3 ids put the version before the family.
+    if let Some(minor) = name.strip_prefix("3-") {
+        return Some(match minor.split('-').next() {
+            Some("7") => (64_000, 200_000),
+            Some("5") => (8_192, 200_000),
+            _ => (4_096, 200_000),
+        });
+    }
+    let mut parts = name.split('-');
+    let family = parts.next()?;
+    if matches!(family, "fable" | "mythos") {
+        return Some((128_000, 1_000_000));
+    }
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .filter(|minor| *minor < 100)
+        .unwrap_or(0);
+    match (family, major, minor) {
+        ("opus" | "sonnet" | "haiku", 5.., _) | ("opus" | "sonnet", 4, 6..) => {
+            Some((128_000, 1_000_000))
+        }
+        ("sonnet" | "haiku", 4, _) | ("opus", 4, 5) => Some((64_000, 200_000)),
+        ("opus", 4, _) => Some((32_000, 200_000)),
+        _ => None,
+    }
 }
 
 fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
@@ -4002,6 +4109,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn output_limit_stop_reasons_cover_every_provider_spelling() {
+        for reason in [
+            "max_tokens",
+            "MAX_TOKENS",
+            "length",
+            "max_output_tokens",
+            "model_context_window_exceeded",
+        ] {
+            assert!(is_output_limit_stop(reason), "{reason}");
+        }
+        for reason in [
+            "stop",
+            "STOP",
+            "end_turn",
+            "tool_use",
+            "toolUse",
+            "completed",
+        ] {
+            assert!(!is_output_limit_stop(reason), "{reason}");
+        }
+    }
+
+    /// Accepts one connection per reply, reads the request, writes the reply
+    /// (possibly nothing), and then keeps the connection open without
+    /// sending anything else.
+    fn spawn_stalling_server(replies: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        std::thread::spawn(move || {
+            let mut stalled = Vec::new();
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                let _ = stream.write_all(reply.as_bytes());
+                stalled.push(stream);
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn stalled_provider_requests_fail_after_the_idle_timeout() {
+        let url = spawn_stalling_server(vec![
+            // No response headers at all.
+            "",
+            // Headers and one event, then nothing.
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        ]);
+        let provider = create_provider_with_client(
+            ProviderConfig {
+                model: ModelRef {
+                    provider: "local".to_string(),
+                    id: "test".to_string(),
+                },
+                api: ProviderApi::OpenAi,
+                base_url: Some(url),
+                auth: ProviderAuth::ApiKey("test-key".to_string()),
+                thinking_level: None,
+                thinking_budget_tokens: None,
+                session_id: None,
+            },
+            provider_http_client_with_idle_timeout(Duration::from_millis(300)),
+        );
+
+        for expected_texts in [vec![], vec!["partial".to_string()]] {
+            let mut texts = Vec::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                provider.complete_streaming(uncapped_request("system"), &mut |event| {
+                    if let StreamEvent::Text(text) = event {
+                        texts.push(text);
+                    }
+                    Ok(())
+                }),
+            )
+            .await
+            .expect("the idle timeout must end a stalled request");
+            let error = result.expect_err("stalled request");
+            assert!(
+                matches!(&error, ProviderError::Request(source) if source.is_timeout()),
+                "{error:?}"
+            );
+            assert!(error.to_string().ends_with("(timed out)"), "{error}");
+            assert_eq!(texts, expected_texts);
+        }
+        assert_eq!(PROVIDER_IDLE_TIMEOUT, Duration::from_secs(300));
+    }
+
     #[tokio::test]
     async fn faux_provider_echoes_last_user_message() {
         let provider = create_provider(ProviderConfig {
@@ -5301,6 +5522,92 @@ mod tests {
         }
     }
 
+    fn anthropic_test_config(
+        id: &str,
+        thinking: Option<&str>,
+        budget: Option<u64>,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            model: ModelRef {
+                provider: "anthropic".to_string(),
+                id: id.to_string(),
+            },
+            api: ProviderApi::Anthropic,
+            base_url: None,
+            auth: ProviderAuth::ApiKey("token".to_string()),
+            thinking_level: thinking.map(str::to_string),
+            thinking_budget_tokens: budget,
+            session_id: None,
+        }
+    }
+
+    fn uncapped_request(system_prompt: &str) -> ProviderRequest {
+        ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: Some(system_prompt.to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "write the file".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn anthropic_requests_without_a_cap_use_the_model_output_limit() {
+        let request = uncapped_request("system");
+        for (id, expected) in [
+            ("claude-opus-4-8", 128_000),
+            ("claude-opus-5", 128_000),
+            ("claude-sonnet-4-6", 128_000),
+            ("claude-fable-5-1", 128_000),
+            ("claude-sonnet-4-5-20250929", 64_000),
+            ("claude-haiku-4-5-20251001", 64_000),
+            ("claude-opus-4-5", 64_000),
+            ("claude-sonnet-4-20250514", 64_000),
+            ("claude-opus-4-1-20250805", 32_000),
+            ("claude-opus-4-20250514", 32_000),
+            ("claude-3-7-sonnet-20250219", 64_000),
+            ("claude-3-5-haiku-20241022", 8_192),
+            ("claude-3-haiku-20240307", 4_096),
+            ("kimi-for-coding", 16_384),
+            ("MiniMax-M2.7", 16_384),
+        ] {
+            let body = anthropic_body(&anthropic_test_config(id, None, None), &request);
+            assert_eq!(body["max_tokens"], expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn anthropic_default_cap_leaves_room_in_the_context_window() {
+        // The input estimates as 160_004 tokens (560k + 14 characters at 3.5
+        // per token); 200k minus that and the 4096 safety margin remain.
+        let request = uncapped_request(&"x".repeat(560_000));
+        let config = anthropic_test_config("claude-sonnet-4-5", None, None);
+        assert_eq!(anthropic_body(&config, &request)["max_tokens"], 35_900);
+
+        // A thinking budget stays below the cap and leaves 1024 for the answer.
+        let thinking = anthropic_test_config("claude-sonnet-4-5", Some("high"), Some(50_000));
+        let body = anthropic_body(&thinking, &request);
+        assert_eq!(body["thinking"]["budget_tokens"], 34_876);
+        let body = anthropic_body(&thinking, &uncapped_request("system"));
+        assert_eq!(body["max_tokens"], 64_000);
+        assert_eq!(body["thinking"]["budget_tokens"], 50_000);
+
+        // An explicit cap is still sent as given.
+        let capped = ProviderRequest {
+            max_output_tokens: Some(2048),
+            ..request
+        };
+        let body = anthropic_body(&thinking, &capped);
+        assert_eq!(body["max_tokens"], 2048);
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+    }
+
     #[test]
     fn opus_5_5_uses_adaptive_thinking_with_xhigh() {
         let request = ProviderRequest {
@@ -5372,7 +5679,8 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
-            max_output_tokens: None,
+            // The TS fixture script passes an explicit `maxTokens: 4096`.
+            max_output_tokens: Some(4096),
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5428,7 +5736,8 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
-            max_output_tokens: None,
+            // The TS fixture script passes an explicit `maxTokens: 4096`.
+            max_output_tokens: Some(4096),
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,
@@ -5638,7 +5947,8 @@ mod tests {
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
-            max_output_tokens: None,
+            // The TS fixture script passes an explicit `maxTokens: 4096`.
+            max_output_tokens: Some(4096),
             system_prompt: Some("pi rust cli".to_string()),
             messages: vec![ChatMessage {
                 role: ChatRole::User,

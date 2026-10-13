@@ -183,6 +183,46 @@ Reason: model lists are provider-owned and change out of band; a stale or
 poisoned cache must never delete working models, and the user needs a manual
 escape hatch when the background refresh cannot recover on its own.
 
+### Anthropic Output Cap Without an Output Catalog
+
+Upstream sends each request the model's catalog `maxTokens`, lowered so the
+estimated input fits the context window. The Rust model catalog has no output
+limits, so an Anthropic Messages request without an explicit cap reads the
+Claude output limit and context window from the version in the model id (for
+example 128000 for Opus 4.6 and later, 64000 for Sonnet and Haiku 4.5, 32000
+for Opus 4.1) and applies the same context clamp. Other models served over
+the Anthropic API get upstream's 16384 default for models without a catalog
+limit instead of their upstream catalog values.
+
+Reason: Anthropic requires `max_tokens`, and the former fixed 4096 cut off
+long replies, thinking, and large `write` calls. Reading the limit from the id
+keeps new Claude models working without a catalog update.
+
+### auth.json Lock and Mode
+
+Upstream serializes `auth.json` updates with a `proper-lockfile` directory
+(`auth.json.lock`, stale after 30 seconds) and applies mode 0600 only when it
+creates the file. Rust takes an advisory `flock` on a sibling
+`auth.json.flock` and replaces `auth.json` by an atomic rename, so every write
+leaves it 0600.
+
+Reason: the operating system releases a `flock` when its holder exits, so no
+stale-lock recovery is needed, and the separate name never collides with an
+upstream process's lock directory. An atomic rename cannot keep the previous
+file's mode, and credentials should never be left group- or world-readable.
+
+### Exact-Match edit Tool
+
+The `edit` tool follows upstream's rules (unique `oldText`, no overlapping
+edits, all edits applied at once, empty `newText`, `edits` as a JSON string,
+BOM and CRLF kept) but matches exactly: it does not fall back to upstream's
+fuzzy matching of smart quotes, Unicode dashes and spaces, and trailing
+whitespace. It also converts only the edited text to the file's line endings
+instead of normalizing a mixed-ending file.
+
+Reason: an exact match cannot edit the wrong region, and bytes outside the
+edits stay untouched.
+
 ### Configurable Agent Round Cap
 
 The per-run provider round cap (`agent.maxToolRounds`, default 200, including

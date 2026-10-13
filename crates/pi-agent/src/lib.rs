@@ -184,6 +184,9 @@ pub async fn run_turn(
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();
+        // A reply cut off by the output limit may carry truncated arguments
+        // that still parse; none of its tool calls run.
+        let mut truncated = false;
         for event in events {
             match event {
                 StreamEvent::Text(delta) => text.push_str(&delta),
@@ -196,6 +199,7 @@ pub async fn run_turn(
                     name,
                     arguments,
                 }),
+                StreamEvent::Stop { reason } => truncated |= pi_ai::is_output_limit_stop(&reason),
                 _ => {}
             }
         }
@@ -210,7 +214,11 @@ pub async fn run_turn(
         });
 
         if let FinalOutputPolicy::RequiredTool { name } = &config.final_output {
-            if let Some(call) = tool_calls.iter().find(|call| &call.name == name) {
+            if let Some(call) = tool_calls
+                .iter()
+                .find(|call| &call.name == name)
+                .filter(|_| !truncated)
+            {
                 let arguments = serde_json::from_str(&call.arguments).map_err(|source| {
                     AgentError::InvalidToolArguments {
                         tool: call.name.clone(),
@@ -243,7 +251,11 @@ pub async fn run_turn(
                 return Err(AgentError::Cancelled);
             }
             on_event(&AgentEvent::ToolStarted(call.clone()));
-            let result = executor.execute(&call).await;
+            let result = if truncated {
+                Err(pi_ai::truncated_tool_call_error(&call.name))
+            } else {
+                executor.execute(&call).await
+            };
             let (output, is_error) = match result {
                 Ok(output) => (output, false),
                 Err(error) => (error, true),
@@ -449,5 +461,165 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, AgentError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn tool_calls_from_a_reply_cut_off_at_the_output_limit_are_not_run() {
+        struct TruncatedThenDone(std::sync::Mutex<usize>);
+
+        #[async_trait]
+        impl Provider for TruncatedThenDone {
+            async fn complete(
+                &self,
+                _request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                let mut calls = self.0.lock().unwrap();
+                *calls += 1;
+                if *calls > 1 {
+                    return Ok(vec![StreamEvent::Text("done".to_string())]);
+                }
+                Ok(vec![
+                    StreamEvent::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: r#"{"command":"rm -rf build"}"#.to_string(),
+                    },
+                    StreamEvent::Stop {
+                        reason: "length".to_string(),
+                    },
+                ])
+            }
+        }
+
+        struct RecordingExecutor(std::sync::Mutex<Vec<String>>);
+
+        #[async_trait]
+        impl ToolExecutor for RecordingExecutor {
+            async fn execute(&self, call: &ChatToolCall) -> Result<String, String> {
+                self.0.lock().unwrap().push(call.name.clone());
+                Ok("ran".to_string())
+            }
+        }
+
+        let executor = RecordingExecutor(std::sync::Mutex::new(Vec::new()));
+        let mut state = AgentState::default();
+        let output = run_turn(
+            &TruncatedThenDone(std::sync::Mutex::new(0)),
+            &mut state,
+            "clean up".into(),
+            &AgentConfig::default(),
+            &executor,
+            &CancellationToken::default(),
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, AgentOutput::Text("done".to_string()));
+        assert!(executor.0.lock().unwrap().is_empty());
+        let result = &state.messages[2];
+        assert_eq!(result.role, ChatRole::Tool);
+        assert_eq!(result.tool_call_id.as_deref(), Some("call_1"));
+        assert!(
+            result.content.contains("output token limit"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_stalls_before_any_output_is_retried() {
+        use std::io::{Read, Write};
+        // The first connection never answers; the second one does.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        std::thread::spawn(move || {
+            let mut stalled = Vec::new();
+            for answer in [false, true] {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                // Read the whole request so closing the socket cannot reset it.
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let line = line.to_ascii_lowercase();
+                                line.strip_prefix("content-length:")?.trim().parse().ok()
+                            })
+                            .unwrap_or(0usize);
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                if answer {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+                          data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                    );
+                } else {
+                    stalled.push(stream);
+                }
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let provider = pi_ai::create_provider_with_client(
+            pi_ai::ProviderConfig {
+                model: pi_ai::ModelRef {
+                    provider: "local".to_string(),
+                    id: "test".to_string(),
+                },
+                api: pi_ai::ProviderApi::OpenAi,
+                base_url: Some(url),
+                auth: pi_ai::ProviderAuth::ApiKey("test-key".to_string()),
+                thinking_level: None,
+                thinking_budget_tokens: None,
+                session_id: None,
+            },
+            pi_ai::provider_http_client_with_idle_timeout(Duration::from_millis(300)),
+        );
+        let request = ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hi".to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+        };
+
+        let events = tokio::time::timeout(
+            Duration::from_secs(20),
+            complete_with_retry(
+                provider.as_ref(),
+                request,
+                &RetryPolicy {
+                    max_retries: 1,
+                    base_delay_ms: 0,
+                    ..RetryPolicy::default()
+                },
+                &CancellationToken::default(),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("the idle timeout must end the stalled attempt")
+        .expect("the retry succeeds");
+
+        assert!(events.contains(&StreamEvent::Text("ok".to_string())));
     }
 }

@@ -1358,14 +1358,15 @@ mod tests {
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
-        // So does a token pi has no refresh token for.
+        // So does a token pi has no refresh token for. It gets its own auth
+        // file: the one above now holds the refreshed token, which wins.
         let unrefreshable = config_with(
             &[(
                 "anthropic",
                 "default",
                 oauth("no-refresh-token", None, 1_180),
             )],
-            &root,
+            &root.join("unrefreshable"),
         );
         let result = check(
             &unrefreshable,

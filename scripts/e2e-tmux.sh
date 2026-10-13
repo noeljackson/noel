@@ -341,7 +341,22 @@ send_line "/multiline"
 send_line "multi one"
 send_line "multi two"
 send_line "."
+# A bare /delete never deletes; it names the current session to delete by id.
 send_line "/delete"
+current_session=""
+for _ in $(seq 1 20); do
+  current_session="$(tmux capture-pane -t "${session_name}" -p -S -2000 \
+    | grep -o 'the current session is [^)]*' | tail -n 1 \
+    | sed 's/^the current session is //' || true)"
+  [ -n "${current_session}" ] && break
+  sleep 0.25
+done
+if [ -z "${current_session}" ]; then
+  tmux capture-pane -t "${session_name}" -p -S -2000 >&2
+  echo "bare /delete did not name the current session" >&2
+  exit 1
+fi
+send_line "/delete ${current_session}"
 send_line "/session"
 send_line "/quit"
 sleep 0.5

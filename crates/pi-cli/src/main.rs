@@ -97,7 +97,7 @@ enum TuiMode {
     Regular,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "pi")]
 #[command(version)]
 #[command(about = "Native Rust CLI for pi")]
@@ -612,9 +612,9 @@ async fn run_auth_login(args: &[String]) -> Result<()> {
     if key.trim().is_empty() {
         return Err(anyhow!("api key is empty"));
     }
-    let mut auth = read_auth_data(&paths.auth_path)?;
-    auth.insert(&provider, &account, AuthCredential::ApiKey { key });
-    write_auth_data(&paths.auth_path, &auth)?;
+    pi_config::update_auth_file(&paths.auth_path, |auth| {
+        auth.insert(&provider, &account, AuthCredential::ApiKey { key })
+    })?;
     println!(
         "stored API-key auth for {provider}{} in {}",
         account_suffix(&account),
@@ -654,21 +654,22 @@ async fn run_codex_login(paths: &ConfigPaths, account: &str) -> Result<()> {
         },
     )
     .await?;
-    let mut auth = read_auth_data(&paths.auth_path)?;
-    let replaced = auth.credential("openai-codex", account).is_some();
-    for provider in ["openai", "openai-codex"] {
-        auth.insert(
-            provider,
-            account,
-            AuthCredential::OAuth {
-                access_token: tokens.access_token.clone(),
-                refresh_token: tokens.refresh_token.clone(),
-                expires: tokens.expires,
-                account_id: tokens.account_id.clone(),
-            },
-        );
-    }
-    write_auth_data(&paths.auth_path, &auth)?;
+    let replaced = pi_config::update_auth_file(&paths.auth_path, |auth| {
+        let replaced = auth.credential("openai-codex", account).is_some();
+        for provider in ["openai", "openai-codex"] {
+            auth.insert(
+                provider,
+                account,
+                AuthCredential::OAuth {
+                    access_token: tokens.access_token.clone(),
+                    refresh_token: tokens.refresh_token.clone(),
+                    expires: tokens.expires,
+                    account_id: tokens.account_id.clone(),
+                },
+            );
+        }
+        replaced
+    })?;
     println!(
         "logged in as account {account}{}",
         if replaced {
@@ -699,19 +700,20 @@ async fn run_claude_login(paths: &ConfigPaths, account: &str) -> Result<()> {
     )
     .await
     .map_err(|_| anyhow!("login timed out after 15 minutes"))??;
-    let mut auth = read_auth_data(&paths.auth_path)?;
-    let replaced = auth.credential("anthropic", account).is_some();
-    auth.insert(
-        "anthropic",
-        account,
-        AuthCredential::OAuth {
-            access_token: tokens.access_token.clone(),
-            refresh_token: tokens.refresh_token.clone(),
-            expires: tokens.expires,
-            account_id: tokens.account_id.clone(),
-        },
-    );
-    write_auth_data(&paths.auth_path, &auth)?;
+    let replaced = pi_config::update_auth_file(&paths.auth_path, |auth| {
+        let replaced = auth.credential("anthropic", account).is_some();
+        auth.insert(
+            "anthropic",
+            account,
+            AuthCredential::OAuth {
+                access_token: tokens.access_token.clone(),
+                refresh_token: tokens.refresh_token.clone(),
+                expires: tokens.expires,
+                account_id: tokens.account_id.clone(),
+            },
+        );
+        replaced
+    })?;
     println!(
         "logged in as account {account}{}",
         if replaced {
@@ -756,9 +758,10 @@ fn run_auth_logout(args: &[String]) -> Result<()> {
     let account = account.unwrap_or_else(|| DEFAULT_ACCOUNT_NAME.to_string());
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd, None)?;
-    let mut auth = read_auth_data(&paths.auth_path)?;
-    if auth.remove(&provider, &account).is_some() {
-        write_auth_data(&paths.auth_path, &auth)?;
+    let removed = pi_config::update_auth_file(&paths.auth_path, |auth| {
+        auth.remove(&provider, &account).is_some()
+    })?;
+    if removed {
         println!(
             "removed stored auth for {provider}{}",
             account_suffix(&account)
@@ -1234,26 +1237,6 @@ fn read_settings_packages(path: &Path) -> Result<Vec<PackageSource>> {
     Ok(settings.packages)
 }
 
-fn read_auth_data(path: &Path) -> Result<AuthData> {
-    if !path.exists() {
-        return Ok(AuthData::default());
-    }
-    Ok(serde_json::from_str::<AuthData>(&fs::read_to_string(
-        path,
-    )?)?)
-}
-
-fn write_auth_data(path: &Path, auth: &AuthData) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_file_atomic(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(auth)?).as_bytes(),
-    )?;
-    Ok(())
-}
-
 fn default_api_key_env(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
@@ -1335,6 +1318,11 @@ async fn main() -> Result<()> {
         }
     }
     apply_cli_overrides(&cli, &cwd, &mut config)?;
+    let _ = CONFIG_SOURCE.set(ConfigSource {
+        cli: cli.clone(),
+        cwd: cwd.clone(),
+        project_trusted,
+    });
     if cli.verbose {
         eprintln!("agent dir: {}", config.paths.agent_dir.display());
         eprintln!("session dir: {}", config.paths.session_dir.display());
@@ -1367,7 +1355,7 @@ async fn main() -> Result<()> {
     let mut systems = ReloadableSystems::from_config(&config, 1);
     systems.offline = offline;
     let mut runtime = create_runtime(&cli, &cwd, &config, systems)?;
-    select_initial_model(&mut runtime, &config, &cli)?;
+    select_initial_model(&mut runtime, &config, &cli, offline)?;
     if cli.no_tools || cli.no_builtin_tools {
         runtime.set_disabled_tools(default_active_tool_names())?;
     } else {
@@ -1482,7 +1470,7 @@ async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) 
                 }
             }
             "reload" => {
-                config = load_config(config.paths.clone())?;
+                config = reload_config(&config)?;
                 start_model_refresh(&config, offline, false);
                 let next_generation = runtime.systems().config_generation + 1;
                 match runtime.reload(ReloadableSystems::from_config(&config, next_generation)) {
@@ -1568,6 +1556,41 @@ fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Val
             "message": message,
         },
     })
+}
+
+/// How startup built this process's config: the project trust decision and
+/// the command line. `/reload`, `/models refresh|reset`, and RPC `reload`
+/// rebuild the config the same way, so a reload neither trusts a project the
+/// session did not trust nor drops `--system-prompt`, `-e`, `--api-key`, and
+/// the other command-line overrides.
+#[derive(Debug, Clone)]
+struct ConfigSource {
+    cli: Cli,
+    cwd: PathBuf,
+    project_trusted: bool,
+}
+
+static CONFIG_SOURCE: std::sync::OnceLock<ConfigSource> = std::sync::OnceLock::new();
+
+impl ConfigSource {
+    fn load(&self, paths: ConfigPaths) -> Result<LoadedConfig> {
+        let mut config = load_config_with_project_trust(paths, self.project_trusted)?;
+        apply_cli_overrides(&self.cli, &self.cwd, &mut config)?;
+        Ok(config)
+    }
+}
+
+/// Reloads the config the way startup built it (see [`ConfigSource`]).
+fn reload_config(config: &LoadedConfig) -> Result<LoadedConfig> {
+    match CONFIG_SOURCE.get() {
+        Some(source) => source.load(config.paths.clone()),
+        // Only startup records a source. Without one there are no overrides
+        // to keep, and a project counts as trusted only by a saved decision.
+        None => Ok(load_config_with_project_trust(
+            config.paths.clone(),
+            project_is_trusted(&config.paths.agent_dir, &config.paths.cwd)?,
+        )?),
+    }
 }
 
 fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Result<()> {
@@ -1726,7 +1749,7 @@ fn apply_cached_claude_code_version(config: &LoadedConfig) {
 }
 
 fn start_model_refresh(config: &LoadedConfig, offline: bool, verbose: bool) {
-    if offline || !model_refresh_enabled(&config.settings) {
+    if !background_refresh_allowed(&config.settings, offline, pi_config::test_isolation()) {
         return;
     }
     let ttl_hours = model_refresh_ttl_hours(&config.settings);
@@ -1742,6 +1765,13 @@ fn start_model_refresh(config: &LoadedConfig, offline: bool, verbose: bool) {
             }
         }
     });
+}
+
+/// Background model refresh runs only online and when enabled, and never
+/// under the test harness (`PI_TEST_ISOLATION`), so tests never call
+/// providers with whatever credentials they can see.
+fn background_refresh_allowed(settings: &Settings, offline: bool, test_isolation: bool) -> bool {
+    !offline && !test_isolation && model_refresh_enabled(settings)
 }
 
 fn model_refresh_enabled(settings: &Settings) -> bool {
@@ -2784,7 +2814,12 @@ fn most_recent_session(session_dir: &Path, cwd: Option<&Path>) -> Result<Option<
     Ok(sessions.pop().map(|summary| summary.path))
 }
 
-fn select_initial_model(runtime: &mut Runtime, config: &LoadedConfig, cli: &Cli) -> Result<()> {
+fn select_initial_model(
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    cli: &Cli,
+    offline: bool,
+) -> Result<()> {
     if runtime.session().active_model.is_some() && cli.provider.is_none() && cli.model.is_none() {
         return Ok(());
     }
@@ -2795,32 +2830,102 @@ fn select_initial_model(runtime: &mut Runtime, config: &LoadedConfig, cli: &Cli)
         })
     } else if let Some(model) = &cli.model {
         resolve_model_reference(config, model)
-    } else if let (Some(provider), Some(id)) = (
-        &config.settings.default_provider,
-        &config.settings.default_model,
-    ) {
-        Some(ModelRef {
-            provider: provider.clone(),
-            id: id.clone(),
-        })
     } else {
-        config
-            .models
-            .iter()
-            .find(|model| model.provider == "faux")
-            .or_else(|| {
-                config
-                    .models
-                    .iter()
-                    .find(|model| has_auth_for_provider(&config.auth, &model.provider, None))
-            })
-            .map(|model| ModelRef {
-                provider: model.provider.clone(),
-                id: model.id.clone(),
-            })
+        default_model(config, offline)
     };
     runtime.set_active_model(model)?;
     Ok(())
+}
+
+/// Upstream `defaultModelPerProvider` (core/model-resolver.ts): the model a
+/// provider with credentials starts on. Providers the catalog lacks never
+/// match.
+const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
+    ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
+    ("ant-ling", "Ring-2.6-1T"),
+    ("anthropic", "claude-opus-4-8"),
+    ("openai", "gpt-5.5"),
+    ("azure", "gpt-5.4"),
+    ("openai-codex", "gpt-6.1-sol"),
+    ("radius", "balanced"),
+    ("nvidia", "nvidia/nemotron-3-ultra-550b-a55b"),
+    ("deepseek", "deepseek-v4-pro"),
+    ("google", "gemini-3.1-pro-preview"),
+    ("google-vertex", "gemini-3.1-pro-preview"),
+    ("github-copilot", "gpt-5.4"),
+    ("openrouter", "moonshotai/kimi-k2.6"),
+    ("vercel-ai-gateway", "zai/glm-5.1"),
+    ("xai", "grok-4.7"),
+    ("groq", "openai/gpt-oss-120b"),
+    ("cerebras", "gpt-oss-120b"),
+    ("zai", "glm-5.3"),
+    ("zai-coding-cn", "glm-5.3"),
+    ("mistral", "devstral-medium-latest"),
+    ("minimax", "MiniMax-M2.7"),
+    ("minimax-cn", "MiniMax-M2.7"),
+    ("moonshotai", "kimi-k2.6"),
+    ("moonshotai-cn", "kimi-k2.6"),
+    ("huggingface", "moonshotai/Kimi-K2.6"),
+    ("fireworks", "accounts/fireworks/models/kimi-k3"),
+    ("together", "moonshotai/Kimi-K3"),
+    ("baseten", "zai-org/GLM-5.2"),
+    ("opencode", "kimi-k2.6"),
+    ("opencode-go", "kimi-k3"),
+    ("kimi-coding", "kimi-for-coding"),
+    ("meta", "muse-spark-1.3"),
+    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
+    (
+        "cloudflare-ai-gateway",
+        "workers-ai/@cf/moonshotai/kimi-k2.6",
+    ),
+    ("qwen-token-plan", "qwen3.7-max"),
+    ("qwen-token-plan-cn", "qwen3.7-max"),
+    ("qwen-token-plan-individual", "qwen3.8-max"),
+    ("xiaomi", "mimo-v2.5-pro"),
+    ("xiaomi-token-plan-cn", "mimo-v2.5-pro"),
+    ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
+    ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
+];
+
+/// The startup model when neither the command line nor the session names
+/// one, in upstream's order (`findInitialModel`): the saved default if its
+/// provider has credentials, then a model with credentials (a provider's
+/// usual model first), and a faux model only when nothing else can run.
+/// Offline, only faux can run.
+fn default_model(config: &LoadedConfig, offline: bool) -> Option<ModelRef> {
+    let usable = |provider: &str| {
+        provider == "faux" || (!offline && has_auth_for_provider(&config.auth, provider, None))
+    };
+    if let (Some(provider), Some(id)) = (
+        &config.settings.default_provider,
+        &config.settings.default_model,
+    ) {
+        if usable(provider) {
+            return Some(ModelRef {
+                provider: provider.clone(),
+                id: id.clone(),
+            });
+        }
+    }
+    let with_auth = config
+        .models
+        .iter()
+        .filter(|model| model.provider != "faux" && usable(&model.provider))
+        .collect::<Vec<_>>();
+    PROVIDER_DEFAULT_MODELS
+        .iter()
+        .find_map(|(provider, id)| {
+            with_auth
+                .iter()
+                .find(|model| model.provider == *provider && model.id == *id)
+        })
+        .or_else(|| with_auth.first())
+        .copied()
+        .or_else(|| config.models.iter().find(|model| model.provider == "faux"))
+        .map(|model| ModelRef {
+            provider: model.provider.clone(),
+            id: model.id.clone(),
+        })
 }
 
 fn resolve_model_reference(config: &LoadedConfig, reference: &str) -> Option<ModelRef> {
@@ -6797,12 +6902,7 @@ fn apply_tui_selector_selection(
             );
         }
         "logout" => {
-            if config
-                .auth
-                .remove(&item.value, DEFAULT_ACCOUNT_NAME)
-                .is_some()
-            {
-                write_auth_file(config)?;
+            if remove_stored_auth(config, &item.value, DEFAULT_ACCOUNT_NAME)? {
                 app.push(
                     TuiEntryKind::System,
                     format!("removed stored auth for {}", item.value),
@@ -7221,7 +7321,7 @@ async fn handle_tui_submission(
         "/reload" => {
             let lifecycle_diagnostics =
                 notify_extension_lifecycle(&config.extensions, "reload", &runtime.session().cwd);
-            *config = load_config(config.paths.clone())?;
+            *config = reload_config(config)?;
             start_model_refresh(config, offline, false);
             let next_generation = runtime.systems().config_generation + 1;
             let report = runtime.reload(ReloadableSystems::from_config(config, next_generation))?;
@@ -7288,6 +7388,7 @@ async fn handle_tui_submission(
                 Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
             }
         }
+        "/image" => app.push(TuiEntryKind::System, "usage: /image <path> [prompt]"),
         _ if line.starts_with("/image ") => {
             let rest = line.trim_start_matches("/image ").trim();
             let (path, prompt) = split_once_text(rest);
@@ -7337,7 +7438,7 @@ async fn handle_tui_submission(
                     } else {
                         let report =
                             refresh_model_cache(config.paths.clone(), config.auth.clone()).await?;
-                        *config = load_config(config.paths.clone())?;
+                        *config = reload_config(config)?;
                         let next_generation = runtime.systems().config_generation + 1;
                         let reload_report = runtime
                             .reload(ReloadableSystems::from_config(config, next_generation))?;
@@ -7349,7 +7450,7 @@ async fn handle_tui_submission(
                 }
                 "reset" => {
                     let message = reset_model_cache(&config.paths.model_cache_path)?;
-                    *config = load_config(config.paths.clone())?;
+                    *config = reload_config(config)?;
                     let next_generation = runtime.systems().config_generation + 1;
                     let reload_report =
                         runtime.reload(ReloadableSystems::from_config(config, next_generation))?;
@@ -7503,6 +7604,7 @@ async fn handle_tui_submission(
             )
             .await);
         }
+        "/prompt" => app.push(TuiEntryKind::System, "usage: /prompt <name> [input]"),
         _ if line.starts_with("/prompt ") => {
             let rest = line.trim_start_matches("/prompt ").trim();
             let (name, input) = split_once_text(rest);
@@ -7580,8 +7682,20 @@ async fn handle_tui_submission(
         }
         _ if line.starts_with("/name") => {
             let name = line.trim_start_matches("/name").trim();
-            runtime.rename_session((!name.is_empty()).then(|| name.to_string()))?;
-            app.push(TuiEntryKind::System, format_session(runtime));
+            if name.is_empty() {
+                // Upstream: a bare /name shows the current name; it never
+                // clears it.
+                app.push(
+                    TuiEntryKind::System,
+                    match &runtime.session().name {
+                        Some(name) => format!("session name: {name}"),
+                        None => "usage: /name <name>".to_string(),
+                    },
+                );
+            } else {
+                runtime.rename_session(Some(name.to_string()))?;
+                app.push(TuiEntryKind::System, format_session(runtime));
+            }
         }
         _ if line.starts_with("/labels") => {
             let labels = line
@@ -7592,11 +7706,21 @@ async fn handle_tui_submission(
             runtime.set_labels(labels)?;
             app.push(TuiEntryKind::System, format_session(runtime));
         }
-        _ if line.starts_with("/export ") => {
-            let path = PathBuf::from(line.trim_start_matches("/export ").trim());
+        _ if line == "/export" || line.starts_with("/export ") => {
+            let requested = line.trim_start_matches("/export").trim();
+            let path = if requested.is_empty() {
+                // Upstream's default: pi-session-<session>.html in the cwd.
+                runtime
+                    .session()
+                    .cwd
+                    .join(format!("pi-session-{}.html", runtime.session().session_id))
+            } else {
+                PathBuf::from(requested)
+            };
             export_session(runtime, &path)?;
             app.push(TuiEntryKind::System, format!("exported {}", path.display()));
         }
+        "/import" => app.push(TuiEntryKind::System, "usage: /import <path.jsonl>"),
         _ if line.starts_with("/import ") => {
             let path = PathBuf::from(line.trim_start_matches("/import ").trim());
             let (store, state) = SessionStore::import_path(&config.paths.session_dir, &path)?;
@@ -7634,8 +7758,7 @@ async fn handle_tui_submission(
                 let mut parts = args.split_whitespace();
                 let provider = parts.next().unwrap_or_default();
                 let account = parts.next().unwrap_or(DEFAULT_ACCOUNT_NAME);
-                if config.auth.remove(provider, account).is_some() {
-                    write_auth_file(config)?;
+                if remove_stored_auth(config, provider, account)? {
                     app.push(
                         TuiEntryKind::System,
                         format!(
@@ -9358,12 +9481,7 @@ fn select_from_selector_message(
             ))
         }
         "logout" => {
-            if config
-                .auth
-                .remove(&item.value, DEFAULT_ACCOUNT_NAME)
-                .is_some()
-            {
-                write_auth_file(config)?;
+            if remove_stored_auth(config, &item.value, DEFAULT_ACCOUNT_NAME)? {
                 Ok(format!("removed stored auth for {}", item.value))
             } else {
                 Ok(format!("no stored auth for {}", item.value))
@@ -9995,14 +10113,14 @@ fn delete_session_message(
     line: &str,
 ) -> Result<String> {
     let reference = line.trim_start_matches("/delete").trim();
-    let target = if reference.is_empty() {
-        runtime
-            .store()
-            .map(|store| store.path().to_path_buf())
-            .ok_or_else(|| anyhow!("ephemeral session cannot be deleted"))?
-    } else {
-        resolve_session_reference(&config.paths.session_dir, reference)?
-    };
+    if reference.is_empty() {
+        // Deleting is never implicit: name the session, even the current one.
+        return Ok(format!(
+            "usage: /delete <id|name|path> (the current session is {})",
+            runtime.session().session_id
+        ));
+    }
+    let target = resolve_session_reference(&config.paths.session_dir, reference)?;
     let deleting_current = runtime
         .store()
         .map(|store| store.path() == target)
@@ -10046,15 +10164,15 @@ async fn copy_last_assistant_message(runtime: &Runtime) -> Result<String> {
     Ok(format!("{}\n{status}", message.content))
 }
 
-fn write_auth_file(config: &LoadedConfig) -> Result<()> {
-    if let Some(parent) = config.paths.auth_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_file_atomic(
-        &config.paths.auth_path,
-        serde_json::to_string_pretty(&config.auth)?.as_bytes(),
-    )?;
-    Ok(())
+/// Logs one account out: removes it from `auth.json` as the file is now (so
+/// tokens refreshed since startup survive) and from this session's config.
+/// The in-memory auth is never written back: it may hold a `--api-key`
+/// value, which must not be persisted.
+fn remove_stored_auth(config: &mut LoadedConfig, provider: &str, account: &str) -> Result<bool> {
+    let removed = pi_config::update_auth_file(&config.paths.auth_path, |auth: &mut AuthData| {
+        auth.remove(provider, account).is_some()
+    })?;
+    Ok(config.auth.remove(provider, account).is_some() || removed)
 }
 
 #[cfg(test)]
@@ -10435,17 +10553,7 @@ mod tests {
     #[test]
     fn command_completions_include_loaded_resources() {
         let config = LoadedConfig {
-            paths: ConfigPaths {
-                cwd: PathBuf::from("."),
-                agent_dir: PathBuf::from(".pi/agent"),
-                session_dir: PathBuf::from(".pi/agent/sessions"),
-                settings_path: PathBuf::from(".pi/agent/settings.json"),
-                project_settings_path: PathBuf::from(".pi/settings.json"),
-                auth_path: PathBuf::from(".pi/agent/auth.json"),
-                models_path: PathBuf::from(".pi/agent/models.json"),
-                model_cache_path: PathBuf::from(".pi/agent/model-cache.json"),
-                keybindings_path: PathBuf::from(".pi/agent/keybindings.json"),
-            },
+            paths: test_config_paths(),
             settings: Settings::default(),
             auth: AuthData::default(),
             models: Vec::new(),
@@ -10499,9 +10607,11 @@ mod tests {
             project_settings_path: root.join(".pi/settings.json"),
             ..test_config_paths()
         };
+        // Only the faux model is enabled, so building the runtime looks up no
+        // provider credentials in the environment or in $HOME login files.
         fs::write(
             &config.paths.settings_path,
-            r#"{"unknownSetting":123,"defaultProvider":"faux","defaultModel":"echo"}"#,
+            r#"{"unknownSetting":123,"defaultProvider":"faux","defaultModel":"echo","enabledModels":["faux/echo"]}"#,
         )
         .unwrap();
         let theme_path = root.join("themes/custom.json");
@@ -10928,6 +11038,234 @@ mod tests {
         assert_eq!(runtime.session().active_account, None);
     }
 
+    #[test]
+    fn logout_rewrites_only_its_entry_and_never_persists_runtime_keys() {
+        let root = std::env::temp_dir().join(format!("pi-cli-logout-{}", unique_temp_suffix()));
+        let auth_path = root.join("agent").join("auth.json");
+        let oauth = |token: &str, expires| AuthCredential::OAuth {
+            access_token: format!("{token}-access"),
+            refresh_token: Some(format!("{token}-refresh")),
+            expires,
+            account_id: None,
+        };
+        let codex = AuthCredential::ApiKey {
+            key: "codex-key".to_string(),
+        };
+        // auth.json now holds tokens another process refreshed since startup.
+        let mut current = AuthData::default();
+        current.insert(
+            "anthropic",
+            DEFAULT_ACCOUNT_NAME,
+            oauth("rotated", 4_000_000_000),
+        );
+        current.insert("openai-codex", DEFAULT_ACCOUNT_NAME, codex.clone());
+        pi_config::write_auth_file(&auth_path, &current).expect("seed auth.json");
+        // This session's startup snapshot: the stale tokens plus a value that
+        // came from `--api-key` and must stay in memory.
+        let mut snapshot = AuthData::default();
+        snapshot.insert("anthropic", DEFAULT_ACCOUNT_NAME, oauth("stale", 1));
+        snapshot.insert("openai-codex", DEFAULT_ACCOUNT_NAME, codex);
+        snapshot.insert(
+            "google",
+            DEFAULT_ACCOUNT_NAME,
+            AuthCredential::ApiKey {
+                key: "cli-only-key".to_string(),
+            },
+        );
+        let mut config = account_test_config(snapshot);
+        config.paths.auth_path = auth_path.clone();
+
+        assert!(remove_stored_auth(&mut config, "openai-codex", DEFAULT_ACCOUNT_NAME).unwrap());
+
+        let content = fs::read_to_string(&auth_path).expect("read auth.json");
+        assert!(!content.contains("cli-only-key"), "{content}");
+        assert!(!content.contains("stale-"), "{content}");
+        let stored = pi_config::read_auth_file(&auth_path).expect("parse auth.json");
+        assert_eq!(
+            stored.credential("anthropic", DEFAULT_ACCOUNT_NAME),
+            Some(&oauth("rotated", 4_000_000_000))
+        );
+        assert!(stored
+            .credential("openai-codex", DEFAULT_ACCOUNT_NAME)
+            .is_none());
+        assert!(config
+            .auth
+            .credential("openai-codex", DEFAULT_ACCOUNT_NAME)
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reload_keeps_the_trust_decision_and_cli_overrides() {
+        let root =
+            std::env::temp_dir().join(format!("pi-cli-config-source-{}", unique_temp_suffix()));
+        let agent = root.join("agent");
+        let project = root.join("project");
+        fs::create_dir_all(&agent).expect("create agent dir");
+        fs::create_dir_all(project.join(".pi/extensions")).expect("create project extensions");
+        fs::write(
+            project.join(".pi/settings.json"),
+            r#"{"shellCommandPrefix":"echo untrusted"}"#,
+        )
+        .expect("write project settings");
+        fs::write(
+            project.join(".pi/extensions/project.md"),
+            "project extension",
+        )
+        .expect("write project extension");
+        fs::write(project.join("AGENTS.md"), "project rules").expect("write context file");
+        let resource = |name: &str| {
+            let path = root.join(format!("{name}.md"));
+            fs::write(&path, format!("cli {name}")).expect("write cli resource");
+            path.display().to_string()
+        };
+        let (extension, skill, template) = (resource("ext"), resource("skill"), resource("tpl"));
+        let cli = Cli::try_parse_from([
+            "pi",
+            "--system-prompt",
+            "cli system",
+            "--append-system-prompt",
+            "cli append",
+            "--no-context-files",
+            "--tools",
+            "read",
+            "--provider",
+            "anthropic",
+            "--api-key",
+            "cli-key",
+            "-e",
+            &extension,
+            "--skill",
+            &skill,
+            "--prompt-template",
+            &template,
+        ])
+        .expect("parse cli");
+        let source = ConfigSource {
+            cli,
+            cwd: project.clone(),
+            project_trusted: false,
+        };
+        let paths = ConfigPaths {
+            cwd: project.clone(),
+            agent_dir: agent.clone(),
+            session_dir: agent.join("sessions"),
+            settings_path: agent.join("settings.json"),
+            project_settings_path: project.join(".pi/settings.json"),
+            auth_path: agent.join("auth.json"),
+            models_path: agent.join("models.json"),
+            model_cache_path: agent.join("model-cache.json"),
+            keybindings_path: agent.join("keybindings.json"),
+        };
+
+        let config = source.load(paths).expect("reload config");
+
+        assert_eq!(config.settings.shell_command_prefix, None);
+        let contents = |resources: &[ResourceFile]| {
+            resources
+                .iter()
+                .map(|resource| resource.content.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(contents(&config.extensions), ["cli ext"]);
+        assert_eq!(contents(&config.skills), ["cli skill"]);
+        assert_eq!(contents(&config.prompt_templates), ["cli tpl"]);
+        assert_eq!(config.system_prompt.as_deref(), Some("cli system"));
+        assert_eq!(config.append_system_prompt, ["cli append"]);
+        assert!(config.context_files.is_empty());
+        assert_eq!(
+            config.settings.enabled_tools,
+            Some(vec!["read".to_string()])
+        );
+        assert_eq!(
+            auth_for_provider(&config.auth, "anthropic", None),
+            Some(ResolvedAuth::ApiKey("cli-key".to_string()))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_prefers_models_with_credentials_over_faux() {
+        // Made-up providers have no environment or login-file credentials,
+        // so only `config.auth` decides which ones are usable.
+        let model = |provider: &str, id: &str| ModelDefinition {
+            context_window: None,
+            provider: provider.to_string(),
+            id: id.to_string(),
+            name: None,
+            api: if provider == "faux" {
+                ConfigProviderApi::Faux
+            } else {
+                ConfigProviderApi::Anthropic
+            },
+            base_url: None,
+        };
+        let key = |key: &str| AuthCredential::ApiKey {
+            key: key.to_string(),
+        };
+        let mut config = account_test_config(AuthData::default());
+        config.models = vec![
+            model("faux", "echo"),
+            model("keyed", "first"),
+            model("unkeyed", "saved"),
+        ];
+        let pick = |config: &LoadedConfig, args: &[&str], offline: bool| {
+            let mut runtime = account_test_runtime("faux", None);
+            runtime.set_active_model(None).expect("clear model");
+            let cli = Cli::try_parse_from(std::iter::once("pi").chain(args.iter().copied()))
+                .expect("parse cli");
+            select_initial_model(&mut runtime, config, &cli, offline).expect("select model");
+            runtime
+                .session()
+                .active_model
+                .as_ref()
+                .map(|model| format!("{}/{}", model.provider, model.id))
+        };
+
+        // Nothing has credentials: faux is the last resort.
+        assert_eq!(pick(&config, &[], false).as_deref(), Some("faux/echo"));
+
+        // A model with credentials wins over faux; a provider's usual model
+        // (upstream defaultModelPerProvider) wins over catalog order.
+        config
+            .auth
+            .insert("keyed", DEFAULT_ACCOUNT_NAME, key("keyed-key"));
+        assert_eq!(pick(&config, &[], false).as_deref(), Some("keyed/first"));
+        config
+            .auth
+            .insert("anthropic", DEFAULT_ACCOUNT_NAME, key("anthropic-key"));
+        config.models.extend([
+            model("anthropic", "claude-opus-4-1-20250805"),
+            model("anthropic", "claude-opus-4-8"),
+        ]);
+        assert_eq!(
+            pick(&config, &[], false).as_deref(),
+            Some("anthropic/claude-opus-4-8")
+        );
+
+        // A saved default counts only when its provider has credentials.
+        config.settings.default_provider = Some("unkeyed".to_string());
+        config.settings.default_model = Some("saved".to_string());
+        assert_eq!(
+            pick(&config, &[], false).as_deref(),
+            Some("anthropic/claude-opus-4-8")
+        );
+        config.settings.default_provider = Some("keyed".to_string());
+        config.settings.default_model = Some("first".to_string());
+        assert_eq!(pick(&config, &[], false).as_deref(), Some("keyed/first"));
+
+        // Offline only faux can run; an explicit --model still wins.
+        assert_eq!(pick(&config, &[], true).as_deref(), Some("faux/echo"));
+        assert_eq!(
+            pick(&config, &["--model", "faux/echo"], false).as_deref(),
+            Some("faux/echo")
+        );
+        assert_eq!(
+            pick(&config, &["--model", "unkeyed/saved"], true).as_deref(),
+            Some("unkeyed/saved")
+        );
+    }
+
     #[tokio::test]
     async fn provider_construction_tolerates_bound_account_without_matching_credential() {
         let mut config = account_test_config(AuthData::default());
@@ -11092,6 +11430,80 @@ mod tests {
             let (_, reopened) =
                 SessionStore::open(runtime.store().unwrap().path().to_path_buf()).unwrap();
             assert_eq!(reopened, expected);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bare_session_commands_never_reach_the_model_or_destroy_state() {
+        let root =
+            std::env::temp_dir().join(format!("pi-cli-bare-commands-{}", unique_temp_suffix()));
+        let mut config = minimal_test_config();
+        config.paths.session_dir = root.join("sessions");
+        config.models.push(ModelDefinition {
+            context_window: None,
+            provider: "faux".to_string(),
+            id: "echo".to_string(),
+            name: None,
+            api: ConfigProviderApi::Faux,
+            base_url: None,
+        });
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut viewport_height = 24;
+        let (store, state) = SessionStore::create(&config.paths.session_dir, root.clone()).unwrap();
+        let session_file = store.path().to_path_buf();
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
+        runtime
+            .set_active_model(Some(ModelRef {
+                provider: "faux".into(),
+                id: "echo".into(),
+            }))
+            .unwrap();
+        runtime.rename_session(Some("keep me".into())).unwrap();
+        let mut app = TuiApp::new(&config, &runtime);
+        let mut surface = TuiSurface {
+            terminal: &mut terminal,
+            viewport_height: &mut viewport_height,
+        };
+
+        for command in [
+            "/name", "/delete", "/export", "/import", "/image", "/prompt",
+        ] {
+            handle_tui_submission(
+                &mut app,
+                &mut surface,
+                &mut runtime,
+                &mut config,
+                true,
+                command.to_string(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // None of them became a prompt, cleared the name, or deleted the
+        // session; a bare /export wrote upstream's default file.
+        assert!(runtime.session().messages.is_empty());
+        assert_eq!(runtime.session().name.as_deref(), Some("keep me"));
+        assert!(session_file.exists());
+        let export = root.join(format!("pi-session-{}.html", runtime.session().session_id));
+        assert!(export.exists(), "{}", export.display());
+        let transcript = app.transcript_text();
+        for expected in [
+            "session name: keep me",
+            "usage: /delete <id|name|path>",
+            "exported",
+            "usage: /import",
+            "usage: /image",
+            "usage: /prompt",
+        ] {
+            assert!(transcript.contains(expected), "{expected}\n{transcript}");
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -12603,17 +13015,22 @@ mod tests {
         );
     }
 
+    /// Paths in a fresh directory under the system temp dir, so a test never
+    /// reads or writes the real `~/.pi` or the repository (nothing is
+    /// created until a test writes).
     fn test_config_paths() -> ConfigPaths {
+        let root = std::env::temp_dir().join(format!("pi-cli-unit-{}", unique_temp_suffix()));
+        let agent_dir = root.join("agent");
         ConfigPaths {
             cwd: PathBuf::from("."),
-            agent_dir: PathBuf::from(".pi/agent"),
-            session_dir: PathBuf::from(".pi/agent/sessions"),
-            settings_path: PathBuf::from(".pi/agent/settings.json"),
-            project_settings_path: PathBuf::from(".pi/settings.json"),
-            auth_path: PathBuf::from(".pi/agent/auth.json"),
-            models_path: PathBuf::from(".pi/agent/models.json"),
-            model_cache_path: PathBuf::from(".pi/agent/model-cache.json"),
-            keybindings_path: PathBuf::from(".pi/agent/keybindings.json"),
+            session_dir: agent_dir.join("sessions"),
+            settings_path: agent_dir.join("settings.json"),
+            project_settings_path: root.join("project/.pi/settings.json"),
+            auth_path: agent_dir.join("auth.json"),
+            models_path: agent_dir.join("models.json"),
+            model_cache_path: agent_dir.join("model-cache.json"),
+            keybindings_path: agent_dir.join("keybindings.json"),
+            agent_dir,
         }
     }
 
@@ -13027,6 +13444,14 @@ mod tests {
         let report = ModelRefreshReport::default();
         assert!(next_model_cache(None, &report, Some(200)).is_none());
         assert!(next_model_cache(None, &report, None).is_none());
+    }
+
+    #[test]
+    fn tests_never_refresh_models_in_the_background() {
+        let settings = Settings::default();
+        assert!(background_refresh_allowed(&settings, false, false));
+        assert!(!background_refresh_allowed(&settings, false, true));
+        assert!(!background_refresh_allowed(&settings, true, false));
     }
 
     #[test]
