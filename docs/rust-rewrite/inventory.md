@@ -36,7 +36,8 @@ Primary modes:
 - Interactive TUI by default when stdin is a TTY.
 - Print mode via `--print`/`-p` or piped stdin.
 - JSON output via `--mode json`.
-- JSON-line RPC mode via `--mode rpc`.
+- Upstream's RPC protocol via `--mode rpc` (stdin not a TTY), with the
+  `run-id`, `expected-run-id`, `request-id`, and `resume-run` extensions.
 
 Implemented CLI flags include:
 
@@ -207,8 +208,8 @@ Reload behavior:
 - Keep the session's project trust decision and re-apply the command-line
   overrides (`--system-prompt`, `--append-system-prompt`, `--no-context-files`,
   `-e`, `--no-extensions`, `--tools`, `--api-key`, `--skill`,
-  `--prompt-template`, ...); the same holds for `/models refresh`,
-  `/models reset`, and RPC `reload`.
+  `--prompt-template`, ...); the same holds for `/models refresh` and
+  `/models reset`. RPC mode has no reload: it keeps the config startup built.
 - Surface diagnostics for invalid resources instead of clearing context.
 - Notify JSON executable extensions with `reload`; notify them with `shutdown` on quit.
 
@@ -462,7 +463,10 @@ including a Codewire command such as `cw exec --name ts-parity-agent -- claude`.
 
 Parity fixtures are sanitized upstream provider request captures. They document
 URL, method, selected headers, body, and payload shape for covered providers.
-Rust tests compare local provider request builders against those captures. Drift
+Rust tests compare local provider request builders against those captures.
+`rpc-protocol.json` records upstream RPC mode instead: every stdout record, in
+order, for scripted runs against a local stub model; `pi-cli`'s `rpc_parity`
+test compares pi's RPC mode with it record by record. Drift
 is handled by updating Rust behavior and committed fixtures together, then
 running `make parity-check` and `make check`.
 

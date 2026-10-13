@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead, Cursor, IsTerminal, Read, Write};
+use std::io::{self, Cursor, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -17,6 +17,9 @@ mod clipboard;
 mod markdown;
 mod oauth_login;
 mod oauth_refresh;
+mod rpc;
+mod rpc_wire;
+mod signals;
 mod transcript_view;
 mod usage;
 use transcript_view::TranscriptView;
@@ -41,10 +44,11 @@ use crossterm::{
     },
 };
 use pi_ai::{
-    anthropic_supports_adaptive_thinking, create_provider, generate_images,
+    anthropic_supports_adaptive_thinking, create_provider_with_client, generate_images,
     set_claude_code_version, ImageGenerationInput, ImageGenerationOutput,
     ImageProviderApi as AiImageProviderApi, ImageProviderConfig, MediaInput, ModelRef,
-    ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig, StreamEvent,
+    ProviderApi as AiProviderApi, ProviderAuth, ProviderConfig, ProviderError, ProviderRequest,
+    StreamEvent,
 };
 use pi_config::{
     auth_for_provider, codex_client_version, has_auth_for_provider, listed_accounts_for_provider,
@@ -61,8 +65,8 @@ use pi_core::{
     run_excluded_bash_result, run_user_turn, run_user_turn_streaming,
     run_user_turn_streaming_events_with_media, run_user_turn_streaming_with_media,
     write_session_export, AgentError, CompactionKind, ConversationMessage, FollowUpQueue,
-    MessageRole, ReloadReport, ReloadableSystems, Runtime, SessionState, SessionStore,
-    SteeringMailbox, TodoItem, TodoStatus, TurnEvent, STEERING_JOIN,
+    MessageRole, ReloadReport, ReloadableSystems, RunControl, Runtime, SessionError, SessionState,
+    SessionStore, SteeringMailbox, TodoItem, TodoStatus, TurnEvent, STEERING_JOIN,
 };
 use pi_tui::{
     parse_theme_color, EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector,
@@ -1291,6 +1295,7 @@ fn print_auth_help(command: &str) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    signals::install();
     if try_run_image_command().await? {
         return Ok(());
     }
@@ -1302,6 +1307,11 @@ async fn main() -> Result<()> {
     }
     let cli = Cli::parse_from(normalized_cli_args(std::env::args()));
     validate_session_id_flags(&cli)?;
+    if matches!(cli.mode, OutputMode::Rpc) && (cli.print || !cli.messages.is_empty()) {
+        return Err(anyhow!(
+            "--mode rpc reads its prompts from stdin and takes no prompt arguments"
+        ));
+    }
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd.clone(), cli.session_dir.clone())?;
     let project_trusted = if cli.approve {
@@ -1354,7 +1364,7 @@ async fn main() -> Result<()> {
 
     let mut systems = ReloadableSystems::from_config(&config, 1);
     systems.offline = offline;
-    let mut runtime = create_runtime(&cli, &cwd, &config, systems)?;
+    let mut runtime = create_runtime_when_unlocked(&cli, &cwd, &config, systems).await?;
     select_initial_model(&mut runtime, &config, &cli, offline)?;
     if cli.no_tools || cli.no_builtin_tools {
         runtime.set_disabled_tools(default_active_tool_names())?;
@@ -1380,12 +1390,8 @@ async fn main() -> Result<()> {
     }
 
     let stdin_is_terminal = io::stdin().is_terminal();
-    if matches!(cli.mode, OutputMode::Rpc)
-        && !stdin_is_terminal
-        && !cli.print
-        && cli.messages.is_empty()
-    {
-        return run_rpc(runtime, config, offline).await;
+    if matches!(cli.mode, OutputMode::Rpc) && !stdin_is_terminal {
+        return rpc::run(runtime, config, offline).await;
     }
 
     let mut initial_prompt = expand_message_inputs(&cwd, &cli.messages)?;
@@ -1422,147 +1428,12 @@ async fn main() -> Result<()> {
     run_interactive(runtime, config, offline, cli.owned_screen()).await
 }
 
-async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) -> Result<()> {
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request = match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                println!(
-                    "{}",
-                    rpc_error(serde_json::Value::Null, -32700, &error.to_string())
-                );
-                continue;
-            }
-        };
-        let id = request
-            .get("id")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let Some(method) = request.get("method").and_then(serde_json::Value::as_str) else {
-            println!("{}", rpc_error(id, -32600, "missing method"));
-            continue;
-        };
-        let result = match method {
-            "prompt" => match rpc_prompt(&request) {
-                Ok(prompt) => match run_prompt(&mut runtime, &config, prompt, offline).await {
-                    Ok(message) => Ok(serde_json::json!({ "message": message })),
-                    Err(error) => Err((1, error.to_string())),
-                },
-                Err(error) => Err((-32602, error)),
-            },
-            "compact" => {
-                let focus = request
-                    .pointer("/params/focus")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                match provider_for_runtime(&runtime, &config, offline).await {
-                    Ok(provider) => runtime
-                        .compact_messages(provider.as_ref(), CompactionKind::Manual, focus)
-                        .await
-                        .map(|record| serde_json::json!(record))
-                        .map_err(|error| (1, error.to_string())),
-                    Err(error) => Err((1, error.to_string())),
-                }
-            }
-            "reload" => {
-                config = reload_config(&config)?;
-                start_model_refresh(&config, offline, false);
-                let next_generation = runtime.systems().config_generation + 1;
-                match runtime.reload(ReloadableSystems::from_config(&config, next_generation)) {
-                    Ok(report) => Ok(serde_json::json!({
-                        "activeModelValid": report.active_model_valid,
-                        "activeAccountValid": report.active_account_valid,
-                        "removedActiveTools": report.removed_active_tools,
-                    })),
-                    Err(error) => Err((1, error.to_string())),
-                }
-            }
-            "session" => Ok(serde_json::json!({
-                "id": runtime.session().session_id,
-                "cwd": runtime.session().cwd.display().to_string(),
-                "file": runtime.store().map(|store| store.path().display().to_string()),
-            })),
-            "model" => match rpc_model(&request) {
-                Ok(reference) => match resolve_model_reference(&config, &reference) {
-                    Some(model) => {
-                        runtime.set_active_model(Some(model.clone()))?;
-                        persist_default_model(&mut config, &model)?;
-                        Ok(serde_json::json!({
-                            "provider": model.provider,
-                            "id": model.id,
-                        }))
-                    }
-                    None => Err((1, format!("model not found: {reference}"))),
-                },
-                Err(error) => Err((-32602, error)),
-            },
-            _ => Err((-32601, format!("method not found: {method}"))),
-        };
-        match result {
-            Ok(result) => println!("{}", rpc_result(id, result)),
-            Err((code, message)) => println!("{}", rpc_error(id, code, &message)),
-        }
-    }
-    Ok(())
-}
-
-fn rpc_prompt(request: &serde_json::Value) -> std::result::Result<String, String> {
-    let params = request
-        .get("params")
-        .ok_or_else(|| "missing params".to_string())?;
-    if let Some(prompt) = params.as_str() {
-        return Ok(prompt.to_string());
-    }
-    params
-        .get("prompt")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| "missing prompt".to_string())
-}
-
-fn rpc_model(request: &serde_json::Value) -> std::result::Result<String, String> {
-    let params = request
-        .get("params")
-        .ok_or_else(|| "missing params".to_string())?;
-    if let Some(model) = params.as_str() {
-        return Ok(model.to_string());
-    }
-    params
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| "missing model".to_string())
-}
-
-fn rpc_result(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result,
-    })
-}
-
-fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    })
-}
-
 /// How startup built this process's config: the project trust decision and
-/// the command line. `/reload`, `/models refresh|reset`, and RPC `reload`
-/// rebuild the config the same way, so a reload neither trusts a project the
-/// session did not trust nor drops `--system-prompt`, `-e`, `--api-key`, and
-/// the other command-line overrides.
+/// the command line. `/reload` and `/models refresh|reset` rebuild the config
+/// the same way, so a reload neither trusts a project the session did not
+/// trust nor drops `--system-prompt`, `-e`, `--api-key`, and the other
+/// command-line overrides. RPC mode never reloads: it keeps the config
+/// startup built.
 #[derive(Debug, Clone)]
 struct ConfigSource {
     cli: Cli,
@@ -2731,6 +2602,45 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
+/// How long startup waits for another pi process to release its session.
+const SESSION_LOCK_WAIT: Duration = Duration::from_secs(5);
+const SESSION_LOCK_POLL: Duration = Duration::from_millis(100);
+/// `EX_TEMPFAIL`: the session is busy, so running again later can succeed.
+const EXIT_SESSION_LOCKED: i32 = 75;
+
+/// Opens the startup session, waiting up to [`SESSION_LOCK_WAIT`] while
+/// another pi process holds it. Print, json, rpc, and interactive modes all
+/// start here, before any terminal setup. A session that stays locked exits
+/// with [`EXIT_SESSION_LOCKED`] and a message naming the path and holder pid.
+async fn create_runtime_when_unlocked(
+    cli: &Cli,
+    cwd: &Path,
+    config: &LoadedConfig,
+    systems: ReloadableSystems,
+) -> Result<Runtime> {
+    let deadline = Instant::now() + SESSION_LOCK_WAIT;
+    loop {
+        let error = match create_runtime(cli, cwd, config, systems.clone()) {
+            Ok(runtime) => return Ok(runtime),
+            Err(error) => error,
+        };
+        if !matches!(
+            error.downcast_ref::<SessionError>(),
+            Some(SessionError::Locked { .. })
+        ) {
+            return Err(error);
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "pi: {error}; gave up after waiting {}s",
+                SESSION_LOCK_WAIT.as_secs()
+            );
+            std::process::exit(EXIT_SESSION_LOCKED);
+        }
+        tokio::time::sleep(SESSION_LOCK_POLL).await;
+    }
+}
+
 fn create_runtime(
     cli: &Cli,
     cwd: &Path,
@@ -2746,7 +2656,7 @@ fn create_runtime(
 
     if let Some(reference) = &cli.fork {
         let path = resolve_session_reference(&config.paths.session_dir, reference)?;
-        let (_store, source_state) = SessionStore::open(path)?;
+        let source_state = SessionStore::read(&path)?;
         let (store, state) = SessionStore::fork(&config.paths.session_dir, &source_state, false)?;
         return Ok(Runtime::with_store(state, systems, store));
     }
@@ -2991,9 +2901,10 @@ async fn run_interactive(
         app.push(TuiEntryKind::System, hint);
     }
     let mut auto_restart = AutoRestart::from_env();
+    // Install restoration before any fallible terminal setup; a fatal signal
+    // restores through the same claim.
+    let _restore = TerminalRestore::claim(owned_screen);
     enable_raw_mode()?;
-    // Install restoration before any fallible terminal setup.
-    let _restore = TerminalRestore { owned_screen };
     if owned_screen {
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     }
@@ -3037,7 +2948,12 @@ async fn run_interactive(
             }
             app.refresh_diff_panel(&runtime);
             if let Some(session_id) = app.pending_session_resume.take() {
-                apply_midturn_session_resume(&mut app, &mut runtime, &config, &session_id)?;
+                // A locked or unreadable pick is reported; the TUI stays up.
+                if let Err(error) =
+                    apply_midturn_session_resume(&mut app, &mut runtime, &config, &session_id)
+                {
+                    app.push(TuiEntryKind::Error, format!("{error:#}"));
+                }
             }
             continue;
         }
@@ -3107,7 +3023,9 @@ async fn run_interactive(
         println!("{}", app.transcript_text());
     }
     if restart {
-        restart_current_process()?;
+        // The session lock is close-on-exec: the new image reopens this
+        // session as soon as it starts.
+        restart_current_process(runtime.store().map(SessionStore::path))?;
     }
     Ok(())
 }
@@ -3195,56 +3113,131 @@ impl AutoRestart {
 }
 
 #[cfg(unix)]
-fn restart_current_process() -> Result<()> {
+fn restart_current_process(session_file: Option<&Path>) -> Result<()> {
     let executable = std::env::var_os("PI_DOGFOOD_RESTART_EXE")
         .map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok())
         .ok_or_else(|| anyhow!("failed to resolve restart executable"))?;
+    let session_file =
+        session_file.map(|path| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
     let error = Command::new(executable)
-        .args(restart_args_preserving_session_model())
+        .args(restart_args(
+            std::env::args_os().skip(1),
+            session_file.as_deref(),
+        ))
         .exec();
     Err(error.into())
 }
 
 #[cfg(not(unix))]
-fn restart_current_process() -> Result<()> {
+fn restart_current_process(_session_file: Option<&Path>) -> Result<()> {
     Err(anyhow!("dogfood auto-restart is only supported on Unix"))
 }
 
-fn restart_args_preserving_session_model() -> Vec<OsString> {
-    strip_restart_model_args(std::env::args_os().skip(1))
-}
-
-fn strip_restart_model_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+/// Arguments for the dogfood exec-restart. The model selection is dropped,
+/// since the session remembers its model. With a session file, the original
+/// session selection (`--continue`, `--resume`, `--fork`, `--session`,
+/// `--session-id`, `--no-session`) is replaced by `--session <file>`: running
+/// `--continue` again could open a newer session, and `--fork` would fork
+/// again. Other arguments are kept as given.
+fn restart_args(
+    args: impl IntoIterator<Item = OsString>,
+    session_file: Option<&Path>,
+) -> Vec<OsString> {
+    const MODEL_OPTIONS: [&str; 2] = ["--model", "--provider"];
+    const SESSION_OPTIONS: [&str; 3] = ["--fork", "--session", "--session-id"];
+    const SESSION_FLAGS: [&str; 3] = ["--continue", "--resume", "--no-session"];
+    let replace_session = session_file.is_some();
     let mut output = Vec::new();
+    let mut positional = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == "--model" || arg == "--provider" {
-            let _ = args.next();
+        let Some(text) = arg.to_str() else {
+            output.push(arg);
+            continue;
+        };
+        if text == "--" {
+            positional.push(arg);
+            positional.extend(args.by_ref());
+            break;
+        }
+        let (name, inline_value) = match text.split_once('=') {
+            Some((name, _)) if name.starts_with("--") => (name, true),
+            _ => (text, false),
+        };
+        if MODEL_OPTIONS.contains(&name) || (replace_session && SESSION_OPTIONS.contains(&name)) {
+            if !inline_value {
+                let _ = args.next();
+            }
             continue;
         }
-        let text = arg.to_string_lossy();
-        if text.starts_with("--model=") || text.starts_with("--provider=") {
+        if replace_session && SESSION_FLAGS.contains(&text) {
+            continue;
+        }
+        if replace_session && text.len() > 1 && text.starts_with('-') && !text.starts_with("--") {
+            match without_session_short_flags(text) {
+                Some(cluster) if cluster == "-" => {}
+                Some(cluster) => output.push(cluster.into()),
+                None => output.push(arg),
+            }
             continue;
         }
         output.push(arg);
     }
+    if let Some(path) = session_file {
+        output.push("--session".into());
+        output.push(path.into());
+    }
+    output.extend(positional);
     output
 }
 
-struct TerminalRestore {
-    owned_screen: bool,
+/// Removes `-c` and `-r` from a short-flag cluster such as `-cp`; `None` when
+/// the cluster has neither. A short option that takes a value (`-t`, `-e`,
+/// `-n`) consumes the rest of its cluster, which is kept verbatim.
+fn without_session_short_flags(cluster: &str) -> Option<String> {
+    let flags = cluster.strip_prefix('-')?;
+    let mut kept = String::from("-");
+    for (index, flag) in flags.char_indices() {
+        match flag {
+            'c' | 'r' => {}
+            't' | 'e' | 'n' => {
+                kept.push_str(&flags[index..]);
+                break;
+            }
+            _ => kept.push(flag),
+        }
+    }
+    (kept != cluster).then_some(kept)
+}
+
+/// The TUI's hold on the terminal. Dropping it restores the terminal unless a
+/// fatal signal already did (see `signals`).
+struct TerminalRestore;
+
+impl TerminalRestore {
+    fn claim(owned_screen: bool) -> Self {
+        signals::claim_tui_terminal(owned_screen);
+        Self
+    }
 }
 
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
-        if self.owned_screen {
-            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-        }
-        let _ = disable_raw_mode();
+        signals::release_tui_terminal();
     }
+}
+
+/// Leaves every terminal mode the TUI enabled. The cursor is shown too: on a
+/// signal exit ratatui's own drop, which normally does it, never runs.
+fn restore_terminal_modes(out: &mut impl Write, owned_screen: bool) {
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
+    let _ = execute!(out, DisableBracketedPaste);
+    if owned_screen {
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+    }
+    let _ = execute!(out, crossterm::cursor::Show);
+    let _ = disable_raw_mode();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5878,7 +5871,14 @@ async fn handle_tui_key(
     offline: bool,
 ) -> Result<bool> {
     if app.selector.is_some() {
-        handle_tui_selector_key(key, app, runtime, config)?;
+        // A failed pick (for example a session locked by another process) is
+        // an error line, never a reason to leave the TUI.
+        if let Err(error) = handle_tui_selector_key(key, app, runtime, config) {
+            app.push(
+                TuiEntryKind::Error,
+                format_tui_error(&error, runtime, config),
+            );
+        }
         app.status = footer_status(config, runtime, &app.editor_state);
         return Ok(false);
     }
@@ -6617,20 +6617,21 @@ fn apply_turn_event(
             app.live_thinking_index = Some(thinking_index);
             app.append_entry(thinking_index, text);
         }
-        TurnEvent::ToolStarted { name } => {
-            *activity = Activity::Tool(name.clone());
+        TurnEvent::ToolStarted { call } => {
+            *activity = Activity::Tool(call.name.clone());
             app.live_thinking_index = None;
             app.turn_saw_tools = true;
             // Close the current text entry: the next delta opens a fresh one
             // below this tool call.
             *text_after_tool = true;
             app.live_tool_indices.push(app.entries.len());
-            app.push(TuiEntryKind::Tool, format!("running {name}\n\n"));
+            app.push(TuiEntryKind::Tool, format!("running {}\n\n", call.name));
         }
         TurnEvent::ToolOutput {
             call,
             output,
             is_error,
+            ..
         } => {
             if let Some(index) = app.live_tool_indices.last().copied() {
                 app.replace_entry(
@@ -8237,6 +8238,11 @@ async fn run_turn_tui(
     let activity_started = Instant::now();
     let mut activity = Activity::Waiting;
     let (delta_tx, delta_rx) = std::sync::mpsc::channel::<TurnEvent>();
+    // An interrupt drops the turn future below; the run is never cancelled.
+    let run = RunControl {
+        steering: steering.clone(),
+        ..RunControl::default()
+    };
     let stream_end = {
         let turn = async {
             let on_event = move |event: &TurnEvent| {
@@ -8249,14 +8255,13 @@ async fn run_turn_tui(
                         provider.as_ref(),
                         prompt,
                         media,
-                        &steering,
+                        &run,
                         on_event,
                     )
                     .await
                 }
                 None => {
-                    continue_turn_streaming_events(runtime, provider.as_ref(), &steering, on_event)
-                        .await
+                    continue_turn_streaming_events(runtime, provider.as_ref(), &run, on_event).await
                 }
             }
         };
@@ -8686,15 +8691,6 @@ fn resolve_bang_command(line: &str, last_shell_command: &Option<String>) -> Opti
     Some(command.to_string())
 }
 
-async fn run_prompt(
-    runtime: &mut Runtime,
-    config: &LoadedConfig,
-    prompt: String,
-    offline: bool,
-) -> Result<String> {
-    run_prompt_media(runtime, config, prompt, Vec::new(), offline).await
-}
-
 async fn run_prompt_media(
     runtime: &mut Runtime,
     config: &LoadedConfig,
@@ -8800,28 +8796,95 @@ async fn provider_for_runtime(
             )
         })?;
     let thinking_level = active_thinking_level(runtime, config, &model);
-    let resolved_auth = oauth_refresh::refresh_expiring_auth(
-        &reqwest::Client::builder()
+    let provider = FreshAuthProvider {
+        config: ProviderConfig {
+            thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
+            thinking_level,
+            model,
+            api: map_provider_api(&definition.api),
+            base_url: definition.base_url.clone(),
+            auth: ProviderAuth::None,
+            session_id: Some(runtime.session().session_id.clone()),
+        },
+        // The client `pi_ai::create_provider` uses: its idle timeout ends a
+        // stalled request instead of hanging the turn.
+        client: pi_ai::provider_http_client(),
+        refresh_client: reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
-        &config.paths.auth_path,
-        &config.auth,
-        &definition.provider,
-        runtime.session().active_account.as_deref(),
-        None,
-        unix_seconds().unwrap_or(0),
-    )
-    .await?;
-    Ok(create_provider(ProviderConfig {
-        thinking_budget_tokens: thinking_budget_tokens(config, thinking_level.as_deref()),
-        thinking_level,
-        model,
-        api: map_provider_api(&definition.api),
-        base_url: definition.base_url.clone(),
-        auth: map_provider_auth(resolved_auth),
-        session_id: Some(runtime.session().session_id.clone()),
-    }))
+        auth_path: config.paths.auth_path.clone(),
+        auth: config.auth.clone(),
+        account: runtime.session().active_account.clone(),
+    };
+    // Fail before the turn starts when there is no usable credential.
+    provider.auth().await?;
+    Ok(Box::new(provider))
+}
+
+/// A provider that resolves its credentials for every request, so a turn
+/// that outlives an OAuth access token refreshes it instead of sending the
+/// token the turn started with.
+struct FreshAuthProvider {
+    /// The config of every request; `auth` is resolved per request.
+    config: ProviderConfig,
+    client: reqwest::Client,
+    refresh_client: reqwest::Client,
+    auth_path: PathBuf,
+    auth: AuthData,
+    account: Option<String>,
+}
+
+impl FreshAuthProvider {
+    async fn auth(&self) -> Result<ProviderAuth> {
+        let resolved = oauth_refresh::refresh_expiring_auth(
+            &self.refresh_client,
+            &self.auth_path,
+            &self.auth,
+            &self.config.model.provider,
+            self.account.as_deref(),
+            None,
+            unix_seconds().unwrap_or(0),
+        )
+        .await?;
+        Ok(map_provider_auth(resolved))
+    }
+
+    /// The provider for one request, with the credentials valid now.
+    async fn provider(&self) -> std::result::Result<Box<dyn pi_ai::Provider>, ProviderError> {
+        let auth = self
+            .auth()
+            .await
+            .map_err(|error| ProviderError::Config(error.to_string()))?;
+        Ok(create_provider_with_client(
+            ProviderConfig {
+                auth,
+                ..self.config.clone()
+            },
+            self.client.clone(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl pi_ai::Provider for FreshAuthProvider {
+    async fn complete(
+        &self,
+        request: ProviderRequest,
+    ) -> std::result::Result<Vec<StreamEvent>, ProviderError> {
+        self.provider().await?.complete(request).await
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: ProviderRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) -> std::result::Result<(), ProviderError> + Send),
+    ) -> std::result::Result<(), ProviderError> {
+        self.provider()
+            .await?
+            .complete_streaming(request, on_event)
+            .await
+    }
 }
 
 fn active_thinking_level(
@@ -8901,10 +8964,8 @@ fn map_provider_api(api: &ConfigProviderApi) -> AiProviderApi {
 
 fn print_response(mode: &OutputMode, response: &str) {
     match mode {
-        OutputMode::Text => println!("{response}"),
-        OutputMode::Json | OutputMode::Rpc => {
-            println!("{}", serde_json::json!({ "message": response }))
-        }
+        OutputMode::Json => println!("{}", serde_json::json!({ "message": response })),
+        OutputMode::Text | OutputMode::Rpc => println!("{response}"),
     }
 }
 
@@ -10089,7 +10150,8 @@ fn resolve_source_session(
         return Ok(runtime.session().clone());
     }
     let path = resolve_session_reference(session_dir, reference)?;
-    Ok(SessionStore::open(path)?.1)
+    // A fork or clone source is only read, so it may be open elsewhere.
+    Ok(SessionStore::read(&path)?)
 }
 
 fn export_session(runtime: &Runtime, path: &Path) -> Result<()> {
@@ -10125,7 +10187,8 @@ fn delete_session_message(
         .store()
         .map(|store| store.path() == target)
         .unwrap_or(false);
-    fs::remove_file(&target)?;
+    // Refuses while another pi process has the session open.
+    SessionStore::delete(&target)?;
     let mut output = format!("deleted {}", target.display());
     if deleting_current {
         let (store, state) =
@@ -10178,6 +10241,7 @@ fn remove_stored_auth(config: &mut LoadedConfig, provider: &str, account: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
 
     #[test]
     fn diff_panel_lists_files_under_cwd_relative_to_it() {
@@ -11284,6 +11348,94 @@ mod tests {
             .expect("faux provider builds regardless of account binding");
     }
 
+    #[tokio::test]
+    async fn every_model_request_sends_the_credential_current_when_it_is_sent() {
+        use std::io::BufReader;
+        let root = std::env::temp_dir().join(format!("pi-cli-fresh-auth-{}", unique_temp_suffix()));
+        fs::create_dir_all(&root).unwrap();
+        let auth_path = root.join("auth.json");
+        let credential = |access_token: &str, expires| AuthCredential::OAuth {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+            expires,
+            account_id: Some("account".to_string()),
+        };
+        let save = |access_token: &str| {
+            let mut auth = AuthData::default();
+            auth.insert("openai", "default", credential(access_token, 4_000_000_000));
+            fs::write(&auth_path, serde_json::to_string(&auth).unwrap()).unwrap();
+        };
+        // The model endpoint records the bearer token of each request.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            (0..2)
+                .map(|_| {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let (mut authorization, mut length) = (String::new(), 0);
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let Some((name, value)) = line.trim_end().split_once(": ") else {
+                            if line.trim_end().is_empty() {
+                                break;
+                            }
+                            continue;
+                        };
+                        match name.to_ascii_lowercase().as_str() {
+                            "authorization" => authorization = value.to_string(),
+                            "content-length" => length = value.parse().unwrap(),
+                            _ => {}
+                        }
+                    }
+                    reader.read_exact(&mut vec![0; length]).unwrap();
+                    let body = r#"{"output_text":"ok"}"#;
+                    write!(
+                        reader.into_inner(),
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                    authorization
+                })
+                .collect::<Vec<_>>()
+        });
+        // The startup snapshot predates a refresh: its token long expired.
+        let mut snapshot = AuthData::default();
+        snapshot.insert("openai", "default", credential("startup-access", 1));
+        let mut config = account_test_config(snapshot);
+        config.paths.auth_path = auth_path.clone();
+        config.models.push(ModelDefinition {
+            context_window: None,
+            provider: "openai".to_string(),
+            id: "echo".to_string(),
+            name: None,
+            api: ConfigProviderApi::OpenAi,
+            base_url: Some(url),
+        });
+        let runtime = account_test_runtime("openai", None);
+        let request = || ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+
+        save("first-access");
+        let provider = provider_for_runtime(&runtime, &config, false)
+            .await
+            .unwrap();
+        provider.complete(request()).await.unwrap();
+        save("second-access");
+        provider.complete(request()).await.unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            ["Bearer first-access", "Bearer second-access"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn model_selection_format_is_compact_and_unlabeled() {
         let model = ModelRef {
@@ -12128,7 +12280,7 @@ mod tests {
         let (store, state) = SessionStore::create(&root.join("sessions"), root.clone()).unwrap();
         let path = store.path().to_path_buf();
         let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
-        let provider = create_provider(ProviderConfig {
+        let provider = pi_ai::create_provider(ProviderConfig {
             model: ModelRef {
                 provider: "faux".into(),
                 id: "echo".into(),
@@ -13004,7 +13156,7 @@ mod tests {
         .into_iter()
         .map(OsString::from);
 
-        let filtered = strip_restart_model_args(args);
+        let filtered = restart_args(args, None);
 
         assert_eq!(
             filtered,
@@ -13012,6 +13164,73 @@ mod tests {
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dogfood_restart_reopens_the_session_it_had_open() {
+        let rewrite = |args: &[&str]| {
+            restart_args(
+                args.iter().map(OsString::from),
+                Some(Path::new("/sessions/current.jsonl")),
+            )
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect::<Vec<_>>()
+        };
+        let reopen = ["--session", "/sessions/current.jsonl"];
+
+        // `make dogfood` runs `--continue --model faux/echo`.
+        assert_eq!(rewrite(&["--continue", "--model", "faux/echo"]), reopen);
+        for selection in [
+            &["-c"][..],
+            &["-r"],
+            &["--resume"],
+            &["--fork", "abc"],
+            &["--fork=abc"],
+            &["--session", "older.jsonl"],
+            &["--session=older.jsonl"],
+            &["--session-id", "named"],
+            &["--session-id=named"],
+            &["--no-session"],
+        ] {
+            assert_eq!(rewrite(selection), reopen, "{selection:?}");
+        }
+        assert_eq!(
+            rewrite(&[
+                "-cpn",
+                "label",
+                "--session-dir",
+                "sessions",
+                "--theme",
+                "dark",
+                "-rt",
+                "read",
+                "--",
+                "-c",
+            ]),
+            [
+                "-pn",
+                "label",
+                "--session-dir",
+                "sessions",
+                "--theme",
+                "dark",
+                "-t",
+                "read",
+                "--session",
+                "/sessions/current.jsonl",
+                "--",
+                "-c",
+            ]
+        );
+        // Without a session file (`--no-session`) the selection stays.
+        assert_eq!(
+            restart_args(
+                ["--no-session", "--model", "faux/echo"].map(OsString::from),
+                None
+            ),
+            [OsString::from("--no-session")]
         );
     }
 
@@ -13843,18 +14062,18 @@ mod tests {
             .join("\n");
         let mut saw_delta = false;
         let mut activity = Activity::Waiting;
+        let call = pi_ai::ChatToolCall {
+            id: "large-read".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"large.rs"}"#.into(),
+        };
         for event in [
-            TurnEvent::ToolStarted {
-                name: "read".into(),
-            },
+            TurnEvent::ToolStarted { call: call.clone() },
             TurnEvent::ToolOutput {
-                call: pi_ai::ChatToolCall {
-                    id: "large-read".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"large.rs"}"#.into(),
-                },
+                call,
                 output: output.clone(),
                 is_error: false,
+                duration: Duration::ZERO,
             },
         ] {
             let mut live_text_index = assistant_index;
@@ -13999,9 +14218,7 @@ mod tests {
             thinking_index,
             &mut saw_delta,
             &mut activity,
-            &TurnEvent::ToolStarted {
-                name: call.name.clone(),
-            },
+            &TurnEvent::ToolStarted { call: call.clone() },
         );
         let mut live_text_index = index;
         let mut text_after_tool = false;
@@ -14016,6 +14233,7 @@ mod tests {
                 call,
                 output: "HTTP 403".into(),
                 is_error: true,
+                duration: Duration::ZERO,
             },
         );
         assert_eq!(
@@ -14110,6 +14328,11 @@ mod tests {
         let mut saw_delta = false;
         let mut live_text_index = entry;
         let mut text_after_tool = false;
+        let read = pi_ai::ChatToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"a.txt"}"#.into(),
+        };
         let send = |app: &mut TuiApp,
                     live_text_index: &mut usize,
                     text_after_tool: &mut bool,
@@ -14137,9 +14360,7 @@ mod tests {
             &mut live_text_index,
             &mut text_after_tool,
             &mut saw_delta,
-            &TurnEvent::ToolStarted {
-                name: "read".into(),
-            },
+            &TurnEvent::ToolStarted { call: read.clone() },
         );
         send(
             &mut app,
@@ -14147,13 +14368,10 @@ mod tests {
             &mut text_after_tool,
             &mut saw_delta,
             &TurnEvent::ToolOutput {
-                call: pi_ai::ChatToolCall {
-                    id: "call-1".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"a.txt"}"#.into(),
-                },
+                call: read,
                 output: "file body".into(),
                 is_error: false,
+                duration: Duration::ZERO,
             },
         );
         send(
@@ -14169,7 +14387,11 @@ mod tests {
             &mut text_after_tool,
             &mut saw_delta,
             &TurnEvent::ToolStarted {
-                name: "bash".into(),
+                call: pi_ai::ChatToolCall {
+                    id: "call-2".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
             },
         );
         send(

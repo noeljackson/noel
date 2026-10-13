@@ -54,6 +54,13 @@ The committed TypeScript parity fixtures are:
 - `openai-responses-tools.json`: OpenAI Responses request shape with function
   tools.
 - `openrouter-kimi.json`: OpenRouter OpenAI-compatible request shape.
+- `rpc-protocol.json`: upstream `pi --mode rpc` stdout records, in order, for
+  scripted runs against a local OpenAI-compatible stub: a text prompt, a tool
+  round, steer, follow_up, abort (also with queued messages), prompts while
+  busy, state queries, clear_queue, parse and unknown-command errors, and queue
+  modes. Each scenario also lists the commands sent and what each model request
+  contained. Timestamps, durations, usage, ids, and paths are placeholders; the
+  `placeholders` block lists them.
 - `session-export.json`: session tree/export shape, including direct open of
   full-tree JSONL active branches.
 - `settings.json`: settings merge and normalization cases.
@@ -78,6 +85,9 @@ Current Rust parity coverage includes:
   selected TUI markers, local tool inventory/schema keys, session export shape,
   and model catalog targets.
 - TypeScript full-tree session JSONL active-branch loading.
+- RPC mode: every `rpc-protocol.json` scenario, record by record and model
+  request by model request, allowing the differences listed under "RPC Mode"
+  in the non-parity register (`crates/pi-cli/tests/rpc_parity.rs`).
 
 ## Validation Commands
 
@@ -88,6 +98,7 @@ make ts-parity-update
 cargo test -p pi-parity
 cargo test -p pi-ai --lib matches_ts
 cargo test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
+cargo test -p pi-cli --test rpc_parity
 make check
 make ts-parity-drift
 ```

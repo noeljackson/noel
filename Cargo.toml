@@ -34,5 +34,6 @@ sha2 = "0.10.9"
 thiserror = "2.0.12"
 time = { version = "0.3.47", features = ["formatting"] }
 tokio = { version = "1.45.0", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
-# pi-tools needs signal/process-group syscalls to kill timed-out bash trees.
-nix = { version = "0.29", default-features = false, features = ["signal"] }
+# pi-tools starts tool subprocesses in their own sessions (setsid) and kills
+# their process groups on timeout, interrupt, or a fatal signal to pi.
+nix = { version = "0.29", default-features = false, features = ["process", "signal"] }

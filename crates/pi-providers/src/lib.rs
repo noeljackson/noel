@@ -68,6 +68,15 @@ pub fn builtin_models() -> Vec<ModelSpec> {
             UsageScope::General,
         ),
         model(
+            "faux",
+            "script",
+            "Faux Script",
+            ProviderApi::Faux,
+            None,
+            None,
+            UsageScope::General,
+        ),
+        model(
             "openai",
             "gpt-5.4",
             "OpenAI GPT 5.4",

@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Every `pi` a test runs is isolated: a cleared environment (no provider
 /// keys or PI_* variables leak in), PI_TEST_ISOLATION (pi refuses the default
@@ -64,6 +64,138 @@ fn print_mode_uses_faux_model_without_session() {
         String::from_utf8_lossy(&output.stdout),
         "[faux/echo] hello\n"
     );
+}
+
+/// A pi command answering from `root/script.json` and logging each request.
+fn faux_script_pi(root: &Path, args: &[&str]) -> Command {
+    let mut command = pi_command();
+    command
+        .current_dir(root)
+        .env("HOME", root)
+        .env("PI_CODING_AGENT_DIR", root.join("agent"))
+        .env("PI_FAUX_SCRIPT", root.join("script.json"))
+        .env("PI_FAUX_SCRIPT_LOG", root.join("requests.jsonl"))
+        .args(["--offline", "--no-session", "--model", "faux/script"])
+        .args(args);
+    command
+}
+
+fn faux_script_log(root: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(root.join("requests.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log line"))
+        .collect()
+}
+
+#[test]
+fn print_mode_runs_a_faux_script_tool_round_and_logs_each_request() {
+    let root = test_dir("pi-cli-faux-script");
+    fs::create_dir_all(root.join("agent")).unwrap();
+    fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+    fs::write(
+        root.join("script.json"),
+        r#"[
+            [{"tool_call": {"name": "read", "arguments": {"path": "notes.txt"}}}],
+            [{"text": "notes.txt lists alpha and beta"}]
+        ]"#,
+    )
+    .unwrap();
+
+    let output = faux_script_pi(
+        &root,
+        &[
+            "--no-context-files",
+            "--system-prompt",
+            "Be brief.",
+            "-p",
+            "read notes.txt",
+        ],
+    )
+    .output()
+    .expect("run pi");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "notes.txt lists alpha and beta\n"
+    );
+    let log = faux_script_log(&root);
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[1]["system_prompt"], "Be brief.");
+    assert!(log[1]["tools"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("read")));
+    let messages = log[1]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3, "{messages:?}");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "read notes.txt");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(
+        messages[1]["tool_calls"],
+        serde_json::json!([{"id": "call_1_1", "name": "read", "arguments": {"path": "notes.txt"}}])
+    );
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_1_1");
+    assert_eq!(messages[2]["tool_name"], "read");
+    assert!(
+        messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("alpha\nbeta"),
+        "{}",
+        messages[2]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn faux_script_log_resumes_the_script_in_a_new_process() {
+    let root = test_dir("pi-cli-faux-script-restart");
+    fs::create_dir_all(root.join("agent")).unwrap();
+    fs::write(
+        root.join("script.json"),
+        r#"[
+            [{"text": "partial"}, {"wait_for_file": "never"}],
+            [{"text": "resumed"}]
+        ]"#,
+    )
+    .unwrap();
+
+    // The first process logs its request, then holds the reply open until killed.
+    let mut first = faux_script_pi(&root, &["-p", "first"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pi");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fs::read_to_string(root.join("requests.jsonl")).is_ok_and(|log| log.ends_with('\n')) {
+        assert!(first.try_wait().unwrap().is_none(), "first pi exited");
+        assert!(Instant::now() < deadline, "first request was never logged");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    first.kill().expect("kill first pi");
+    first.wait().expect("reap first pi");
+
+    let output = faux_script_pi(&root, &["-p", "second"])
+        .output()
+        .expect("run pi");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "resumed\n");
+    let log = faux_script_log(&root);
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0]["messages"][0]["content"], "first");
+    assert_eq!(log[1]["messages"][0]["content"], "second");
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -707,45 +839,9 @@ fn settings_session_dir_is_honored_when_no_override_is_passed() {
 }
 
 #[test]
-fn rpc_mode_accepts_json_line_requests_from_stdin() {
-    let mut command = pi_command();
-    command
-        .args(["--no-session", "--mode", "rpc", "--model", "faux/echo"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn pi");
-    let stdin = child.stdin.as_mut().expect("child stdin");
-    writeln!(
-        stdin,
-        r#"{{"jsonrpc":"2.0","id":1,"method":"prompt","params":{{"prompt":"rpc hello"}}}}"#
-    )
-    .expect("write prompt request");
-    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"session"}}"#)
-        .expect("write session request");
-    drop(child.stdin.take());
-
-    let output = child.wait_with_output().expect("wait for pi");
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 2);
-    let first = serde_json::from_str::<serde_json::Value>(lines[0]).expect("parse first");
-    let second = serde_json::from_str::<serde_json::Value>(lines[1]).expect("parse second");
-    assert_eq!(first["id"], 1);
-    assert_eq!(first["result"]["message"], "[faux/echo] rpc hello");
-    assert_eq!(second["id"], 2);
-    assert_eq!(second["result"]["id"], "ephemeral");
-}
-
-#[test]
-fn rpc_reload_keeps_an_untrusted_project_untrusted() {
-    let root = test_dir("pi-cli-rpc-reload-trust");
+fn rpc_mode_keeps_an_untrusted_project_untrusted() {
+    use std::io::BufRead;
+    let root = test_dir("pi-cli-rpc-trust");
     let agent = root.join("agent");
     let project = root.join("project");
     fs::create_dir_all(&agent).expect("create agent dir");
@@ -755,60 +851,66 @@ fn rpc_reload_keeps_an_untrusted_project_untrusted() {
         r#"{"modelRefresh":{"enabled":false}}"#,
     )
     .expect("write settings");
-    // An untrusted repository's settings must not take effect, before or
-    // after a reload.
     fs::write(
         project.join(".pi/settings.json"),
-        r#"{"shellCommandPrefix":"echo untrusted-prefix"}"#,
+        r#"{"shellCommandPrefix":"echo project-prefix"}"#,
     )
     .expect("write project settings");
 
-    let mut child = pi_command()
-        .current_dir(&project)
-        .env("HOME", &root)
-        .env("PI_CODING_AGENT_DIR", &agent)
-        .args([
-            "--mode",
-            "rpc",
-            "--no-session",
-            "--model",
-            "faux/echo",
-            "--no-approve",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn pi");
-    let mut stdin = child.stdin.take().expect("child stdin");
-    for request in [
-        r#"{"jsonrpc":"2.0","id":1,"method":"prompt","params":{"prompt":"/bash echo hi"}}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"reload"}"#,
-        r#"{"jsonrpc":"2.0","id":3,"method":"prompt","params":{"prompt":"/bash echo hi"}}"#,
-    ] {
-        writeln!(stdin, "{request}").expect("write request");
-    }
-    drop(stdin);
-    let output = child.wait_with_output().expect("wait for pi");
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let responses = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json response"))
-        .collect::<Vec<_>>();
-    assert_eq!(responses.len(), 3, "{responses:?}");
-    assert!(responses[1].get("result").is_some(), "{}", responses[1]);
-    for response in [&responses[0], &responses[2]] {
-        assert_eq!(
-            response["result"]["message"].as_str().map(str::trim),
-            Some("hi"),
-            "{response}"
+    // The output of `/bash echo hi`, run without the model. RPC mode has no
+    // reload: every command uses the config startup built.
+    let bash_output = |trust: &str| {
+        let mut child = pi_command()
+            .current_dir(&project)
+            .env("HOME", &root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .args(["--mode", "rpc", "--no-session", "--model", "faux/echo"])
+            .arg(trust)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pi");
+        let mut stdin = child.stdin.take().expect("child stdin");
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("child stdout"));
+        let mut until = |done: &dyn Fn(&serde_json::Value) -> bool| loop {
+            let mut line = String::new();
+            assert!(
+                stdout.read_line(&mut line).expect("read record") > 0,
+                "pi exited early"
+            );
+            let record = serde_json::from_str::<serde_json::Value>(&line).expect("json record");
+            if done(&record) {
+                return record;
+            }
+        };
+        writeln!(stdin, r#"{{"type":"prompt","message":"/bash echo hi"}}"#).expect("write prompt");
+        until(&|record| record["type"] == "agent_settled");
+        writeln!(stdin, r#"{{"id":"messages","type":"get_messages"}}"#).expect("write request");
+        let reply = until(&|record| record["id"] == "messages");
+        drop(stdin);
+        let output = child.wait_with_output().expect("wait for pi");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
-    }
+        let messages = reply["data"]["messages"].as_array().expect("messages");
+        let result = messages
+            .iter()
+            .find(|message| message["role"] == "toolResult")
+            .unwrap_or_else(|| panic!("no tool result in {reply}"));
+        result["content"][0]["text"]
+            .as_str()
+            .expect("tool output")
+            .trim()
+            .to_string()
+    };
+
+    // An untrusted repository's settings must not take effect; a trusted
+    // one's do, so the prefix would show.
+    assert_eq!(bash_output("--no-approve"), "hi");
+    assert_eq!(bash_output("--approve"), "project-prefix\nhi");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1040,6 +1142,157 @@ fn session_reference_and_fork_flags_preserve_parent_context() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// A pi command for one isolated home, agent dir, and session dir.
+fn isolated_pi(root: &Path, args: &[&str]) -> Command {
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"modelRefresh":{"enabled":false}}"#,
+    )
+    .expect("write settings");
+    let mut command = pi_command();
+    command
+        .current_dir(root)
+        .env("HOME", root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["--offline", "--model", "faux/echo", "--session-dir"])
+        .arg(root.join("sessions"))
+        .args(args);
+    command
+}
+
+#[test]
+fn a_session_open_in_another_process_makes_startup_wait_then_exit_75() {
+    let root = test_dir("pi-cli-session-lock");
+    let mut holder = isolated_pi(&root, &["--mode", "rpc", "--session-id", "shared"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rpc holder");
+    // The journal's first record is written only after the lock is taken.
+    let journal = root.join("sessions/shared.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fs::metadata(&journal).map_or(true, |metadata| metadata.len() == 0) {
+        assert!(holder.try_wait().unwrap().is_none(), "rpc holder exited");
+        assert!(
+            Instant::now() < deadline,
+            "rpc holder never opened its session"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let started = Instant::now();
+    let blocked = isolated_pi(&root, &["-p", "--session-id", "shared", "hi"])
+        .output()
+        .expect("run blocked print");
+    let waited = started.elapsed();
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert_eq!(blocked.status.code(), Some(75), "{stderr}");
+    assert!(
+        waited >= Duration::from_millis(4_500) && waited < Duration::from_secs(20),
+        "waited {waited:?}"
+    );
+    assert!(stderr.contains("shared.jsonl"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "in use by another pi process (pid {})",
+            holder.id()
+        )),
+        "{stderr}"
+    );
+    assert!(blocked.stdout.is_empty());
+
+    // SIGKILL runs no cleanup and leaves the lock file behind; the kernel
+    // still releases the lock, so the session opens right away.
+    holder.kill().expect("kill rpc holder");
+    holder.wait().expect("reap rpc holder");
+    let after = isolated_pi(&root, &["-p", "--session-id", "shared", "hi"])
+        .output()
+        .expect("run print after holder exit");
+    assert!(
+        after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&after.stdout), "[faux/echo] hi\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn continue_skips_a_damaged_session_and_writers_repair_torn_tails() {
+    let root = test_dir("pi-cli-damaged-sessions");
+    let first = isolated_pi(&root, &["-p", "first"]).output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let sessions = root.join("sessions");
+    let good = fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .expect("first session journal");
+    let cwd = serde_json::to_string(&root).unwrap();
+    fs::write(
+        sessions.join("damaged.jsonl"),
+        format!(
+            "{{\"type\":\"started\",\"session_id\":\"damaged\",\"cwd\":{cwd}}}\n{{\"type\":\"mess\n"
+        ),
+    )
+    .unwrap();
+
+    // One unreadable journal must not break listing for --continue.
+    let second = isolated_pi(&root, &["-p", "--continue", "second"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let log = fs::read_to_string(&good).unwrap();
+    assert!(log.contains("first") && log.contains("second"), "{log}");
+
+    // A writer drops a torn tail left by an interrupted append, then appends.
+    let torn = sessions.join("torn.jsonl");
+    fs::write(
+        &torn,
+        format!(
+            "{{\"type\":\"started\",\"session_id\":\"torn\",\"cwd\":{cwd}}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"us"
+        ),
+    )
+    .unwrap();
+    let resumed = isolated_pi(
+        &root,
+        &["-p", "--session", torn.to_str().unwrap(), "after torn"],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&resumed.stdout),
+        "[faux/echo] after torn\n"
+    );
+    let log = fs::read_to_string(&torn).unwrap();
+    assert!(log.ends_with('\n'));
+    for line in log.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|error| panic!("corrupt line {line:?}: {error}"));
+    }
+    assert!(log.contains("after torn"));
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -1057,7 +1310,7 @@ fn unique_suffix() -> u128 {
 
 #[test]
 fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_original_transcript() {
-    use std::io::Read;
+    use std::io::{BufRead, Read};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     let root = test_dir("pi-cli-semantic-rpc");
@@ -1158,27 +1411,38 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
         .stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    for (id, prompt) in [
-        (
-            1,
-            format!("use SQLite transactions {}", "reference ".repeat(300)),
-        ),
-        (2, "current migration".into()),
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    // Each command waits for the previous run to settle.
+    let mut until = |done: &dyn Fn(&serde_json::Value) -> bool| loop {
+        let mut line = String::new();
+        assert!(stdout.read_line(&mut line).unwrap() > 0, "pi exited early");
+        let record = serde_json::from_str::<serde_json::Value>(&line).unwrap();
+        if done(&record) {
+            return record;
+        }
+    };
+    let settled = |record: &serde_json::Value| record["type"] == "agent_settled";
+    for prompt in [
+        format!("use SQLite transactions {}", "reference ".repeat(300)),
+        "current migration".into(),
     ] {
         writeln!(
             stdin,
             "{}",
-            serde_json::json!({"id":id,"method":"prompt","params":{"prompt":prompt}})
+            serde_json::json!({"type":"prompt","message":prompt})
         )
         .unwrap();
+        assert_eq!(until(&settled)["aborted"], false);
     }
-    writeln!(stdin, "{}", serde_json::json!({"id":3,"method":"compact","params":{"focus":"preserve database decisions"}})).unwrap();
+    writeln!(stdin, "{}", serde_json::json!({"id":"compact","type":"compact","customInstructions":"preserve database decisions"})).unwrap();
+    let compacted = until(&|record| record["id"] == "compact");
     writeln!(
         stdin,
         "{}",
-        serde_json::json!({"id":4,"method":"prompt","params":{"prompt":"continue"}})
+        serde_json::json!({"type":"prompt","message":"continue"})
     )
     .unwrap();
+    until(&settled);
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -1187,13 +1451,9 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
         String::from_utf8_lossy(&output.stderr)
     );
     server.join().unwrap();
-    let responses = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(responses.len(), 4);
-    assert_eq!(responses[2]["result"]["omitted_messages"], 2);
-    assert!(responses[2]["result"]["summary"]
+    assert_eq!(compacted["success"], true, "{compacted}");
+    assert_eq!(compacted["data"]["details"]["omittedMessages"], 2);
+    assert!(compacted["data"]["summary"]
         .as_str()
         .unwrap()
         .contains("SQLite"));
@@ -1218,7 +1478,7 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
     let journal = fs::read_to_string(&journal_path).unwrap();
     assert!(journal.contains("use SQLite transactions reference"));
     assert!(journal.contains("compaction_checkpoint"));
-    let (_, loaded) = pi_core::SessionStore::open(journal_path).unwrap();
+    let loaded = pi_core::SessionStore::read(&journal_path).unwrap();
     assert_eq!(loaded.compactions.len(), 1);
     assert_eq!(loaded.usage.requests, 4);
     fs::remove_dir_all(root).unwrap();
@@ -1483,5 +1743,210 @@ fn auth_commands_leave_imported_logins_unrefreshed_until_they_expire() {
         codex_login
     );
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Whether `pid` still runs. A killed process stays a zombie (state Z) until
+/// it is reaped, which counts as exited.
+#[cfg(unix)]
+fn process_is_running(pid: &str) -> bool {
+    if cfg!(target_os = "linux") {
+        return fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, fields)| !fields.trim_start().starts_with('Z'))
+        });
+    }
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Serves `responses` OpenAI chat-completions bodies, one per connection.
+#[cfg(unix)]
+fn serve_chat_completions(responses: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for body in responses {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "local provider timed out");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("local server: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let body_start = loop {
+                let mut chunk = [0u8; 4096];
+                let read = socket.read(&mut chunk).unwrap();
+                assert!(read > 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let length = String::from_utf8_lossy(&request[..body_start])
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < body_start + length {
+                let mut chunk = [0u8; 4096];
+                let read = socket.read(&mut chunk).unwrap();
+                assert!(read > 0, "request ended before its body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    (url, server)
+}
+
+#[cfg(unix)]
+#[test]
+fn fatal_signals_during_a_print_mode_bash_tool_kill_its_tree_and_end_pi_like_upstream() {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+    let root = test_dir("pi-cli-signal-bash");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"modelRefresh":{"enabled":false},"retry":{"enabled":false},"compaction":{"enabled":false}}"#,
+    )
+    .unwrap();
+    fs::write(
+        agent.join("auth.json"),
+        r#"{"local":{"type":"api_key","key":"fake-local-key"}}"#,
+    )
+    .unwrap();
+
+    // Upstream exits 143/129 on SIGTERM/SIGHUP and dies of SIGINT.
+    for (signal, expected) in [
+        ("TERM", (Some(143), None)),
+        ("INT", (None, Some(2))),
+        ("HUP", (Some(129), None)),
+    ] {
+        // The model calls bash; the shell and a background child publish
+        // their pids, then wait on the child. Each case has its own
+        // one-response provider, so a dying pi cannot take the next reply.
+        let pid_file = root.join(format!("{signal}.pids"));
+        let command = format!(
+            "echo $$ > '{0}.tmp'; sleep 30 & echo $! >> '{0}.tmp'; mv '{0}.tmp' '{0}'; wait",
+            pid_file.display()
+        );
+        let (url, server) = serve_chat_completions(vec![serde_json::json!({
+            "choices":[{"message":{"content":null,"tool_calls":[{
+                "id":"call-1","type":"function",
+                "function":{"name":"bash","arguments":serde_json::json!({"command":command}).to_string()}
+            }]},"finish_reason":"tool_calls"}]
+        })
+        .to_string()]);
+        fs::write(
+            agent.join("models.json"),
+            serde_json::json!([{
+                "provider":"local","id":"test","api":"openai-completions","baseUrl":url,"contextWindow":8192
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut pi = pi_command()
+            .current_dir(&root)
+            .env("HOME", &root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .env("SHELL", "/bin/sh")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .args(["--no-session", "--no-context-files", "-p"])
+            .args(["--model", "local/test", "run the tool"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let pids = loop {
+            if let Ok(pids) = fs::read_to_string(&pid_file) {
+                break pids
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+            }
+            if Instant::now() >= deadline || pi.try_wait().unwrap().is_some() {
+                let _ = pi.kill();
+                let output = pi.wait_with_output().unwrap();
+                panic!(
+                    "the bash tool never started: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(pids.len(), 2, "{pids:?}");
+        assert!(Command::new("kill")
+            .args([&format!("-{signal}"), &pi.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = pi.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = pi.kill();
+                panic!("pi ignored SIG{signal}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pids.iter().any(|pid| process_is_running(pid)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survivors = pids
+            .iter()
+            .filter(|pid| process_is_running(pid))
+            .collect::<Vec<_>>();
+        for pid in &survivors {
+            let _ = Command::new("kill").args(["-KILL", pid.as_str()]).status();
+        }
+        let mut stderr = String::new();
+        pi.stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(
+            (status.code(), status.signal()),
+            expected,
+            "SIG{signal}: {stderr}"
+        );
+        assert!(
+            survivors.is_empty(),
+            "SIG{signal} left tool processes running: {survivors:?}"
+        );
+        server.join().unwrap();
+    }
     fs::remove_dir_all(root).unwrap();
 }

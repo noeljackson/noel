@@ -308,12 +308,8 @@ where
 {
     let device = request_device_code(client, base_url, CODEX_CLIENT_ID).await?;
     on_code(&device);
-    let success = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            return Err(anyhow!("login cancelled"));
-        }
-        result = poll_device_token(client, base_url, &device, LOGIN_TIMEOUT) => result?,
-    };
+    // Ctrl+C is handled process-wide (`signals`): pi exits with status 130.
+    let success = poll_device_token(client, base_url, &device, LOGIN_TIMEOUT).await?;
     let redirect_uri = format!("{base_url}/deviceauth/callback");
     let tokens = exchange_authorization_code(
         client,

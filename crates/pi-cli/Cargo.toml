@@ -10,11 +10,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 base64.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 getrandom.workspace = true
 image.workspace = true
+nix.workspace = true
 pi-ai = { path = "../pi-ai" }
 pi-config = { path = "../pi-config" }
 pi-core = { path = "../pi-core" }
