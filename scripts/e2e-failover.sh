@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Account failover e2e, on a scripted faux model with two stored accounts:
 # a rate-limited account's request is answered by the other without a retry
-# and the TUI says which account is cooling down; `/account <name>` pins an
-# account, after which a rate limit is the run loop's to retry.
+# and the TUI names both accounts; `/account <name>` pins an account, after
+# which a rate limit is the run loop's to retry.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e-isolate.sh
 source "${repo_root}/scripts/e2e-isolate.sh"
@@ -46,7 +46,8 @@ wait_for '│ >'
 tmux send-keys -t "${session}" 'first prompt' Enter
 wait_for 'served after the switch'
 # The switch is reported after the turn, as a system line; it was not a retry.
-wait_for 'account first hit its limit; cooling down until'
+wait_for 'faux account first is rate limited until'
+wait_for 'UTC; switched to second'
 capture
 if grep -Fq 'retrying in' "${work_dir}/pane.txt"; then fail 'a failover switch was shown as a retry'; fi
 [ "$(requests)" = 2 ] || fail "expected 2 requests after the switch, got $(requests)"

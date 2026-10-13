@@ -990,7 +990,7 @@ impl MergeSettings for ModelRefreshSettings {
 /// Failover-only multi-account rotation settings.
 ///
 /// One sticky account carries the session; other stored accounts are used
-/// only when the sticky one is rate limited (429/529) or its 5h usage
+/// only when the sticky one is rate limited (429) or its 5h usage
 /// window is at the exhaustion threshold. This is availability failover,
 /// not load balancing: requests are never spread across accounts to
 /// maximize throughput.
@@ -1026,7 +1026,7 @@ pub struct FailoverProviderSettings {
     /// resets. Default 90.
     pub exhaustion_threshold_pct: Option<u64>,
     /// Minimum milliseconds between voluntary account switches. Default
-    /// 10000. Switches forced by 429/529 are not rate limited.
+    /// 10000. Switches away from a rate-limited account never wait.
     pub min_switch_interval_ms: Option<u64>,
 }
 
@@ -1973,7 +1973,7 @@ pub fn update_auth_file<T>(
 
 /// Creates `dir` and any missing parents owner-only; an existing directory
 /// keeps its permissions.
-fn create_private_dir_all(dir: &Path) -> Result<(), ConfigError> {
+pub fn create_private_dir_all(dir: &Path) -> Result<(), ConfigError> {
     if dir.as_os_str().is_empty() || dir.is_dir() {
         return Ok(());
     }

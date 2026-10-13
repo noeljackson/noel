@@ -1,116 +1,57 @@
 //! Failover-only multi-account provider wrapper.
 //!
 //! Intent: availability, not throughput. One "sticky" account carries the
-//! session; other stored accounts are used only when the sticky one returns
-//! an exhaustion signal (HTTP 429 or 529) with no streamed output. Selection
-//! is sticky across turns, cooldowns come from the provider's own reset
-//! timestamps, and switching is rate-limited so the wrapper never flaps
-//! between accounts. This deliberately does not load-balance, rebalance to
-//! the lowest-usage account, or spread requests across the pool.
+//! session; other stored accounts are used only when the sticky one is rate
+//! limited (HTTP 429 with no streamed output) or its 5h usage window is at
+//! the exhaustion threshold. A rate limit lasts until the provider says it
+//! resets, and a switch away from an account near its usage limit waits out
+//! a minimum interval after the last switch, so the pool never flaps between
+//! accounts. This deliberately does not load-balance, rebalance to the
+//! lowest-usage account, or spread requests across the pool.
+//!
+//! Every request builds its own pool. What pools learn (the sticky account,
+//! rate limits, the last switch) is saved in `failover-state.json` in the
+//! agent directory, so it holds across requests and across processes.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use noel_ai::{Provider, ProviderAuth, ProviderError, ProviderRequest, StreamEvent};
-use noel_config::{auth_for_provider, AuthData, ResolvedAuth, UsageCache, UsageWindow};
+use noel_config::{auth_for_provider, AuthData, UsageCache, UsageWindow};
+use serde::{Deserialize, Serialize};
 
-/// Minimum time between voluntary account switches, in milliseconds.
-/// Prevents rapid flapping when multiple accounts are near their limits.
-/// Involuntary switches (the current account just returned 429/529) are not
-/// subject to this guard.
+/// Minimum time between voluntary account switches, in milliseconds: those
+/// away from an account whose usage window is at the threshold. A switch
+/// away from a rate-limited account is never held back.
 pub const MIN_SWITCH_INTERVAL_MS: u64 = 10_000;
 
-/// Usage windows at or above this percentage are treated as exhausted for
-/// candidate filtering when no explicit cooldown exists.
+/// Usage at or above this percentage of the 5h window sets an account aside
+/// until the window resets, unless a provider's `exhaustionThresholdPct`
+/// says otherwise.
 pub const EXHAUSTION_THRESHOLD_PCT: f64 = 90.0;
 
-/// Fallback cooldown in seconds when no usage-window reset time is known:
-/// long enough that a saturated account is skipped for the current work,
-/// short enough that a transient 429 does not bench an account for an hour.
+/// How long a rate-limited account sits out when the provider's answer says
+/// nothing about when it may ask again.
 pub const DEFAULT_COOLDOWN_SECONDS: i64 = 300;
 
+/// The pools' saved state, in the agent directory.
+pub const STATE_FILE: &str = "failover-state.json";
+
+/// A stored account that can join a provider's pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailoverConfig {
-    pub enabled: bool,
-    /// Explicit per-account cooldown overrides: account -> epoch seconds.
-    pub cooldowns: BTreeMap<String, i64>,
-    pub min_switch_interval_ms: u64,
-}
-
-impl Default for FailoverConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            cooldowns: BTreeMap::new(),
-            min_switch_interval_ms: MIN_SWITCH_INTERVAL_MS,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct FailoverCandidate {
     pub account: String,
-    pub auth: ResolvedAuth,
-    /// Cooldown deadline (epoch seconds). Zero or past means available.
-    pub cooldown_until: i64,
+    /// Until when its 5h usage window is at the exhaustion threshold, in
+    /// epoch seconds; 0 when it is not.
+    pub exhausted_until: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailoverDecision {
-    /// The account that should serve the current request.
-    pub account: String,
-    /// True when this is a switch away from the previously used account.
-    pub switched: bool,
-}
-
-/// Order candidates for sticky selection: the previous account first, then
-/// the remaining accounts in storage order. Deterministic: storage order is
-/// the sorted key order of `auth.json`.
-fn ordered_candidates(
-    candidates: &[FailoverCandidate],
-    previous: Option<&str>,
-) -> Vec<FailoverCandidate> {
-    let mut ordered: Vec<FailoverCandidate> = Vec::with_capacity(candidates.len());
-    if let Some(previous) = previous {
-        if let Some(index) = candidates
-            .iter()
-            .position(|candidate| candidate.account == previous)
-        {
-            ordered.push(candidates[index].clone());
-        }
-    }
-    for candidate in candidates {
-        if previous != Some(candidate.account.as_str()) {
-            ordered.push(candidate.clone());
-        }
-    }
-    ordered
-}
-
-/// Pick the account that should serve the next request.
-///
-/// Sticky by design: `previous` wins unless it is cooling down, in which case
-/// the next available account in storage order serves the request and becomes
-/// the new sticky choice for subsequent turns.
-pub fn select_account(
-    candidates: &[FailoverCandidate],
-    previous: Option<&str>,
-    now: i64,
-) -> Option<FailoverDecision> {
-    let ordered = ordered_candidates(candidates, previous);
-    let pick = ordered
-        .iter()
-        .find(|candidate| candidate.cooldown_until <= now)?;
-    Some(FailoverDecision {
-        account: pick.account.clone(),
-        switched: previous.is_some_and(|previous| previous != pick.account),
-    })
-}
-
-/// Build the failover pool for a provider from stored auth and cached usage.
+/// The stored accounts of `provider` that have a credential, in storage
+/// order (the sorted key order of `auth.json`), with what the usage cache
+/// says of their 5h windows.
 ///
 /// Env and imported-file accounts are excluded: they are not stored under an
 /// account name, so they cannot participate in named rotation, and mixing
@@ -119,50 +60,35 @@ pub fn failover_candidates(
     auth: &AuthData,
     usage_cache: Option<&UsageCache>,
     provider: &str,
-    config: &FailoverConfig,
+    threshold_pct: f64,
     now: i64,
 ) -> Vec<FailoverCandidate> {
     auth.accounts_for_provider(provider)
         .into_iter()
-        .filter_map(|account| {
-            let resolved = auth_for_provider(auth, provider, Some(&account))?;
-            let cooldown_until = account_cooldown(
-                &account,
-                usage_cache
-                    .and_then(|cache| cache.accounts.get(&format!("{provider}:{account}")))
-                    .map(|usage| usage.windows.as_slice()),
-                &config.cooldowns,
-                now,
-            );
-            Some(FailoverCandidate {
+        .filter(|account| auth_for_provider(auth, provider, Some(account)).is_some())
+        .map(|account| {
+            let windows = usage_cache
+                .and_then(|cache| cache.accounts.get(&format!("{provider}:{account}")))
+                .map(|usage| usage.windows.as_slice());
+            FailoverCandidate {
+                exhausted_until: exhausted_until(windows, threshold_pct, now),
                 account,
-                auth: resolved,
-                cooldown_until,
-            })
+            }
         })
         .collect()
 }
 
-/// Cooldown deadline for one account. Explicit settings win; otherwise the
-/// 5h usage window's reset time applies once usage crosses the exhaustion
-/// threshold. The weekly window is deliberately ignored: a weekly-capped
-/// account has no useful failover target, and benching it for days would
-/// defeat the availability goal.
-fn account_cooldown(
-    account: &str,
-    windows: Option<&[UsageWindow]>,
-    overrides: &BTreeMap<String, i64>,
-    now: i64,
-) -> i64 {
-    if let Some(explicit) = overrides.get(account) {
-        return *explicit;
-    }
+/// When the 5h usage window resets, once its usage is at `threshold_pct` or
+/// above. The weekly window is deliberately ignored: a weekly-capped account
+/// has no useful failover target, and setting it aside for days would defeat
+/// the availability goal.
+fn exhausted_until(windows: Option<&[UsageWindow]>, threshold_pct: f64, now: i64) -> i64 {
     let Some(short_window) =
         windows.and_then(|windows| windows.iter().find(|window| window.label == "5h"))
     else {
         return 0;
     };
-    if short_window.used_pct < EXHAUSTION_THRESHOLD_PCT {
+    if short_window.used_pct < threshold_pct {
         return 0;
     }
     short_window
@@ -171,107 +97,264 @@ fn account_cooldown(
         .unwrap_or(0)
 }
 
+/// Where an account stands for the next request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Standing<'a> {
+    pub account: &'a str,
+    /// Until when the provider refuses it, in epoch seconds.
+    pub limited_until: i64,
+    /// Until when its 5h usage window is at the exhaustion threshold.
+    pub exhausted_until: i64,
+}
+
+/// Pick the account that should serve the next request.
+///
+/// Sticky by design: `previous` wins unless it is set aside, and then the
+/// first account in storage order that is not. When every account the
+/// provider still takes is at its usage threshold, the sticky one goes on
+/// serving: such an account still answers. `None` when the provider refuses
+/// every account.
+pub fn select_account<'a>(
+    accounts: &[Standing<'a>],
+    previous: Option<&str>,
+    now: i64,
+) -> Option<&'a str> {
+    let sticky = accounts
+        .iter()
+        .filter(|standing| Some(standing.account) == previous);
+    let rest = accounts
+        .iter()
+        .filter(|standing| Some(standing.account) != previous);
+    let ordered = sticky.chain(rest);
+    let taken = |standing: &&Standing| standing.limited_until <= now;
+    ordered
+        .clone()
+        .find(|standing| taken(standing) && standing.exhausted_until <= now)
+        .or_else(|| ordered.clone().find(taken))
+        .map(|standing| standing.account)
+}
+
+/// Only a rate limit moves a request to another account. A 529 says the
+/// provider is overloaded for everyone, so it stays the run loop's to retry.
 fn is_rate_limited(error: &ProviderError) -> bool {
-    match error {
-        ProviderError::Status { status, .. } => status.as_u16() == 429 || status.as_u16() == 529,
-        _ => false,
+    matches!(error, ProviderError::Status { status, .. } if status.as_u16() == 429)
+}
+
+/// When the provider says a rate-limited account may ask again, in epoch
+/// seconds: the wait its answer asks for, or the `error.resets_at` an
+/// `openai-codex` usage limit carries, whichever is later.
+fn limit_resets_at(error: &ProviderError, now: i64) -> Option<i64> {
+    let ProviderError::Status {
+        body, retry_after, ..
+    } = error
+    else {
+        return None;
+    };
+    let wait = retry_after.map(|wait| now.saturating_add(wait.as_secs_f64().ceil() as i64));
+    let resets_at = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|body| body.pointer("/error/resets_at")?.as_i64());
+    wait.into_iter().chain(resets_at).max()
+}
+
+/// What `failover-state.json` holds for one provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedProvider {
+    /// The account that carries the provider's requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// When a pool last switched accounts, in epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_switch_ms: Option<u64>,
+    /// Rate-limited accounts, and the epoch second each may ask again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub limited_until: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SavedState {
+    #[serde(default)]
+    providers: BTreeMap<String, SavedProvider>,
+}
+
+fn read_state(path: &Path) -> SavedState {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// What the pools of `provider` saved in `path`; nothing when the file is
+/// missing or unreadable.
+pub fn saved_state(path: &Path, provider: &str) -> SavedProvider {
+    read_state(path)
+        .providers
+        .remove(provider)
+        .unwrap_or_default()
+}
+
+/// Applies `change` to what `path` holds for `provider`, drops rate limits
+/// that have ended, and writes the file back. Processes write it without a
+/// lock: one that writes between another's read and write undoes that
+/// change, which costs at most one request to an account the provider then
+/// refuses again.
+fn save_state(path: &Path, provider: &str, now: i64, change: impl FnOnce(&mut SavedProvider)) {
+    let mut state = read_state(path);
+    change(state.providers.entry(provider.to_string()).or_default());
+    for saved in state.providers.values_mut() {
+        saved.limited_until.retain(|_, until| *until > now);
+    }
+    let mut bytes = serde_json::to_vec_pretty(&state).expect("failover state serializes");
+    bytes.push(b'\n');
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let written = noel_config::create_private_dir_all(parent)
+        .and_then(|()| noel_config::write_file_atomic(path, &bytes));
+    if let Err(error) = written {
+        notice_once(
+            format!("save {}", path.display()),
+            format!("account failover could not save its state: {error}"),
+        );
     }
 }
 
-fn status_of(error: &ProviderError) -> u16 {
-    match error {
-        ProviderError::Status { status, .. } => status.as_u16(),
-        _ => 0,
+/// Notices for the person running noel, which each mode shows its way: the
+/// TUI after the turn, print mode on stderr, RPC as a notification.
+struct Notices {
+    pending: Vec<String>,
+    /// Keys of the notices given once per process.
+    given: BTreeSet<String>,
+    /// Every notice, for tests: they run in parallel, and a drain takes
+    /// every test's notices.
+    #[cfg(test)]
+    log: Vec<String>,
+}
+
+static NOTICES: Mutex<Notices> = Mutex::new(Notices {
+    pending: Vec::new(),
+    given: BTreeSet::new(),
+    #[cfg(test)]
+    log: Vec::new(),
+});
+
+fn notices() -> std::sync::MutexGuard<'static, Notices> {
+    NOTICES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Notices {
+    fn give(&mut self, text: String) {
+        #[cfg(test)]
+        self.log.push(text.clone());
+        self.pending.push(text);
     }
 }
 
-/// Signals emitted by the wrapper so the CLI can surface account switches in
-/// the transcript without the wrapper owning UI state.
+fn notice(text: String) {
+    notices().give(text);
+}
+
+fn notice_once(key: String, text: String) {
+    let mut notices = notices();
+    if notices.given.insert(key) {
+        notices.give(text);
+    }
+}
+
+/// Notices given since the last drain, oldest first.
+pub fn drain_notices() -> Vec<String> {
+    std::mem::take(&mut notices().pending)
+}
+
+/// Every notice this process gave that contains `text`.
+#[cfg(test)]
+pub fn notices_given(text: &str) -> Vec<String> {
+    notices()
+        .log
+        .iter()
+        .filter(|notice| notice.contains(text))
+        .cloned()
+        .collect()
+}
+
+/// Says once per process that an account is left out of the pool, and why.
+pub fn report_left_out(provider: &str, account: &str, reason: &str) {
+    notice_once(
+        format!("left out {provider}:{account}"),
+        format!("{provider} account {account} is left out of failover: {reason}"),
+    );
+}
+
+/// `until` (epoch seconds) as a UTC time, with the date unless it is within
+/// a day of `now`.
+fn format_time(until: i64, now: i64) -> String {
+    let description = if until - now < 20 * 60 * 60 {
+        "[hour]:[minute] UTC"
+    } else {
+        "[year]-[month]-[day] [hour]:[minute] UTC"
+    };
+    time::OffsetDateTime::from_unix_timestamp(until)
+        .ok()
+        .zip(time::format_description::parse(description).ok())
+        .and_then(|(time, format)| time.format(&format).ok())
+        .unwrap_or_else(|| format!("{until} (epoch seconds)"))
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Signals for tests to observe the wrapper with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailoverEvent {
-    /// Serving with this account; `switched` is true when it differs from
-    /// the previously used account.
-    Serving { account: String, switched: bool },
-    /// An account returned an exhaustion signal and is now cooling down
-    /// until the given epoch second.
-    Cooldown {
+    /// Serving with this account; `switched_from` names the sticky account
+    /// it replaced.
+    Serving {
         account: String,
-        until: i64,
-        status: u16,
+        switched_from: Option<String>,
     },
+    /// The provider refused an account until the given epoch second.
+    Limited { account: String, until: i64 },
 }
 
+/// What one pool knows, from the saved state and the usage cache.
 struct PoolState {
-    /// Account that currently carries the session. Sticky across turns
-    /// within the process.
     current: Option<String>,
-    /// Monotonic milliseconds of the last account switch.
-    last_switch_ms: AtomicU64,
-    /// Account -> cooldown deadline in epoch seconds.
-    cooldowns: BTreeMap<String, i64>,
+    last_switch_ms: Option<u64>,
+    limited_until: BTreeMap<String, i64>,
+    exhausted_until: BTreeMap<String, i64>,
 }
 
-/// Monotonic clock base for switch rate limiting. `Instant` cannot be
-/// constructed in a const context, so it is lazily initialized once.
-fn monotonic_base() -> Instant {
-    static BASE: OnceLock<Instant> = OnceLock::new();
-    *BASE.get_or_init(Instant::now)
+impl PoolState {
+    fn limited_until(&self, account: &str) -> i64 {
+        self.limited_until.get(account).copied().unwrap_or(0)
+    }
+
+    fn exhausted_until(&self, account: &str) -> i64 {
+        self.exhausted_until.get(account).copied().unwrap_or(0)
+    }
 }
 
-fn monotonic_ms() -> u64 {
-    monotonic_base().elapsed().as_millis() as u64
-}
-
-/// Process-wide failover memory. Providers are reconstructed for every
-/// request, so stickiness (which account carried the session) and learned
-/// cooldowns must live outside any single wrapper instance. Scoped to this
-/// process, which is the session lifetime for `noel`.
-#[derive(Default)]
-struct FailoverMemory {
-    /// provider -> account that last served a request.
-    current: BTreeMap<String, String>,
-    /// "provider:account" -> cooldown deadline (epoch seconds).
-    cooldowns: BTreeMap<String, i64>,
-    /// Human-readable notices (switches, cooldowns) for UI surfacing.
-    notices: Vec<String>,
-}
-
-static MEMORY: Mutex<Option<FailoverMemory>> = Mutex::new(None);
-
-fn with_memory<R>(f: impl FnOnce(&mut FailoverMemory) -> R) -> R {
-    let mut guard = MEMORY.lock().expect("failover memory poisoned");
-    let memory = guard.get_or_insert_with(FailoverMemory::default);
-    f(memory)
-}
-
-/// Seed the wrapper with the process-level sticky account and cooldowns for
-/// this provider. Called at build time.
-pub fn remembered_state(provider: &str) -> (Option<String>, BTreeMap<String, i64>) {
-    with_memory(|memory| {
-        let cooldowns = memory
-            .cooldowns
-            .iter()
-            .filter_map(|(key, until)| {
-                key.strip_prefix(&format!("{provider}:"))
-                    .map(|account| (account.to_string(), *until))
-            })
-            .collect();
-        (memory.current.get(provider).cloned(), cooldowns)
-    })
-}
-
-/// Notices generated since the last drain, oldest first. The UI drains these
-/// after a turn to surface account switches without injecting text into the
-/// assistant stream.
-pub fn drain_notices() -> Vec<String> {
-    with_memory(|memory| std::mem::take(&mut memory.notices))
+/// The account a request goes to.
+struct Choice {
+    index: usize,
+    switched_from: Option<String>,
+    /// Whether the sticky account changed, so the saved state must.
+    sticky_changed: bool,
 }
 
 pub struct FailoverProvider {
+    provider_name: String,
     /// Per-account constructed providers, in candidate order.
     providers: Vec<(String, Box<dyn Provider>)>,
     state: Mutex<PoolState>,
     min_switch_interval_ms: u64,
+    /// Where the state is saved; none in tests of the pool alone.
+    state_path: Option<PathBuf>,
     on_event: Box<dyn Fn(FailoverEvent) + Send + Sync>,
 }
 
@@ -279,6 +362,7 @@ impl std::fmt::Debug for FailoverProvider {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("FailoverProvider")
+            .field("provider", &self.provider_name)
             .field(
                 "accounts",
                 &self.providers.iter().map(|(a, _)| a).collect::<Vec<_>>(),
@@ -289,32 +373,24 @@ impl std::fmt::Debug for FailoverProvider {
 }
 
 pub struct FailoverProviderBuilder {
-    accounts: Vec<(String, ProviderAuth)>,
     provider_name: String,
-    initial_current: Option<String>,
+    accounts: Vec<(String, ProviderAuth)>,
+    exhausted_until: BTreeMap<String, i64>,
     min_switch_interval_ms: u64,
+    state_path: Option<PathBuf>,
     on_event: Option<Box<dyn Fn(FailoverEvent) + Send + Sync>>,
-    cooldowns: BTreeMap<String, i64>,
 }
 
 impl FailoverProviderBuilder {
     pub fn new(provider_name: impl Into<String>) -> Self {
         Self {
-            accounts: Vec::new(),
             provider_name: provider_name.into(),
-            initial_current: None,
+            accounts: Vec::new(),
+            exhausted_until: BTreeMap::new(),
             min_switch_interval_ms: MIN_SWITCH_INTERVAL_MS,
+            state_path: None,
             on_event: None,
-            cooldowns: BTreeMap::new(),
         }
-    }
-
-    /// Seed the sticky account from process memory (the previous request's
-    /// choice). Without this, per-request provider reconstruction would
-    /// reset stickiness to storage order.
-    pub fn remember(mut self, account: Option<String>) -> Self {
-        self.initial_current = account;
-        self
     }
 
     pub fn account(mut self, account: impl Into<String>, auth: ProviderAuth) -> Self {
@@ -322,8 +398,20 @@ impl FailoverProviderBuilder {
         self
     }
 
+    /// The account's 5h usage window is at the threshold until `until`.
+    pub fn exhausted_until(mut self, account: impl Into<String>, until: i64) -> Self {
+        self.exhausted_until.insert(account.into(), until);
+        self
+    }
+
     pub fn min_switch_interval_ms(mut self, ms: u64) -> Self {
         self.min_switch_interval_ms = ms;
+        self
+    }
+
+    /// Start from the state saved in `path`, and save what changes there.
+    pub fn saved_in(mut self, path: PathBuf) -> Self {
+        self.state_path = Some(path);
         self
     }
 
@@ -333,173 +421,155 @@ impl FailoverProviderBuilder {
         self
     }
 
-    pub fn cooldown(mut self, account: impl Into<String>, until: i64) -> Self {
-        self.cooldowns.insert(account.into(), until);
-        self
-    }
-
     /// Build the wrapper. `factory` constructs the concrete provider for one
     /// account; the wrapper stays agnostic to provider APIs.
     pub fn build(
         self,
         mut factory: impl FnMut(ProviderAuth) -> Box<dyn Provider>,
     ) -> FailoverProvider {
-        let providers = self
-            .accounts
-            .into_iter()
-            .map(|(account, auth)| (account, factory(auth)))
-            .collect();
-        let provider_name = self.provider_name.clone();
-        let on_event = self.on_event.unwrap_or_else(|| Box::new(|_| {}));
+        let saved = self
+            .state_path
+            .as_deref()
+            .map(|path| saved_state(path, &self.provider_name))
+            .unwrap_or_default();
         FailoverProvider {
-            providers,
+            providers: self
+                .accounts
+                .into_iter()
+                .map(|(account, auth)| (account, factory(auth)))
+                .collect(),
             state: Mutex::new(PoolState {
-                current: self.initial_current.clone(),
-                last_switch_ms: AtomicU64::new(0),
-                cooldowns: self.cooldowns,
+                current: saved.current,
+                last_switch_ms: saved.last_switch_ms,
+                limited_until: saved.limited_until,
+                exhausted_until: self.exhausted_until,
             }),
+            provider_name: self.provider_name,
             min_switch_interval_ms: self.min_switch_interval_ms,
-            on_event: Box::new(move |event| {
-                record_failover_event(&provider_name, &event);
-                on_event(event);
-            }),
+            state_path: self.state_path,
+            on_event: self.on_event.unwrap_or_else(|| Box::new(|_| {})),
         }
-    }
-}
-
-/// Persist a wrapper event into process memory: sticky account, learned
-/// cooldowns, and a UI notice.
-fn record_failover_event(provider: &str, event: &FailoverEvent) {
-    match event {
-        FailoverEvent::Serving { account, .. } => {
-            with_memory(|memory| {
-                memory.current.insert(provider.to_string(), account.clone());
-            });
-        }
-        FailoverEvent::Cooldown { account, until, .. } => {
-            with_memory(|memory| {
-                memory
-                    .cooldowns
-                    .insert(format!("{provider}:{account}"), *until);
-                memory.notices.push(format!(
-                    "account {account} hit its limit; cooling down until {}",
-                    format_cooldown(*until)
-                ));
-            });
-        }
-    }
-}
-
-fn format_cooldown(until: i64) -> String {
-    if until <= 0 {
-        return "shortly".to_string();
-    }
-    let Ok(timestamp) = time::OffsetDateTime::from_unix_timestamp(until) else {
-        return "shortly".to_string();
-    };
-    let Ok(format) = time::format_description::parse("[hour]:[minute] UTC") else {
-        return "shortly".to_string();
-    };
-    timestamp
-        .format(&format)
-        .unwrap_or_else(|_| "shortly".to_string())
-}
-
-impl Default for FailoverProviderBuilder {
-    fn default() -> Self {
-        Self::new(String::new())
     }
 }
 
 impl FailoverProvider {
-    /// Attempt one request against one account. Returns the error together
-    /// with the number of events already streamed when it fails partway.
-    async fn attempt(
-        &self,
-        index: usize,
-        request: &ProviderRequest,
-        on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
-    ) -> Result<Vec<StreamEvent>, (ProviderError, usize)> {
-        let provider = &self.providers[index].1;
-        let mut events = Vec::new();
-        let result = provider
-            .complete_streaming(request.clone(), &mut |event: StreamEvent| {
-                events.push(event.clone());
-                on_event(event.clone())
-            })
-            .await;
-        match result {
-            Ok(()) => Ok(events),
-            Err(error) => Err((error, events.len())),
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        self.state.lock().expect("failover pool poisoned")
+    }
+
+    fn save(&self, now: i64, change: impl FnOnce(&mut SavedProvider)) {
+        if let Some(path) = &self.state_path {
+            save_state(path, &self.provider_name, now, change);
         }
     }
 
-    /// Choose the account for this request under the pool lock, applying
-    /// cooldowns and the voluntary-switch rate limit. `forced` marks a
-    /// switch forced by an exhaustion signal on the current account, which
-    /// bypasses the rate limit (availability first, still no flapping
-    /// because the failed account enters a cooldown).
-    fn choose(&self, now: i64, forced: bool) -> Option<(usize, FailoverDecision)> {
-        let mut state = self.state.lock().expect("failover pool poisoned");
-        let candidates: Vec<FailoverCandidate> = self
+    /// Choose the account for this request. A switch away from a sticky
+    /// account the provider refuses is forced. One away from a sticky
+    /// account at its usage threshold is voluntary, and waits until
+    /// `min_switch_interval_ms` has passed since the last switch.
+    fn choose(&self, now_ms: u64) -> Option<Choice> {
+        let now = (now_ms / 1000) as i64;
+        let mut state = self.lock();
+        let accounts = self
             .providers
             .iter()
-            .map(|(account, _)| FailoverCandidate {
-                account: account.clone(),
-                auth: ResolvedAuth::ApiKey(String::new()),
-                cooldown_until: state.cooldowns.get(account).copied().unwrap_or(0),
+            .map(|(account, _)| Standing {
+                account: account.as_str(),
+                limited_until: state.limited_until(account),
+                exhausted_until: state.exhausted_until(account),
             })
-            .collect();
-        let previous = state.current.clone();
-        let decision = select_account(&candidates, previous.as_deref(), now)?;
-        if decision.switched && !forced {
-            let last = state.last_switch_ms.load(Ordering::SeqCst);
-            if monotonic_ms().saturating_sub(last) < self.min_switch_interval_ms {
-                // Rate-limited voluntary switch: keep serving with the
-                // previous account if it is still in the pool.
-                if let Some(index) = self
-                    .providers
-                    .iter()
-                    .position(|(account, _)| Some(account.as_str()) == previous.as_deref())
-                {
-                    return Some((
-                        index,
-                        FailoverDecision {
-                            account: previous.unwrap_or_default(),
-                            switched: false,
-                        },
-                    ));
-                }
+            .collect::<Vec<_>>();
+        let previous = state
+            .current
+            .as_deref()
+            .and_then(|current| accounts.iter().find(|standing| standing.account == current));
+        let mut pick = select_account(&accounts, previous.map(|standing| standing.account), now)?;
+        if let Some(previous) = previous.filter(|previous| previous.account != pick) {
+            let voluntary = previous.limited_until <= now;
+            let recent = state
+                .last_switch_ms
+                .is_some_and(|last| now_ms.saturating_sub(last) < self.min_switch_interval_ms);
+            if voluntary && recent {
+                pick = previous.account;
             }
         }
-        if decision.switched {
-            state.last_switch_ms.store(monotonic_ms(), Ordering::SeqCst);
+        let switched_from = previous
+            .filter(|previous| previous.account != pick)
+            .map(|previous| previous.account.to_string());
+        if switched_from.is_some() {
+            state.last_switch_ms = Some(now_ms);
         }
-        state.current = Some(decision.account.clone());
-        let index = self
-            .providers
-            .iter()
-            .position(|(account, _)| *account == decision.account)?;
-        Some((index, decision))
+        let sticky_changed = state.current.as_deref() != Some(pick);
+        state.current = Some(pick.to_string());
+        let index = self.providers.iter().position(|(name, _)| name == pick)?;
+        Some(Choice {
+            index,
+            switched_from,
+            sticky_changed,
+        })
     }
 
-    /// Record an exhaustion signal for an account, apply the cooldown, and
-    /// emit the corresponding event. Returns the cooldown deadline.
-    fn cooldown_after_rate_limit(&self, account: &str, status: u16, now: i64) -> i64 {
-        let until = now + DEFAULT_COOLDOWN_SECONDS;
-        if let Ok(mut state) = self.state.lock() {
-            // Never shorten an existing longer cooldown.
-            let current = state.cooldowns.get(account).copied().unwrap_or(0);
-            state
-                .cooldowns
-                .insert(account.to_string(), current.max(until));
-        }
-        (self.on_event)(FailoverEvent::Cooldown {
+    /// Sets an account aside until the provider says it may ask again, and
+    /// never for less than it already is.
+    fn limit(&self, account: &str, error: &ProviderError, now: i64) {
+        let until = limit_resets_at(error, now)
+            .unwrap_or(now + DEFAULT_COOLDOWN_SECONDS)
+            .max(now + 1);
+        let until = {
+            let mut state = self.lock();
+            let until = state.limited_until(account).max(until);
+            state.limited_until.insert(account.to_string(), until);
+            until
+        };
+        self.save(now, |saved| {
+            let saved_until = saved.limited_until.entry(account.to_string()).or_default();
+            *saved_until = (*saved_until).max(until);
+        });
+        (self.on_event)(FailoverEvent::Limited {
             account: account.to_string(),
             until,
-            status,
         });
-        until
+    }
+
+    /// Says why the pool moved off `from` and where to.
+    fn report_switch(&self, from: &str, to: &str, now: i64) {
+        let state = self.lock();
+        let (why, until) = match state.limited_until(from) {
+            until if until > now => ("is rate limited", until),
+            _ => ("is near its 5h usage limit", state.exhausted_until(from)),
+        };
+        drop(state);
+        notice(format!(
+            "{} account {from} {why} until {}; switched to {to}",
+            self.provider_name,
+            format_time(until, now)
+        ));
+    }
+
+    /// The error when no account is left for a request: when the first
+    /// account may ask again, and each account's answer this request got.
+    fn exhausted(&self, now: i64, answers: &[String]) -> ProviderError {
+        let first_reset = {
+            let state = self.lock();
+            self.providers
+                .iter()
+                .map(|(account, _)| state.limited_until(account))
+                .filter(|until| *until > now)
+                .min()
+        };
+        let mut message = match first_reset {
+            Some(until) => format!(
+                "every {} account is rate limited; the first may be asked again at {}",
+                self.provider_name,
+                format_time(until, now)
+            ),
+            None => format!("no {} account is available", self.provider_name),
+        };
+        if !answers.is_empty() {
+            message.push_str(": ");
+            message.push_str(&answers.join("; "));
+        }
+        ProviderError::Config(message)
     }
 }
 
@@ -520,51 +590,52 @@ impl Provider for FailoverProvider {
         request: ProviderRequest,
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
     ) -> Result<(), ProviderError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        let mut forced = false;
-        let mut errors: Vec<String> = Vec::new();
-        for _ in 0..self.providers.len().max(1) {
-            let Some((index, decision)) = self.choose(now, forced) else {
-                if errors.is_empty() {
-                    return Err(ProviderError::Config(
-                        "no accounts available for failover".to_string(),
-                    ));
-                }
+        let now_ms = epoch_ms();
+        let now = (now_ms / 1000) as i64;
+        let mut answers: Vec<String> = Vec::new();
+        for _ in 0..self.providers.len() {
+            let Some(choice) = self.choose(now_ms) else {
                 break;
             };
+            let (account, provider) = &self.providers[choice.index];
+            if choice.sticky_changed {
+                self.save(now, |saved| {
+                    saved.current = Some(account.clone());
+                    if choice.switched_from.is_some() {
+                        saved.last_switch_ms = Some(now_ms);
+                    }
+                });
+            }
+            if let Some(from) = &choice.switched_from {
+                self.report_switch(from, account, now);
+            }
             (self.on_event)(FailoverEvent::Serving {
-                account: decision.account.clone(),
-                switched: decision.switched,
+                account: account.clone(),
+                switched_from: choice.switched_from,
             });
-            match self.attempt(index, &request, on_event).await {
-                Ok(_events) => return Ok(()),
-                Err((error, streamed)) if streamed > 0 => {
-                    // Output already delivered to the caller; rotating now
-                    // would duplicate or corrupt the in-flight response.
-                    return Err(error);
+            let mut streamed = false;
+            let result = provider
+                .complete_streaming(request.clone(), &mut |event: StreamEvent| {
+                    streamed = true;
+                    on_event(event)
+                })
+                .await;
+            match result {
+                Ok(()) => return Ok(()),
+                // Output already reached the caller; another account would
+                // duplicate or corrupt the reply in flight.
+                Err(error) if streamed => return Err(error),
+                Err(error) if is_rate_limited(&error) => {
+                    self.limit(account, &error, now);
+                    answers.push(format!("{account}: {error}"));
                 }
-                Err((error, _)) if is_rate_limited(&error) => {
-                    let account = self.providers[index].0.clone();
-                    self.cooldown_after_rate_limit(&account, status_of(&error), now);
-                    errors.push(format!("{account}: {error}"));
-                    forced = true;
-                    continue;
-                }
-                Err((error, _)) => {
-                    // Non-exhaustion failures do not rotate: auth, network,
-                    // and server errors are either account-independent or
-                    // belong to the outer retry loop.
-                    return Err(error);
-                }
+                // Anything else is either the same on every account (auth,
+                // network, an overloaded provider) or the run loop's to
+                // retry.
+                Err(error) => return Err(error),
             }
         }
-        Err(ProviderError::Config(format!(
-            "all accounts exhausted (rate limited): {}",
-            errors.join("; ")
-        )))
+        Err(self.exhausted(now, &answers))
     }
 }
 
@@ -574,12 +645,13 @@ mod tests {
     use noel_config::AccountUsage;
     use noel_config::AuthCredential;
     use std::sync::Arc;
+    use std::time::Duration;
 
-    fn candidate(account: &str, cooldown_until: i64) -> FailoverCandidate {
-        FailoverCandidate {
-            account: account.to_string(),
-            auth: ResolvedAuth::ApiKey("key".to_string()),
-            cooldown_until,
+    fn standing(account: &str, limited_until: i64, exhausted_until: i64) -> Standing<'_> {
+        Standing {
+            account,
+            limited_until,
+            exhausted_until,
         }
     }
 
@@ -615,44 +687,51 @@ mod tests {
 
     #[test]
     fn selection_is_sticky_when_previous_is_available() {
-        let candidates = vec![candidate("a", 0), candidate("b", 0)];
-        let decision = select_account(&candidates, Some("b"), 1_000).expect("decision");
-        assert_eq!(decision.account, "b");
-        assert!(!decision.switched);
+        let accounts = [standing("a", 0, 0), standing("b", 0, 0)];
+        assert_eq!(select_account(&accounts, Some("b"), 1_000), Some("b"));
     }
 
     #[test]
-    fn selection_moves_to_storage_order_when_previous_cooling() {
-        let candidates = vec![candidate("a", 0), candidate("b", 5_000)];
-        let decision = select_account(&candidates, Some("b"), 1_000).expect("decision");
-        assert_eq!(decision.account, "a");
-        assert!(decision.switched);
+    fn selection_moves_to_storage_order_when_previous_is_set_aside() {
+        for previous in [standing("b", 5_000, 0), standing("b", 0, 5_000)] {
+            let accounts = [standing("a", 0, 0), previous];
+            assert_eq!(select_account(&accounts, Some("b"), 1_000), Some("a"));
+        }
     }
 
     #[test]
-    fn selection_returns_none_when_all_cooling() {
-        let candidates = vec![candidate("a", 5_000), candidate("b", 5_000)];
-        assert!(select_account(&candidates, Some("a"), 1_000).is_none());
+    fn selection_returns_none_when_every_account_is_rate_limited() {
+        let accounts = [standing("a", 5_000, 0), standing("b", 5_000, 0)];
+        assert_eq!(select_account(&accounts, Some("a"), 1_000), None);
     }
 
     #[test]
     fn selection_without_previous_uses_storage_order() {
-        let candidates = vec![candidate("a", 0), candidate("b", 0), candidate("c", 0)];
-        let decision = select_account(&candidates, None, 1_000).expect("decision");
-        assert_eq!(decision.account, "a");
-        assert!(!decision.switched);
+        let accounts = [
+            standing("a", 0, 0),
+            standing("b", 0, 0),
+            standing("c", 0, 0),
+        ];
+        assert_eq!(select_account(&accounts, None, 1_000), Some("a"));
+    }
+
+    /// An account at its usage threshold still answers: when no other is
+    /// free it serves, the sticky one first, and a rate-limited one never.
+    #[test]
+    fn selection_falls_back_to_an_account_at_its_usage_threshold() {
+        let accounts = [
+            standing("a", 0, 5_000),
+            standing("b", 0, 5_000),
+            standing("c", 5_000, 0),
+        ];
+        assert_eq!(select_account(&accounts, Some("b"), 1_000), Some("b"));
+        assert_eq!(select_account(&accounts, Some("c"), 1_000), Some("a"));
+        assert_eq!(select_account(&accounts, None, 1_000), Some("a"));
     }
 
     #[test]
     fn candidates_come_from_stored_auth_in_storage_order() {
-        let mut auth = AuthData::default();
-        auth.insert(
-            "anthropic",
-            "work",
-            AuthCredential::ApiKey {
-                key: "work-key".to_string(),
-            },
-        );
+        let mut auth = api_key_auth("work");
         auth.insert(
             "anthropic",
             "personal",
@@ -660,8 +739,7 @@ mod tests {
                 key: "personal-key".to_string(),
             },
         );
-        let candidates =
-            failover_candidates(&auth, None, "anthropic", &FailoverConfig::default(), 1_000);
+        let candidates = failover_candidates(&auth, None, "anthropic", 90.0, 1_000);
         assert_eq!(
             candidates
                 .iter()
@@ -672,64 +750,69 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_uses_five_hour_window_reset_time() {
+    fn the_5h_window_sets_an_account_aside_from_the_threshold_until_it_resets() {
         let auth = api_key_auth("work");
-        let candidates = failover_candidates(
-            &auth,
-            Some(&usage_cache(95.0, 9_000)),
-            "anthropic",
-            &FailoverConfig::default(),
-            1_000,
-        );
-        assert_eq!(candidates[0].cooldown_until, 9_000);
-    }
-
-    #[test]
-    fn cooldown_zero_when_usage_below_threshold() {
-        let auth = api_key_auth("work");
-        let candidates = failover_candidates(
-            &auth,
-            Some(&usage_cache(42.0, 9_000)),
-            "anthropic",
-            &FailoverConfig::default(),
-            1_000,
-        );
-        assert_eq!(candidates[0].cooldown_until, 0);
-    }
-
-    #[test]
-    fn cooldown_zero_when_reset_time_already_passed() {
-        let auth = api_key_auth("work");
-        let candidates = failover_candidates(
-            &auth,
-            Some(&usage_cache(95.0, 500)),
-            "anthropic",
-            &FailoverConfig::default(),
-            1_000,
-        );
-        assert_eq!(candidates[0].cooldown_until, 0);
-    }
-
-    #[test]
-    fn explicit_cooldown_overrides_usage_cache() {
-        let auth = api_key_auth("work");
-        let config = FailoverConfig {
-            cooldowns: BTreeMap::from([("work".to_string(), 7_000)]),
-            ..FailoverConfig::default()
+        let exhausted = |pct: f64, resets_at: i64, threshold: f64| {
+            failover_candidates(
+                &auth,
+                Some(&usage_cache(pct, resets_at)),
+                "anthropic",
+                threshold,
+                1_000,
+            )[0]
+            .exhausted_until
         };
-        let candidates = failover_candidates(
-            &auth,
-            Some(&usage_cache(10.0, 2_000)),
-            "anthropic",
-            &config,
-            1_000,
+        assert_eq!(exhausted(95.0, 9_000, 90.0), 9_000);
+        assert_eq!(exhausted(90.0, 9_000, 90.0), 9_000);
+        assert_eq!(exhausted(42.0, 9_000, 90.0), 0);
+        // A provider's own threshold.
+        assert_eq!(exhausted(85.0, 9_000, 80.0), 9_000);
+        assert_eq!(exhausted(85.0, 9_000, 90.0), 0);
+        // A window that already reset.
+        assert_eq!(exhausted(95.0, 500, 90.0), 0);
+    }
+
+    fn status(status: u16, body: &str, retry_after: Option<Duration>) -> ProviderError {
+        ProviderError::Status {
+            status: reqwest::StatusCode::from_u16(status).expect("status code"),
+            body: body.to_string(),
+            retry_after,
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_lasts_until_the_provider_says_it_resets() {
+        let now = 1_000;
+        let wait = |seconds| Some(Duration::from_secs_f64(seconds));
+        assert_eq!(
+            limit_resets_at(&status(429, "", wait(30.0)), now),
+            Some(1_030)
         );
-        assert_eq!(candidates[0].cooldown_until, 7_000);
+        assert_eq!(
+            limit_resets_at(&status(429, "", wait(0.2)), now),
+            Some(1_001)
+        );
+        let codex = r#"{"error":{"type":"usage_limit_reached","resets_at":9000}}"#;
+        assert_eq!(limit_resets_at(&status(429, codex, None), now), Some(9_000));
+        // The later of the two.
+        assert_eq!(
+            limit_resets_at(&status(429, codex, wait(30.0)), now),
+            Some(9_000)
+        );
+        assert_eq!(limit_resets_at(&status(429, "slow down", None), now), None);
     }
 
     /// Fails with the given statuses in order, then streams "ok".
     struct FlakyProvider {
-        statuses: Mutex<Vec<u16>>,
+        statuses: Mutex<Vec<(u16, Option<Duration>)>>,
+    }
+
+    impl FlakyProvider {
+        fn new(statuses: &[u16]) -> Self {
+            Self {
+                statuses: Mutex::new(statuses.iter().map(|status| (*status, None)).collect()),
+            }
+        }
     }
 
     #[async_trait]
@@ -738,13 +821,7 @@ mod tests {
             &self,
             _request: ProviderRequest,
         ) -> Result<Vec<StreamEvent>, ProviderError> {
-            let mut collected = Vec::new();
-            self.complete_streaming(_request, &mut |event| {
-                collected.push(event.clone());
-                Ok(())
-            })
-            .await?;
-            Ok(collected)
+            unimplemented!("streaming path is the product path")
         }
 
         async fn complete_streaming(
@@ -752,13 +829,12 @@ mod tests {
             _request: ProviderRequest,
             on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
         ) -> Result<(), ProviderError> {
-            let mut statuses = self.statuses.lock().expect("statuses");
-            if let Some(status) = statuses.first().copied() {
-                statuses.remove(0);
-                return Err(ProviderError::Status {
-                    status: reqwest::StatusCode::from_u16(status).expect("status code"),
-                    body: "rate limited".to_string(),
-                });
+            let next = {
+                let mut statuses = self.statuses.lock().expect("statuses");
+                (!statuses.is_empty()).then(|| statuses.remove(0))
+            };
+            if let Some((code, retry_after)) = next {
+                return Err(status(code, "rate limited", retry_after));
             }
             on_event(StreamEvent::Text("ok".to_string()))?;
             Ok(())
@@ -803,10 +879,7 @@ mod tests {
             on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), ProviderError> + Send),
         ) -> Result<(), ProviderError> {
             on_event(StreamEvent::Text("partial".to_string()))?;
-            Err(ProviderError::Status {
-                status: reqwest::StatusCode::from_u16(429).expect("status"),
-                body: "mid-stream".to_string(),
-            })
+            Err(status(429, "mid-stream", None))
         }
     }
 
@@ -818,9 +891,7 @@ mod tests {
             &self,
             _request: ProviderRequest,
         ) -> Result<Vec<StreamEvent>, ProviderError> {
-            Err(ProviderError::MissingApiKey {
-                provider: "anthropic".to_string(),
-            })
+            unimplemented!("streaming path is the product path")
         }
 
         async fn complete_streaming(
@@ -843,147 +914,264 @@ mod tests {
         }
     }
 
+    /// A fresh state file for one test.
+    fn state_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "noel-failover-{name}-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("state dir");
+        dir.join(STATE_FILE)
+    }
+
+    fn serving(events: &Arc<Mutex<Vec<FailoverEvent>>>) -> Vec<String> {
+        events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter_map(|event| match event {
+                FailoverEvent::Serving {
+                    account,
+                    switched_from: None,
+                } => Some(account.clone()),
+                FailoverEvent::Serving {
+                    account,
+                    switched_from: Some(from),
+                } => Some(format!("{from}->{account}")),
+                FailoverEvent::Limited { .. } => None,
+            })
+            .collect()
+    }
+
+    /// A pool of accounts "a" and "b" that reports to `events`, saving to
+    /// `path` when given.
+    fn pool(
+        path: Option<&Path>,
+        events: &Arc<Mutex<Vec<FailoverEvent>>>,
+    ) -> FailoverProviderBuilder {
+        let seen = events.clone();
+        let builder = FailoverProviderBuilder::new("test")
+            .account("a", ProviderAuth::ApiKey("a".to_string()))
+            .account("b", ProviderAuth::ApiKey("b".to_string()))
+            .on_event(move |event| seen.lock().expect("events").push(event));
+        match path {
+            Some(path) => builder.saved_in(path.to_path_buf()),
+            None => builder,
+        }
+    }
+
+    /// Builds the pool with one provider per account, in order.
+    fn build(
+        builder: FailoverProviderBuilder,
+        providers: Vec<Box<dyn Provider>>,
+    ) -> FailoverProvider {
+        let mut providers = providers.into_iter();
+        builder.build(move |_| providers.next().expect("one provider per account"))
+    }
+
+    async fn ask(pool: &FailoverProvider) -> Result<(), ProviderError> {
+        pool.complete_streaming(test_request(), &mut |_| Ok(()))
+            .await
+    }
+
     #[tokio::test]
     async fn wrapper_rotates_on_rate_limit_with_zero_streamed_output() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let seen = events.clone();
-        // First constructed account (storage order "a") fails once with 429;
-        // the second ("b") succeeds.
-        let mut first = true;
-        let provider = FailoverProviderBuilder::new("anthropic")
-            .account("a", ProviderAuth::ApiKey("a".to_string()))
-            .account("b", ProviderAuth::ApiKey("b".to_string()))
-            .on_event(move |event| {
-                seen.lock().expect("events").push(match event {
-                    FailoverEvent::Serving { account, switched } => {
-                        if switched {
-                            format!("switch:{account}")
-                        } else {
-                            format!("serving:{account}")
-                        }
-                    }
-                    FailoverEvent::Cooldown { account, .. } => format!("cooldown:{account}"),
-                });
-            })
-            .build(move |_| {
-                let provider: Box<dyn Provider> = if first {
-                    first = false;
-                    Box::new(FlakyProvider {
-                        statuses: Mutex::new(vec![429]),
-                    })
-                } else {
-                    Box::new(OkProvider)
-                };
-                provider
-            });
+        let pool = build(
+            pool(None, &events),
+            vec![Box::new(FlakyProvider::new(&[429])), Box::new(OkProvider)],
+        );
         let mut collected = Vec::new();
-        provider
-            .complete_streaming(test_request(), &mut |event| {
-                collected.push(event.clone());
-                Ok(())
-            })
-            .await
-            .expect("request should succeed after failover");
+        pool.complete_streaming(test_request(), &mut |event| {
+            collected.push(event);
+            Ok(())
+        })
+        .await
+        .expect("request should succeed after failover");
         assert_eq!(collected.len(), 1);
-        let events = events.lock().expect("events").clone();
-        assert!(events.contains(&"cooldown:a".to_string()), "{events:?}");
-        assert!(events.contains(&"serving:a".to_string()), "{events:?}");
-        assert!(events.contains(&"switch:b".to_string()), "{events:?}");
+        assert_eq!(serving(&events), ["a", "a->b"]);
+        assert!(events.lock().expect("events").iter().any(
+            |event| matches!(event, FailoverEvent::Limited { account, .. } if account == "a")
+        ));
+    }
+
+    /// A 529 or a 503 is the provider overloaded or down for every
+    /// account: it is returned for the run loop to retry, and no account is
+    /// set aside.
+    #[tokio::test]
+    async fn wrapper_does_not_rotate_on_an_overloaded_provider() {
+        for code in [529, 503] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let pool = build(
+                pool(None, &events),
+                vec![Box::new(FlakyProvider::new(&[code])), Box::new(OkProvider)],
+            );
+            let error = ask(&pool).await.expect_err("not failed over");
+            assert!(
+                matches!(error, ProviderError::Status { status, .. } if status.as_u16() == code)
+            );
+            assert_eq!(serving(&events), ["a"]);
+            assert!(pool.lock().limited_until.is_empty());
+        }
     }
 
     #[tokio::test]
     async fn wrapper_is_sticky_across_requests() {
-        let served = Arc::new(Mutex::new(Vec::new()));
-        let seen = served.clone();
-        let provider = FailoverProviderBuilder::new("anthropic")
-            .account("a", ProviderAuth::ApiKey("a".to_string()))
-            .account("b", ProviderAuth::ApiKey("b".to_string()))
-            .on_event(move |event| {
-                if let FailoverEvent::Serving { account, .. } = event {
-                    seen.lock().expect("served").push(account);
-                }
-            })
-            .build(|_| Box::new(OkProvider));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let pool = build(
+            pool(None, &events),
+            vec![Box::new(OkProvider), Box::new(OkProvider)],
+        );
         for _ in 0..3 {
-            provider
-                .complete_streaming(test_request(), &mut |_| Ok(()))
-                .await
-                .expect("request succeeds");
+            ask(&pool).await.expect("request succeeds");
         }
-        let served = served.lock().expect("served").clone();
-        assert_eq!(served, vec!["a", "a", "a"]);
+        assert_eq!(serving(&events), ["a", "a", "a"]);
     }
 
     #[tokio::test]
-    async fn wrapper_reports_error_when_all_accounts_rate_limited() {
-        let provider = FailoverProviderBuilder::new("anthropic")
-            .account("a", ProviderAuth::ApiKey("a".to_string()))
-            .account("b", ProviderAuth::ApiKey("b".to_string()))
-            .build(|_| {
+    async fn wrapper_reports_when_every_account_is_rate_limited() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let hour = Some(Duration::from_secs(3_600));
+        let pool = build(
+            pool(None, &events),
+            vec![
                 Box::new(FlakyProvider {
-                    statuses: Mutex::new(vec![429, 429, 429, 429]),
-                })
-            });
-        let error = provider
-            .complete_streaming(test_request(), &mut |_| Ok(()))
+                    statuses: Mutex::new(vec![(429, hour)]),
+                }),
+                Box::new(FlakyProvider::new(&[429])),
+            ],
+        );
+        let message = ask(&pool)
             .await
-            .expect_err("all accounts exhausted");
-        let message = error.to_string();
-        assert!(message.contains("all accounts exhausted"), "{message}");
+            .expect_err("all accounts limited")
+            .to_string();
+        assert!(
+            message.contains("every test account is rate limited; the first may be asked again at")
+                && message.contains("a: request failed with status 429")
+                && message.contains("b: request failed with status 429"),
+            "{message}"
+        );
+        // Asked again, the pool sends nothing.
+        let message = ask(&pool).await.expect_err("still limited").to_string();
+        assert!(message.ends_with(" UTC"), "{message}");
+        assert_eq!(serving(&events), ["a", "a->b"]);
     }
 
     #[tokio::test]
     async fn wrapper_does_not_rotate_after_partial_stream() {
-        let provider = FailoverProviderBuilder::new("anthropic")
-            .account("a", ProviderAuth::ApiKey("a".to_string()))
-            .account("b", ProviderAuth::ApiKey("b".to_string()))
-            .build(|_| Box::new(PartialStreamProvider));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let pool = build(
+            pool(None, &events),
+            vec![Box::new(PartialStreamProvider), Box::new(OkProvider)],
+        );
         let mut collected = Vec::new();
-        let error = provider
+        let error = pool
             .complete_streaming(test_request(), &mut |event| {
-                collected.push(event.clone());
+                collected.push(event);
                 Ok(())
             })
             .await
             .expect_err("mid-stream failures must not rotate");
         assert!(matches!(error, ProviderError::Status { .. }));
         assert_eq!(collected.len(), 1);
+        assert_eq!(serving(&events), ["a"]);
     }
 
     #[tokio::test]
     async fn wrapper_does_not_rotate_on_non_rate_limit_errors() {
-        let provider = FailoverProviderBuilder::new("anthropic")
-            .account("a", ProviderAuth::ApiKey("a".to_string()))
-            .account("b", ProviderAuth::ApiKey("b".to_string()))
-            .build(|_| Box::new(AuthErrorProvider));
-        let error = provider
-            .complete_streaming(test_request(), &mut |_| Ok(()))
-            .await
-            .expect_err("auth errors must not rotate");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let pool = build(
+            pool(None, &events),
+            vec![Box::new(AuthErrorProvider), Box::new(OkProvider)],
+        );
+        let error = ask(&pool).await.expect_err("auth errors must not rotate");
         assert!(matches!(error, ProviderError::MissingApiKey { .. }));
     }
 
+    /// "a" is at its usage threshold: the first request goes to "b" without
+    /// asking "a" first.
     #[tokio::test]
-    async fn wrapper_honors_preseeded_cooldown_from_usage_cache() {
-        // "a" is cooling down from a saturated 5h window; the first request
-        // must be served by "b" without any 429 round trip on "a".
-        let served = Arc::new(Mutex::new(Vec::new()));
-        let seen = served.clone();
-        let provider = FailoverProviderBuilder::new("anthropic")
-            .account("a", ProviderAuth::ApiKey("a".to_string()))
-            .account("b", ProviderAuth::ApiKey("b".to_string()))
-            .cooldown("a", i64::MAX / 2)
-            .on_event(move |event| {
-                if let FailoverEvent::Serving { account, .. } = event {
-                    seen.lock().expect("served").push(account);
-                }
-            })
-            .build(|_| Box::new(OkProvider));
-        provider
-            .complete_streaming(test_request(), &mut |_| Ok(()))
-            .await
-            .expect("request succeeds on b");
-        let served = served.lock().expect("served").clone();
-        assert_eq!(served, vec!["b"]);
+    async fn wrapper_passes_over_an_account_at_its_usage_threshold() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let pool = build(
+            pool(None, &events).exhausted_until("a", i64::MAX / 2),
+            vec![Box::new(AuthErrorProvider), Box::new(OkProvider)],
+        );
+        ask(&pool).await.expect("request succeeds on b");
+        assert_eq!(serving(&events), ["b"]);
+    }
+
+    /// What one pool learns, the next starts from: the sticky account and
+    /// the rate limit, until the time the provider gave.
+    #[tokio::test]
+    async fn the_saved_state_carries_over_to_the_next_pool() {
+        let path = state_path("carry-over");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let first = build(
+            pool(Some(&path), &events),
+            vec![
+                Box::new(FlakyProvider {
+                    statuses: Mutex::new(vec![(429, Some(Duration::from_secs(3_600)))]),
+                }),
+                Box::new(OkProvider),
+            ],
+        );
+        let before = (epoch_ms() / 1000) as i64;
+        ask(&first).await.expect("b answers");
+        let saved = saved_state(&path, "test");
+        assert_eq!(saved.current.as_deref(), Some("b"));
+        assert!(saved.last_switch_ms.is_some());
+        let until = saved.limited_until["a"];
+        assert!(
+            (before + 3_600..=before + 3_602).contains(&until),
+            "{until}"
+        );
+
+        // A new pool, as the next request builds, does not ask "a".
+        let second = build(
+            pool(Some(&path), &events),
+            vec![Box::new(AuthErrorProvider), Box::new(OkProvider)],
+        );
+        ask(&second).await.expect("b answers again");
+        assert_eq!(serving(&events), ["a", "a->b", "b"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A switch away from an account at its usage threshold waits for
+    /// `min_switch_interval_ms` after the last switch, also one another pool
+    /// made. A switch away from a rate-limited account never waits.
+    #[tokio::test]
+    async fn only_voluntary_switches_wait_out_the_interval() {
+        for (limited, last_switch_ago_ms, expected) in [
+            (false, Some(1_000), "a"),
+            (false, Some(60_000), "a->b"),
+            (false, None, "a->b"),
+            (true, Some(1_000), "a->b"),
+        ] {
+            let path = state_path("interval");
+            let now = epoch_ms();
+            let mut saved = SavedProvider {
+                current: Some("a".into()),
+                last_switch_ms: last_switch_ago_ms.map(|ago| now - ago),
+                ..SavedProvider::default()
+            };
+            if limited {
+                saved.limited_until.insert("a".into(), i64::MAX / 2);
+            }
+            save_state(&path, "test", 0, |state| *state = saved);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let pool = build(
+                pool(Some(&path), &events).exhausted_until("a", i64::MAX / 2),
+                vec![Box::new(OkProvider), Box::new(OkProvider)],
+            );
+            ask(&pool).await.expect("a request is served");
+            assert_eq!(
+                serving(&events),
+                [expected],
+                "limited {limited}, last switch {last_switch_ago_ms:?} ms ago"
+            );
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
     }
 }
