@@ -82,10 +82,11 @@ send_line "paint-multiline-two stays attached to the same assistant response aft
 send_line "."
 send_line "/write ${cwd_dir}/paint.txt paint-tool-output"
 send_line "/read ${cwd_dir}/paint.txt"
+# /model opens the provider layer of the two-layer model picker.
 send_line "/model"
 sleep 0.5
 capture "${work_dir}/selector-pane.txt"
-grep -Fq "model selector" "${work_dir}/selector-pane.txt"
+grep -Fq "provider selector" "${work_dir}/selector-pane.txt"
 tmux send-keys -t "${session_name}" Escape
 sleep 0.3
 
