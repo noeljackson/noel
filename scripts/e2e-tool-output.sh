@@ -5,9 +5,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e-isolate.sh
 source "${repo_root}/scripts/e2e-isolate.sh"
-pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
+noel_bin="${NOEL_BIN:-${repo_root}/target/debug/noel}"
 work_dir="$(mktemp -d "${e2e_root}/e2e-tool-output.XXXXXX")"
-session="pi-e2e-tool-output-${$}"
+session="noel-e2e-tool-output-${$}"
 trap 'e2e_status=$?; tmux kill-session -t "${session}" >/dev/null 2>&1 || true; e2e_isolation_cleanup "${e2e_status}"' EXIT
 mkdir -p "${work_dir}/agent" "${work_dir}/sessions"
 printf '{"modelRefresh":{"enabled":false},"compaction":{"enabled":false}}\n' > "${work_dir}/agent/settings.json"
@@ -34,7 +34,7 @@ for mode in owned inline; do
   if [ "${mode}" = inline ]; then args='--no-alt-screen'; fi
   tmux new-session -d -s "${session}" -x 100 -y 40
   tmux send-keys -t "${session}" \
-    "cd '${work_dir}' && env -u PI_TUI_E2E_DUMP PI_CODING_AGENT_DIR='${work_dir}/agent' '${pi_bin}' --session-dir '${work_dir}/sessions' --model faux/echo --offline ${args}" Enter
+    "cd '${work_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${work_dir}/agent' '${noel_bin}' --session-dir '${work_dir}/sessions' --model faux/echo --offline ${args}" Enter
   wait_for '│ >'
   tmux send-keys -t "${session}" '/read tool-fixture.txt' Enter
   wait_for '11 more lines'
@@ -136,7 +136,7 @@ mkdir -p "${work_dir}/live-agent"
 printf '{"modelRefresh":{"enabled":false},"retry":{"baseDelayMs":1500}}\n' > "${work_dir}/live-agent/settings.json"
 tmux new-session -d -s "${session}" -x 100 -y 40
 tmux send-keys -t "${session}" \
-  "cd '${work_dir}' && env -u PI_TUI_E2E_DUMP PI_FAUX_SCRIPT='${work_dir}/script.json' PI_CODING_AGENT_DIR='${work_dir}/live-agent' '${pi_bin}' --no-session --model faux/script --offline" Enter
+  "cd '${work_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_FAUX_SCRIPT='${work_dir}/script.json' NOEL_DIR='${work_dir}/live-agent' '${noel_bin}' --no-session --model faux/script --offline" Enter
 wait_for '│ >'
 tmux send-keys -t "${session}" 'run it' Enter
 # The last line so far, under a command that has not ended.
@@ -171,7 +171,7 @@ cat > "${work_dir}/ends.json" <<'JSON'
 JSON
 tmux new-session -d -s "${session}" -x 100 -y 40
 tmux send-keys -t "${session}" \
-  "cd '${work_dir}' && env -u PI_TUI_E2E_DUMP PI_FAUX_SCRIPT='${work_dir}/ends.json' PI_CODING_AGENT_DIR='${work_dir}/live-agent' '${pi_bin}' --no-session --model faux/script --offline" Enter
+  "cd '${work_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_FAUX_SCRIPT='${work_dir}/ends.json' NOEL_DIR='${work_dir}/live-agent' '${noel_bin}' --no-session --model faux/script --offline" Enter
 wait_for '│ >'
 tmux send-keys -t "${session}" 'first' Enter
 wait_for 'Ran a command · $ echo settle-one'

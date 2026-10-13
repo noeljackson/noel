@@ -1,20 +1,20 @@
 [workspace]
 members = [
-    "crates/pi-agent",
-    "crates/pi-ai",
-    "crates/pi-cli",
-    "crates/pi-config",
-    "crates/pi-core",
-    "crates/pi-parity",
-    "crates/pi-providers",
-    "crates/pi-session",
-    "crates/pi-tools",
-    "crates/pi-tui",
+    "crates/noel-agent",
+    "crates/noel-ai",
+    "crates/noel-cli",
+    "crates/noel-config",
+    "crates/noel-core",
+    "crates/noel-parity",
+    "crates/noel-providers",
+    "crates/noel-session",
+    "crates/noel-tools",
+    "crates/noel-tui",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 
@@ -34,6 +34,6 @@ sha2 = "0.10.9"
 thiserror = "2.0.12"
 time = { version = "0.3.47", features = ["formatting"] }
 tokio = { version = "1.45.0", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
-# pi-tools starts tool subprocesses in their own sessions (setsid) and kills
-# their process groups on timeout, interrupt, or a fatal signal to pi.
+# noel-tools starts tool subprocesses in their own sessions (setsid) and kills
+# their process groups on timeout, interrupt, or a fatal signal to noel.
 nix = { version = "0.29", default-features = false, features = ["process", "signal"] }

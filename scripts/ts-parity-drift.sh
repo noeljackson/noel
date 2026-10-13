@@ -44,7 +44,7 @@ if ! diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}"; then
     printf -- '- Do not run npm on the host.\n'
     printf -- '- Execute TypeScript only through Docker targets such as `make ts-parity-fixtures`, `make ts-parity-update`, or `make ts-parity-drift`.\n'
     printf -- '- Keep changes scoped to Rust parity code, fixtures, tests, and docs required by the drift.\n'
-    printf -- '- Run `cargo test -p pi-parity`, `cargo test -p pi-ai --lib matches_ts`, `cargo test -p pi-ai --lib catalog`, `cargo test -p pi-config --lib model`, `cargo test -p pi-cli --test model_parity`, `cargo test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools`, `cargo test -p pi-core --lib system_prompt_matches_ts_builder`, `cargo test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery`, `cargo test -p pi-core --lib tool_parity_tests`, `cargo test -p pi-config --lib _ts`, `cargo test -p pi-core --lib input_expansion_matches_ts_session`, `cargo test -p pi-cli --test rpc_parity get_commands_matches_upstream`, `cargo test -p pi-cli --test rpc_parity golden_`, and `make check` before committing.\n'
+    printf -- '- Run `cargo test -p noel-parity`, `cargo test -p noel-ai --lib matches_ts`, `cargo test -p noel-ai --lib catalog`, `cargo test -p noel-config --lib model`, `cargo test -p noel-cli --test model_parity`, `cargo test -p noel-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools`, `cargo test -p noel-core --lib system_prompt_matches_ts_builder`, `cargo test -p noel-cli --bin noel prompt_and_context_files_match_ts_discovery`, `cargo test -p noel-core --lib tool_parity_tests`, `cargo test -p noel-config --lib _ts`, `cargo test -p noel-core --lib input_expansion_matches_ts_session`, `cargo test -p noel-cli --test rpc_parity get_commands_matches_upstream`, `cargo test -p noel-cli --test rpc_parity golden_`, and `make check` before committing.\n'
     printf -- '- If a GitHub issue is provided, include `closes #<number>` in the commit message.\n\n'
     printf '## Suggested Workflow\n\n'
     printf '1. Inspect `tests/fixtures/ts-parity` and the diff below.\n'
@@ -62,9 +62,9 @@ if ! diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}"; then
   printf 'Diff: %s\n' "${diff_file}" >&2
   printf 'Agent brief: %s\n' "${brief_file}" >&2
 
-  if [ -n "${PI_PARITY_AGENT_COMMAND:-}" ]; then
-    printf 'Dispatching parity agent command: %s\n' "${PI_PARITY_AGENT_COMMAND}" >&2
-    sh -c "${PI_PARITY_AGENT_COMMAND}" < "${brief_file}"
+  if [ -n "${NOEL_PARITY_AGENT_COMMAND:-}" ]; then
+    printf 'Dispatching parity agent command: %s\n' "${NOEL_PARITY_AGENT_COMMAND}" >&2
+    sh -c "${NOEL_PARITY_AGENT_COMMAND}" < "${brief_file}"
   fi
 
   exit 1
@@ -76,19 +76,19 @@ fi
   printf 'Reference: `%s` at `%s`.\n' "${reference_repo}" "${tracking_ref}"
 } > "${brief_file}"
 
-"${cargo_bin}" test -p pi-ai --lib matches_ts
-"${cargo_bin}" test -p pi-ai --lib catalog
-"${cargo_bin}" test -p pi-config --lib model
-"${cargo_bin}" test -p pi-cli --test model_parity
-"${cargo_bin}" test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
-"${cargo_bin}" test -p pi-core --lib system_prompt_matches_ts_builder
-"${cargo_bin}" test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery
-"${cargo_bin}" test -p pi-core --lib tool_parity_tests
-"${cargo_bin}" test -p pi-config --lib _ts
-"${cargo_bin}" test -p pi-core --lib input_expansion_matches_ts_session
-"${cargo_bin}" test -p pi-cli --test rpc_parity get_commands_matches_upstream
-"${cargo_bin}" test -p pi-cli --test rpc_parity golden_
-"${cargo_bin}" test -p pi-parity
+"${cargo_bin}" test -p noel-ai --lib matches_ts
+"${cargo_bin}" test -p noel-ai --lib catalog
+"${cargo_bin}" test -p noel-config --lib model
+"${cargo_bin}" test -p noel-cli --test model_parity
+"${cargo_bin}" test -p noel-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
+"${cargo_bin}" test -p noel-core --lib system_prompt_matches_ts_builder
+"${cargo_bin}" test -p noel-cli --bin noel prompt_and_context_files_match_ts_discovery
+"${cargo_bin}" test -p noel-core --lib tool_parity_tests
+"${cargo_bin}" test -p noel-config --lib _ts
+"${cargo_bin}" test -p noel-core --lib input_expansion_matches_ts_session
+"${cargo_bin}" test -p noel-cli --test rpc_parity get_commands_matches_upstream
+"${cargo_bin}" test -p noel-cli --test rpc_parity golden_
+"${cargo_bin}" test -p noel-parity
 
 printf 'No TS parity drift detected.\n'
 printf 'Brief: %s\n' "${brief_file}"

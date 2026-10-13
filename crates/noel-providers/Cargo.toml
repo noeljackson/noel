@@ -1,0 +1,17 @@
+[package]
+name = "noel-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["rustls-tls"]
+native-tls = ["noel-ai/native-tls", "reqwest/native-tls"]
+rustls-tls = ["noel-ai/rustls-tls", "reqwest/rustls-tls"]
+
+[dependencies]
+noel-ai = { path = "../noel-ai", default-features = false }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
