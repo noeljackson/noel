@@ -9,6 +9,7 @@ import {
 	resolveCliModel,
 	resolveModelScopeFromModels,
 } from "/ts-reference/packages/coding-agent/src/core/model-resolver.ts";
+import { ModelRuntime } from "/ts-reference/packages/coding-agent/src/core/model-runtime.ts";
 // The glob matcher upstream's scope resolution calls.
 import { minimatch } from "/ts-reference/node_modules/minimatch/dist/esm/index.js";
 import { builtinModelRuntime, fixtureSource } from "./model-runtime.ts";
@@ -21,13 +22,24 @@ import { builtinModelRuntime, fixtureSource } from "./model-runtime.ts";
  * same catalog) with a stand-in for the model runtime that reports the
  * providers in `authenticated` as having credentials.
  *
+ * `credentials` are the one part the stand-in replaces: which credentials make
+ * a provider's models available. Each case builds upstream's real model
+ * runtime over an agent directory holding the case's `auth.json`, with the
+ * case's environment, and records which of the providers it asks about have
+ * credentials (`hasConfiguredAuth`) and the model `findInitialModel` then
+ * starts on. Upstream keeps credentials per provider, and each provider says
+ * what it takes: `openai-codex` a ChatGPT login and no API key, `openai` an
+ * API key or its own ChatGPT sign-in, `anthropic` a key or a Claude login,
+ * and the two Cloudflare providers one key plus the ids their URLs hold.
+ *
  * `globs` are what the matcher behind scope globs answers, called as upstream
  * calls it: `minimatch(text, pattern, { nocase: true })`.
  *
- * `launches` start upstream `pi --mode rpc` in an empty agent directory with
- * the case's arguments, settings, and provider keys, send the RPC commands,
- * and record the answers: what a supervisor sees of the model and the
- * thinking level in effect. The keys are fake and no request is sent.
+ * `launches` start upstream `pi --mode rpc` in an agent directory holding
+ * only the case's settings and `auth.json`, with the case's arguments and
+ * provider keys, send the RPC commands, and record the answers: what a
+ * supervisor sees of the model and the thinking level in effect. The keys
+ * and logins are fake, the logins never expire, and no request is sent.
  */
 
 type Json = Record<string, any>;
@@ -247,10 +259,55 @@ const initialModelCases: Array<{ defaultProvider?: string; defaultModel?: string
 	{ defaultProvider: "anthropic", authenticated: ["openai"] },
 ];
 
+/** A login as upstream stores one in `auth.json`. It never expires, so nothing refreshes it. */
+const login = { type: "oauth", access: "fixture-access-token", refresh: "fixture-refresh-token", expires: 4102444800000 };
+const storedKey = { type: "api_key", key: "sk-fixture" };
+/** The providers whose logins and keys a user could take for one another. */
+const LOGIN_PROVIDERS = ["anthropic", "openai", "openai-codex"];
+const CLOUDFLARE_PROVIDERS = ["cloudflare-workers-ai", "cloudflare-ai-gateway"];
+const cloudflareKey = { CLOUDFLARE_API_KEY: "fixture" };
+
+const credentialCases: Array<{
+	name: string;
+	auth?: Json;
+	env?: Record<string, string>;
+	/** The providers the case asks about; the login providers when absent. */
+	providers?: string[];
+}> = [
+	{ name: "chatgpt-login-stored-for-openai-codex", auth: { "openai-codex": login } },
+	{ name: "api-key-stored-for-openai", auth: { openai: storedKey } },
+	{ name: "api-key-in-the-environment", env: KEYS.openai },
+	{ name: "api-key-stored-for-openai-codex", auth: { "openai-codex": storedKey } },
+	{ name: "chatgpt-login-beside-an-api-key", auth: { "openai-codex": login }, env: KEYS.openai },
+	{ name: "api-key-stored-for-openai-codex-beside-an-api-key", auth: { "openai-codex": storedKey }, env: KEYS.openai },
+	// Upstream's own sign-in for `openai`: a token its Responses API takes, from a flow pi does not have.
+	{ name: "chatgpt-sign-in-stored-for-openai", auth: { openai: login } },
+	{ name: "claude-login-stored-for-anthropic", auth: { anthropic: login } },
+	{ name: "api-key-stored-for-anthropic", auth: { anthropic: storedKey } },
+	{ name: "claude-token-in-the-environment", env: { ANTHROPIC_OAUTH_TOKEN: "fixture-oauth-token" } },
+	{ name: "claude-login-beside-a-chatgpt-login", auth: { anthropic: login, "openai-codex": login } },
+	{ name: "nothing" },
+	// One key serves both Cloudflare providers, each only with the ids its URLs are built from.
+	{ name: "cloudflare-key", env: cloudflareKey, providers: CLOUDFLARE_PROVIDERS },
+	{
+		name: "cloudflare-key-and-account",
+		env: { ...cloudflareKey, CLOUDFLARE_ACCOUNT_ID: "fixture-account" },
+		providers: CLOUDFLARE_PROVIDERS,
+	},
+	{
+		name: "cloudflare-key-account-and-gateway",
+		env: { ...cloudflareKey, CLOUDFLARE_ACCOUNT_ID: "fixture-account", CLOUDFLARE_GATEWAY_ID: "fixture-gateway" },
+		providers: CLOUDFLARE_PROVIDERS,
+	},
+	{ name: "cloudflare-key-stored", auth: { "cloudflare-workers-ai": storedKey }, providers: CLOUDFLARE_PROVIDERS },
+];
+
 type Launch = {
 	name: string;
 	args: string[];
 	authenticated: string[];
+	/** The agent directory's `auth.json`. */
+	auth?: Json;
 	settings?: Json;
 	/** RPC commands after startup; `get_state` alone when absent. */
 	commands?: Json[];
@@ -423,6 +480,28 @@ const launches: Launch[] = [
 		authenticated: ["anthropic"],
 		commands: [setModel("anthropic", "no-such-model"), setModel("openai", "gpt-5.5"), setModel("ANTHROPIC", "claude-opus-4-8"), state],
 	},
+	// A ChatGPT login is `openai-codex`'s credential and an API key is `openai`'s; neither serves the other.
+	{
+		name: "chatgpt-login",
+		args: [],
+		authenticated: [],
+		auth: { "openai-codex": login },
+		commands: [state, setModel("openai", "gpt-5.5"), state],
+	},
+	{ name: "chatgpt-login-beside-an-api-key", args: [], authenticated: ["openai"], auth: { "openai-codex": login } },
+	{
+		name: "api-key",
+		args: [],
+		authenticated: ["openai"],
+		commands: [state, setModel("openai-codex", "gpt-6.1-sol"), state],
+	},
+	{
+		name: "api-key-stored-for-openai-codex",
+		args: [],
+		authenticated: ["anthropic"],
+		auth: { "openai-codex": storedKey },
+		commands: [state, setModel("openai-codex", "gpt-6.1-sol"), state],
+	},
 ];
 
 function modelRef(model: Json | undefined) {
@@ -456,6 +535,7 @@ async function launch(testCase: Launch): Promise<Json> {
 	const dir = await mkdtemp(join(tmpdir(), "pi-model-launch-"));
 	for (const sub of ["cwd", "home", "agent"]) await mkdir(join(dir, sub), { recursive: true });
 	if (testCase.settings) await writeFile(join(dir, "agent", "settings.json"), JSON.stringify(testCase.settings));
+	if (testCase.auth) await writeFile(join(dir, "agent", "auth.json"), JSON.stringify(testCase.auth));
 	const keys = Object.assign({}, ...testCase.authenticated.map((provider) => KEYS[provider]));
 	const child = spawn("npx", ["tsx", CLI, "--mode", "rpc", "--no-session", ...testCase.args], {
 		cwd: join(dir, "cwd"),
@@ -532,6 +612,7 @@ async function launch(testCase: Launch): Promise<Json> {
 		name: testCase.name,
 		args: testCase.args,
 		authenticated: testCase.authenticated,
+		auth: testCase.auth ?? {},
 		settings: testCase.settings ?? {},
 		exitCode,
 		stderr: stderr
@@ -613,6 +694,33 @@ async function main() {
 		initialModel.push({ input, expected: modelRef(resolved.model) });
 	}
 
+	const credentials = [];
+	for (const input of credentialCases) {
+		const dir = await mkdtemp(join(tmpdir(), "pi-model-credentials-"));
+		const authPath = join(dir, "auth.json");
+		await writeFile(authPath, JSON.stringify(input.auth ?? {}));
+		const env = input.env ?? {};
+		const providers = input.providers ?? LOGIN_PROVIDERS;
+		Object.assign(process.env, env);
+		try {
+			const real = await ModelRuntime.create({ modelsPath: null, authPath });
+			// Fills the runtime's record of which providers have credentials.
+			await real.getAvailable();
+			const resolved = await findInitialModel({ scopedModels: [], isContinuing: false, modelRuntime: real });
+			credentials.push({
+				name: input.name,
+				input: { auth: input.auth ?? {}, env, providers },
+				expected: {
+					configured: providers.filter((provider) => real.hasConfiguredAuth(provider)),
+					initialModel: modelRef(resolved.model),
+				},
+			});
+		} finally {
+			for (const name of Object.keys(env)) delete process.env[name];
+			await rm(dir, { recursive: true, force: true });
+		}
+	}
+
 	const globs = globCases.map(([pattern, text]) => ({
 		pattern,
 		text,
@@ -632,6 +740,7 @@ async function main() {
 				modelScope,
 				exactReference,
 				initialModel,
+				credentials,
 				globs,
 				launches: launched,
 			},

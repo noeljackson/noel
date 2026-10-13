@@ -406,7 +406,10 @@ Implemented providers:
 Credential resolution supports runtime API keys, named multi-account
 `auth.json` entries, environment variables, Claude Code login token fallback,
 Codex/ChatGPT login token fallback, and provider-specific environment
-settings. Imported Claude Code and Codex/ChatGPT OAuth tokens are refreshed
+settings. A credential serves the provider it is stored for and only if the
+provider takes its kind: a ChatGPT login is `openai-codex`'s and an API key is
+`openai`'s (`provider_takes` in `pi-config`). A Cloudflare provider is
+offered only with the ids its URLs need (`has_auth_for_provider`). Imported Claude Code and Codex/ChatGPT OAuth tokens are refreshed
 automatically when they expire; refreshed credentials persist to pi's own
 `auth.json`. Per-account quota probes feed `pi accounts status` and are cached
 in `usage-cache.json`.

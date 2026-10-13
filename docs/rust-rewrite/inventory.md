@@ -148,7 +148,9 @@ Rust behavior:
   lock (`auth.json.flock`), re-read the file, and change only their own entry;
   a refresh continues from the stored refresh token, not the startup snapshot.
 - Keep `--api-key` values in memory; they are never written to `auth.json`.
-- Reuse Claude Code OAuth and Codex/ChatGPT login credentials when available.
+- Reuse Claude Code OAuth and Codex/ChatGPT login credentials when available:
+  the Claude login for `anthropic`, the ChatGPT login for `openai-codex`.
+  `openai` takes an API key only.
 - Do not automatically migrate legacy TypeScript sessions.
 
 ## Settings Surface

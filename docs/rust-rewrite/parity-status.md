@@ -66,10 +66,14 @@ The committed TypeScript parity fixtures are:
   references (`findExactModelReferenceMatch`), the startup default
   (`findInitialModel`), and the glob matcher behind scope patterns
   (`minimatch`), each with its inputs and upstream's answer or error text.
+  Its `credentials` build upstream's real model runtime over an `auth.json`
+  and an environment, and record which of the providers a case asks about
+  (`anthropic`, `openai`, and `openai-codex`, or the two Cloudflare ones)
+  then have credentials, and the model startup takes.
   Its `launches` start upstream `pi --mode rpc` with model and thinking flags,
-  settings, and fake provider keys, and record `get_state`, `set_model`, and
-  `set_thinking_level` answers, the `thinking_level_changed` events, stderr,
-  and the exit code.
+  settings, an `auth.json`, and fake provider keys and logins, and record
+  `get_state`, `set_model`, and `set_thinking_level` answers, the
+  `thinking_level_changed` events, stderr, and the exit code.
 - `model-thinking.json`: what upstream's `getSupportedThinkingLevels` and
   `clampThinkingLevel` answer for every shape of model in its built-in
   catalog (one case per distinct `reasoning` flag and `thinkingLevelMap`),
@@ -157,10 +161,15 @@ Current Rust parity coverage includes:
 - Model resolution: every `cliModel`, `modelScope`, `exactReference`,
   `initialModel`, and `globs` case of `model-resolution.json`, run on
   upstream's whole catalog (`crates/pi-config/src/model_resolver.rs`).
+- Credentials: every `credentials` case, with the same `auth.json` and
+  environment, gives the same providers credentials and the same startup
+  model (`credentials_offer_the_same_models_as_upstream` in
+  `crates/pi-config`), but for upstream's own ChatGPT sign-in for `openai`,
+  which the test names.
 - Model and thinking selection end to end: every `launches` case, with pi
-  started on the same arguments, settings, and keys, answers what upstream
-  answered: the model object, the thinking level in effect, events, stderr,
-  and exit code (`crates/pi-cli/tests/model_parity.rs`).
+  started on the same arguments, settings, `auth.json`, and keys, answers
+  what upstream answered: the model object, the thinking level in effect,
+  events, stderr, and exit code (`crates/pi-cli/tests/model_parity.rs`).
 - Output caps: the provider request fixtures carry upstream's `maxTokens`
   for their models, and the builders now take them from the catalog.
 - Built-in tools: every call of `tool-behavior.json` run against pi's tools in

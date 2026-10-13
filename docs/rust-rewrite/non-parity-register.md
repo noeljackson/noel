@@ -78,6 +78,39 @@ the same v2 accounts and refresh machinery. The official CLIs' flows are
 public, documented in their shipped binaries, and produce tokens for the same
 upstream services.
 
+### Credentials That Make a Provider Available
+
+Rust keeps upstream's rule that a credential belongs to the provider it is
+stored for, and that a provider takes only its own kinds: `openai-codex` a
+ChatGPT login and no API key, `openai` an API key. A stored credential of the
+other kind is not a credential. The two Cloudflare providers share one key,
+and each also needs the ids its URLs are built from (`CLOUDFLARE_ACCOUNT_ID`,
+and `CLOUDFLARE_GATEWAY_ID` for the gateway). The models of a provider
+without what it needs are not available: startup does not take one, and a
+scope pattern, `/model <reference>`, or `set_model` does not reach one
+(`credentials` and the last `launches` of `model-resolution.json`). These
+parts differ:
+
+- Upstream's `openai` also has a ChatGPT sign-in of its own, whose tokens its
+  Responses API takes. Rust has no such flow, so a login stored under
+  `openai` does not count. It is the Codex login earlier versions of
+  `pi login` stored there as well, which that API does not take; it is
+  ignored wherever credentials are read, and `pi logout openai` removes it.
+- Rust also reads the Codex CLI's own credentials, each for the provider it
+  can serve: `CODEX_ACCESS_TOKEN` and `~/.codex/auth.json` for
+  `openai-codex`, and `CODEX_API_KEY` as a second name for `openai`'s API
+  key. Upstream reads neither.
+- `pi login openai` without `--api-key` stores `env:OPENAI_API_KEY` when that
+  variable is set and otherwise prints the usage; `pi login openai-codex
+  --api-key` is refused.
+- Upstream also takes the Cloudflare ids from a stored credential's `env`.
+  Rust reads them from the process environment only, and `pi auth check`
+  reports on the key alone.
+
+Reason: a ChatGPT login cannot authenticate `openai`'s Responses models, and
+counting it made a user with only that login start on a model that fails
+with a missing API key. A Cloudflare key without the ids fails the same way.
+
 ### Todo Tool and Edited-Files Panel
 
 Rust adds a `todo` builtin tool (checklist with `pending`/`in_progress`/

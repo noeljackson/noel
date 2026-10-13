@@ -785,6 +785,23 @@ pub enum AuthCredential {
 
 pub const DEFAULT_ACCOUNT_NAME: &str = "default";
 
+/// Whether `provider`'s requests can carry `credential`. Upstream keeps
+/// credentials per provider, and each provider names what it takes:
+/// `openai-codex` a ChatGPT login and no API key, `openai` an API key. A
+/// stored credential of the other kind is no credential, so nothing offers
+/// the provider's models on the strength of it.
+///
+/// Upstream's `openai` also has a ChatGPT sign-in of its own, whose tokens
+/// its Responses API takes. pi has no such flow: a login stored under
+/// `openai` is the Codex login `pi login` used to save there as well, which
+/// that API does not take.
+fn provider_takes(provider: &str, credential: &AuthCredential) -> bool {
+    !matches!(
+        (provider, credential),
+        ("openai", AuthCredential::OAuth { .. }) | ("openai-codex", AuthCredential::ApiKey { .. })
+    )
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthData {
     pub providers: BTreeMap<String, BTreeMap<String, AuthCredential>>,
@@ -805,15 +822,33 @@ impl AuthData {
         provider
     }
 
-    pub fn accounts_for_provider(&self, provider: &str) -> Vec<String> {
+    /// `provider`'s stored accounts, less those whose credential it does
+    /// not take (see [`provider_takes`]).
+    fn accounts<'a, 'p>(
+        &'a self,
+        provider: &'p str,
+    ) -> impl Iterator<Item = (&'a str, &'a AuthCredential)> + 'p
+    where
+        'a: 'p,
+    {
         self.providers
             .get(self.stored_key(provider))
-            .map(|accounts| accounts.keys().cloned().collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter(move |(_, credential)| provider_takes(provider, credential))
+            .map(|(account, credential)| (account.as_str(), credential))
+    }
+
+    pub fn accounts_for_provider(&self, provider: &str) -> Vec<String> {
+        self.accounts(provider)
+            .map(|(account, _)| account.to_string())
+            .collect()
     }
 
     pub fn credential(&self, provider: &str, account: &str) -> Option<&AuthCredential> {
-        self.providers.get(self.stored_key(provider))?.get(account)
+        self.accounts(provider)
+            .find(|(name, _)| *name == account)
+            .map(|(_, credential)| credential)
     }
 
     pub fn insert(&mut self, provider: &str, account: &str, credential: AuthCredential) {
@@ -838,12 +873,15 @@ impl AuthData {
     }
 
     pub fn account_for_resolution(&self, provider: &str) -> Option<&str> {
-        let accounts = self.providers.get(self.stored_key(provider))?;
-        if accounts.contains_key(DEFAULT_ACCOUNT_NAME) {
+        let accounts = self
+            .accounts(provider)
+            .map(|(account, _)| account)
+            .collect::<Vec<_>>();
+        if accounts.contains(&DEFAULT_ACCOUNT_NAME) {
             return Some(DEFAULT_ACCOUNT_NAME);
         }
-        match accounts.len() {
-            1 => accounts.keys().next().map(String::as_str),
+        match accounts[..] {
+            [only] => Some(only),
             _ => None,
         }
     }
@@ -1481,8 +1519,18 @@ pub fn auth_for_provider(
     env_auth(provider).or_else(|| login_auth(provider))
 }
 
+/// Whether `provider`'s models can be offered: it has a credential, and, for
+/// the Cloudflare providers, the ids their URLs are built from. Upstream
+/// counts neither on the key alone (`cloudflare-auth.ts`), and one key
+/// serves both.
 pub fn has_auth_for_provider(auth: &AuthData, provider: &str, account: Option<&str>) -> bool {
-    auth_for_provider(auth, provider, account).is_some()
+    let ids: &[&str] = match provider {
+        "cloudflare-workers-ai" => &["CLOUDFLARE_ACCOUNT_ID"],
+        "cloudflare-ai-gateway" => &["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"],
+        _ => &[],
+    };
+    ids.iter().all(|name| read_non_empty_env(name).is_some())
+        && auth_for_provider(auth, provider, account).is_some()
 }
 
 pub fn import_account_name(provider: &str) -> &'static str {
@@ -1834,7 +1882,6 @@ fn env_api_key(provider: &str) -> Option<String> {
         "moonshotai" | "moonshotai-cn" => &["MOONSHOT_API_KEY"][..],
         "nvidia" => &["NVIDIA_API_KEY"][..],
         "openai" => &["OPENAI_API_KEY"],
-        "openai-codex" => &["CODEX_API_KEY"][..],
         "opencode" | "opencode-go" => &["OPENCODE_API_KEY"][..],
         "openrouter" => &["OPENROUTER_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
@@ -1865,19 +1912,11 @@ fn env_auth(provider: &str) -> Option<ResolvedAuth> {
                 expires: 0,
             })
             .or_else(|| env_api_key(provider).map(ResolvedAuth::ApiKey)),
+        // An API key, under OpenAI's name for it or the Codex CLI's. A
+        // ChatGPT login is `openai-codex`'s credential (see `provider_takes`).
         "openai" => env_api_key(provider)
-            .map(ResolvedAuth::ApiKey)
-            .or_else(|| read_non_empty_env("CODEX_API_KEY").map(ResolvedAuth::ApiKey))
-            .or_else(|| {
-                read_non_empty_env("CODEX_ACCESS_TOKEN").map(|access_token| {
-                    ResolvedAuth::ChatGptOAuth {
-                        access_token,
-                        refresh_token: None,
-                        expires: 0,
-                        account_id: read_non_empty_env("CHATGPT_ACCOUNT_ID"),
-                    }
-                })
-            }),
+            .or_else(|| read_non_empty_env("CODEX_API_KEY"))
+            .map(ResolvedAuth::ApiKey),
         "openai-codex" => read_non_empty_env("CODEX_ACCESS_TOKEN").map(|access_token| {
             ResolvedAuth::ChatGptOAuth {
                 access_token,
@@ -1897,7 +1936,7 @@ fn login_auth(provider: &str) -> Option<ResolvedAuth> {
     }
     match provider {
         "anthropic" => read_claude_code_oauth(),
-        "openai" | "openai-codex" => read_codex_chatgpt_oauth(),
+        "openai-codex" => read_codex_chatgpt_oauth(),
         _ => None,
     }
 }
@@ -1914,12 +1953,6 @@ fn oauth_for_provider(
             access_token,
             refresh_token,
             expires,
-        },
-        "openai" => ResolvedAuth::ChatGptOAuth {
-            access_token,
-            refresh_token,
-            expires,
-            account_id,
         },
         "openai-codex" => ResolvedAuth::ChatGptOAuth {
             access_token,
@@ -3993,7 +4026,7 @@ mod tests {
                 },
             ),
             (
-                "openai".to_string(),
+                "openai-codex".to_string(),
                 AuthCredential::OAuth {
                     access_token: "codex-token".to_string(),
                     refresh_token: Some("codex-refresh".to_string()),
@@ -4012,7 +4045,7 @@ mod tests {
             })
         );
         assert_eq!(
-            auth_for_provider(&auth, "openai", None),
+            auth_for_provider(&auth, "openai-codex", None),
             Some(ResolvedAuth::ChatGptOAuth {
                 access_token: "codex-token".to_string(),
                 refresh_token: Some("codex-refresh".to_string()),
@@ -4020,6 +4053,165 @@ mod tests {
                 account_id: Some("account-id".to_string())
             })
         );
+    }
+
+    /// The variables that can give `anthropic`, `openai`, `openai-codex`, or
+    /// a Cloudflare provider a credential.
+    const LOGIN_ENV: [&str; 11] = [
+        "CLOUDFLARE_API_KEY",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_GATEWAY_ID",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CHATGPT_ACCOUNT_ID",
+    ];
+
+    /// Runs `test` with none of [`LOGIN_ENV`] set and no login file read, so
+    /// those providers have only the credentials the test gives them.
+    fn without_ambient_logins(test: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        let saved = LOGIN_ENV.map(save_env);
+        let isolation = save_env(ENV_TEST_ISOLATION);
+        for name in LOGIN_ENV {
+            env::remove_var(name);
+        }
+        env::set_var(ENV_TEST_ISOLATION, "1");
+        test();
+        for (name, value) in saved {
+            restore_env(name, value);
+        }
+        restore_env(isolation.0, isolation.1);
+    }
+
+    /// Which credentials make a provider's models available, and the model
+    /// startup then takes, against upstream's real model runtime
+    /// (`credentials` in `model-resolution.json`).
+    #[test]
+    fn credentials_offer_the_same_models_as_upstream() {
+        let fixture = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../tests/fixtures/ts-parity/model-resolution.json"
+        ))
+        .expect("parse model-resolution.json");
+        let cases = fixture["credentials"].as_array().expect("credentials");
+        assert!(cases.len() >= 16, "{} cases", cases.len());
+        let models = default_models();
+        let models = models.iter().collect::<Vec<_>>();
+        without_ambient_logins(|| {
+            for case in cases {
+                let name = case["name"].as_str().expect("name");
+                let input = &case["input"];
+                // Upstream's `auth.json`, read as pi reads the file.
+                let auth = serde_json::from_value::<AuthData>(input["auth"].clone())
+                    .expect("parse auth.json");
+                let variables = input["env"].as_object().expect("env");
+                for (variable, value) in variables {
+                    env::set_var(variable, value.as_str().expect("value"));
+                }
+                let asked = input["providers"]
+                    .as_array()
+                    .expect("providers")
+                    .iter()
+                    .map(|provider| provider.as_str().expect("provider"))
+                    .collect::<Vec<_>>();
+                let has_auth = |provider: &str| {
+                    asked.contains(&provider) && has_auth_for_provider(&auth, provider, None)
+                };
+                let configured = asked
+                    .iter()
+                    .copied()
+                    .filter(|provider| has_auth(provider))
+                    .collect::<Vec<_>>();
+                let start = find_initial_model(&models, None, None, &has_auth);
+                let answered = serde_json::json!({
+                    "configured": configured,
+                    "initialModel": start.map(|model| {
+                        serde_json::json!({ "provider": model.provider, "id": model.id })
+                    }),
+                });
+                for variable in variables.keys() {
+                    env::remove_var(variable);
+                }
+
+                let mut expected = case["expected"].clone();
+                // The one case pi answers differently, on purpose: upstream's
+                // own ChatGPT sign-in for `openai`, a flow pi does not have
+                // ("Credentials That Make a Provider Available" in the
+                // non-parity register).
+                if name == "chatgpt-sign-in-stored-for-openai" {
+                    assert_eq!(expected["configured"], serde_json::json!(["openai"]));
+                    expected = serde_json::json!({ "configured": [], "initialModel": null });
+                }
+                assert_eq!(answered, expected, "{name}");
+            }
+        });
+    }
+
+    /// The states only pi can be in: the Codex CLI's variables, and the
+    /// login `pi login` used to store under `openai` as well.
+    #[test]
+    fn a_chatgpt_login_serves_openai_codex_and_an_api_key_serves_openai() {
+        let login = || AuthCredential::OAuth {
+            access_token: "login-token".to_string(),
+            refresh_token: Some("login-refresh".to_string()),
+            expires: 0,
+            account_id: None,
+        };
+        let key = |key: &str| AuthCredential::ApiKey {
+            key: key.to_string(),
+        };
+        let is_login = |auth: &AuthData, provider: &str| {
+            matches!(
+                auth_for_provider(auth, provider, None),
+                Some(ResolvedAuth::ChatGptOAuth { .. })
+            )
+        };
+        without_ambient_logins(|| {
+            let mut auth = AuthData::default();
+            auth.insert("openai", DEFAULT_ACCOUNT_NAME, login());
+            auth.insert("openai-codex", DEFAULT_ACCOUNT_NAME, login());
+            assert!(is_login(&auth, "openai-codex"));
+            assert_eq!(auth.accounts_for_provider("openai-codex"), ["default"]);
+            assert!(!has_auth_for_provider(&auth, "openai", None));
+            assert!(auth.accounts_for_provider("openai").is_empty());
+            // The login is not in the way of a key, in the environment or
+            // stored beside it.
+            env::set_var("OPENAI_API_KEY", "env-key");
+            assert_eq!(
+                auth_for_provider(&auth, "openai", None),
+                Some(ResolvedAuth::ApiKey("env-key".to_string()))
+            );
+            env::remove_var("OPENAI_API_KEY");
+            auth.insert("openai", "work", key("work-key"));
+            assert_eq!(auth.account_for_resolution("openai"), Some("work"));
+            assert_eq!(
+                auth_for_provider(&auth, "openai", None),
+                Some(ResolvedAuth::ApiKey("work-key".to_string()))
+            );
+
+            let mut auth = AuthData::default();
+            auth.insert("openai-codex", DEFAULT_ACCOUNT_NAME, key("stored-key"));
+            assert!(!has_auth_for_provider(&auth, "openai-codex", None));
+            assert!(auth.accounts_for_provider("openai-codex").is_empty());
+
+            // The Codex CLI's login token and its API key.
+            let nothing = AuthData::default();
+            env::set_var("CODEX_ACCESS_TOKEN", "codex-token");
+            assert!(is_login(&nothing, "openai-codex"));
+            assert!(!has_auth_for_provider(&nothing, "openai", None));
+            env::remove_var("CODEX_ACCESS_TOKEN");
+            env::set_var("CODEX_API_KEY", "codex-key");
+            assert_eq!(
+                auth_for_provider(&nothing, "openai", None),
+                Some(ResolvedAuth::ApiKey("codex-key".to_string()))
+            );
+            assert!(!has_auth_for_provider(&nothing, "openai-codex", None));
+            env::remove_var("CODEX_API_KEY");
+        });
     }
 
     #[test]

@@ -5,8 +5,9 @@
 //! `set_model` and `set_thinking_level` change them, and the warnings and
 //! errors startup prints.
 //!
-//! Each launch has its own empty agent directory and fake provider keys; no
-//! request is sent.
+//! Each launch has its own agent directory, holding only the launch's
+//! settings and `auth.json`, and fake provider keys and logins; no request is
+//! sent.
 
 use std::fs;
 use std::io::Write;
@@ -57,6 +58,8 @@ fn run(launch: &Value) -> Value {
     let mut settings = launch["settings"].clone();
     settings["modelRefresh"] = json!({ "enabled": false });
     fs::write(root.join("agent/settings.json"), settings.to_string()).unwrap();
+    // Upstream's `auth.json`, which pi reads as it is.
+    fs::write(root.join("agent/auth.json"), launch["auth"].to_string()).unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
     command
@@ -146,10 +149,50 @@ fn run(launch: &Value) -> Value {
     })
 }
 
+/// A state upstream cannot be in: the Codex login `pi login` used to store
+/// under `openai` as well as `openai-codex`. It is `openai-codex`'s
+/// credential. `openai` takes an API key, so pi neither starts on its models
+/// nor offers them.
+#[test]
+fn a_chatgpt_login_stored_for_openai_too_starts_on_openai_codex() {
+    let login = json!({
+        "type": "oauth",
+        "access_token": "fixture-access-token",
+        "refresh_token": "fixture-refresh-token",
+        "expires": 4_102_444_800_u64,
+    });
+    let answered = run(&json!({
+        "name": "login-stored-for-both",
+        "args": [],
+        "authenticated": [],
+        "auth": { "openai": { "default": login }, "openai-codex": { "default": login } },
+        "settings": {},
+        "exchanges": [
+            { "command": { "type": "get_state" } },
+            { "command": { "type": "set_model", "provider": "openai", "modelId": "gpt-5.5" } },
+        ],
+    }));
+    assert_eq!(answered["exitCode"], 0, "{answered}");
+    let answers = answered["exchanges"]
+        .as_array()
+        .expect("exchanges")
+        .iter()
+        .map(|exchange| &exchange["response"])
+        .collect::<Vec<_>>();
+    assert_eq!(
+        answers[0]["model"]["provider"], "openai-codex",
+        "{answered}"
+    );
+    assert_eq!(
+        *answers[1],
+        json!({ "success": false, "error": "Model not found: openai/gpt-5.5" })
+    );
+}
+
 #[test]
 fn model_and_thinking_launches_match_ts() {
     let launches = launches();
-    assert!(launches.len() > 30, "{} launches", launches.len());
+    assert!(launches.len() > 40, "{} launches", launches.len());
     let mut failures = Vec::new();
     for launch in &launches {
         let expected = json!({

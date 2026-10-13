@@ -600,12 +600,17 @@ async fn run_auth_login(args: &[String]) -> Result<()> {
     let account = account.unwrap_or_else(|| DEFAULT_ACCOUNT_NAME.to_string());
     let cwd = std::env::current_dir()?;
     let paths = ConfigPaths::discover(cwd, None)?;
-    if api_key.is_none() {
-        match provider.as_str() {
-            "openai" | "openai-codex" => return run_codex_login(&paths, &account).await,
-            "anthropic" => return run_claude_login(&paths, &account).await,
-            _ => {}
+    // A ChatGPT login is `openai-codex`'s credential, and its only one; an
+    // API key is `openai`'s.
+    match (provider.as_str(), &api_key) {
+        ("openai-codex", None) => return run_codex_login(&paths, &account).await,
+        ("openai-codex", Some(_)) => {
+            return Err(anyhow!(
+                "openai-codex signs in with ChatGPT and takes no API key: run `pi login openai-codex`, or store the key with `pi login openai --api-key <key|env:VAR|->`"
+            ))
         }
+        ("anthropic", None) => return run_claude_login(&paths, &account).await,
+        _ => {}
     }
     let key = match api_key {
         Some(value) if value == "-" => {
@@ -674,18 +679,16 @@ async fn run_codex_login(paths: &ConfigPaths, account: &str) -> Result<()> {
     .await?;
     let replaced = pi_config::update_auth_file(&paths.auth_path, |auth| {
         let replaced = auth.credential("openai-codex", account).is_some();
-        for provider in ["openai", "openai-codex"] {
-            auth.insert(
-                provider,
-                account,
-                AuthCredential::OAuth {
-                    access_token: tokens.access_token.clone(),
-                    refresh_token: tokens.refresh_token.clone(),
-                    expires: tokens.expires,
-                    account_id: tokens.account_id.clone(),
-                },
-            );
-        }
+        auth.insert(
+            "openai-codex",
+            account,
+            AuthCredential::OAuth {
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                expires: tokens.expires,
+                account_id: tokens.account_id,
+            },
+        );
         replaced
     })?;
     println!(
@@ -1259,7 +1262,6 @@ fn default_api_key_env(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         "openai" => Some("OPENAI_API_KEY"),
-        "openai-codex" => Some("CODEX_API_KEY"),
         "google" => Some("GEMINI_API_KEY"),
         "openrouter" => Some("OPENROUTER_API_KEY"),
         "mistral" => Some("MISTRAL_API_KEY"),
@@ -1803,38 +1805,34 @@ async fn refresh_model_cache(
         report.record("anthropic", cached_at_start.as_ref(), result);
     }
 
-    match auth_for_provider(&auth, "openai", None) {
-        Some(ResolvedAuth::ApiKey(api_key)) => {
-            let result = fetch_openai_api_models(
-                "openai",
-                ConfigProviderApi::OpenAiResponses,
-                None,
-                OPENAI_MODELS_URL,
-                &api_key,
-            )
-            .await;
-            report.record("openai", cached_at_start.as_ref(), result);
-        }
-        Some(ResolvedAuth::ChatGptOAuth {
-            access_token,
-            account_id,
-            ..
-        }) => {
-            let result = fetch_chatgpt_backend_models(
-                "openai",
-                ConfigProviderApi::OpenAiResponses,
-                None,
-                &access_token,
-                account_id.as_deref(),
-            )
-            .await;
-            report.record("openai", cached_at_start.as_ref(), result);
-        }
-        _ => {}
+    // `openai` lists with its API key and `openai-codex` with its ChatGPT
+    // login; neither provider has the other's credential.
+    if let Some(ResolvedAuth::ApiKey(api_key)) = auth_for_provider(&auth, "openai", None) {
+        let result = fetch_openai_api_models(
+            "openai",
+            ConfigProviderApi::OpenAiResponses,
+            None,
+            OPENAI_MODELS_URL,
+            &api_key,
+        )
+        .await;
+        report.record("openai", cached_at_start.as_ref(), result);
     }
 
-    if let Some(auth) = auth_for_provider(&auth, "openai-codex", None) {
-        let result = fetch_codex_models(auth).await;
+    if let Some(ResolvedAuth::ChatGptOAuth {
+        access_token,
+        account_id,
+        ..
+    }) = auth_for_provider(&auth, "openai-codex", None)
+    {
+        let result = fetch_chatgpt_backend_models(
+            "openai-codex",
+            ConfigProviderApi::OpenAiCodexResponses,
+            Some("https://chatgpt.com/backend-api".to_string()),
+            &access_token,
+            account_id.as_deref(),
+        )
+        .await;
         report.record("openai-codex", cached_at_start.as_ref(), result);
     }
 
@@ -2171,36 +2169,6 @@ async fn fetch_openai_api_models(
             ..ModelDefinition::default()
         })
         .collect())
-}
-
-async fn fetch_codex_models(auth: ResolvedAuth) -> Result<Vec<ModelDefinition>> {
-    match auth {
-        ResolvedAuth::ApiKey(api_key) => {
-            fetch_openai_api_models(
-                "openai-codex",
-                ConfigProviderApi::OpenAiCodexResponses,
-                Some("https://chatgpt.com/backend-api".to_string()),
-                OPENAI_MODELS_URL,
-                &api_key,
-            )
-            .await
-        }
-        ResolvedAuth::ChatGptOAuth {
-            access_token,
-            account_id,
-            ..
-        } => {
-            fetch_chatgpt_backend_models(
-                "openai-codex",
-                ConfigProviderApi::OpenAiCodexResponses,
-                Some("https://chatgpt.com/backend-api".to_string()),
-                &access_token,
-                account_id.as_deref(),
-            )
-            .await
-        }
-        ResolvedAuth::ClaudeCodeOAuth { .. } => Err(anyhow!("unsupported Codex auth type")),
-    }
 }
 
 async fn fetch_chatgpt_backend_models(
@@ -11292,8 +11260,8 @@ mod tests {
             expires,
             account_id: None,
         };
-        let codex = AuthCredential::ApiKey {
-            key: "codex-key".to_string(),
+        let openai = AuthCredential::ApiKey {
+            key: "openai-key".to_string(),
         };
         // auth.json now holds tokens another process refreshed since startup.
         let mut current = AuthData::default();
@@ -11302,13 +11270,13 @@ mod tests {
             DEFAULT_ACCOUNT_NAME,
             oauth("rotated", 4_000_000_000),
         );
-        current.insert("openai-codex", DEFAULT_ACCOUNT_NAME, codex.clone());
+        current.insert("openai", DEFAULT_ACCOUNT_NAME, openai.clone());
         pi_config::write_auth_file(&auth_path, &current).expect("seed auth.json");
         // This session's startup snapshot: the stale tokens plus a value that
         // came from `--api-key` and must stay in memory.
         let mut snapshot = AuthData::default();
         snapshot.insert("anthropic", DEFAULT_ACCOUNT_NAME, oauth("stale", 1));
-        snapshot.insert("openai-codex", DEFAULT_ACCOUNT_NAME, codex);
+        snapshot.insert("openai", DEFAULT_ACCOUNT_NAME, openai);
         snapshot.insert(
             "google",
             DEFAULT_ACCOUNT_NAME,
@@ -11319,7 +11287,7 @@ mod tests {
         let mut config = account_test_config(snapshot);
         config.paths.auth_path = auth_path.clone();
 
-        assert!(remove_stored_auth(&mut config, "openai-codex", DEFAULT_ACCOUNT_NAME).unwrap());
+        assert!(remove_stored_auth(&mut config, "openai", DEFAULT_ACCOUNT_NAME).unwrap());
 
         let content = fs::read_to_string(&auth_path).expect("read auth.json");
         assert!(!content.contains("cli-only-key"), "{content}");
@@ -11329,12 +11297,10 @@ mod tests {
             stored.credential("anthropic", DEFAULT_ACCOUNT_NAME),
             Some(&oauth("rotated", 4_000_000_000))
         );
-        assert!(stored
-            .credential("openai-codex", DEFAULT_ACCOUNT_NAME)
-            .is_none());
+        assert!(stored.credential("openai", DEFAULT_ACCOUNT_NAME).is_none());
         assert!(config
             .auth
-            .credential("openai-codex", DEFAULT_ACCOUNT_NAME)
+            .credential("openai", DEFAULT_ACCOUNT_NAME)
             .is_none());
         let _ = fs::remove_dir_all(root);
     }
@@ -11685,7 +11651,11 @@ mod tests {
         };
         let save = |access_token: &str| {
             let mut auth = AuthData::default();
-            auth.insert("openai", "default", credential(access_token, 4_000_000_000));
+            auth.insert(
+                "openai-codex",
+                "default",
+                credential(access_token, 4_000_000_000),
+            );
             fs::write(&auth_path, serde_json::to_string(&auth).unwrap()).unwrap();
         };
         // The model endpoint records the bearer token of each request.
@@ -11726,19 +11696,19 @@ mod tests {
         });
         // The startup snapshot predates a refresh: its token long expired.
         let mut snapshot = AuthData::default();
-        snapshot.insert("openai", "default", credential("startup-access", 1));
+        snapshot.insert("openai-codex", "default", credential("startup-access", 1));
         let mut config = account_test_config(snapshot);
         config.paths.auth_path = auth_path.clone();
         config.models.push(ModelDefinition {
             context_window: None,
-            provider: "openai".to_string(),
+            provider: "openai-codex".to_string(),
             id: "echo".to_string(),
             name: None,
             api: ConfigProviderApi::OpenAi,
             base_url: Some(url),
             ..ModelDefinition::default()
         });
-        let runtime = account_test_runtime("openai", None);
+        let runtime = account_test_runtime("openai-codex", None);
         let request = || ProviderRequest {
             max_output_tokens: None,
             system_prompt: None,

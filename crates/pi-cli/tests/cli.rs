@@ -883,6 +883,58 @@ fn login_commands_manage_api_key_auth() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// An API key is `openai`'s credential and a ChatGPT login is
+/// `openai-codex`'s; `pi login` stores neither for the other provider.
+#[test]
+fn login_keeps_api_keys_for_openai_and_chatgpt_logins_for_openai_codex() {
+    let root = test_dir("pi-cli-login-openai");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).expect("create agent dir");
+    let login = |args: &[&str]| {
+        let mut command = pi_command();
+        command
+            .current_dir(&root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            // A login flow, were one to start, fails here instead of
+            // reaching a real endpoint.
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9");
+        command.arg("login").args(args).output().expect("pi login")
+    };
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).to_string();
+
+    let refused = login(&["openai-codex", "--api-key", "sk-test"]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("openai-codex signs in with ChatGPT and takes no API key"),
+        "{}",
+        stderr(&refused)
+    );
+    // `openai` has no login to run: without a key there is nothing to store.
+    let keyless = login(&["openai"]);
+    assert!(!keyless.status.success());
+    assert!(
+        stderr(&keyless).contains("usage: pi login openai --api-key"),
+        "{}",
+        stderr(&keyless)
+    );
+    assert!(!agent.join("auth.json").exists());
+
+    let stored = login(&["openai", "--api-key", "sk-test"]);
+    assert!(stored.status.success(), "{}", stderr(&stored));
+    let auth = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(agent.join("auth.json")).expect("auth.json"),
+    )
+    .expect("parse auth.json");
+    assert_eq!(
+        auth,
+        serde_json::json!({ "openai": { "default": { "type": "api_key", "key": "sk-test" } } })
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn login_logout_round_trip_named_accounts() {
     let root = test_dir("pi-cli-named-accounts");
@@ -2006,6 +2058,11 @@ fn auth_commands_leave_imported_logins_unrefreshed_until_they_expire() {
         "{}",
         stderr(&codex)
     );
+    // Codex's login is `openai-codex`'s credential; `openai` takes an API
+    // key and has none.
+    let openai = auth(&["check", "--provider", "openai"]);
+    assert_eq!(openai.status.code(), Some(1), "{}", stderr(&openai));
+    assert_eq!(stdout(&openai), "not_ready\n");
 
     // Three minutes left: enough for a 1m request, so no warning; a check
     // reports it ready but expiring soon.

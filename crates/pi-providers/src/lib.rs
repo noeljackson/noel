@@ -299,7 +299,6 @@ fn env_credential(provider: &str) -> Option<Credential> {
 fn provider_env_names(provider: &str) -> &'static [&'static str] {
     match provider {
         "openai" => &["OPENAI_API_KEY", "CODEX_API_KEY"],
-        "openai-codex" => &["CODEX_API_KEY"],
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "zai" | "zai-coding" | "zai-anthropic" => &["ZAI_API_KEY"],
         "moonshotai" => &["MOONSHOT_API_KEY"],
@@ -404,6 +403,16 @@ mod tests {
         let output = format!("{credential:?}");
         assert!(!output.contains("super-secret"));
         assert!(output.contains("REDACTED"));
+    }
+
+    /// `openai-codex` signs in with ChatGPT; an API key is `openai`'s.
+    #[test]
+    fn an_api_key_variable_is_openais_and_never_openai_codexs() {
+        assert_eq!(
+            provider_env_names("openai"),
+            ["OPENAI_API_KEY", "CODEX_API_KEY"]
+        );
+        assert!(provider_env_names("openai-codex").is_empty());
     }
 
     #[test]

@@ -301,7 +301,7 @@ impl Refresher<'_> {
 fn imported_login(auth: &AuthData, provider: &str, account: Option<&str>) -> Option<&'static str> {
     let cli = match provider {
         "anthropic" => "Claude Code",
-        "openai" | "openai-codex" => "Codex",
+        "openai-codex" => "Codex",
         _ => return None,
     };
     let stored = match account {
@@ -1278,11 +1278,13 @@ mod tests {
         );
         assert_eq!(imported_login(&auth, "openai-codex", None), Some("Codex"));
         assert_eq!(
-            imported_login(&auth, "openai", Some("codex-import")),
+            imported_login(&auth, "openai-codex", Some("codex-import")),
             Some("Codex")
         );
-        // Other providers have no login file to import.
+        // Other providers have no login file to import; Codex's login is
+        // not `openai`'s.
         assert_eq!(imported_login(&auth, "acme", None), None);
+        assert_eq!(imported_login(&auth, "openai", None), None);
 
         // pi's own accounts, including the copy it saves after a refresh.
         auth.insert(
