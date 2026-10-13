@@ -125,12 +125,18 @@ Project-local files:
 - `.pi/prompts`
 - `.pi/themes`
 - `.agents/skills`
-- `AGENTS.md` or `CLAUDE.md` discovered from the global agent dir and cwd ancestors.
+- `AGENTS.md` or `CLAUDE.md` discovered from the global agent dir and cwd
+  ancestors, whatever the project trust decision; trust gates only the `.pi`
+  resources and `.agents/skills` above.
 
 Rust behavior:
 
 - Preserve the config root and key file names where useful.
-- Keep `auth.json` permissions strict where the platform supports it.
+- Write `auth.json` atomically and owner-only (0600; a missing agent directory
+  is created 0700). Logins, logouts, and OAuth refreshes take a cross-process
+  lock (`auth.json.flock`), re-read the file, and change only their own entry;
+  a refresh continues from the stored refresh token, not the startup snapshot.
+- Keep `--api-key` values in memory; they are never written to `auth.json`.
 - Reuse Claude Code OAuth and Codex/ChatGPT login credentials when available.
 - Do not automatically migrate legacy TypeScript sessions.
 
@@ -198,6 +204,11 @@ Reload behavior:
 - No hot module reload.
 - Reject reload while an assistant response is in progress.
 - Preserve messages, cwd, session id/file, tool history, queued messages, branch state, active model, and active thinking level.
+- Keep the session's project trust decision and re-apply the command-line
+  overrides (`--system-prompt`, `--append-system-prompt`, `--no-context-files`,
+  `-e`, `--no-extensions`, `--tools`, `--api-key`, `--skill`,
+  `--prompt-template`, ...); the same holds for `/models refresh`,
+  `/models reset`, and RPC `reload`.
 - Surface diagnostics for invalid resources instead of clearing context.
 - Notify JSON executable extensions with `reload`; notify them with `shutdown` on quit.
 
@@ -261,10 +272,10 @@ Implemented built-in slash commands include:
 - `/clone [id|name|path]`
 - `/tree`
 - `/summaries`
-- `/delete [id|name|path]`
-- `/name <name>`
+- `/delete <id|name|path>` (bare `/delete` shows usage; it never deletes)
+- `/name [name]` (bare `/name` shows the current name)
 - `/labels <labels...>`
-- `/export <file>`
+- `/export [file]` (default `pi-session-<session id>.html` in the session cwd)
 - `/import <file>`
 - `/copy`
 - `/share [file]`
@@ -312,6 +323,13 @@ Rust behavior:
 
 - Preserve tool names and user-facing semantics.
 - Preserve dirty-worktree awareness and avoid wiping unrelated user changes.
+- `edit`: each `oldText` must occur exactly once in the original file and the
+  edits must not overlap; all edits apply in memory and the file is written
+  once, or nothing changes. An empty `newText` deletes; `edits` may arrive as a
+  JSON string. Edits follow the file's CRLF line endings and keep a BOM. No
+  fuzzy matching (upstream normalizes quotes, dashes, and trailing spaces when
+  an exact match fails).
+- `write` accepts empty `content`.
 - Execute shell commands with configured shell settings.
 - Show visible TUI progress when terminal progress is enabled.
 
@@ -356,6 +374,26 @@ Current auth sources:
 - Claude Code login token fallback.
 - Codex/ChatGPT login token fallback.
 - Custom provider fallback from model config.
+
+Startup model selection (upstream `findInitialModel`):
+
+- `--model`/`--provider`, then the resumed session's model, then the saved
+  default if its provider has credentials, then a model with credentials
+  (upstream's per-provider default model first), and `faux` only when it is
+  requested or nothing else can run. Offline, only `faux` can run.
+
+Request limits:
+
+- Anthropic Messages requests without an explicit cap send the Claude model's
+  output limit, lowered to fit the context window; other models on the
+  Anthropic API default to 16384 tokens.
+- Tool calls in a reply cut off by the output-token limit (`max_tokens`,
+  `length`) are not run; each returns an error asking the model to re-issue
+  it with complete arguments.
+- Provider requests fail after 5 minutes without response headers or without
+  new body or stream data (upstream's default HTTP idle timeout, not
+  configurable here). The timed-out request error is retried like other
+  network errors when nothing was streamed yet.
 
 Model refresh:
 

@@ -2247,6 +2247,7 @@ async fn run_model_turn_streaming_events(
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
         let mut usage = None;
+        let mut truncated = false;
         for event in events {
             match event {
                 StreamEvent::Text(delta) => {
@@ -2266,7 +2267,7 @@ async fn run_model_turn_streaming_events(
                     input_tokens,
                     output_tokens,
                 } => usage = Some((input_tokens, output_tokens)),
-                StreamEvent::Stop { .. } => {}
+                StreamEvent::Stop { reason } => truncated |= pi_ai::is_output_limit_stop(&reason),
             }
         }
 
@@ -2297,7 +2298,11 @@ async fn run_model_turn_streaming_events(
             on_event(&TurnEvent::ToolStarted {
                 name: tool_call.name.clone(),
             });
-            let result = execute_model_tool_call(runtime, &tool_call).await;
+            let result = if truncated {
+                fail_truncated_tool_call(runtime, &tool_call)
+            } else {
+                execute_model_tool_call(runtime, &tool_call).await
+            };
             let event = runtime
                 .session
                 .tool_history
@@ -2555,7 +2560,7 @@ fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
         },
         "edit" => AiToolDefinition {
             name: "edit".to_string(),
-            description: "Apply exact text replacements to a file.".to_string(),
+            description: "Apply exact text replacements to a file. Each edits[].oldText must match a unique, non-overlapping region of the original file; all edits apply together or none do.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2777,6 +2782,31 @@ struct TodoToolArgs {
     todos: Vec<TodoItem>,
 }
 
+/// A reply cut off by the output limit can carry truncated arguments that
+/// still parse, so its tool calls are recorded as errors instead of run.
+fn fail_truncated_tool_call(
+    runtime: &mut Runtime,
+    tool_call: &ChatToolCall,
+) -> Result<(), AgentError> {
+    let output = pi_ai::truncated_tool_call_error(&tool_call.name);
+    runtime.push_tool_event(ToolEvent {
+        id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        result: output.clone(),
+        is_error: true,
+    })?;
+    runtime.push_message(ConversationMessage {
+        thinking: String::new(),
+        role: MessageRole::Tool,
+        content: output,
+        media: Vec::new(),
+        tool_call_id: Some(tool_call.id.clone()),
+        tool_name: Some(tool_call.name.clone()),
+        tool_calls: Vec::new(),
+    })?;
+    Ok(())
+}
+
 async fn execute_model_tool_call(
     runtime: &mut Runtime,
     tool_call: &ChatToolCall,
@@ -2986,7 +3016,7 @@ fn model_tool_requests(tool_call: &ChatToolCall) -> Result<Vec<ToolRequest>, Age
         }],
         "write" => vec![ToolRequest::Write {
             path: string_tool_arg(&args, &["path"], &tool_call.name)?,
-            content: string_tool_arg(&args, &["content"], &tool_call.name)?,
+            content: text_tool_arg(&args, &["content"], &tool_call.name)?,
         }],
         "edit" => edit_tool_requests(&args, &tool_call.name)?,
         "grep" => vec![ToolRequest::Grep {
@@ -3031,34 +3061,51 @@ fn parse_tool_arguments(tool_call: &ChatToolCall) -> Result<serde_json::Value, A
     })
 }
 
+/// One edit request carrying every replacement, so they apply together or
+/// not at all. Like upstream `prepareEditArguments`, `edits` may arrive as a
+/// JSON string or a single object, and a top-level `oldText`/`newText` pair
+/// is one edit. An empty `newText` deletes the matched text.
 fn edit_tool_requests(
     args: &serde_json::Value,
     tool: &str,
 ) -> Result<Vec<ToolRequest>, AgentError> {
     let path = string_tool_arg(args, &["path"], tool)?;
-    if let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) {
-        if edits.is_empty() {
-            return Err(AgentError::InvalidToolCall {
-                tool: tool.to_string(),
-                message: "edits must not be empty".to_string(),
-            });
+    let invalid = |message: &str| AgentError::InvalidToolCall {
+        tool: tool.to_string(),
+        message: message.to_string(),
+    };
+    let entries = match args.get("edits") {
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Array(edits)) => edits,
+            Ok(edit @ Value::Object(_)) => vec![edit],
+            _ => {
+                return Err(invalid(
+                    "edits must be an array of {oldText, newText} objects",
+                ))
+            }
+        },
+        Some(Value::Array(edits)) => edits.clone(),
+        Some(edit @ Value::Object(_)) => vec![edit.clone()],
+        Some(_) => {
+            return Err(invalid(
+                "edits must be an array of {oldText, newText} objects",
+            ))
         }
-        return edits
-            .iter()
-            .map(|edit| {
-                Ok(ToolRequest::Edit {
-                    path: path.clone(),
-                    find: string_tool_arg(edit, &["oldText", "find"], tool)?,
-                    replace: string_tool_arg(edit, &["newText", "replace"], tool)?,
-                })
-            })
-            .collect();
+        None => vec![args.clone()],
+    };
+    if entries.is_empty() {
+        return Err(invalid("edits must not be empty"));
     }
-    Ok(vec![ToolRequest::Edit {
-        path,
-        find: string_tool_arg(args, &["oldText", "find"], tool)?,
-        replace: string_tool_arg(args, &["newText", "replace"], tool)?,
-    }])
+    let edits = entries
+        .iter()
+        .map(|edit| {
+            Ok(pi_tools::TextEdit {
+                find: text_tool_arg(edit, &["oldText", "find"], tool)?,
+                replace: text_tool_arg(edit, &["newText", "replace"], tool)?,
+            })
+        })
+        .collect::<Result<Vec<_>, AgentError>>()?;
+    Ok(vec![ToolRequest::Edit { path, edits }])
 }
 
 fn string_tool_arg(
@@ -3070,6 +3117,19 @@ fn string_tool_arg(
         tool: tool.to_string(),
         message: format!("missing string argument {}", names[0]),
     })
+}
+
+/// A string argument that may be empty: file content, or replacement text
+/// that deletes.
+fn text_tool_arg(args: &Value, names: &[&str], tool: &str) -> Result<String, AgentError> {
+    names
+        .iter()
+        .find_map(|name| args.get(*name).and_then(Value::as_str))
+        .map(ToString::to_string)
+        .ok_or_else(|| AgentError::InvalidToolCall {
+            tool: tool.to_string(),
+            message: format!("missing string argument {}", names[0]),
+        })
 }
 
 fn optional_string_tool_arg(args: &serde_json::Value, names: &[&str]) -> Option<String> {
@@ -3211,8 +3271,10 @@ fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentEr
                 name: "edit".to_string(),
                 request: ToolRequest::Edit {
                     path: path.to_string(),
-                    find: find.to_string(),
-                    replace: replace.to_string(),
+                    edits: vec![pi_tools::TextEdit {
+                        find: find.to_string(),
+                        replace: replace.to_string(),
+                    }],
                 },
             }))
         }
@@ -5040,8 +5102,19 @@ mod tests {
             ReloadableSystems::default(),
         );
         assert_eq!(runtime.systems.max_tool_rounds, DEFAULT_MAX_TOOL_ROUNDS);
+        let agent_dir = cwd.join("agent");
         let config = LoadedConfig {
-            paths: pi_config::ConfigPaths::discover(cwd.clone(), None).unwrap(),
+            paths: pi_config::ConfigPaths {
+                cwd: cwd.clone(),
+                session_dir: agent_dir.join("sessions"),
+                settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".pi/settings.json"),
+                auth_path: agent_dir.join("auth.json"),
+                models_path: agent_dir.join("models.json"),
+                model_cache_path: agent_dir.join("model-cache.json"),
+                keybindings_path: agent_dir.join("keybindings.json"),
+                agent_dir,
+            },
             settings: pi_config::Settings {
                 agent: Some(pi_config::AgentSettings {
                     max_tool_rounds: Some(120),
@@ -5456,6 +5529,56 @@ mod tests {
         let _ = fs::remove_dir_all(cwd);
     }
 
+    #[tokio::test]
+    async fn write_and_edit_accept_empty_text_and_edits_as_a_json_string() {
+        let cwd = std::env::temp_dir().join(format!("pi-edit-args-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let call = |id: &str, name: &str, arguments: Value| ChatToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        };
+
+        let calls = [
+            call(
+                "write_empty",
+                "write",
+                serde_json::json!({"path": "empty.txt", "content": ""}),
+            ),
+            call(
+                "write_code",
+                "write",
+                serde_json::json!({"path": "a.rs", "content": "keep\ndrop\nlast\n"}),
+            ),
+            // Some models send `edits` as a JSON string; an empty newText
+            // deletes the matched text.
+            call(
+                "edit_string",
+                "edit",
+                serde_json::json!({
+                    "path": "a.rs",
+                    "edits": r#"[{"oldText":"drop\n","newText":""},{"oldText":"last","newText":"end"}]"#
+                }),
+            ),
+        ];
+        for tool_call in &calls {
+            execute_model_tool_call(&mut runtime, tool_call)
+                .await
+                .expect("execute tool call");
+        }
+
+        for event in &runtime.session().tool_history {
+            assert!(!event.is_error, "{}: {}", event.id, event.result);
+        }
+        assert_eq!(fs::read_to_string(cwd.join("empty.txt")).unwrap(), "");
+        assert_eq!(fs::read_to_string(cwd.join("a.rs")).unwrap(), "keep\nend\n");
+        let _ = fs::remove_dir_all(cwd);
+    }
+
     #[test]
     fn session_store_restores_edited_files_on_load() {
         let base =
@@ -5585,6 +5708,70 @@ mod tests {
             captured[1].messages[2].tool_call_id.as_deref(),
             Some("call_read_bad")
         );
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_from_a_reply_cut_off_at_the_output_limit_are_not_run() {
+        struct TruncatedReplyProvider {
+            requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for TruncatedReplyProvider {
+            async fn complete(
+                &self,
+                request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                let mut requests = self.requests.lock().expect("requests");
+                requests.push(request);
+                if requests.len() > 1 {
+                    return Ok(vec![StreamEvent::Text("done".to_string())]);
+                }
+                // The write arguments parse but were cut off mid-content.
+                Ok(vec![
+                    StreamEvent::ToolCall {
+                        id: "call_write_cut".to_string(),
+                        name: "write".to_string(),
+                        arguments: r#"{"path":"a.txt","content":"partial"}"#.to_string(),
+                    },
+                    StreamEvent::Stop {
+                        reason: "max_tokens".to_string(),
+                    },
+                ])
+            }
+        }
+
+        let cwd = std::env::temp_dir().join(format!("pi-truncated-tool-test-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems::default(),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = TruncatedReplyProvider {
+            requests: requests.clone(),
+        };
+
+        let response = run_user_turn(&mut runtime, &provider, "write a.txt".to_string())
+            .await
+            .expect("run tool loop");
+
+        assert_eq!(response, "done");
+        assert!(!cwd.join("a.txt").exists(), "truncated write must not run");
+        let event = &runtime.session().tool_history[0];
+        assert_eq!(event.id, "call_write_cut");
+        assert!(event.is_error);
+        assert!(
+            event.result.contains("output token limit"),
+            "{}",
+            event.result
+        );
+        let captured = requests.lock().expect("requests").clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[1].messages[2].role, ChatRole::Tool);
+        assert_eq!(captured[1].messages[2].content, event.result);
 
         let _ = fs::remove_dir_all(cwd);
     }

@@ -2,24 +2,50 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Every `pi` a test runs is isolated: a cleared environment (no provider
+/// keys or PI_* variables leak in), PI_TEST_ISOLATION (pi refuses the default
+/// ~/.pi/agent, imports no login from $HOME, and starts no background model
+/// refresh), and its own agent dir and HOME under the target dir (paths
+/// only; nothing exists there unless pi writes). A test that needs a
+/// particular agent dir or HOME sets its own.
 fn pi_command() -> Command {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let isolated = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "pi-cli-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut command = Command::new(env!("CARGO_BIN_EXE_pi"));
-    command.stdin(Stdio::null());
-    command.env_remove("OPENAI_API_KEY");
-    command.env_remove("ANTHROPIC_API_KEY");
-    command.env_remove("GEMINI_API_KEY");
-    command.env_remove("GOOGLE_API_KEY");
-    command.env_remove("AZURE_OPENAI_API_KEY");
-    command.env_remove("COPILOT_GITHUB_TOKEN");
-    command.env_remove("OPENROUTER_API_KEY");
-    command.env_remove("GOOGLE_CLOUD_API_KEY");
-    command.env_remove("AWS_BEARER_TOKEN_BEDROCK");
-    command.env_remove("MISTRAL_API_KEY");
-    command.env_remove("CLOUDFLARE_API_KEY");
-    command.env_remove("CODEX_ACCESS_TOKEN");
     command
+        .stdin(Stdio::null())
+        .env_clear()
+        .env("PI_TEST_ISOLATION", "1")
+        .env("PI_CODING_AGENT_DIR", isolated.join("agent"))
+        .env("HOME", isolated.join("home"));
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command
+}
+
+#[test]
+fn tests_cannot_fall_back_to_the_default_agent_dir() {
+    // Without its own agent dir a test fails instead of reading ~/.pi/agent.
+    let output = pi_command()
+        .env_remove("PI_CODING_AGENT_DIR")
+        .args(["--no-session", "-p", "--model", "faux/echo", "hello"])
+        .output()
+        .expect("run pi");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing the default agent dir ~/.pi/agent"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -482,6 +508,55 @@ fn login_logout_round_trip_named_accounts() {
 }
 
 #[test]
+fn login_waits_for_another_process_auth_lock_and_writes_owner_only() {
+    let root = test_dir("pi-cli-login-lock");
+    let agent = root.join("agent");
+    let auth_path = agent.join("auth.json");
+    let held = pi_config::AuthFileLock::try_acquire(&auth_path)
+        .expect("lock auth.json")
+        .expect("free lock");
+
+    let mut login = pi_command()
+        .current_dir(&root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args(["login", "anthropic", "--api-key", "locked-key"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn login");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        login.try_wait().expect("poll login").is_none(),
+        "login finished while another process held the auth.json lock"
+    );
+    assert!(!auth_path.exists());
+
+    drop(held);
+    let output = login.wait_with_output().expect("wait for login");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let auth = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(&auth_path).expect("auth.json"),
+    )
+    .expect("parse auth.json");
+    assert_eq!(auth["anthropic"]["default"]["key"], "locked-key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&auth_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn accounts_status_prints_table_or_empty_state() {
     let root = test_dir("pi-cli-accounts-status");
     let agent = root.join("agent");
@@ -666,6 +741,76 @@ fn rpc_mode_accepts_json_line_requests_from_stdin() {
     assert_eq!(first["result"]["message"], "[faux/echo] rpc hello");
     assert_eq!(second["id"], 2);
     assert_eq!(second["result"]["id"], "ephemeral");
+}
+
+#[test]
+fn rpc_reload_keeps_an_untrusted_project_untrusted() {
+    let root = test_dir("pi-cli-rpc-reload-trust");
+    let agent = root.join("agent");
+    let project = root.join("project");
+    fs::create_dir_all(&agent).expect("create agent dir");
+    fs::create_dir_all(project.join(".pi")).expect("create project config dir");
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"modelRefresh":{"enabled":false}}"#,
+    )
+    .expect("write settings");
+    // An untrusted repository's settings must not take effect, before or
+    // after a reload.
+    fs::write(
+        project.join(".pi/settings.json"),
+        r#"{"shellCommandPrefix":"echo untrusted-prefix"}"#,
+    )
+    .expect("write project settings");
+
+    let mut child = pi_command()
+        .current_dir(&project)
+        .env("HOME", &root)
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--model",
+            "faux/echo",
+            "--no-approve",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pi");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    for request in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"prompt","params":{"prompt":"/bash echo hi"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"reload"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"prompt","params":{"prompt":"/bash echo hi"}}"#,
+    ] {
+        writeln!(stdin, "{request}").expect("write request");
+    }
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for pi");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json response"))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 3, "{responses:?}");
+    assert!(responses[1].get("result").is_some(), "{}", responses[1]);
+    for response in [&responses[0], &responses[2]] {
+        assert_eq!(
+            response["result"]["message"].as_str().map(str::trim),
+            Some("hi"),
+            "{response}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1243,6 +1388,10 @@ fn auth_commands_leave_imported_logins_unrefreshed_until_they_expire() {
             .current_dir(&root)
             .env("HOME", &root)
             .env("PI_CODING_AGENT_DIR", &agent)
+            // PI_TEST_ISOLATION switches the login import off. This test
+            // checks that import against login files in its own HOME, so it
+            // runs without the marker.
+            .env_remove("PI_TEST_ISOLATION")
             // Any refresh attempt fails locally instead of reaching a real token endpoint.
             .env("HTTPS_PROXY", "http://127.0.0.1:9")
             .env("https_proxy", "http://127.0.0.1:9")

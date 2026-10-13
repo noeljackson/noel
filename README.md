@@ -60,6 +60,14 @@ should not clear conversation messages, cwd, session identity, tool history,
 queued messages, or active context. `make check` runs formatting, clippy, and
 Rust tests. `make e2e` runs tmux-based terminal behavior checks.
 
+Tests never touch the real `~/.pi`. `make test` sets `PI_TEST_ISOLATION=1`,
+under which pi refuses to fall back to `~/.pi/agent` (a test names its agent
+dir with `PI_CODING_AGENT_DIR`), imports no Claude Code or Codex login from
+`$HOME`, and starts no background model refresh. The
+CLI tests run every `pi` through `pi_command()`, which also sets that marker
+and gives each run a cleared environment and its own agent dir and `HOME`
+under the target directory.
+
 TypeScript is reference material, not a runtime dependency. Parity fixtures are
 generated only through Docker:
 
@@ -197,6 +205,14 @@ Project skills are also discovered from `.agents/skills` directories from the
 current working directory up to the git root. `SKILL.md` files are named by
 their containing directory.
 
+Project resources (`.pi/settings.json`, `.pi/extensions`, `.pi/skills`,
+`.pi/prompts`, `.pi/themes`, and `.agents/skills`) load only for a trusted
+project: pass `-a`/`--approve` (or `--no-approve` to refuse) or save a
+decision with `/trust`. `AGENTS.md` and `CLAUDE.md` from the agent directory
+and from the current directory and its ancestors load whatever the trust
+decision, as upstream does; treat a repository's instructions as untrusted
+input.
+
 Environment overrides:
 
 - `PI_CODING_AGENT_DIR`
@@ -218,6 +234,13 @@ Environment overrides:
   }
 }
 ```
+
+At startup the model comes from `--model`/`--provider`, then the resumed
+session, then the saved default if its provider has credentials, then a model
+whose provider has credentials (preferring that provider's usual model, as
+upstream does). A `faux` model is chosen only when it is requested or nothing
+else is available; with `--offline` only `faux` can run, so it is chosen
+unless `--model` names another.
 
 ### Web tools
 
@@ -339,6 +362,13 @@ account:
 Older flat files (`{ "openai": { "type": "api_key", ... } }`) are migrated on
 read; writes always use the nested form. Without an explicit selection the
 `default` account is used, or the sole account when only one exists.
+
+`auth.json` is written atomically and owner-only (`0600`; a missing agent
+directory is created `0700`). Logins, logouts, and OAuth refreshes hold an
+advisory lock on `auth.json.flock`, re-read the file, and change only their
+own entry, so concurrent pi processes never drop each other's credentials or
+rotated refresh tokens. A `--api-key` value is used for that run only and is
+never written.
 
 Or use the CLI helper:
 
@@ -598,10 +628,10 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/clone [id|name|path]`
 - `/tree`
 - `/summaries`
-- `/delete [id|name|path]`
-- `/name <name>`
+- `/delete <id|name|path>` (bare `/delete` shows usage; it never deletes)
+- `/name [name]` (bare `/name` shows the current name)
 - `/labels <labels...>`
-- `/export <file>`
+- `/export [file]` (default `pi-session-<session id>.html` in the session cwd)
 - `/import <file>`
 - `/copy`
 - `/share [file]`
@@ -632,7 +662,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `!!`
 - `/quit`
 
-`/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state.
+`/reload` reloads config, prompts, context files, model metadata, keybindings, provider availability, and tool definitions without clearing the current session state. It keeps the session's project trust decision and command-line overrides (such as `--system-prompt`, `-e`, `--tools`, and `--api-key`), as do `/models refresh`, `/models reset`, and RPC `reload`.
 
 The editor uses a rounded box with a `>` prompt. A labeled Todo section and
 queued-message previews sit above it, separated by muted rules. Drafts wrap
