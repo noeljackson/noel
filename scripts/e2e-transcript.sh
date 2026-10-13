@@ -280,6 +280,10 @@ grep -Fq '"type":"active_model"' "${work_dir}/held.jsonl" || fail 'rpc holder di
 restart_fixture "${work_dir}/direct.jsonl"
 # Wide enough that the error, which names the full journal path, fits a row.
 tmux resize-window -t "${session}" -x 240 -y 24
+# A resize and input that reach the TUI together can leave the input unread
+# until more arrives, so the line is typed once the prompt box has been drawn
+# at the new width.
+wait_for "╭$(printf '─%.0s' $(seq 1 238))╮"
 tmux send-keys -t "${session}" "/resume ${work_dir}/held.jsonl" Enter
 wait_for "held.jsonl is in use by another pi process (pid ${holder_pid})"
 tmux send-keys -t "${session}" 'after-locked-resume' Enter
