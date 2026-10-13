@@ -6,6 +6,11 @@
   },
   "commands": [
     {
+      "name": "bug",
+      "description": "Report a bug to the Pi developers",
+      "argumentHint": "<description>"
+    },
+    {
       "name": "changelog",
       "description": "Show changelog entries"
     },
@@ -86,6 +91,11 @@
     {
       "name": "share",
       "description": "Share session as a secret GitHub gist"
+    },
+    {
+      "name": "thinking",
+      "description": "Set thinking level",
+      "argumentHint": "<level>"
     },
     {
       "name": "tree",

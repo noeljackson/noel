@@ -3,11 +3,15 @@ set -euo pipefail
 
 # Test native scrollback while the TUI is alive, never the exit-time dump.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/e2e-isolate.sh
+source "${repo_root}/scripts/e2e-isolate.sh"
 pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
-work_dir="$(mktemp -d "${repo_root}/target/e2e-scrollback.XXXXXX")"
+work_dir="$(mktemp -d "${e2e_root}/e2e-scrollback.XXXXXX")"
 session="pi-e2e-scrollback-${$}"
 cleanup() {
+  local status=$?
   tmux kill-session -t "${session}" >/dev/null 2>&1 || true
+  e2e_isolation_cleanup "${status}"
 }
 trap cleanup EXIT
 mkdir -p "${work_dir}/agent"

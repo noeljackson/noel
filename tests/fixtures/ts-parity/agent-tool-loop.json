@@ -8,6 +8,7 @@
     "streamCalls": [
       {
         "roles": [
+          "system",
           "user"
         ],
         "toolNames": [
@@ -17,6 +18,7 @@
       },
       {
         "roles": [
+          "system",
           "user",
           "assistant",
           "toolResult"
@@ -34,6 +36,8 @@
       "message_end",
       "message_start",
       "message_end",
+      "message_start",
+      "message_end",
       "tool_execution_start",
       "tool_execution_end",
       "message_start",
@@ -46,6 +50,12 @@
       "agent_end"
     ],
     "messages": [
+      {
+        "role": "system",
+        "text": "",
+        "toolCallNames": [],
+        "toolResultFor": null
+      },
       {
         "role": "user",
         "text": "use the fixture tool",

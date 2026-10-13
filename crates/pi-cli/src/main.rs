@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod auth_command;
+mod bug_report;
 mod clipboard;
 mod markdown;
 mod oauth_login;
@@ -85,6 +87,14 @@ enum OutputMode {
     Text,
     Json,
     Rpc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TuiMode {
+    /// Owned alternate screen with a fixed composer (default).
+    Fullscreen,
+    /// Native inline scrollback owned by the terminal.
+    Regular,
 }
 
 #[derive(Debug, Parser)]
@@ -170,6 +180,10 @@ struct Cli {
     #[arg(long)]
     theme: Option<String>,
 
+    /// Select the initial interactive theme for this run without saving it.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["theme", "no_themes"])]
+    use_theme: Option<String>,
+
     #[arg(long)]
     no_themes: bool,
 
@@ -181,6 +195,10 @@ struct Cli {
 
     #[arg(long)]
     no_extensions: bool,
+
+    /// Accepted for upstream compatibility; pi has no MCP support, so this is a no-op.
+    #[arg(long)]
+    no_mcp: bool,
 
     #[arg(long)]
     image: Vec<PathBuf>,
@@ -204,11 +222,29 @@ struct Cli {
     #[arg(long)]
     no_alt_screen: bool,
 
+    /// TUI mode: fullscreen (default) or regular; regular equals --no-alt-screen.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        conflicts_with = "no_alt_screen"
+    )]
+    tui_mode: Option<TuiMode>,
+
     #[arg(long)]
     offline: bool,
 
     #[arg()]
     messages: Vec<String>,
+}
+
+impl Cli {
+    fn owned_screen(&self) -> bool {
+        match self.tui_mode {
+            Some(mode) => mode == TuiMode::Fullscreen,
+            None => !self.no_alt_screen,
+        }
+    }
 }
 
 async fn try_run_image_command() -> Result<bool> {
@@ -489,6 +525,17 @@ async fn try_run_package_command() -> Result<bool> {
             run_auth_logout(&args[1..])?;
             Ok(true)
         }
+        "auth" => {
+            let status = auth_command::run(&args[1..]).await;
+            if status != 0 {
+                std::process::exit(status);
+            }
+            Ok(true)
+        }
+        // Upstream's MCP server manager; refuse instead of prompting the model.
+        "mcp" => Err(anyhow!(
+            "pi mcp is not available: this port has no MCP support (see docs/rust-rewrite/non-parity-register.md)"
+        )),
         _ => Ok(false),
     }
 }
@@ -1384,7 +1431,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_interactive(runtime, config, offline, !cli.no_alt_screen).await
+    run_interactive(runtime, config, offline, cli.owned_screen()).await
 }
 
 async fn run_rpc(mut runtime: Runtime, mut config: LoadedConfig, offline: bool) -> Result<()> {
@@ -1555,7 +1602,14 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
         config.settings.theme = None;
         config.settings.accent_color = None;
         config.themes.clear();
-    } else if let Some(theme) = &cli.theme {
+    } else if let Some(theme) = cli.theme.as_ref().or(cli.use_theme.as_ref()) {
+        // Either flag selects the theme for this run only (clap rejects both
+        // together); --use-theme takes one name, not upstream's light/dark pair.
+        if cli.use_theme.is_some() && theme.contains('/') {
+            return Err(anyhow!(
+                "--use-theme {theme}: light/dark theme pairs are not supported; pass one theme name"
+            ));
+        }
         let resolved = resolve_terminal_theme(config, theme)?;
         config.settings.theme = Some(resolved.name.clone());
         resolved
@@ -3749,8 +3803,7 @@ impl TuiApp {
     fn cursor_to_line_start(&mut self) {
         self.input_cursor = self.input[..self.input_cursor]
             .match_indices('\n')
-            .filter(|(offset, _)| self.input_newline_is_visible(*offset))
-            .next_back()
+            .rfind(|(offset, _)| self.input_newline_is_visible(*offset))
             .map(|(index, _)| index + 1)
             .unwrap_or(0);
     }
@@ -7598,6 +7651,9 @@ async fn handle_tui_submission(
                 }
             }
         }
+        _ if line.split_whitespace().next() == Some("/bug") => {
+            bug_report::run_tui_command(app, runtime, config, &line)
+        }
         _ if line.starts_with("/share") => {
             let requested = line.trim_start_matches("/share").trim();
             let path = if requested.is_empty() {
@@ -8327,17 +8383,29 @@ fn format_session_tool_message(message: &ConversationMessage, runtime: &Runtime)
 }
 
 fn collect_diff_file_entries(cwd: &Path, paths: &[String]) -> Vec<DiffFileEntry> {
-    let stats = git_numstat(cwd, paths);
+    // git reports paths relative to cwd, so files under it are listed (and
+    // looked up in git's output) the same way; that also keeps names visible
+    // in the narrow panel.
+    let paths = paths
+        .iter()
+        .map(|path| match Path::new(path).strip_prefix(cwd) {
+            Ok(relative) if !relative.as_os_str().is_empty() => {
+                relative.to_string_lossy().into_owned()
+            }
+            _ => path.clone(),
+        })
+        .collect::<Vec<_>>();
+    let stats = git_numstat(cwd, &paths);
     let untracked = git_untracked_paths(cwd);
     paths
-        .iter()
+        .into_iter()
         .map(|path| {
             let (added, removed) = stats.get(path.as_str()).copied().unwrap_or((None, None));
             DiffFileEntry {
-                path: path.clone(),
                 added,
                 removed,
-                untracked: untracked.contains(path),
+                untracked: untracked.contains(&path),
+                path,
             }
         })
         .collect()
@@ -9992,6 +10060,26 @@ fn write_auth_file(config: &LoadedConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_panel_lists_files_under_cwd_relative_to_it() {
+        let entries = collect_diff_file_entries(
+            Path::new("/no-such-dir/work/cwd"),
+            &[
+                "/no-such-dir/work/cwd/src/file.txt".to_string(),
+                "/elsewhere/notes.md".to_string(),
+                "already/relative.rs".to_string(),
+            ],
+        );
+        let paths = entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec!["src/file.txt", "/elsewhere/notes.md", "already/relative.rs"]
+        );
+    }
 
     fn picker_summary(first_prompt: Option<&str>, unfinished: bool) -> pi_core::SessionSummary {
         pi_core::SessionSummary {
@@ -14018,13 +14106,86 @@ mod tests {
             }
         }
 
-        for command in fixture["commands"].as_array().expect("fixture commands") {
-            let command = command.as_str().expect("command");
+        let fixture_commands = fixture["commands"]
+            .as_array()
+            .expect("fixture commands")
+            .iter()
+            .map(|command| command.as_str().expect("command"))
+            .collect::<BTreeSet<_>>();
+        let register = include_str!("../../../docs/rust-rewrite/non-parity-register.md");
+        for (command, heading) in UNSUPPORTED_UPSTREAM_CLI_COMMANDS {
+            assert!(
+                fixture_commands.contains(command),
+                "stale exception: upstream no longer has CLI command {command}"
+            );
+            assert!(
+                !rust_commands.contains(*command),
+                "{command} is implemented; drop its exception"
+            );
+            assert!(
+                register.contains(heading),
+                "non-parity register must record CLI command {command} under {heading:?}"
+            );
+        }
+        for command in fixture_commands {
+            if UNSUPPORTED_UPSTREAM_CLI_COMMANDS
+                .iter()
+                .any(|(unsupported, _)| *unsupported == command)
+            {
+                continue;
+            }
             assert!(
                 rust_commands.contains(command),
                 "missing upstream CLI command {command}"
             );
         }
+    }
+
+    /// Upstream CLI commands this port deliberately leaves out, each with
+    /// its docs/rust-rewrite/non-parity-register.md heading.
+    const UNSUPPORTED_UPSTREAM_CLI_COMMANDS: &[(&str, &str)] = &[("mcp", "### No MCP Support")];
+
+    #[test]
+    fn tui_mode_flag_selects_owned_or_native_screen() {
+        let parse = |args: &[&str]| Cli::try_parse_from([&["pi"][..], args].concat());
+        let owned = |args: &[&str]| parse(args).expect("parse cli").owned_screen();
+        assert!(owned(&[]));
+        assert!(owned(&["--tui-mode", "fullscreen"]));
+        assert!(!owned(&["--tui-mode", "regular"]));
+        assert!(!owned(&["--no-alt-screen"]));
+        assert!(parse(&["--tui-mode", "fullscreen", "--no-alt-screen"]).is_err());
+        assert!(parse(&["--tui-mode", "split"]).is_err());
+        assert!(parse(&["--no-mcp"]).expect("parse cli").no_mcp);
+    }
+
+    #[test]
+    fn use_theme_conflicts_with_other_theme_flags_and_applies_for_one_run() {
+        let parse = |args: &[&str]| Cli::try_parse_from([&["pi"][..], args].concat());
+        for args in [
+            &["--use-theme", "light", "--no-themes"][..],
+            &["--use-theme", "light", "--theme", "dark"],
+        ] {
+            let error = parse(args).expect_err("conflicting theme flags");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+        }
+
+        let mut config = minimal_test_config();
+        let no_themes = parse(&["--theme", "missing", "--no-themes"]).expect("parse cli");
+        apply_cli_overrides(&no_themes, Path::new("."), &mut config).expect("no themes");
+        assert_eq!(config.settings.theme, None);
+        let use_theme = parse(&["--use-theme", "light"]).expect("parse cli");
+        apply_cli_overrides(&use_theme, Path::new("."), &mut config).expect("use theme");
+        assert_eq!(config.settings.theme.as_deref(), Some("light"));
+        let pair = parse(&["--use-theme", "light/dark"]).expect("parse cli");
+        let error = apply_cli_overrides(&pair, Path::new("."), &mut config).expect_err("pair");
+        assert!(
+            error.to_string().contains("theme pairs are not supported"),
+            "{error}"
+        );
     }
 
     fn rust_cli_option_contract() -> BTreeSet<String> {
@@ -14046,10 +14207,18 @@ mod tests {
     }
 
     fn rust_cli_command_contract() -> BTreeSet<String> {
-        ["config", "install", "list", "remove", "uninstall", "update"]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect()
+        [
+            "auth",
+            "config",
+            "install",
+            "list",
+            "remove",
+            "uninstall",
+            "update",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect()
     }
 
     fn test_resource(name: &str) -> ResourceFile {

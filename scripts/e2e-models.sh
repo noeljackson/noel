@@ -5,15 +5,17 @@ set -euo pipefail
 # /models refresh reports per-provider outcomes (never a paid API), offline
 # mode refuses refresh, and the model selector reflects the reset list.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/e2e-isolate.sh
+source "${repo_root}/scripts/e2e-isolate.sh"
 pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
 # Anchor to an absolute path so the cd inside tmux cannot break the lookup.
 case "${pi_bin}" in
   /*) ;;
   *) pi_bin="${repo_root}/${pi_bin}" ;;
 esac
-work_dir="$(mktemp -d "${repo_root}/target/e2e-models.XXXXXX")"
+work_dir="$(mktemp -d "${e2e_root}/e2e-models.XXXXXX")"
 session="pi-e2e-models-${$}"
-trap 'tmux kill-session -t "${session}" >/dev/null 2>&1 || true' EXIT
+trap 'e2e_status=$?; tmux kill-session -t "${session}" >/dev/null 2>&1 || true; e2e_isolation_cleanup "${e2e_status}"' EXIT
 mkdir -p "${work_dir}/agent"
 printf '{"modelRefresh":{"enabled":false},"compaction":{"enabled":false}}\n' > "${work_dir}/agent/settings.json"
 # Poisoned cache: a bogus model that must vanish after /models reset.

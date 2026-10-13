@@ -84,9 +84,11 @@
         "retry": {
           "enabled": true,
           "maxRetries": 4,
-          "baseDelayMs": 2000
+          "baseDelayMs": 2000,
+          "maxAgentDelayMs": 60000
         },
         "providerRetry": {
+          "timeoutMs": 1000,
           "maxRetries": 2,
           "maxRetryDelayMs": 60000
         },
@@ -137,7 +139,8 @@
         "retry": {
           "enabled": true,
           "maxRetries": 3,
-          "baseDelayMs": 2000
+          "baseDelayMs": 2000,
+          "maxAgentDelayMs": 60000
         },
         "providerRetry": {
           "maxRetryDelayMs": 12345
@@ -179,7 +182,8 @@
         "retry": {
           "enabled": true,
           "maxRetries": 3,
-          "baseDelayMs": 2000
+          "baseDelayMs": 2000,
+          "maxAgentDelayMs": 60000
         },
         "providerRetry": {
           "maxRetryDelayMs": 60000

@@ -4,7 +4,7 @@
     "ref": "main",
     "script": "/ts-parity/model-catalog-fixture.ts"
   },
-  "providerCount": 37,
+  "providerCount": 42,
   "targets": [
     {
       "provider": "anthropic",
