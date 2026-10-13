@@ -32,6 +32,10 @@ wait_for() {
   for _ in $(seq 1 120); do capture; if grep -Fq "$1" "${work_dir}/pane.txt"; then return; fi; sleep 0.1; done
   fail "missing selection marker: $1"
 }
+absent() {
+  for _ in $(seq 1 100); do capture; if ! grep -Fq "$1" "${work_dir}/pane.txt"; then return; fi; sleep 0.1; done
+  fail "unexpected selection marker: $1"
+}
 # The clipboard helper creates its file before it has written it, so a copy
 # is checked by waiting for the content, never as soon as the file exists.
 # Waits until the clipboard holds exactly $1; $2 says what failed otherwise.
@@ -151,6 +155,9 @@ for _ in $(seq 1 100); do
 done
 [ -n "${completed}" ] || fail 'selection interrupted streaming'
 tmux send-keys -t "${session}" Escape
+# An Escape the TUI has not read yet is taken together with the input after
+# it, as a chord: paste only once it has returned to the latest output.
+absent 'Scroll to bottom'
 wait_for '│ >'
 clipboard_is "${marker}" 'the selection in live output was not copied'
 tmux load-buffer -b "${session}" "${work_dir}/clipboard.txt"
@@ -176,7 +183,7 @@ encoded="$(printf '%s' "${marker}" | base64 | tr -d '\n')"
 for _ in $(seq 1 40); do grep -Fq $'\033]52;c;'"${encoded}"$'\007' "${work_dir}/osc52.raw" && break; sleep 0.1; done
 grep -Fq $'\033]52;c;'"${encoded}"$'\007' "${work_dir}/osc52.raw" || fail 'missing OSC 52 clipboard request'
 tmux send-keys -t "${session}" Escape
-sleep 0.3
+absent 'Scroll to bottom'
 tmux send-keys -t "${session}" '/quit' Enter
 wait_for osc52-shell-restored
 echo "selection e2e passed (artifacts: ${work_dir})"

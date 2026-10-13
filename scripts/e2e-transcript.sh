@@ -97,6 +97,9 @@ selector_anchor="$(first_row)"
 tmux send-keys -t "${session}" '/models' Enter
 wait_for 'provider selector'
 tmux send-keys -t "${session}" Escape
+# An Escape the TUI has not read yet is taken together with the input after
+# it, as a chord: go on once the selector it closes is gone.
+absent '┌ provider selector'
 wait_for 'Scroll to bottom'
 wait_for '│ >'
 [ "$(first_row)" = "${selector_anchor}" ] || fail 'selector Escape changed reading anchor'
@@ -145,6 +148,7 @@ for _ in $(seq 1 20); do
 done
 for i in $(seq 1 100); do grep -Fq "streamed-answer-$(printf '%03d' "${i}")" "${work_dir}/stream-windows.txt"; done
 tmux send-keys -t "${session}" Escape
+absent 'Scroll to bottom'
 wait_for '│ > stream draft'
 tmux send-keys -t "${session}" C-c '/clear' Enter
 sleep 0.3
@@ -280,6 +284,10 @@ grep -Fq '"type":"active_model"' "${work_dir}/held.jsonl" || fail 'rpc holder di
 restart_fixture "${work_dir}/direct.jsonl"
 # Wide enough that the error, which names the full journal path, fits a row.
 tmux resize-window -t "${session}" -x 240 -y 24
+# A resize and input that reach the TUI together can leave the input unread
+# until more arrives, so the line is typed once the prompt box has been drawn
+# at the new width.
+wait_for "╭$(printf '─%.0s' $(seq 1 238))╮"
 tmux send-keys -t "${session}" "/resume ${work_dir}/held.jsonl" Enter
 wait_for "held.jsonl is in use by another pi process (pid ${holder_pid})"
 tmux send-keys -t "${session}" 'after-locked-resume' Enter
