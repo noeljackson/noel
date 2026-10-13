@@ -26,7 +26,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-time = { workspace = true, features = ["parsing"] }
+time = { workspace = true, features = ["formatting", "parsing"] }
 tokio.workspace = true
 unicode-segmentation = "1.13.2"
 unicode-width = "0.2.2"
