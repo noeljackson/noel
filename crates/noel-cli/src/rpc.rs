@@ -107,6 +107,13 @@ fn send(record: &impl Serialize) {
     let _ = stdout.write_all(&line).and_then(|()| stdout.flush());
 }
 
+/// Sends account failover's notices as upstream's notifications.
+fn send_notices() {
+    for notice in crate::account_failover::drain_notices() {
+        send(&Event::warning(run_id(), &notice));
+    }
+}
+
 /// Answers the command that starts `start`, before the run's records.
 fn started(request: &Request, start: Start) -> Start {
     send(&Response::to(
@@ -241,8 +248,10 @@ impl Rpc {
                 custom_instructions,
             }) => self.compact(custom_instructions.as_deref()).await,
             Ok(Command::SetSessionName { name }) => self.set_session_name(name),
+            Ok(Command::ExtensionUiResponse) => return None,
             Ok(Command::Other) => request.unknown(),
         };
+        send_notices();
         send(&Response::to(&request, reply));
         None
     }
@@ -716,6 +725,7 @@ impl Shared {
                 "Cannot {} while the agent is running; wait for agent_settled",
                 request.kind.as_deref().unwrap_or_default()
             )),
+            Ok(Command::ExtensionUiResponse) => return,
             Ok(Command::Other) => request.unknown(),
         };
         send(&Response::to(&request, reply));
@@ -822,6 +832,7 @@ impl Shared {
 
     /// An event from the active run's engine call.
     fn record(&mut self, event: &TurnEvent) {
+        send_notices();
         let Self { queue, run, .. } = self;
         let Some(run) = run else {
             return;
@@ -857,6 +868,7 @@ impl Shared {
             return;
         };
         run.answer_retry_aborts();
+        send_notices();
         run.recorder.finish(outcome, &mut |record| send(&record));
         for id in run.aborts {
             send(&Response::new(id.as_ref(), Some("abort"), Ok(None)));

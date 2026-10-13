@@ -1012,8 +1012,9 @@ Other differences:
   <type>`: `bash`, `abort_bash`, `set_auto_compaction`, `cycle_model`,
   `get_available_models`, `cycle_thinking_level`,
   `get_available_thinking_levels`, `get_session_stats`, `export_html`,
-  `fork`, `clone`, `get_fork_messages`, `get_entries`, and `get_tree`. noel has
-  no extension UI requests.
+  `fork`, `clone`, `get_fork_messages`, `get_entries`, and `get_tree`. noel
+  opens no extension UI dialogs: its one extension UI request is a `notify`
+  for an account failover switch.
 - `get_commands` lists prompt templates, then skills. noel has no extension
   commands to list before them, and its own `/extension:<name>` commands
   exist only in the TUI.

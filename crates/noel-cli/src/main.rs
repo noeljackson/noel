@@ -71,11 +71,11 @@ use noel_config::{
 };
 use noel_core::{
     continue_turn_streaming_events, default_active_tool_names, expand_input, format_todo_list,
-    run_excluded_bash_result, run_user_turn, run_user_turn_streaming,
-    run_user_turn_streaming_events_with_media, run_user_turn_streaming_with_media,
-    write_session_export, AgentError, CompactionKind, ConversationMessage, FollowUpQueue,
-    MessageRole, ReloadReport, ReloadableSystems, RunControl, Runtime, SessionError, SessionState,
-    SessionStore, SteeringMailbox, TodoItem, TodoStatus, TurnEvent, PRODUCT_NAME, STEERING_JOIN,
+    run_excluded_bash_result, run_user_turn, run_user_turn_streaming_events_with_media,
+    run_user_turn_streaming_with_media, write_session_export, AgentError, CompactionKind,
+    ConversationMessage, FollowUpQueue, MessageRole, ReloadReport, ReloadableSystems, RunControl,
+    Runtime, SessionError, SessionState, SessionStore, SteeringMailbox, TodoItem, TodoStatus,
+    TurnEvent, PRODUCT_NAME, STEERING_JOIN,
 };
 use noel_tui::{
     parse_theme_color, EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector,
@@ -1309,10 +1309,7 @@ fn print_auth_help(command: &str) {
             "usage: noel logout <provider> [--account <name>]\n\nRemove stored provider auth. Without --account, removes the \"default\" account."
         ),
         "accounts" => println!(
-            "usage: noel accounts status [--refresh]\n\nShow auth and quota status for every configured account. --refresh bypasses the 15-minute usage cache."
-        ),
-        "failover" => println!(
-            "usage: settings.json {{ \"failover\": {{ \"enabled\": true }} }}\n\nEnable failover-only account rotation for providers with multiple stored accounts. One sticky account carries the session; others are used only when it is rate limited (429/529) or its 5h usage window passes the exhaustion threshold. Pinning an account with /account disables rotation for that session."
+            "usage: noel accounts status [--refresh]\n\nShow auth and quota status for every configured account. --refresh bypasses the 15-minute usage cache.\n\nAccount failover, in settings.json: {{ \"failover\": {{ \"enabled\": true }} }}\nWith two or more stored accounts for a provider, one sticky account carries its requests. Another takes over when the provider answers 429 before any output, until the time the provider gives for the limit to reset (else 5 minutes), or when the sticky account's 5h usage window is at failover.providers.<provider>.exhaustionThresholdPct (default 90) by the usage cache. A switch away from an account near its usage limit waits minSwitchIntervalMs (default 10000) after the last switch. What failover learns is kept in failover-state.json. Pinning an account with /account, or --api-key, turns failover off."
         ),
         _ => {}
     }
@@ -1615,6 +1612,9 @@ fn apply_cli_overrides(cli: &Cli, cwd: &Path, config: &mut LoadedConfig) -> Resu
         let provider = infer_cli_provider(cli, config).ok_or_else(|| {
             anyhow!("--api-key requires --provider, --model, or configured default provider")
         })?;
+        // A key given on the command line serves this run; failover would
+        // pool it with the stored accounts and could carry on with another.
+        config.settings.failover = None;
         config.auth.insert(
             &provider,
             DEFAULT_ACCOUNT_NAME,
@@ -8710,7 +8710,25 @@ async fn run_prompt_media(
     media: Vec<MediaInput>,
     offline: bool,
 ) -> Result<String> {
-    run_prompt_once(runtime, config, prompt, media, offline, false).await
+    let provider = provider_for_runtime(runtime, config, offline).await?;
+    let response = if media.is_empty() {
+        run_user_turn(runtime, provider.as_ref(), prompt).await
+    } else {
+        run_user_turn_streaming_with_media(
+            runtime,
+            provider.as_ref(),
+            prompt,
+            media,
+            &SteeringMailbox::default(),
+            |_| {},
+        )
+        .await
+    };
+    // An account switch is reported whether or not the turn succeeded.
+    for notice in account_failover::drain_notices() {
+        eprintln!("noel: {notice}");
+    }
+    response.map_err(Into::into)
 }
 
 fn auto_compaction_enabled(config: &LoadedConfig) -> bool {
@@ -8720,66 +8738,6 @@ fn auto_compaction_enabled(config: &LoadedConfig) -> bool {
         .as_ref()
         .and_then(|compaction| compaction.enabled)
         .unwrap_or(true)
-}
-
-async fn run_prompt_once(
-    runtime: &mut Runtime,
-    config: &LoadedConfig,
-    prompt: String,
-    media: Vec<MediaInput>,
-    offline: bool,
-    stream_output: bool,
-) -> Result<String> {
-    let provider = provider_for_runtime(runtime, config, offline).await?;
-    if !stream_output {
-        if media.is_empty() {
-            return run_user_turn(runtime, provider.as_ref(), prompt)
-                .await
-                .map_err(Into::into);
-        }
-        return run_user_turn_streaming_with_media(
-            runtime,
-            provider.as_ref(),
-            prompt,
-            media,
-            &SteeringMailbox::default(),
-            |_| {},
-        )
-        .await
-        .map_err(Into::into);
-    }
-    let mut printed = false;
-    let response = if media.is_empty() {
-        run_user_turn_streaming(runtime, provider.as_ref(), prompt, |delta| {
-            printed = true;
-            print!("{delta}");
-            let _ = io::stdout().flush();
-        })
-        .await?
-    } else {
-        run_user_turn_streaming_with_media(
-            runtime,
-            provider.as_ref(),
-            prompt,
-            media,
-            &SteeringMailbox::default(),
-            |delta| {
-                printed = true;
-                print!("{delta}");
-                let _ = io::stdout().flush();
-            },
-        )
-        .await?
-    };
-    if printed {
-        println!();
-    } else if !response.is_empty() {
-        println!("{response}");
-    }
-    for notice in account_failover::drain_notices() {
-        eprintln!("{notice}");
-    }
-    Ok(response)
 }
 
 async fn provider_for_runtime(
@@ -8862,7 +8820,9 @@ fn failover_enabled_for(config: &LoadedConfig, provider: &str) -> bool {
 /// instead of one account.
 struct FailoverPoolSettings {
     min_switch_interval_ms: u64,
+    exhaustion_threshold_pct: f64,
     usage_cache_path: PathBuf,
+    state_path: PathBuf,
 }
 
 /// The pool settings of a turn when failover is enabled for the provider and
@@ -8881,12 +8841,15 @@ fn failover_for(
         .and_then(|settings| settings.providers.get(provider))
         .cloned()
         .unwrap_or_default();
-    let min_switch_interval_ms = provider_settings
-        .min_switch_interval_ms
-        .unwrap_or(account_failover::MIN_SWITCH_INTERVAL_MS);
     Some(FailoverPoolSettings {
-        min_switch_interval_ms,
+        min_switch_interval_ms: provider_settings
+            .min_switch_interval_ms
+            .unwrap_or(account_failover::MIN_SWITCH_INTERVAL_MS),
+        exhaustion_threshold_pct: provider_settings
+            .exhaustion_threshold_pct
+            .map_or(account_failover::EXHAUSTION_THRESHOLD_PCT, |pct| pct as f64),
         usage_cache_path: config.paths.agent_dir.join("usage-cache.json"),
+        state_path: config.paths.agent_dir.join(account_failover::STATE_FILE),
     })
 }
 
@@ -8928,6 +8891,10 @@ impl FreshAuthProvider {
     /// Build a failover pool for one request when the turn fails over and
     /// more than one stored account has a credential. Returns `None` when
     /// the single-account path should be used.
+    ///
+    /// An account whose credential cannot be refreshed is left out, once
+    /// with a notice, and the others serve; only when none is left does the
+    /// request fail, with the first account's error.
     async fn failover_pool(&self) -> Result<Option<Box<dyn noel_ai::Provider>>> {
         let Some(failover) = &self.failover else {
             return Ok(None);
@@ -8937,26 +8904,23 @@ impl FreshAuthProvider {
         let usage_cache = noel_config::read_usage_cache(&failover.usage_cache_path)
             .ok()
             .flatten();
-        let failover_config = account_failover::FailoverConfig {
-            enabled: true,
-            cooldowns: BTreeMap::new(),
-            min_switch_interval_ms: failover.min_switch_interval_ms,
-        };
         let candidates = account_failover::failover_candidates(
             &self.auth,
             usage_cache.as_ref(),
             provider,
-            &failover_config,
+            failover.exhaustion_threshold_pct,
             now as i64,
         );
         if candidates.len() < 2 {
             return Ok(None);
         }
-        // Refresh each account's OAuth tokens before constructing providers so
-        // every account in the pool starts with usable credentials.
-        let mut resolved: Vec<(String, ResolvedAuth)> = Vec::with_capacity(candidates.len());
-        for candidate in &candidates {
-            let auth = oauth_refresh::refresh_expiring_auth(
+        let mut pool = account_failover::FailoverProviderBuilder::new(provider)
+            .min_switch_interval_ms(failover.min_switch_interval_ms)
+            .saved_in(failover.state_path.clone());
+        let saved_sticky = account_failover::saved_state(&failover.state_path, provider).current;
+        let (mut accounts, mut first_error, mut sticky) = (0, None, None);
+        for candidate in candidates {
+            let refreshed = oauth_refresh::refresh_expiring_auth(
                 &self.refresh_client,
                 &self.auth_path,
                 &self.auth,
@@ -8965,36 +8929,55 @@ impl FreshAuthProvider {
                 None,
                 now,
             )
-            .await?;
-            let Some(auth) = auth else {
-                continue;
+            .await;
+            let auth = match refreshed {
+                Ok(Some(auth)) => auth,
+                Ok(None) => continue,
+                Err(error) => {
+                    account_failover::report_left_out(
+                        provider,
+                        &candidate.account,
+                        &format!("{error:#}"),
+                    );
+                    first_error.get_or_insert(error);
+                    continue;
+                }
             };
-            resolved.push((candidate.account.clone(), auth));
+            accounts += 1;
+            if sticky.is_none() || saved_sticky.as_ref() == Some(&candidate.account) {
+                sticky = Some((candidate.account.clone(), auth.clone()));
+            }
+            pool = pool
+                .account(candidate.account.clone(), map_provider_auth(Some(auth)))
+                .exhausted_until(candidate.account, candidate.exhausted_until);
         }
-        if resolved.len() < 2 {
-            return Ok(None);
+        if accounts == 0 {
+            return first_error.map_or(Ok(None), Err);
         }
-        let (remembered, remembered_cooldowns) = account_failover::remembered_state(provider);
-        let pool = account_failover::FailoverProviderBuilder::new(provider.to_string())
-            .min_switch_interval_ms(failover.min_switch_interval_ms)
-            .remember(remembered);
-        let pool = remembered_cooldowns
-            .into_iter()
-            .fold(pool, |pool, (account, until)| pool.cooldown(account, until));
-        let pool = resolved
-            .into_iter()
-            .fold(pool, |pool, (account, auth)| {
-                pool.account(account, map_provider_auth(Some(auth)))
-            })
-            .build(|auth| {
-                create_provider_with_client(
-                    ProviderConfig {
-                        auth,
-                        ..self.config.clone()
-                    },
-                    self.client.clone(),
-                )
-            });
+        // The 5h window only helps while the usage cache is fresh, so keep
+        // the sticky account's fresh; the others are read as last cached.
+        if let Some((account, auth)) = sticky {
+            usage::refresh_stale_in_background(
+                failover.usage_cache_path.clone(),
+                provider,
+                &account,
+                auth,
+                self.config.base_url.clone(),
+                usage_cache
+                    .as_ref()
+                    .and_then(|cache| cache.accounts.get(&format!("{provider}:{account}"))),
+                now as i64,
+            );
+        }
+        let pool = pool.build(|auth| {
+            create_provider_with_client(
+                ProviderConfig {
+                    auth,
+                    ..self.config.clone()
+                },
+                self.client.clone(),
+            )
+        });
         Ok(Some(Box::new(pool)))
     }
 
@@ -9895,7 +9878,6 @@ fn account_selector_items(config: &LoadedConfig, runtime: &Runtime) -> Vec<Selec
         ""
     };
     let active = runtime.session().active_account.as_deref();
-    let failover = failover_enabled_for(config, &model.provider);
     let mut items = vec![SelectorItem {
         label: if failover {
             "auto (failover: sticky account, switches on limits)".to_string()
@@ -11980,6 +11962,10 @@ mod tests {
         Says(&'static str),
         /// This HTTP status.
         Status(u16),
+        /// A 429 whose `retry-after` header holds this.
+        Limited(&'static str),
+        /// Anthropic's 529: the provider is overloaded.
+        Overloaded,
         /// The start of a reply, then the connection drops.
         BreaksOff,
     }
@@ -12023,9 +12009,9 @@ mod tests {
                     seen.push(credential.clone());
                     seen.iter().filter(|seen| **seen == credential).count() - 1
                 };
-                let json = |status: &str, body: String| {
+                let json = |status: &str, headers: &str, body: String| {
                     format!(
-                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     )
                 };
@@ -12034,6 +12020,7 @@ mod tests {
                     // endpoint of an `openai-codex` login words it.
                     Answer::Says(text) => json(
                         "200 OK",
+                        "",
                         serde_json::json!({
                             "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
                             "output_text": text,
@@ -12042,7 +12029,19 @@ mod tests {
                     ),
                     Answer::Status(status) => json(
                         &format!("{status} Synthetic"),
+                        "",
                         r#"{"error":"synthetic"}"#.to_string(),
+                    ),
+                    Answer::Limited(retry_after) => json(
+                        "429 Too Many Requests",
+                        &format!("retry-after: {retry_after}\r\n"),
+                        r#"{"error":"synthetic"}"#.to_string(),
+                    ),
+                    Answer::Overloaded => json(
+                        "529 Overloaded",
+                        "",
+                        r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+                            .to_string(),
                     ),
                     // One chunk of a chunked stream and no end of it.
                     Answer::BreaksOff => {
@@ -12063,10 +12062,10 @@ mod tests {
 
     /// A config whose provider `provider` has one model at `url` and the
     /// API-key accounts `accounts` (each with the key `<account>-key`), with
-    /// failover enabled, and a runtime on that model that retries twice
-    /// after `backoff_ms`. Every failover test has a provider id of its
-    /// own, because `account_failover` remembers per provider for the whole
-    /// process.
+    /// failover enabled and an agent directory of its own, and a runtime on
+    /// that model that retries twice after `backoff_ms`. Every failover test
+    /// has a provider id of its own, which its notices name: notices are
+    /// the process's.
     fn failover_fixture(
         provider: &str,
         url: &str,
@@ -12084,6 +12083,7 @@ mod tests {
             );
         }
         let mut config = account_test_config(auth);
+        fs::create_dir_all(&config.paths.agent_dir).unwrap();
         config.settings.failover = Some(noel_config::FailoverSettings {
             enabled: Some(true),
             ..Default::default()
@@ -12104,6 +12104,14 @@ mod tests {
         systems.retry.max_retries = 2;
         systems.retry.base_delay_ms = backoff_ms;
         (config, Runtime::new(session, systems))
+    }
+
+    /// What the pools of `provider` saved in the fixture's agent directory.
+    fn saved_failover(config: &LoadedConfig, provider: &str) -> account_failover::SavedProvider {
+        account_failover::saved_state(
+            &config.paths.agent_dir.join(account_failover::STATE_FILE),
+            provider,
+        )
     }
 
     /// One turn on a provider built for it, as every mode runs one: how it
@@ -12147,18 +12155,18 @@ mod tests {
         assert_eq!(reply.as_deref(), Ok("from the second account"));
         assert_eq!(retries, 0);
         assert_eq!(*requests.lock().unwrap(), ["first-key", "second-key"]);
-        // What the TUI shows after the turn. No other test takes notices.
-        let notices = account_failover::drain_notices();
+        // What the TUI shows after the turn: both accounts, and until when.
+        let notices = account_failover::notices_given(&format!("{provider} account "));
+        assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(
-            notices
-                .iter()
-                .any(|notice| notice.starts_with("account first hit its limit; cooling down until")),
+            notices[0].starts_with("failover-switch account first is rate limited until ")
+                && notices[0].ends_with(" UTC; switched to second"),
             "{notices:?}"
         );
 
         // The next turn has a new provider and its request a new pool: the
         // second account still carries the session and the first is still
-        // cooling down, so it is not asked again.
+        // limited, so it is not asked again.
         let (reply, retries) = failover_turn(&mut runtime, &config).await;
         assert_eq!(reply.as_deref(), Ok("from the second account"));
         assert_eq!(retries, 0);
@@ -12166,14 +12174,48 @@ mod tests {
             *requests.lock().unwrap(),
             ["first-key", "second-key", "second-key"]
         );
-        let (sticky, cooldowns) = account_failover::remembered_state(provider);
-        assert_eq!(sticky.as_deref(), Some("second"));
-        assert_eq!(cooldowns.keys().collect::<Vec<_>>(), ["first"]);
+        let saved = saved_failover(&config, provider);
+        assert_eq!(saved.current.as_deref(), Some("second"));
+        assert_eq!(saved.limited_until.keys().collect::<Vec<_>>(), ["first"]);
+        assert_eq!(
+            account_failover::notices_given(&format!("{provider} account ")).len(),
+            1
+        );
+    }
+
+    /// A rate limit lasts until the time the provider's `retry-after` gives,
+    /// and five minutes when the answer gives none.
+    #[tokio::test]
+    async fn a_rate_limit_lasts_until_the_reset_the_provider_gives() {
+        for (provider, answer) in [
+            ("failover-retry-after", Some("7200")),
+            ("failover-no-retry-after", None),
+        ] {
+            let (url, _) = failover_endpoint(move |credential, _| match (credential, answer) {
+                ("first-key", Some(seconds)) => Answer::Limited(seconds),
+                ("first-key", None) => Answer::Status(429),
+                _ => Answer::Says("ok"),
+            });
+            let (config, mut runtime) = failover_fixture(provider, &url, &["first", "second"], 1);
+            let before = unix_seconds().unwrap() as i64;
+            let (reply, _) = failover_turn(&mut runtime, &config).await;
+            assert_eq!(reply.as_deref(), Ok("ok"));
+            let wait = if answer.is_some() {
+                7_200
+            } else {
+                account_failover::DEFAULT_COOLDOWN_SECONDS
+            };
+            let until = saved_failover(&config, provider).limited_until["first"];
+            assert!(
+                (before + wait..=before + wait + 2).contains(&until),
+                "{provider}: {until} is not {wait} s after {before}"
+            );
+        }
     }
 
     /// With no account left the turn ends at once. The pool's error is noel's
     /// own, not a provider's answer, so the run loop does not retry it: each
-    /// account is asked once, and none again while they cool down.
+    /// account is asked once, and none again while they are limited.
     #[tokio::test]
     async fn an_exhausted_pool_ends_the_turn_and_is_not_retried() {
         let (url, requests) = failover_endpoint(|_, _| Answer::Status(429));
@@ -12183,19 +12225,21 @@ mod tests {
         let (reply, retries) = failover_turn(&mut runtime, &config).await;
         let error = reply.expect_err("no account is left");
         assert!(
-            error.contains("all accounts exhausted (rate limited)")
-                && error.contains("first: request failed with status 429 Too Many Requests")
+            error.contains(
+                "every failover-exhausted account is rate limited; the first may be asked again at "
+            ) && error.contains("first: request failed with status 429 Too Many Requests")
                 && error.contains("second: request failed with status 429 Too Many Requests"),
             "{error}"
         );
         assert_eq!(retries, 0);
         assert_eq!(*requests.lock().unwrap(), ["first-key", "second-key"]);
 
-        // Both accounts are cooling down: the next turn sends nothing.
+        // Both accounts are limited: the next turn sends nothing.
         let (reply, retries) = failover_turn(&mut runtime, &config).await;
-        let error = reply.expect_err("both accounts are cooling down");
+        let error = reply.expect_err("both accounts are limited");
         assert!(
-            error.contains("no accounts available for failover"),
+            error.contains("every failover-exhausted account is rate limited")
+                && error.ends_with(" UTC"),
             "{error}"
         );
         assert_eq!(retries, 0);
@@ -12203,14 +12247,14 @@ mod tests {
     }
 
     /// Failures that are not a rate limit before any output stay with the
-    /// account in use and are the run loop's to retry: a 503, and a reply
-    /// that breaks off. Neither moves to the other account or cools one
-    /// down.
+    /// account in use and are the run loop's to retry: an overloaded
+    /// provider (529), and a reply that breaks off. Neither moves to the
+    /// other account or sets one aside.
     #[tokio::test]
     async fn other_failures_are_retried_by_the_run_loop_on_the_same_account() {
         let provider = "failover-retry";
         let (url, requests) = failover_endpoint(|_, earlier| match earlier {
-            0 => Answer::Status(503),
+            0 => Answer::Overloaded,
             1 => Answer::BreaksOff,
             _ => Answer::Says("the whole reply"),
         });
@@ -12223,9 +12267,96 @@ mod tests {
             *requests.lock().unwrap(),
             ["first-key", "first-key", "first-key"]
         );
-        let (sticky, cooldowns) = account_failover::remembered_state(provider);
-        assert_eq!(sticky.as_deref(), Some("first"));
-        assert!(cooldowns.is_empty(), "{cooldowns:?}");
+        let saved = saved_failover(&config, provider);
+        assert_eq!(saved.current.as_deref(), Some("first"));
+        assert!(saved.limited_until.is_empty(), "{saved:?}");
+        assert!(account_failover::notices_given(&format!("{provider} account ")).is_empty());
+    }
+
+    /// An account whose 5h usage window the usage cache shows at the
+    /// threshold is passed over before the provider limits it, and the
+    /// provider's own `exhaustionThresholdPct` moves the threshold.
+    #[tokio::test]
+    async fn an_account_at_its_usage_threshold_is_passed_over() {
+        for (provider, threshold, first_serves) in [
+            ("failover-usage", None, false),
+            ("failover-usage-high", Some(99), true),
+        ] {
+            let (url, requests) = failover_endpoint(|credential, _| match credential {
+                "first-key" => Answer::Says("first"),
+                _ => Answer::Says("second"),
+            });
+            let (mut config, mut runtime) =
+                failover_fixture(provider, &url, &["first", "second"], 1);
+            if let Some(threshold) = threshold {
+                config.settings.failover.as_mut().unwrap().providers.insert(
+                    provider.to_string(),
+                    noel_config::FailoverProviderSettings {
+                        exhaustion_threshold_pct: Some(threshold),
+                        ..Default::default()
+                    },
+                );
+            }
+            let now = unix_seconds().unwrap() as i64;
+            let mut cache = noel_config::UsageCache::default();
+            for (account, used_pct) in [("first", 95.0), ("second", 10.0)] {
+                cache.accounts.insert(
+                    format!("{provider}:{account}"),
+                    noel_config::AccountUsage {
+                        plan: None,
+                        windows: vec![noel_config::UsageWindow {
+                            label: "5h".to_string(),
+                            used_pct,
+                            resets_at: Some(now + 3_600),
+                        }],
+                        balance: None,
+                        fetched_at: now,
+                    },
+                );
+            }
+            noel_config::write_usage_cache(
+                &config.paths.agent_dir.join("usage-cache.json"),
+                &cache,
+            )
+            .unwrap();
+
+            let (reply, _) = failover_turn(&mut runtime, &config).await;
+            let expected = if first_serves { "first" } else { "second" };
+            assert_eq!(reply.as_deref(), Ok(expected), "{provider}");
+            assert_eq!(*requests.lock().unwrap(), [format!("{expected}-key")]);
+        }
+    }
+
+    /// An account whose credential cannot be refreshed is left out, with one
+    /// notice however many turns it is left out of, and the others serve.
+    /// Only a provider with a login of its own expires one: `anthropic`.
+    #[tokio::test]
+    async fn an_account_that_cannot_refresh_is_left_out_of_the_pool() {
+        let provider = "anthropic";
+        let (url, requests) = failover_endpoint(|_, _| Answer::Says("from the second account"));
+        let (mut config, mut runtime) = failover_fixture(provider, &url, &["second"], 1);
+        // Expired, and nothing to refresh it with.
+        config.auth.insert(
+            provider,
+            "first",
+            AuthCredential::OAuth {
+                access_token: "first-access".to_string(),
+                refresh_token: None,
+                expires: 1,
+                account_id: None,
+            },
+        );
+        for _ in 0..2 {
+            let (reply, _) = failover_turn(&mut runtime, &config).await;
+            assert_eq!(reply.as_deref(), Ok("from the second account"));
+        }
+        assert_eq!(*requests.lock().unwrap(), ["second-key", "second-key"]);
+        let notices = account_failover::notices_given(&format!("{provider} account "));
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with("anthropic account first is left out of failover: "),
+            "{notices:?}"
+        );
     }
 
     /// Without failover a rate limit is the run loop's, as on a build
@@ -12261,10 +12392,54 @@ mod tests {
             assert_eq!(retries, 2);
             assert_eq!(*requests.lock().unwrap(), [account, account, account]);
             assert_eq!(
-                account_failover::remembered_state(provider),
-                (None, BTreeMap::new())
+                saved_failover(&config, provider),
+                account_failover::SavedProvider::default()
             );
         }
+    }
+
+    /// Named accounts without a `default` make a provider's models
+    /// available when failover rotates between them; without failover the
+    /// session has to pin one.
+    #[test]
+    fn named_accounts_make_a_provider_usable_when_failover_rotates() {
+        let (mut config, _) = failover_fixture(
+            "failover-usable",
+            "http://127.0.0.1:9",
+            &["first", "second"],
+            1,
+        );
+        assert!(provider_usable(&config, "failover-usable", false));
+        assert!(!provider_usable(&config, "failover-usable", true));
+        config.settings.failover = None;
+        assert!(!provider_usable(&config, "failover-usable", false));
+    }
+
+    /// A key given with `--api-key` serves the run: failover is off, so the
+    /// stored accounts cannot take its place.
+    #[test]
+    fn an_api_key_on_the_command_line_turns_failover_off() {
+        let (mut config, _) = failover_fixture(
+            "failover-cli-key",
+            "http://127.0.0.1:9",
+            &["first", "second"],
+            1,
+        );
+        let cli = Cli::try_parse_from([
+            "noel",
+            "--model",
+            "failover-cli-key/echo",
+            "--api-key",
+            "cli-key",
+        ])
+        .unwrap();
+        apply_cli_overrides(&cli, Path::new("."), &mut config).unwrap();
+        assert_eq!(config.settings.failover, None);
+        assert!(!failover_enabled_for(&config, "failover-cli-key"));
+        assert_eq!(
+            auth_for_provider(&config.auth, "failover-cli-key", None),
+            Some(ResolvedAuth::ApiKey("cli-key".to_string()))
+        );
     }
 
     /// What the run loop asks the provider about the model does not depend

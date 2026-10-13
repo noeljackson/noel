@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use noel_config::{
     auth_for_provider, is_expired, listed_accounts_for_provider, read_usage_cache,
@@ -87,6 +88,61 @@ pub async fn get_usage(
         },
         UsageProbeResult::Unsupported => UsageProbeResult::Unsupported,
     }
+}
+
+/// The providers whose usage reports a 5h window, the one account failover
+/// reads.
+const FIVE_HOUR_WINDOW_PROVIDERS: [&str; 6] = [
+    "anthropic",
+    "openai",
+    "openai-codex",
+    "zai",
+    "zai-coding",
+    "zai-anthropic",
+];
+
+/// Refreshes an account's cached usage in the background when `cached` is
+/// older than [`USAGE_CACHE_TTL_SECONDS`], for account failover's 5h window.
+/// Each account is tried at most once per that time in a process, so a
+/// probe that fails is not repeated on every request.
+pub fn refresh_stale_in_background(
+    cache_path: PathBuf,
+    provider: &str,
+    account: &str,
+    auth: ResolvedAuth,
+    base_url: Option<String>,
+    cached: Option<&AccountUsage>,
+    now: i64,
+) {
+    static TRIED: Mutex<BTreeMap<String, i64>> = Mutex::new(BTreeMap::new());
+    if !FIVE_HOUR_WINDOW_PROVIDERS.contains(&provider)
+        || cached.is_some_and(|usage| now - usage.fetched_at < USAGE_CACHE_TTL_SECONDS)
+    {
+        return;
+    }
+    let key = format!("{provider}:{account}");
+    {
+        let mut tried = TRIED.lock().unwrap_or_else(PoisonError::into_inner);
+        if tried
+            .get(&key)
+            .is_some_and(|at| now - at < USAGE_CACHE_TTL_SECONDS)
+        {
+            return;
+        }
+        tried.insert(key, now);
+    }
+    let (provider, account) = (provider.to_string(), account.to_string());
+    tokio::spawn(async move {
+        let request = UsageRequest {
+            provider: &provider,
+            account: &account,
+            auth: &auth,
+            base_url: base_url.as_deref(),
+            refresh: false,
+            endpoint_override: None,
+        };
+        get_usage(&usage_http_client(), &cache_path, request, now).await;
+    });
 }
 
 fn store_usage(cache_path: &Path, key: &str, usage: &AccountUsage, now: i64) -> Result<(), String> {
