@@ -130,7 +130,7 @@ send_line "/copy"
 send_line "/quit"
 sleep 0.5
 
-pane_output="$(tmux capture-pane -t "${session_name}" -p -S -2000 2>/dev/null || true)"
+pane_output="$(tmux capture-pane -J -t "${session_name}" -p -S -2000 2>/dev/null || true)"
 printf '%s\n' "${pane_output}" > "${work_dir}/pane.txt"
 
 require_output() {
