@@ -8,7 +8,12 @@ use crate::{ToolError, ToolResult};
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_CHARS: usize = 20_000;
 const MAX_CHARS: usize = 50_000;
-const USER_AGENT: &str = "noel-agent/0.2 (+https://github.com/noeljackson/noel)";
+/// What the web tools identify as: this build's version and its repository.
+const USER_AGENT: &str = concat!(
+    "noel-agent/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/noeljackson/noel)"
+);
 
 #[derive(Debug, Clone)]
 enum SearchProvider {
@@ -434,6 +439,18 @@ mod tests {
         );
         let (_, text) = readable_html(&html, &Url::parse("https://example.org").unwrap());
         assert!(text.len() <= MAX_RESPONSE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn requests_name_this_build_and_its_repository() {
+        let (url, thread) = server(vec![response("text/plain", "ok")]);
+        fetch(&url, None).await.unwrap();
+        let request = thread.join().unwrap().remove(0).to_lowercase();
+        let user_agent = format!(
+            "user-agent: noel-agent/{} (+https://github.com/noeljackson/noel)\r\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(request.contains(&user_agent), "{request}");
     }
 
     #[tokio::test]
