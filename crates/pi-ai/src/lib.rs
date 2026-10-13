@@ -5270,7 +5270,9 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         let error = reqwest::Client::new().get(url).send().await.unwrap_err();
-        let error = ProviderError::Request(error);
+        // Without the URL: its port is random, and a port such as 35033
+        // contains one of upstream's patterns ("503").
+        let error = ProviderError::Request(error.without_url());
         // The text names no cause upstream's patterns know; the kind does.
         assert!(!is_retryable_error_text(&error.to_string()), "{error}");
         assert!(error.is_retryable());
