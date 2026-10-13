@@ -886,37 +886,50 @@ them when one is rate limited, instead of retrying that account:
 ```
 
 Failover is availability-only, not load balancing: one sticky account carries
-the session and the others are used only when it returns 429/529 with no
-streamed output, or when its 5h usage window is at/above the exhaustion
-threshold (default 90%). Cooldowns come from the provider's own reset
-timestamps, and voluntary switches are rate-limited (default one per 10s) so
-the pool never flaps. Requests are never spread across accounts to maximize
-throughput. Per-provider tuning: `failover.providers.anthropic.exhaustionThresholdPct`
-and `minSwitchIntervalMs`. Pinning an account with `/account name` disables
-rotation for that session; run `noel help failover` for the summary.
+the provider's requests, and another takes over only when
 
-Four statements in that paragraph describe the design and are not wired yet:
+- the provider answers the sticky account with a 429 before any output. That
+  account then sits out until the time the provider gives: the answer's
+  `retry-after-ms` or `retry-after` (in seconds), or the `error.resets_at` of
+  an `openai-codex` usage limit, whichever is later; five minutes when the
+  answer gives none. The switch is made inside the request, before
+  [run recovery](#run-recovery) sees a failure: it is not a retry and waits
+  for no backoff.
+- or the sticky account's 5h usage window is at the exhaustion threshold
+  (default 90%, `failover.providers.<provider>.exhaustionThresholdPct`), by
+  the usage cache that `noel accounts status` and `/usage` show. Such an
+  account is set aside until its window resets, and still serves when every
+  other account is set aside too. While failover is on, noel refreshes the
+  sticky account's cached usage in the background when it is older than 15
+  minutes (`anthropic` and `openai-codex` logins and `zai` keys report a 5h
+  window).
+  A switch away from an account near its limit waits until
+  `minSwitchIntervalMs` (default 10000) has passed since the last switch, so
+  the pool does not flap between accounts near their limits; a switch away
+  from a rate-limited account never waits.
 
-- The 5h usage window and `exhaustionThresholdPct` are not consulted. An
-  account at or over the threshold still serves until it answers 429 or 529.
-- A rate-limited account cools down for a fixed 300 seconds. No reset
-  timestamp is read.
-- The switch-rate limit and `minSwitchIntervalMs` have no effect: the pool is
-  built for each request, and its clock with it.
-- `noel help failover` is not a command.
+Requests are never spread across accounts to maximize throughput. Pinning an
+account with `/account name`, or giving `--api-key`, turns failover off.
+`noel accounts --help` has the summary.
 
-A switch is made inside the request, before [run recovery](#run-recovery)
-sees a failure: it is not a retry and waits for no backoff. When every account
-is rate limited the turn ends at once with each account's error, and until a
-cooldown ends requests fail with `no accounts available for failover`; neither
-is retried. Any other failure, and a reply that breaks off, stays on the
-sticky account and is retried as run recovery describes. The pool holds the
-accounts the provider takes: an API key stored under `openai-codex`, or a
-ChatGPT login stored under `openai`, is not one of them. Failover does not
-make a provider's models available: as without it, that takes an account
-named `default`, an environment key or an imported login, and with named
-accounts only the model has to be given with `--model`. The TUI reports a
-cooldown as a system line after the turn; print and RPC mode report nothing.
+The sticky account, the rate limits and the time of the last switch are kept
+in `failover-state.json` in the agent directory, so they hold across turns and
+across `noel` processes: a `noel -p` does not ask an account the last one found
+limited. The TUI reports a switch as a system line after the turn, print mode
+on stderr, and RPC mode as a notification (see [RPC Mode](#rpc-mode)); each
+names both accounts and when the first may be asked again.
+
+When every account is rate limited the turn ends at once with each account's
+answer and when the first may be asked again, and until then requests fail
+with the same time; neither is retried. Any other failure stays on the sticky
+account and is retried as run recovery describes: an overloaded provider
+(529), which is overloaded for every account alike, a reply that breaks off,
+and errors that are not the provider's answer. An account whose login cannot be
+refreshed is left out, with one notice, and the others serve. The pool holds
+the accounts the provider takes: an API key stored under `openai-codex`, or a
+ChatGPT login stored under `openai`, is not one of them. With failover on, two
+or more named accounts make the provider's models available, as an account
+named `default`, an environment key or an imported login does without it.
 
 Pooled subscriptions remain subject to each provider's terms: failover is
 intended for accounts you are individually entitled to use, and the sticky
@@ -1352,7 +1365,7 @@ print mode, and RPC mode alike:
   at once: 400, 401, 403, and 404 responses, other statuses whose body names
   nothing transient, a missing credential, and quota or billing limits even
   when they arrive as a 429. With [account failover](#account-failover) on,
-  a 429 or 529 before any output goes to another account first. The rules
+  a 429 before any output goes to another account first. The rules
   are upstream's patterns over the error text
   (`error-classification.json`). When retries
   run out, the error names the likely causes, including a local firewall
@@ -1444,6 +1457,12 @@ again). The run then starts over with another `agent_start`, under the same
 that succeeded, or the `agent_end` of the last failure. `abort_retry` ends a
 backoff in progress: the run settles with the failure it would have retried,
 and `auto_retry_end` reports `Retry cancelled`.
+
+When [account failover](#account-failover) switches accounts, noel sends one
+of upstream's notifications before the reply: an `extension_ui_request` with
+`method` `notify`, `notifyType` `warning` and the switch as `message`. It
+needs no answer, and an `extension_ui_response` gets none, as upstream ignores
+one that nothing waits for. noel sends no other extension UI request.
 
 While a `bash` call runs, `tool_execution_update` records carry its output so
 far in `partialResult.content`: none when the command starts, then all of it

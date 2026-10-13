@@ -81,6 +81,13 @@ fn faux_script_noel(root: &Path, args: &[&str]) -> Command {
     command
 }
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 fn faux_script_log(root: &Path) -> Vec<serde_json::Value> {
     fs::read_to_string(root.join("requests.jsonl"))
         .unwrap_or_default()
@@ -186,8 +193,9 @@ fn print_mode_fails_over_to_a_second_account_when_the_first_is_rate_limited() {
         fs::write(
             root.join("script.json"),
             r#"[
-                [{"error": {"status": 429, "body": "rate limited"}}],
-                [{"text": "served by the second account"}]
+                [{"error": {"status": 429, "body": "rate limited", "retry_after_ms": 60000}}],
+                [{"text": "served by the second account"}],
+                [{"text": "served by the second account again"}]
             ]"#,
         )
         .unwrap();
@@ -195,11 +203,11 @@ fn print_mode_fails_over_to_a_second_account_when_the_first_is_rate_limited() {
             .output()
             .expect("run noel");
         let requests = faux_script_log(&root).len();
-        fs::remove_dir_all(root).unwrap();
-        (output, requests)
+        (root, output, requests)
     };
 
-    let (output, requests) = run("noel-cli-failover-on", true);
+    let before = unix_now();
+    let (root, output, requests) = run("noel-cli-failover-on", true);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert_eq!(
@@ -207,8 +215,36 @@ fn print_mode_fails_over_to_a_second_account_when_the_first_is_rate_limited() {
         "served by the second account\n"
     );
     assert_eq!(requests, 2);
+    // The switch is reported on stderr, naming both accounts.
+    assert!(
+        stderr.starts_with("noel: faux account default is rate limited until ")
+            && stderr.ends_with(" UTC; switched to second\n"),
+        "{stderr}"
+    );
+    // The next process remembers: the first account is limited for the
+    // minute the provider asked for, so only the second is asked.
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("agent/failover-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["providers"]["faux"]["current"], "second");
+    let until = state["providers"]["faux"]["limitedUntil"]["default"]
+        .as_i64()
+        .unwrap();
+    assert!((before + 60..=unix_now() + 61).contains(&until), "{state}");
+    let output = faux_script_noel(&root, &["--no-context-files", "-p", "hello"])
+        .output()
+        .expect("run noel");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "served by the second account again\n"
+    );
+    assert_eq!(output.stderr, b"");
+    assert_eq!(faux_script_log(&root).len(), 3);
+    fs::remove_dir_all(root).unwrap();
 
-    let (output, requests) = run("noel-cli-failover-off", false);
+    let (root, output, requests) = run("noel-cli-failover-off", false);
+    fs::remove_dir_all(root).unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     assert!(

@@ -136,6 +136,9 @@ pub(crate) enum Command {
     SetSessionName {
         name: String,
     },
+    /// The answer to a dialog. noel opens none, so it is ignored, as
+    /// upstream ignores one whose request is not waiting.
+    ExtensionUiResponse,
     #[serde(other)]
     Other,
 }
@@ -906,6 +909,26 @@ pub(crate) enum Event<'a> {
     ThinkingLevelChanged {
         level: &'a str,
     },
+    /// Upstream's notification (`ctx.ui.notify`), which expects no answer.
+    ExtensionUiRequest {
+        id: String,
+        method: &'static str,
+        message: &'a str,
+        notify_type: &'static str,
+    },
+}
+
+impl<'a> Event<'a> {
+    /// A warning for whoever drives noel, such as an account failover
+    /// switch.
+    pub fn warning(id: String, message: &'a str) -> Self {
+        Self::ExtensionUiRequest {
+            id,
+            method: "notify",
+            message,
+            notify_type: "warning",
+        }
+    }
 }
 
 /// `message_update`'s event: a content block's start, delta or end.

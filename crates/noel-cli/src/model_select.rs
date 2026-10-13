@@ -21,9 +21,13 @@ use crate::Cli;
 
 /// Whether `provider`'s models can run now: it has credentials (upstream's
 /// "available" models), or it is the local faux provider. Offline, only
-/// faux can.
+/// faux can. Named accounts without a `default` count when account failover
+/// rotates between them, because the pool resolves which one serves.
 pub(crate) fn provider_usable(config: &LoadedConfig, provider: &str, offline: bool) -> bool {
-    provider == "faux" || (!offline && has_auth_for_provider(&config.auth, provider, None))
+    provider == "faux"
+        || (!offline
+            && (has_auth_for_provider(&config.auth, provider, None)
+                || crate::failover_enabled_for(config, provider)))
 }
 
 /// The models that can run now, in catalog order.
