@@ -97,6 +97,9 @@ selector_anchor="$(first_row)"
 tmux send-keys -t "${session}" '/models' Enter
 wait_for 'provider selector'
 tmux send-keys -t "${session}" Escape
+# An Escape the TUI has not read yet is taken together with the input after
+# it, as a chord: go on once the selector it closes is gone.
+absent '┌ provider selector'
 wait_for 'Scroll to bottom'
 wait_for '│ >'
 [ "$(first_row)" = "${selector_anchor}" ] || fail 'selector Escape changed reading anchor'
@@ -145,6 +148,7 @@ for _ in $(seq 1 20); do
 done
 for i in $(seq 1 100); do grep -Fq "streamed-answer-$(printf '%03d' "${i}")" "${work_dir}/stream-windows.txt"; done
 tmux send-keys -t "${session}" Escape
+absent 'Scroll to bottom'
 wait_for '│ > stream draft'
 tmux send-keys -t "${session}" C-c '/clear' Enter
 sleep 0.3
