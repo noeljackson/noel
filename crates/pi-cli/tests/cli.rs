@@ -160,6 +160,64 @@ fn print_mode_runs_a_faux_script_tool_round_and_logs_each_request() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// With retries off, a rate limit ends a run on one account. With account
+/// failover on and a second stored account, the same rate limit is answered
+/// by that account instead.
+#[test]
+fn print_mode_fails_over_to_a_second_account_when_the_first_is_rate_limited() {
+    let run = |name: &str, failover: bool| {
+        let root = test_dir(name);
+        fs::create_dir_all(root.join("agent")).unwrap();
+        fs::write(
+            root.join("agent/settings.json"),
+            serde_json::json!({"retry": {"enabled": false}, "failover": {"enabled": failover}})
+                .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("agent/auth.json"),
+            r#"{"faux": {
+                "default": {"type": "api_key", "key": "default-key"},
+                "second": {"type": "api_key", "key": "second-key"}
+            }}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("script.json"),
+            r#"[
+                [{"error": {"status": 429, "body": "rate limited"}}],
+                [{"text": "served by the second account"}]
+            ]"#,
+        )
+        .unwrap();
+        let output = faux_script_pi(&root, &["--no-context-files", "-p", "hello"])
+            .output()
+            .expect("run pi");
+        let requests = faux_script_log(&root).len();
+        fs::remove_dir_all(root).unwrap();
+        (output, requests)
+    };
+
+    let (output, requests) = run("pi-cli-failover-on", true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "served by the second account\n"
+    );
+    assert_eq!(requests, 2);
+
+    let (output, requests) = run("pi-cli-failover-off", false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("request failed with status 429 Too Many Requests: rate limited"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(requests, 1);
+}
+
 /// Runs pi once in `root` on a one-reply script and returns the system
 /// prompt its request carried.
 fn system_prompt_sent(root: &Path, args: &[&str]) -> String {
