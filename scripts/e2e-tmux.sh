@@ -956,15 +956,12 @@ if ! printf '%s\n' "${clear_before}" | grep -Fq "clear-screen-marker"; then
   exit 1
 fi
 
-tmux send-keys -t "${clear_session}" "/clear" Enter
-clear_output=""
-for _ in $(seq 1 30); do
-  sleep 0.1
-  clear_output="$(tmux capture-pane -t "${clear_session}" -p -S -2000 2>/dev/null || true)"
-  if ! printf '%s\n' "${clear_output}" | grep -Fq "clear-screen-marker"; then
-    break
-  fi
-done
+# /clear empties the screen and the next frame draws the prompt again; the
+# pane is blank in between, so it is read once both have happened.
+type_line "/clear"
+absent "clear-screen-marker" "/clear did not remove prior pane output"
+wait_for "│ >" "/clear did not redraw the input prompt"
+clear_output="$(tmux capture-pane -t "${clear_session}" -p -S -2000 2>/dev/null || true)"
 printf '%s\n' "${clear_output}" > "${work_dir}/clear-pane.txt"
 tmux send-keys -t "${clear_session}" "/quit" Enter
 sleep 0.5
