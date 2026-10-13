@@ -7,6 +7,6 @@ RUN apt-get update \
 WORKDIR /workspace
 COPY . .
 
-RUN cargo build -p pi-cli
+RUN cargo build -p noel-cli
 
 CMD ["./scripts/e2e-tmux.sh"]

@@ -1,6 +1,6 @@
-# pi
+# noel
 
-`pi` is a native Rust CLI coding agent.
+`noel` is a native Rust CLI coding agent.
 
 The repository has been cut over from the previous TypeScript/npm monorepo to a Rust-only Cargo workspace. The web UI and npm package runtime are no longer part of the product path.
 
@@ -8,12 +8,12 @@ The repository has been cut over from the previous TypeScript/npm monorepo to a 
 
 Current Rust implementation:
 
-- CLI binary: `pi`
+- CLI binary: `noel`
 - Interactive terminal loop
 - Print mode
 - Append-only JSONL sessions
 - Context-safe `/reload`
-- Config/auth/model loading from `~/.pi/agent`
+- Config/auth/model loading from `~/.noel`
 - Upstream's default system prompt, with `SYSTEM.md`, `APPEND_SYSTEM.md`,
   and `AGENTS.md`/`CLAUDE.md` context discovery
 - Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `todo`, `web_search`, `web_fetch`
@@ -43,10 +43,10 @@ between a web UI, Node process, and package runtime.
 
 ## How Development Works
 
-Use Cargo and Make targets only. The main binary is `crates/pi-cli`; shared
-behavior lives in `pi-core`, provider adapters in `pi-ai`, configuration in
-`pi-config`, local tools in `pi-tools`, terminal rendering helpers in `pi-tui`,
-and TypeScript parity checks in `pi-parity`.
+Use Cargo and Make targets only. The main binary is `crates/noel-cli`; shared
+behavior lives in `noel-core`, provider adapters in `noel-ai`, configuration in
+`noel-config`, local tools in `noel-tools`, terminal rendering helpers in `noel-tui`,
+and TypeScript parity checks in `noel-parity`.
 
 For normal local work:
 
@@ -62,13 +62,15 @@ should not clear conversation messages, cwd, session identity, tool history,
 queued messages, or active context. `make check` runs formatting, clippy, and
 Rust tests. `make e2e` runs tmux-based terminal behavior checks.
 
-Tests never touch the real `~/.pi`. `make test` sets `PI_TEST_ISOLATION=1`,
-under which pi refuses to fall back to `~/.pi/agent` (a test names its agent
-dir with `PI_CODING_AGENT_DIR`), imports no Claude Code or Codex login from
-`$HOME`, and starts no background model refresh. The
-CLI tests run every `pi` through `pi_command()`, which also sets that marker
-and gives each run a cleared environment and its own agent dir and `HOME`
-under the target directory.
+Tests never touch the real `~/.noel` or `~/.pi`. `make test` sets
+`NOEL_TEST_ISOLATION=1`, under which noel refuses to fall back to `~/.noel` (a
+test names its agent dir with `NOEL_DIR`), imports neither `~/.pi/agent` nor a
+Claude Code or Codex login from `$HOME`, and starts no background model
+refresh. The CLI tests run every `noel` through `noel_command()`, which also
+sets that marker and gives each run a cleared environment and its own agent
+dir and `HOME` under the target directory. The tmux e2e suites run without the
+marker: `scripts/e2e-isolate.sh` gives them an empty `HOME`, and the import
+suite starts noel on its default directory there.
 
 TypeScript is reference material, not a runtime dependency. Parity fixtures are
 generated only through Docker:
@@ -87,7 +89,7 @@ cargo build --release
 The binary is:
 
 ```bash
-target/release/pi
+target/release/noel
 ```
 
 Install for the current user:
@@ -99,7 +101,7 @@ make install
 Install under a different prefix:
 
 ```bash
-make install PREFIX="/opt/pi"
+make install PREFIX="/opt/noel"
 ```
 
 Install system-wide:
@@ -113,7 +115,7 @@ sudo make install PREFIX="/usr/local"
 Interactive mode:
 
 ```bash
-cargo run -p pi-cli
+cargo run -p noel-cli
 ```
 
 Local dogfood mode with session resume, the faux provider, and automatic
@@ -126,7 +128,7 @@ make dogfood
 Print mode:
 
 ```bash
-cargo run -p pi-cli -- -p --model faux/echo "hello"
+cargo run -p noel-cli -- -p --model faux/echo "hello"
 ```
 
 RPC mode (see [RPC Mode](#rpc-mode)). `faux/echo` answers at once; with a real
@@ -134,48 +136,48 @@ model, keep stdin open until `agent_settled`, since closing it stops the run:
 
 ```bash
 printf '%s\n' '{"id":"1","type":"prompt","message":"hello"}' \
-  | cargo run -p pi-cli -- --mode rpc --model faux/echo
+  | cargo run -p noel-cli -- --mode rpc --model faux/echo
 ```
 
 List models, or the ones whose provider, id, name, or API contains a text:
 
 ```bash
-cargo run -p pi-cli -- --list-models
-cargo run -p pi-cli -- --list-models opus
+cargo run -p noel-cli -- --list-models
+cargo run -p noel-cli -- --list-models opus
 ```
 
 Choose a model and a thinking level (see [Models and thinking levels](#models-and-thinking-levels)):
 
 ```bash
-cargo run -p pi-cli -- --model anthropic/claude-opus-4-8 --thinking high
-cargo run -p pi-cli -- --model sonnet:high
-cargo run -p pi-cli -- --provider openai --model gpt-5
+cargo run -p noel-cli -- --model anthropic/claude-opus-4-8 --thinking high
+cargo run -p noel-cli -- --model sonnet:high
+cargo run -p noel-cli -- --provider openai --model gpt-5
 ```
 
 List image-generation models:
 
 ```bash
-cargo run -p pi-cli -- images
+cargo run -p noel-cli -- images
 ```
 
 Generate an image through a configured OpenRouter API key:
 
 ```bash
-cargo run -p pi-cli -- generate-image --output image.png \
+cargo run -p noel-cli -- generate-image --output image.png \
   --model openrouter/google/gemini-3.1-flash-image-preview "a compact rust cli logo"
 ```
 
 Resume or fork sessions:
 
 ```bash
-cargo run -p pi-cli -- --continue
-cargo run -p pi-cli -- --session <id-prefix|name|path>
-cargo run -p pi-cli -- --fork <id-prefix|name|path>
+cargo run -p noel-cli -- --continue
+cargo run -p noel-cli -- --session <id-prefix|name|path>
+cargo run -p noel-cli -- --fork <id-prefix|name|path>
 ```
 
 A session has one writer at a time: opening it for writing takes a lock on
 `<session>.jsonl.lock` beside the journal. Startup waits up to 5 seconds for
-another pi process to release the session, then exits with status 75, naming
+another noel process to release the session, then exits with status 75, naming
 the session path and the holder's pid. In the TUI, `/resume`, the picker,
 `/import` onto that session id, and `/delete` report the conflict and keep
 running. Listing, `--fork`, `/fork`, and `/clone` only read. A crash during an
@@ -185,22 +187,22 @@ writer drops; a journal that fails to load is left out of listings.
 Useful CLI scope flags:
 
 ```bash
-cargo run -p pi-cli -- --models faux/echo --tools read,write -p "hello"
-cargo run -p pi-cli -- --tools -bash,-write -p "everything but bash and write"
-cargo run -p pi-cli -- --no-builtin-tools -p "extension tools only"
-cargo run -p pi-cli -- --no-tools -p "no tools"
-cargo run -p pi-cli -- --system-prompt prompt.md --append-system-prompt extra.md -p "hello"
-cargo run -p pi-cli -- --skill ./skills/review -p "/skill:review src/"
-cargo run -p pi-cli -- --image screenshot.png -p "describe this"
-cargo run -p pi-cli -- --export session.json -p "hello"
-cargo run -p pi-cli -- --export session.html -p "hello"
-cargo run -p pi-cli -- --export session.jsonl -p "hello"
+cargo run -p noel-cli -- --models faux/echo --tools read,write -p "hello"
+cargo run -p noel-cli -- --tools -bash,-write -p "everything but bash and write"
+cargo run -p noel-cli -- --no-builtin-tools -p "extension tools only"
+cargo run -p noel-cli -- --no-tools -p "no tools"
+cargo run -p noel-cli -- --system-prompt prompt.md --append-system-prompt extra.md -p "hello"
+cargo run -p noel-cli -- --skill ./skills/review -p "/skill:review src/"
+cargo run -p noel-cli -- --image screenshot.png -p "describe this"
+cargo run -p noel-cli -- --export session.json -p "hello"
+cargo run -p noel-cli -- --export session.html -p "hello"
+cargo run -p noel-cli -- --export session.jsonl -p "hello"
 ```
 
 Prompt arguments starting with `@` are expanded from files:
 
 ```bash
-cargo run -p pi-cli -- -p --model faux/echo @prompt.txt
+cargo run -p noel-cli -- -p --model faux/echo @prompt.txt
 ```
 
 ### Faux models
@@ -209,10 +211,10 @@ The `faux` provider needs no credentials and is the only provider `--offline`
 allows.
 
 `faux/echo` answers `[faux/echo] ` followed by the last user message.
-`PI_FAUX_STREAM_DELAY_MS` sleeps before each streamed event, and
-`PI_FAUX_STREAM_CHARS=1` streams its text one character at a time.
+`NOEL_FAUX_STREAM_DELAY_MS` sleeps before each streamed event, and
+`NOEL_FAUX_STREAM_CHARS=1` streams its text one character at a time.
 
-`faux/script` replays scripted responses for tests. `PI_FAUX_SCRIPT` names a
+`faux/script` replays scripted responses for tests. `NOEL_FAUX_SCRIPT` names a
 JSON file that holds an array of responses. Each response is an array of steps,
 and each step is an object with one key:
 
@@ -244,22 +246,22 @@ and each step is an object with one key:
   that is retried follows the rules for a real provider's error.
 - `{"delay_ms": 200}` pauses the response.
 - `{"wait_for_file": "path"}` holds the response until the file exists, for
-  example while a test steers or kills pi. Relative paths resolve against the
+  example while a test steers or kills noel. Relative paths resolve against the
   script's directory.
 
-If `PI_FAUX_SCRIPT_LOG` names a file, every request is appended to it as one
+If `NOEL_FAUX_SCRIPT_LOG` names a file, every request is appended to it as one
 JSON line and fsynced before the response starts. A line holds the
 `system_prompt`, the `messages` (`role`, `content`, and when present
 `tool_calls`, `tool_call_id`, `tool_name`, and a `media` count), and the names
 of the offered `tools`. The number of requests already in the log selects the
-response, so a restarted pi continues the script where the previous process
+response, so a restarted noel continues the script where the previous process
 stopped. Without a log, a counter in the process selects it. A request past the
 end of the script fails at once with a configuration error, which is never
 retried.
 
 ```bash
-PI_FAUX_SCRIPT=script.json PI_FAUX_SCRIPT_LOG=requests.jsonl \
-  cargo run -p pi-cli -- --offline --no-session -p --model faux/script "read notes.txt"
+NOEL_FAUX_SCRIPT=script.json NOEL_FAUX_SCRIPT_LOG=requests.jsonl \
+  cargo run -p noel-cli -- --offline --no-session -p --model faux/script "read notes.txt"
 ```
 
 ## Configuration
@@ -267,7 +269,7 @@ PI_FAUX_SCRIPT=script.json PI_FAUX_SCRIPT_LOG=requests.jsonl \
 Default config root:
 
 ```text
-~/.pi/agent
+~/.noel
 ```
 
 Supported files:
@@ -290,19 +292,20 @@ Skills are also read from `.agents/skills` directories; see [Skills](#skills)
 and [Prompt templates](#prompt-templates) for what `skills/` and `prompts/`
 hold.
 
-Project resources (`.pi/settings.json`, `.pi/SYSTEM.md`,
-`.pi/APPEND_SYSTEM.md`, `.pi/extensions`, `.pi/skills`, `.pi/prompts`,
-`.pi/themes`, and `.agents/skills`) load only for a trusted project: pass
+Project resources (`.noel/settings.json`, `.noel/SYSTEM.md`,
+`.noel/APPEND_SYSTEM.md`, `.noel/extensions`, `.noel/skills`, `.noel/prompts`,
+`.noel/themes`, and `.agents/skills`) load only for a trusted project: pass
 `-a`/`--approve` (or `--no-approve` to refuse) or save a decision with
 `/trust`. Context files (`AGENTS.md`, `CLAUDE.md`) from the agent directory
 and from the current directory and its ancestors load whatever the trust
 decision, as upstream does; treat a repository's instructions as untrusted
-input.
+input. A project without a `.noel/` directory is read from its `.pi/`
+instead; see [Moving from pi](#moving-from-pi).
 
 Environment overrides:
 
-- `PI_CODING_AGENT_DIR`
-- `PI_CODING_AGENT_SESSION_DIR`
+- `NOEL_DIR`
+- `NOEL_SESSION_DIR`
 
 `settings.json` supports default model selection, shell configuration, prompt inputs, enabled models/tools, and `sessionDir`:
 
@@ -322,16 +325,51 @@ Environment overrides:
 }
 ```
 
+### Moving from pi
+
+noel keeps pi's layout under new names: `~/.pi/agent` is `~/.noel`,
+`PI_CODING_AGENT_DIR` is `NOEL_DIR`, `PI_CODING_AGENT_SESSION_DIR` is
+`NOEL_SESSION_DIR`, the other `PI_*` variables are `NOEL_*`, and the project
+directory is `.noel/`. noel reads only the new names: a `PI_*` variable set
+for pi has no effect.
+
+The first command that loads noel's configuration without `NOEL_DIR`, if
+`~/.noel` does not exist and `~/.pi/agent` does, imports pi's state once.
+`noel --version`, `noel --help`, and a command line noel rejects write
+nothing, so a version probe never imports. The import takes settings,
+`trust.json`, `keybindings.json`, `models.json`, `auth.json`, `SYSTEM.md`,
+`APPEND_SYSTEM.md`, the global context file (`AGENTS.override.md`,
+`AGENTS.md` or `CLAUDE.md`), skills, prompts, themes, extensions and
+sessions, so `noel -c` and `/resume` find pi's sessions. It prints what it
+imported and never modifies `~/.pi`; caches are rebuilt. A `models.json` or
+`keybindings.json` that noel cannot load is left behind with a notice. The
+copy is staged next to `~/.noel` and renamed into place, so an interrupted
+import never leaves a partial `~/.noel`, and the next start imports again.
+
+OAuth refresh tokens rotate: once noel refreshes an imported login, only noel's
+copy stays valid, so pi on the same host (upstream, or an earlier build of this
+port) has to log in again.
+
+Projects written for pi keep working. Without a `.noel/` directory, noel uses
+the project's `.pi/` for everything a project configures: its settings,
+`SYSTEM.md`, `APPEND_SYSTEM.md`, extensions, skills, prompt templates and
+themes, including what noel writes there (`noel install -l`, `noel config ...
+-l`). Once the project has a `.noel/`, its `.pi/` is not read at all. noel
+also reads `.pi-extension.json` manifests and the `pi` key of a package's
+`package.json`, gives extensions both the `NOEL_EXTENSION_*` and the
+`PI_EXTENSION_*` variables, and sets the [session variables](#session-variables)
+under pi's names too, for skills and scripts written for pi.
+
 ### Models and thinking levels
 
-pi knows the models upstream pi knows. The built-in catalog is upstream's,
+noel knows the models upstream pi knows. The built-in catalog is upstream's,
 generated from upstream's own model runtime and compiled in
 (`tests/fixtures/ts-parity/model-catalog.json`; `make ts-parity-update`
 regenerates it). Each model has its API and base URL, context window, output
 cap, what it accepts (`text`, `image`), prices, and which thinking levels it
 supports. Beside it sit the providers only this port has: `faux`,
 `zai-coding`, `zai-anthropic`, and `kimi-coding-openai`. The catalog is a
-snapshot: pi does not fetch upstream's hosted catalog or OpenRouter's
+snapshot: noel does not fetch upstream's hosted catalog or OpenRouter's
 per-key listing, and it leaves out upstream's Radius gateway, whose API it
 does not speak. Provider listings fetched by the model refresh and
 `models.json` add to it (see below).
@@ -339,7 +377,7 @@ does not speak. Provider listings fetched by the model refresh and
 `--model <pattern>` picks a model as upstream's does:
 
 - `provider/id` or a bare `id`, ignoring case. An id several providers have
-  goes to the one provider with credentials; with none or several, pi names
+  goes to the one provider with credentials; with none or several, noel names
   the candidates and asks for `--provider` or `provider/id`.
 - Otherwise the best match on id or name: an alias before a dated id
   (`claude-haiku-4-5` before `claude-haiku-4-5-20251001`), then the id that
@@ -383,9 +421,10 @@ model's output cap, lowered to fit its context window.
 
 ### System prompt
 
-Every model request starts with pi's system prompt, in every mode. It is
-upstream's prompt, word for word: one sentence naming the role, then tagged
-sections.
+Every model request starts with noel's system prompt, in every mode. It is
+upstream's prompt, word for word under noel's names (the product in the first
+sentence, and the `NOEL_*` variables of bash's rule): one sentence naming the
+role, then tagged sections.
 
 - `<tools>`: the active tools, one line each. An extension tool is listed
   when its manifest has a `promptSnippet`.
@@ -403,7 +442,7 @@ The tool list and rules follow the tools the request declares, so
 `--no-builtin-tools`, `--no-tools`, and `--offline` (which removes the web
 tools) change them. An extension tool named like a built-in tool replaces it
 here too: the tool appears once, with the extension's snippet and guidelines. Upstream's `<docs>` section, which
-points at its installed documentation, is left out: pi installs none.
+points at its installed documentation, is left out: noel installs none.
 
 A custom prompt replaces the role, `<tools>`, and `<rules>`. The appended
 text, context files, skills, and working directory still follow it. It is the
@@ -411,12 +450,12 @@ first of these that exists:
 
 1. `--system-prompt <text-or-path>`
 2. the `systemPrompt` setting
-3. `.pi/SYSTEM.md` in the working directory, if the project is trusted
+3. `.noel/SYSTEM.md` in the working directory, if the project is trusted
 4. `SYSTEM.md` in the agent directory
 
 Appended text is the `appendSystemPrompt` setting's entries followed by each
 `--append-system-prompt <text-or-path>`. Without either, it is
-`.pi/APPEND_SYSTEM.md` of a trusted project, else `APPEND_SYSTEM.md` in the
+`.noel/APPEND_SYSTEM.md` of a trusted project, else `APPEND_SYSTEM.md` in the
 agent directory. Files with the same name are not combined: the project's
 replaces the agent directory's.
 
@@ -431,7 +470,7 @@ checkout's file of the same name instead of adding to it.
 ### Skills
 
 A skill is a directory with a `SKILL.md`: frontmatter with a `description`,
-then instructions. pi loads and uses skills as upstream does (its
+then instructions. noel loads and uses skills as upstream does (its
 `docs/skills.md`, and the Agent Skills specification).
 
 ```markdown
@@ -446,7 +485,7 @@ Read `references/formats.md` before converting a document.
 
 Where skills come from, in the order they load:
 
-1. The `skills` setting of a trusted project, then `.pi/skills`, then
+1. The `skills` setting of a trusted project, then `.noel/skills`, then
    `.agents/skills` in each directory from the working directory up to the
    repository root.
 2. The user's `skills` setting, then `skills/` in the agent directory, then
@@ -460,7 +499,7 @@ skill's own directory is searched, so its scripts and references are not
 skills. A Markdown file with a `description` is a skill too when it sits
 directly in `skills/` (in `.agents/skills`, when it sits below it). A skill is
 named by its frontmatter `name`, else by its directory. A `SKILL.md` without
-a `description`, or with frontmatter pi cannot read, is not loaded.
+a `description`, or with frontmatter noel cannot read, is not loaded.
 Frontmatter is read as the YAML the Agent Skills specification uses: plain
 and quoted values, `true`/`false`, and `|` or `>` blocks; a nested mapping or
 a list is accepted and ignored.
@@ -482,7 +521,7 @@ the directory its relative paths start from, followed by the arguments.
 
 A Markdown file `name.md` is the command `/name`, as in upstream's
 `docs/prompt-templates.md`. Templates come from the `prompts` setting and
-`.pi/prompts` of a trusted project, the user's `prompts` setting and
+`.noel/prompts` of a trusted project, the user's `prompts` setting and
 `prompts/` in the agent directory, packages, and each
 `--prompt-template <path>` (a file or a directory), in that order; the first
 of a name wins. `--no-prompt-templates` (`-np`) keeps only the
@@ -515,10 +554,10 @@ and description.
 Skill commands and templates expand wherever input enters: a prompt in the
 TUI, in print mode, and in RPC mode, and steering and follow-ups in the TUI
 and in RPC mode. A command that names neither is sent to the model as text.
-The TUI's own commands come first, then pi's slash-tool prompts (`/read
+The TUI's own commands come first, then noel's slash-tool prompts (`/read
 <path>`, `/bash <command>`, ...), then skills, then templates.
 
-pi also keeps `/prompt <name> [input]` in the TUI: `{{input}}` in the
+noel also keeps `/prompt <name> [input]` in the TUI: `{{input}}` in the
 template stands for the input, which otherwise follows the template's text.
 
 ### Session variables
@@ -527,20 +566,24 @@ Commands the model runs with `bash` see the session they belong to:
 
 | Variable | Value |
 |---|---|
-| `PI_SESSION_ID` | The session id (`ephemeral` with `--no-session`) |
-| `PI_SESSION_FILE` | Absolute path of the session journal; unset with `--no-session` |
-| `PI_PROVIDER` | The active model's provider |
-| `PI_MODEL` | The active model's id |
-| `PI_REASONING_LEVEL` | The reasoning level the turn's requests use: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
+| `NOEL_SESSION_ID` | The session id (`ephemeral` with `--no-session`) |
+| `NOEL_SESSION_FILE` | Absolute path of the session journal; unset with `--no-session` |
+| `NOEL_PROVIDER` | The active model's provider |
+| `NOEL_MODEL` | The active model's id |
+| `NOEL_REASONING_LEVEL` | The reasoning level the turn's requests use: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
 
 They are set for each command as it starts, and the system prompt tells the
-model they exist. A variable with nothing to report is removed rather than
-inherited, so a pi started from another pi's command never reports its
-parent's session. Commands you type (`/bash`, `!`, `!!`) are not given them.
+model they exist. Each is also set under pi's name, with the same value, for
+skills and scripts written for pi: `PI_SESSION_ID`, `PI_SESSION_FILE`,
+`PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`. A variable with nothing
+to report is removed under both names rather than inherited, so a noel started
+from another noel's command (or pi's) never reports its parent's session.
+Commands you type (`/bash`, `!`, `!!`) are not given them.
 
-pi also marks its own process, and so every command and tool it starts:
-`AI_AGENT=pi` names the agent for any tool that asks, and
-`PI_CODING_AGENT=true` is pi's own marker.
+noel also marks its own process, and so every command and tool it starts:
+`AI_AGENT=noel` names the agent for any tool that asks, and
+`NOEL_CODING_AGENT=true` is noel's own marker, which it also sets as
+`PI_CODING_AGENT=true`.
 
 ### Tool selection
 
@@ -588,7 +631,7 @@ confined to the working directory. Differences from upstream are listed in
   `shellCommandPrefix` is put before every command. It is not a login shell.
   stdout and stderr come back as one stream in the order written. The model
   gets the last 2000 lines or 50 KB; longer output is also saved whole to
-  `pi-bash-<random>.log` in the temp directory (readable only by you), and
+  `noel-bash-<random>.log` in the temp directory (readable only by you), and
   the result names that file. There is no default timeout. With `timeout`
   (seconds) the command and its process group are killed when it passes, and
   the result is the output so far followed by `Command timed out after N
@@ -625,7 +668,7 @@ images in tool results:
 | Bedrock Converse | Amazon Bedrock | Sent in the tool result |
 | OpenAI chat completions | OpenAI chat models, OpenRouter, Cloudflare, Mistral, and the OpenAI-compatible aliases | Not sent; the result says the image was left out |
 
-pi decides by API, not yet by the model's `input` in the catalog, so an image
+noel decides by API, not yet by the model's `input` in the catalog, so an image
 is sent to every model behind the first four APIs. `images.blockImages` keeps
 `read` from returning images at all, and `images.autoResize` (on by default)
 scales an image down to at most 2000 pixels a side and 4.5 MB.
@@ -636,10 +679,10 @@ scales an image down to at most 2000 pixels a side and 4.5 MB.
 readable HTML/text/JSON/XML, retaining source URLs and links. They are enabled
 by default unless `defaultTools`, `enabledTools`, `--tools`, `--exclude-tools`,
 `--no-builtin-tools`, or `--no-tools` leaves them out. `--offline` /
-`PI_OFFLINE=1` blocks both, including after reload.
+`NOEL_OFFLINE=1` blocks both, including after reload.
 
 Search uses DuckDuckGo HTML without an API key by default. For a more reliable
-backend, set `BRAVE_SEARCH_API_KEY`, or set `PI_SEARXNG_URL` to the complete
+backend, set `BRAVE_SEARCH_API_KEY`, or set `NOEL_SEARXNG_URL` to the complete
 search endpoint (for example `https://search.example/search`), with JSON output
 enabled on that SearXNG instance. SearXNG takes precedence over Brave; keys are
 only sent in the Brave request header and never included in results/errors.
@@ -684,7 +727,7 @@ still take precedence on startup and `/reload`. `--theme <name|path>` selects a
 preset, loaded resource, or JSON file for this invocation; `--no-themes` starts
 with native colors and no accent override.
 
-Custom resources in `themes/` or trusted `.pi/themes/` use their filename stem
+Custom resources in `themes/` or trusted `.noel/themes/` use their filename stem
 as the theme name. They can extend a built-in preset and override any of
 `foreground`, `background`, `surface`, `muted`, `border`, `accent`, `success`,
 `warning`, and `error`:
@@ -758,39 +801,39 @@ as `azure`. Without an explicit selection the
 `auth.json` is written atomically and owner-only (`0600`; a missing agent
 directory is created `0700`). Logins, logouts, and OAuth refreshes hold an
 advisory lock on `auth.json.flock`, re-read the file, and change only their
-own entry, so concurrent pi processes never drop each other's credentials or
+own entry, so concurrent noel processes never drop each other's credentials or
 rotated refresh tokens. A `--api-key` value is used for that run only and is
 never written.
 
 Or use the CLI helper:
 
 ```bash
-pi login anthropic --api-key env:ANTHROPIC_API_KEY
-printf '%s' "$ANTHROPIC_API_KEY" | pi login anthropic --api-key -
-pi login anthropic --account work --api-key env:WORK_ANTHROPIC_API_KEY
-pi logout anthropic
-pi logout anthropic --account work
+noel login anthropic --api-key env:ANTHROPIC_API_KEY
+printf '%s' "$ANTHROPIC_API_KEY" | noel login anthropic --api-key -
+noel login anthropic --account work --api-key env:WORK_ANTHROPIC_API_KEY
+noel logout anthropic
+noel logout anthropic --account work
 ```
 
 Native OAuth enrollment is available for ChatGPT/Codex and Claude using the
 official CLIs' public clients:
 
 ```bash
-pi login openai-codex              # device authorization flow (browser + one-time code)
-pi login openai-codex --account work
-pi login anthropic                 # PKCE authorize + paste-code flow
-pi login anthropic --account work
+noel login openai-codex              # device authorization flow (browser + one-time code)
+noel login openai-codex --account work
+noel login anthropic                 # PKCE authorize + paste-code flow
+noel login anthropic --account work
 ```
 
-`pi login openai-codex` stores the login for `openai-codex`, and
-`pi login anthropic` stores it for `anthropic`. A ChatGPT login is
+`noel login openai-codex` stores the login for `openai-codex`, and
+`noel login anthropic` stores it for `anthropic`. A ChatGPT login is
 `openai-codex`'s credential and its only one; `openai` takes an API key
-(`pi login openai --api-key ...`, `OPENAI_API_KEY`, or the Codex CLI's
+(`noel login openai --api-key ...`, `OPENAI_API_KEY`, or the Codex CLI's
 `CODEX_API_KEY`). Neither provider's models count as available on the
-strength of the other's credential: with only a ChatGPT login pi starts on an
+strength of the other's credential: with only a ChatGPT login noel starts on an
 `openai-codex` model, and a `--models` pattern, `/model <reference>`, or
 `set_model` does not reach `openai`'s. Earlier versions stored the ChatGPT
-login under `openai` as well; that copy is ignored and `pi logout openai`
+login under `openai` as well; that copy is ignored and `noel logout openai`
 removes it. Expiry and `account_id` come from the issued token
 (JWT `exp` for Codex, `expires_in` for Claude), and the stored credentials
 refresh automatically when they expire, also in the middle of a turn: every
@@ -799,43 +842,43 @@ model request resolves them anew. Importing credentials from
 fallback when no stored account exists. Re-running login for an existing
 account replaces it.
 
-When no explicit API key is configured, `pi` can reuse existing CLI login credentials:
+When no explicit API key is configured, `noel` can reuse existing CLI login credentials:
 
 - Claude Code: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or `~/.claude/.credentials.json`
 - Codex/ChatGPT: `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json` for `openai-codex`
 
 Explicit API keys still take precedence over login tokens. Imported OAuth
 credentials are refreshed automatically when they expire; refreshed tokens are
-persisted to pi's own `auth.json` as `codex-import`/`claude-import` accounts
+persisted to noel's own `auth.json` as `codex-import`/`claude-import` accounts
 and never written back to the imported files.
 
 `/account [name]` binds an account to the current session (bare `/account`
-opens a selector; the binding is journaled and survives resume). `pi accounts
+opens a selector; the binding is journaled and survives resume). `noel accounts
 status` and `/accounts` show auth state, plan windows, and balance for every
 configured account, including environment and imported pseudo-accounts; results
 are cached for 15 minutes in `usage-cache.json` (`--refresh` bypasses the
 cache).
 
-For scripts, `pi auth check --provider <p>` (or `--model <ref>`) reports whether
+For scripts, `noel auth check --provider <p>` (or `--model <ref>`) reports whether
 credentials are ready (exit 0 ready, 1 not ready, 2 invalid; `--json`,
 `--no-refresh`, `--account <name>`). As upstream, an unknown subcommand or
 option exits 1, while other argument errors exit 2 for `check`. A ready OAuth
 token that expires within five minutes gets `"expiresSoon": true` with
-`--json`, or a warning on stderr in text output. `pi auth print-api-key` and
-`pi auth print-bearer-token` write a usable credential to stdout; the bearer
+`--json`, or a warning on stderr in text output. `noel auth print-api-key` and
+`noel auth print-bearer-token` write a usable credential to stdout; the bearer
 form first refreshes OAuth tokens that expire within `--min-expiry` (default
 30m). With `--account`, `--model` resolves to the providers that have that
 account. Logins read from `~/.claude` or `~/.codex` are the exception to early
 refresh: refreshing one spends that CLI's single-use refresh token and signs it
-out, so `pi auth` refreshes them only once they expire, as requests do, and
-prints or reports a token that expires sooner with a warning on stderr. pi's
+out, so `noel auth` refreshes them only once they expire, as requests do, and
+prints or reports a token that expires sooner with a warning on stderr. noel's
 own accounts, including saved `claude-import`/`codex-import` copies, refresh
-early. pi has no MCP support, so `--no-mcp` is accepted and does
-nothing, and `pi mcp` exits with an error.
+early. noel has no MCP support, so `--no-mcp` is accepted and does
+nothing, and `noel mcp` exits with an error.
 
 ### Account failover
 
-With more than one stored account for a provider, `pi` can fail over between
+With more than one stored account for a provider, `noel` can fail over between
 them when one is rate limited, instead of retrying that account:
 
 ```json
@@ -850,7 +893,7 @@ timestamps, and voluntary switches are rate-limited (default one per 10s) so
 the pool never flaps. Requests are never spread across accounts to maximize
 throughput. Per-provider tuning: `failover.providers.anthropic.exhaustionThresholdPct`
 and `minSwitchIntervalMs`. Pinning an account with `/account name` disables
-rotation for that session; run `pi help failover` for the summary.
+rotation for that session; run `noel help failover` for the summary.
 
 Four statements in that paragraph describe the design and are not wired yet:
 
@@ -860,7 +903,7 @@ Four statements in that paragraph describe the design and are not wired yet:
   timestamp is read.
 - The switch-rate limit and `minSwitchIntervalMs` have no effect: the pool is
   built for each request, and its clock with it.
-- `pi help failover` is not a command.
+- `noel help failover` is not a command.
 
 A switch is made inside the request, before [run recovery](#run-recovery)
 sees a failure: it is not a retry and waits for no backoff. When every account
@@ -885,7 +928,7 @@ Provider-specific environment:
 - Google Vertex: set `GOOGLE_CLOUD_PROJECT` or `GCLOUD_PROJECT`, plus `GOOGLE_CLOUD_LOCATION`.
 - Cloudflare: set `CLOUDFLARE_ACCOUNT_ID`; AI Gateway also needs `CLOUDFLARE_GATEWAY_ID`. Without them the provider's models do not count as available, whatever key is set.
 - Amazon Bedrock: Rust direct calls currently use Bedrock bearer-token auth via `AWS_BEARER_TOKEN_BEDROCK`.
-- Claude Code OAuth: requests identify as `claude-cli/<version>`. The version tracks the latest published Claude Code release (fetched from the npm registry during model refresh, cached in `model-cache.json`); set `PI_CLAUDE_CODE_VERSION` to pin it.
+- Claude Code OAuth: requests identify as `claude-cli/<version>`. The version tracks the latest published Claude Code release (fetched from the npm registry during model refresh, cached in `model-cache.json`); set `NOEL_CLAUDE_CODE_VERSION` to pin it.
 
 `models.json` adds models to the built-in catalog or redefines them:
 
@@ -927,15 +970,15 @@ has no thinking levels and requests carry no output cap unless the entry says
 so (the Anthropic API requires one: 16384). The file's format is this port's
 own; upstream's `providers` format is not read.
 
-A base URL names the API's root, as it does upstream: pi appends
+A base URL names the API's root, as it does upstream: noel appends
 `/v1/messages` (Anthropic), `/chat/completions` (OpenAI chat),
 `/responses`, or `/v1/chat/completions` (Mistral). An Anthropic or Mistral
 URL that already ends in `/v1` gets only the rest of the path.
 
-`model-cache.json` is managed by `pi`. On startup, `pi` uses built-in models,
+`model-cache.json` is managed by `noel`. On startup, `noel` uses built-in models,
 cached models, and explicit `models.json` entries immediately, then starts a
 non-blocking background refresh when `modelRefresh.enabled` is not false,
-`PI_OFFLINE`/`--offline` is not set, the cache is older than `ttlHours`, and a
+`NOEL_OFFLINE`/`--offline` is not set, the cache is older than `ttlHours`, and a
 provider has supported auth. `/reload` also kicks a refresh. Refreshed models
 are available after `/reload` or the next startup. Refresh covers `anthropic`
 (API key or Claude login), `openai` (API key), and `openai-codex` (ChatGPT
@@ -992,11 +1035,11 @@ or an object map:
 
 Local Rust-path packages are configured with `packages`. A package may expose
 resources by convention through `extensions/`, `skills/`, `prompts/`, and
-`themes/`, or with `package.json` under the `pi` key:
+`themes/`, or with `package.json` under the `noel` key:
 
 ```json
 {
-  "pi": {
+  "noel": {
     "extensions": ["extensions/assist"],
     "skills": ["skills/review"],
     "prompts": ["prompts/fix.md"],
@@ -1011,7 +1054,7 @@ Object package entries filter package resources without npm:
 {
   "packages": [
     {
-      "source": "vendor/pi-package",
+      "source": "vendor/noel-package",
       "extensions": ["extensions/*.md", "!extensions/legacy.md", "+extensions/force.txt"],
       "skills": [],
       "prompts": ["prompts/review.md"]
@@ -1027,8 +1070,8 @@ Resource discovery honors `.gitignore`, `.ignore`, and `.fdignore` files in
 scanned resource directories.
 
 Executable extensions can opt into the JSON protocol with an adjacent
-`.pi-extension.json` manifest. A manifest `tools` array registers model-callable
-tools; Pi sends `kind: "tool"` JSON requests on stdin and expects a JSON
+`.noel-extension.json` manifest. A manifest `tools` array registers model-callable
+tools; Noel sends `kind: "tool"` JSON requests on stdin and expects a JSON
 response with `output` or `error`. Like `bash`, a tool process has no
 controlling terminal, and an interrupted call kills its process group. A
 non-zero exit is a failed call: the model gets what the extension printed as
@@ -1062,8 +1105,8 @@ active; both are optional, and a tool without a snippet is not listed:
 ```
 
 Resources can be disabled by name or wildcard through `disabledResources`, or
-managed with `pi config disable <extension|skill|prompt|theme> <name>` and
-`pi config enable <extension|skill|prompt|theme> <name>`:
+managed with `noel config disable <extension|skill|prompt|theme> <name>` and
+`noel config enable <extension|skill|prompt|theme> <name>`:
 
 ```json
 {
@@ -1122,7 +1165,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/delete <id|name|path>` (bare `/delete` shows usage; it never deletes)
 - `/name [name]` (bare `/name` shows the current name)
 - `/labels <labels...>`
-- `/export [file]` (default `pi-session-<session id>.html` in the session cwd)
+- `/export [file]` (default `noel-session-<session id>.html` in the session cwd)
 - `/import <file>`
 - `/copy`
 - `/share [file]`
@@ -1135,7 +1178,7 @@ managed with `pi config disable <extension|skill|prompt|theme> <name>` and
 - `/accounts`
 - `/todos`
 - `/diff`
-- `/bug [description]` (writes a local `pi-bug-report-<id>.md` with environment,
+- `/bug [description]` (writes a local `noel-bug-report-<id>.md` with environment,
   model, auth type, redacted settings and session errors (URL secrets, `Bearer`
   and `Basic` credentials, and API-key-shaped tokens redacted), never the
   transcript, and prints a link for filing it; nothing is uploaded)
@@ -1174,7 +1217,7 @@ Collapsed thinking and tool blocks use at most three terminal rows (excluding th
 
 Queued follow-ups are visible immediately above the editor, one truncated line per message (the newest four when the queue overflows). Up with an empty editor recalls the newest queued message for editing (otherwise prompt-history navigation is unchanged). Mid-turn `ctrl+s` steers queued messages followed by the draft at the next provider boundary (a prose-only response has no interior boundary, so steering is delivered after it finishes and the queue hint says so); the existing steering mode still controls batch size. Queue edits are journaled during streaming and survive reload/resume.
 
-Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. A skill command or a prompt template typed mid-turn is queued expanded: as a follow-up with Enter, as steering with ctrl+s. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Shell commands (`!`, `/bash`, and the model's `bash` tool) are non-interactive: stdin is empty and the command runs in its own session without a controlling terminal, so a program that prompts for input fails instead of waiting. A command that times out or whose turn is interrupted is killed together with its whole process group, and a timeout returns the output so far; background jobs started by a command that finished normally keep running, and the command returns without waiting for them. `!` and `/bash` commands time out after 120 seconds; the model's `bash` calls have no timeout unless the model sets one. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`PI_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
+Interactive assistant responses stream text as provider deltas arrive. While a response streams, a footer spinner shows the current phase (waiting, thinking, writing, or the running tool) with elapsed time, ctrl+c interrupts the turn unless transcript text is selected (then it copies); Esc interrupts only at the transcript bottom without a selection, Enter queues the draft as a follow-up, Up recalls the newest pending follow-up for editing, and ctrl+s steers the running turn (including promoting queued drafts): everything queued joins the conversation before the next provider request, combined into one user message so a burst of steering reads as a single instruction rather than several interruptions. Slash commands typed mid-turn still execute: `/queue` lists pending follow-ups, `/queue-clear` clears them, `/interrupt` and `/quit` act on the turn. A skill command or a prompt template typed mid-turn is queued expanded: as a follow-up with Enter, as steering with ctrl+s. `/queue <prompt>` adds follow-up prompts that run after the next assistant turn. Completed turns drain queued prose as one combined turn (queued tool commands such as `/read` still dispatch individually because their arguments are positional), including prompts queued during a follow-up, so nothing waits for a manual resubmission. Interruption, quit, or failure stops automatic dispatch and preserves remaining work. At idle, `/interrupt` clears queued follow-ups, and `!`/`!!` execute shell commands without adding them to the conversation context. Shell commands (`!`, `/bash`, and the model's `bash` tool) are non-interactive: stdin is empty and the command runs in its own session without a controlling terminal, so a program that prompts for input fails instead of waiting. A command that times out or whose turn is interrupted is killed together with its whole process group, and a timeout returns the output so far; background jobs started by a command that finished normally keep running, and the command returns without waiting for them. `!` and `/bash` commands time out after 120 seconds; the model's `bash` calls have no timeout unless the model sets one. Editing keys follow common agentic-CLI conventions: shift+enter or ctrl+j inserts a newline, ctrl+g opens the draft in an external editor (`NOEL_EDITOR_COMMAND`, `VISUAL`, or `EDITOR`), ctrl+c with a draft clears it, and ctrl+c/ctrl+d on an empty input require a second press to quit. Manual and automatic compaction persist summary records, and forked or cloned sessions persist branch summaries. Editor state tracks history, undo, kill-ring, and slash completions; restored session user prompts repopulate prompt history.
 
 The TUI defaults to an owned alternate-screen transcript with a fixed composer. Mouse wheel and PageUp/PageDown scroll only the conversation; Up/Down retain prompt-history/queue navigation. At the bottom, new output follows automatically. Scrolling up anchors the reader to logical text: streaming, resizing, panel changes, and reload do not steal the reading position. `↓ Scroll to bottom · Esc` appears while reading (with `new output` when text arrives); click it, press Esc, or scroll down to resume following. Live thinking-tail previews are frozen while reading; returning to latest refreshes them. Esc dismisses an open selector/diff panel first, otherwise returns to latest without clearing the draft/attachments or interrupting generation. At latest it retains the existing clear/interrupt behavior. Bracketed paste inserts pasted text into the prompt. Image inputs are encoded as provider attachments with terminal text fallback.
 
@@ -1188,15 +1231,15 @@ copies the selection again without clearing the draft or interrupting generation
 clicking the composer clears selection without changing the draft.
 
 Clipboard writes use `pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux, or
-`clip.exe` on Windows. `PI_CLIPBOARD_COMMAND` overrides the helper. If local
-helpers are unavailable, Pi requests the terminal clipboard via OSC 52 (useful
+`clip.exe` on Windows. `NOEL_CLIPBOARD_COMMAND` overrides the helper. If local
+helpers are unavailable, Noel requests the terminal clipboard via OSC 52 (useful
 over SSH; terminal/tmux clipboard permissions must allow it). An OSC 52 request
 cannot confirm delivery. Copy errors appear in the transcript hint; selection
 remains available for retry. Without a selection, `/copy` copies the last assistant
 message. Terminal-native selection via Shift+drag (sometimes Option on macOS)
 remains available; `/export <file>` exports the conversation.
 
-Run `pi --no-alt-screen` (or upstream's `--tui-mode regular`) for native inline
+Run `noel --no-alt-screen` (or upstream's `--tui-mode regular`) for native inline
 compatibility: overflow is written once to terminal scrollback, mouse
 selection/wheel remain terminal-owned, and the composer scrolls with the
 terminal. `--tui-mode fullscreen` selects the owned screen explicitly.
@@ -1207,12 +1250,12 @@ Owned mode restores the previous screen, mouse reporting, paste, and raw mode
 on exit. This viewport is an intentional Rust UI divergence; upstream parity
 fixtures are not rewritten.
 
-SIGTERM and SIGHUP end pi in every mode, as does SIGINT outside the TUI (print,
+SIGTERM and SIGHUP end noel in every mode, as does SIGINT outside the TUI (print,
 JSON, RPC, and login); in the TUI ctrl+c stays a key and an outside SIGINT is
-ignored. pi first kills running tool commands with their process groups and
+ignored. noel first kills running tool commands with their process groups and
 restores the terminal, then exits like upstream pi: with status 128 + the
 signal number for SIGTERM and SIGHUP, and by the signal itself for SIGINT, so
-ctrl+c also stops a shell loop that runs pi.
+ctrl+c also stops a shell loop that runs noel.
 
 Ctrl+V reads a clipboard **image** into the current draft; type a prompt and
 press Enter to send it. Image-only drafts use “Describe this image.” Esc or
@@ -1223,7 +1266,7 @@ Images respect `images.blockImages` and `images.autoResize`. While a turn runs,
 image drafts are kept for submission after it finishes (not sent as text-only
 steering/follow-ups). Linux needs `wl-paste` (Wayland) or `xclip` (X11); macOS
 uses AppKit via Swift (Xcode command-line tools), and Windows uses PowerShell.
-For remote/headless sessions, `PI_CLIPBOARD_IMAGE_COMMAND` can supply encoded
+For remote/headless sessions, `NOEL_CLIPBOARD_IMAGE_COMMAND` can supply encoded
 PNG/JPEG/GIF/WebP bytes on stdout; otherwise use `/image <path>`.
 
 `/undo` changes only conversation context and restores the prompt, including
@@ -1248,7 +1291,7 @@ subsequent compactions, rather than nested first/last snippets.
 Automatic compaction runs before every model request, including tool rounds and
 queued prompts. It uses **estimated active-context tokens**, including instructions,
 tool schemas, calls, and attachment allowances—not billed session totals or message
-count. Configure `.pi/settings.json` or global settings:
+count. Configure `.noel/settings.json` or global settings:
 
 ```json
 {
@@ -1317,11 +1360,11 @@ print mode, and RPC mode alike:
   approved, because on default-deny hosts an unanswered prompt is
   indistinguishable from an outage.
 - **Context overflow.** When the provider refuses a request as too large for
-  the model's context window, pi compacts and asks again, once. The same
+  the model's context window, noel compacts and asks again, once. The same
   happens when a final reply is cut off at the output limit although the
   model could have written more, by its catalog `maxTokens` (for a
   `models.json` model of a provider the catalog does not know that names no
-  `maxTokens`, pi assumes the context was the cause): the cut-off reply is
+  `maxTokens`, noel assumes the context was the cause): the cut-off reply is
   dropped and the compacted request is sent again. A reply cut off
   while calling a tool is kept instead; its calls get error results and the
   model issues them again. If there is nothing to compact, or compaction is
@@ -1338,14 +1381,14 @@ checkpoint and its replacement context are committed together through an atomic
 file replacement. Empty/truncated/oversized/tool-bearing summaries, provider
 failures, or cancellation leave active history intact; no silent truncation
 fallback is used. If the latest turn or persistent instructions still cannot fit,
-pi reports an error instead of repeatedly compacting. Completed summarization
+noel reports an error instead of repeatedly compacting. Completed summarization
 requests count toward `/usage`. `/export` exports the current checkpoint and
 retained context, not the pre-compaction journal transcript.
 
 
 ## RPC Mode
 
-`pi --mode rpc` speaks upstream pi's RPC protocol (upstream's `docs/rpc.md`,
+`noel --mode rpc` speaks upstream pi's RPC protocol (upstream's `docs/rpc.md`,
 `docs/rpc-commands.md` and `docs/json.md`): one JSON command per line on
 stdin, and responses and session events as one JSON object per line on stdout.
 Lines split on LF only: a trailing CR is dropped, and U+2028 or U+2029 inside a
@@ -1366,7 +1409,7 @@ prompt template is expanded when it arrives, so the queue and the session
 hold the expansion. `get_commands` lists the templates and the skills (as
 `skill:<name>`) with their descriptions and where each was loaded from. A
 message that starts with `/` and names neither goes to the model as text,
-except pi's slash-tool prompts, which run their tool.
+except noel's slash-tool prompts, which run their tool.
 
 A `prompt` that starts a run answers `{"disposition":"started","runId":"…"}`,
 then the run reports `agent_start`, its turns (`turn_start` … `turn_end`),
@@ -1406,7 +1449,7 @@ While a `bash` call runs, `tool_execution_update` records carry its output so
 far in `partialResult.content`: none when the command starts, then all of it
 (within the result's limits) each time more arrives, at most every 100 ms.
 
-pi adds four extensions, listed in `get_state.rpcExtensions`:
+noel adds four extensions, listed in `get_state.rpcExtensions`:
 
 - `run-id`: every run has a `runId` (a UUID), given in the `prompt` response,
   `agent_start`, `agent_settled`, and `get_state` while the run is active.
@@ -1423,8 +1466,8 @@ pi adds four extensions, listed in `get_state.rpcExtensions`:
 
 Runs are saved in the session journal: a run's start together with its
 prompt before `prompt` answers, and how it ended before `agent_settled`. A run
-that started and never ended is `interrupted`: pi crashed, was killed or
-ended by a signal, or saw stdin close mid-run. pi never resumes a run by
+that started and never ended is `interrupted`: noel crashed, was killed or
+ended by a signal, or saw stdin close mid-run. noel never resumes a run by
 itself.
 
 `get_state.lastRun` is `{runId, requestId, status, phase, pendingTools}`,
@@ -1465,7 +1508,7 @@ run stops the run where it is, kills its tool processes, and exits with status
 
 Differences from upstream are listed under "RPC Mode" in
 `docs/rust-rewrite/non-parity-register.md`.
-`crates/pi-cli/tests/rpc_parity.rs` runs every scenario of
+`crates/noel-cli/tests/rpc_parity.rs` runs every scenario of
 `tests/fixtures/ts-parity/rpc-protocol.json` and compares the records with
 upstream's, allowing exactly those differences.
 
@@ -1512,19 +1555,26 @@ URL, method, selected headers, request body, or payload. Contract fixtures cover
 CLI flags, slash commands, settings normalization, and session/export shape
 where Rust intentionally supports compatibility or analogous behavior. The RPC
 protocol fixture records every stdout record of upstream `pi --mode rpc` for
-scripted runs against a local stub model, and pi's RPC mode is compared with it
+scripted runs against a local stub model, and noel's RPC mode is compared with it
 record by record. The system prompt fixture records upstream's prompt text
 for fixed tools, prompt sources, context files, and skills, and which prompt
-and context files upstream picks from a directory tree; pi's prompt is
-compared with it to the byte. The skills fixture records which skills and
-prompt templates upstream loads from directory trees, settings, and flags,
-how it reads their frontmatter, and what it sends for `/skill:name` and
-`/template` input; pi is compared with each. The error classification
-fixture records which failed requests upstream retries and which it reads as
-a context overflow: its pattern lists, which pi keeps verbatim, and its
-verdicts for sample error messages. Secrets are redacted. Rust tests
-compare covered behavior against those fixtures, so upstream changes become
-visible as fixture diffs and test failures.
+and context files upstream picks from a directory tree; noel's prompt is
+compared with it to the byte, under noel's names. The skills fixture records
+which skills and prompt templates upstream loads from directory trees,
+settings, and flags, how it reads their frontmatter, and what it sends for
+`/skill:name` and `/template` input; noel is compared with each. The error
+classification fixture records which failed requests upstream retries and
+which it reads as a context overflow: its pattern lists, which noel keeps
+verbatim, and its verdicts for sample error messages. Secrets are redacted.
+Rust tests compare covered behavior against those fixtures, so upstream
+changes become visible as fixture diffs and test failures.
+
+The fixtures are upstream's output and keep upstream's names. Where a test
+needs noel's (the product and the `NOEL_*` variables in the system prompt, a
+project's `.noel/`), it reads the fixture through
+`noel_config::with_noel_names`, the one substitution, listed in the
+non-parity register. The tests that load a project tree run it both ways: as
+upstream wrote it, which is a project written for pi, and under noel's names.
 
 Generate fixtures from the configured reference:
 
@@ -1562,10 +1612,10 @@ constraints, suggested workflow, and the fixture diff. To dispatch that brief to
 an external CLI agent:
 
 ```bash
-PI_PARITY_AGENT_COMMAND='cw exec --name ts-parity-agent -- claude' make ts-parity-agent
+NOEL_PARITY_AGENT_COMMAND='cw exec --name ts-parity-agent -- claude' make ts-parity-agent
 ```
 
-`PI_PARITY_AGENT_COMMAND` receives `brief.md` on stdin. Scheduled GitHub Actions
+`NOEL_PARITY_AGENT_COMMAND` receives `brief.md` on stdin. Scheduled GitHub Actions
 runs the same drift harness and opens or updates a `TS parity drift detected`
 issue when upstream changes. Override `TS_REFERENCE_REPO` or
 `TS_PARITY_TRACKING_REF` to compare against a different TypeScript repository or
@@ -1586,7 +1636,7 @@ real-provider smoke tests.
 
 The parity inventory and deliberate non-parity decisions are tracked in
 `docs/rust-rewrite/parity-status.md` and
-`docs/rust-rewrite/non-parity-register.md`. The `pi-parity` crate keeps fixture
+`docs/rust-rewrite/non-parity-register.md`. The `noel-parity` crate keeps fixture
 inventory, fixture source metadata, redaction checks, and parity documentation
 in sync.
 
@@ -1599,17 +1649,17 @@ make smoke-claude-opus-oauth
 Generic opt-in real-provider print smoke:
 
 ```bash
-PI_SMOKE_REAL=1 PI_SMOKE_REAL_MODEL=provider/model make smoke-real
+NOEL_SMOKE_REAL=1 NOEL_SMOKE_REAL_MODEL=provider/model make smoke-real
 ```
 
 Provider profile smokes:
 
 ```bash
-PI_SMOKE_REAL=1 make smoke-real-openai
-PI_SMOKE_REAL=1 make smoke-real-anthropic
-PI_SMOKE_REAL=1 make smoke-real-gemini
-PI_SMOKE_REAL=1 make smoke-real-mistral
-PI_SMOKE_REAL=1 make smoke-real-openrouter
+NOEL_SMOKE_REAL=1 make smoke-real-openai
+NOEL_SMOKE_REAL=1 make smoke-real-anthropic
+NOEL_SMOKE_REAL=1 make smoke-real-gemini
+NOEL_SMOKE_REAL=1 make smoke-real-mistral
+NOEL_SMOKE_REAL=1 make smoke-real-openrouter
 ```
 
 Full manual smoke suite:
@@ -1619,7 +1669,7 @@ make test-smoke
 ```
 
 `make dogfood` runs the development TUI with `--continue --model faux/echo`.
-It also starts a quiet background `cargo build -p pi-cli` watcher; successful
+It also starts a quiet background `cargo build -p noel-cli` watcher; successful
 rebuilds restart the running TUI process into the session it had open
 (`--session <file>` replaces the original session flags, so a restart never
 jumps to a newer session or forks again), which restores conversation
@@ -1642,7 +1692,7 @@ cap and saves all work; a resumed run gets a fresh
 budget without discarding the saved work.
 Watcher output is written to
 `target/dogfood-dev/watch.log`. `make dogfood-release` builds
-`target/release/pi` and runs the binary in tmux with an isolated agent/session
+`target/release/noel` and runs the binary in tmux with an isolated agent/session
 directory under `target/`. It uses the faux provider, so it does not require
 provider credentials or network access. `make dogfood-long` uses the same
 release binary and faux provider in `--no-alt-screen` compatibility mode: it
@@ -1653,29 +1703,29 @@ opt-in and runs real Claude and Codex TTY smoke tests when local credentials are
 available. It asks each provider for a tiny Rust program and checks that a real
 assistant message contains the expected marker and `fn main`. `make smoke-real`
 is a generic print-mode live-provider smoke; it exits without network access
-unless `PI_SMOKE_REAL=1` and `PI_SMOKE_REAL_MODEL=provider/model` are set.
+unless `NOEL_SMOKE_REAL=1` and `NOEL_SMOKE_REAL_MODEL=provider/model` are set.
 The profile targets preselect default models for OpenAI, Anthropic, Gemini,
 Mistral, and OpenRouter while still using the normal auth resolver.
 
-The real TTY dogfood target can be narrowed with `PI_DOGFOOD_REAL_PROVIDERS`:
+The real TTY dogfood target can be narrowed with `NOEL_DOGFOOD_REAL_PROVIDERS`:
 
 ```bash
-PI_DOGFOOD_REAL_PROVIDERS=claude make dogfood-real
-PI_DOGFOOD_REAL_PROVIDERS=codex make dogfood-real
+NOEL_DOGFOOD_REAL_PROVIDERS=claude make dogfood-real
+NOEL_DOGFOOD_REAL_PROVIDERS=codex make dogfood-real
 ```
 
-The default models can be overridden with `PI_DOGFOOD_CLAUDE_MODEL` and
-`PI_DOGFOOD_CODEX_MODEL`.
+The default models can be overridden with `NOEL_DOGFOOD_CLAUDE_MODEL` and
+`NOEL_DOGFOOD_CODEX_MODEL`.
 
 The real-provider smoke is intentionally not part of `test`, `check`, or `e2e`.
 It requires `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or
 `~/.claude/.credentials.json`, sends one tiny prompt to
 `anthropic/claude-opus-4-7`, and defaults to `--thinking max`. The generic
 `smoke-real` target uses the normal auth resolver for the selected model and
-defaults to `--thinking off` unless `PI_SMOKE_REAL_THINKING` is set.
-Provider profile defaults can be overridden with `PI_SMOKE_OPENAI_MODEL`,
-`PI_SMOKE_ANTHROPIC_MODEL`, `PI_SMOKE_GEMINI_MODEL`, `PI_SMOKE_MISTRAL_MODEL`,
-or `PI_SMOKE_OPENROUTER_MODEL`. `PI_SMOKE_REAL_EXPECTED` changes the expected
+defaults to `--thinking off` unless `NOEL_SMOKE_REAL_THINKING` is set.
+Provider profile defaults can be overridden with `NOEL_SMOKE_OPENAI_MODEL`,
+`NOEL_SMOKE_ANTHROPIC_MODEL`, `NOEL_SMOKE_GEMINI_MODEL`, `NOEL_SMOKE_MISTRAL_MODEL`,
+or `NOEL_SMOKE_OPENROUTER_MODEL`. `NOEL_SMOKE_REAL_EXPECTED` changes the expected
 marker for all real-provider print smokes.
 `test-smoke` runs local tmux e2e first, then the opt-in generic real-provider
 smoke and the real-provider Opus OAuth smoke.

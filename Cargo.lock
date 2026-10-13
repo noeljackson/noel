@@ -1481,6 +1481,146 @@ dependencies = [
 ]
 
 [[package]]
+name = "noel-agent"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "noel-ai",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "noel-ai"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "noel-cli"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "clap",
+ "crossterm",
+ "getrandom 0.2.17",
+ "image",
+ "nix",
+ "noel-ai",
+ "noel-config",
+ "noel-core",
+ "noel-tui",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "noel-config"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "noel-ai",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "noel-core"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "noel-agent",
+ "noel-ai",
+ "noel-config",
+ "noel-session",
+ "noel-tools",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "noel-parity"
+version = "0.3.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "noel-providers"
+version = "0.3.0"
+dependencies = [
+ "noel-ai",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "noel-session"
+version = "0.3.0"
+dependencies = [
+ "noel-ai",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "noel-tools"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "globset",
+ "ignore",
+ "image",
+ "nix",
+ "regex",
+ "reqwest",
+ "scraper",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "noel-tui"
+version = "0.3.0"
+dependencies = [
+ "ratatui",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1717,146 +1857,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
 dependencies = [
  "siphasher",
-]
-
-[[package]]
-name = "pi-agent"
-version = "0.2.1"
-dependencies = [
- "async-trait",
- "pi-ai",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "pi-ai"
-version = "0.2.1"
-dependencies = [
- "async-trait",
- "base64",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "pi-cli"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "clap",
- "crossterm",
- "getrandom 0.2.17",
- "image",
- "nix",
- "pi-ai",
- "pi-config",
- "pi-core",
- "pi-tui",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "time",
- "tokio",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
-name = "pi-config"
-version = "0.2.1"
-dependencies = [
- "base64",
- "pi-ai",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "pi-core"
-version = "0.2.1"
-dependencies = [
- "async-trait",
- "base64",
- "pi-agent",
- "pi-ai",
- "pi-config",
- "pi-session",
- "pi-tools",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "time",
- "tokio",
-]
-
-[[package]]
-name = "pi-parity"
-version = "0.2.1"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
-name = "pi-providers"
-version = "0.2.1"
-dependencies = [
- "pi-ai",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "pi-session"
-version = "0.2.1"
-dependencies = [
- "pi-ai",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
- "tokio",
-]
-
-[[package]]
-name = "pi-tools"
-version = "0.2.1"
-dependencies = [
- "base64",
- "globset",
- "ignore",
- "image",
- "nix",
- "regex",
- "reqwest",
- "scraper",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "pi-tui"
-version = "0.2.1"
-dependencies = [
- "ratatui",
- "serde",
- "serde_json",
 ]
 
 [[package]]

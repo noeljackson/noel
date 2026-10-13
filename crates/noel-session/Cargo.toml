@@ -1,0 +1,15 @@
+[package]
+name = "noel-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+noel-ai = { path = "../noel-ai" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

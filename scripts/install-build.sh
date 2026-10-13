@@ -7,7 +7,7 @@ if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root"
   cargo_path="$(command -v "${cargo_cmd}")"
   exec sudo -u "${SUDO_USER}" env \
     PATH="${PATH}" \
-    "${cargo_path}" build --release -p pi-cli
+    "${cargo_path}" build --release -p noel-cli
 fi
 
-exec "${cargo_cmd}" build --release -p pi-cli
+exec "${cargo_cmd}" build --release -p noel-cli

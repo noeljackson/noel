@@ -1,0 +1,16 @@
+[package]
+name = "noel-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+noel-ai = { path = "../noel-ai" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

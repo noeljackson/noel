@@ -33,6 +33,7 @@ compaction-results/
 syntax.jsonl
 out.jsonl
 pi-*.html
+noel-session-*.html
 out.html
 packages/coding-agent/binaries/
 todo.md

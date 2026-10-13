@@ -4,9 +4,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e-isolate.sh
 source "${repo_root}/scripts/e2e-isolate.sh"
-pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
+noel_bin="${NOEL_BIN:-${repo_root}/target/debug/noel}"
 work_dir="$(mktemp -d "${e2e_root}/e2e-selection.XXXXXX")"
-session="pi-e2e-selection-${$}"
+session="noel-e2e-selection-${$}"
 trap 'e2e_status=$?; tmux kill-session -t "${session}" >/dev/null 2>&1 || true; e2e_isolation_cleanup "${e2e_status}"' EXIT
 mkdir -p "${work_dir}/agent"
 printf '{"modelRefresh":{"enabled":false},"compaction":{"enabled":false}}\n' > "${work_dir}/agent/settings.json"
@@ -25,7 +25,7 @@ chmod +x "${work_dir}/clipboard-helper"
 tmux new-session -d -s "${session}" -x 100 -y 24
 # The clipboard is a local stub; no desktop, real credentials, or provider calls.
 tmux send-keys -t "${session}" \
-  "cd '${work_dir}' && env -u PI_TUI_E2E_DUMP PI_CLIPBOARD_COMMAND='${work_dir}/clipboard-helper' PI_CODING_AGENT_DIR='${work_dir}/agent' PI_FAUX_STREAM_DELAY_MS=5 PI_FAUX_STREAM_CHARS=1 '${pi_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline; printf 'selection-shell-restored\\n'" Enter
+  "cd '${work_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_CLIPBOARD_COMMAND='${work_dir}/clipboard-helper' NOEL_DIR='${work_dir}/agent' NOEL_FAUX_STREAM_DELAY_MS=5 NOEL_FAUX_STREAM_CHARS=1 '${noel_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline; printf 'selection-shell-restored\\n'" Enter
 capture() { tmux capture-pane -t "${session}" -p > "${work_dir}/pane.txt"; }
 fail() { cat "${work_dir}/pane.txt" >&2; echo "$* (artifacts: ${work_dir})" >&2; exit 1; }
 wait_for() {
@@ -172,7 +172,7 @@ mkdir "${work_dir}/bin"
 ln -s /bin/sh "${work_dir}/bin/sh"
 tmux pipe-pane -t "${session}" -o "cat > '${work_dir}/osc52.raw'"
 tmux send-keys -t "${session}" \
-  "env -u PI_CLIPBOARD_COMMAND -u PI_TUI_E2E_DUMP PATH='${work_dir}/bin' PI_CODING_AGENT_DIR='${work_dir}/agent' '${pi_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline; printf 'osc52-shell-restored\\n'" Enter
+  "env -u NOEL_CLIPBOARD_COMMAND -u NOEL_TUI_E2E_DUMP PATH='${work_dir}/bin' NOEL_DIR='${work_dir}/agent' '${noel_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline; printf 'osc52-shell-restored\\n'" Enter
 wait_for '│ >'
 tmux send-keys -t "${session}" PPage
 wait_for 'Scroll to bottom'

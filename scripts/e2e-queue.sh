@@ -5,9 +5,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e-isolate.sh
 source "${repo_root}/scripts/e2e-isolate.sh"
-pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
+noel_bin="${NOEL_BIN:-${repo_root}/target/debug/noel}"
 work_dir="$(mktemp -d "${e2e_root}/e2e-queue.XXXXXX")"
-session="pi-e2e-queue-${$}"
+session="noel-e2e-queue-${$}"
 trap 'e2e_status=$?; tmux kill-session -t "${session}" >/dev/null 2>&1 || true; e2e_isolation_cleanup "${e2e_status}"' EXIT
 
 capture() { tmux capture-pane -t "${session}" -p > "${case_dir}/pane.txt"; }
@@ -52,7 +52,7 @@ for mode in default legacy-setting; do
     if [ "${view}" = inline ]; then args='--no-alt-screen'; fi
     tmux new-session -d -s "${session}" -x 100 -y 30
     tmux send-keys -t "${session}" \
-      "cd '${case_dir}' && env -u PI_TUI_E2E_DUMP PI_CODING_AGENT_DIR='${case_dir}/agent' PI_FAUX_STREAM_DELAY_MS=12 PI_FAUX_STREAM_CHARS=1 '${pi_bin}' --session-dir '${case_dir}/sessions' --model faux/echo --offline ${args}" Enter
+      "cd '${case_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${case_dir}/agent' NOEL_FAUX_STREAM_DELAY_MS=12 NOEL_FAUX_STREAM_CHARS=1 '${noel_bin}' --session-dir '${case_dir}/sessions' --model faux/echo --offline ${args}" Enter
     wait_for '│ >'
     journal="$(find "${case_dir}/sessions" -name '*.jsonl' -print -quit)"
 
@@ -129,7 +129,7 @@ for mode in default legacy-setting; do
     # Reopen an unfinished turn: finish saved context, then drain pending work.
     tmux new-session -d -s "${session}" -x 100 -y 30
     tmux send-keys -t "${session}" \
-      "cd '${case_dir}' && env -u PI_TUI_E2E_DUMP PI_CODING_AGENT_DIR='${case_dir}/agent' '${pi_bin}' --session '${journal}' --offline ${args}" Enter
+      "cd '${case_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${case_dir}/agent' '${noel_bin}' --session '${journal}' --offline ${args}" Enter
     wait_for 'continuing automatically'
     wait_record assistant "[faux/echo] ${initial}-quit"
     wait_record assistant '[faux/echo] after-quit'

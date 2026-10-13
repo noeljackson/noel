@@ -7,15 +7,15 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-pi_bin="${PI_BIN:-${repo_root}/target/release/pi}"
+noel_bin="${NOEL_BIN:-${repo_root}/target/release/noel}"
 
-if [ ! -x "${pi_bin}" ]; then
-  echo "release binary is not executable: ${pi_bin}" >&2
-  echo "run make release first, or set PI_BIN" >&2
+if [ ! -x "${noel_bin}" ]; then
+  echo "release binary is not executable: ${noel_bin}" >&2
+  echo "run make release first, or set NOEL_BIN" >&2
   exit 1
 fi
 
-session_name="pi-long-${$}"
+session_name="noel-long-${$}"
 session_dir="${repo_root}/target/dogfood-long-sessions"
 work_dir="${repo_root}/target/dogfood-long-work"
 cwd_dir="${work_dir}/cwd"
@@ -41,7 +41,7 @@ JSON
 
 tmux new-session -d -s "${session_name}" -x 92 -y 24
 tmux send-keys -t "${session_name}" \
-  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${pi_bin}' --session-dir '${session_dir}' --model faux/echo --no-alt-screen" \
+  "cd '${cwd_dir}' && NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' '${noel_bin}' --session-dir '${session_dir}' --model faux/echo --no-alt-screen" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -54,14 +54,14 @@ done
 
 if [ ! -f "${prompt_file}" ]; then
   tmux capture-pane -t "${session_name}" -p -S -2000 >&2
-  echo "pi prompt did not appear in long dogfood" >&2
+  echo "noel prompt did not appear in long dogfood" >&2
   exit 1
 fi
 
 send_line() {
   tmux send-keys -t "${session_name}" -l "$1"
   tmux send-keys -t "${session_name}" Enter
-  sleep "${2:-${PI_DOGFOOD_LINE_DELAY:-0.18}}"
+  sleep "${2:-${NOEL_DOGFOOD_LINE_DELAY:-0.18}}"
 }
 
 capture() {
@@ -101,7 +101,7 @@ fi
 
 capture_scrollback "${work_dir}/scrollback-pane.txt"
 grep -Fq "paint-line-01" "${work_dir}/scrollback-pane.txt"
-grep -Fq "pi rust cli" "${work_dir}/scrollback-pane.txt"
+grep -Fq "noel rust cli" "${work_dir}/scrollback-pane.txt"
 grep -Fq "│ >" "${work_dir}/scrollback-pane.txt"
 
 tmux resize-window -t "${session_name}" -x 72 -y 18

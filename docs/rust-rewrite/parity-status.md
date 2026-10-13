@@ -9,9 +9,9 @@ Parity is enforced in three layers:
 
 - Docker-generated TypeScript fixtures in `tests/fixtures/ts-parity/`.
 - Rust behavior tests in the owning crates.
-- Inventory and documentation checks in `crates/pi-parity`.
+- Inventory and documentation checks in `crates/noel-parity`.
 
-`make check` runs the Rust tests, including `pi-parity`. `make
+`make check` runs the Rust tests, including `noel-parity`. `make
 ts-parity-drift` regenerates TypeScript fixtures in Docker, compares them to the
 committed fixtures, then runs the fixture-backed Rust parity assertions.
 
@@ -37,7 +37,7 @@ The committed TypeScript parity fixtures are:
 - `error-classification.json`: how upstream reads a failed model request from
   its error text: the pattern lists of `isRetryableAssistantError` and
   `isContextOverflow`, and both verdicts for 124 error messages (HTTP
-  statuses and bodies as pi words them, the overflow errors of each provider,
+  statuses and bodies as noel words them, the overflow errors of each provider,
   transport failures, and quota and billing limits).
 - `github-copilot-gpt-5.4.json`: GitHub Copilot Responses request shape.
 - `google-gemini-2.5-pro.json`: Gemini request shape and thinking config.
@@ -55,9 +55,9 @@ The committed TypeScript parity fixtures are:
 - `model-catalog.json`: upstream's whole built-in chat model catalog as its
   coding agent sees it with no credentials and no network: every provider in
   upstream's order, every model with every field, and the model each provider
-  starts on (`defaultModelPerProvider`). This file is also data: `pi-ai`
-  compiles it in as pi's built-in catalog, so regenerating it changes the
-  models pi knows. Upstream generates the catalog from the providers' listings
+  starts on (`defaultModelPerProvider`). This file is also data: `noel-ai`
+  compiles it in as noel's built-in catalog, so regenerating it changes the
+  models noel knows. Upstream generates the catalog from the providers' listings
   when the reference image is built, so the file is a snapshot of that moment
   and drifts with the listings, not only with upstream's source.
 - `model-resolution.json`: how upstream picks a model, from its own functions
@@ -114,7 +114,7 @@ The committed TypeScript parity fixtures are:
   directory and the YAML library's error text are placeholders.
 - `slash-commands.json`: slash command inventory and selected descriptions.
 - `system-prompt.json`: the text of upstream's system prompt builder, with
-  its sections, for the default tools, every tool pi shares with upstream, a
+  its sections, for the default tools, every tool noel shares with upstream, a
   subset, no tools, context files, a custom prompt, appended text, both,
   extension tools, and skills (with `read`, with `bash` only, with neither,
   and after a custom prompt); each case's inputs are the ones a real upstream
@@ -148,76 +148,81 @@ Current Rust parity coverage includes:
 - Auth discovery and credential redaction for supported providers.
 - CLI flags, command inventory, settings normalization, slash commands,
   selected TUI markers, local tool inventory, and session export shape.
-- The model catalog, in full: every upstream model pi can run is a built-in
-  model with upstream's values for every field pi reads, in upstream's order
+- The model catalog, in full: every upstream model noel can run is a built-in
+  model with upstream's values for every field noel reads, in upstream's order
   (`builtin_catalog_is_upstreams_catalog_in_full` in
-  `crates/pi-ai/src/catalog.rs`, and
-  `default_models_are_upstreams_catalog_in_full` in `crates/pi-config` for
-  what a config loads). The fields pi does not read yet are named in the
+  `crates/noel-ai/src/catalog.rs`, and
+  `default_models_are_upstreams_catalog_in_full` in `crates/noel-config` for
+  what a config loads). The fields noel does not read yet are named in the
   test, so a new upstream field fails it.
 - Thinking levels: supported levels and clamping for every case of
   `model-thinking.json`, and every catalog model has one of the recorded
   shapes (`thinking_levels_match_ts_for_every_catalog_model`).
 - Model resolution: every `cliModel`, `modelScope`, `exactReference`,
   `initialModel`, and `globs` case of `model-resolution.json`, run on
-  upstream's whole catalog (`crates/pi-config/src/model_resolver.rs`).
+  upstream's whole catalog (`crates/noel-config/src/model_resolver.rs`).
 - Credentials: every `credentials` case, with the same `auth.json` and
   environment, gives the same providers credentials and the same startup
   model (`credentials_offer_the_same_models_as_upstream` in
-  `crates/pi-config`), but for upstream's own ChatGPT sign-in for `openai`,
+  `crates/noel-config`), but for upstream's own ChatGPT sign-in for `openai`,
   which the test names.
-- Model and thinking selection end to end: every `launches` case, with pi
+- Model and thinking selection end to end: every `launches` case, with noel
   started on the same arguments, settings, `auth.json`, and keys, answers
   what upstream answered: the model object, the thinking level in effect,
-  events, stderr, and exit code (`crates/pi-cli/tests/model_parity.rs`).
+  events, stderr, and exit code (`crates/noel-cli/tests/model_parity.rs`).
 - Output caps: the provider request fixtures carry upstream's `maxTokens`
   for their models, and the builders now take them from the catalog.
-- Built-in tools: every call of `tool-behavior.json` run against pi's tools in
+- Built-in tools: every call of `tool-behavior.json` run against noel's tools in
   the same trees, with results compared exactly, and each tool's description
   and parameter schema compared exactly
-  (`crates/pi-core/src/tool_parity_tests.rs`). The differences that remain are
+  (`crates/noel-core/src/tool_parity_tests.rs`). The differences that remain are
   outside the recorded calls and are listed under "Built-in Tools Run
   In-Process" and the entries after it in the non-parity register.
 - TypeScript full-tree session JSONL active-branch loading.
 - RPC mode: every `rpc-protocol.json` scenario, record by record and model
   request by model request, allowing the differences listed under "RPC Mode"
-  in the non-parity register (`crates/pi-cli/tests/rpc_parity.rs`). In two
-  scenarios the model requests are compared only up to where pi's own choice
-  begins: after the overflow of `overflow-recovery` (pi's compaction), and
-  after the cut-off reply of `length-stop` (which pi keeps).
-- Run recovery: `pi-ai` holds upstream's four pattern lists verbatim and
+  in the non-parity register (`crates/noel-cli/tests/rpc_parity.rs`). In two
+  scenarios the model requests are compared only up to where noel's own choice
+  begins: after the overflow of `overflow-recovery` (noel's compaction), and
+  after the cut-off reply of `length-stop` (which noel keeps).
+- Run recovery: `noel-ai` holds upstream's four pattern lists verbatim and
   gives upstream's verdict (retryable, context overflow) for every message of
   `error-classification.json`
   (`error_classification_matches_ts_patterns_and_verdicts`). How the run loop
   acts on a verdict is covered by the RPC scenarios above and by
-  `crates/pi-core/src/recovery_tests.rs`.
+  `crates/noel-core/src/recovery_tests.rs`.
 - The system prompt: for every `system-prompt.json` case, a runtime with
-  upstream's inputs sends upstream's text to the byte, apart from the product
-  name and the `docs` section
-  (`system_prompt_matches_ts_builder` in `crates/pi-core/src/system_prompt.rs`).
+  upstream's inputs sends upstream's text to the byte, apart from noel's
+  names (`noel_config::UPSTREAM_NAMES`: the product, and the `NOEL_*`
+  variables of bash's rule) and the `docs` section
+  (`system_prompt_matches_ts_builder` in `crates/noel-core/src/system_prompt.rs`).
 - Prompt and context file discovery: for every `system-prompt.json` discovery
   case, startup resolves the custom prompt, appended text, and context files
   upstream's resource loader resolves
-  (`prompt_and_context_files_match_ts_discovery` in `crates/pi-cli/src/main.rs`).
+  (`prompt_and_context_files_match_ts_discovery` in `crates/noel-cli/src/main.rs`).
+  Each case runs on the tree as upstream wrote it (a project's `.pi/`, which
+  noel reads when there is no `.noel/`) and again under noel's names.
 
 Only those two tests cover the system prompt. The provider request fixtures
 pass an explicit prompt, and the RPC goldens record messages without it.
 
 - Skills and prompt templates, each against `skills.json`:
   - frontmatter fields, types, and bodies, and which files are rejected
-    (`frontmatter_matches_ts_parser` in `crates/pi-config/src/frontmatter.rs`);
+    (`frontmatter_matches_ts_parser` in `crates/noel-config/src/frontmatter.rs`);
   - what loads, in what order, from where, with which diagnostics
     (`discovery_matches_ts_resource_loader` in
-    `crates/pi-config/src/resources.rs`);
+    `crates/noel-config/src/resources.rs`), on the tree as upstream wrote it
+    (`.pi/`) and again under noel's names (`.noel/`);
   - the listing text (`skills_listing_matches_ts_formatter` in
-    `crates/pi-config/src/skills.rs`), and inside the whole prompt the
+    `crates/noel-config/src/skills.rs`), and inside the whole prompt the
     `skills` cases of `system_prompt_matches_ts_builder`;
   - argument splitting and substitution (`template_arguments_match_ts` in
-    `crates/pi-config/src/prompt_templates.rs`);
+    `crates/noel-config/src/prompt_templates.rs`);
   - `/skill:name` and `/template` expansion, and the input left as it is
-    (`input_expansion_matches_ts_session` in `crates/pi-core/src/input.rs`);
-  - `get_commands` and the resource flags, through the binary
-    (`get_commands_matches_upstream` in `crates/pi-cli/tests/rpc_parity.rs`).
+    (`input_expansion_matches_ts_session` in `crates/noel-core/src/input.rs`);
+  - `get_commands` and the resource flags, through the binary and in both
+    of those layouts
+    (`get_commands_matches_upstream` in `crates/noel-cli/tests/rpc_parity.rs`).
 
   Expansion in each mode is covered by Rust's own tests: RPC `prompt`,
   `steer`, and `follow_up` with a skill given by `--skill`
@@ -234,18 +239,18 @@ Use these before accepting intentional parity changes:
 
 ```bash
 make ts-parity-update
-cargo test -p pi-parity
-cargo test -p pi-ai --lib matches_ts
-cargo test -p pi-ai --lib catalog
-cargo test -p pi-config --lib model
-cargo test -p pi-cli --test model_parity
-cargo test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
-cargo test -p pi-core --lib system_prompt_matches_ts_builder
-cargo test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery
-cargo test -p pi-core --lib tool_parity_tests
-cargo test -p pi-config --lib _ts
-cargo test -p pi-core --lib input_expansion_matches_ts_session
-cargo test -p pi-cli --test rpc_parity
+cargo test -p noel-parity
+cargo test -p noel-ai --lib matches_ts
+cargo test -p noel-ai --lib catalog
+cargo test -p noel-config --lib model
+cargo test -p noel-cli --test model_parity
+cargo test -p noel-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
+cargo test -p noel-core --lib system_prompt_matches_ts_builder
+cargo test -p noel-cli --bin noel prompt_and_context_files_match_ts_discovery
+cargo test -p noel-core --lib tool_parity_tests
+cargo test -p noel-config --lib _ts
+cargo test -p noel-core --lib input_expansion_matches_ts_session
+cargo test -p noel-cli --test rpc_parity
 make check
 make ts-parity-drift
 ```
