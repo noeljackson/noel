@@ -1,0 +1,23 @@
+[package]
+name = "noel-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+noel-ai = { path = "../noel-ai" }
+noel-agent = { path = "../noel-agent" }
+noel-config = { path = "../noel-config" }
+noel-session = { path = "../noel-session" }
+noel-tools = { path = "../noel-tools" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+base64.workspace = true
+sha2.workspace = true
+tokio.workspace = true

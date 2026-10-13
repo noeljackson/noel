@@ -5,9 +5,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e-isolate.sh
 source "${repo_root}/scripts/e2e-isolate.sh"
-pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
+noel_bin="${NOEL_BIN:-${repo_root}/target/debug/noel}"
 work_dir="$(mktemp -d "${e2e_root}/e2e-scrollback.XXXXXX")"
-session="pi-e2e-scrollback-${$}"
+session="noel-e2e-scrollback-${$}"
 cleanup() {
   local status=$?
   tmux kill-session -t "${session}" >/dev/null 2>&1 || true
@@ -26,7 +26,7 @@ awk 'BEGIN {
 tmux new-session -d -s "${session}" -x 80 -y 20
 # Explicitly unset the dump flag even if the shared tmux server inherited it.
 tmux send-keys -t "${session}" \
-  "cd '${work_dir}' && env -u PI_TUI_E2E_DUMP PI_CODING_AGENT_DIR='${work_dir}/agent' '${pi_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline --no-alt-screen" Enter
+  "cd '${work_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${work_dir}/agent' '${noel_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline --no-alt-screen" Enter
 capture() { tmux capture-pane -t "${session}" -p -S -2000 > "${work_dir}/pane.txt"; }
 wait_for() {
   for _ in $(seq 1 100); do

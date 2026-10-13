@@ -1,0 +1,12 @@
+[package]
+name = "noel-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+noel-ai = { path = "../noel-ai" }
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

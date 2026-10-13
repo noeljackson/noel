@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 log_dir="${repo_root}/target/dogfood-dev"
 log_file="${log_dir}/watch.log"
-restart_exe="${repo_root}/target/debug/pi"
+restart_exe="${repo_root}/target/debug/noel"
 watcher_pid=""
 cargo_bin="${CARGO:-cargo}"
 
@@ -32,8 +32,8 @@ source_fingerprint() {
 
 build_once() {
   {
-    printf '\n[%s] cargo build -p pi-cli\n' "$(date -Is)"
-    "${cargo_bin}" build -p pi-cli
+    printf '\n[%s] cargo build -p noel-cli\n' "$(date -Is)"
+    "${cargo_bin}" build -p noel-cli
   } >> "${log_file}" 2>&1
 }
 
@@ -56,4 +56,4 @@ watch_loop &
 watcher_pid="$!"
 
 printf 'dogfood watcher log: %s\n' "${log_file}" >&2
-PI_DOGFOOD_AUTO_RESTART=1 PI_DOGFOOD_RESTART_EXE="${restart_exe}" "${cargo_bin}" run -p pi-cli -- "$@"
+NOEL_DOGFOOD_AUTO_RESTART=1 NOEL_DOGFOOD_RESTART_EXE="${restart_exe}" "${cargo_bin}" run -p noel-cli -- "$@"

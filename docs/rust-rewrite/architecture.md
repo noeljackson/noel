@@ -1,8 +1,8 @@
 # Rust Rewrite Architecture
 
-Original tracking issue: https://github.com/noeljackson/pi/issues/4
+Original tracking issue: https://github.com/noeljackson/noel/issues/4
 
-Current doc refresh: https://github.com/noeljackson/pi/issues/38
+Current doc refresh: https://github.com/noeljackson/noel/issues/38
 
 This document records the implemented Rust architecture. The product path is
 CLI/TUI-only and Rust-only. TypeScript behavioral reference should use the tip
@@ -10,7 +10,7 @@ of upstream `main` from `https://github.com/earendil-works/pi`.
 
 ## Goals
 
-- Build and ship a native Rust `pi` binary.
+- Build and ship a native Rust `noel` binary.
 - Remove npm, Node.js, TypeScript, web UI, and browser runtime dependencies from the product path.
 - Preserve CLI/TUI coding-agent workflows from the TypeScript reference.
 - Preserve active conversation context during explicit reload.
@@ -29,21 +29,21 @@ of upstream `main` from `https://github.com/earendil-works/pi`.
 
 The Rust implementation uses a Cargo workspace with explicit crate boundaries:
 
-- `crates/pi-cli`
+- `crates/noel-cli`
   - Binary entrypoint.
   - Argument parsing.
   - Mode dispatch.
   - Interactive TUI loop.
   - Slash command dispatch.
   - Package/config CLI commands.
-- `crates/pi-core`
+- `crates/noel-core`
   - Agent loop.
   - System prompt.
   - Session state.
   - Conversation orchestration.
   - Session persistence and export/import.
   - Runtime reload state.
-- `crates/pi-config`
+- `crates/noel-config`
   - Config paths.
   - Settings loading.
   - Auth loading.
@@ -52,18 +52,18 @@ The Rust implementation uses a Cargo workspace with explicit crate boundaries:
   - Resource/package discovery.
   - Model definitions: the catalog, the model cache, and `models.json`.
   - Model resolution and scoping (`model_resolver.rs`).
-- `crates/pi-ai`
+- `crates/noel-ai`
   - Provider request/response normalization.
   - The built-in model catalog and the thinking-level rules (`catalog.rs`).
   - Credential resolution.
   - Faux provider for tests.
   - Production provider adapters.
-- `crates/pi-tools`
+- `crates/noel-tools`
   - Shell execution.
   - Filesystem reads/writes.
   - Search/list operations.
   - Patch/edit operations.
-- `crates/pi-tui`
+- `crates/noel-tui`
   - Terminal renderer and layout primitives.
   - Editor/input helpers.
   - Selectors.
@@ -149,7 +149,7 @@ There is no file-watch hot module reload.
 
 ## CLI Mode Behavior
 
-`pi-cli` dispatches:
+`noel-cli` dispatches:
 
 - `interactive`: default when stdin is a TTY.
 - `print`: `--print` or piped stdin.
@@ -164,7 +164,7 @@ machinery where applicable.
 `--mode rpc` speaks upstream pi's RPC protocol over stdin and stdout, plus the
 `run-id`, `expected-run-id`, `request-id`, and `resume-run` extensions (see the
 README's RPC Mode and the non-parity register). It lives in two modules of
-`pi-cli`:
+`noel-cli`:
 
 - `rpc_wire.rs` holds the protocol: serde types for commands, responses,
   events, and messages in upstream's field order, and `Recorder`, which turns
@@ -217,11 +217,11 @@ crash between the two delivers it again unless the queue is cleared.
 
 ## Run Recovery
 
-The run loop (`run_model_turn_streaming_events` in `pi-core`) asks for one
+The run loop (`run_model_turn_streaming_events` in `noel-core`) asks for one
 reply per round. What follows a failed request is decided in one place,
 `Recovery`, the counterpart of upstream's `_handlePostAgentRun`:
 
-- `pi-ai` classifies the failure: `ProviderError::is_retryable` and
+- `noel-ai` classifies the failure: `ProviderError::is_retryable` and
   `is_context_overflow` apply upstream's patterns (kept verbatim, and checked
   against `error-classification.json`) to what the provider answered, and
   treat a transport failure as retryable by its kind.
@@ -240,7 +240,7 @@ A reply is saved only when it stands, after its request succeeded. So a
 dropped reply is never in the session or its journal: the request that asks
 again is built from the same saved messages, and there is nothing to remove.
 The only journal write of a recovery is the compaction checkpoint, which is
-atomic. A pi killed during a backoff or a compaction resumes from the saved
+atomic. A noel killed during a backoff or a compaction resumes from the saved
 prompt and recovers again; killed after the checkpoint, it resumes with the
 compacted context.
 
@@ -248,7 +248,7 @@ A turn's cancellation ends a backoff or an overflow compaction at once, like
 any other step. `RunControl::retry` ends a backoff only, and the turn then
 fails with the error it would have retried.
 
-`pi-agent` keeps a self-contained retry (`complete_with_retry`) with the same
+`noel-agent` keeps a self-contained retry (`complete_with_retry`) with the same
 classification for requests that are not a turn's reply: a compaction's
 summary.
 
@@ -256,7 +256,7 @@ summary.
 
 Default root:
 
-- `~/.pi/agent`
+- `~/.noel`
 
 File names:
 
@@ -273,7 +273,7 @@ File names:
 
 Project-local roots:
 
-- `.pi/`
+- `.noel/`
 - `.agents/skills`, in each directory from the cwd up to the repository root
 
 User skills are also read from `~/.agents/skills`.
@@ -288,7 +288,7 @@ Context discovery, whatever the project trust decision:
 
 Prompt files:
 
-- `SYSTEM.md` and `APPEND_SYSTEM.md`: the trusted project's `.pi/` copy, else
+- `SYSTEM.md` and `APPEND_SYSTEM.md`: the trusted project's `.noel/` copy, else
   the agent dir's. The `systemPrompt`/`appendSystemPrompt` settings and the
   `--system-prompt`/`--append-system-prompt` flags come before the files.
 
@@ -302,7 +302,7 @@ Validation rules:
 
 ## System Prompt
 
-`crates/pi-core/src/system_prompt.rs` builds the prompt every model request
+`crates/noel-core/src/system_prompt.rs` builds the prompt every model request
 starts with. It is a port of upstream's `buildSystemPrompt`: a pure function
 from the active tools, the custom and appended prompt text, the context
 files, the skills, and the working directory to the text, with no runtime
@@ -314,7 +314,7 @@ The prompt is a one-sentence role followed by tagged sections joined by blank
 lines: `tools`, `rules`, `addendum`, `project_context`, `skills`, and `cwd`. A
 custom prompt replaces the role, `tools`, and `rules`; the rest still follow
 it. `skills` is the listing of the loaded skills
-(`pi_config::format_skills_for_prompt`), present while `read` or `bash` is
+(`noel_config::format_skills_for_prompt`), present while `read` or `bash` is
 active.
 
 The runtime builds the prompt once per turn (`runtime_system_prompt`) from
@@ -352,7 +352,7 @@ Required properties:
 - Can recover partial sessions after process interruption: each append writes
   its record and newline in one write, readers ignore a torn final segment,
   and writers drop it (or terminate a complete record) before appending.
-- Records RPC runs and the queue (steering and follow-ups) so a restarted pi
+- Records RPC runs and the queue (steering and follow-ups) so a restarted noel
   can report an interrupted run and continue it (see RPC Mode).
 - Can be tested with in-memory and temp-dir storage.
 - Persists active model and active thinking level.
@@ -408,10 +408,10 @@ Credential resolution supports runtime API keys, named multi-account
 Codex/ChatGPT login token fallback, and provider-specific environment
 settings. A credential serves the provider it is stored for and only if the
 provider takes its kind: a ChatGPT login is `openai-codex`'s and an API key is
-`openai`'s (`provider_takes` in `pi-config`). A Cloudflare provider is
+`openai`'s (`provider_takes` in `noel-config`). A Cloudflare provider is
 offered only with the ids its URLs need (`has_auth_for_provider`). Imported Claude Code and Codex/ChatGPT OAuth tokens are refreshed
-automatically when they expire; refreshed credentials persist to pi's own
-`auth.json`. Per-account quota probes feed `pi accounts status` and are cached
+automatically when they expire; refreshed credentials persist to noel's own
+`auth.json`. Per-account quota probes feed `noel accounts status` and are cached
 in `usage-cache.json`.
 
 Model refresh runs in the background when enabled, online, stale, and
@@ -423,19 +423,19 @@ authenticated. It does not block startup. Refreshed models become visible after
 The built-in catalog is data, not code. `scripts/ts-parity/model-catalog-fixture.ts`
 runs upstream's model runtime in Docker and writes every provider and chat
 model it knows, with every field, to
-`tests/fixtures/ts-parity/model-catalog.json`. `pi-ai`'s `catalog.rs` compiles
+`tests/fixtures/ts-parity/model-catalog.json`. `noel-ai`'s `catalog.rs` compiles
 that file in (`include_str!`) and parses it once, on first use. The file is
 both the parity fixture and the product's data, so `make ts-parity-update`
-(and the drift job's pull request) updates the models pi knows, and the drift
+(and the drift job's pull request) updates the models noel knows, and the drift
 check reports a catalog that has moved. The providers only this port has
 (`faux`, `zai-coding`, `zai-anthropic`, `kimi-coding-openai`) are in
-`crates/pi-ai/src/catalog_port_models.json`, written by hand in the same
+`crates/noel-ai/src/catalog_port_models.json`, written by hand in the same
 shape and loaded first, so `faux/echo` stays the first model. Upstream models
-on an API pi has no adapter for are skipped at load.
+on an API noel has no adapter for are skipped at load.
 
-A catalog entry keeps the fields pi reads: provider, id, name, API, base URL,
+A catalog entry keeps the fields noel reads: provider, id, name, API, base URL,
 `reasoning`, `thinkingLevelMap`, `input`, `cost`, `contextWindow`, and
-`maxTokens`. `pi-config`'s `ModelDefinition` has the same fields under
+`maxTokens`. `noel-config`'s `ModelDefinition` has the same fields under
 upstream's names, all optional past the endpoint, so a built-in model, a
 cached provider listing, and a `models.json` entry describe a model the same
 way. `load_config` merges the three (`merge_model_definitions`): the catalog
@@ -446,12 +446,12 @@ out from the catalog. `LoadedConfig.models` is every known model;
 them, resolved by the CLI because it depends on credentials.
 
 Resolution is a port of upstream's `core/model-resolver.ts` in
-`pi-config/src/model_resolver.rs`: pure functions over a list of models in
+`noel-config/src/model_resolver.rs`: pure functions over a list of models in
 catalog order and a predicate for which providers have credentials
 (`resolve_cli_model`, `resolve_model_scope`,
 `find_exact_model_reference_match`, `find_initial_model`, `custom_model`),
 with upstream's collation order and glob matching ported for ASCII ids.
-`pi-cli`'s `model_select.rs` applies them to a session: startup selection
+`noel-cli`'s `model_select.rs` applies them to a session: startup selection
 (`resolve_cli_selection`, `select_initial_model`), model switches
 (`switch_model`), and thinking-level changes (`set_thinking_level`), used
 alike by the CLI, the TUI commands, and RPC mode. The session stores a
@@ -463,13 +463,13 @@ A thinking level is one of upstream's seven names, `off` to `max`. Which of
 them a model supports follows from its definition (`reasoning` and
 `thinkingLevelMap`) through two functions ported from upstream's
 `ai/src/models.ts`, `supported_thinking_levels` and `clamp_thinking_level` in
-`pi-ai`'s `catalog.rs`; there are no per-provider rules.
+`noel-ai`'s `catalog.rs`; there are no per-provider rules.
 
 The session stores a level only once something sets one. The level in effect
 (`effective_thinking_level`) is the session's, else the model's entry in
 `modelThinkingLevels`, else `defaultThinkingLevel`, else `medium`, clamped to
 the model; `get_state`, the status line, and the bash tool's
-`PI_REASONING_LEVEL` report it. Setting a level stores the clamped one, and a
+`NOEL_REASONING_LEVEL` report it. Setting a level stores the clamped one, and a
 model switch carries the level in effect over unless the settings give the
 new model one.
 
@@ -483,7 +483,7 @@ adaptive or budget thinking for Anthropic and Bedrock, a budget for Google.
 
 ## Tool Architecture
 
-Tool definitions live in `pi-tools`. The tools a run may use are computed
+Tool definitions live in `noel-tools`. The tools a run may use are computed
 from the tool settings and command-line flags whenever the reloadable systems
 are built; the session does not record a selection.
 
@@ -506,18 +506,18 @@ Rules:
 - Tool tests do not call providers.
 - Shell execution supports configured shell path and command prefix.
 - A `bash` call from the model runs with the session's variables
-  (`PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`,
-  `PI_REASONING_LEVEL`), set per call by `pi-core` through
+  (`NOEL_SESSION_ID`, `NOEL_SESSION_FILE`, `NOEL_PROVIDER`, `NOEL_MODEL`,
+  `NOEL_REASONING_LEVEL`), set per call by `noel-core` through
   `ToolRuntimeOptions::bash_env`; a variable with nothing to report is
   removed from the inherited environment. The reasoning level is the turn's
   provider's thinking level (`Provider::thinking_level`). Commands the user
   types get none.
-- `pi-cli` sets the process markers `AI_AGENT` and `PI_CODING_AGENT` before
+- `noel-cli` sets the process markers `AI_AGENT` and `NOEL_CODING_AGENT` before
   starting any thread, so every child process inherits them.
-- A `bash` call reports its output while it runs: `pi-tools`
+- A `bash` call reports its output while it runs: `noel-tools`
   (`execute_tool_streaming`) passes what the command has printed so far,
   within the limits of the result, to a callback, at most every 100 ms;
-  `pi-core` reports it as `TurnEvent::ToolUpdate`, which the TUI shows in the
+  `noel-core` reports it as `TurnEvent::ToolUpdate`, which the TUI shows in the
   running tool's entry and RPC mode sends as `tool_execution_update`. The
   result is unchanged.
 - TUI progress rendering is controlled by `terminal.showTerminalProgress`.
@@ -527,7 +527,7 @@ side effects.
 
 ## TUI Architecture
 
-`pi-tui` owns terminal mechanics and reusable rendering metadata. `pi-cli` owns
+`noel-tui` owns terminal mechanics and reusable rendering metadata. `noel-cli` owns
 the product event loop and command interactions.
 
 Implemented TUI concepts:
@@ -556,20 +556,20 @@ Keybindings:
 Skills and prompt templates are ports of upstream's modules, kept file for
 file so each can be read against its source:
 
-- `crates/pi-config/src/frontmatter.rs` (`utils/frontmatter.ts`): the
+- `crates/noel-config/src/frontmatter.rs` (`utils/frontmatter.ts`): the
   frontmatter and body of a Markdown file. Upstream uses a YAML library;
   this is a parser for the YAML the Agent Skills specification uses.
-- `crates/pi-config/src/resources.rs` (the skill and prompt parts of
+- `crates/noel-config/src/resources.rs` (the skill and prompt parts of
   `core/package-manager.ts` and `core/resource-loader.ts`): which files to
   load, in the order that decides a name collision: project setting, project
   directories, user setting, user directories, packages, then the command
   line's paths. `--no-skills` and `--no-prompt-templates` keep only the last.
-- `crates/pi-config/src/skills.rs` (`core/skills.ts`): a skill from its file,
+- `crates/noel-config/src/skills.rs` (`core/skills.ts`): a skill from its file,
   the Agent Skills name and description rules, first-wins collisions, and the
   system prompt's listing.
-- `crates/pi-config/src/prompt_templates.rs` (`core/prompt-templates.ts`): a
+- `crates/noel-config/src/prompt_templates.rs` (`core/prompt-templates.ts`): a
   template from its file, argument splitting, and placeholder substitution.
-- `crates/pi-core/src/input.rs` (the session's expansion in
+- `crates/noel-core/src/input.rs` (the session's expansion in
   `core/agent-session.ts`): `expand_input`, which turns `/skill:name` and
   `/template` input into the prompt it stands for.
 
@@ -597,17 +597,17 @@ Rust package/resource support is local and git based.
 Package discovery supports:
 
 - Resource directories by convention: `extensions/`, `skills/`, `prompts/`, `themes/`.
-- `package.json` with a `pi` key.
+- `package.json` with a `noel` key.
 - Object package entries with include/exclude filters.
 - `.gitignore`, `.ignore`, and `.fdignore` handling.
-- Disabled resource state from settings and `pi config enable|disable`.
+- Disabled resource state from settings and `noel config enable|disable`.
 
 Extension execution supports:
 
 - Raw executable extensions.
 - JSON stdio executable extensions.
 - JSON lifecycle events for `reload` and `shutdown`.
-- JSON model-tool registration from adjacent `.pi-extension.json` manifests.
+- JSON model-tool registration from adjacent `.noel-extension.json` manifests.
   Registered tools receive `kind: "tool"` protocol requests and return JSON
   command responses. A tool's optional `promptSnippet` and `promptGuidelines`
   become its line and rules in the system prompt.
@@ -653,22 +653,22 @@ ts-parity-update` refreshes fixtures from the moving reference ref. `make ts-par
 regenerates those fixtures, fails if committed fixtures would change, writes
 `target/ts-parity-drift/brief.md`, and runs Rust TS-shape tests when no drift is
 present. `make ts-parity-agent` uses the same harness and pipes the brief to
-`PI_PARITY_AGENT_COMMAND` when that environment variable is set.
+`NOEL_PARITY_AGENT_COMMAND` when that environment variable is set.
 
 The parity fixtures are sanitized provider request captures. They cover request
 shape for URLs, selected headers, request bodies, and provider payloads. The
-Rust `pi-ai` tests compare local builders against those captures.
+Rust `noel-ai` tests compare local builders against those captures.
 `rpc-protocol.json` is a protocol transcript instead: upstream `pi --mode rpc`
 driven against a local stub model, with every stdout record in order and
-volatile values replaced by placeholders. `pi-cli`'s `rpc_parity` test replays
+volatile values replaced by placeholders. `noel-cli`'s `rpc_parity` test replays
 each scenario against `faux/script` and compares the records.
 `error-classification.json` holds the patterns upstream classifies a failed
-request with and its verdicts for sample errors; `pi-ai` keeps the same
+request with and its verdicts for sample errors; `noel-ai` keeps the same
 patterns and is checked against both. When upstream
 changes, the drift harness produces both a raw diff and an agent-oriented brief
 that states the constraints: no host npm, TypeScript only in Docker, keep Rust
 changes scoped to parity behavior, and rerun Rust validation before committing.
-The `pi-parity` crate owns fixture inventory, source metadata, script-output
+The `noel-parity` crate owns fixture inventory, source metadata, script-output
 mapping, redaction checks, and parity documentation coverage.
 
 This is request-shape parity, not a live-provider guarantee. Full product

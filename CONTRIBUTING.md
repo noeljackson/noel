@@ -1,4 +1,4 @@
-# Contributing to pi
+# Contributing to noel
 
 This repository is now a Rust-only Cargo workspace.
 

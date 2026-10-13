@@ -63,13 +63,13 @@ transparently, so existing setups keep working; only the write format diverges.
 
 Reason: multiple accounts per provider (work/personal, plan variants) need a
 named account layer for session binding (`/account`), per-account OAuth
-refresh, and per-account quota probes (`pi accounts status`). The TypeScript
+refresh, and per-account quota probes (`noel accounts status`). The TypeScript
 shape cannot represent that.
 
 ### Native OAuth Enrollment Flows
 
-Rust supports interactive OAuth login (`pi login openai-codex` device
-authorization, `pi login anthropic` PKCE paste-code) using the official Codex
+Rust supports interactive OAuth login (`noel login openai-codex` device
+authorization, `noel login anthropic` PKCE paste-code) using the official Codex
 CLI and Claude Code public client registrations and endpoint contracts.
 
 Reason: upstream pi authenticates via API keys or imported credential files.
@@ -94,17 +94,17 @@ parts differ:
 - Upstream's `openai` also has a ChatGPT sign-in of its own, whose tokens its
   Responses API takes. Rust has no such flow, so a login stored under
   `openai` does not count. It is the Codex login earlier versions of
-  `pi login` stored there as well, which that API does not take; it is
-  ignored wherever credentials are read, and `pi logout openai` removes it.
+  `noel login` stored there as well, which that API does not take; it is
+  ignored wherever credentials are read, and `noel logout openai` removes it.
 - Rust also reads the Codex CLI's own credentials, each for the provider it
   can serve: `CODEX_ACCESS_TOKEN` and `~/.codex/auth.json` for
   `openai-codex`, and `CODEX_API_KEY` as a second name for `openai`'s API
   key. Upstream reads neither.
-- `pi login openai` without `--api-key` stores `env:OPENAI_API_KEY` when that
-  variable is set and otherwise prints the usage; `pi login openai-codex
+- `noel login openai` without `--api-key` stores `env:OPENAI_API_KEY` when that
+  variable is set and otherwise prints the usage; `noel login openai-codex
   --api-key` is refused.
 - Upstream also takes the Cloudflare ids from a stored credential's `env`.
-  Rust reads them from the process environment only, and `pi auth check`
+  Rust reads them from the process environment only, and `noel auth check`
   reports on the key alone.
 
 Reason: a ChatGPT login cannot authenticate `openai`'s Responses models, and
@@ -133,12 +133,12 @@ For Claude Code OAuth requests, TypeScript pins `user-agent: claude-cli/<version
 version>` instead: the model refresh fetches the newest `@anthropic-ai/claude-code`
 version from the npm registry, caches it in `model-cache.json`, and falls back to
 `DEFAULT_CLAUDE_CODE_VERSION`, which tracks upstream's pin
-(`PI_CLAUDE_CODE_VERSION` overrides both). The parity test compares the fixture
+(`NOEL_CLAUDE_CODE_VERSION` overrides both). The parity test compares the fixture
 against that fallback, so it fails when upstream moves its pin.
 
 Reason: Anthropic's API rejects OAuth requests for new models when the
 reported Claude Code version is too old ("version X or newer is required"). A
-pinned version strands every new model until the next pi release; tracking the
+pinned version strands every new model until the next noel release; tracking the
 published version keeps OAuth-gated models usable.
 
 ### Native Web Tools and Transcript Previews
@@ -206,7 +206,7 @@ them (a truncated listing is how new models silently disappear); an exhausted
 Anthropic pagination budget fails the fetch instead of caching a partial list;
 a pass where every provider failed leaves `refreshedAt` untouched so the next
 startup retries immediately instead of waiting out the TTL; and the cache is
-re-read right before writing so concurrent pi processes cannot clobber each
+re-read right before writing so concurrent noel processes cannot clobber each
 other's fetched models. Refresh diagnostics persist into the cache and surface
 through `/diagnostics`. `/models refresh` runs a foreground refresh with a
 per-provider report and `/models reset` deletes the cache so the next refresh
@@ -220,7 +220,7 @@ escape hatch when the background refresh cannot recover on its own.
 
 Rust's built-in models are upstream's catalog, generated from upstream's model
 runtime into `tests/fixtures/ts-parity/model-catalog.json` and compiled in
-(`crates/pi-ai/src/catalog.rs`); tests compare every model and every field
+(`crates/noel-ai/src/catalog.rs`); tests compare every model and every field
 Rust reads with that file. These parts differ:
 
 - No catalog refresh. Upstream wraps each built-in provider with a refresh
@@ -261,7 +261,7 @@ prices, and thinking levels without either.
 ### Port-Only Providers Beside the Catalog
 
 Four providers exist only in Rust and are written by hand in
-`crates/pi-ai/src/catalog_port_models.json`, in the catalog's shape: `faux`
+`crates/noel-ai/src/catalog_port_models.json`, in the catalog's shape: `faux`
 (`echo`, `script`), `zai-coding`, `zai-anthropic`, and `kimi-coding-openai`.
 They come first in the model list, never redefine an upstream provider (a
 test checks), and have no thinking levels. Upstream's `zai` is the coding
@@ -439,7 +439,7 @@ The shell leads its own session and process group and the timeout path issues
 Kimi/Claude/Codex style: one line per session with the first user prompt as a
 topic preview (truncated), relative age (`5s`, `2h`, `3d`), message count,
 active model, and an `unfinished` marker for sessions that ended mid-turn.
-Typing filters, Enter resumes, Esc cancels. Bare `pi` startup deliberately
+Typing filters, Enter resumes, Esc cancels. Bare `noel` startup deliberately
 does not auto-open the picker: scripting and e2e harnesses send their first
 prompt immediately, and trapping that text in a selector would break them;
 the industry CLIs also gate the picker behind an explicit resume action.
@@ -490,7 +490,7 @@ differences:
 - A `SYSTEM.md`, `APPEND_SYSTEM.md`, or context file that cannot be read is
   listed in `/diagnostics` and skipped. Upstream prints a warning, and for
   the two prompt files uses the file's path as the prompt text.
-- With `--no-session`, bash's `PI_SESSION_ID` is `ephemeral`, Rust's id for a
+- With `--no-session`, bash's `NOEL_SESSION_ID` is `ephemeral`, Rust's id for a
   session without a journal; upstream generates an id for it.
 - The rules for the `powershell` tool are not ported (see Windows-Only
   PowerShell Tool).
@@ -532,7 +532,7 @@ Loading:
 - The `skills` and `prompts` settings name paths. Upstream also reads
   pattern entries there (`!pattern`, `+path`, `-path`, and globs), which
   narrow the named paths and switch discovered resources on and off. Rust
-  reads none; it has `disabledResources` and `pi config enable|disable`,
+  reads none; it has `disabledResources` and `noel config enable|disable`,
   applied after loading, so disabling the skill that won a name does not
   load the one it beat. A setting's path that does not exist is listed in
   `/diagnostics`; upstream passes over it.
@@ -542,7 +542,7 @@ Loading:
   otherwise. Upstream's extensions can add skill and template paths
   (`resources_discover`, and packages given with `-e`); Rust's cannot.
 - A `file://` URL as a resource path is not resolved.
-- Under the test harness (`PI_TEST_ISOLATION`), `~/.agents/skills` is not
+- Under the test harness (`NOEL_TEST_ISOLATION`), `~/.agents/skills` is not
   read.
 - Diagnostics appear in `/diagnostics` and the footer's count, all alike.
   Upstream prints skill and prompt conflicts at startup, a
@@ -551,7 +551,7 @@ Loading:
 
 Use:
 
-- Input is expanded where each mode takes it (`pi_core::expand_input`): the
+- Input is expanded where each mode takes it (`noel_core::expand_input`): the
   TUI on submit, on steering, and on queueing, print mode for its prompt, and
   RPC mode for `prompt`, `steer`, and `follow_up`. Upstream expands in its
   session, after extension commands and `input` handlers, which Rust lacks.
@@ -563,7 +563,7 @@ Use:
   Upstream has no slash-tool prompts.
 - A skill whose file can no longer be read when its command is used is sent
   as the command's text, as in upstream, without upstream's error event.
-- Print mode joins its arguments into one prompt, so `pi -p /fix 42` is the
+- Print mode joins its arguments into one prompt, so `noel -p /fix 42` is the
   command `/fix 42`. Upstream sends each argument as its own prompt.
 - TUI: `/skills`, `/prompts`, and `/prompt <name> [input]` are Rust's own.
   `/prompt` sends the template's text without its frontmatter, with
@@ -596,10 +596,10 @@ CLI help describes it as "Execute PowerShell commands on Windows". The
 exempts exactly this tool and fails once Rust defines it, so the exemption and
 this entry go together.
 
-Reason: pi targets Linux and macOS terminals, where the upstream tool can only
+Reason: noel targets Linux and macOS terminals, where the upstream tool can only
 fail, and Rust enables every builtin tool by default, so porting it would offer
 the model a tool that cannot run. `bash` covers shell execution on the supported
-platforms. Revisit if pi adds Windows support.
+platforms. Revisit if noel adds Windows support.
 
 ### All Built-in Tools Enabled by Default
 
@@ -652,7 +652,7 @@ they are missing. Rust searches in-process with ripgrep's own `ignore` and
 `globset` crates and the `regex` crate, passing the options upstream passes
 (`rg --hidden [--ignore-case] [--fixed-strings] [--glob]`, `fd --glob
 --hidden`). `tool-behavior.json` records upstream's results for 93 calls and
-`crates/pi-core/src/tool_parity_tests.rs` requires Rust's to be identical.
+`crates/noel-core/src/tool_parity_tests.rs` requires Rust's to be identical.
 Outside those calls these differences are known:
 
 - Order. ripgrep and fd walk in parallel, so upstream's results have no fixed
@@ -761,7 +761,7 @@ separate work.
 
 Rust has no Model Context Protocol client. Upstream's `pi mcp` command
 (`list`, `login`, `logout`, `add`, `remove`), the `/mcp` slash command, MCP
-tools, and `mcp.json` are not ported. `pi mcp` exits with an error instead of
+tools, and `mcp.json` are not ported. `noel mcp` exits with an error instead of
 sending "mcp ..." to the model as a prompt, and `--no-mcp` is accepted as a
 documented no-op so upstream invocations keep working. The CLI contract test
 (`cli_contract_covers_upstream_ts_options_and_commands`) exempts exactly the
@@ -769,15 +769,15 @@ documented no-op so upstream invocations keep working. The CLI contract test
 
 Reason: MCP is a large protocol surface (stdio and HTTP transports, OAuth,
 tool exposure modes, codemode) outside the native CLI/TUI scope today.
-Revisit if pi adds an MCP client.
+Revisit if noel adds an MCP client.
 
 ### Local `/bug` Reports for This Port
 
-`/bug [description]` writes `pi-bug-report-<id>.md` to the current directory
-(pi, OS, and terminal versions, model and provider configuration without
+`/bug [description]` writes `noel-bug-report-<id>.md` to the current directory
+(noel, OS, and terminal versions, model and provider configuration without
 credentials, extensions, redacted settings, configuration diagnostics, and
 errors shown in the session) and prints a new-issue link for
-https://github.com/noeljackson/pi/issues. Upstream uploads the report to its
+https://github.com/noeljackson/noel/issues. Upstream uploads the report to its
 Radius gateway or exports a zip, can attach the transcript or a model-written
 summary, records a `pi.bug-report` session entry, attaches its crash log, and
 suggests `/bug` after unexplained errors. Rust does none of these; the
@@ -805,80 +805,80 @@ skips discovery, while Rust's `--theme` selects the run's theme and
 
 Reason: choosing a half without asking the terminal would silently guess.
 
-### `pi auth` Named Accounts
+### `noel auth` Named Accounts
 
-`pi auth check|print-api-key|print-bearer-token` follow upstream's options,
-output, and exit codes, and add `--account <name>` to choose one of pi's named
-accounts. Credentials resolve in pi's usual order (stored account,
+`noel auth check|print-api-key|print-bearer-token` follow upstream's options,
+output, and exit codes, and add `--account <name>` to choose one of noel's named
+accounts. Credentials resolve in noel's usual order (stored account,
 environment, imported CLI logins), so environment keys and imported logins
 count as configured; upstream's `--model` lookup and bearer-token printing
 consider only stored credentials. With `--account`, a `--model` several
 providers serve resolves to the providers that have that account.
 
-Reason: pi stores several accounts per provider (see Named Multi-Account
-auth.json), and `pi auth` should report the credential a session would use.
+Reason: noel stores several accounts per provider (see Named Multi-Account
+auth.json), and `noel auth` should report the credential a session would use.
 
-### `pi auth` Refreshes Imported Logins Only Once They Expire
+### `noel auth` Refreshes Imported Logins Only Once They Expire
 
-`print-bearer-token` and `check` refresh pi's own OAuth tokens that expire
+`print-bearer-token` and `check` refresh noel's own OAuth tokens that expire
 within `--min-expiry` (default 30m) or five minutes, as upstream does. A login
-pi reads from Claude Code's `~/.claude/.credentials.json` or Codex's
+noel reads from Claude Code's `~/.claude/.credentials.json` or Codex's
 `~/.codex/auth.json` refreshes only once it expires, as on the request path;
 a sooner expiry is printed, or reported ready, with a warning on stderr.
 `check --json` adds `"expiresSoon": true` to a ready OAuth token that expires
 within five minutes, a field upstream's output lacks.
 
-Reason: those CLIs rotate single-use refresh tokens and pi never writes
-refreshed tokens back to their files, so an early refresh from `pi auth` would
-sign the user out of Claude Code or Codex. After pi refreshes such a login it
+Reason: those CLIs rotate single-use refresh tokens and noel never writes
+refreshed tokens back to their files, so an early refresh from `noel auth` would
+sign the user out of Claude Code or Codex. After noel refreshes such a login it
 keeps its own `claude-import`/`codex-import` account, which refreshes early
 like any stored account.
 
 ### Run Recovery
 
-pi retries a failed model request and answers a context overflow with one
+noel retries a failed model request and answers a context overflow with one
 compaction and one more request, as upstream's agent session does after a
 failed run. `error-classification.json` holds upstream's rules and
-`rpc-protocol.json` its records for both; pi is compared with each. These
+`rpc-protocol.json` its records for both; noel is compared with each. These
 parts differ:
 
-- Upstream's patterns read the error text, and pi applies them to its own
+- Upstream's patterns read the error text, and noel applies them to its own
   text for what the provider answered: an HTTP status with its body, or a
-  response pi could not use. A transport failure (no connection, a timeout, a
+  response noel could not use. A transport failure (no connection, a timeout, a
   stream that broke) is retried by its kind instead, because its text is the
-  HTTP library's and not the one the patterns expect. pi's own errors (no
+  HTTP library's and not the one the patterns expect. noel's own errors (no
   credential, an invalid header, its configuration, a faux script that ran
   out) are never retried, whatever their text contains.
 - A reply the run drops is not saved. Upstream saves the failed or cut-off
   attempt and hides it from the model with a `context_edit` journal entry, so
-  its history and exports still show it. pi saves a reply only once it
-  stands: a retried or overflowed attempt leaves no record, and a pi killed
+  its history and exports still show it. noel saves a reply only once it
+  stands: a retried or overflowed attempt leaves no record, and a noel killed
   during a recovery resumes from the prompt, or from the compaction
   checkpoint once that is written.
 - A final reply cut off at the output limit stands when nothing replaces it:
   there is nothing to compact, compaction is off, or the compaction fails.
   Upstream hides the reply from the model in those cases too, so its next
-  request no longer contains it. pi could only drop it altogether, and it
-  may be the only answer the user got, so pi keeps it: saved, and sent with
+  request no longer contains it. noel could only drop it altogether, and it
+  may be the only answer the user got, so noel keeps it: saved, and sent with
   the next request.
 - Upstream decides whether a cut-off reply could have been longer from the
-  model's `maxTokens` (`isRecoverableLength`), and so does pi, with the
+  model's `maxTokens` (`isRecoverableLength`), and so does noel, with the
   catalog's number: a final reply cut off below it is an overflow, and one
   that reached it stands. Only a `models.json` model of a provider the catalog
   does not know has no such number, when its entry gives no `maxTokens` and
   it is not served over the Anthropic API (see Provider Listings and
-  `models.json` Extend the Catalog). pi takes that model's cut-off final
+  `models.json` Extend the Catalog). noel takes that model's cut-off final
   reply for a context overflow and compacts once. Upstream gives the model
   16384 and lets a reply that reached it stand.
 - Upstream also reads a reply that completed as an overflow when the usage
-  it reports exceeds the context window, and compacts right after it. pi
+  it reports exceeds the context window, and compacts right after it. noel
   compacts before the next request, when its own estimate crosses the
   threshold.
 - After a second overflow in a row upstream also reports a failed compaction
-  ("recovery failed after one compact-and-retry attempt"). pi ends the turn
+  ("recovery failed after one compact-and-retry attempt"). noel ends the turn
   with the provider's error alone.
 - `retry.provider.timeoutMs`, `retry.provider.maxRetries`, and
-  `retry.provider.maxRetryDelayMs` are read and not used: pi has no retries
+  `retry.provider.maxRetryDelayMs` are read and not used: noel has no retries
   inside one provider request and does not follow `Retry-After`. Only the
   retry above applies.
 - In the TUI a retry or an overflow is a system line, text the dropped reply
@@ -888,19 +888,19 @@ parts differ:
 
 Reason: the rules, the single compact-and-retry, and the records are
 upstream's, so a run survives what upstream's survives and a client sees the
-same protocol. The differences follow from pi's journal, which saves what the
+same protocol. The differences follow from noel's journal, which saves what the
 model will see again and nothing else, and from its own HTTP stack.
 
 ### RPC Mode
 
-`pi --mode rpc` speaks upstream's RPC protocol, with four additions listed in
+`noel --mode rpc` speaks upstream's RPC protocol, with four additions listed in
 `get_state.rpcExtensions`: `run-id` (every run has a `runId`),
 `expected-run-id` (`steer`, `follow_up`, and `abort` change nothing unless
 their `expectedRunId` names the active run), `request-id` (a `prompt` that
 repeats a `requestId` gets the run the first one started), and `resume-run`
 (`get_state.lastRun`, and `resume_run` to continue an interrupted run).
-`crates/pi-cli/tests/rpc_parity.rs` compares every scenario of
-`rpc-protocol.json` with pi's records and allows exactly the differences in
+`crates/noel-cli/tests/rpc_parity.rs` compares every scenario of
+`rpc-protocol.json` with noel's records and allows exactly the differences in
 the first list; its `normalize`, `expected`, and `without_own` functions
 name them, so the two lists change together. The extensions' keys
 (`runId`, `requestId`, `lastRun`, `rpcExtensions`) are the allowed extras.
@@ -908,32 +908,32 @@ name them, so the two lists change together. The extensions' keys
 Differences in the golden records:
 
 - No system messages: upstream's transcript starts with a system message
-  (upstream #9548, which pi has not ported), reported by `message_start` and
-  `message_end` and kept in `agent_end` and `get_messages`. pi reports none:
+  (upstream #9548, which noel has not ported), reported by `message_start` and
+  `message_end` and kept in `agent_end` and `get_messages`. noel reports none:
   it sends its system prompt with every request and keeps it out of the
   transcript.
-- `messageCount` counts the messages pi keeps: not upstream's system message,
+- `messageCount` counts the messages noel keeps: not upstream's system message,
   and not an aborted reply (see below).
-- Queue modes: pi delivers everything queued at once (see Batched Queue and
+- Queue modes: noel delivers everything queued at once (see Batched Queue and
   Steering Dispatch). `steeringMode` and `followUpMode` are always `all`, and
   setting `one-at-a-time` fails.
 - Model object: `faux/script` has no `baseUrl`, and its `input` and
   `maxTokens` are upstream's faux provider's rather than the stub model's.
 - Assistant messages have no `responseId`. Usage holds the input and output
-  tokens providers report to pi; cache tokens and costs are zero, and there is
+  tokens providers report to noel; cache tokens and costs are zero, and there is
   no `reasoning` count.
 - Tool results are text, and for a `read` of an image the image: no
   `structuredContent` or `details`, in a `tool_execution_update`'s
   `partialResult` either.
 - No `entry_appended` records: they report the journal entry with which
-  upstream hides a dropped reply from the model, and pi never saves that
+  upstream hides a dropped reply from the model, and noel never saves that
   reply (see Run Recovery).
-- A provider error is in pi's words, in an error reply's `errorMessage` and
+- A provider error is in noel's words, in an error reply's `errorMessage` and
   in `auto_retry_start` and `auto_retry_end`: `request failed with status 503
   Service Unavailable: <body>` where upstream has `503: <body>`.
 - A compaction's `result` is `{summary, details: {omittedMessages,
   retainedMessages}}`, not upstream's entry ids and token estimates. What a
-  compaction summarizes is pi's choice (see Clipboard Drafts, Conversation
+  compaction summarizes is noel's choice (see Clipboard Drafts, Conversation
   Undo, and Session Usage), so after an overflow the summary request and the
   request that asks again are not upstream's.
 - A final reply cut off at the output limit stays in the conversation when
@@ -948,7 +948,7 @@ Other differences:
 - While a run is active, `set_model`, `set_thinking_level`, `set_auto_retry`,
   `compact`, `new_session`, `switch_session`, and `set_session_name` are
   refused. Upstream takes `set_auto_retry` at any time and saves it in
-  `settings.json`; pi's lasts for the process.
+  `settings.json`; noel's lasts for the process.
 - An aborted reply, and the `Operation aborted` result of a tool call the
   abort interrupted, are reported but not saved, so `get_messages` and later
   model requests leave them out. Upstream keeps the aborted reply in the
@@ -957,8 +957,8 @@ Other differences:
 - Closing stdin during a run stops it where it is, kills its tool processes,
   and exits without `agent_end` or `agent_settled`; what the run saved stays
   in the session, and the run stays interrupted for `resume_run`. A signal
-  that ends pi does the same. Upstream disposes the runtime first.
-- Runs outlive pi: the journal saves each run's start and end, a restarted pi
+  that ends noel does the same. Upstream disposes the runtime first.
+- Runs outlive noel: the journal saves each run's start and end, a restarted noel
   reports a run that never ended as interrupted, and `resume_run` continues
   it under its `runId`. Upstream keeps runs in memory, and its agent cannot
   continue from a reply whose tool calls have no results.
@@ -989,7 +989,7 @@ Other differences:
 - `compact` runs to completion: commands sent meanwhile wait, and `abort` does
   not cancel it.
 - The model object in `get_state` and `set_model` has the fields of upstream's
-  that pi's model definition has: `id`, `name`, `api`, `provider`, `baseUrl`,
+  that noel's model definition has: `id`, `name`, `api`, `provider`, `baseUrl`,
   `reasoning`, `thinkingLevelMap`, `input`, `cost`, `contextWindow`, and
   `maxTokens`. It has no `compat`, `headers`, `inputLimits`, `promptCache`, or
   `type`.
@@ -998,25 +998,25 @@ Other differences:
   as upstream clamps it.
 - `new_session` refuses `parentSession`. With `--no-session` the session id
   stays `ephemeral`.
-- A prompt that is a pi tool command (`/bash ls`, `/read path`) runs the tool
+- A prompt that is a noel tool command (`/bash ls`, `/read path`) runs the tool
   without the model; the run reports its user message and tool result, but no
   turn.
-- Upstream commands pi does not implement answer `Unsupported command:
+- Upstream commands noel does not implement answer `Unsupported command:
   <type>`: `bash`, `abort_bash`, `set_auto_compaction`, `cycle_model`,
   `get_available_models`, `cycle_thinking_level`,
   `get_available_thinking_levels`, `get_session_stats`, `export_html`,
-  `fork`, `clone`, `get_fork_messages`, `get_entries`, and `get_tree`. pi has
+  `fork`, `clone`, `get_fork_messages`, `get_entries`, and `get_tree`. noel has
   no extension UI requests.
-- `get_commands` lists prompt templates, then skills. pi has no extension
+- `get_commands` lists prompt templates, then skills. noel has no extension
   commands to list before them, and its own `/extension:<name>` commands
   exist only in the TUI.
 - `--mode rpc` takes no prompt arguments; upstream ignores them.
 
-Reason: pi's run engine, session journal, and queue are its own (see Batched
+Reason: noel's run engine, session journal, and queue are its own (see Batched
 Queue and Steering Dispatch). The protocol keeps upstream's records and
-command contract, so a client written for upstream works; where pi lacks data
+command contract, so a client written for upstream works; where noel lacks data
 it leaves the field out rather than inventing it. Durable runs serve a
-supervisor (Codewire) that must learn, after its own restart or pi's, what
+supervisor (Codewire) that must learn, after its own restart or noel's, what
 became of the run it started, and have it finished when that is safe: a
 prompt is applied once, a call that is not replay-safe runs at most once, a
 replay-safe one at least once, and a model request cut off by a stop is sent

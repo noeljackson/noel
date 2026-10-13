@@ -1,8 +1,8 @@
 CARGO ?= cargo
 DOCKER ?= docker
-E2E_IMAGE ?= pi-e2e
+E2E_IMAGE ?= noel-e2e
 TS_PARITY_IMAGE ?= pi-ts-parity
-RUST_CI_IMAGE ?= pi-rust-ci:1.99.0
+RUST_CI_IMAGE ?= noel-rust-ci:1.99.0
 TS_REFERENCE_REPO ?= https://github.com/earendil-works/pi.git
 TS_REFERENCE_REF ?= main
 TS_PARITY_TRACKING_REF ?= main
@@ -23,10 +23,10 @@ help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  build        Build the workspace' \
-		'  release      Build the pi CLI release binary' \
-		'  install      Install the pi CLI release binary to $$(PREFIX)/bin' \
-		'  install-system Install the pi CLI release binary to /usr/local/bin' \
-		'  run          Run the pi CLI; pass RUN_ARGS="..." for CLI args' \
+		'  release      Build the noel CLI release binary' \
+		'  install      Install the noel CLI release binary to $$(PREFIX)/bin' \
+		'  install-system Install the noel CLI release binary to /usr/local/bin' \
+		'  run          Run the noel CLI; pass RUN_ARGS="..." for CLI args' \
 		'  dogfood     Run dev TUI with rebuild/restart watcher' \
 		'  fmt          Check Rust formatting' \
 		'  lint         Run clippy with warnings denied' \
@@ -47,7 +47,7 @@ help:
 		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
 		'  ts-parity-update    Refresh fixtures from moving TS reference inside Docker' \
 		'  ts-parity-drift     Check moving TS reference for fixture drift' \
-		'  ts-parity-agent     Check drift and optionally dispatch PI_PARITY_AGENT_COMMAND' \
+		'  ts-parity-agent     Check drift and optionally dispatch NOEL_PARITY_AGENT_COMMAND' \
 		'  smoke-claude-opus-oauth  Run manual Claude Opus OAuth smoke' \
 		'  clean        Remove Cargo build output'
 
@@ -55,19 +55,19 @@ build:
 	$(CARGO) build --all
 
 release:
-	$(CARGO) build --release -p pi-cli
+	$(CARGO) build --release -p noel-cli
 
 install:
 	CARGO="$(CARGO)" $(INSTALL_BUILD_SCRIPT)
 	install -d "$(BINDIR)"
-	install -m 0755 target/release/pi "$(BINDIR)/pi"
+	install -m 0755 target/release/noel "$(BINDIR)/noel"
 
 install-system: release
 	$(SUDO) install -d "$(SYSTEM_BINDIR)"
-	$(SUDO) install -m 0755 target/release/pi "$(SYSTEM_BINDIR)/pi"
+	$(SUDO) install -m 0755 target/release/noel "$(SYSTEM_BINDIR)/noel"
 
 run:
-	$(CARGO) run -p pi-cli -- $(RUN_ARGS)
+	$(CARGO) run -p noel-cli -- $(RUN_ARGS)
 
 dogfood:
 	CARGO="$(CARGO)" scripts/dogfood-dev.sh $(DOGFOOD_ARGS)
@@ -78,18 +78,18 @@ fmt:
 lint:
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
-# PI_TEST_ISOLATION: no test may fall back to ~/.pi/agent or refresh models.
+# NOEL_TEST_ISOLATION: no test may fall back to ~/.noel or refresh models.
 test:
-	PI_TEST_ISOLATION=1 $(CARGO) test --all
+	NOEL_TEST_ISOLATION=1 $(CARGO) test --all
 
 check: fmt lint test
 
 check-ci:
 	$(DOCKER) build -q -f Dockerfile.ci -t $(RUST_CI_IMAGE) .
-	mkdir -p "$(HOME)/.cache/pi-ci-cargo"
+	mkdir -p "$(HOME)/.cache/noel-ci-cargo"
 	$(DOCKER) run --rm --user "$$(id -u):$$(id -g)" \
 		-v "$(CURDIR):/src" -w /src \
-		-v "$(HOME)/.cache/pi-ci-cargo:/cargo" -e CARGO_HOME=/cargo -e HOME=/tmp \
+		-v "$(HOME)/.cache/noel-ci-cargo:/cargo" -e CARGO_HOME=/cargo -e HOME=/tmp \
 		-e CARGO_TARGET_DIR=/src/target/ci \
 		$(RUST_CI_IMAGE) make check
 
@@ -118,19 +118,19 @@ docker-e2e: docker-build
 	$(DOCKER) run --rm $(E2E_IMAGE)
 
 parity-check:
-	$(CARGO) test -p pi-parity
-	$(CARGO) test -p pi-ai --lib matches_ts
-	$(CARGO) test -p pi-ai --lib catalog
-	$(CARGO) test -p pi-config --lib model
-	$(CARGO) test -p pi-cli --test model_parity
-	$(CARGO) test -p pi-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
-	$(CARGO) test -p pi-core --lib system_prompt_matches_ts_builder
-	$(CARGO) test -p pi-cli --bin pi prompt_and_context_files_match_ts_discovery
-	$(CARGO) test -p pi-core --lib tool_parity_tests
-	$(CARGO) test -p pi-config --lib _ts
-	$(CARGO) test -p pi-core --lib input_expansion_matches_ts_session
-	$(CARGO) test -p pi-cli --test rpc_parity get_commands_matches_upstream
-	$(CARGO) test -p pi-cli --test rpc_parity golden_
+	$(CARGO) test -p noel-parity
+	$(CARGO) test -p noel-ai --lib matches_ts
+	$(CARGO) test -p noel-ai --lib catalog
+	$(CARGO) test -p noel-config --lib model
+	$(CARGO) test -p noel-cli --test model_parity
+	$(CARGO) test -p noel-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools
+	$(CARGO) test -p noel-core --lib system_prompt_matches_ts_builder
+	$(CARGO) test -p noel-cli --bin noel prompt_and_context_files_match_ts_discovery
+	$(CARGO) test -p noel-core --lib tool_parity_tests
+	$(CARGO) test -p noel-config --lib _ts
+	$(CARGO) test -p noel-core --lib input_expansion_matches_ts_session
+	$(CARGO) test -p noel-cli --test rpc_parity get_commands_matches_upstream
+	$(CARGO) test -p noel-cli --test rpc_parity golden_
 	$(MAKE) ts-parity-drift
 
 ts-parity-build:

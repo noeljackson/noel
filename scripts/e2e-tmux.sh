@@ -11,7 +11,7 @@ cargo_bin="$(command -v cargo)"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e-isolate.sh
 source "${repo_root}/scripts/e2e-isolate.sh"
-session_name="pi-e2e-${$}"
+session_name="noel-e2e-${$}"
 session_dir="${e2e_root}/e2e-tmux-sessions"
 work_dir="${e2e_root}/e2e-tmux-work"
 cwd_dir="${work_dir}/cwd"
@@ -21,12 +21,12 @@ prompt_file="${work_dir}/prompt-ready"
 cleanup() {
   local status=$?
   tmux kill-session -t "${session_name}" >/dev/null 2>&1 || true
-  tmux kill-session -t "pi-e2e-clear-${$}" >/dev/null 2>&1 || true
-  tmux kill-session -t "pi-e2e-one-follow-${$}" >/dev/null 2>&1 || true
-  tmux kill-session -t "pi-e2e-disabled-${$}" >/dev/null 2>&1 || true
-  tmux kill-session -t "pi-e2e-stream-${$}" >/dev/null 2>&1 || true
-  tmux kill-session -t "pi-e2e-modern-${$}" >/dev/null 2>&1 || true
-  tmux kill-session -t "pi-e2e-input-${$}" >/dev/null 2>&1 || true
+  tmux kill-session -t "noel-e2e-clear-${$}" >/dev/null 2>&1 || true
+  tmux kill-session -t "noel-e2e-one-follow-${$}" >/dev/null 2>&1 || true
+  tmux kill-session -t "noel-e2e-disabled-${$}" >/dev/null 2>&1 || true
+  tmux kill-session -t "noel-e2e-stream-${$}" >/dev/null 2>&1 || true
+  tmux kill-session -t "noel-e2e-modern-${$}" >/dev/null 2>&1 || true
+  tmux kill-session -t "noel-e2e-input-${$}" >/dev/null 2>&1 || true
   e2e_isolation_cleanup "${status}"
 }
 trap cleanup EXIT
@@ -49,25 +49,25 @@ cat > "${agent_dir}/extensions/json-ext" <<'SH'
 request="$(cat)"
 kind="$(printf '%s' "${request}" | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')"
 input="$(printf '%s' "${request}" | sed -n 's/.*"input":"\([^"]*\)".*/\1/p')"
-if [ "${kind}" != "command" ] && [ -n "${PI_EXTENSION_EVENTS_LOG:-}" ]; then
-  printf '%s\n' "${kind}" >> "${PI_EXTENSION_EVENTS_LOG}"
+if [ "${kind}" != "command" ] && [ -n "${NOEL_EXTENSION_EVENTS_LOG:-}" ]; then
+  printf '%s\n' "${kind}" >> "${NOEL_EXTENSION_EVENTS_LOG}"
 fi
 printf '{"output":"json-ext saw %s"}\n' "${input}"
 SH
 chmod +x "${agent_dir}/extensions/json-ext"
-printf '{"protocol":"json"}\n' > "${agent_dir}/extensions/json-ext.pi-extension.json"
+printf '{"protocol":"json"}\n' > "${agent_dir}/extensions/json-ext.noel-extension.json"
 printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=' | base64 -d > "${work_dir}/pixel.png"
 
-(cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config disable extension assist) > "${work_dir}/config-disable.txt"
-(cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config show) > "${work_dir}/config-disabled.txt"
+(cd "${cwd_dir}" && NOEL_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p noel-cli -- config disable extension assist) > "${work_dir}/config-disable.txt"
+(cd "${cwd_dir}" && NOEL_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p noel-cli -- config show) > "${work_dir}/config-disabled.txt"
 grep -Fq "disabled extensions: assist" "${work_dir}/config-disabled.txt"
-(cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config enable extension assist) > "${work_dir}/config-enable.txt"
-(cd "${cwd_dir}" && PI_CODING_AGENT_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p pi-cli -- config show) > "${work_dir}/config-enabled.txt"
+(cd "${cwd_dir}" && NOEL_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p noel-cli -- config enable extension assist) > "${work_dir}/config-enable.txt"
+(cd "${cwd_dir}" && NOEL_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p noel-cli -- config show) > "${work_dir}/config-enabled.txt"
 grep -Fq "disabled extensions: -" "${work_dir}/config-enabled.txt"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${cwd_dir}' && env -u NO_COLOR PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' PI_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' PI_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' PI_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo; printf 'pi-%s\\n' exited" \
+  "cd '${cwd_dir}' && env -u NO_COLOR NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' NOEL_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' NOEL_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' NOEL_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' NOEL_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-dir '${session_dir}' --model faux/echo; printf 'noel-%s\\n' exited" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -80,12 +80,12 @@ done
 
 if [ ! -f "${prompt_file}" ]; then
   tmux capture-pane -t "${session_name}" -p -S -2000 >&2
-  echo "pi prompt did not appear" >&2
+  echo "noel prompt did not appear" >&2
   exit 1
 fi
 
 tmux capture-pane -t "${session_name}" -p -S -2000 > "${work_dir}/live-pane.txt"
-if ! grep -Fq "pi rust cli" "${work_dir}/live-pane.txt"; then
+if ! grep -Fq "noel rust cli" "${work_dir}/live-pane.txt"; then
   cat "${work_dir}/live-pane.txt" >&2
   echo "TUI transcript did not appear" >&2
   exit 1
@@ -176,11 +176,11 @@ wait_cursor() {
   fail "$2"
 }
 
-# The pane's shell prints this marker after pi on its command line, so the
-# pane is read only once pi has written its transcript and gone.
-quit_pi() {
+# The pane's shell prints this marker after noel on its command line, so the
+# pane is read only once noel has written its transcript and gone.
+quit_noel() {
   type_line "/quit"
-  wait_for "pi-exited"
+  wait_for "noel-exited"
 }
 
 # The main test process unsets NO_COLOR inherited from a shared tmux server.
@@ -428,7 +428,7 @@ if [ -z "${current_session}" ]; then
 fi
 send_line "/delete ${current_session}"
 send_line "/session"
-quit_pi
+quit_noel
 
 pane_output="$(tmux capture-pane -t "${session_name}" -p -S -2000 2>/dev/null || true)"
 printf '%s\n' "${pane_output}" > "${work_dir}/pane.txt"
@@ -451,7 +451,7 @@ require_output_regex() {
   fi
 }
 
-require_output "pi rust cli"
+require_output "noel rust cli"
 require_output "assistant>"
 require_output "user>"
 require_output "[faux/echo] hello from tmux e2e"
@@ -629,12 +629,12 @@ if [ ! -f "${work_dir}/session-export.html" ]; then
   echo "missing exported html session" >&2
   exit 1
 fi
-grep -Fq "pi session export" "${work_dir}/session-export.html"
+grep -Fq "noel session export" "${work_dir}/session-export.html"
 if [ ! -f "${work_dir}/session-share.html" ]; then
   echo "missing shared html session" >&2
   exit 1
 fi
-grep -Fq "pi session export" "${work_dir}/session-share.html"
+grep -Fq "noel session export" "${work_dir}/session-share.html"
 if [ ! -f "${work_dir}/clipboard.txt" ]; then
   echo "missing clipboard capture" >&2
   exit 1
@@ -649,10 +649,10 @@ grep -Fxq "shutdown" "${work_dir}/extension-events.txt"
 grep -Fq '"enabled": false' "${agent_dir}/settings.json"
 
 printf '{"followUpMode":"one-at-a-time"}\n' > "${agent_dir}/settings.json"
-one_follow_session="pi-e2e-one-follow-${$}"
+one_follow_session="noel-e2e-one-follow-${$}"
 tmux new-session -d -s "${one_follow_session}" -x 100 -y 20
 tmux send-keys -t "${one_follow_session}" \
-  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo; printf 'pi-%s\\n' exited" \
+  "cd '${cwd_dir}' && NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-dir '${session_dir}' --model faux/echo; printf 'noel-%s\\n' exited" \
   Enter
 session="${one_follow_session}"
 wait_for "│ >"
@@ -663,7 +663,7 @@ send_line "/queue first-one-at-a-time" 1
 send_line "/queue second-one-at-a-time" 2
 send_line "trigger one followup"
 send_line "/queue"
-quit_pi
+quit_noel
 one_follow_output="$(tmux capture-pane -t "${one_follow_session}" -p -S -2000 2>/dev/null || true)"
 printf '%s\n' "${one_follow_output}" > "${work_dir}/one-follow-pane.txt"
 tmux kill-session -t "${one_follow_session}" >/dev/null 2>&1 || true
@@ -686,16 +686,16 @@ if ! grep -Eq "(queue is empty|no pending follow-ups)" "${work_dir}/one-follow-p
   exit 1
 fi
 
-disabled_session="pi-e2e-disabled-${$}"
+disabled_session="noel-e2e-disabled-${$}"
 tmux new-session -d -s "${disabled_session}" -x 100 -y 20
 tmux send-keys -t "${disabled_session}" \
-  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo --no-tools; printf 'pi-%s\\n' exited" \
+  "cd '${cwd_dir}' && NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-dir '${session_dir}' --model faux/echo --no-tools; printf 'noel-%s\\n' exited" \
   Enter
 session="${disabled_session}"
 wait_for "│ >"
 
 send_line "/write ${cwd_dir}/blocked.txt blocked"
-quit_pi
+quit_noel
 disabled_output="$(tmux capture-pane -t "${disabled_session}" -p -S -2000 2>/dev/null || true)"
 printf '%s\n' "${disabled_output}" > "${work_dir}/disabled-pane.txt"
 tmux kill-session -t "${disabled_session}" >/dev/null 2>&1 || true
@@ -710,13 +710,13 @@ if [ -f "${cwd_dir}/blocked.txt" ]; then
   exit 1
 fi
 
-stream_session="pi-e2e-stream-${$}"
+stream_session="noel-e2e-stream-${$}"
 stream_ready="${work_dir}/stream-ready"
 stream_done="${work_dir}/stream-done"
 stream_prompt="$(printf 'stream%.0s' $(seq 1 120))"
 tmux new-session -d -s "${stream_session}" -x 100 -y 24
 tmux send-keys -t "${stream_session}" \
-  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' PI_FAUX_STREAM_DELAY_MS=4 PI_FAUX_STREAM_CHARS=1 PI_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' NOEL_FAUX_STREAM_DELAY_MS=4 NOEL_FAUX_STREAM_CHARS=1 NOEL_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -939,10 +939,10 @@ if [ -z "${stream_esc_interrupted}" ]; then
   exit 1
 fi
 
-clear_session="pi-e2e-clear-${$}"
+clear_session="noel-e2e-clear-${$}"
 tmux new-session -d -s "${clear_session}" -x 100 -y 20
 tmux send-keys -t "${clear_session}" \
-  "cd '${cwd_dir}' && PI_TUI_E2E_DUMP=1 PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-dir '${session_dir}' --model faux/echo" \
+  "cd '${cwd_dir}' && NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-dir '${session_dir}' --model faux/echo" \
   Enter
 
 session="${clear_session}"
@@ -980,11 +980,11 @@ fi
 
 # Exercise wrapping, paste placeholders, deletion, and exact full-text
 # submission in a separate local-provider session without transcript dumps.
-input_session="pi-e2e-input-${$}"
+input_session="noel-e2e-input-${$}"
 input_log="${session_dir}/growing-input.jsonl"
 tmux new-session -d -s "${input_session}" -x 40 -y 20
 tmux send-keys -t "${input_session}" \
-  "cd '${cwd_dir}' && PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session-id growing-input --session-dir '${session_dir}' --model faux/echo --offline" Enter
+  "cd '${cwd_dir}' && NOEL_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-id growing-input --session-dir '${session_dir}' --model faux/echo --offline" Enter
 session="${input_session}"
 wait_for "│ >"
 input_capture() { tmux capture-pane -t "${input_session}" -p > "${work_dir}/input-pane.txt"; }
@@ -1072,7 +1072,7 @@ tmux kill-session -t "${input_session}" >/dev/null 2>&1 || true
 
 # Resume a local fixture to exercise thinking/tool previews, task selection,
 # key toggles, and idle queue recall without real-provider requests.
-modern_session="pi-e2e-modern-${$}"
+modern_session="noel-e2e-modern-${$}"
 modern_log="${session_dir}/modern-harness.jsonl"
 cat > "${modern_log}" <<'JSONL'
 {"type":"started","session_id":"modern-harness","cwd":"."}
@@ -1086,7 +1086,7 @@ cat > "${modern_log}" <<'JSONL'
 JSONL
 tmux new-session -d -s "${modern_session}" -x 100 -y 40
 tmux send-keys -t "${modern_session}" \
-  "cd '${cwd_dir}' && env -u NO_COLOR PI_CODING_AGENT_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p pi-cli -- --session '${modern_log}' --session-dir '${session_dir}' --model faux/echo --offline" Enter
+  "cd '${cwd_dir}' && env -u NO_COLOR NOEL_DIR='${agent_dir}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session '${modern_log}' --session-dir '${session_dir}' --model faux/echo --offline" Enter
 session="${modern_session}"
 wait_for "│ >"
 modern_capture() { tmux capture-pane -t "${modern_session}" -p > "${work_dir}/modern-pane.txt"; }

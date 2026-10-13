@@ -1,0 +1,32 @@
+[package]
+name = "noel-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "noel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+getrandom.workspace = true
+image.workspace = true
+nix.workspace = true
+noel-ai = { path = "../noel-ai" }
+noel-config = { path = "../noel-config" }
+noel-core = { path = "../noel-core" }
+noel-tui = { path = "../noel-tui" }
+ratatui.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time = { workspace = true, features = ["formatting", "parsing"] }
+tokio.workspace = true
+unicode-segmentation = "1.13.2"
+unicode-width = "0.2.2"

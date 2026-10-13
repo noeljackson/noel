@@ -29,13 +29,13 @@ jobs:
         uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Build
-        run: cargo build --release -p pi-cli
+        run: cargo build --release -p noel-cli
 
       - name: Package
         run: |
           mkdir -p dist
-          cp target/release/pi dist/pi-linux-x64
-          tar -C dist -czf dist/pi-linux-x64.tar.gz pi-linux-x64
+          cp target/release/noel dist/noel-linux-x64
+          tar -C dist -czf dist/noel-linux-x64.tar.gz noel-linux-x64
 
       - name: Release
         env:
@@ -44,6 +44,6 @@ jobs:
           gh release create "${RELEASE_TAG}" \
             --title "${RELEASE_TAG}" \
             --notes "Release ${RELEASE_TAG}" \
-            dist/pi-linux-x64.tar.gz \
+            dist/noel-linux-x64.tar.gz \
             2>/dev/null || \
-          gh release upload "${RELEASE_TAG}" dist/pi-linux-x64.tar.gz --clobber
+          gh release upload "${RELEASE_TAG}" dist/noel-linux-x64.tar.gz --clobber
