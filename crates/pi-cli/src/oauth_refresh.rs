@@ -15,7 +15,8 @@ pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 pub const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-const REFRESH_WINDOW_SECONDS: u64 = 60;
+/// The request path refreshes OAuth tokens this close to expiry.
+pub const REFRESH_WINDOW_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshedTokens {
@@ -64,11 +65,11 @@ fn refresh_failure(account: &str, provider: &str, reason: &str) -> anyhow::Error
     )
 }
 
-pub fn needs_refresh(auth: &ResolvedAuth, now: u64) -> bool {
+pub fn needs_refresh(auth: &ResolvedAuth, now: u64, window_seconds: u64) -> bool {
     auth.refresh_token()
         .map(|token| !token.trim().is_empty())
         .unwrap_or(false)
-        && expires_within(auth.expires(), now, REFRESH_WINDOW_SECONDS)
+        && expires_within(auth.expires(), now, window_seconds)
 }
 
 fn refresh_request_form<'a>(
@@ -220,10 +221,36 @@ pub async fn refresh_expiring_auth(
     endpoint_override: Option<(&str, &str)>,
     now: u64,
 ) -> Result<Option<ResolvedAuth>> {
+    refresh_auth_expiring_within(
+        client,
+        auth_path,
+        auth,
+        provider,
+        account,
+        endpoint_override,
+        now,
+        REFRESH_WINDOW_SECONDS,
+    )
+    .await
+}
+
+/// [`refresh_expiring_auth`] for callers that need more remaining lifetime
+/// than the request path: tokens expiring within `window_seconds` refresh.
+#[allow(clippy::too_many_arguments)]
+pub async fn refresh_auth_expiring_within(
+    client: &reqwest::Client,
+    auth_path: &Path,
+    auth: &AuthData,
+    provider: &str,
+    account: Option<&str>,
+    endpoint_override: Option<(&str, &str)>,
+    now: u64,
+    window_seconds: u64,
+) -> Result<Option<ResolvedAuth>> {
     let Some(resolved) = auth_for_provider(auth, provider, account) else {
         return Ok(None);
     };
-    if !expires_within(resolved.expires(), now, REFRESH_WINDOW_SECONDS) {
+    if !expires_within(resolved.expires(), now, window_seconds) {
         return Ok(Some(resolved));
     }
     let account = persisted_account_name(auth, provider, account);
@@ -240,10 +267,10 @@ pub async fn refresh_expiring_auth(
         .credential(provider, &account)
         .and_then(|_| auth_for_provider(&stored, provider, Some(&account)))
         .unwrap_or(resolved);
-    if !expires_within(resolved.expires(), now, REFRESH_WINDOW_SECONDS) {
+    if !expires_within(resolved.expires(), now, window_seconds) {
         return Ok(Some(resolved));
     }
-    if !needs_refresh(&resolved, now) {
+    if !needs_refresh(&resolved, now, window_seconds) {
         if is_expired(resolved.expires(), now) {
             return Err(refresh_failure(
                 &account,
@@ -452,8 +479,8 @@ mod tests {
             expires: 1_000,
             account_id: None,
         };
-        assert!(needs_refresh(&base, 941));
-        assert!(!needs_refresh(&base, 100));
+        assert!(needs_refresh(&base, 941, REFRESH_WINDOW_SECONDS));
+        assert!(!needs_refresh(&base, 100, REFRESH_WINDOW_SECONDS));
 
         let without_refresh = ResolvedAuth::ChatGptOAuth {
             access_token: "access".to_string(),
@@ -461,7 +488,11 @@ mod tests {
             expires: 1_000,
             account_id: None,
         };
-        assert!(!needs_refresh(&without_refresh, 1_000));
+        assert!(!needs_refresh(
+            &without_refresh,
+            1_000,
+            REFRESH_WINDOW_SECONDS
+        ));
 
         let unknown_expiry = ResolvedAuth::ChatGptOAuth {
             access_token: "access".to_string(),
@@ -469,7 +500,11 @@ mod tests {
             expires: 0,
             account_id: None,
         };
-        assert!(!needs_refresh(&unknown_expiry, u64::MAX));
+        assert!(!needs_refresh(
+            &unknown_expiry,
+            u64::MAX,
+            REFRESH_WINDOW_SECONDS
+        ));
     }
 
     #[tokio::test]
@@ -671,6 +706,62 @@ mod tests {
         .expect("auth");
         assert_eq!(resolved.expires(), 4_000_000_000);
         assert_eq!(stub.hits.load(Ordering::SeqCst), 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn refresh_window_extends_to_requested_lifetime() {
+        let root = test_dir("pi-cli-oauth-window");
+        let auth_path = root.join("agent").join("auth.json");
+        let stub = spawn_stub(
+            200,
+            r#"{"access_token":"long-access","refresh_token":"long-refresh","expires_in":7200}"#,
+        );
+        let mut auth = AuthData::default();
+        auth.insert(
+            "anthropic",
+            "default",
+            AuthCredential::OAuth {
+                access_token: "ten-minutes-left".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires: 1_600,
+                account_id: None,
+            },
+        );
+        let client = reqwest::Client::new();
+        let endpoint = Some((stub.url.as_str(), "test-client"));
+
+        let request_path = refresh_expiring_auth(
+            &client,
+            &auth_path,
+            &auth,
+            "anthropic",
+            None,
+            endpoint,
+            1_000,
+        )
+        .await
+        .expect("request path")
+        .expect("auth");
+        assert_eq!(request_path.expires(), 1_600);
+        assert_eq!(stub.hits.load(Ordering::SeqCst), 0);
+
+        let extended = refresh_auth_expiring_within(
+            &client,
+            &auth_path,
+            &auth,
+            "anthropic",
+            None,
+            endpoint,
+            1_000,
+            30 * 60,
+        )
+        .await
+        .expect("windowed refresh")
+        .expect("auth");
+        assert_eq!(extended.expires(), 1_000 + 7200);
+        assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }

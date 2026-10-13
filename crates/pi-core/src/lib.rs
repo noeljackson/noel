@@ -370,6 +370,7 @@ pub struct RuntimeRetrySettings {
     pub enabled: bool,
     pub max_retries: u64,
     pub base_delay_ms: u64,
+    pub max_agent_delay_ms: u64,
 }
 
 impl Default for RuntimeRetrySettings {
@@ -378,6 +379,7 @@ impl Default for RuntimeRetrySettings {
             enabled: true,
             max_retries: 3,
             base_delay_ms: 2_000,
+            max_agent_delay_ms: pi_agent::DEFAULT_MAX_RETRY_DELAY_MS,
         }
     }
 }
@@ -484,6 +486,12 @@ impl ReloadableSystems {
                     .as_ref()
                     .and_then(|retry| retry.base_delay_ms)
                     .unwrap_or(2_000),
+                max_agent_delay_ms: config
+                    .settings
+                    .retry
+                    .as_ref()
+                    .and_then(|retry| retry.max_agent_delay_ms)
+                    .unwrap_or(pi_agent::DEFAULT_MAX_RETRY_DELAY_MS),
             },
             max_tool_rounds: config
                 .settings
@@ -2476,6 +2484,7 @@ async fn complete_with_retry_streaming(
     let retry = RetryPolicy {
         max_retries: if retry.enabled { retry.max_retries } else { 0 },
         base_delay_ms: retry.base_delay_ms,
+        max_delay_ms: retry.max_agent_delay_ms,
     };
     pi_agent::complete_with_retry(
         provider,
@@ -3985,6 +3994,9 @@ mod tests {
                 .len(),
             2
         );
+        // `toolNames` is the tool set offered to the model. Upstream now
+        // declares it on transcript system messages (`toolsAdded`), which the
+        // fixture script replays with `getCurrentTools`.
         assert_eq!(
             tool_loop["streamCalls"][0]["toolNames"],
             serde_json::json!(["fixture_echo"])
@@ -4292,7 +4304,17 @@ mod tests {
         // Rust intentionally adds tools beyond the upstream set (see
         // docs/rust-rewrite/non-parity-register.md); upstream tools must keep
         // their schema keys, but rust-only tools are not in the fixture.
+        // Upstream's `powershell` tool only runs on Windows, so Rust omits it
+        // ("Windows-Only PowerShell Tool" in non-parity-register.md).
+        const WINDOWS_ONLY_UPSTREAM_TOOL: &str = "powershell";
         for (name, keys) in &expected {
+            if name == WINDOWS_ONLY_UPSTREAM_TOOL {
+                assert!(
+                    !actual.contains_key(name),
+                    "{name} is now ported; drop its non-parity exception"
+                );
+                continue;
+            }
             assert_eq!(actual.get(name), Some(keys), "schema keys for {name}");
         }
     }
@@ -5880,6 +5902,7 @@ mod tests {
                     enabled: true,
                     max_retries: 2,
                     base_delay_ms: 0,
+                    ..Default::default()
                 },
                 ..ReloadableSystems::default()
             },
@@ -5910,6 +5933,7 @@ mod tests {
                     enabled: false,
                     max_retries: 2,
                     base_delay_ms: 0,
+                    ..Default::default()
                 },
                 ..ReloadableSystems::default()
             },
@@ -5942,6 +5966,7 @@ mod tests {
                     enabled: true,
                     max_retries: 3,
                     base_delay_ms: 0,
+                    ..Default::default()
                 },
                 ..ReloadableSystems::default()
             },

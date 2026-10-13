@@ -15,8 +15,9 @@ on:
         default: 'main'
 
 permissions:
-  contents: read
-  issues: write
+  contents: write
+  pull-requests: write
+  actions: write
 
 concurrency:
   group: ts-parity-drift
@@ -28,17 +29,29 @@ jobs:
     env:
       TS_REFERENCE_REPO: ${{ inputs.ts_reference_repo || 'https://github.com/earendil-works/pi.git' }}
       TS_PARITY_TRACKING_REF: ${{ inputs.ts_reference_ref || 'main' }}
+      DRIFT_BRANCH: parity/drift
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Check TypeScript parity drift
         id: parity
         continue-on-error: true
         run: make ts-parity-agent
+
+      - name: Classify the result
+        id: result
+        if: steps.parity.outcome == 'failure'
+        run: |
+          if [ -s target/ts-parity-drift/fixture.diff ]; then
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload drift brief
         if: steps.parity.outcome == 'failure'
@@ -47,63 +60,46 @@ jobs:
           name: ts-parity-drift
           path: target/ts-parity-drift
 
-      - name: Report drift issue
-        if: steps.parity.outcome == 'failure'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const title = 'TS parity drift detected';
-            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const briefPath = 'target/ts-parity-drift/brief.md';
-            const diffPath = 'target/ts-parity-drift/fixture.diff';
-            const diffPreview = fs.existsSync(diffPath)
-              ? fs.readFileSync(diffPath, 'utf8').split('\n').slice(0, 120).join('\n')
-              : '';
-            const body = [
-              'The scheduled TypeScript parity drift harness detected fixture changes.',
-              '',
-              `Run: ${runUrl}`,
-              `Reference repo: \`${process.env.TS_REFERENCE_REPO}\``,
-              `Reference ref: \`${process.env.TS_PARITY_TRACKING_REF}\``,
-              '',
-              'Local commands:',
-              '',
-              '```bash',
-              'make ts-parity-update',
-              'make parity-check',
-              '```',
-              '',
-              'Agent brief is uploaded as the `ts-parity-drift` workflow artifact.',
-              '',
-              diffPreview ? 'Diff preview:' : '',
-              diffPreview ? '```diff' : '',
-              diffPreview,
-              diffPreview ? '```' : '',
-            ].filter(Boolean).join('\n');
+      # One open pull request carries the regenerated fixtures, so drift is a
+      # reviewable diff whose CI run shows which Rust parity tests it breaks.
+      # Fixes pushed to the branch are kept: new drift lands as a commit on top,
+      # and nothing is committed or re-run when the fixtures did not change.
+      - name: Open or update the drift pull request
+        if: steps.result.outputs.drift == 'true'
+        run: |
+          set -euo pipefail
+          sha="$(cat target/ts-parity-drift/reference-sha)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin "$DRIFT_BRANCH" > /dev/null; then
+            git fetch --no-tags origin "$DRIFT_BRANCH"
+            git switch -C "$DRIFT_BRANCH" "origin/$DRIFT_BRANCH"
+          else
+            git switch -C "$DRIFT_BRANCH"
+          fi
+          # Mirror the regenerated set, so fixtures upstream dropped are removed too.
+          rm -f tests/fixtures/ts-parity/*.json
+          cp target/ts-parity-drift/fixtures/*.json tests/fixtures/ts-parity/
+          git add -A tests/fixtures/ts-parity
+          changed=false
+          if ! git diff --cached --quiet; then
+            git commit -m "parity: refresh fixtures from upstream ${TS_PARITY_TRACKING_REF} at ${sha:0:12}"
+            git push origin "$DRIFT_BRANCH"
+            changed=true
+          fi
+          title="Parity drift: upstream ${TS_PARITY_TRACKING_REF} at ${sha:0:12}"
+          head -c 60000 target/ts-parity-drift/brief.md > target/ts-parity-drift/pr-body.md
+          pr="$(gh pr list --head "$DRIFT_BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --title "$title" --body-file target/ts-parity-drift/pr-body.md
+          else
+            gh pr create --draft --base main --head "$DRIFT_BRANCH" \
+              --title "$title" --body-file target/ts-parity-drift/pr-body.md
+          fi
+          if [ "$changed" = true ]; then
+            gh workflow run ci.yml --ref "$DRIFT_BRANCH"
+          fi
 
-            const search = await github.rest.search.issuesAndPullRequests({
-              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`,
-              per_page: 1,
-            });
-
-            if (search.data.items.length > 0) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: search.data.items[0].number,
-                body,
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body,
-                labels: ['pkg:ai', 'pkg:agent'],
-              });
-            }
-
-      - name: Fail on drift
-        if: steps.parity.outcome == 'failure'
+      - name: Fail when the harness itself failed
+        if: steps.parity.outcome == 'failure' && steps.result.outputs.drift != 'true'
         run: exit 1

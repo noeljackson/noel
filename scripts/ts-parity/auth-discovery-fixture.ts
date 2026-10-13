@@ -9,7 +9,7 @@ import { RuntimeCredentials } from "/ts-reference/packages/coding-agent/src/core
 import { defaultProviderAuthContext } from "/ts-reference/packages/ai/src/auth/context.ts";
 import { resolveProviderAuth } from "/ts-reference/packages/ai/src/auth/resolve.ts";
 import { anthropicProvider } from "/ts-reference/packages/ai/src/providers/anthropic.ts";
-import { azureOpenAIResponsesProvider } from "/ts-reference/packages/ai/src/providers/azure-openai-responses.ts";
+import { azureProvider } from "/ts-reference/packages/ai/src/providers/azure.ts";
 import { openaiProvider } from "/ts-reference/packages/ai/src/providers/openai.ts";
 
 type ProviderEnvCase = {
@@ -39,7 +39,7 @@ const envCases: ProviderEnvCase[] = [
 		expectedSource: "environment",
 	},
 	{
-		provider: "azure-openai-responses",
+		provider: "azure",
 		env: { AZURE_OPENAI_API_KEY: "azure-api-key" },
 		statusLabel: "AZURE_OPENAI_API_KEY",
 		expectedApiKey: "azure-api-key",
@@ -70,7 +70,7 @@ async function summarizeEnvCase(testCase: ProviderEnvCase) {
 	const provider = {
 		anthropic: anthropicProvider(),
 		openai: openaiProvider(),
-		"azure-openai-responses": azureOpenAIResponsesProvider(),
+		azure: azureProvider(),
 	}[testCase.provider];
 	if (!provider) {
 		throw new Error(`unsupported auth fixture provider: ${testCase.provider}`);

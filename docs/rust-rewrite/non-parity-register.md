@@ -95,12 +95,13 @@ does not carry.
 
 ### Claude Code Version User-Agent
 
-For Claude Code OAuth requests, TypeScript pins `user-agent: claude-cli/2.1.75`.
-Rust reports `claude-cli/<latest published version>` instead: the model refresh
-fetches the newest `@anthropic-ai/claude-code` version from the npm registry,
-caches it in `model-cache.json`, and falls back to a bundled minimum
-(`PI_CLAUDE_CODE_VERSION` overrides both). The parity test pins the version to
-the fixture value to keep comparing the identity shape.
+For Claude Code OAuth requests, TypeScript pins `user-agent: claude-cli/<version>`
+(2.1.280 at the current fixture). Rust reports `claude-cli/<latest published
+version>` instead: the model refresh fetches the newest `@anthropic-ai/claude-code`
+version from the npm registry, caches it in `model-cache.json`, and falls back to
+`DEFAULT_CLAUDE_CODE_VERSION`, which tracks upstream's pin
+(`PI_CLAUDE_CODE_VERSION` overrides both). The parity test compares the fixture
+against that fallback, so it fails when upstream moves its pin.
 
 Reason: Anthropic's API rejects OAuth requests for new models when the
 reported Claude Code version is too old ("version X or newer is required"). A
@@ -273,3 +274,96 @@ the industry CLIs also gate the picker behind an explicit resume action.
 
 Reason: the previous flat `/resume` list showed only ids and names, which
 made picking the right session impossible without opening journals by hand.
+
+### Windows-Only PowerShell Tool
+
+Rust does not ship upstream's `powershell` builtin tool. Upstream registers it
+on every platform, so `local-tools.json` lists it, but leaves it out of the
+default tool selection and executes it only on Windows: `getPowerShellConfig()`
+throws "The powershell tool is only available on Windows." elsewhere, and the
+CLI help describes it as "Execute PowerShell commands on Windows". The
+`local-tools.json` parity tests (`builtin_tools_cover_upstream_ts_names`,
+`model_tool_definitions_match_ts_local_tool_schema_keys`) exempt exactly this
+tool and fail once Rust defines it, so the exemption and this entry go together.
+
+Reason: pi targets Linux and macOS terminals, where the upstream tool can only
+fail, and Rust enables every builtin tool by default, so porting it would offer
+the model a tool that cannot run. `bash` covers shell execution on the supported
+platforms. Revisit if pi adds Windows support.
+
+### No MCP Support
+
+Rust has no Model Context Protocol client. Upstream's `pi mcp` command
+(`list`, `login`, `logout`, `add`, `remove`), the `/mcp` slash command, MCP
+tools, and `mcp.json` are not ported. `pi mcp` exits with an error instead of
+sending "mcp ..." to the model as a prompt, and `--no-mcp` is accepted as a
+documented no-op so upstream invocations keep working. The CLI contract test
+(`cli_contract_covers_upstream_ts_options_and_commands`) exempts exactly the
+`mcp` command and requires this entry.
+
+Reason: MCP is a large protocol surface (stdio and HTTP transports, OAuth,
+tool exposure modes, codemode) outside the native CLI/TUI scope today.
+Revisit if pi adds an MCP client.
+
+### Local `/bug` Reports for This Port
+
+`/bug [description]` writes `pi-bug-report-<id>.md` to the current directory
+(pi, OS, and terminal versions, model and provider configuration without
+credentials, extensions, redacted settings, configuration diagnostics, and
+errors shown in the session) and prints a new-issue link for
+https://github.com/noeljackson/pi/issues. Upstream uploads the report to its
+Radius gateway or exports a zip, can attach the transcript or a model-written
+summary, records a `pi.bug-report` session entry, attaches its crash log, and
+suggests `/bug` after unexplained errors. Rust does none of these; the
+transcript is shared only through an explicit `/export`. Error text is
+redacted before it is written: secret query values in any URL it mentions,
+`Bearer`/`Basic` credentials, and API-key-shaped tokens (`sk-…`, `AIza…`,
+GitHub, Slack, and AWS access key ids).
+
+Reason: upstream reports go to the upstream developers' service, while this
+port's bugs belong in its own tracker. A local file that the user reviews and
+attaches keeps upstream's consent model without network calls or a zip
+dependency.
+
+### `--use-theme` Takes One Theme Name
+
+`--use-theme <name>` selects the initial theme for one run without saving it,
+as Rust's `--theme` does. Upstream also accepts a `light/dark` pair and picks
+a half from the terminal's reported background. Rust has no terminal
+appearance detection, so it rejects pairs with an error, and a `light/dark`
+`theme` setting still falls back to the system theme with a diagnostic.
+`--use-theme` also conflicts with `--theme` and `--no-themes`: upstream
+combines them because its `--theme` loads theme files and `--no-themes` only
+skips discovery, while Rust's `--theme` selects the run's theme and
+`--no-themes` clears it, so one flag would silently override the other.
+
+Reason: choosing a half without asking the terminal would silently guess.
+
+### `pi auth` Named Accounts
+
+`pi auth check|print-api-key|print-bearer-token` follow upstream's options,
+output, and exit codes, and add `--account <name>` to choose one of pi's named
+accounts. Credentials resolve in pi's usual order (stored account,
+environment, imported CLI logins), so environment keys and imported logins
+count as configured; upstream's `--model` lookup and bearer-token printing
+consider only stored credentials. With `--account`, a `--model` several
+providers serve resolves to the providers that have that account.
+
+Reason: pi stores several accounts per provider (see Named Multi-Account
+auth.json), and `pi auth` should report the credential a session would use.
+
+### `pi auth` Refreshes Imported Logins Only Once They Expire
+
+`print-bearer-token` and `check` refresh pi's own OAuth tokens that expire
+within `--min-expiry` (default 30m) or five minutes, as upstream does. A login
+pi reads from Claude Code's `~/.claude/.credentials.json` or Codex's
+`~/.codex/auth.json` refreshes only once it expires, as on the request path;
+a sooner expiry is printed, or reported ready, with a warning on stderr.
+`check --json` adds `"expiresSoon": true` to a ready OAuth token that expires
+within five minutes, a field upstream's output lacks.
+
+Reason: those CLIs rotate single-use refresh tokens and pi never writes
+refreshed tokens back to their files, so an early refresh from `pi auth` would
+sign the user out of Claude Code or Codex. After pi refreshes such a login it
+keeps its own `claude-import`/`codex-import` account, which refreshes early
+like any stored account.

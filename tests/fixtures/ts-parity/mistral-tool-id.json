@@ -13,17 +13,16 @@
       "accept": "text/event-stream",
       "authorization": "Bearer <redacted>",
       "content-type": "application/json",
-      "cookie": "",
-      "user-agent": "mistral-client-typescript/2.2.6",
+      "user-agent": "pi (linux <kernel>; x64)",
       "x-affinity": "session_ts_parity"
     },
     "body": {
       "model": "devstral-medium-latest",
-      "max_tokens": 258005,
       "stream": true,
       "messages": [
         {
           "role": "assistant",
+          "prefix": false,
           "tool_calls": [
             {
               "id": "1j55k0s7o",
@@ -34,19 +33,18 @@
               },
               "index": 0
             }
-          ],
-          "prefix": false
+          ]
         },
         {
           "role": "tool",
+          "name": "read",
           "content": [
             {
               "type": "text",
               "text": "file contents"
             }
           ],
-          "tool_call_id": "1j55k0s7o",
-          "name": "read"
+          "tool_call_id": "1j55k0s7o"
         }
       ],
       "tools": [
@@ -55,7 +53,6 @@
           "function": {
             "name": "read",
             "description": "Read a file",
-            "strict": false,
             "parameters": {
               "type": "object",
               "required": [
@@ -66,10 +63,12 @@
                   "type": "string"
                 }
               }
-            }
+            },
+            "strict": false
           }
         }
       ],
+      "max_tokens": 257999,
       "prompt_cache_key": "session_ts_parity"
     }
   }

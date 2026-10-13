@@ -9,7 +9,7 @@ import type {
 	StreamFn,
 } from "/ts-reference/packages/agent/src/types.ts";
 import { getModel } from "/ts-reference/packages/ai/src/compat.ts";
-import { Type } from "/ts-reference/packages/ai/src/index.ts";
+import { getCurrentTools, Type } from "/ts-reference/packages/ai/src/index.ts";
 import { createAssistantMessageEventStream } from "/ts-reference/packages/ai/src/utils/event-stream.ts";
 
 type StreamCall = {
@@ -47,7 +47,10 @@ async function captureAgentToolLoop() {
 	const streamFn: StreamFn = (streamModel, context) => {
 		streamCalls.push({
 			roles: context.messages.map((message) => message.role),
-			toolNames: context.tools?.map((candidate) => candidate.name) ?? [],
+			// The stream context no longer has a `tools` field: transcript system
+			// messages declare model-callable tools (toolsAdded/toolsRemoved), so
+			// replay them to record what the model was offered.
+			toolNames: getCurrentTools(context.messages).map((candidate) => candidate.name),
 			lastRole: context.messages.at(-1)?.role ?? null,
 		});
 

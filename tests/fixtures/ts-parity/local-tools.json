@@ -35,6 +35,20 @@
       }
     },
     {
+      "name": "powershell",
+      "label": "powershell",
+      "promptSnippet": "Execute PowerShell commands",
+      "parameters": {
+        "properties": [
+          "command",
+          "timeout"
+        ],
+        "required": [
+          "command"
+        ]
+      }
+    },
+    {
       "name": "edit",
       "label": "edit",
       "promptSnippet": "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
