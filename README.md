@@ -782,9 +782,16 @@ pi login anthropic                 # PKCE authorize + paste-code flow
 pi login anthropic --account work
 ```
 
-`pi login openai-codex` stores the OAuth credential for both `openai` and
-`openai-codex` (mirroring the codex import mapping); `pi login anthropic`
-stores it for `anthropic`. Expiry and `account_id` come from the issued token
+`pi login openai-codex` stores the login for `openai-codex`, and
+`pi login anthropic` stores it for `anthropic`. A ChatGPT login is
+`openai-codex`'s credential and its only one; `openai` takes an API key
+(`pi login openai --api-key ...`, `OPENAI_API_KEY`, or the Codex CLI's
+`CODEX_API_KEY`). Neither provider's models count as available on the
+strength of the other's credential: with only a ChatGPT login pi starts on an
+`openai-codex` model, and a `--models` pattern, `/model <reference>`, or
+`set_model` does not reach `openai`'s. Earlier versions stored the ChatGPT
+login under `openai` as well; that copy is ignored and `pi logout openai`
+removes it. Expiry and `account_id` come from the issued token
 (JWT `exp` for Codex, `expires_in` for Claude), and the stored credentials
 refresh automatically when they expire, also in the middle of a turn: every
 model request resolves them anew. Importing credentials from
@@ -795,7 +802,7 @@ account replaces it.
 When no explicit API key is configured, `pi` can reuse existing CLI login credentials:
 
 - Claude Code: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, or `~/.claude/.credentials.json`
-- Codex/ChatGPT: `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json` for `openai` and `openai-codex`
+- Codex/ChatGPT: `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json` for `openai-codex`
 
 Explicit API keys still take precedence over login tokens. Imported OAuth
 credentials are refreshed automatically when they expire; refreshed tokens are
@@ -830,7 +837,7 @@ Provider-specific environment:
 
 - Azure OpenAI: set `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`; optionally set `AZURE_OPENAI_DEPLOYMENT_NAME`, `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`, and `AZURE_OPENAI_API_VERSION`.
 - Google Vertex: set `GOOGLE_CLOUD_PROJECT` or `GCLOUD_PROJECT`, plus `GOOGLE_CLOUD_LOCATION`.
-- Cloudflare: set `CLOUDFLARE_ACCOUNT_ID`; AI Gateway also needs `CLOUDFLARE_GATEWAY_ID`.
+- Cloudflare: set `CLOUDFLARE_ACCOUNT_ID`; AI Gateway also needs `CLOUDFLARE_GATEWAY_ID`. Without them the provider's models do not count as available, whatever key is set.
 - Amazon Bedrock: Rust direct calls currently use Bedrock bearer-token auth via `AWS_BEARER_TOKEN_BEDROCK`.
 - Claude Code OAuth: requests identify as `claude-cli/<version>`. The version tracks the latest published Claude Code release (fetched from the npm registry during model refresh, cached in `model-cache.json`); set `PI_CLAUDE_CODE_VERSION` to pin it.
 
@@ -884,9 +891,9 @@ cached models, and explicit `models.json` entries immediately, then starts a
 non-blocking background refresh when `modelRefresh.enabled` is not false,
 `PI_OFFLINE`/`--offline` is not set, the cache is older than `ttlHours`, and a
 provider has supported auth. `/reload` also kicks a refresh. Refreshed models
-are available after `/reload` or the next startup. Refresh covers `anthropic`,
-`openai`, and `openai-codex` (API key or OAuth login), plus the
-OpenAI-compatible `zai`, `zai-coding`, `moonshotai`, and `kimi-coding-openai`
+are available after `/reload` or the next startup. Refresh covers `anthropic`
+(API key or Claude login), `openai` (API key), and `openai-codex` (ChatGPT
+login), plus the OpenAI-compatible `zai`, `zai-coding`, `moonshotai`, and `kimi-coding-openai`
 endpoints via their API keys, each at the base URL the catalog gives the
 provider. Anthropic refresh paginates the official Models API; OAuth refresh
 is best-effort against the same provider auth paths used for model requests.

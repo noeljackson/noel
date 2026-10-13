@@ -2837,6 +2837,406 @@
       }
     }
   ],
+  "credentials": [
+    {
+      "name": "chatgpt-login-stored-for-openai-codex",
+      "input": {
+        "auth": {
+          "openai-codex": {
+            "type": "oauth",
+            "access": "fixture-access-token",
+            "refresh": "fixture-refresh-token",
+            "expires": 4102444800000
+          }
+        },
+        "env": {},
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "openai-codex"
+        ],
+        "initialModel": {
+          "provider": "openai-codex",
+          "id": "gpt-6.1-sol"
+        }
+      }
+    },
+    {
+      "name": "api-key-stored-for-openai",
+      "input": {
+        "auth": {
+          "openai": {
+            "type": "api_key",
+            "key": "sk-fixture"
+          }
+        },
+        "env": {},
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "openai"
+        ],
+        "initialModel": {
+          "provider": "openai",
+          "id": "gpt-5.5"
+        }
+      }
+    },
+    {
+      "name": "api-key-in-the-environment",
+      "input": {
+        "auth": {},
+        "env": {
+          "OPENAI_API_KEY": "sk-fixture"
+        },
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "openai"
+        ],
+        "initialModel": {
+          "provider": "openai",
+          "id": "gpt-5.5"
+        }
+      }
+    },
+    {
+      "name": "api-key-stored-for-openai-codex",
+      "input": {
+        "auth": {
+          "openai-codex": {
+            "type": "api_key",
+            "key": "sk-fixture"
+          }
+        },
+        "env": {},
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [],
+        "initialModel": null
+      }
+    },
+    {
+      "name": "chatgpt-login-beside-an-api-key",
+      "input": {
+        "auth": {
+          "openai-codex": {
+            "type": "oauth",
+            "access": "fixture-access-token",
+            "refresh": "fixture-refresh-token",
+            "expires": 4102444800000
+          }
+        },
+        "env": {
+          "OPENAI_API_KEY": "sk-fixture"
+        },
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "openai",
+          "openai-codex"
+        ],
+        "initialModel": {
+          "provider": "openai",
+          "id": "gpt-5.5"
+        }
+      }
+    },
+    {
+      "name": "api-key-stored-for-openai-codex-beside-an-api-key",
+      "input": {
+        "auth": {
+          "openai-codex": {
+            "type": "api_key",
+            "key": "sk-fixture"
+          }
+        },
+        "env": {
+          "OPENAI_API_KEY": "sk-fixture"
+        },
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "openai"
+        ],
+        "initialModel": {
+          "provider": "openai",
+          "id": "gpt-5.5"
+        }
+      }
+    },
+    {
+      "name": "chatgpt-sign-in-stored-for-openai",
+      "input": {
+        "auth": {
+          "openai": {
+            "type": "oauth",
+            "access": "fixture-access-token",
+            "refresh": "fixture-refresh-token",
+            "expires": 4102444800000
+          }
+        },
+        "env": {},
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "openai"
+        ],
+        "initialModel": {
+          "provider": "openai",
+          "id": "gpt-5.5"
+        }
+      }
+    },
+    {
+      "name": "claude-login-stored-for-anthropic",
+      "input": {
+        "auth": {
+          "anthropic": {
+            "type": "oauth",
+            "access": "fixture-access-token",
+            "refresh": "fixture-refresh-token",
+            "expires": 4102444800000
+          }
+        },
+        "env": {},
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "anthropic"
+        ],
+        "initialModel": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        }
+      }
+    },
+    {
+      "name": "api-key-stored-for-anthropic",
+      "input": {
+        "auth": {
+          "anthropic": {
+            "type": "api_key",
+            "key": "sk-fixture"
+          }
+        },
+        "env": {},
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "anthropic"
+        ],
+        "initialModel": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        }
+      }
+    },
+    {
+      "name": "claude-token-in-the-environment",
+      "input": {
+        "auth": {},
+        "env": {
+          "ANTHROPIC_OAUTH_TOKEN": "fixture-oauth-token"
+        },
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "anthropic"
+        ],
+        "initialModel": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        }
+      }
+    },
+    {
+      "name": "claude-login-beside-a-chatgpt-login",
+      "input": {
+        "auth": {
+          "anthropic": {
+            "type": "oauth",
+            "access": "fixture-access-token",
+            "refresh": "fixture-refresh-token",
+            "expires": 4102444800000
+          },
+          "openai-codex": {
+            "type": "oauth",
+            "access": "fixture-access-token",
+            "refresh": "fixture-refresh-token",
+            "expires": 4102444800000
+          }
+        },
+        "env": {},
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "anthropic",
+          "openai-codex"
+        ],
+        "initialModel": {
+          "provider": "anthropic",
+          "id": "claude-opus-4-8"
+        }
+      }
+    },
+    {
+      "name": "nothing",
+      "input": {
+        "auth": {},
+        "env": {},
+        "providers": [
+          "anthropic",
+          "openai",
+          "openai-codex"
+        ]
+      },
+      "expected": {
+        "configured": [],
+        "initialModel": null
+      }
+    },
+    {
+      "name": "cloudflare-key",
+      "input": {
+        "auth": {},
+        "env": {
+          "CLOUDFLARE_API_KEY": "fixture"
+        },
+        "providers": [
+          "cloudflare-workers-ai",
+          "cloudflare-ai-gateway"
+        ]
+      },
+      "expected": {
+        "configured": [],
+        "initialModel": null
+      }
+    },
+    {
+      "name": "cloudflare-key-and-account",
+      "input": {
+        "auth": {},
+        "env": {
+          "CLOUDFLARE_API_KEY": "fixture",
+          "CLOUDFLARE_ACCOUNT_ID": "fixture-account"
+        },
+        "providers": [
+          "cloudflare-workers-ai",
+          "cloudflare-ai-gateway"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "cloudflare-workers-ai"
+        ],
+        "initialModel": {
+          "provider": "cloudflare-workers-ai",
+          "id": "@cf/moonshotai/kimi-k2.6"
+        }
+      }
+    },
+    {
+      "name": "cloudflare-key-account-and-gateway",
+      "input": {
+        "auth": {},
+        "env": {
+          "CLOUDFLARE_API_KEY": "fixture",
+          "CLOUDFLARE_ACCOUNT_ID": "fixture-account",
+          "CLOUDFLARE_GATEWAY_ID": "fixture-gateway"
+        },
+        "providers": [
+          "cloudflare-workers-ai",
+          "cloudflare-ai-gateway"
+        ]
+      },
+      "expected": {
+        "configured": [
+          "cloudflare-workers-ai",
+          "cloudflare-ai-gateway"
+        ],
+        "initialModel": {
+          "provider": "cloudflare-workers-ai",
+          "id": "@cf/moonshotai/kimi-k2.6"
+        }
+      }
+    },
+    {
+      "name": "cloudflare-key-stored",
+      "input": {
+        "auth": {
+          "cloudflare-workers-ai": {
+            "type": "api_key",
+            "key": "sk-fixture"
+          }
+        },
+        "env": {},
+        "providers": [
+          "cloudflare-workers-ai",
+          "cloudflare-ai-gateway"
+        ]
+      },
+      "expected": {
+        "configured": [],
+        "initialModel": null
+      }
+    }
+  ],
   "globs": [
     {
       "pattern": "anthropic/*",
@@ -3139,6 +3539,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3186,6 +3587,7 @@
         "anthropic/claude-opus-4-8"
       ],
       "authenticated": [],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3237,6 +3639,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3288,6 +3691,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3335,6 +3739,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3387,6 +3792,7 @@
       "authenticated": [
         "openai"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3434,6 +3840,7 @@
       "authenticated": [
         "openai"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3499,6 +3906,7 @@
       "authenticated": [
         "google"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3553,6 +3961,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3604,6 +4013,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3655,6 +4065,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [
@@ -3702,6 +4113,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3753,6 +4165,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -3807,6 +4220,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [
@@ -3860,6 +4274,7 @@
       "authenticated": [
         "openai"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [
@@ -3925,6 +4340,7 @@
         "high"
       ],
       "authenticated": [],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [
@@ -3969,6 +4385,7 @@
         "mistral/new-model"
       ],
       "authenticated": [],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [
@@ -4015,6 +4432,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 1,
       "stderr": [
@@ -4033,6 +4451,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 1,
       "stderr": [
@@ -4049,6 +4468,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 1,
       "stderr": [
@@ -4062,6 +4482,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -4109,6 +4530,7 @@
         "openai",
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -4156,6 +4578,7 @@
         "openai",
         "anthropic"
       ],
+      "auth": {},
       "settings": {
         "defaultProvider": "openai",
         "defaultModel": "gpt-5.4"
@@ -4219,6 +4642,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {
         "defaultProvider": "openai",
         "defaultModel": "gpt-5.4"
@@ -4268,6 +4692,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {
         "defaultThinkingLevel": "high"
       },
@@ -4316,6 +4741,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {
         "defaultThinkingLevel": "high",
         "modelThinkingLevels": {
@@ -4370,6 +4796,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {
         "defaultThinkingLevel": "high",
         "modelThinkingLevels": {
@@ -4424,6 +4851,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -4469,6 +4897,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {
         "defaultProvider": "anthropic",
         "defaultModel": "claude-sonnet-5"
@@ -4518,6 +4947,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {
         "enabledModels": [
           "anthropic/claude-haiku-*",
@@ -4568,6 +4998,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {
         "enabledModels": [
           "anthropic/claude-haiku-*"
@@ -4623,6 +5054,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [
@@ -4676,6 +5108,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -4725,6 +5158,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -4900,6 +5334,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -4968,6 +5403,7 @@
         "anthropic",
         "openai"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -5231,6 +5667,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {
         "defaultThinkingLevel": "low",
         "modelThinkingLevels": {
@@ -5393,6 +5830,7 @@
       "authenticated": [
         "anthropic"
       ],
+      "auth": {},
       "settings": {},
       "exitCode": 0,
       "stderr": [],
@@ -5431,6 +5869,419 @@
           "response": {
             "success": false,
             "error": "Model not found: ANTHROPIC/claude-opus-4-8"
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "chatgpt-login",
+      "args": [],
+      "authenticated": [],
+      "auth": {
+        "openai-codex": {
+          "type": "oauth",
+          "access": "fixture-access-token",
+          "refresh": "fixture-refresh-token",
+          "expires": 4102444800000
+        }
+      },
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-6.1-sol",
+              "name": "GPT-6.1 Sol",
+              "api": "openai-codex-responses",
+              "provider": "openai-codex",
+              "baseUrl": "https://chatgpt.com/backend-api",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": null,
+                "minimal": "low",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 272000,
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
+                  }
+                ]
+              },
+              "contextWindow": 272000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "openai",
+            "modelId": "gpt-5.5"
+          },
+          "events": [],
+          "response": {
+            "success": false,
+            "error": "Model not found: openai/gpt-5.5"
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-6.1-sol",
+              "name": "GPT-6.1 Sol",
+              "api": "openai-codex-responses",
+              "provider": "openai-codex",
+              "baseUrl": "https://chatgpt.com/backend-api",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": null,
+                "minimal": "low",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 272000,
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
+                  }
+                ]
+              },
+              "contextWindow": 272000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "chatgpt-login-beside-an-api-key",
+      "args": [],
+      "authenticated": [
+        "openai"
+      ],
+      "auth": {
+        "openai-codex": {
+          "type": "oauth",
+          "access": "fixture-access-token",
+          "refresh": "fixture-refresh-token",
+          "expires": 4102444800000
+        }
+      },
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-5.5",
+              "name": "GPT-5.5",
+              "api": "openai-responses",
+              "provider": "openai",
+              "baseUrl": "https://api.openai.com/v1",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": null
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 30,
+                "cacheRead": 0.5,
+                "cacheWrite": 0,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 272000,
+                    "input": 10,
+                    "output": 45,
+                    "cacheRead": 1,
+                    "cacheWrite": 0
+                  }
+                ]
+              },
+              "contextWindow": 272000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "api-key",
+      "args": [],
+      "authenticated": [
+        "openai"
+      ],
+      "auth": {},
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-5.5",
+              "name": "GPT-5.5",
+              "api": "openai-responses",
+              "provider": "openai",
+              "baseUrl": "https://api.openai.com/v1",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": null
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 30,
+                "cacheRead": 0.5,
+                "cacheWrite": 0,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 272000,
+                    "input": 10,
+                    "output": 45,
+                    "cacheRead": 1,
+                    "cacheWrite": 0
+                  }
+                ]
+              },
+              "contextWindow": 272000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "openai-codex",
+            "modelId": "gpt-6.1-sol"
+          },
+          "events": [],
+          "response": {
+            "success": false,
+            "error": "Model not found: openai-codex/gpt-6.1-sol"
+          }
+        },
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "gpt-5.5",
+              "name": "GPT-5.5",
+              "api": "openai-responses",
+              "provider": "openai",
+              "baseUrl": "https://api.openai.com/v1",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "off": "none",
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+                "max": null
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 30,
+                "cacheRead": 0.5,
+                "cacheWrite": 0,
+                "tiers": [
+                  {
+                    "inputTokensAbove": 272000,
+                    "input": 10,
+                    "output": 45,
+                    "cacheRead": 1,
+                    "cacheWrite": 0
+                  }
+                ]
+              },
+              "contextWindow": 272000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "name": "api-key-stored-for-openai-codex",
+      "args": [],
+      "authenticated": [
+        "anthropic"
+      ],
+      "auth": {
+        "openai-codex": {
+          "type": "api_key",
+          "key": "sk-fixture"
+        }
+      },
+      "settings": {},
+      "exitCode": 0,
+      "stderr": [],
+      "exchanges": [
+        {
+          "command": {
+            "type": "get_state"
+          },
+          "events": [],
+          "response": {
+            "success": true,
+            "model": {
+              "id": "claude-opus-4-8",
+              "name": "Claude Opus 4.8",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
+              "reasoning": true,
+              "thinkingLevelMap": {
+                "xhigh": "xhigh",
+                "max": "max"
+              },
+              "input": [
+                "text",
+                "image"
+              ],
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25
+              },
+              "contextWindow": 1000000,
+              "maxTokens": 128000
+            },
+            "thinkingLevel": "medium"
+          }
+        },
+        {
+          "command": {
+            "type": "set_model",
+            "provider": "openai-codex",
+            "modelId": "gpt-6.1-sol"
+          },
+          "events": [],
+          "response": {
+            "success": false,
+            "error": "Model not found: openai-codex/gpt-6.1-sol"
           }
         },
         {
