@@ -75,6 +75,9 @@ tmux send-keys -t "${session}" '/models glm' Enter
 wait_for 'model selector'
 absent 'glm-bogus-from-cache'
 tmux send-keys -t "${session}" Escape
+# An Escape the TUI has not read yet is taken together with the input after
+# it, as a chord: type once the selector it closes is gone.
+absent '┌ model selector'
 wait_for '│ >'
 tmux send-keys -t "${session}" '/quit' Enter
 
