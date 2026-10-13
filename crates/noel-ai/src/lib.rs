@@ -270,6 +270,9 @@ pub enum ProviderError {
     Status {
         status: reqwest::StatusCode,
         body: String,
+        /// How long the answer asks the client to wait before asking again,
+        /// from its `retry-after-ms` or `retry-after` header.
+        retry_after: Option<Duration>,
     },
     #[error("invalid header value: {0}")]
     Header(#[from] reqwest::header::InvalidHeaderValue),
@@ -299,7 +302,7 @@ impl ProviderError {
     /// model's context window ([`is_context_overflow_text`]). Cerebras
     /// answers an overflow with a 400 or 413 without a body.
     pub fn is_context_overflow(&self, provider: &str) -> bool {
-        if let Self::Status { status, body } = self {
+        if let Self::Status { status, body, .. } = self {
             if provider == "cerebras"
                 && matches!(status.as_u16(), 400 | 413)
                 && body.trim().is_empty()
@@ -821,12 +824,18 @@ enum FauxScriptStep {
 }
 
 /// How a scripted request fails: a message is the body of an HTTP 503,
-/// which the agent retries; `status` and `body` are any other response.
+/// which the agent retries; `status` and `body` are any other response,
+/// with the wait a `retry-after-ms` header would ask for.
 #[derive(Debug, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 enum FauxScriptError {
     Overloaded(String),
-    Status { status: u16, body: String },
+    Status {
+        status: u16,
+        body: String,
+        #[serde(default)]
+        retry_after_ms: Option<u64>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -900,23 +909,28 @@ impl FauxScript {
                     })?;
                 }
                 FauxScriptStep::Error(error) => {
-                    let (status, body) = match error {
+                    let (status, body, retry_after) = match error {
                         FauxScriptError::Overloaded(message) => {
-                            (reqwest::StatusCode::SERVICE_UNAVAILABLE, message)
+                            (reqwest::StatusCode::SERVICE_UNAVAILABLE, message, None)
                         }
-                        FauxScriptError::Status { status, body } => {
+                        FauxScriptError::Status {
+                            status,
+                            body,
+                            retry_after_ms,
+                        } => {
                             let status = reqwest::StatusCode::from_u16(*status).map_err(|_| {
                                 ProviderError::Config(format!(
                                     "faux script {}: {status} is not an HTTP status",
                                     self.path.display()
                                 ))
                             })?;
-                            (status, body)
+                            (status, body, retry_after_ms.map(Duration::from_millis))
                         }
                     };
                     return Err(ProviderError::Status {
                         status,
                         body: body.clone(),
+                        retry_after,
                     });
                 }
                 FauxScriptStep::DelayMs(delay) => {
@@ -3244,8 +3258,31 @@ async fn error_for_status_with_body(
     if status.is_success() {
         return Ok(response);
     }
+    let retry_after = retry_after(response.headers());
     let body = response.text().await.unwrap_or_default();
-    Err(ProviderError::Status { status, body })
+    Err(ProviderError::Status {
+        status,
+        body,
+        retry_after,
+    })
+}
+
+/// How long an answer asks the client to wait, read as upstream's Codex
+/// provider reads it: `retry-after-ms`, else `retry-after` in seconds. A
+/// date in `retry-after` is not read.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+    };
+    let (value, unit) = match header("retry-after-ms") {
+        Some(millis) => (millis, 1000.0),
+        None => (header("retry-after")?, 1.0),
+    };
+    let seconds = value.parse::<f64>().ok()? / unit;
+    Duration::try_from_secs_f64(seconds.max(0.0)).ok()
 }
 
 struct SseStreamResult {
@@ -5177,6 +5214,7 @@ mod tests {
         let status = |status: u16, body: &str| ProviderError::Status {
             status: reqwest::StatusCode::from_u16(status).unwrap(),
             body: body.to_string(),
+            retry_after: None,
         };
         let invalid = |text: &str| ProviderError::InvalidResponse(text.to_string());
         for (error, retryable) in [
@@ -5240,10 +5278,47 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_reads_milliseconds_then_seconds() {
+        let wait = |headers: &[(&'static str, &str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in headers {
+                map.insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            retry_after(&map)
+        };
+        assert_eq!(wait(&[]), None);
+        assert_eq!(
+            wait(&[("retry-after", "30")]),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            wait(&[("retry-after", " 1.5 ")]),
+            Some(Duration::from_millis(1500))
+        );
+        // Milliseconds win, as upstream reads them first.
+        assert_eq!(
+            wait(&[("retry-after-ms", "250"), ("retry-after", "30")]),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(wait(&[("retry-after", "-5")]), Some(Duration::ZERO));
+        // A date, and values no wait can hold, are not read.
+        assert_eq!(
+            wait(&[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")]),
+            None
+        );
+        assert_eq!(wait(&[("retry-after", "inf")]), None);
+        assert_eq!(
+            wait(&[("retry-after-ms", "soon"), ("retry-after", "30")]),
+            None
+        );
+    }
+
+    #[test]
     fn context_overflow_is_read_from_the_error_text_and_cerebras_statuses() {
         let status = |status: u16, body: &str| ProviderError::Status {
             status: reqwest::StatusCode::from_u16(status).unwrap(),
             body: body.to_string(),
+            retry_after: None,
         };
         let overflow = status(400, r#"{"error":{"code":"context_length_exceeded"}}"#);
         assert!(overflow.is_context_overflow("openai"));

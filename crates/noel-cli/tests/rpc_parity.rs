@@ -1330,10 +1330,11 @@ fn a_retried_run_starts_over_under_its_run_id_and_settles_once() {
 
 /// With account failover on, a rate-limited account's request goes to the
 /// next account inside the provider. The run asks twice and has no retry:
-/// its records are those of a run that succeeded at once, and nothing else
-/// is written to stdout (`Noel::push` takes only JSON lines).
+/// its records are those of a run that succeeded at once, and one of
+/// upstream's notifications, which says which account took over and needs no
+/// answer. An answer is ignored, as upstream ignores one nothing waits for.
 #[test]
-fn a_failover_switch_is_not_a_retry_and_adds_no_record() {
+fn a_failover_switch_is_not_a_retry_and_is_reported_as_a_notification() {
     let run = |name: &str, script: Value, settings: Value| {
         let root = test_root(name);
         let account = |key: &str| json!({"type": "api_key", "key": key});
@@ -1343,21 +1344,52 @@ fn a_failover_switch_is_not_a_retry_and_adds_no_record() {
         let mut noel = Noel::spawn(root, script, &["--no-session"], settings);
         noel.command(json!({"id": "run", "type": "prompt", "message": "hi"}));
         noel.wait_for("agent_settled", 1);
-        assert!(noel.close().success());
         noel
     };
     let rate_limited = json!({"error": {"status": 429, "body": "rate limited"}});
-    let failover = run(
+    let mut failover = run(
         "failover-switch",
         json!([[rate_limited], [text("ok")]]),
         json!({"failover": {"enabled": true}}),
     );
     // The same two accounts without failover, and no rate limit.
-    let plain = run("failover-plain", json!([[text("ok")]]), json!({}));
+    let mut plain = run("failover-plain", json!([[text("ok")]]), json!({}));
+    assert!(plain.close().success());
+
+    let notification = of_type(&failover.records, "extension_ui_request")
+        .next()
+        .cloned()
+        .unwrap();
+    failover.command(json!({
+        "type": "extension_ui_response",
+        "id": notification["id"],
+        "cancelled": true,
+    }));
+    failover.command(json!({"id": "state", "type": "get_state"}));
+    failover.response("state");
+    assert!(failover.close().success());
 
     assert_eq!(failover.logged_requests().len(), 2);
     assert_eq!(plain.logged_requests().len(), 1);
-    assert_eq!(kinds(&failover.records), kinds(&plain.records));
+    // Before the reply: the switch is made in its request, after the prompt's
+    // records.
+    let mut kinds_with_notification = kinds(&plain.records);
+    let at = kinds_with_notification
+        .iter()
+        .position(|kind| *kind == "message_update")
+        .unwrap()
+        - 1;
+    kinds_with_notification.insert(at, "extension_ui_request");
+    kinds_with_notification.push("response");
+    assert_eq!(kinds(&failover.records), kinds_with_notification);
+    assert_eq!(notification["method"], "notify");
+    assert_eq!(notification["notifyType"], "warning");
+    let message = notification["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("faux account first is rate limited until ")
+            && message.ends_with(" UTC; switched to second"),
+        "{message}"
+    );
     assert_eq!(of_type(&failover.records, "auto_retry_start").count(), 0);
     let end = of_type(&failover.records, "agent_end").next().unwrap();
     assert_eq!(end["willRetry"], false);
