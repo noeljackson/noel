@@ -32,6 +32,28 @@ wait_for() {
   for _ in $(seq 1 120); do capture; if grep -Fq "$1" "${work_dir}/pane.txt"; then return; fi; sleep 0.1; done
   fail "missing selection marker: $1"
 }
+# The clipboard helper creates its file before it has written it, so a copy
+# is checked by waiting for the content, never as soon as the file exists.
+# Waits until the clipboard holds exactly $1; $2 says what failed otherwise.
+clipboard_is() {
+  local seen='no clipboard file'
+  for _ in $(seq 1 40); do
+    if [ -f "${work_dir}/clipboard.txt" ]; then
+      seen="'$(cat "${work_dir}/clipboard.txt")'"
+      if [ "${seen}" = "'$1'" ]; then return; fi
+    fi
+    sleep 0.1
+  done
+  fail "$2: the clipboard held ${seen}, not '$1'"
+}
+# Waits until the clipboard contains $1.
+clipboard_has() {
+  for _ in $(seq 1 40); do
+    if grep -Fqs "$1" "${work_dir}/clipboard.txt"; then return; fi
+    sleep 0.1
+  done
+  fail "$2: the clipboard lacks '$1'; it starts '$(head -c 200 "${work_dir}/clipboard.txt" 2>/dev/null)'"
+}
 mouse() { tmux send-keys -t "${session}" Escape "[<$1;$2;$3$4"; }
 select_row() {
   local marker="$1" row
@@ -51,16 +73,15 @@ marker="$(head -1 "${work_dir}/pane.txt" | sed -n 's/.*\(select-row-[0-9]*\).*/\
 [ -n "${marker}" ] || fail 'missing selectable top row'
 select_row "${marker}"
 wait_for 'copied selection'
-[ "$(cat "${work_dir}/clipboard.txt")" = "${marker}" ] || fail 'copy-on-release selected wrong text'
+clipboard_is "${marker}" 'copy-on-release selected wrong text'
 [ "$(head -1 "${work_dir}/pane.txt")" = "${anchor}" ] || fail 'selection moved reading anchor'
 wait_for '│ > retained selection draft'
 tmux capture-pane -t "${session}" -p -e > "${work_dir}/highlight.txt"
 grep -Eq '\[[0-9;]*7([;m])' "${work_dir}/highlight.txt" || fail 'selection was not highlighted'
 # Ctrl+C copies, rather than clearing the draft or quitting. /copy also uses selection.
-rm "${work_dir}/clipboard.txt"
+rm -f "${work_dir}/clipboard.txt"
 tmux send-keys -t "${session}" C-c
-for _ in $(seq 1 40); do [ -f "${work_dir}/clipboard.txt" ] && break; sleep 0.1; done
-[ "$(cat "${work_dir}/clipboard.txt")" = "${marker}" ]
+clipboard_is "${marker}" 'ctrl+c did not copy the selection'
 wait_for '│ > retained selection draft'
 # Preserve selection through reflow, then copy the selection with /copy.
 for size in '70 18' '100 24'; do
@@ -68,25 +89,23 @@ for size in '70 18' '100 24'; do
   tmux resize-window -t "${session}" -x "${width}" -y "${height}"
   sleep 0.3
   wait_for 'Scroll to bottom'
-  rm "${work_dir}/clipboard.txt"
+  rm -f "${work_dir}/clipboard.txt"
   tmux send-keys -t "${session}" C-c
-  for _ in $(seq 1 40); do [ -f "${work_dir}/clipboard.txt" ] && break; sleep 0.1; done
-  [ "$(cat "${work_dir}/clipboard.txt")" = "${marker}" ] || fail 'reflow changed copied selection'
+  clipboard_is "${marker}" 'reflow changed copied selection'
 done
 # Backspace edits the draft without clearing transcript selection.
 for _ in $(seq 1 24); do tmux send-keys -t "${session}" BSpace; done
-rm "${work_dir}/clipboard.txt"
+rm -f "${work_dir}/clipboard.txt"
 tmux send-keys -t "${session}" '/copy' Enter
-for _ in $(seq 1 40); do [ -f "${work_dir}/clipboard.txt" ] && break; sleep 0.1; done
-[ "$(cat "${work_dir}/clipboard.txt")" = "${marker}" ] || fail '/copy ignored selection'
+clipboard_is "${marker}" '/copy ignored selection'
 tmux send-keys -t "${session}" Escape
 sleep 0.3
 wait_for select-row-080
 tmux send-keys -t "${session}" '/copy' Enter
 wait_for 'copied to clipboard via'
 # No selection: /copy keeps its existing last-response behavior.
-grep -Fq select-row-001 "${work_dir}/clipboard.txt"
-grep -Fq select-row-080 "${work_dir}/clipboard.txt"
+clipboard_has select-row-001 '/copy without a selection did not copy the last response'
+clipboard_has select-row-080 '/copy without a selection did not copy the last response'
 # Failed copy stays visible and keeps selection available for Ctrl+C retry.
 tmux send-keys -t "${session}" PPage
 wait_for 'Scroll to bottom'
@@ -97,7 +116,7 @@ wait_for 'copy failed:'
 rm "${work_dir}/fail-copy"
 tmux send-keys -t "${session}" C-c
 wait_for 'copied selection'
-[ "$(cat "${work_dir}/clipboard.txt")" = "${marker}" ]
+clipboard_is "${marker}" 'ctrl+c did not retry the failed copy'
 # Clicking the composer clears the selection without touching its draft.
 tmux send-keys -t "${session}" -l 'composer draft'
 wait_for '│ > composer draft'
@@ -133,6 +152,7 @@ done
 [ -n "${completed}" ] || fail 'selection interrupted streaming'
 tmux send-keys -t "${session}" Escape
 wait_for '│ >'
+clipboard_is "${marker}" 'the selection in live output was not copied'
 tmux load-buffer -b "${session}" "${work_dir}/clipboard.txt"
 tmux paste-buffer -r -p -d -b "${session}" -t "${session}"
 wait_for "│ > ${marker}"
