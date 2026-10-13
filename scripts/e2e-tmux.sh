@@ -1116,6 +1116,9 @@ wait_for "+6 more (3 pending, 3 done)"
 modern_capture
 for marker in "Todo" "+6 more (3 pending, 3 done)" "active-task" "❯ recall queued fixture" "│ >" "╭" "╰"; do modern_require "${marker}"; done
 tmux resize-window -t "${modern_session}" -x 100 -y 40
+# A resize and a key that reach the TUI together can leave the key unread
+# until more input arrives, so Up is sent once the taller frame is drawn.
+wait_for "+3 more (3 done)"
 tmux send-keys -t "${modern_session}" Up
 wait_for "│ > recall queued fixture"
 modern_capture
