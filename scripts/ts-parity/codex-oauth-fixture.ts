@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
+import { stableUserAgent } from "./user-agent.ts";
 
 type CapturedRequest = {
 	url: string;
@@ -70,14 +71,17 @@ async function captureCodexOAuthRequest(): Promise<CapturedRequest> {
 	};
 
 	try {
-		const [{ getModel }, { stream }] = await Promise.all([
+		const [{ getModel }, { stream }, { normalizeContext }] = await Promise.all([
 			import("/ts-reference/packages/ai/src/compat.ts"),
 			import("/ts-reference/packages/ai/src/api/openai-codex-responses.ts"),
+			import("/ts-reference/packages/ai/src/utils/transcript.ts"),
 		]);
 		const model = getModel("openai-codex", "gpt-5.5");
 		const response = stream(
 			model,
-			{
+			// The API-level stream takes a transcript: fold the system prompt into
+			// the leading system message, as the public entry points do.
+			normalizeContext({
 				systemPrompt: "pi rust cli",
 				messages: [
 					{
@@ -86,7 +90,7 @@ async function captureCodexOAuthRequest(): Promise<CapturedRequest> {
 						timestamp: 0,
 					},
 				],
-			},
+			}),
 			{
 				apiKey: fakeChatGptToken("acct_ts_parity"),
 				reasoningEffort: "xhigh",
@@ -110,12 +114,7 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 		sanitized.authorization = "Bearer <redacted>";
 	}
 	if (sanitized["user-agent"]) {
-		// The TS client embeds the host kernel release, which makes fixtures
-		// drift on every kernel upgrade; pin it to a stable placeholder.
-		sanitized["user-agent"] = sanitized["user-agent"].replace(
-			/(linux )[^;]+(;)/,
-			"$1<kernel>$2",
-		);
+		sanitized["user-agent"] = stableUserAgent(sanitized["user-agent"]);
 	}
 	return sanitized;
 }

@@ -864,27 +864,41 @@ fn openrouter_reasoning_effort(level: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Upstream catalog limits `(maxTokens, contextWindow)` for the models whose
+/// requests carry an explicit output cap (TS `packages/ai/src/providers/data`).
+fn catalog_output_limits(provider: &str, id: &str) -> Option<(u64, u64)> {
+    match (provider, id) {
+        ("openai", "gpt-5.4") => Some((128_000, 272_000)),
+        ("github-copilot", "gpt-5.4") => Some((128_000, 1_000_000)),
+        ("google", "gemini-2.5-pro") => Some((65_536, 1_048_576)),
+        ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1") => Some((128_000, 1_000_000)),
+        ("mistral", "devstral-medium-latest") => Some((262_144, 262_144)),
+        ("openrouter", "moonshotai/kimi-k2.6") => Some((235_929, 262_144)),
+        ("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") => {
+            Some((256_000, 262_144))
+        }
+        _ => None,
+    }
+}
+
 /// Tokens upstream keeps free for the request beyond its estimate
 /// (`CONTEXT_SAFETY_TOKENS`).
 const CONTEXT_SAFETY_TOKENS: u64 = 4_096;
 
+/// Upstream `clampMaxTokensToContext` (`packages/ai/src/api/simple-options.ts`):
+/// the catalog `maxTokens`, lowered so the estimated input plus the answer fit
+/// the context window.
 fn provider_max_tokens(config: &ProviderConfig, request: &ProviderRequest) -> Option<u64> {
     if let Some(limit) = request.max_output_tokens {
         return Some(limit.max(1));
     }
-    match (config.model.provider.as_str(), config.model.id.as_str()) {
-        ("openai", "gpt-5.4") | ("github-copilot", "gpt-5.4") => Some(128_000),
-        ("google", "gemini-2.5-pro") => Some(65_536),
-        ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1") => Some(128_000),
-        ("mistral", "devstral-medium-latest") => Some(if request.tools.is_empty() {
-            258_043
-        } else {
-            258_001
-        }),
-        ("openrouter", "moonshotai/kimi-k2.6") => Some(258_043),
-        ("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") => Some(251_899),
-        _ => None,
-    }
+    let (max_tokens, context_window) =
+        catalog_output_limits(config.model.provider.as_str(), config.model.id.as_str())?;
+    let available = context_window
+        .saturating_sub(estimate_request_tokens(request))
+        .saturating_sub(CONTEXT_SAFETY_TOKENS)
+        .max(1);
+    Some(max_tokens.min(available))
 }
 
 /// Upstream `estimateContextTokens` (`packages/ai/src/utils/estimate.ts`)
@@ -1379,7 +1393,8 @@ fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 
 /// Minimum version accepted for current OAuth-gated models; the CLI replaces
 /// this with the latest published Claude Code version whenever it can reach
-/// the npm registry.
+/// the npm registry. Matches the `claudeCodeVersion` upstream pins in
+/// `packages/ai/src/api/anthropic-messages.ts`.
 pub const DEFAULT_CLAUDE_CODE_VERSION: &str = "2.1.280";
 pub const CLAUDE_CODE_VERSION_ENV: &str = "PI_CLAUDE_CODE_VERSION";
 
@@ -1884,10 +1899,7 @@ impl MistralProvider {
 fn mistral_headers(config: &ProviderConfig, api_key: &str) -> Result<HeaderMap, ProviderError> {
     let mut headers = bearer_headers(api_key)?;
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static("mistral-client-typescript/2.2.6"),
-    );
+    headers.insert(USER_AGENT, HeaderValue::from_str(pi_user_agent())?);
     if let Some(session_id) = &config.session_id {
         headers.insert("x-affinity", HeaderValue::from_str(session_id)?);
     }
@@ -2569,6 +2581,71 @@ fn bearer_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
     );
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(headers)
+}
+
+/// Upstream `getPiUserAgent()` (`packages/ai/src/utils/pi-user-agent.ts`):
+/// `pi (<platform> <release>; <arch>)` using Node's `os` names.
+fn pi_user_agent() -> &'static str {
+    static PI_USER_AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PI_USER_AGENT.get_or_init(|| {
+        format_pi_user_agent(
+            node_platform(env::consts::OS),
+            &os_release(),
+            node_arch(env::consts::ARCH),
+        )
+    })
+}
+
+fn format_pi_user_agent(platform: &str, release: &str, arch: &str) -> String {
+    format!("pi ({platform} {release}; {arch})")
+}
+
+/// Node's `os.platform()` name for a Rust target OS.
+fn node_platform(os: &str) -> &str {
+    match os {
+        "macos" => "darwin",
+        "windows" => "win32",
+        "solaris" | "illumos" => "sunos",
+        other => other,
+    }
+}
+
+/// Node's `os.arch()` name for a Rust target architecture.
+fn node_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        "aarch64" => "arm64",
+        "loongarch64" => "loong64",
+        "powerpc" => "ppc",
+        "powerpc64" => "ppc64",
+        other => other,
+    }
+}
+
+/// Node's `os.release()`: the kernel release `uname -r` reports, limited to
+/// header-safe characters, or "unknown".
+pub fn os_release() -> String {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("uname")
+                .arg("-r")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+        })
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .filter(char::is_ascii_graphic)
+        .collect::<String>();
+    if release.is_empty() {
+        "unknown".to_string()
+    } else {
+        release
+    }
 }
 
 fn openai_compatible_headers(
@@ -3863,7 +3940,9 @@ fn google_inline_data_part(media: &MediaInput) -> Value {
 }
 
 fn google_requires_tool_call_id(model_id: &str) -> bool {
-    model_id.starts_with("claude-") || model_id.starts_with("gpt-oss-")
+    model_id.starts_with("claude-")
+        || model_id.starts_with("gpt-oss-")
+        || google_gemini_major_version(model_id).is_some_and(|major| major >= 3)
 }
 
 fn google_supports_multimodal_function_response(model_id: &str) -> bool {
@@ -3942,6 +4021,47 @@ mod tests {
             ..request
         };
         assert_eq!(provider_max_tokens(&config, &regular), Some(128_000));
+    }
+
+    #[test]
+    fn provider_max_tokens_leaves_room_for_the_input() {
+        let config = ProviderConfig {
+            model: ModelRef {
+                provider: "cloudflare-ai-gateway".to_string(),
+                id: "workers-ai/@cf/moonshotai/kimi-k2.6".to_string(),
+            },
+            api: ProviderApi::OpenAi,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+        };
+        let request = |content: &str| ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: Some("pi rust cli".to_string()),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: content.to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+        };
+        // Small input: the catalog cap.
+        assert_eq!(
+            provider_max_tokens(&config, &request("hello")),
+            Some(256_000)
+        );
+        // 300k characters estimate as 85_715 tokens; with the 4 for the system
+        // prompt and the 4096 safety margin, 172_329 remain for the answer.
+        let long = "x".repeat(300_000);
+        assert_eq!(provider_max_tokens(&config, &request(&long)), Some(172_329));
+        // An input past the window still asks for one token, as upstream does.
+        let huge = "x".repeat(1_000_000);
+        assert_eq!(provider_max_tokens(&config, &request(&huge)), Some(1));
     }
 
     #[test]
@@ -5551,8 +5671,9 @@ mod tests {
     #[test]
     fn anthropic_claude_code_oauth_matches_ts_identity_shape() {
         // The runtime version tracks the latest published Claude Code release;
-        // pin it to the fixture's value to compare the identity shape.
-        set_claude_code_version("2.1.75");
+        // pin it to the compiled fallback, which must equal upstream's pinned
+        // version, to compare the identity shape.
+        set_claude_code_version(DEFAULT_CLAUDE_CODE_VERSION);
         let fixture = serde_json::from_str::<Value>(include_str!(
             "../../../tests/fixtures/ts-parity/anthropic-claude-code-oauth.json"
         ))
@@ -6364,13 +6485,28 @@ mod tests {
         let fixture_request = &fixture["request"];
         let headers = mistral_headers(&config, "mistral-key").expect("headers");
 
-        for name in ["accept", "content-type", "user-agent", "x-affinity"] {
+        for name in ["accept", "content-type", "x-affinity"] {
             assert_eq!(
                 headers.get(name).and_then(|value| value.to_str().ok()),
                 fixture_request["headers"][name].as_str(),
                 "header {name}"
             );
         }
+        // The fixture was captured on Linux x86_64 with the kernel release
+        // pinned to `<kernel>`; Rust sends the same identity for its own host.
+        assert_eq!(
+            headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(pi_user_agent())
+        );
+        assert_eq!(
+            Some(
+                format_pi_user_agent(node_platform("linux"), "<kernel>", node_arch("x86_64"))
+                    .as_str()
+            ),
+            fixture_request["headers"]["user-agent"].as_str()
+        );
         assert!(headers.get(AUTHORIZATION).is_some());
 
         let body = mistral_chat_body(&config, &request);

@@ -1223,3 +1223,265 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
     assert_eq!(loaded.usage.requests, 4);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn upstream_v1_1_flags_are_accepted_in_print_mode() {
+    let root = test_dir("pi-cli-v1-1-flags");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    let run = |extra: &[&str]| {
+        pi_command()
+            .current_dir(&root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .args(["--offline", "--no-session", "-p", "--model", "faux/echo"])
+            .args(extra)
+            .arg("hello")
+            .output()
+            .unwrap()
+    };
+
+    let output = run(&["--no-mcp", "--tui-mode", "regular", "--use-theme", "light"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[faux/echo] hello\n"
+    );
+    assert!(!agent.join("settings.json").exists());
+
+    let pair = run(&["--use-theme", "light/dark"]);
+    assert!(!pair.status.success());
+    assert!(String::from_utf8_lossy(&pair.stderr).contains("theme pairs are not supported"));
+    for args in [
+        &["--no-themes", "--use-theme", "light"][..],
+        &["--theme", "dark", "--use-theme", "light"],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cannot be used with") && stderr.contains("--use-theme"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let invalid_mode = run(&["--tui-mode", "split"]);
+    assert!(!invalid_mode.status.success());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mcp_command_reports_missing_support_instead_of_prompting() {
+    let output = pi_command().args(["mcp", "list"]).output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no MCP support"));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn auth_commands_print_and_check_stored_credentials() {
+    let root = test_dir("pi-cli-auth-command");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        agent.join("auth.json"),
+        r#"{"anthropic":{"default":{"type":"api_key","key":"sk-ant-synthetic"}}}"#,
+    )
+    .unwrap();
+    let auth = |args: &[&str]| {
+        pi_command()
+            .current_dir(&root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .env("HOME", &root)
+            .arg("auth")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let stdout =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).to_string();
+
+    let help = auth(&["--help"]);
+    assert!(help.status.success());
+    assert!(stdout(&help).contains("pi auth print-bearer-token"));
+
+    let key = auth(&["print-api-key", "--provider", "anthropic"]);
+    assert!(key.status.success(), "{}", stderr(&key));
+    assert_eq!(stdout(&key), "sk-ant-synthetic\n");
+
+    let ready = auth(&["check", "--provider", "anthropic", "--json"]);
+    assert_eq!(ready.status.code(), Some(0), "{}", stderr(&ready));
+    assert_eq!(
+        stdout(&ready),
+        "{\"status\":\"ready\",\"provider\":\"anthropic\",\"authType\":\"api_key\"}\n"
+    );
+
+    let not_ready = auth(&["check", "--provider", "mistral"]);
+    assert_eq!(not_ready.status.code(), Some(1), "{}", stderr(&not_ready));
+    assert_eq!(stdout(&not_ready), "not_ready\n");
+
+    let bearer = auth(&["print-bearer-token", "--provider", "anthropic"]);
+    assert_eq!(bearer.status.code(), Some(1));
+    assert!(stderr(&bearer).contains("is not configured with an OAuth bearer token"));
+    assert!(stdout(&bearer).is_empty());
+
+    // Exit statuses follow upstream: argument errors make a check invalid (2)
+    // and a print fail (1), while an unknown command or option exits 1 for
+    // every kind (upstream pins `auth check --credentails` to 1).
+    let missing = auth(&["check"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(stderr(&missing).contains("Auth checks require --provider"));
+    let positional = auth(&["check", "--provider", "anthropic", "extra"]);
+    assert_eq!(positional.status.code(), Some(2), "{}", stderr(&positional));
+    let missing = auth(&["print-api-key"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("Credential printing requires --provider"));
+
+    let unknown = auth(&["status"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(stderr(&unknown).contains("Unknown auth command \"status\""));
+    let misspelled = auth(&["check", "--provider", "anthropic", "--credentails"]);
+    assert_eq!(misspelled.status.code(), Some(1));
+    assert!(stderr(&misspelled).contains("Unknown option --credentails for \"auth check\"."));
+    assert!(stdout(&misspelled).is_empty());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Claude Code and Codex logins pi reads from their own files: refreshing one
+/// early would spend that CLI's single-use refresh token and sign it out.
+#[test]
+fn auth_commands_leave_imported_logins_unrefreshed_until_they_expire() {
+    use base64::Engine as _;
+
+    let root = test_dir("pi-cli-auth-imports");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    fs::create_dir_all(root.join(".codex")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claude_login = |expires: u64| {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"claude-code-access","refreshToken":"claude-code-refresh","expiresAt":{}}}}}"#,
+            expires * 1000
+        )
+    };
+    let jwt_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(format!(r#"{{"exp":{}}}"#, now + 600));
+    let codex_access = format!("eyJhbGciOiJub25lIn0.{jwt_payload}.signature");
+    let codex_login = format!(
+        r#"{{"tokens":{{"access_token":"{codex_access}","refresh_token":"codex-refresh","account_id":"account"}}}}"#
+    );
+    fs::write(root.join(".codex/auth.json"), &codex_login).unwrap();
+    let auth = |args: &[&str]| {
+        let mut command = pi_command();
+        command
+            .current_dir(&root)
+            .env("HOME", &root)
+            .env("PI_CODING_AGENT_DIR", &agent)
+            // PI_TEST_ISOLATION switches the login import off. This test
+            // checks that import against login files in its own HOME, so it
+            // runs without the marker.
+            .env_remove("PI_TEST_ISOLATION")
+            // Any refresh attempt fails locally instead of reaching a real token endpoint.
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("https_proxy", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env("all_proxy", "http://127.0.0.1:9");
+        for name in [
+            "NO_PROXY",
+            "no_proxy",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ] {
+            command.env_remove(name);
+        }
+        command.arg("auth").args(args).output().unwrap()
+    };
+    let stdout =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Ten minutes left is under the 30m default, but the login is printed
+    // unrefreshed with a warning.
+    fs::write(
+        root.join(".claude/.credentials.json"),
+        claude_login(now + 600),
+    )
+    .unwrap();
+    let claude = auth(&["print-bearer-token", "--provider", "anthropic"]);
+    assert_eq!(claude.status.code(), Some(0), "{}", stderr(&claude));
+    assert_eq!(stdout(&claude), "claude-code-access\n");
+    for expected in [
+        "Warning: the anthropic OAuth token from Claude Code expires in ",
+        "sooner than the requested 30m",
+        "so Claude Code stays signed in",
+    ] {
+        assert!(stderr(&claude).contains(expected), "{}", stderr(&claude));
+    }
+    let codex = auth(&["print-bearer-token", "--provider", "openai-codex"]);
+    assert_eq!(codex.status.code(), Some(0), "{}", stderr(&codex));
+    assert_eq!(stdout(&codex), format!("{codex_access}\n"));
+    assert!(
+        stderr(&codex).contains("from Codex expires in"),
+        "{}",
+        stderr(&codex)
+    );
+
+    // Three minutes left: enough for a 1m request, so no warning; a check
+    // reports it ready but expiring soon.
+    fs::write(
+        root.join(".claude/.credentials.json"),
+        claude_login(now + 180),
+    )
+    .unwrap();
+    let short = auth(&[
+        "print-bearer-token",
+        "--provider",
+        "anthropic",
+        "--min-expiry",
+        "1m",
+    ]);
+    assert_eq!(short.status.code(), Some(0), "{}", stderr(&short));
+    assert_eq!(stdout(&short), "claude-code-access\n");
+    assert!(stderr(&short).is_empty(), "{}", stderr(&short));
+    let json = auth(&["check", "--provider", "anthropic", "--json"]);
+    assert_eq!(json.status.code(), Some(0), "{}", stderr(&json));
+    assert_eq!(
+        stdout(&json),
+        "{\"status\":\"ready\",\"provider\":\"anthropic\",\"authType\":\"oauth\",\"expiresSoon\":true}\n"
+    );
+    assert!(stderr(&json).is_empty(), "{}", stderr(&json));
+    let text = auth(&["check", "--provider", "anthropic"]);
+    assert_eq!(text.status.code(), Some(0), "{}", stderr(&text));
+    assert_eq!(stdout(&text), "ready\n");
+    assert!(
+        stderr(&text).contains("Warning: the anthropic OAuth token from Claude Code expires in"),
+        "{}",
+        stderr(&text)
+    );
+
+    // Nothing was refreshed: pi stored no copy and the logins are untouched.
+    assert!(!agent.join("auth.json").exists());
+    assert_eq!(
+        fs::read_to_string(root.join(".claude/.credentials.json")).unwrap(),
+        claude_login(now + 180)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".codex/auth.json")).unwrap(),
+        codex_login
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

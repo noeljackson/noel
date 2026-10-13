@@ -3,10 +3,12 @@ set -euo pipefail
 
 # Live queue dispatch against a delayed faux provider, without transcript dumps.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/e2e-isolate.sh
+source "${repo_root}/scripts/e2e-isolate.sh"
 pi_bin="${PI_BIN:-${repo_root}/target/debug/pi}"
-work_dir="$(mktemp -d "${repo_root}/target/e2e-queue.XXXXXX")"
+work_dir="$(mktemp -d "${e2e_root}/e2e-queue.XXXXXX")"
 session="pi-e2e-queue-${$}"
-trap 'tmux kill-session -t "${session}" >/dev/null 2>&1 || true' EXIT
+trap 'e2e_status=$?; tmux kill-session -t "${session}" >/dev/null 2>&1 || true; e2e_isolation_cleanup "${e2e_status}"' EXIT
 
 capture() { tmux capture-pane -t "${session}" -p > "${case_dir}/pane.txt"; }
 fail() { capture; cat "${case_dir}/pane.txt" >&2; echo "$* (artifacts: ${work_dir})" >&2; exit 1; }

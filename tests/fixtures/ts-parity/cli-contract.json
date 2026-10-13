@@ -71,6 +71,9 @@
       "short": "ne"
     },
     {
+      "long": "no-mcp"
+    },
+    {
       "long": "no-prompt-templates",
       "short": "np"
     },
@@ -131,6 +134,12 @@
       "short": "t"
     },
     {
+      "long": "tui-mode"
+    },
+    {
+      "long": "use-theme"
+    },
+    {
       "long": "verbose"
     },
     {
@@ -139,9 +148,11 @@
     }
   ],
   "commands": [
+    "auth",
     "config",
     "install",
     "list",
+    "mcp",
     "remove",
     "uninstall",
     "update"
