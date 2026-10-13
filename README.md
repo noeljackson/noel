@@ -833,6 +833,52 @@ own accounts, including saved `claude-import`/`codex-import` copies, refresh
 early. pi has no MCP support, so `--no-mcp` is accepted and does
 nothing, and `pi mcp` exits with an error.
 
+### Account failover
+
+With more than one stored account for a provider, `pi` can fail over between
+them when one is rate limited, instead of retrying that account:
+
+```json
+{ "failover": { "enabled": true } }
+```
+
+Failover is availability-only, not load balancing: one sticky account carries
+the session and the others are used only when it returns 429/529 with no
+streamed output, or when its 5h usage window is at/above the exhaustion
+threshold (default 90%). Cooldowns come from the provider's own reset
+timestamps, and voluntary switches are rate-limited (default one per 10s) so
+the pool never flaps. Requests are never spread across accounts to maximize
+throughput. Per-provider tuning: `failover.providers.anthropic.exhaustionThresholdPct`
+and `minSwitchIntervalMs`. Pinning an account with `/account name` disables
+rotation for that session; run `pi help failover` for the summary.
+
+Four statements in that paragraph describe the design and are not wired yet:
+
+- The 5h usage window and `exhaustionThresholdPct` are not consulted. An
+  account at or over the threshold still serves until it answers 429 or 529.
+- A rate-limited account cools down for a fixed 300 seconds. No reset
+  timestamp is read.
+- The switch-rate limit and `minSwitchIntervalMs` have no effect: the pool is
+  built for each request, and its clock with it.
+- `pi help failover` is not a command.
+
+A switch is made inside the request, before [run recovery](#run-recovery)
+sees a failure: it is not a retry and waits for no backoff. When every account
+is rate limited the turn ends at once with each account's error, and until a
+cooldown ends requests fail with `no accounts available for failover`; neither
+is retried. Any other failure, and a reply that breaks off, stays on the
+sticky account and is retried as run recovery describes. The pool holds the
+accounts the provider takes: an API key stored under `openai-codex`, or a
+ChatGPT login stored under `openai`, is not one of them. Failover does not
+make a provider's models available: as without it, that takes an account
+named `default`, an environment key or an imported login, and with named
+accounts only the model has to be given with `--model`. The TUI reports a
+cooldown as a system line after the turn; print and RPC mode report nothing.
+
+Pooled subscriptions remain subject to each provider's terms: failover is
+intended for accounts you are individually entitled to use, and the sticky
+behavior exists so the client does not multiply quota by rotation.
+
 Provider-specific environment:
 
 - Azure OpenAI: set `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`; optionally set `AZURE_OPENAI_DEPLOYMENT_NAME`, `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`, and `AZURE_OPENAI_API_VERSION`.
@@ -1262,8 +1308,10 @@ print mode, and RPC mode alike:
   `retry.baseDelayMs`, `retry.maxAgentDelayMs`). Other failures end the turn
   at once: 400, 401, 403, and 404 responses, other statuses whose body names
   nothing transient, a missing credential, and quota or billing limits even
-  when they arrive as a 429. The rules are upstream's
-  patterns over the error text (`error-classification.json`). When retries
+  when they arrive as a 429. With [account failover](#account-failover) on,
+  a 429 or 529 before any output goes to another account first. The rules
+  are upstream's patterns over the error text
+  (`error-classification.json`). When retries
   run out, the error names the likely causes, including a local firewall
   that denies connections from a freshly built binary until its prompt is
   approved, because on default-deny hosts an unanswered prompt is

@@ -1325,6 +1325,43 @@ fn a_retried_run_starts_over_under_its_run_id_and_settles_once() {
     assert_eq!(settled(&pi.records)[0]["runId"], run_id);
 }
 
+/// With account failover on, a rate-limited account's request goes to the
+/// next account inside the provider. The run asks twice and has no retry:
+/// its records are those of a run that succeeded at once, and nothing else
+/// is written to stdout (`Pi::push` takes only JSON lines).
+#[test]
+fn a_failover_switch_is_not_a_retry_and_adds_no_record() {
+    let run = |name: &str, script: Value, settings: Value| {
+        let root = test_root(name);
+        let account = |key: &str| json!({"type": "api_key", "key": key});
+        let auth =
+            json!({"faux": {"first": account("first-key"), "second": account("second-key")}});
+        fs::write(root.join("agent/auth.json"), auth.to_string()).unwrap();
+        let mut pi = Pi::spawn(root, script, &["--no-session"], settings);
+        pi.command(json!({"id": "run", "type": "prompt", "message": "hi"}));
+        pi.wait_for("agent_settled", 1);
+        assert!(pi.close().success());
+        pi
+    };
+    let rate_limited = json!({"error": {"status": 429, "body": "rate limited"}});
+    let failover = run(
+        "failover-switch",
+        json!([[rate_limited], [text("ok")]]),
+        json!({"failover": {"enabled": true}}),
+    );
+    // The same two accounts without failover, and no rate limit.
+    let plain = run("failover-plain", json!([[text("ok")]]), json!({}));
+
+    assert_eq!(failover.logged_requests().len(), 2);
+    assert_eq!(plain.logged_requests().len(), 1);
+    assert_eq!(kinds(&failover.records), kinds(&plain.records));
+    assert_eq!(of_type(&failover.records, "auto_retry_start").count(), 0);
+    let end = of_type(&failover.records, "agent_end").next().unwrap();
+    assert_eq!(end["willRetry"], false);
+    let reply = end["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(reply["content"][0]["text"], "ok", "{reply}");
+}
+
 #[test]
 fn retry_commands_answer_whether_or_not_a_retry_is_waiting() {
     let mut pi = Pi::start(
