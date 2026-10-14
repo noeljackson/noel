@@ -2,6 +2,7 @@
 members = [
     "crates/noel-agent",
     "crates/noel-ai",
+    "crates/noel-chord",
     "crates/noel-cli",
     "crates/noel-config",
     "crates/noel-core",

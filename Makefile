@@ -6,6 +6,10 @@ RUST_CI_IMAGE ?= noel-rust-ci:1.99.0
 TS_REFERENCE_REPO ?= https://github.com/earendil-works/pi.git
 TS_REFERENCE_REF ?= main
 TS_PARITY_TRACKING_REF ?= main
+# chord-delta.json is pinned to this upstream commit, whatever TS_REFERENCE_REF
+# is. ts-parity-drift reports packages/chord commits on the tracking ref that
+# came after it; move the pin here and regenerate.
+CHORD_REFERENCE_REF ?= 1692bba6347a287ab0f3cb554a4430fafffc474b
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -131,12 +135,14 @@ parity-check:
 	$(CARGO) test -p noel-core --lib input_expansion_matches_ts_session
 	$(CARGO) test -p noel-cli --test rpc_parity get_commands_matches_upstream
 	$(CARGO) test -p noel-cli --test rpc_parity golden_
+	$(CARGO) test -p noel-chord
 	$(MAKE) ts-parity-drift
 
 ts-parity-build:
 	$(DOCKER) build -f Dockerfile.ts-parity \
 		--build-arg TS_REFERENCE_REPO="$(TS_REFERENCE_REPO)" \
 		--build-arg TS_REFERENCE_REF="$(TS_REFERENCE_REF)" \
+		--build-arg CHORD_REFERENCE_REF="$(CHORD_REFERENCE_REF)" \
 		-t $(TS_PARITY_IMAGE) .
 
 ts-parity-fixtures: ts-parity-build

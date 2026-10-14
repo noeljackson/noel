@@ -1116,3 +1116,35 @@ Reason: repositories written for pi, this one and upstream's included, track
 `.pi/`, and their extensions, packages, skills, and scripts use pi's names.
 noel loads upstream-format skills, so a skill that reads `PI_SESSION_FILE`
 has to find it.
+
+### Chord Delta, Canonical JSON and Contracts
+
+`crates/noel-chord` matches upstream Chord's delta ops, wire codec,
+`canonicalJson`, `hash64`, contract fingerprints, `coverage` and `fits` at the
+pinned commit (`chord-delta.json`). These parts differ:
+
+- noel's strings are Unicode text, so they cannot hold a lone surrogate. A `t`
+  op that would cut a surrogate pair in half fails with `SplitSurrogate`
+  instead of leaving half of the pair, and JSON carrying a lone surrogate
+  escape does not parse. Upstream's own diff never cuts a pair.
+- A numeric path segment of 2^64 or more is refused as an unsafe segment.
+  Upstream accepts any non-negative integer and, on an object, writes the key
+  JavaScript prints for it.
+- Where upstream's `fits` throws on a malformed schema (a `required` that is
+  neither a list nor a string, a `parameters` that is not a list, an invalid
+  `patternProperties` pattern), noel answers "does not fit", so `coverage`
+  reports a difference where upstream throws.
+- `patternProperties` patterns are compiled by Rust's `regex` crate, not as
+  JavaScript `u` regexes. A pattern using lookaround or backreferences does
+  not fit, and `\d`, `\w`, `\b` and `.` can match differently on names with
+  non-ASCII characters or `\r`.
+- noel parses JSON numbers with `serde_json`'s default float parser, which can
+  round a number with more than 15 significant digits, or a large exponent,
+  one unit differently from `JSON.parse`. Such a number received as text can
+  then differ in its last bit, and so in canonical JSON and `hash64`. Contract
+  descriptions hold no such numbers. `serde_json`'s `float_roundtrip` feature
+  would close this, for every crate in the workspace at once.
+
+Reason: Rust strings and integers cannot represent the first two. Matching
+the regex differences would need a JavaScript regex engine, and the float
+parser is a choice for the whole workspace, not for this crate.

@@ -42,6 +42,20 @@ RUN set -eu; \
     install -m 0755 "${rg}/rg" "${fd}/fd" /usr/local/bin/; \
     rm -rf "${rg}" "${fd}" "${rg}.tar.gz" "${fd}.tar.gz"
 
+# Chord's goldens (chord-delta.json) come from their own pinned commit, not
+# from TS_REFERENCE_REF: link protocol 2 is unreleased and changes often. The
+# pin is checked out at /chord-reference with Chord's locked dependencies and
+# built once, so an image exists only for a pin at which packages/chord builds.
+ARG CHORD_REFERENCE_REF=1692bba6347a287ab0f3cb554a4430fafffc474b
+RUN set -eu; \
+    cd /ts-reference; \
+    git cat-file -e "${CHORD_REFERENCE_REF}^{commit}" 2>/dev/null \
+        || git fetch --filter=blob:none origin "${CHORD_REFERENCE_REF}"; \
+    git worktree add --detach /chord-reference "${CHORD_REFERENCE_REF}"; \
+    cd /chord-reference; \
+    npm ci --ignore-scripts --no-audit --no-fund --workspace packages/chord --include-workspace-root; \
+    npm --prefix packages/chord run build
+
 COPY scripts/ts-parity /ts-parity
 
 CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do npx tsx \"$fixture\" /fixtures; done"]

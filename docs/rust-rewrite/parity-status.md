@@ -31,6 +31,15 @@ The committed TypeScript parity fixtures are:
 - `bedrock-claude-opus-4.6.json`: Bedrock Claude Converse payload shape.
 - `bedrock-tools.json`: Bedrock Claude Converse payload shape with
   model-callable tools.
+- `chord-delta.json`: upstream Chord's delta ops, recorded from
+  `packages/chord` at its own pinned commit (`CHORD_REFERENCE_REF` in the
+  Makefile) rather than `main`. Streams of op batches through one `encoder()`
+  and `decoder()`, with the exact wire tuples, the decoded ops and each value
+  after `applyImmutable`; wire batches the decoder rejects; `applyImmutable`
+  results and errors; `diffRevisions` cases, by their result only; vectors of
+  `canonicalJson` and `hash64` with non-ASCII and astral text, `-0`, large and
+  small numbers and control characters; and contract descriptions with their
+  fingerprints, `coverage` between them, and `fits` cases.
 - `cli-contract.json`: upstream CLI option and command contract.
 - `cloudflare-ai-gateway-kimi.json`: Cloudflare AI Gateway OpenAI-compatible
   request shape.
@@ -251,6 +260,7 @@ cargo test -p noel-core --lib tool_parity_tests
 cargo test -p noel-config --lib _ts
 cargo test -p noel-core --lib input_expansion_matches_ts_session
 cargo test -p noel-cli --test rpc_parity
+cargo test -p noel-chord
 make check
 make ts-parity-drift
 ```
