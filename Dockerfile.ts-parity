@@ -1,4 +1,4 @@
-FROM node:24-bookworm
+FROM node:24-bookworm AS reference
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
@@ -47,8 +47,9 @@ RUN set -eu; \
 # changes often. The pin is checked out at /chord-reference with Chord's locked
 # dependencies and built once, so an image exists only for a pin at which
 # packages/chord builds. LocalEnv's goldens (local-env.json) run Durable's
-# NodeExecutionEnv and env conformance cases from the same checkout; they need
-# only Node and Chord's context module.
+# NodeExecutionEnv and env conformance cases from the same checkout. pi-env's
+# client and tests (packages/env) run from it too, for the pi-env goldens
+# (pi-env.json) and `make env-interop`, so its workspace is installed as well.
 ARG CHORD_REFERENCE_REF=1692bba6347a287ab0f3cb554a4430fafffc474b
 RUN set -eu; \
     cd /ts-reference; \
@@ -56,9 +57,25 @@ RUN set -eu; \
         || git fetch --filter=blob:none origin "${CHORD_REFERENCE_REF}"; \
     git worktree add --detach /chord-reference "${CHORD_REFERENCE_REF}"; \
     cd /chord-reference; \
-    npm ci --ignore-scripts --no-audit --no-fund --workspace packages/chord --include-workspace-root; \
+    npm ci --ignore-scripts --no-audit --no-fund --workspace packages/chord --workspace packages/env --include-workspace-root; \
     npm --prefix packages/chord run build
 
+# Upstream's pi-env daemon from the same pinned checkout, built as upstream
+# ships it for Linux (static musl, release), with upstream's lock file. The
+# pi-env goldens record upstream's client talking to it.
+FROM rust:1.99.0 AS pi-env-daemon
+COPY --from=reference /chord-reference/packages/env /pi-env
+RUN set -eu; \
+    target="$(uname -m)-unknown-linux-musl"; \
+    rustup target add --toolchain 1.99.0 "${target}"; \
+    cd /pi-env/daemon; \
+    RUSTUP_TOOLCHAIN=1.99.0 cargo build --release --locked --target "${target}"; \
+    install -m 0755 "target/${target}/release/pi-env" /pi-env/pi-env
+
+FROM reference
+COPY --from=pi-env-daemon /pi-env/pi-env /usr/local/bin/pi-env
 COPY scripts/ts-parity /ts-parity
 
-CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do npx tsx \"$fixture\" /fixtures; done"]
+# pi-env-fixture.ts loads upstream's packages from their sources (`source`
+# export condition) with Node's own type stripping.
+CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do case \"$fixture\" in */pi-env-fixture.ts) node --conditions=source \"$fixture\" /fixtures ;; *) npx tsx \"$fixture\" /fixtures ;; esac; done"]

@@ -7,6 +7,7 @@ members = [
     "crates/noel-config",
     "crates/noel-core",
     "crates/noel-env",
+    "crates/noel-env-daemon",
     "crates/noel-parity",
     "crates/noel-providers",
     "crates/noel-session",
@@ -39,3 +40,11 @@ tokio = { version = "1.45.0", features = ["fs", "io-util", "macros", "process", 
 # noel-tools starts tool subprocesses in their own sessions (setsid) and kills
 # their process groups on timeout, interrupt, or a fatal signal to noel.
 nix = { version = "0.29", default-features = false, features = ["process", "signal"] }
+
+# noel-env serve is uploaded to remote machines, so `make env-daemon` builds it
+# small, as upstream builds pi-env; the other binaries keep the release profile.
+[profile.env-daemon]
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true

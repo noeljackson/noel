@@ -76,8 +76,14 @@ recorded by outcome only and are not run here until `LocalEnv` watches.
 Differences from upstream are in `docs/rust-rewrite/non-parity-register.md`
 under "Workspaces".
 
-## Later in this crate
+## pi-env
 
-The Rust port of upstream's `pi-env`: the framed protocol client, a remote
-`ExecutionEnv`, SSH deployment, and the `noel-env serve` daemon
-(`docs/spec.md` §10).
+`frame` is pi-env protocol 1's frame codec (upstream
+`packages/env/docs/protocol.md`). The daemon that speaks it, `noel-env serve`,
+is the `noel-env-daemon` crate; it shares this codec, `StreamDecoder` and
+`LineScanner`, and keeps its own dependencies (`notify`, `ignore`) out of this
+library.
+
+Later in this crate: the rest of the Rust port of upstream's `pi-env`, the
+protocol client, a remote `ExecutionEnv` and SSH deployment (`docs/spec.md`
+§10).

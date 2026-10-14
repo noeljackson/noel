@@ -8,13 +8,16 @@
 //! upstream's `NodeExecutionEnv` does.
 //!
 //! [`LocalEnv`] runs on this machine and behaves as `NodeExecutionEnv`
-//! (`packages/env/docs/semantics.md`). Remote workspaces (the `pi-env`
-//! protocol) come later in this crate.
+//! (`packages/env/docs/semantics.md`). Remote workspaces speak the `pi-env`
+//! protocol, whose frames are in [`frame`]; the daemon is the
+//! `noel-env-daemon` crate (`noel-env serve`), and the client comes later in
+//! this crate.
 
 mod context;
 mod decode;
 mod error;
 mod exec;
+pub mod frame;
 mod line_scan;
 mod local;
 mod path;
