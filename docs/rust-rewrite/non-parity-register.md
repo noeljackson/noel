@@ -307,6 +307,24 @@ format, with credential syntax and offline mode, is a later piece of work; the
 model object already has upstream's field names so upstream's file can map
 onto it.
 
+### Provider Base-URL Variables
+
+`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` point the `anthropic` and `openai`
+providers at another address:
+- every built-in model of the provider follows the variable;
+- a `models.json` entry with no `baseUrl` follows it too;
+- an entry that names its own `baseUrl` keeps that address.
+
+Each value follows its provider's own convention: Anthropic's has no `/v1`,
+and noel adds `/v1/messages`; OpenAI's includes `/v1`. Upstream reads neither
+variable and takes each model's address from its catalog or `models.json`.
+
+Reason: Claude Code and the OpenAI SDK read these variables, and environments
+that keep provider credentials out of the workload rely on them. A Codewire
+Sandbox sets them to its local credential proxy, together with a placeholder
+credential that the proxy replaces. noel ignoring them would send the
+placeholder straight to the provider.
+
 ### Model Scope, Picker, and Model Commands
 
 `--models` and `enabledModels` resolve as upstream's scope does (exact, fuzzy,
