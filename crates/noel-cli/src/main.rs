@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod account_failover;
+mod attach;
 mod auth_command;
 mod bug_report;
 mod clipboard;
@@ -142,6 +143,25 @@ struct Cli {
 
     #[arg(long)]
     session_dir: Option<PathBuf>,
+
+    /// Open the TUI on a session that `noel server` holds, starting the
+    /// server when none listens. The session runs with its own settings, so
+    /// the options that shape a local session are refused with it.
+    #[arg(
+        long,
+        value_name = "SESSION_ID",
+        conflicts_with_all = [
+            "print", "continue", "resume", "fork", "no_session", "session",
+            "session_id", "export", "messages", "session_dir", "provider",
+            "model", "models", "api_key", "thinking", "system_prompt",
+            "append_system_prompt", "no_tools", "tools", "exclude_tools",
+            "no_builtin_tools", "skill", "no_skills", "prompt_template",
+            "no_prompt_templates", "no_context_files", "extension",
+            "no_extensions", "no_mcp", "image", "name", "approve", "no_approve",
+            "offline",
+        ]
+    )]
+    attach: Option<String>,
 
     #[arg(long)]
     provider: Option<String>,
@@ -1402,6 +1422,14 @@ async fn run() -> Result<()> {
     if cli.verbose {
         eprintln!("agent dir: {}", config.paths.agent_dir.display());
         eprintln!("session dir: {}", config.paths.session_dir.display());
+    }
+    // The remote backend: the session runs in its worker, so nothing below
+    // (a local runtime, its model, its session) applies.
+    if let Some(session) = &cli.attach {
+        if !matches!(cli.mode, OutputMode::Text) || !io::stdin().is_terminal() {
+            return Err(anyhow!("--attach opens the TUI and needs a terminal"));
+        }
+        return attach::run(session, config, cli.owned_screen()).await;
     }
     let offline = offline_enabled(cli.offline);
     apply_cached_claude_code_version(&config);
@@ -2835,21 +2863,7 @@ async fn run_interactive(
         app.push(TuiEntryKind::System, hint);
     }
     let mut auto_restart = AutoRestart::from_env();
-    // Install restoration before any fallible terminal setup; a fatal signal
-    // restores through the same claim.
-    let _restore = TerminalRestore::claim(owned_screen);
-    enable_raw_mode()?;
-    if owned_screen {
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    }
-    execute!(io::stdout(), EnableBracketedPaste)?;
-    let _ = execute!(
-        io::stdout(),
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    );
-    let mut viewport_height = terminal_viewport_height();
-    let mut terminal = new_tui_terminal(viewport_height, owned_screen)?;
-    terminal.clear()?;
+    let (_restore, mut terminal, mut viewport_height) = open_tui_terminal(owned_screen)?;
 
     let mut restart = false;
     loop {
@@ -2946,20 +2960,52 @@ async fn run_interactive(
             break;
         }
     }
+    close_tui_terminal(terminal, _restore, &app)?;
+    if restart {
+        // The session lock is close-on-exec: the new image reopens this
+        // session as soon as it starts.
+        restart_current_process(runtime.store().map(SessionStore::path))?;
+    }
+    Ok(())
+}
+
+/// Takes the terminal for the TUI: raw mode, the alternate screen and mouse
+/// capture when it owns the screen, bracketed paste and escape-code
+/// disambiguation. Restoration is claimed first, so a fatal signal during
+/// setup restores the terminal too.
+fn open_tui_terminal(owned_screen: bool) -> Result<(TerminalRestore, TuiTerminal, u16)> {
+    let restore = TerminalRestore::claim(owned_screen);
+    enable_raw_mode()?;
+    if owned_screen {
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    }
+    execute!(io::stdout(), EnableBracketedPaste)?;
+    let _ = execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    let viewport_height = terminal_viewport_height();
+    let mut terminal = new_tui_terminal(viewport_height, owned_screen)?;
+    terminal.clear()?;
+    Ok((restore, terminal, viewport_height))
+}
+
+/// Gives the terminal back, then prints the transcript for the e2e suites
+/// when `NOEL_TUI_E2E_DUMP=1`.
+fn close_tui_terminal(
+    mut terminal: TuiTerminal,
+    restore: TerminalRestore,
+    app: &TuiApp,
+) -> Result<()> {
     let dump_transcript = std::env::var("NOEL_TUI_E2E_DUMP").ok().as_deref() == Some("1");
     if dump_transcript {
         terminal.clear()?;
     }
     drop(terminal);
-    drop(_restore);
+    drop(restore);
     if dump_transcript {
         println!();
         println!("{}", app.transcript_text());
-    }
-    if restart {
-        // The session lock is close-on-exec: the new image reopens this
-        // session as soon as it starts.
-        restart_current_process(runtime.store().map(SessionStore::path))?;
     }
     Ok(())
 }

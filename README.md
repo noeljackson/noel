@@ -11,6 +11,8 @@ Current Rust implementation:
 - CLI binary: `noel`
 - Interactive terminal loop
 - Print mode
+- Server sessions: `noel server`, `noel client`, and the TUI attached to a
+  server session (`noel --attach`)
 - Append-only JSONL sessions
 - Context-safe `/reload`
 - Config/auth/model loading from `~/.noel`
@@ -1403,9 +1405,32 @@ retained context, not the pre-compaction journal transcript.
 ## Specification
 
 `docs/spec.md` is noel's normative specification for sessions, durability, the
-queue and abort, recovery, and the coming `noel server` and `noel client`. It
-marks what is built, what is decided and what is proposed, and cites upstream
-where noel follows it.
+queue and abort, recovery, and `noel server`, `noel worker` and the clients
+that attach to it. It marks what is built, what is decided and what is
+proposed, and cites upstream where noel follows it.
+
+## Server Sessions
+
+`noel server` holds sessions for clients on this machine (spec §5–§8), and a
+client starts it when none listens. Open the TUI on a session the server holds
+with `--attach`; any saved session can be attached, including one a local
+`noel` made:
+
+```bash
+noel client new --model faux/echo   # prints the new session's id
+noel --attach <session-id>          # the TUI on that session
+noel client watch <session-id>      # its view as text, from another terminal
+```
+
+Several TUIs can attach to one session, and each shows the same transcript and
+the run as it streams. Enter sends a prompt; during a run it queues a
+follow-up, ctrl+s steers, Up takes the last queued submission back into the
+draft, and Esc aborts the run (which withdraws what was queued). `/model
+<provider/id>`, `/thinking <level>` and `/compact` change the session; commands
+for this process's own sessions, settings and accounts say they are not
+available when attached. `/quit` detaches, and a run goes on in the server. If
+the session's worker or the server stops, the TUI says so, holds the session
+again and redraws it; the server resumes an interrupted run.
 
 ## RPC Mode
 
