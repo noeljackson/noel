@@ -10,9 +10,10 @@ use noel_config::{
     model_context_window, LoadedConfig, ModelCost, ModelDefinition, ProviderApi, SourceInfo,
     ThinkingLevelMap,
 };
+use noel_core::controller::{Outcome, Queue, Repeat, SubmissionState};
 use noel_core::{
-    CompactionRecord, ConversationMessage, MessageRole, Run, RunStatus, Runtime, SessionState,
-    SteeringMailbox, ToolEvent, TurnEvent, RETRY_CANCELLED, STEERING_JOIN,
+    CompactionRecord, ConversationMessage, MessageRole, RunStatus, Runtime, SessionState,
+    ToolEvent, TurnEvent, RETRY_CANCELLED,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -324,17 +325,21 @@ impl Data {
         }
     }
 
-    /// The reply to a prompt that repeats the `requestId` of `run`, which
-    /// starts nothing: `started` until the run has finished, `handled`
-    /// after.
-    pub fn repeated(run: &Run) -> Self {
+    /// The reply to a prompt that repeats the `requestId` of an earlier
+    /// one, which starts nothing: `started` until its run has finished,
+    /// `handled` after.
+    pub fn repeated(repeat: &Repeat) -> Self {
+        let (disposition, run_id) = match &repeat.state {
+            SubmissionState::Placed { run_id } => ("started", Some(run_id.clone())),
+            SubmissionState::Settled { run_id, .. } => ("handled", Some(run_id.clone())),
+            // Only prompts carry a requestId here, and a prompt starts a
+            // run; a session another mode queued into may name others.
+            SubmissionState::Queued(_) => ("queued", None),
+            SubmissionState::Withdrawn => ("handled", None),
+        };
         Data::Disposition {
-            disposition: if run.status.is_finished() {
-                "handled"
-            } else {
-                "started"
-            },
-            run_id: Some(run.id.clone()),
+            disposition,
+            run_id,
         }
     }
 
@@ -877,7 +882,7 @@ pub(crate) enum Event<'a> {
     },
     QueueUpdate {
         steering: Vec<String>,
-        follow_up: &'a [String],
+        follow_up: Vec<String>,
     },
     AutoRetryStart {
         attempt: u64,
@@ -987,48 +992,13 @@ pub(crate) type Sink<'s> = &'s mut dyn FnMut(Event<'_>);
 
 // The queue.
 
-/// Messages waiting for the agent. Steering joins a run's next provider
+/// `queue_update`: what is queued. Steering joins a run's next provider
 /// round; follow-ups start another turn when the run would end. Both are
 /// delivered batched, like the TUI's queue.
-#[derive(Default)]
-pub(crate) struct Queue {
-    pub steering: SteeringMailbox,
-    pub follow_ups: Vec<String>,
-}
-
-/// A queue's steering and follow-ups.
-pub(crate) type Contents = (Vec<String>, Vec<String>);
-
-impl Queue {
-    pub fn pending(&self) -> usize {
-        self.steering.pending() + self.follow_ups.len()
-    }
-
-    pub fn update(&self) -> Event<'_> {
-        Event::QueueUpdate {
-            steering: self.steering.list(),
-            follow_up: &self.follow_ups,
-        }
-    }
-
-    pub fn contents(&self) -> Contents {
-        (self.steering.list(), self.follow_ups.clone())
-    }
-
-    /// Makes `contents` the queue. The steering mailbox stays the one the
-    /// active run reads.
-    pub fn replace(&mut self, (steering, follow_ups): Contents) {
-        self.steering.drain();
-        for message in steering {
-            self.steering.send(message);
-        }
-        self.follow_ups = follow_ups;
-    }
-
-    /// The queued follow-ups as one prompt.
-    pub fn take_follow_ups(&mut self) -> Option<String> {
-        (!self.follow_ups.is_empty())
-            .then(|| std::mem::take(&mut self.follow_ups).join(STEERING_JOIN))
+pub(crate) fn queue_update(queue: &Queue) -> Event<'static> {
+    Event::QueueUpdate {
+        steering: queue.steering(),
+        follow_up: queue.follow_ups(),
     }
 }
 
@@ -1049,23 +1019,6 @@ pub(crate) enum Prompt {
     Initial,
     /// Follow-ups taken from the queue, announced by a queue_update.
     FollowUps,
-}
-
-/// How a run ended.
-pub(crate) enum Outcome {
-    Completed,
-    Aborted,
-    Failed(String),
-}
-
-impl Outcome {
-    pub fn status(&self) -> RunStatus {
-        match self {
-            Outcome::Completed => RunStatus::Completed,
-            Outcome::Aborted => RunStatus::Aborted,
-            Outcome::Failed(_) => RunStatus::Failed,
-        }
-    }
 }
 
 /// Writes one run's records from the engine's events. A run is one upstream
@@ -1270,9 +1223,9 @@ impl Recorder {
     /// Ends the run: closes what an abort or a failure left open, then
     /// agent_end, unless the run ended with a reply it had dropped, and
     /// agent_settled.
-    pub fn finish(mut self, outcome: Outcome, sink: Sink) {
+    pub fn finish(mut self, outcome: &Outcome, sink: Sink) {
         let aborted = matches!(outcome, Outcome::Aborted);
-        let error = match &outcome {
+        let error = match outcome {
             Outcome::Failed(error) => Some(error.as_str()),
             Outcome::Completed | Outcome::Aborted => None,
         };
@@ -1386,7 +1339,7 @@ impl Recorder {
     fn add_user(&mut self, message: &ConversationMessage, queue: &Queue, sink: Sink) {
         // Steering and follow-ups leave the queue as they are delivered.
         if self.prompt.take() != Some(Prompt::Initial) {
-            sink(queue.update());
+            sink(queue_update(queue));
         }
         self.add(Message::user(message, Some(now())), sink);
     }
