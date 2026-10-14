@@ -1297,6 +1297,7 @@ mod tests {
         runtime.set_store(SessionStore {
             lock: crate::session_lock::acquire(&base).unwrap(),
             path: base.clone(),
+            progress: None,
         });
         let before = runtime.session.clone();
         assert!(runtime
