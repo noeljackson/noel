@@ -63,6 +63,16 @@ The committed TypeScript parity fixtures are:
 - `google-tool-image-routing.json`: Gemini 2 versus Gemini 3 tool-result
   image routing.
 - `google-tools.json`: Gemini request shape with model-callable tools.
+- `local-env.json`: upstream Durable's env conformance cases
+  (`packages/durable/src/testing/env-conformance.ts`) run against
+  `NodeExecutionEnv`, recorded from the same pinned commit as Chord's goldens:
+  every assertion each case makes, in order, with its actual and expected
+  values (byte ranges and line scans of a binary reader, directory pages,
+  exec output per stream, exit codes, and the error codes of refused calls),
+  the case's directory and modification times as placeholders. Watch cases
+  record only their outcome, since their change reports vary from run to run.
+  `crates/noel-env/tests/local_env_conformance.rs` runs the same cases against
+  `LocalEnv` and compares every assertion.
 - `local-tools.json`: built-in local tool inventory (names, labels, prompt
   snippets, parameter names). Rust checks only that every upstream tool is
   present; `tool-behavior.json` covers what the tools do.
@@ -271,6 +281,7 @@ cargo test -p noel-config --lib _ts
 cargo test -p noel-core --lib input_expansion_matches_ts_session
 cargo test -p noel-cli --test rpc_parity
 cargo test -p noel-chord
+cargo test -p noel-env
 make check
 make ts-parity-drift
 ```

@@ -1,26 +1,34 @@
+//! noel's built-in tools. They work in a workspace, an
+//! [`ExecutionEnv`]: `read`, `write`, `edit`, `ls` and `bash` reach files
+//! and run commands only through it, and `grep` and `find` resolve their
+//! paths in it (they search with ripgrep's crates, so they need a local
+//! workspace).
+
+mod mutation;
 mod output;
 mod paths;
-mod process;
 mod read;
 mod search;
 mod truncate;
 mod web;
 
-use std::fs;
-use std::os::fd::OwnedFd;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use noel_env::{
+    Context, ExecOptions, ExecutionEnv, ExecutionErrorCode, FileErrorCode, LocalEnv,
+    LocalEnvOptions, OutputChunk, ShellCommand,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
-use tokio::process::{ChildStdout, Command};
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
+pub use noel_env::{kill_running_tool_groups, spawn_tool_process, ToolProcessGroup};
 use output::{OutputAccumulator, OutputSnapshot};
-use paths::resolve_to_cwd;
-pub use process::{kill_running_tool_groups, spawn_tool_process, ToolProcessGroup};
+use paths::resolve_tool_path;
 use truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +153,8 @@ pub enum ToolError {
 
 #[derive(Debug, Clone)]
 pub struct ToolRuntimeOptions {
+    /// The shell of the local workspace [`execute_tool`] makes; a workspace
+    /// passed to [`execute_tool_in`] brings its own.
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
     pub offline: bool,
@@ -195,12 +205,32 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     .collect()
 }
 
+/// The local workspace at `cwd` that [`execute_tool`] runs tools in.
+pub fn local_env(cwd: &Path, options: &ToolRuntimeOptions) -> LocalEnv {
+    LocalEnv::with_options(
+        cwd,
+        LocalEnvOptions {
+            shell_path: options.shell_path.clone(),
+        },
+    )
+}
+
+/// Runs a tool in the local workspace at `cwd`.
 pub async fn execute_tool(
     cwd: &Path,
     request: ToolRequest,
     options: &ToolRuntimeOptions,
 ) -> Result<ToolResult, ToolError> {
-    execute_tool_streaming(cwd, request, options, &mut |_| {}).await
+    execute_tool_in(&local_env(cwd, options), request, options).await
+}
+
+/// Runs a tool in the workspace `env`.
+pub async fn execute_tool_in(
+    env: &dyn ExecutionEnv,
+    request: ToolRequest,
+    options: &ToolRuntimeOptions,
+) -> Result<ToolResult, ToolError> {
+    execute_tool_streaming_in(env, request, options, &mut |_| {}).await
 }
 
 /// [`execute_tool`] that also reports a `bash` command's output while it
@@ -214,6 +244,18 @@ pub async fn execute_tool_streaming(
     options: &ToolRuntimeOptions,
     on_output: &mut (dyn FnMut(&str) + Send),
 ) -> Result<ToolResult, ToolError> {
+    execute_tool_streaming_in(&local_env(cwd, options), request, options, on_output).await
+}
+
+/// [`execute_tool_streaming`] in the workspace `env`. Dropping the future
+/// stops the tool, and kills a running command's processes.
+pub async fn execute_tool_streaming_in(
+    env: &dyn ExecutionEnv,
+    request: ToolRequest,
+    options: &ToolRuntimeOptions,
+    on_output: &mut (dyn FnMut(&str) + Send),
+) -> Result<ToolResult, ToolError> {
+    let cx = Context::background();
     if options.offline
         && matches!(
             &request,
@@ -229,13 +271,13 @@ pub async fn execute_tool_streaming(
             path,
             offset,
             limit,
-        } => read::read_tool(cwd, &path, offset, limit, options),
+        } => read::read_tool(env, &path, offset, limit, options, &cx).await,
         ToolRequest::Bash {
             command,
             timeout_ms,
-        } => bash_tool(cwd, &command, timeout_ms, options, on_output).await,
-        ToolRequest::Edit { path, edits } => edit_tool(cwd, &path, &edits),
-        ToolRequest::Write { path, content } => write_tool(cwd, &path, &content),
+        } => bash_tool(env, &command, timeout_ms, options, on_output, &cx).await,
+        ToolRequest::Edit { path, edits } => edit_tool(env, &path, &edits, &cx).await,
+        ToolRequest::Write { path, content } => write_tool(env, &path, &content, &cx).await,
         ToolRequest::Grep {
             path,
             pattern,
@@ -244,24 +286,28 @@ pub async fn execute_tool_streaming(
             ignore_case,
             context,
             limit,
-        } => search::grep_tool(
-            cwd,
-            search::GrepArgs {
-                pattern: &pattern,
-                path: path.as_deref(),
-                glob: glob.as_deref(),
-                ignore_case: ignore_case.unwrap_or(false),
-                literal: literal.unwrap_or(false),
-                context: context.unwrap_or(0),
-                limit,
-            },
-        ),
+        } => {
+            search::grep_tool(
+                env,
+                search::GrepArgs {
+                    pattern: &pattern,
+                    path: path.as_deref(),
+                    glob: glob.as_deref(),
+                    ignore_case: ignore_case.unwrap_or(false),
+                    literal: literal.unwrap_or(false),
+                    context: context.unwrap_or(0),
+                    limit,
+                },
+                &cx,
+            )
+            .await
+        }
         ToolRequest::Find {
             pattern,
             path,
             limit,
-        } => search::find_tool(cwd, &pattern, path.as_deref(), limit),
-        ToolRequest::Ls { path, limit } => search::ls_tool(cwd, path.as_deref(), limit),
+        } => search::find_tool(env, &pattern, path.as_deref(), limit, &cx).await,
+        ToolRequest::Ls { path, limit } => search::ls_tool(env, path.as_deref(), limit, &cx).await,
         ToolRequest::WebSearch { query, limit } => {
             tokio::time::timeout(Duration::from_secs(30), web::search(&query, limit))
                 .await
@@ -303,51 +349,12 @@ pub fn cap_tool_output(output: String) -> String {
     )
 }
 
-/// After the shell exits, output still arriving (a background job holds the
-/// pipes) is read until it pauses for this long.
-const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(100);
-
 /// The shortest time between two reports of a running command's output
 /// (upstream `BASH_UPDATE_THROTTLE_MS`).
 pub const BASH_UPDATE_THROTTLE: Duration = Duration::from_millis(100);
 
-/// The shell commands run in (upstream `getShellConfig`): the `shellPath`
-/// setting, else `/bin/bash`, else `bash` on PATH, else `sh`.
-fn shell_program(shell_path: Option<&str>) -> Result<PathBuf, ToolError> {
-    if let Some(shell_path) = shell_path {
-        return if Path::new(shell_path).exists() {
-            Ok(PathBuf::from(shell_path))
-        } else {
-            Err(ToolError::Failed(format!(
-                "Custom shell path not found: {shell_path}"
-            )))
-        };
-    }
-    let bin_bash = Path::new("/bin/bash");
-    if bin_bash.exists() {
-        return Ok(bin_bash.to_path_buf());
-    }
-    Ok(std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join("bash"))
-                .find(|candidate| candidate.is_file())
-        })
-        .unwrap_or_else(|| PathBuf::from("sh")))
-}
-
-/// Reads the next chunk of the output pipe; `None` once it is closed. A
-/// closed pipe never completes, so `select!` keeps waiting on its other
-/// branches.
-async fn read_chunk(pipe: &mut Option<ChildStdout>, buffer: &mut [u8]) -> Option<usize> {
-    match pipe {
-        Some(open) => match open.read(buffer).await {
-            Ok(read) if read > 0 => Some(read),
-            _ => None,
-        },
-        None => std::future::pending().await,
-    }
-}
+/// The longest timeout a workspace accepts (a 32-bit millisecond timer).
+const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
@@ -398,18 +405,64 @@ fn with_status(text: String, status: &str) -> String {
     }
 }
 
-/// Runs `command` with `bash -c` (upstream `bash.ts`). stdout and stderr are
-/// one stream in the order written; the model gets its last 2000 lines or
-/// 50 KB, and a longer output is saved whole to a temp file. A timeout or a
-/// non-zero exit is an error result that still carries the output. While
-/// the command runs, `on_output` gets its output so far (see
-/// [`execute_tool_streaming`]).
+/// What a running command printed, and when it was last reported.
+struct BashReporter<'a> {
+    output: OutputAccumulator,
+    on_output: &'a mut (dyn FnMut(&str) + Send),
+    /// Output not reported yet is reported once the throttle allows.
+    unreported: bool,
+    last_report: Option<Instant>,
+    report_due: Option<Instant>,
+    /// Why the output could not be kept, which stopped the command.
+    error: Option<io::Error>,
+}
+
+impl BashReporter<'_> {
+    fn report(&mut self) {
+        (self.unreported, self.report_due, self.last_report) = (false, None, Some(Instant::now()));
+        (self.on_output)(&self.output.tail());
+    }
+
+    /// Keeps a chunk of output and reports it now, or returns true when the
+    /// throttle moved the report to `report_due`.
+    fn append(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        if let Err(error) = self.output.append(bytes) {
+            let message = error.to_string();
+            self.error = Some(error);
+            return Err(message);
+        }
+        self.unreported = true;
+        let due = self.last_report.map(|at| at + BASH_UPDATE_THROTTLE);
+        match due.filter(|due| *due > Instant::now()) {
+            Some(due) => {
+                self.report_due = Some(due);
+                Ok(true)
+            }
+            None => {
+                self.report();
+                Ok(false)
+            }
+        }
+    }
+}
+
+fn lock<'a, 'b>(reporter: &'a Mutex<BashReporter<'b>>) -> MutexGuard<'a, BashReporter<'b>> {
+    reporter.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `command` through the workspace's shell (upstream `bash.ts`).
+/// stdout and stderr are one stream in the order written; the model gets
+/// its last 2000 lines or 50 KB, and a longer output is saved whole to a
+/// temp file. A timeout or a non-zero exit is an error result that still
+/// carries the output. While the command runs, `on_output` gets its output
+/// so far (see [`execute_tool_streaming`]).
 async fn bash_tool(
-    cwd: &Path,
+    env: &dyn ExecutionEnv,
     command: &str,
     timeout_ms: Option<u64>,
     options: &ToolRuntimeOptions,
     on_output: &mut (dyn FnMut(&str) + Send),
+    cx: &Context,
 ) -> Result<ToolResult, ToolError> {
     // Like upstream, the first report says the command is starting, even if
     // it then cannot start.
@@ -418,158 +471,155 @@ async fn bash_tool(
         Some(prefix) if !prefix.trim().is_empty() => format!("{prefix}\n{command}"),
         _ => command.to_string(),
     };
-    let shell = shell_program(options.shell_path.as_deref())?;
-    if !cwd.exists() {
-        return Err(ToolError::Failed(format!(
-            "Working directory does not exist: {}\nCannot execute bash commands.",
-            cwd.display()
-        )));
-    }
+    let cwd = PathBuf::from(env.cwd());
     let io_error = |source| ToolError::Io {
-        path: cwd.to_path_buf(),
+        path: cwd.clone(),
         source,
     };
-    // stdout and stderr share one pipe, so the output is in the order it
-    // was written.
-    let (reader, writer) = std::io::pipe().map_err(io_error)?;
-    let mut process = Command::new(shell);
-    process
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        // Commands are non-interactive: stdin is empty and the shell gets no
-        // controlling terminal, so nothing can read noel's input (the RPC
-        // request stream or the TUI's terminal).
-        .stdin(Stdio::null())
-        .stdout(writer.try_clone().map_err(io_error)?)
-        .stderr(writer);
-    for (name, value) in &options.bash_env {
-        match value {
-            Some(value) => process.env(name, value),
-            None => process.env_remove(name),
-        };
-    }
-    // The shell leads its own process group, so a timeout or an interrupt
-    // (dropping this future) kills the whole tree, not just the shell pid:
-    // killing only the shell orphaned children like a long preflight script.
-    let (mut child, group) = spawn_tool_process(&mut process).map_err(io_error)?;
-    // The builder holds the pipe's write ends; the pipe closes once the
-    // command's processes are its only writers.
-    drop(process);
-    let mut group = Some(group);
-    let mut pipe = Some(
-        ChildStdout::from_std(std::process::ChildStdout::from(OwnedFd::from(reader)))
-            .map_err(io_error)?,
-    );
-    let mut buffer = vec![0; 64 * 1024];
-    let mut output = OutputAccumulator::new("noel-bash");
-    let mut deadline = timeout_ms
-        .and_then(|timeout_ms| Instant::now().checked_add(Duration::from_millis(timeout_ms)));
-    let mut timed_out = false;
-    let mut status = None;
-    // Once the shell has exited, output is read until it pauses.
-    let mut output_grace = None;
-    // Output not reported yet is reported once the throttle allows.
-    let mut unreported = false;
-    let mut last_report: Option<Instant> = None;
-    let mut report_due = None;
-    while status.is_none() || pipe.is_some() {
-        tokio::select! {
-            read = read_chunk(&mut pipe, &mut buffer) => match read {
-                Some(read) => {
-                    output.append(&buffer[..read]).map_err(io_error)?;
-                    unreported = true;
-                    let due = last_report.map(|at| at + BASH_UPDATE_THROTTLE);
-                    match due.filter(|due| *due > Instant::now()) {
-                        Some(due) => report_due = Some(due),
-                        None => {
-                            (unreported, report_due, last_report) =
-                                (false, None, Some(Instant::now()));
-                            on_output(&output.tail());
-                        }
+    let reporter = Mutex::new(BashReporter {
+        output: OutputAccumulator::new("noel-bash"),
+        on_output,
+        unreported: false,
+        last_report: None,
+        report_due: None,
+        error: None,
+    });
+    // Wakes the loop below when a report was put off.
+    let report_put_off = Notify::new();
+    let mut on_chunk = |chunk: OutputChunk<'_>| {
+        if lock(&reporter).append(chunk.raw.unwrap_or(chunk.text.as_bytes()))? {
+            report_put_off.notify_one();
+        }
+        Ok(())
+    };
+    let result = {
+        // stdout and stderr share one pipe, so the output is in the order
+        // it was written. The command runs in its own session and process
+        // group: a timeout or an interrupt (dropping this future) kills the
+        // whole tree, not just the shell.
+        let exec = env.exec(
+            ShellCommand::Script(command),
+            ExecOptions {
+                env: options.bash_env.clone(),
+                // A zero timeout still starts the command and kills it at
+                // once; a longer one than the timer holds becomes its
+                // longest.
+                timeout: timeout_ms
+                    .map(|timeout_ms| Duration::from_millis(timeout_ms.clamp(1, MAX_TIMEOUT_MS))),
+                on_output: Some(&mut on_chunk),
+                merge_stderr: true,
+                ..ExecOptions::default()
+            },
+            cx,
+        );
+        tokio::pin!(exec);
+        loop {
+            let due = lock(&reporter).report_due;
+            tokio::select! {
+                biased;
+                result = &mut exec => break result,
+                () = report_put_off.notified() => {}
+                () = sleep_until(due) => {
+                    let mut reporter = lock(&reporter);
+                    // A report made since, or put off again, is not due.
+                    if reporter.report_due.is_some_and(|due| due <= Instant::now()) {
+                        reporter.report();
                     }
                 }
-                None => pipe = None,
-            },
-            () = sleep_until(report_due) => {
-                (unreported, report_due, last_report) = (false, None, Some(Instant::now()));
-                on_output(&output.tail());
             }
-            exit = child.wait(), if status.is_none() => status = Some(exit.map_err(io_error)?),
-            () = sleep_until(deadline) => {
-                // Dropping the group kills the tree; what it wrote is kept.
-                timed_out = true;
-                deadline = None;
-                drop(group.take());
+        }
+    };
+    let mut reporter = reporter
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    let exit_code = match result {
+        Ok(result) => Some(result.exit_code),
+        Err(error) => match error.code {
+            ExecutionErrorCode::Timeout => None,
+            ExecutionErrorCode::CallbackError => {
+                return Err(io_error(
+                    reporter
+                        .error
+                        .take()
+                        .unwrap_or_else(|| io::Error::other(error.message)),
+                ));
             }
-            () = sleep_until(output_grace) => break,
-        }
-        if status.is_some() {
-            output_grace = Some(Instant::now() + EXIT_OUTPUT_GRACE);
-        }
-    }
-    if let Some(group) = group {
-        group.finish();
-    }
-    if unreported {
-        on_output(&output.tail());
+            ExecutionErrorCode::SpawnError if error.errno.is_some() => {
+                return Err(io_error(io::Error::from_raw_os_error(
+                    error.errno.unwrap_or_default(),
+                )));
+            }
+            _ => return Err(ToolError::Failed(error.message)),
+        },
+    };
+    if reporter.unreported {
+        reporter.report();
     }
 
-    let snapshot = output.finish().map_err(io_error)?;
-    if timed_out {
+    let snapshot = reporter.output.finish().map_err(io_error)?;
+    let Some(code) = exit_code else {
+        // Killed at the timeout; what it wrote is kept.
         let seconds = timeout_ms.unwrap_or_default() as f64 / 1000.0;
         return Ok(ToolResult::error(with_status(
             bash_output_text(&snapshot, ""),
             &format!("Command timed out after {seconds} seconds"),
         )));
-    }
+    };
     let text = bash_output_text(&snapshot, "(no output)");
-    // A shell killed by a signal has no exit code; report it the shell way.
-    let code = status.and_then(|status| {
-        status.code().or_else(|| {
-            std::os::unix::process::ExitStatusExt::signal(&status).map(|signal| 128 + signal)
-        })
-    });
     Ok(match code {
-        Some(0) => ToolResult::text(text),
-        Some(code) => ToolResult::error(with_status(
+        0 => ToolResult::text(text),
+        code => ToolResult::error(with_status(
             text,
             &format!("Command exited with code {code}"),
         )),
-        None => ToolResult::error(with_status(text, "Command terminated without an exit code")),
     })
 }
 
-/// The error code Node reports for an I/O failure, where upstream's tools
-/// put it in their results.
-pub(crate) fn node_error_code(error: &std::io::Error) -> Option<&'static str> {
-    match error.kind() {
-        std::io::ErrorKind::NotFound => Some("ENOENT"),
-        std::io::ErrorKind::PermissionDenied => Some("EACCES"),
-        std::io::ErrorKind::IsADirectory => Some("EISDIR"),
+/// The error code Node reports for a failure, where upstream's tools put it
+/// in their results.
+pub(crate) fn node_error_code(code: FileErrorCode) -> Option<&'static str> {
+    match code {
+        FileErrorCode::NotFound => Some("ENOENT"),
+        FileErrorCode::PermissionDenied => Some("EACCES"),
+        FileErrorCode::IsDirectory => Some("EISDIR"),
         _ => None,
     }
 }
 
-fn edit_tool(cwd: &Path, input_path: &str, edits: &[TextEdit]) -> Result<ToolResult, ToolError> {
-    let path = resolve_to_cwd(cwd, input_path);
+async fn edit_tool(
+    env: &dyn ExecutionEnv,
+    input_path: &str,
+    edits: &[TextEdit],
+    cx: &Context,
+) -> Result<ToolResult, ToolError> {
+    let path = resolve_tool_path(env, input_path, cx).await?;
     // A file that cannot be read or written is reported as upstream does.
-    let io_error = |source: std::io::Error| match node_error_code(&source) {
+    let file_error = |error: noel_env::FileError| match node_error_code(error.code) {
         Some(code) => ToolError::Failed(format!(
             "Could not edit file: {input_path}. Error code: {code}."
         )),
         None => ToolError::Io {
-            path: path.clone(),
-            source,
+            path: PathBuf::from(&path),
+            source: error.to_io_error(),
         },
     };
-    let content = fs::read_to_string(&path).map_err(io_error)?;
-    let next = apply_text_edits(&content, edits, input_path)?;
-    fs::write(&path, next).map_err(io_error)?;
-    Ok(ToolResult::text(format!(
-        "Successfully replaced {} block(s) in {input_path}.",
-        edits.len()
-    )))
+    mutation::with_file_mutation_queue(env, &path, cx, async {
+        let bytes = env.read_binary_file(&path, cx).await.map_err(file_error)?;
+        // Strictly UTF-8: an edit must not rewrite bytes it could not read.
+        let content = io::read_to_string(bytes.as_slice()).map_err(|source| ToolError::Io {
+            path: PathBuf::from(&path),
+            source,
+        })?;
+        let next = apply_text_edits(&content, edits, input_path)?;
+        env.write_file(&path, next.as_bytes(), cx)
+            .await
+            .map_err(file_error)?;
+        Ok(ToolResult::text(format!(
+            "Successfully replaced {} block(s) in {input_path}.",
+            edits.len()
+        )))
+    })
+    .await
 }
 
 /// Applies every edit to `content`, or none (upstream
@@ -644,27 +694,34 @@ fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<Str
     Ok(next)
 }
 
-fn write_tool(cwd: &Path, input_path: &str, content: &str) -> Result<ToolResult, ToolError> {
-    let path = resolve_to_cwd(cwd, input_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| ToolError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    fs::write(&path, content).map_err(|source| ToolError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    Ok(ToolResult::text(format!(
-        "Successfully wrote to {input_path}"
-    )))
+async fn write_tool(
+    env: &dyn ExecutionEnv,
+    input_path: &str,
+    content: &str,
+    cx: &Context,
+) -> Result<ToolResult, ToolError> {
+    let path = resolve_tool_path(env, input_path, cx).await?;
+    mutation::with_file_mutation_queue(env, &path, cx, async {
+        // Missing parent directories are created; a failure names the path
+        // that failed, the file or a parent.
+        env.write_file(&path, content.as_bytes(), cx)
+            .await
+            .map_err(|error| ToolError::Io {
+                path: PathBuf::from(error.path.as_deref().unwrap_or(&path)),
+                source: error.to_io_error(),
+            })?;
+        Ok(ToolResult::text(format!(
+            "Successfully wrote to {input_path}"
+        )))
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::fs;
 
     #[tokio::test]
     async fn web_tools_are_read_only_and_offline_rejects_network_before_connecting() {
