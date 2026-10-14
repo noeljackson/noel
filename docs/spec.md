@@ -147,9 +147,10 @@ Journal shape **(Proposed):**
   - flow control by window, including the reset when a waiting subscription outgrows four windows.
 - **Left out:** hot reload and plugins. noel sends no reload control, and a worker that receives it answers `unavailable`.
 
-**Open:**
-- Protocol 2 is under `[Unreleased]` in Chord's changelog.
-- The proposal pins the goldens to an exact upstream commit, flags drift with `ts-parity-drift`, and offers only device access until Chord releases protocol 2.
+**Decided (2026-10-14):**
+- noel builds on protocol 2 now, although it is under `[Unreleased]` in Chord's changelog.
+- The goldens are pinned to an exact upstream commit, and `ts-parity-drift` flags drift.
+- Until Chord releases protocol 2, the server offers only device access.
 
 ### 7.2 Objects
 
@@ -228,7 +229,11 @@ a submission belongs to this session.
 
 **Proposed:** a session's workspace is saved as a journal record `Workspace {adapter, …}`; when there is none, the workspace is local.
 
-**Open:** whether noel runs upstream's MIT `pi-env` daemon unchanged (proposed) or a daemon of its own.
+**Decided (2026-10-14):** noel has its own `noel-env`, a Rust port of upstream's whole `pi-env` package (`env/`), which upstream writes partly in TypeScript and partly in Rust.
+- **The client:** the framed-protocol connection; a remote `ExecutionEnv` whose results match the local one (`env/docs/semantics.md`); and SSH deployment that accepts the host key once, names the daemon by its SHA-256 and verifies it before each start (`env/README.md`).
+- **The daemon:** `noel-env serve`, speaking `pi-env` protocol version 1 unchanged (`env/docs/protocol.md`), so either side can talk to upstream's.
+- **Proof:** goldens recorded from upstream's `RemoteExecutionEnv` and daemon at a pinned commit, plus interop tests that connect noel's client to upstream's daemon and upstream's client to noel's daemon.
+- **The Codewire adapter** starts `noel-env serve` inside a Sandbox through Codewire's exec API. There is one remote-workspace protocol; SSH, Codewire or another VM system only changes how the daemon is started.
 
 ## 11. Compatibility and goldens
 
