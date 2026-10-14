@@ -589,6 +589,8 @@ impl Message {
     }
 
     /// A saved reply: its thinking, text and tool calls, and how it stopped.
+    /// An aborted reply has upstream's stop reason and error text for an
+    /// aborted request.
     fn reply(message: &ConversationMessage) -> Self {
         let mut content = Vec::new();
         if !message.thinking.is_empty() {
@@ -600,9 +602,15 @@ impl Message {
             content.push(Content::text(&message.content));
         }
         content.extend(message.tool_calls.iter().map(Content::tool_call));
+        let (stop_reason, error_message) = if message.aborted {
+            ("aborted", Some(ABORTED.to_owned()))
+        } else {
+            (stop_reason(None, !message.tool_calls.is_empty()), None)
+        };
         Message::Assistant(Assistant {
             content,
-            stop_reason: stop_reason(None, !message.tool_calls.is_empty()),
+            stop_reason,
+            error_message,
             ..Assistant::default()
         })
     }

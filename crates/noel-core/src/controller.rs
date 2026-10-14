@@ -613,6 +613,7 @@ impl<H: Host> SessionController<H> {
             let live = live.get_mut().expect("controller state");
             let control = RunControl {
                 steering: live.queue.steering.clone(),
+                run_id: Some(run_id.clone()),
                 ..RunControl::default()
             };
             let mut session = runtime.session().clone();
@@ -1142,6 +1143,7 @@ impl ActiveRun {
                     tool_call_id: Some(call.id.clone()),
                     tool_name: Some(call.name.clone()),
                     tool_calls: Vec::new(),
+                    aborted: false,
                 });
             }
             _ => {}

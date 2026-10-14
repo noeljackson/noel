@@ -1,7 +1,8 @@
 //! How a turn recovers the reply it is asking for: a transient failure is
 //! retried after a backoff, and a context overflow is answered by one
-//! compaction. Either way the failed reply is dropped: never saved, and
-//! absent from the request that asks again.
+//! compaction. Either way the failed reply is dropped: never kept, and
+//! absent from the request that asks again. A reply an abort or a failure
+//! cuts off for good is kept as an aborted reply (spec §4.2).
 
 use std::collections::VecDeque;
 use std::fs;
@@ -140,6 +141,7 @@ fn message(role: MessageRole, content: &str) -> ConversationMessage {
         tool_call_id: None,
         tool_name: None,
         tool_calls: Vec::new(),
+        aborted: false,
     }
 }
 
@@ -641,4 +643,180 @@ async fn a_running_command_reports_its_output_before_its_result() {
             "finished bash",
         ]
     );
+}
+
+// What a reply that does not stand leaves (spec §4.2).
+
+/// The saved conversation with each message's aborted mark.
+fn saved_marked(runtime: &Runtime) -> Vec<(MessageRole, &str, bool)> {
+    let messages = runtime.session().messages.iter();
+    messages
+        .map(|message| {
+            (
+                message.role.clone(),
+                message.content.as_str(),
+                message.aborted,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_aborted_reply_is_kept_and_left_out_of_later_requests() {
+    let (mut runtime, store, base) = session("aborted", &[]);
+    let provider = Steps::new([
+        Step {
+            events: vec![
+                StreamEvent::Thinking("plot".into()),
+                StreamEvent::Text("Once".into()),
+            ],
+            error: None,
+            hangs: true,
+        },
+        says("Shorter."),
+    ]);
+    let run = RunControl::default();
+    let cancelled = {
+        let cancellation = run.cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancellation.cancel();
+        })
+    };
+    let (result, _) = turn(&mut runtime, &provider, "tell a long story", &run).await;
+    cancelled.await.unwrap();
+    assert!(matches!(result, Err(AgentError::Cancelled)));
+    assert_eq!(
+        saved_marked(&runtime),
+        [
+            (MessageRole::User, "tell a long story", false),
+            (MessageRole::Assistant, "Once", true),
+        ]
+    );
+    assert_eq!(runtime.session().messages[1].thinking, "plot");
+    assert_journal_matches(&store, &runtime);
+
+    let (result, _) = turn(
+        &mut runtime,
+        &provider,
+        "shorter please",
+        &RunControl::default(),
+    )
+    .await;
+    assert_eq!(result.unwrap(), "Shorter.");
+    assert_eq!(
+        provider.request(1),
+        [
+            (ChatRole::User, "tell a long story".into()),
+            (ChatRole::User, "shorter please".into())
+        ]
+    );
+    assert_eq!(saved_marked(&runtime).len(), 4);
+    assert_journal_matches(&store, &runtime);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn a_failure_that_ends_the_turn_keeps_what_the_reply_streamed_as_aborted() {
+    let (mut runtime, store, base) = session("failed", &[]);
+    let error = r#"{"error":{"message":"Unsupported parameter."}}"#;
+    let provider = Steps::new([broken(vec![StreamEvent::Text("Hel".into())], error)]);
+    let (result, _) = turn(&mut runtime, &provider, "hi", &RunControl::default()).await;
+    assert!(matches!(result, Err(AgentError::Provider(_))));
+    assert_eq!(
+        saved_marked(&runtime),
+        [
+            (MessageRole::User, "hi", false),
+            (MessageRole::Assistant, "Hel", true),
+        ]
+    );
+    assert!(runtime.session().has_unfinished_turn());
+    assert_journal_matches(&store, &runtime);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn a_stop_during_a_retry_backoff_leaves_no_partial_to_recover() {
+    let (mut runtime, store, base) = session("backoff-stop", &[]);
+    runtime
+        .reload(ReloadableSystems {
+            retry: RuntimeRetrySettings {
+                base_delay_ms: 60_000,
+                ..RuntimeRetrySettings::default()
+            },
+            ..systems()
+        })
+        .unwrap();
+    let provider = Steps::new([broken(vec![StreamEvent::Text("Hel".into())], OVERLOADED)]);
+    let run = RunControl::default();
+    let turn = run_user_turn_streaming_events_with_media(
+        &mut runtime,
+        &provider,
+        "hi".into(),
+        Vec::new(),
+        &run,
+        |_| {},
+    );
+    // The process stops during the backoff.
+    assert!(tokio::time::timeout(Duration::from_millis(500), turn)
+        .await
+        .is_err());
+    let path = store.path().to_path_buf();
+    let journal = fs::read_to_string(&path).unwrap();
+    assert!(
+        journal.contains(r#""type":"partial","attempt":1,"text":"Hel""#),
+        "{journal}"
+    );
+    drop((runtime, store));
+    // The retry dropped the reply: nothing of it is recovered.
+    let (_, state) = SessionStore::open(path).unwrap();
+    assert_eq!(state.messages.len(), 1);
+    assert!(state.has_unfinished_turn());
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn an_abort_during_a_round_answers_the_running_call_and_the_ones_after_it() {
+    let (mut runtime, store, base) = session("aborted-round", &[]);
+    let marker = base.join("ran.txt");
+    let call = |id: &str, command: String| StreamEvent::ToolCall {
+        id: id.into(),
+        name: "bash".into(),
+        arguments: json!({ "command": command }).to_string(),
+    };
+    let provider = Steps::new([reply(vec![
+        call("b1", "echo so far; exec sleep 30".into()),
+        call("b2", format!("touch '{}'", marker.display())),
+    ])]);
+    let run = RunControl::default();
+    let cancelled = {
+        let cancellation = run.cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            cancellation.cancel();
+        })
+    };
+    let (result, lines) = turn(&mut runtime, &provider, "run both", &run).await;
+    cancelled.await.unwrap();
+    assert!(matches!(result, Err(AgentError::Cancelled)));
+    assert!(!marker.exists(), "the second call ran");
+    // Only the running call is reported.
+    assert_eq!(
+        lines[lines.len() - 2..],
+        [
+            r#"output b1 "so far\n\n\nOperation aborted" error"#,
+            "finished bash error"
+        ]
+    );
+    let results = saved(&runtime)[2..].to_vec();
+    assert_eq!(
+        results,
+        [
+            (MessageRole::Tool, "so far\n\n\nOperation aborted"),
+            (MessageRole::Tool, "Operation aborted"),
+        ]
+    );
+    assert!(runtime.session().pending_tool_calls().is_none());
+    assert_journal_matches(&store, &runtime);
+    fs::remove_dir_all(base).unwrap();
 }

@@ -451,6 +451,8 @@ pub struct Settings {
     #[serde(default)]
     pub agent: Option<AgentSettings>,
     #[serde(default)]
+    pub progress: Option<ProgressSettings>,
+    #[serde(default)]
     pub terminal: Option<TerminalSettings>,
     #[serde(default)]
     pub images: Option<ImageSettings>,
@@ -542,6 +544,7 @@ impl Settings {
             branch_summary: merge_optional_settings(self.branch_summary, overrides.branch_summary),
             retry: merge_optional_settings(self.retry, overrides.retry),
             agent: merge_optional_settings(self.agent, overrides.agent),
+            progress: merge_optional_settings(self.progress, overrides.progress),
             terminal: merge_optional_settings(self.terminal, overrides.terminal),
             images: merge_optional_settings(self.images, overrides.images),
             double_escape_action: overrides.double_escape_action.or(self.double_escape_action),
@@ -855,6 +858,27 @@ impl MergeSettings for AgentSettings {
     fn merge(self, overrides: Self) -> Self {
         Self {
             max_tool_rounds: overrides.max_tool_rounds.or(self.max_tool_rounds),
+        }
+    }
+}
+
+/// How often a run saves what it has produced so far (upstream Durable's
+/// `settings.progress`): a streaming reply's text and thinking, and a
+/// running tool's output. A crash loses at most the last interval.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressSettings {
+    /// Default 100.
+    pub partial_interval_ms: Option<u64>,
+    /// Default 100.
+    pub output_interval_ms: Option<u64>,
+}
+
+impl MergeSettings for ProgressSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            partial_interval_ms: overrides.partial_interval_ms.or(self.partial_interval_ms),
+            output_interval_ms: overrides.output_interval_ms.or(self.output_interval_ms),
         }
     }
 }
