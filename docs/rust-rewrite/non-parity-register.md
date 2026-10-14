@@ -1357,6 +1357,50 @@ what its journal and run engine hold, in Durable's shape where it can. The
 process model keeps one writer per session (the journal lock) and lets a run
 finish while no server is attached.
 
+### The TUI Attached to a Server Session
+
+`noel --attach <session-id>` (`crates/noel-cli/src/attach.rs`,
+`docs/spec.md` §7.4) opens the TUI on a session that `noel server` holds.
+Upstream has no such client (its experimental `pi client` was removed in
+Chord 1.2.0), so the comparison is with noel's own TUI on a local session,
+which it otherwise matches: the same terminal, editor, keys and transcript
+rendering. It differs where the session lives in its worker and is shared
+with other clients:
+
+- **Abort withdraws the queue.** Esc (or the interrupt key) aborts with
+  Mode 2's rule (spec §3.3): queued steers and follow-ups are withdrawn. The
+  local TUI keeps them.
+- **The queue is the session's.** During a run, Enter queues a follow-up and
+  ctrl+s a steer in the session's queue (`pi.inbox`), which every attached
+  client shows; ctrl+s does not turn queued follow-ups into steers. Up on an
+  empty draft withdraws the last queued submission, whichever client queued
+  it, into the draft.
+- **Input is expanded by the worker,** with the session's configuration:
+  skills, prompt templates and tool commands (`/bash`, `/read`, …) reach the
+  worker as typed. Other clients' prompts show as the session saved them, as
+  reopening a session shows them.
+- **Commands for this process's own session are not available.** Session
+  commands (`/new`, `/resume`, `/fork`, `/clone`, `/import`, `/export`,
+  `/name`, `/delete`, `/undo`, `/tree`), settings, themes, accounts and
+  logins, `/reload`, `/diff`, `/todos`, images, local shell commands (`!`),
+  `/queue <prompt>`, and the model picker say they are not available when
+  attached. `/model <provider/id>` and `/thinking <level>` are `configure`,
+  `/compact` is `compact`, and `/interrupt` is `abort`.
+- **Live output is what was saved:** a reply's partial and a tool's output
+  appear as the worker commits them (spec §4.2, at most every 100 ms), not
+  each streamed piece.
+- **Status.** The spinner's time counts from when this TUI first saw the run.
+  A reply aborted mid-stream shows `aborted` after it in every attached TUI,
+  where the local TUI notes `interrupted`.
+- **Recovery is the server's.** The TUI never continues an interrupted run
+  (the local TUI does when it reopens one): a lost worker is a note, then the
+  view is held again and redrawn from its snapshot, and a lost server is
+  reconnected (and started).
+
+Reason: the session's runtime is in its worker, and the TUI is one of the
+clients that follow its view (spec §7.3); a command that acts on a session in
+this process has no session here.
+
 ### Workspaces
 
 `crates/noel-env`'s `ExecutionEnv` has upstream Durable's methods, results
