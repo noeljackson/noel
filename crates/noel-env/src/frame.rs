@@ -100,6 +100,23 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<Option<Frame>> {
     }))
 }
 
+/// One frame as bytes, for a writer that queues frames (noel's client).
+pub fn encode_frame(kind: u8, id: u32, json: &Value, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let json = serde_json::to_vec(json).map_err(|_| invalid("unserializable JSON"))?;
+    let length = 9 + json.len() + payload.len();
+    if length > MAX_FRAME {
+        return Err(invalid("frame too large"));
+    }
+    let mut bytes = Vec::with_capacity(4 + length);
+    bytes.extend_from_slice(&(length as u32).to_be_bytes());
+    bytes.push(kind);
+    bytes.extend_from_slice(&id.to_be_bytes());
+    bytes.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&json);
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
 /// Write one frame and flush it.
 pub fn write_frame(output: &mut impl Write, frame: &Frame) -> io::Result<()> {
     let json = serde_json::to_vec(&frame.json).map_err(|_| invalid("unserializable JSON"))?;
@@ -131,6 +148,10 @@ mod tests {
             &Frame::with_payload(RESULT, 7, json!({ "a": 1 }), vec![0, 255, 10]),
         )
         .unwrap();
+        assert_eq!(
+            encode_frame(RESULT, 7, &json!({ "a": 1 }), &[0, 255, 10]).unwrap(),
+            buffer
+        );
         let frame = read_frame(&mut buffer.as_slice()).unwrap().unwrap();
         assert_eq!((frame.kind, frame.id), (RESULT, 7));
         assert_eq!(frame.json, json!({ "a": 1 }));

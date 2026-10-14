@@ -26,10 +26,11 @@ mkdir -p "${fresh_fixtures_dir}" "${fixtures_dir}"
   git -C /ts-reference rev-parse HEAD > "${out_dir}/reference-sha"
 reference_sha="$(cat "${out_dir}/reference-sha")"
 
-# chord-delta.json, chord-link.json, local-env.json and pi-env.json are pinned
-# (CHORD_REFERENCE_REF in the Makefile) rather than made from the tracking ref,
-# so their drift is the commits on the tracking ref after the pin: to
-# packages/chord, to Durable's env and its conformance cases, and to pi-env.
+# chord-delta.json, chord-link.json, local-env.json, pi-env.json and
+# pi-env-ssh.json are pinned (CHORD_REFERENCE_REF in the Makefile) rather than
+# made from the tracking ref, so their drift is the commits on the tracking ref
+# after the pin: to packages/chord, to Durable's env and its conformance cases,
+# and to pi-env.
 chord_file="${out_dir}/chord-commits"
 env_file="${out_dir}/env-commits"
 chord_pin="$("${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
@@ -68,11 +69,11 @@ if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file}" ] || [ -s "${env_file}"
     fi
     if [ -s "${env_file}" ]; then
       printf '## Durable env pin\n\n'
-      printf '`local-env.json` and `pi-env.json` are pinned to `%s` too. Durable'"'"'s env, its conformance cases or pi-env (`packages/env`) changed after it on the tracked reference:\n\n' "${chord_pin}"
+      printf '`local-env.json`, `pi-env.json` and `pi-env-ssh.json` are pinned to `%s` too. Durable'"'"'s env, its conformance cases or pi-env (`packages/env`) changed after it on the tracked reference:\n\n' "${chord_pin}"
       printf '```text\n'
       cat "${env_file}"
       printf '```\n\n'
-      printf 'After moving the pin, regenerate with `make ts-parity-env` and `make ts-parity-pi-env`, bring `crates/noel-env`'"'"'s `LocalEnv` and its conformance port (`crates/noel-env/tests/local_env_conformance.rs`), and `noel-env serve` (`crates/noel-env-daemon`, a port of `packages/env/daemon`), level with the new cases, and run `cargo test -p noel-env -p noel-env-daemon` and `make env-interop`.\n\n'
+      printf 'After moving the pin, regenerate with `make ts-parity-env`, `make ts-parity-pi-env` and `make ts-parity-pi-env-ssh`, bring `crates/noel-env`'"'"'s `LocalEnv`, `RemoteEnv`, client and SSH deployment and their conformance port (`crates/noel-env/tests/conformance`), and `noel-env serve` (`crates/noel-env-daemon`, a port of `packages/env/daemon`), level with the new cases, and run `cargo test -p noel-env -p noel-env-daemon` and `make env-interop`.\n\n'
     fi
     printf '## Constraints\n\n'
     printf -- '- Do not run npm on the host.\n'

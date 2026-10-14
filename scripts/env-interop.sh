@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
-# pi-env interop: upstream's pi-env client (packages/env at the pin in the
-# ts-parity image) drives `noel-env serve`, which it starts directly (no ssh)
-# through PI_ENV_DAEMON, as upstream's CI tests its release daemons:
+# pi-env interop, both ways, without ssh:
 #
-#   - Durable's env conformance suite over RemoteExecutionEnv and
-#     LocalExecutionEnv (test/conformance.test.ts);
-#   - remote.test.ts, differential.test.ts (RemoteExecutionEnv against
-#     NodeExecutionEnv) and terminal.test.ts.
+# 1. Upstream's pi-env client (packages/env at the pin in the ts-parity image)
+#    drives `noel-env serve`, which it starts directly through PI_ENV_DAEMON,
+#    as upstream's CI tests its release daemons:
+#    - Durable's env conformance suite over RemoteExecutionEnv and
+#      LocalExecutionEnv (test/conformance.test.ts);
+#    - remote.test.ts, differential.test.ts (RemoteExecutionEnv against
+#      NodeExecutionEnv) and terminal.test.ts.
+#    The same suites run against upstream's own daemon first, as the baseline.
+#    noel-env is built static (musl), as upstream ships its Linux daemons, so
+#    it runs in the image.
 #
-# The same suites run against upstream's own daemon first, as the baseline.
-# SSH deployment (ssh.test.ts, ssh-external.test.ts) is not part of the
-# daemon. noel-env is built static (musl), as upstream ships its Linux
-# daemons, so it runs in the image; this needs a Linux host. The tests run as
-# the caller's uid, so permission cases behave as they do for a user.
+# 2. noel's client (noel_env::RemoteEnv, Connection and ssh deployment) drives
+#    upstream's daemon: the client tests of crates/noel-env-daemon
+#    (remote_env_conformance, remote_env, pi_env_client_golden, ssh_deploy)
+#    run with NOEL_ENV_TEST_DAEMON pointing at upstream's pi-env, copied out of
+#    the image (a static binary), after the same tests against noel-env serve
+#    as the baseline. ssh_deploy deploys the daemon through a stand-in for ssh.
+#
+# This needs a Linux host. The tests run as the caller's uid, so permission
+# cases behave as they do for a user.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,12 +42,13 @@ if command -v rustup >/dev/null 2>&1 && ! rustup target list --installed | grep 
   exit 2
 fi
 "${cargo_bin}" build -q -p noel-env-daemon --target "${target}"
+"${cargo_bin}" build -q -p noel-env-daemon
 daemon="${target_dir}/${target}/debug/noel-env"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/env-interop.XXXXXX")"
 container="env-interop-$$"
 cleanup() {
-  "${docker_bin}" rm -f "${container}-upstream" "${container}-noel" "${container}-summary" >/dev/null 2>&1 || true
+  "${docker_bin}" rm -f "${container}-upstream" "${container}-noel" "${container}-summary" "${container}-copy" >/dev/null 2>&1 || true
   rm -rf "${work}"
 }
 trap cleanup EXIT
@@ -98,5 +107,27 @@ for (const [test, status] of outcomes(noel)) {
 console.log(`tests whose outcome differs from upstream: ${differences}`);
 '
 
-printf '== upstream exit %s, noel exit %s\n' "${upstream_status}" "${noel_status}"
-[ "${noel_status}" -eq 0 ]
+printf '== upstream client: against upstream exit %s, against noel exit %s\n' "${upstream_status}" "${noel_status}"
+
+# noel's client against noel's daemon (the baseline), then against upstream's.
+client_tests=(--test remote_env_conformance --test remote_env --test pi_env_client_golden --test ssh_deploy)
+run_client_tests() {
+  local name="$1" daemon_path="$2"
+  printf '== noel client against %s (%s)\n' "${name}" "$("${daemon_path}" --version)"
+  set +e
+  NOEL_ENV_TEST_DAEMON="${daemon_path}" NOEL_TEST_ISOLATION=1 \
+    "${cargo_bin}" test -q -p noel-env-daemon "${client_tests[@]}" > "${work}/client-${name}.log" 2>&1
+  local status=$?
+  set -e
+  grep -E '^test result|FAILED|panicked' "${work}/client-${name}.log" || true
+  return "${status}"
+}
+"${docker_bin}" run --rm --name "${container}-copy" --user "$(id -u):$(id -g)" -v "${work}:/out" "${image}" \
+  cp /usr/local/bin/pi-env /out/pi-env
+client_noel_status=0
+run_client_tests noel "${target_dir}/debug/noel-env" || client_noel_status=$?
+client_upstream_status=0
+run_client_tests upstream "${work}/pi-env" || client_upstream_status=$?
+printf '== noel client: against noel exit %s, against upstream exit %s\n' "${client_noel_status}" "${client_upstream_status}"
+
+[ "${noel_status}" -eq 0 ] && [ "${client_noel_status}" -eq 0 ] && [ "${client_upstream_status}" -eq 0 ]
