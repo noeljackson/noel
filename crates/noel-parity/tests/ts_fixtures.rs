@@ -14,6 +14,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "auth-discovery.json",
     "bedrock-claude-opus-4.6.json",
     "bedrock-tools.json",
+    "chord-delta.json",
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
     "error-classification.json",
@@ -47,6 +48,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "anthropic-oauth-fixture.ts",
     "auth-discovery-fixture.ts",
     "bedrock-fixture.ts",
+    "chord-delta-fixture.ts",
     "cli-contract-fixture.ts",
     "cloudflare-fixture.ts",
     "codex-oauth-fixture.ts",
@@ -97,7 +99,11 @@ fn fixtures_have_source_metadata_and_payloads() {
             source.get("repository").and_then(Value::as_str),
             Some("https://github.com/earendil-works/pi")
         );
-        assert_eq!(source.get("ref").and_then(Value::as_str), Some("main"));
+        assert_eq!(
+            source.get("ref").and_then(Value::as_str),
+            Some(expected_ref(fixture_name).as_str()),
+            "{fixture_name} source.ref"
+        );
         let script = fixture_script_name(&fixture);
         assert!(
             EXPECTED_SCRIPTS.contains(&script),
@@ -143,6 +149,7 @@ fn every_script_output_is_committed() {
             "bedrock-fixture.ts",
             fixture_set(&["bedrock-claude-opus-4.6.json", "bedrock-tools.json"]),
         ),
+        ("chord-delta-fixture.ts", fixture_set(&["chord-delta.json"])),
         (
             "cli-contract-fixture.ts",
             fixture_set(&["cli-contract.json"]),
@@ -237,6 +244,20 @@ fn every_script_output_is_committed() {
     assert_eq!(by_script, expected);
 }
 
+/// The upstream ref a fixture records: `main`, except for Chord's goldens,
+/// which are pinned to `CHORD_REFERENCE_REF` in the Makefile.
+fn expected_ref(fixture_name: &str) -> String {
+    if fixture_name != "chord-delta.json" {
+        return "main".to_string();
+    }
+    let makefile = fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
+    makefile
+        .lines()
+        .find_map(|line| line.strip_prefix("CHORD_REFERENCE_REF ?= "))
+        .expect("the Makefile pins Chord")
+        .to_string()
+}
+
 fn fixture_set(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| (*name).to_string()).collect()
 }
@@ -279,6 +300,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("auth-discovery.json", "crates/noel-config/src/lib.rs"),
         ("bedrock-claude-opus-4.6.json", "crates/noel-ai/src/lib.rs"),
         ("bedrock-tools.json", "crates/noel-ai/src/lib.rs"),
+        (
+            "chord-delta.json",
+            "crates/noel-chord/tests/chord_delta_parity.rs",
+        ),
         ("cli-contract.json", "crates/noel-cli/src/main.rs"),
         (
             "cloudflare-ai-gateway-kimi.json",
