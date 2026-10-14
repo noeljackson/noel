@@ -1619,6 +1619,7 @@ dependencies = [
  "noel-agent",
  "noel-ai",
  "noel-config",
+ "noel-env",
  "noel-session",
  "noel-tools",
  "serde",
@@ -1626,6 +1627,19 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "time",
+ "tokio",
+]
+
+[[package]]
+name = "noel-env"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "nix",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -1668,6 +1682,7 @@ dependencies = [
  "ignore",
  "image",
  "nix",
+ "noel-env",
  "regex",
  "reqwest",
  "scraper",

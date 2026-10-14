@@ -1207,3 +1207,65 @@ noel implements a subset, and these parts differ:
 Reason: noel needs Chord's protocol, not its runtime: one code version, no
 plugins, and objects whose state it owns directly. The rest are a native
 JSON library and scheduler standing in for JavaScript's.
+
+### Workspaces
+
+`crates/noel-env`'s `ExecutionEnv` has upstream Durable's methods, results
+and error codes, and `LocalEnv` makes the same observations as
+`NodeExecutionEnv` in every case of upstream's env conformance suite that it
+runs (`local-env.json`, at the pinned commit). These parts differ:
+
+- **No watching yet.** `LocalEnv::watch` fails with `not_supported`, so the
+  suite's nine watch cases are not run against it; the fixture records them
+  by outcome only, since their change reports vary from run to run.
+  `list_files` fails with `not_supported` too, as `NodeExecutionEnv` has no
+  `listFiles`.
+- **Id.** `LocalEnv`'s id is `local`; `NodeExecutionEnv`'s is `node:local`.
+  Ids only say which environments share files.
+- **Rust types.** Offsets, lengths, sizes and counts are unsigned integers and
+  timeouts are durations, so the negative and fractional values upstream
+  rejects at run time with `invalid` cannot be passed. The conformance port
+  passes the nearest values that are not safe integers either (above 2^53 -
+  1), which `LocalEnv` rejects with `invalid` as upstream rejects any value
+  that is not a non-negative safe integer. A zero timeout is rejected with
+  `timeout`, as upstream rejects a timeout that is not above zero.
+- **Callbacks.** An output callback fails a command by returning `Err`
+  (upstream: by throwing), which kills it and settles it with
+  `callback_error`.
+- **Additions to `exec`.** An `env` entry with no value removes an inherited
+  variable (noel's bash calls drop stale `NOEL_*` and `PI_*` values); with
+  `merge_stderr` both streams share one pipe, so output keeps its order and
+  every chunk is stdout (the bash tool uses this, as before: see Shell Tool
+  Differences); and each chunk also carries its raw bytes, so the bash tool
+  saves the exact output. A chunk whose bytes end inside a character has
+  empty text.
+- **Shell lookup.** Without a configured shell, `/bin/bash`, then `bash`
+  found on `PATH`, then `sh`; upstream runs `which bash` for the middle step.
+- **One `cleanup`.** Upstream's `FileSystem` and `Shell` each declare
+  `cleanup`, which TypeScript merges; Rust declares it once, on `Shell`.
+- **Unix only.** Upstream's Windows rules (drive-relative paths, Git Bash,
+  `taskkill`) are not ported.
+
+The tools now reach files and commands through the workspace. Their limits,
+results and error texts are unchanged, except in these corners:
+
+- `ls` lists through the workspace, which describes files, directories and
+  links only, so sockets, FIFOs and devices inside the directory are left out
+  of the listing (one named as the path is still `Not a directory`). A
+  directory that can be read but not searched (`r` without `x`) fails with
+  `Cannot read directory` instead of listing nothing.
+- `file://` paths resolve as Node's `fileURLToPath` resolves them: a query or
+  fragment is dropped, and a URL with a host other than `localhost`, an
+  encoded `/`, or an escape that is not UTF-8 is an ordinary relative path.
+- `grep` and `find` search with ripgrep's crates on this machine's files, so
+  in a workspace that is not local they fail and say so.
+- `edit` and `write` of one file run one at a time within noel, keyed by the
+  workspace id and the canonical path (upstream's file mutation queue). Where
+  the canonical path cannot be found for another reason than a missing file,
+  noel keys by the absolute path and lets the edit or write report the
+  failure; upstream fails the call with the lookup's error.
+
+Reason: the interface is upstream's so that the remote workspace (pi-env
+protocol 1) can follow without changing the tools. Watching waits for the
+features that need it. The additions keep the bash tool's output exactly as
+it was, and the rest are Rust's type system and noel being Unix-only.

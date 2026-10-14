@@ -42,10 +42,13 @@ RUN set -eu; \
     install -m 0755 "${rg}/rg" "${fd}/fd" /usr/local/bin/; \
     rm -rf "${rg}" "${fd}" "${rg}.tar.gz" "${fd}.tar.gz"
 
-# Chord's goldens (chord-delta.json) come from their own pinned commit, not
-# from TS_REFERENCE_REF: link protocol 2 is unreleased and changes often. The
-# pin is checked out at /chord-reference with Chord's locked dependencies and
-# built once, so an image exists only for a pin at which packages/chord builds.
+# Chord's goldens (chord-delta.json, chord-link.json) come from their own
+# pinned commit, not from TS_REFERENCE_REF: link protocol 2 is unreleased and
+# changes often. The pin is checked out at /chord-reference with Chord's locked
+# dependencies and built once, so an image exists only for a pin at which
+# packages/chord builds. LocalEnv's goldens (local-env.json) run Durable's
+# NodeExecutionEnv and env conformance cases from the same checkout; they need
+# only Node and Chord's context module.
 ARG CHORD_REFERENCE_REF=1692bba6347a287ab0f3cb554a4430fafffc474b
 RUN set -eu; \
     cd /ts-reference; \

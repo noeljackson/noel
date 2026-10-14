@@ -233,6 +233,14 @@ a submission belongs to this session.
 - **The remote adapter** speaks `pi-env`'s framed protocol version 1 (`env/docs/protocol.md`).
 - **A Codewire adapter** is built on the MIT Rust SDK. It is optional.
 
+**Built** in `crates/noel-env`, matching upstream's `durable/src/env` at the pinned commit (`CHORD_REFERENCE_REF` in the Makefile):
+- **the interface:** `ExecutionEnv`, a `FileSystem` plus a `Shell` with upstream's methods, results and error codes (`FileErrorCode`, `ExecutionErrorCode`). It is async, object-safe (`Arc<dyn ExecutionEnv>`), and every operation takes a `Context` whose abort signal it checks;
+- **`LocalEnv`** (id `local`), which behaves as `NodeExecutionEnv` (`env/docs/semantics.md`). A string command runs through the shell and an argument list without one, each in a new session with stdin from `/dev/null`; abort, timeout, or dropping the call kills only that command's process group. It is checked against `tests/fixtures/ts-parity/local-env.json`, the observations of upstream's env conformance cases (`durable/src/testing/env-conformance.ts`) on `NodeExecutionEnv`. `watch` and `listFiles` fail with `not_supported` for now;
+- **the tools:** `read`, `write`, `edit`, `ls` and `bash` reach files and run commands only through the workspace, with their limits, results and error texts unchanged; `edit` and `write` of one file run one at a time per file system id and canonical path (`durable/src/tools/file-mutation-queue.ts`). `grep` and `find` resolve their paths in the workspace and search with ripgrep's crates, so they need a local one;
+- **the hook:** `Runtime` asks its `EnvProvider` for the workspace of each tool call with `EnvTarget {session_id, cwd}`, as Durable's harness `env(target)` does; a failure is that call's error result. The default is a `LocalEnv` at the session's working directory, so every mode behaves as before.
+
+Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-register.md` ("Workspaces").
+
 **Proposed:** a session's workspace is saved as a journal record `Workspace {adapter, …}`; when there is none, the workspace is local.
 
 **Decided (2026-10-14):** noel has its own `noel-env`, a Rust port of upstream's whole `pi-env` package (`env/`), which upstream writes partly in TypeScript and partly in Rust.
@@ -247,7 +255,7 @@ a submission belongs to this session.
 - **No server or client to record.** Upstream publishes no `pi server` or `pi client`, so the Chord goldens drive upstream's public `packages/chord` with noel's contracts, covering delta and canonical-JSON vectors and the link frames.
 - **Interop:** a test in Docker connects an upstream Chord client to a noel server, and the reverse.
 - **pi-env goldens** come from upstream's `RemoteExecutionEnv` talking to its own daemon.
-- **`LocalEnv`** is checked against the conformance results of upstream's `NodeExecutionEnv`.
+- **`LocalEnv`** is checked against the conformance results of upstream's `NodeExecutionEnv` (**Built**: `local-env.json`).
 
 ## 12. Deviations from upstream
 

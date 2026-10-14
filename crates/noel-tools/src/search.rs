@@ -1,15 +1,18 @@
 //! `grep`, `find`, and `ls`. Upstream runs ripgrep and fd; these walk the
 //! tree with ripgrep's own `ignore` and `globset` crates and reproduce the
-//! flags upstream passes, so the same files are searched and listed.
+//! flags upstream passes, so the same files are searched and listed. Those
+//! crates read this machine's files, so `grep` and `find` need a local
+//! workspace; `ls` lists through the workspace.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use noel_env::{Context, ExecutionEnv, FileErrorCode, FileKind};
 
-use crate::paths::resolve_to_cwd;
+use crate::paths::resolve_tool_path;
 use crate::truncate::{
     format_size, truncate_head, truncate_line, DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH,
 };
@@ -51,6 +54,18 @@ fn limited_output(lines: &[String], mut notices: Vec<String>, after_bytes: &[&st
     ToolResult::text(output)
 }
 
+/// Refuses a search in a workspace that is not this machine.
+fn require_local(env: &dyn ExecutionEnv, tool: &str) -> Result<(), ToolError> {
+    if noel_env::is_local(env) {
+        Ok(())
+    } else {
+        Err(failed(format!(
+            "{tool} needs a local workspace; this one is {}",
+            env.id()
+        )))
+    }
+}
+
 /// A path below `root` with `/` separators.
 fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
@@ -62,8 +77,14 @@ fn relative_display(root: &Path, path: &Path) -> String {
 /// Like `rg --hidden [--ignore-case] [--fixed-strings] [--glob GLOB]`:
 /// hidden files are searched, ignore files apply, and inside a git
 /// repository so does `.gitignore`. Files are searched in path order.
-pub(crate) fn grep_tool(cwd: &Path, args: GrepArgs<'_>) -> Result<ToolResult, ToolError> {
-    let search_path = resolve_to_cwd(cwd, args.path.unwrap_or("."));
+pub(crate) async fn grep_tool(
+    env: &dyn ExecutionEnv,
+    args: GrepArgs<'_>,
+    cx: &Context,
+) -> Result<ToolResult, ToolError> {
+    require_local(env, "grep")?;
+    let cwd = Path::new(env.cwd());
+    let search_path = PathBuf::from(resolve_tool_path(env, args.path.unwrap_or("."), cx).await?);
     let Ok(metadata) = fs::metadata(&search_path) else {
         return Err(failed(format!("Path not found: {}", search_path.display())));
     };
@@ -211,13 +232,15 @@ pub(crate) fn grep_tool(cwd: &Path, args: GrepArgs<'_>) -> Result<ToolResult, To
 /// glob, or whose path does when the glob has a `/`. Hidden entries are
 /// listed and ignore files apply, `.gitignore` also outside a repository.
 /// Results are in path order.
-pub(crate) fn find_tool(
-    cwd: &Path,
+pub(crate) async fn find_tool(
+    env: &dyn ExecutionEnv,
     pattern: &str,
     path: Option<&str>,
     limit: Option<u64>,
+    cx: &Context,
 ) -> Result<ToolResult, ToolError> {
-    let search_path = resolve_to_cwd(cwd, path.unwrap_or("."));
+    require_local(env, "find")?;
+    let search_path = PathBuf::from(resolve_tool_path(env, path.unwrap_or("."), cx).await?);
     if !search_path.exists() {
         return Err(failed(format!("Path not found: {}", search_path.display())));
     }
@@ -291,44 +314,98 @@ pub(crate) fn find_tool(
     Ok(limited_output(&results, notices, &[]))
 }
 
+/// What a path names once links are followed, as Node's `existsSync` and
+/// `statSync` see it.
+enum Found {
+    Missing,
+    Directory,
+    Other,
+}
+
+async fn follow(env: &dyn ExecutionEnv, path: &str, cx: &Context) -> Found {
+    let info = match env.file_info(path, cx).await {
+        Ok(info) => info,
+        // A socket, FIFO or device, which the workspace does not describe.
+        Err(error) if error.code == FileErrorCode::Invalid => return Found::Other,
+        Err(_) => return Found::Missing,
+    };
+    let kind = if info.kind == FileKind::Symlink {
+        let Ok(target) = env.canonical_path(path, cx).await else {
+            return Found::Missing;
+        };
+        match env.file_info(&target, cx).await {
+            Ok(info) => info.kind,
+            Err(error) if error.code == FileErrorCode::Invalid => return Found::Other,
+            Err(_) => return Found::Missing,
+        }
+    } else {
+        info.kind
+    };
+    if kind == FileKind::Directory {
+        Found::Directory
+    } else {
+        Found::Other
+    }
+}
+
 /// Entries of one directory, dotfiles included, directories marked with `/`.
-pub(crate) fn ls_tool(
-    cwd: &Path,
+pub(crate) async fn ls_tool(
+    env: &dyn ExecutionEnv,
     path: Option<&str>,
     limit: Option<u64>,
+    cx: &Context,
 ) -> Result<ToolResult, ToolError> {
-    let directory = resolve_to_cwd(cwd, path.unwrap_or("."));
-    if !directory.exists() {
-        return Err(failed(format!("Path not found: {}", directory.display())));
-    }
-    if !directory.is_dir() {
-        return Err(failed(format!("Not a directory: {}", directory.display())));
+    let directory = resolve_tool_path(env, path.unwrap_or("."), cx).await?;
+    match follow(env, &directory, cx).await {
+        Found::Missing => return Err(failed(format!("Path not found: {directory}"))),
+        Found::Other => return Err(failed(format!("Not a directory: {directory}"))),
+        Found::Directory => {}
     }
     let limit = limit.unwrap_or(LS_DEFAULT_LIMIT) as usize;
-    let mut names = fs::read_dir(&directory)
-        .and_then(|entries| {
-            entries
-                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|error| failed(format!("Cannot read directory: {error}")))?;
-    names.sort_by_cached_key(|name| (name_sort_key(name), name.clone()));
+    let cannot_read = |error: noel_env::FileError| {
+        failed(format!("Cannot read directory: {}", error.to_io_error()))
+    };
+    let mut reader = env
+        .open_dir_reader(&directory, cx)
+        .await
+        .map_err(cannot_read)?;
+    let mut entries = Vec::new();
+    let listed = loop {
+        match reader.next(1000, cx).await {
+            Ok(page) => {
+                entries.extend(page.entries);
+                if page.done {
+                    break Ok(());
+                }
+            }
+            Err(error) => break Err(cannot_read(error)),
+        }
+    };
+    reader.close(cx).await;
+    listed?;
+    entries.sort_by_cached_key(|entry| (name_sort_key(&entry.name), entry.name.clone()));
 
     let mut results = Vec::new();
     let mut limit_reached = false;
-    for name in names {
+    for entry in entries {
         if results.len() >= limit {
             limit_reached = true;
             break;
         }
-        // Entries that cannot be inspected, such as broken links, are left out.
-        let Ok(metadata) = fs::metadata(directory.join(&name)) else {
-            continue;
+        // Links are followed; broken ones are left out.
+        let directory = match entry.kind {
+            FileKind::Directory => true,
+            FileKind::File => false,
+            FileKind::Symlink => match follow(env, &entry.path, cx).await {
+                Found::Missing => continue,
+                Found::Directory => true,
+                Found::Other => false,
+            },
         };
-        results.push(if metadata.is_dir() {
-            format!("{name}/")
+        results.push(if directory {
+            format!("{}/", entry.name)
         } else {
-            name
+            entry.name
         });
     }
     if results.is_empty() {
