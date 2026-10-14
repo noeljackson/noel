@@ -1,39 +1,18 @@
 //! Tool path arguments (upstream `path-utils.ts`): any path the user could
 //! name is accepted, relative to the working directory, absolute, or under
-//! `~`. Paths are not confined to the working directory.
+//! `~`. Paths are not confined to the working directory. The workspace
+//! resolves them (`ExecutionEnv::absolute_path`); a tool only normalizes how
+//! it was typed first.
 
-use std::path::{Component, Path, PathBuf};
+use noel_env::{Context, ExecutionEnv};
 
-/// Resolves a tool's path argument against `cwd`.
-pub(crate) fn resolve_to_cwd(cwd: &Path, input: &str) -> PathBuf {
-    resolve_with_home(cwd, input, std::env::home_dir().as_deref())
-}
+use crate::ToolError;
 
-/// Resolves the path of a file to read. When it does not exist, tries the
-/// spellings macOS gives screenshots: a narrow no-break space before AM/PM
-/// and a curly apostrophe.
-pub(crate) fn resolve_read_path(cwd: &Path, input: &str) -> PathBuf {
-    let resolved = resolve_to_cwd(cwd, input);
-    if resolved.exists() {
-        return resolved;
-    }
-    let Some(text) = resolved.to_str() else {
-        return resolved;
-    };
-    let am_pm = ["AM", "PM", "am", "pm", "Am", "Pm", "aM", "pM"]
-        .iter()
-        .fold(text.to_string(), |text, half| {
-            text.replace(&format!(" {half}."), &format!("\u{202f}{half}."))
-        });
-    [am_pm, text.replace('\'', "\u{2019}")]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|variant| variant.exists())
-        .unwrap_or(resolved)
-}
-
-fn resolve_with_home(cwd: &Path, input: &str, home: Option<&Path>) -> PathBuf {
-    // Unicode spaces that editors and terminals paste in place of a space.
+/// A tool's path argument as typed (upstream Durable's
+/// `normalizeToolPath`): Unicode spaces that editors and terminals paste in
+/// place of a space become spaces, and the `@` prompts put before a file is
+/// dropped.
+pub(crate) fn normalize_tool_path(input: &str) -> String {
     let input = input.replace(
         |character| {
             matches!(
@@ -43,68 +22,64 @@ fn resolve_with_home(cwd: &Path, input: &str, home: Option<&Path>) -> PathBuf {
         },
         " ",
     );
-    // `@path` is how prompts refer to files.
-    let input = input.strip_prefix('@').unwrap_or(&input);
-    let path = match (input, home) {
-        ("~", Some(home)) => home.to_path_buf(),
-        (_, Some(home)) if input.starts_with("~/") => home.join(&input[2..]),
-        _ => match input.strip_prefix("file://") {
-            Some(url_path) => PathBuf::from(percent_decode(
-                url_path.strip_prefix("localhost").unwrap_or(url_path),
-            )),
-            None => PathBuf::from(input),
-        },
-    };
-    // The result is absolute even when `cwd` is not.
-    let base = std::env::current_dir().unwrap_or_default().join(cwd);
-    normalize(&base.join(path))
+    match input.strip_prefix('@') {
+        Some(rest) => rest.to_string(),
+        None => input,
+    }
 }
 
-/// Removes `.` and resolves `..` without touching the file system.
-fn normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other),
-        }
-    }
-    normalized
+/// Resolves a tool's path argument in `env`.
+pub(crate) async fn resolve_tool_path(
+    env: &dyn ExecutionEnv,
+    input: &str,
+    cx: &Context,
+) -> Result<String, ToolError> {
+    env.absolute_path(&normalize_tool_path(input), cx)
+        .await
+        .map_err(|error| ToolError::Failed(error.message))
 }
 
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let hex = bytes
-            .get(index + 1..index + 3)
-            .filter(|_| bytes[index] == b'%')
-            .and_then(|hex| std::str::from_utf8(hex).ok())
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        match hex {
-            Some(byte) => {
-                decoded.push(byte);
-                index += 3;
-            }
-            None => {
-                decoded.push(bytes[index]);
-                index += 1;
-            }
+/// Resolves the path of a file to read. When it does not exist, tries the
+/// spellings macOS gives screenshots: a narrow no-break space before AM/PM
+/// and a curly apostrophe.
+pub(crate) async fn resolve_read_path(
+    env: &dyn ExecutionEnv,
+    input: &str,
+    cx: &Context,
+) -> Result<String, ToolError> {
+    let resolved = resolve_tool_path(env, input, cx).await?;
+    // Only a path known to be missing is respelled; one that cannot be
+    // inspected is read as it is and fails there.
+    if !matches!(env.exists(&resolved, cx).await, Ok(false)) {
+        return Ok(resolved);
+    }
+    let am_pm = ["AM", "PM", "am", "pm", "Am", "Pm", "aM", "pM"]
+        .iter()
+        .fold(resolved.clone(), |text, half| {
+            text.replace(&format!(" {half}."), &format!("\u{202f}{half}."))
+        });
+    for variant in [am_pm, resolved.replace('\'', "\u{2019}")] {
+        if matches!(env.exists(&variant, cx).await, Ok(true)) {
+            return Ok(variant);
         }
     }
-    String::from_utf8_lossy(&decoded).into_owned()
+    Ok(resolved)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use noel_env::{resolve_local_path, LocalEnv};
+
     use super::*;
 
     fn resolve(input: &str) -> PathBuf {
-        resolve_with_home(Path::new("/work/dir"), input, Some(Path::new("/home/user")))
+        PathBuf::from(resolve_local_path(
+            "/work/dir",
+            &normalize_tool_path(input),
+            Some("/home/user"),
+        ))
     }
 
     #[test]
@@ -132,20 +107,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_paths_fall_back_to_macos_screenshot_spellings() {
+    #[tokio::test]
+    async fn read_paths_fall_back_to_macos_screenshot_spellings() {
         let dir = std::env::temp_dir().join(format!("noel-paths-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let narrow = dir.join("Shot at 9.41\u{202f}AM.png");
         let curly = dir.join("Capture d\u{2019}ecran.png");
         std::fs::write(&narrow, "x").unwrap();
         std::fs::write(&curly, "x").unwrap();
-        assert_eq!(resolve_read_path(&dir, "Shot at 9.41 AM.png"), narrow);
-        assert_eq!(resolve_read_path(&dir, "Capture d'ecran.png"), curly);
-        assert_eq!(
-            resolve_read_path(&dir, "missing.png"),
-            dir.join("missing.png")
-        );
+        let env = LocalEnv::new(&dir);
+        let resolve_read = |input: &'static str| {
+            let env = &env;
+            async move {
+                PathBuf::from(
+                    resolve_read_path(env, input, &Context::background())
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+        assert_eq!(resolve_read("Shot at 9.41 AM.png").await, narrow);
+        assert_eq!(resolve_read("Capture d'ecran.png").await, curly);
+        assert_eq!(resolve_read("missing.png").await, dir.join("missing.png"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

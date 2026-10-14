@@ -6,6 +6,7 @@ members = [
     "crates/noel-cli",
     "crates/noel-config",
     "crates/noel-core",
+    "crates/noel-env",
     "crates/noel-parity",
     "crates/noel-providers",
     "crates/noel-session",
