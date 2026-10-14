@@ -2807,3 +2807,22 @@ fn fatal_signals_during_a_print_mode_bash_tool_kill_its_tree_and_end_noel_like_u
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn attach_refuses_the_options_that_shape_a_local_session() {
+    for args in [
+        &["--attach", "s-1", "--model", "faux/echo"][..],
+        &["--attach", "s-1", "--session-dir", "sessions"],
+        &["--attach", "s-1", "--thinking", "high"],
+        &["--attach", "s-1", "--no-tools"],
+        &["--attach", "s-1", "-p", "hi"],
+    ] {
+        let output = noel_command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cannot be used with") && stderr.contains("--attach"),
+            "{args:?}: {stderr}"
+        );
+    }
+}

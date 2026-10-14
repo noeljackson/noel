@@ -145,13 +145,20 @@ struct Cli {
     session_dir: Option<PathBuf>,
 
     /// Open the TUI on a session that `noel server` holds, starting the
-    /// server when none listens.
+    /// server when none listens. The session runs with its own settings, so
+    /// the options that shape a local session are refused with it.
     #[arg(
         long,
         value_name = "SESSION_ID",
         conflicts_with_all = [
             "print", "continue", "resume", "fork", "no_session", "session",
-            "session_id", "export", "messages",
+            "session_id", "export", "messages", "session_dir", "provider",
+            "model", "models", "api_key", "thinking", "system_prompt",
+            "append_system_prompt", "no_tools", "tools", "exclude_tools",
+            "no_builtin_tools", "skill", "no_skills", "prompt_template",
+            "no_prompt_templates", "no_context_files", "extension",
+            "no_extensions", "no_mcp", "image", "name", "approve", "no_approve",
+            "offline",
         ]
     )]
     attach: Option<String>,
