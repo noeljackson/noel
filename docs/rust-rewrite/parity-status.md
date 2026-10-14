@@ -40,6 +40,16 @@ The committed TypeScript parity fixtures are:
   `canonicalJson` and `hash64` with non-ASCII and astral text, `-0`, large and
   small numbers and control characters; and contract descriptions with their
   fingerprints, `coverage` between them, and `fits` cases.
+- `chord-link.json`: every frame upstream Chord's hosts send on their links,
+  recorded from `packages/chord` at the same pinned commit, in fifteen
+  scenarios run with noel's kind of contracts (a counter on the server, a
+  session object on a `session:` worker): hello; holds, `shape` and `gone`;
+  subscriptions with `snap`, `ops` and `unsub`; calls, results and errors;
+  cancel, `maxCalls` and release; relay through the server's route, with roots
+  and `root_end`; refused routes and a forged principal; `invalidatePrincipal`
+  with re-stamping and closing; pings and the ping timeout; window
+  coalescing and the four-window reset; version mismatches both ways; and
+  protocol violations. Each frame has its link and the side that sent it.
 - `cli-contract.json`: upstream CLI option and command contract.
 - `cloudflare-ai-gateway-kimi.json`: Cloudflare AI Gateway OpenAI-compatible
   request shape.

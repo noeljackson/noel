@@ -15,6 +15,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "bedrock-claude-opus-4.6.json",
     "bedrock-tools.json",
     "chord-delta.json",
+    "chord-link.json",
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
     "error-classification.json",
@@ -49,6 +50,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "auth-discovery-fixture.ts",
     "bedrock-fixture.ts",
     "chord-delta-fixture.ts",
+    "chord-link-fixture.ts",
     "cli-contract-fixture.ts",
     "cloudflare-fixture.ts",
     "codex-oauth-fixture.ts",
@@ -150,6 +152,7 @@ fn every_script_output_is_committed() {
             fixture_set(&["bedrock-claude-opus-4.6.json", "bedrock-tools.json"]),
         ),
         ("chord-delta-fixture.ts", fixture_set(&["chord-delta.json"])),
+        ("chord-link-fixture.ts", fixture_set(&["chord-link.json"])),
         (
             "cli-contract-fixture.ts",
             fixture_set(&["cli-contract.json"]),
@@ -247,7 +250,7 @@ fn every_script_output_is_committed() {
 /// The upstream ref a fixture records: `main`, except for Chord's goldens,
 /// which are pinned to `CHORD_REFERENCE_REF` in the Makefile.
 fn expected_ref(fixture_name: &str) -> String {
-    if fixture_name != "chord-delta.json" {
+    if !matches!(fixture_name, "chord-delta.json" | "chord-link.json") {
         return "main".to_string();
     }
     let makefile = fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
@@ -303,6 +306,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         (
             "chord-delta.json",
             "crates/noel-chord/tests/chord_delta_parity.rs",
+        ),
+        (
+            "chord-link.json",
+            "crates/noel-chord/tests/chord_link_parity.rs",
         ),
         ("cli-contract.json", "crates/noel-cli/src/main.rs"),
         (

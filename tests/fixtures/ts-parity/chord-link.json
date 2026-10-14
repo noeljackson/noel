@@ -1,0 +1,7566 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "1692bba6347a287ab0f3cb554a4430fafffc474b",
+    "package": "packages/chord",
+    "packageCommit": "301617df7b88951c328f8a7b6a732e590713df07",
+    "script": "/ts-parity/chord-link-fixture.ts"
+  },
+  "format": {
+    "scenarios": "Each scenario starts fresh hosts, runs its steps with a pause after each for in-memory traffic to settle, then closes the clients, the server and the workers in that order. `frames` lists every frame sent, in the order sent, with its link and the side that sent it. Within one link and direction the order is the protocol's; across links it is this run's.",
+    "links": "`client` and `client2` are WebSocket links (an in-memory WebSocket pair: one text message per frame) between a client host and the server, accepted as acceptWebSockets accepts them. `worker` is an in-memory link between the server and the worker its `session:` route spawned. `raw` links are bare peers the fixture drives by hand.",
+    "omitted": "`ack` frames are not recorded: when they are sent depends on timer order. The flow scenarios hold the client's acknowledgements back; `gate` records the one they release.",
+    "normalized": "Root ids carry a random incarnation, replaced by `*` (`server#*:3`). Compare ping and pong `n` and error messages as placeholders.",
+    "contracts": "The contract descriptions the scenarios use, after a JSON round trip."
+  },
+  "contracts": {
+    "counter": {
+      "name": "noel.test.counter",
+      "scope": "remote",
+      "version": 1,
+      "input": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "variants": {
+        "owner": {
+          "count": {
+            "kind": "state",
+            "schema": {
+              "type": "object",
+              "required": [
+                "n"
+              ],
+              "properties": {
+                "n": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "add": {
+            "kind": "method",
+            "args": {
+              "type": "integer"
+            },
+            "result": {
+              "type": "integer"
+            }
+          },
+          "set": {
+            "kind": "method",
+            "args": {
+              "type": "integer"
+            }
+          },
+          "wait": {
+            "kind": "method"
+          },
+          "fail": {
+            "kind": "method",
+            "result": {
+              "type": "integer"
+            }
+          }
+        },
+        "viewer": {
+          "count": {
+            "kind": "state",
+            "schema": {
+              "type": "object",
+              "required": [
+                "n"
+              ],
+              "properties": {
+                "n": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "counterDrifted": {
+      "name": "noel.test.counter",
+      "scope": "remote",
+      "version": 1,
+      "input": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "variants": {
+        "owner": {
+          "count": {
+            "kind": "state",
+            "schema": {
+              "type": "object",
+              "required": [
+                "n"
+              ],
+              "properties": {
+                "n": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "add": {
+            "kind": "method",
+            "args": {
+              "type": "integer"
+            },
+            "result": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "counterV2": {
+      "name": "noel.test.counter",
+      "scope": "remote",
+      "version": 2,
+      "input": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "variants": {
+        "owner": {
+          "count": {
+            "kind": "state",
+            "schema": {
+              "type": "object",
+              "required": [
+                "n"
+              ],
+              "properties": {
+                "n": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "missing": {
+      "name": "noel.test.missing",
+      "scope": "remote",
+      "version": 1,
+      "input": {
+        "type": "object",
+        "properties": {}
+      },
+      "variants": {
+        "main": {
+          "ping": {
+            "kind": "method"
+          }
+        }
+      }
+    },
+    "session": {
+      "name": "noel.test.session",
+      "scope": "remote",
+      "version": 1,
+      "input": {
+        "type": "object",
+        "required": [
+          "session"
+        ],
+        "properties": {
+          "session": {
+            "type": "string"
+          }
+        }
+      },
+      "variants": {
+        "participant": {
+          "log": {
+            "kind": "state",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "say": {
+            "kind": "method",
+            "args": {
+              "type": "string"
+            },
+            "result": {
+              "type": "integer"
+            }
+          },
+          "who": {
+            "kind": "method",
+            "result": {}
+          },
+          "wait": {
+            "kind": "method"
+          }
+        },
+        "viewer": {
+          "log": {
+            "kind": "state",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "name": "hello",
+      "description": "A client connects and leaves: both hellos, then the client's bye.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "hold",
+      "description": "A guest holds a counter (shape, variant viewer); holds that fail are gone: forbidden by the factory, an unknown type, a contract that is not covered and one of another version (upgrade_required for a client), and an invalid input. Then it releases the live hold.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "a"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "viewer",
+            "members": [
+              "count"
+            ],
+            "contract": "93ba9f7ef8c79f2b",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 2,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "private"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 3,
+            "at": "server",
+            "token": {
+              "name": "noel.test.missing",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "properties": {}
+              },
+              "variants": {
+                "main": {
+                  "ping": {
+                    "kind": "method"
+                  }
+                }
+              }
+            },
+            "input": {}
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 4,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "a"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 5,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 2,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "a"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 6,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": 5
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "gone",
+            "id": 2,
+            "error": {
+              "code": "forbidden",
+              "message": "forbidden: private is private"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "gone",
+            "id": 3,
+            "error": {
+              "code": "unavailable",
+              "message": "unavailable/unknown_type: noel.test.missing is not served by server",
+              "reason": "unknown_type"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "gone",
+            "id": 4,
+            "error": {
+              "code": "upgrade_required",
+              "message": "upgrade_required: contract_mismatch: noel.test.counter@1 does not cover the consumer's description (owner.add result); forgotten version bump?"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "gone",
+            "id": 5,
+            "error": {
+              "code": "upgrade_required",
+              "message": "upgrade_required: contract_mismatch: noel.test.counter: provider version 1, consumer version 2, no accepts adapter"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "gone",
+            "id": 6,
+            "error": {
+              "code": "invalid",
+              "message": "invalid/input: noel.test.counter input: /name must be string",
+              "reason": "input"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "release",
+            "id": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "state",
+      "description": "An owner subscribes to a counter: snapshot, then ops through one delta encoder (an inline path, then a definition and references, an `r` that clears them), unsubscribes, subscribes again for a new snapshot, and releases.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "a"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "sub",
+            "id": 2,
+            "hold": 1,
+            "member": "count"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "owner",
+            "members": [
+              "count",
+              "add",
+              "set",
+              "wait",
+              "fail"
+            ],
+            "contract": "93ba9f7ef8c79f2b",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "snap": {
+              "n": 0
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 3,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "s",
+                [
+                  "n"
+                ],
+                1
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 3,
+            "value": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 4,
+            "hold": 1,
+            "member": "add",
+            "args": 2
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "#",
+                0,
+                [
+                  "n"
+                ]
+              ],
+              [
+                "s",
+                0,
+                3
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 4,
+            "value": 3
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 5,
+            "hold": 1,
+            "member": "add",
+            "args": 3
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "s",
+                0,
+                6
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 5,
+            "value": 6
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 6,
+            "hold": 1,
+            "member": "set",
+            "args": 10
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "r",
+                {
+                  "n": 10
+                }
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 6
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 7,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "s",
+                [
+                  "n"
+                ],
+                11
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 7,
+            "value": 11
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "unsub",
+            "id": 2
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "sub",
+            "id": 8,
+            "hold": 1,
+            "member": "count"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 8,
+            "snap": {
+              "n": 11
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "unsub",
+            "id": 8
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "release",
+            "id": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "call",
+      "description": "Calls with a result, a void result, invalid arguments (invalid/args) and a method that throws (unavailable).",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "a"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "owner",
+            "members": [
+              "count",
+              "add",
+              "set",
+              "wait",
+              "fail"
+            ],
+            "contract": "93ba9f7ef8c79f2b",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 2,
+            "hold": 1,
+            "member": "add",
+            "args": 5
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 2,
+            "value": 5
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 3,
+            "hold": 1,
+            "member": "set",
+            "args": 7
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 3
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 4,
+            "hold": 1,
+            "member": "add",
+            "args": "x"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 4,
+            "error": {
+              "code": "invalid",
+              "message": "invalid/args: noel.test.counter\u0000{\"name\":\"a\"}\u0000p:{\"kind\":\"owner\",\"via\":\"device\"}.add args: / must be integer",
+              "reason": "args"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 5,
+            "hold": 1,
+            "member": "fail"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 5,
+            "error": {
+              "code": "unavailable",
+              "message": "boom"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "cancel",
+      "description": "With maxCalls 1, a waiting call is cancelled by the caller (aborted), a second call meanwhile is refused at once (unavailable/too_many_calls), and releasing a subscribed hold sends unsub then release.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "a"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "sub",
+            "id": 2,
+            "hold": 1,
+            "member": "count"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "owner",
+            "members": [
+              "count",
+              "add",
+              "set",
+              "wait",
+              "fail"
+            ],
+            "contract": "93ba9f7ef8c79f2b",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "snap": {
+              "n": 0
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 3,
+            "hold": 1,
+            "member": "wait"
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 4,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 4,
+            "error": {
+              "code": "unavailable",
+              "message": "unavailable/too_many_calls: Too many calls in progress on this connection (1); wait for earlier ones to finish",
+              "reason": "too_many_calls"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "cancel",
+            "id": 3
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 3,
+            "error": {
+              "code": "aborted",
+              "message": "aborted: cancelled by caller"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "unsub",
+            "id": 2
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "release",
+            "id": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "relay",
+      "description": "An owner holds a session object on a worker through the server's route: the server stamps the principal on the relayed hold, forwards the subscription, calls (with a root, ended by root_end) and a cancel, then the release.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "sub",
+            "id": 2,
+            "hold": 1,
+            "member": "log"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "session:s1",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            },
+            "principal": {
+              "kind": "owner",
+              "via": "device"
+            },
+            "client": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "sub",
+            "id": 2,
+            "hold": 1,
+            "member": "log"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "snap": []
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "snap": []
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 3,
+            "hold": 1,
+            "member": "say",
+            "args": "hi"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "call",
+            "id": 3,
+            "hold": 1,
+            "member": "say",
+            "args": "hi",
+            "root": {
+              "rootId": "server#*:1",
+              "codeVersion": 1
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "p",
+                [],
+                0,
+                0,
+                [
+                  "hi"
+                ]
+              ]
+            ]
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "result",
+            "id": 3,
+            "value": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "p",
+                [],
+                0,
+                0,
+                [
+                  "hi"
+                ]
+              ]
+            ]
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "root_end",
+            "rootId": "server#*:1"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 3,
+            "value": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 4,
+            "hold": 1,
+            "member": "who"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "call",
+            "id": 4,
+            "hold": 1,
+            "member": "who",
+            "root": {
+              "rootId": "server#*:2",
+              "codeVersion": 1
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "result",
+            "id": 4,
+            "value": {
+              "kind": "owner",
+              "via": "device"
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "root_end",
+            "rootId": "server#*:2"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 4,
+            "value": {
+              "kind": "owner",
+              "via": "device"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 5,
+            "hold": 1,
+            "member": "wait"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "call",
+            "id": 5,
+            "hold": 1,
+            "member": "wait",
+            "root": {
+              "rootId": "server#*:3",
+              "codeVersion": 1
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "cancel",
+            "id": 5
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "cancel",
+            "id": 5
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "root_end",
+            "rootId": "server#*:3"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 5,
+            "error": {
+              "code": "aborted",
+              "message": "aborted: call cancelled"
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "result",
+            "id": 5,
+            "error": {
+              "code": "aborted",
+              "message": "aborted: cancelled by caller"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "unsub",
+            "id": 2
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "release",
+            "id": 1
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "unsub",
+            "id": 2
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "release",
+            "id": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "refused",
+      "description": "A guest of session s1: its hold on s2 is refused by the route (forbidden), a host without a route is unavailable, and a principal it forges in its hold is ignored: the worker sees the stamped guest.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "session:s2",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s2"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "gone",
+            "id": 1,
+            "error": {
+              "code": "forbidden",
+              "message": "forbidden: session:s2 refused for this principal"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 2,
+            "at": "nowhere",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "gone",
+            "id": 2,
+            "error": {
+              "code": "unavailable",
+              "message": "unavailable: no route to nowhere"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 3,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            },
+            "principal": {
+              "kind": "owner",
+              "via": "device"
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "session:s1",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            },
+            "principal": {
+              "kind": "guest",
+              "id": "g1",
+              "name": "Guest",
+              "session": "s1",
+              "mode": "full",
+              "revision": 1
+            },
+            "client": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 3,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 4,
+            "hold": 3,
+            "member": "who"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "call",
+            "id": 2,
+            "hold": 1,
+            "member": "who",
+            "root": {
+              "rootId": "server#*:1",
+              "codeVersion": 1
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "result",
+            "id": 2,
+            "value": {
+              "kind": "guest",
+              "id": "g1",
+              "name": "Guest",
+              "session": "s1",
+              "mode": "full",
+              "revision": 1
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "root_end",
+            "rootId": "server#*:1"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 4,
+            "value": {
+              "kind": "guest",
+              "id": "g1",
+              "name": "Guest",
+              "session": "s1",
+              "mode": "full",
+              "revision": 1
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "release",
+            "id": 3
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "release",
+            "id": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "invalidate",
+      "description": "invalidatePrincipal({kind: guest, id: g1}) on the server: a link accepted with restamp keeps its link under revision 2 and holds again; one without is closed. Relays under the old principal are gone, released downstream, and the pattern propagates to the worker.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client2",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client2",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "sub",
+            "id": 2,
+            "hold": 1,
+            "member": "log"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "session:s1",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            },
+            "principal": {
+              "kind": "guest",
+              "id": "g1",
+              "name": "Guest",
+              "session": "s1",
+              "mode": "full",
+              "revision": 1
+            },
+            "client": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "sub",
+            "id": 2,
+            "hold": 1,
+            "member": "log"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "snap": []
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "snap": []
+          }
+        },
+        {
+          "link": "client2",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "hold",
+            "id": 3,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            },
+            "principal": {
+              "kind": "guest",
+              "id": "g1",
+              "name": "Guest",
+              "session": "s1",
+              "mode": "view",
+              "revision": 1
+            },
+            "client": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "shape",
+            "id": 3,
+            "variant": "viewer",
+            "members": [
+              "log"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client2",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "viewer",
+            "members": [
+              "log"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "unsub",
+            "id": 2
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "release",
+            "id": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "gone",
+            "id": 1,
+            "error": {
+              "code": "gone",
+              "message": "gone: principal invalidated"
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "release",
+            "id": 3
+          }
+        },
+        {
+          "link": "client2",
+          "from": "server",
+          "frame": {
+            "t": "gone",
+            "id": 1,
+            "error": {
+              "code": "gone",
+              "message": "gone: principal invalidated"
+            }
+          }
+        },
+        {
+          "link": "client2",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "principal invalidated"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "invalidate",
+            "pattern": {
+              "kind": "guest",
+              "id": "g1"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "unsub",
+            "id": 2
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 3,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "hold",
+            "id": 4,
+            "at": "session:s1",
+            "token": {
+              "name": "noel.test.session",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "session"
+                ],
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "participant": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "say": {
+                    "kind": "method",
+                    "args": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "who": {
+                    "kind": "method",
+                    "result": {}
+                  },
+                  "wait": {
+                    "kind": "method"
+                  }
+                },
+                "viewer": {
+                  "log": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "session": "s1"
+            },
+            "principal": {
+              "kind": "guest",
+              "id": "g1",
+              "name": "Guest",
+              "session": "s1",
+              "mode": "full",
+              "revision": 2
+            },
+            "client": true
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "shape",
+            "id": 4,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 3,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "bc60dc49877fbbb0",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 4,
+            "hold": 3,
+            "member": "who"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "call",
+            "id": 5,
+            "hold": 4,
+            "member": "who",
+            "root": {
+              "rootId": "server#*:1",
+              "codeVersion": 1
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "result",
+            "id": 5,
+            "value": {
+              "kind": "guest",
+              "id": "g1",
+              "name": "Guest",
+              "session": "s1",
+              "mode": "full",
+              "revision": 2
+            }
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "root_end",
+            "rootId": "server#*:1"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 4,
+            "value": {
+              "kind": "guest",
+              "id": "g1",
+              "name": "Guest",
+              "session": "s1",
+              "mode": "full",
+              "revision": 2
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "release",
+            "id": 4
+          }
+        },
+        {
+          "link": "worker",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "ping",
+      "description": "Both sides ping every 100 ms and answer pings with pongs; the run lasts 150 ms.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "ping",
+            "n": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "ping",
+            "n": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "pong",
+            "n": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "pong",
+            "n": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "ping-timeout",
+      "description": "A peer that says hello and then nothing: pings every 100 ms, and after 250 ms without a frame the link closes with `ping timeout`.",
+      "frames": [
+        {
+          "link": "raw",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "raw",
+          "from": "raw",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "raw",
+            "kind": "client",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "raw",
+          "from": "server",
+          "frame": {
+            "t": "ping",
+            "n": 1
+          }
+        },
+        {
+          "link": "raw",
+          "from": "server",
+          "frame": {
+            "t": "ping",
+            "n": 2
+          }
+        },
+        {
+          "link": "raw",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "ping timeout"
+          }
+        }
+      ]
+    },
+    {
+      "name": "flow-coalesce",
+      "description": "Window 200: while the client holds back its acknowledgements, state waits once the window is full while results go out; the released ack sends the waiting ops as one frame.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "a"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "sub",
+            "id": 2,
+            "hold": 1,
+            "member": "count"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "owner",
+            "members": [
+              "count",
+              "add",
+              "set",
+              "wait",
+              "fail"
+            ],
+            "contract": "93ba9f7ef8c79f2b",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "snap": {
+              "n": 0
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 3,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "s",
+                [
+                  "n"
+                ],
+                1
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 3,
+            "value": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 4,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "#",
+                0,
+                [
+                  "n"
+                ]
+              ],
+              [
+                "s",
+                0,
+                2
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 4,
+            "value": 2
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 5,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "s",
+                0,
+                3
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 5,
+            "value": 3
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 6,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 6,
+            "value": 4
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 7,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 7,
+            "value": 5
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 8,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 8,
+            "value": 6
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 9,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 9,
+            "value": 7
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 10,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 10,
+            "value": 8
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 11,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 11,
+            "value": 9
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 12,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 12,
+            "value": 10
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 13,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 13,
+            "value": 11
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 14,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 14,
+            "value": 12
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 15,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 15,
+            "value": 13
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 16,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 16,
+            "value": 14
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 17,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 17,
+            "value": 15
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 18,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 18,
+            "value": 16
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 19,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 19,
+            "value": 17
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 20,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 20,
+            "value": 18
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 21,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 21,
+            "value": 19
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 22,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 22,
+            "value": 20
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 23,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 23,
+            "value": 21
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 24,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 24,
+            "value": 22
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 25,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 25,
+            "value": 23
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 26,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 26,
+            "value": 24
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 27,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 27,
+            "value": 25
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 28,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 28,
+            "value": 26
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 29,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 29,
+            "value": 27
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 30,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 30,
+            "value": 28
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 31,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 31,
+            "value": 29
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 32,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 32,
+            "value": 30
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 33,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 33,
+            "value": 31
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 34,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 34,
+            "value": 32
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 35,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 35,
+            "value": 33
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 36,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 36,
+            "value": 34
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 37,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 37,
+            "value": 35
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 38,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 38,
+            "value": 36
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 39,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 39,
+            "value": 37
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 40,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 40,
+            "value": 38
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 41,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 41,
+            "value": 39
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 42,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 42,
+            "value": 40
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "s",
+                0,
+                4
+              ],
+              [
+                "s",
+                0,
+                5
+              ],
+              [
+                "s",
+                0,
+                6
+              ],
+              [
+                "s",
+                0,
+                7
+              ],
+              [
+                "s",
+                0,
+                8
+              ],
+              [
+                "s",
+                0,
+                9
+              ],
+              [
+                "s",
+                0,
+                10
+              ],
+              [
+                "s",
+                0,
+                11
+              ],
+              [
+                "s",
+                0,
+                12
+              ],
+              [
+                "s",
+                0,
+                13
+              ],
+              [
+                "s",
+                0,
+                14
+              ],
+              [
+                "s",
+                0,
+                15
+              ],
+              [
+                "s",
+                0,
+                16
+              ],
+              [
+                "s",
+                0,
+                17
+              ],
+              [
+                "s",
+                0,
+                18
+              ],
+              [
+                "s",
+                0,
+                19
+              ],
+              [
+                "s",
+                0,
+                20
+              ],
+              [
+                "s",
+                0,
+                21
+              ],
+              [
+                "s",
+                0,
+                22
+              ],
+              [
+                "s",
+                0,
+                23
+              ],
+              [
+                "s",
+                0,
+                24
+              ],
+              [
+                "s",
+                0,
+                25
+              ],
+              [
+                "s",
+                0,
+                26
+              ],
+              [
+                "s",
+                0,
+                27
+              ],
+              [
+                "s",
+                0,
+                28
+              ],
+              [
+                "s",
+                0,
+                29
+              ],
+              [
+                "s",
+                0,
+                30
+              ],
+              [
+                "s",
+                0,
+                31
+              ],
+              [
+                "s",
+                0,
+                32
+              ],
+              [
+                "s",
+                0,
+                33
+              ],
+              [
+                "s",
+                0,
+                34
+              ],
+              [
+                "s",
+                0,
+                35
+              ],
+              [
+                "s",
+                0,
+                36
+              ],
+              [
+                "s",
+                0,
+                37
+              ],
+              [
+                "s",
+                0,
+                38
+              ],
+              [
+                "s",
+                0,
+                39
+              ],
+              [
+                "s",
+                0,
+                40
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "flow-reset",
+      "description": "Window 64: a waiting subscription whose ops outgrow four windows is replaced by a reset of the current value; the released ack sends the reset and the ops after it.",
+      "frames": [
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "a"
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "sub",
+            "id": 2,
+            "hold": 1,
+            "member": "count"
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "owner",
+            "members": [
+              "count",
+              "add",
+              "set",
+              "wait",
+              "fail"
+            ],
+            "contract": "93ba9f7ef8c79f2b",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "snap": {
+              "n": 0
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 3,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "s",
+                [
+                  "n"
+                ],
+                1
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 3,
+            "value": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 4,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 4,
+            "value": 2
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 5,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 5,
+            "value": 3
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 6,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 6,
+            "value": 4
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 7,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 7,
+            "value": 5
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 8,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 8,
+            "value": 6
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 9,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 9,
+            "value": 7
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 10,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 10,
+            "value": 8
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 11,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 11,
+            "value": 9
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 12,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 12,
+            "value": 10
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 13,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 13,
+            "value": 11
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 14,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 14,
+            "value": 12
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 15,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 15,
+            "value": 13
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 16,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 16,
+            "value": 14
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 17,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 17,
+            "value": 15
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 18,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 18,
+            "value": 16
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 19,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 19,
+            "value": 17
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 20,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 20,
+            "value": 18
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 21,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 21,
+            "value": 19
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 22,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 22,
+            "value": 20
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 23,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 23,
+            "value": 21
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 24,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 24,
+            "value": 22
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 25,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 25,
+            "value": 23
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 26,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 26,
+            "value": 24
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 27,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 27,
+            "value": 25
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 28,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 28,
+            "value": 26
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 29,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 29,
+            "value": 27
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 30,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 30,
+            "value": 28
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 31,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 31,
+            "value": 29
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 32,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 32,
+            "value": 30
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 33,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 33,
+            "value": 31
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 34,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 34,
+            "value": 32
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 35,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 35,
+            "value": 33
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 36,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 36,
+            "value": 34
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 37,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 37,
+            "value": 35
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 38,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 38,
+            "value": 36
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 39,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 39,
+            "value": 37
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 40,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 40,
+            "value": 38
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 41,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 41,
+            "value": 39
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 42,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 42,
+            "value": 40
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 43,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 43,
+            "value": 41
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 44,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 44,
+            "value": 42
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 45,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 45,
+            "value": 43
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 46,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 46,
+            "value": 44
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 47,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 47,
+            "value": 45
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 48,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 48,
+            "value": 46
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 49,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 49,
+            "value": 47
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 50,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 50,
+            "value": 48
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 51,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 51,
+            "value": 49
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 52,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 52,
+            "value": 50
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 53,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 53,
+            "value": 51
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 54,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 54,
+            "value": 52
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 55,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 55,
+            "value": 53
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 56,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 56,
+            "value": 54
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 57,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 57,
+            "value": 55
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 58,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 58,
+            "value": 56
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 59,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 59,
+            "value": 57
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 60,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 60,
+            "value": 58
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 61,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 61,
+            "value": 59
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 62,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 62,
+            "value": 60
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 63,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 63,
+            "value": 61
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 64,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 64,
+            "value": 62
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 65,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 65,
+            "value": 63
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 66,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 66,
+            "value": 64
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 67,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 67,
+            "value": 65
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 68,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 68,
+            "value": 66
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 69,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 69,
+            "value": 67
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 70,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 70,
+            "value": 68
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 71,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 71,
+            "value": 69
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 72,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 72,
+            "value": 70
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 73,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 73,
+            "value": 71
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 74,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 74,
+            "value": 72
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 75,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 75,
+            "value": 73
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 76,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 76,
+            "value": 74
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 77,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 77,
+            "value": 75
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 78,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 78,
+            "value": 76
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 79,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 79,
+            "value": 77
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 80,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 80,
+            "value": 78
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 81,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 81,
+            "value": 79
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 82,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 82,
+            "value": 80
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 83,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 83,
+            "value": 81
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 84,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 84,
+            "value": 82
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 85,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 85,
+            "value": 83
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 86,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 86,
+            "value": 84
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 87,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 87,
+            "value": 85
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 88,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 88,
+            "value": 86
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 89,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 89,
+            "value": 87
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 90,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 90,
+            "value": 88
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 91,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 91,
+            "value": 89
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 92,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 92,
+            "value": 90
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 93,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 93,
+            "value": 91
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 94,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 94,
+            "value": 92
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 95,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 95,
+            "value": 93
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 96,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 96,
+            "value": 94
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 97,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 97,
+            "value": 95
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 98,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 98,
+            "value": 96
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 99,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 99,
+            "value": 97
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 100,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 100,
+            "value": 98
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 101,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 101,
+            "value": 99
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "call",
+            "id": 102,
+            "hold": 1,
+            "member": "add",
+            "args": 1
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "result",
+            "id": 102,
+            "value": 100
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "reset": {
+              "n": 82
+            }
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "id": 2,
+            "ops": [
+              [
+                "s",
+                [
+                  "n"
+                ],
+                83
+              ],
+              [
+                "#",
+                0,
+                [
+                  "n"
+                ]
+              ],
+              [
+                "s",
+                0,
+                84
+              ],
+              [
+                "s",
+                0,
+                85
+              ],
+              [
+                "s",
+                0,
+                86
+              ],
+              [
+                "s",
+                0,
+                87
+              ],
+              [
+                "s",
+                0,
+                88
+              ],
+              [
+                "s",
+                0,
+                89
+              ],
+              [
+                "s",
+                0,
+                90
+              ],
+              [
+                "s",
+                0,
+                91
+              ],
+              [
+                "s",
+                0,
+                92
+              ],
+              [
+                "s",
+                0,
+                93
+              ],
+              [
+                "s",
+                0,
+                94
+              ],
+              [
+                "s",
+                0,
+                95
+              ],
+              [
+                "s",
+                0,
+                96
+              ],
+              [
+                "s",
+                0,
+                97
+              ],
+              [
+                "s",
+                0,
+                98
+              ],
+              [
+                "s",
+                0,
+                99
+              ],
+              [
+                "s",
+                0,
+                100
+              ]
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "host closed"
+          }
+        }
+      ]
+    },
+    {
+      "name": "version-old-peer",
+      "description": "A peer whose hello has no protocol (version 1): the server answers with its hello, then closes with `protocol-version 2`.",
+      "frames": [
+        {
+          "link": "raw",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "raw",
+          "from": "raw",
+          "frame": {
+            "t": "hello",
+            "name": "old",
+            "kind": "client",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "raw",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "protocol-version 2"
+          }
+        }
+      ]
+    },
+    {
+      "name": "version-new-server",
+      "description": "A client whose server says protocol 3: the client closes with `protocol-version 2`.",
+      "frames": [
+        {
+          "link": "raw",
+          "from": "client",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "client",
+            "kind": "client",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "raw",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 3,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "raw",
+          "from": "client",
+          "frame": {
+            "t": "bye",
+            "reason": "protocol-version 2"
+          }
+        }
+      ]
+    },
+    {
+      "name": "violations",
+      "description": "Protocol violations close the link: a malformed frame, a duplicate hold id, a control frame from a child, a hello that does not match how the peer was accepted, and an ack outside the expected range.",
+      "frames": [
+        {
+          "link": "raw1",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "raw1",
+          "from": "raw",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "raw",
+            "kind": "client",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "raw1",
+          "from": "raw",
+          "frame": {
+            "t": "call",
+            "hold": 1
+          }
+        },
+        {
+          "link": "raw1",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "protocol error: malformed frame"
+          }
+        },
+        {
+          "link": "raw2",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "raw2",
+          "from": "raw",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "raw",
+            "kind": "client",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "raw2",
+          "from": "raw",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "a"
+            }
+          }
+        },
+        {
+          "link": "raw2",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 1,
+            "variant": "viewer",
+            "members": [
+              "count"
+            ],
+            "contract": "93ba9f7ef8c79f2b",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "raw2",
+          "from": "raw",
+          "frame": {
+            "t": "hold",
+            "id": 1,
+            "at": "server",
+            "token": {
+              "name": "noel.test.counter",
+              "scope": "remote",
+              "version": 1,
+              "input": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "variants": {
+                "owner": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "add": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    },
+                    "result": {
+                      "type": "integer"
+                    }
+                  },
+                  "set": {
+                    "kind": "method",
+                    "args": {
+                      "type": "integer"
+                    }
+                  },
+                  "wait": {
+                    "kind": "method"
+                  },
+                  "fail": {
+                    "kind": "method",
+                    "result": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "viewer": {
+                  "count": {
+                    "kind": "state",
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "n"
+                      ],
+                      "properties": {
+                        "n": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "input": {
+              "name": "b"
+            }
+          }
+        },
+        {
+          "link": "raw2",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "protocol error: duplicate hold id 1"
+          }
+        },
+        {
+          "link": "raw3",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "raw3",
+          "from": "raw",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "raw",
+            "kind": "client",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "raw3",
+          "from": "raw",
+          "frame": {
+            "t": "invalidate",
+            "pattern": {}
+          }
+        },
+        {
+          "link": "raw3",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "protocol error: invalidate from a child"
+          }
+        },
+        {
+          "link": "raw4",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "raw4",
+          "from": "raw",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "session:x",
+            "kind": "host",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "raw4",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "protocol error: hello host session:x does not match the accepted client "
+          }
+        },
+        {
+          "link": "raw5",
+          "from": "server",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "server",
+            "kind": "host",
+            "codeVersion": 1,
+            "acks": true
+          }
+        },
+        {
+          "link": "raw5",
+          "from": "raw",
+          "frame": {
+            "t": "hello",
+            "protocol": 2,
+            "name": "raw",
+            "kind": "client",
+            "codeVersion": 1
+          }
+        },
+        {
+          "link": "raw5",
+          "from": "server",
+          "frame": {
+            "t": "bye",
+            "reason": "protocol error: ack 5 outside 0..1"
+          }
+        }
+      ]
+    }
+  ],
+  "gate": [
+    {
+      "scenario": "flow-coalesce",
+      "released": {
+        "t": "ack",
+        "n": 46
+      }
+    },
+    {
+      "scenario": "flow-reset",
+      "released": {
+        "t": "ack",
+        "n": 104
+      }
+    }
+  ]
+}
