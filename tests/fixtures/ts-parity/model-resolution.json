@@ -1931,6 +1931,11 @@
             "provider": "openrouter",
             "id": "openrouter/fusion",
             "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "openrouter/pareto-code",
+            "thinkingLevel": null
           }
         ],
         "diagnostics": []
