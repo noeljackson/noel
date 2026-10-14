@@ -122,8 +122,20 @@ The committed TypeScript parity fixtures are:
   calls. Machine fields, process ids, file identities and times are
   placeholders; output is merged per stream.
   `crates/noel-env-daemon/tests/pi_env_golden.rs` sends the client's frames to
-  `noel-env serve` and compares its answers; `make env-interop` runs
-  upstream's client tests against it.
+  `noel-env serve` and compares its answers;
+  `crates/noel-env-daemon/tests/pi_env_client_golden.rs` runs the scenarios
+  (all but `pty`) with noel's `RemoteEnv` and compares the frames it sends.
+  `make env-interop` runs upstream's client tests against `noel-env serve`,
+  and noel's client tests against upstream's `pi-env`.
+- `pi-env-ssh.json`: upstream pi-env's SSH deployment (`ssh.ts`) through a
+  stand-in for `ssh` (`scripts/ts-parity/fake-ssh.sh`) that runs the remote
+  commands in a scratch home: `sshArguments` for two targets, and every
+  `ssh` invocation of scanning a host key, `connectSsh` deploying and
+  finding the daemon, starting it plainly and through the login shell, and
+  `sshConnection`'s first request. The scratch directory, the daemon's
+  SHA-256 and the token are placeholders.
+  `crates/noel-env-daemon/tests/ssh_deploy.rs` drives noel's port through the
+  same stand-in; the invocations differ only by the daemon's names.
 - `rpc-protocol.json`: upstream `pi --mode rpc` stdout records, in order, for
   scripted runs against a local OpenAI-compatible stub: a text prompt, a tool
   round, steer, follow_up, abort (also with queued messages), prompts while

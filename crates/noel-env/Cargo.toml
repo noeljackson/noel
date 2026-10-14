@@ -3,7 +3,7 @@ name = "noel-env"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "noel's workspaces: the ExecutionEnv interface (a file system plus a shell, as upstream Durable's) and LocalEnv"
+description = "noel's workspaces: the ExecutionEnv interface (a file system plus a shell, as upstream Durable's), LocalEnv, and the pi-env client (RemoteEnv over a daemon, SSH deployment)"
 
 [dependencies]
 async-trait.workspace = true
@@ -11,5 +11,6 @@ libc = "=0.2.186"
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

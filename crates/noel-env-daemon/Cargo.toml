@@ -19,3 +19,9 @@ libc = "=0.2.186"
 noel-env = { path = "../noel-env" }
 notify = "=8.2.0"
 serde_json.workspace = true
+
+# The client tests (RemoteEnv over this daemon) run on tokio; the daemon itself does not.
+[dev-dependencies]
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
