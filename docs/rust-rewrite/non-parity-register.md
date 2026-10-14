@@ -1504,3 +1504,81 @@ Reason: noel ships its own daemon, versioned with noel; noel runs on Linux
 and macOS; and reusing noel-env's decoder and line scanner keeps one
 implementation of each, checked against the same goldens, and one dependency
 fewer.
+
+### noel-env Client
+
+`crates/noel-env`'s `Connection`, `RemoteEnv` and `ssh` module port upstream's
+pi-env client (`packages/env/src`) at the pinned commit. Over `noel-env serve`
+`RemoteEnv` makes the observations `NodeExecutionEnv` makes in every case of
+`local-env.json` and passes upstream's watch and `listFiles` cases; it sends
+exactly the frames upstream's client sent in `pi-env.json`; its `ssh`
+invocations equal upstream's in `pi-env-ssh.json` except for the names below;
+and its tests pass against upstream's `pi-env` too (`make env-interop`). These
+parts differ:
+
+- **A library for now.** Nothing in noel starts a `RemoteEnv` yet; the
+  session's `Workspace` record and choosing a remote workspace come next.
+- **No terminals.** `openTerminal` and `RemoteTerminal` (`terminal.ts`) are
+  not ported, since noel's `ExecutionEnv` has no terminals; the daemon still
+  serves `pty`. Upstream's `LocalExecutionEnv` (`NodeExecutionEnv` with
+  `listFiles` through a daemon on the same machine) and `localDaemon()` are
+  not ported either: `LocalEnv::list_files` stays `not_supported`, and
+  `list_files_over` lists through any connection.
+- **noel's additions to `exec`** do not travel in protocol 1. Chunks carry no
+  raw bytes (the daemon sends decoded text; the bash tool keeps the text's
+  bytes). `merge_stderr` cannot share a pipe, so both streams arrive in
+  arrival order, each labelled with its own stream, as `ExecOptions`
+  documents. An `env` entry without a value removes only what the client
+  itself adds (`shell_env`), as upstream skips `undefined` values; a variable
+  the daemon inherited stays. Over `ssh` the daemon inherits the remote
+  login's environment (no `SendEnv`), but a daemon started on this machine
+  inherits noel's.
+- **Dropping a call.** Dropping an unsettled `exec`, `scanLines`,
+  `listFiles` or `watch` future sends `cancel`, as dropping a `LocalEnv` call
+  stops it, and dropping the last `Connection` stops the daemon as `close`
+  does; upstream has no dropped promises.
+- **POSIX remotes only.** Paths resolve with POSIX rules, and a daemon that
+  reports Windows is refused with `not_supported`; upstream applies Windows'
+  path rules and drive working directories.
+- **Rust types.** `list_files` takes a `Duration` timeout, so only whole
+  milliseconds are a valid `timeoutMs` (upstream rejects 1.5 as not a safe
+  integer); counts and lengths above 2^53 - 1 are `invalid`, as elsewhere.
+- **Oversized requests** (a frame above 16 MiB, such as a huge argv) fail
+  alone with `unknown`; upstream sends them and the daemon ends the
+  connection.
+- **JSON key order.** Requests carry the same fields, serialized in sorted
+  order rather than upstream's insertion order (`op` last); the daemon reads
+  fields by name, and the goldens compare objects by field.
+- **Text decoding.** Whole-file text reads decode once at the end with
+  Rust's lossy rule rather than with Node's `StringDecoder` chunk by chunk,
+  with the same text; the requests are upstream's.
+- **SSH: Linux and macOS only.** Upstream's PowerShell detection, upload and
+  launch for Windows are not ported: a Git Bash, MSYS or Cygwin shell is
+  refused, and a failed POSIX probe is reported as is (upstream tries
+  PowerShell next). Android (Termux) is refused rather than deployed to with
+  warnings.
+- **SSH: names.** The daemons to upload are `noel-env-<platform>-<arch>`
+  files in a directory (an option, else `NOEL_ENV_DAEMON_DIR`, else beside
+  the running executable), where upstream ships
+  `bin/pi-env-<platform>-<arch>/pi-env` in its package. On the remote machine
+  the daemon is `~/.cache/noel-env/noel-env-<SHA-256 prefix>`, not
+  `~/.pi/mobile/tools/pi-env-<SHA-256 prefix>`; its temporary file is
+  `.noel-env.XXXXXX`, and the corrupt-upload message names `noel-env`. The
+  probe (with its `PI-ENV-PROBE` marker), the hash function and every other
+  part of the commands are upstream's, byte for byte.
+- **Known hosts.** Changes to known-hosts files wait for each other across
+  all files, not per file.
+
+The conformance comparison over `RemoteEnv` does not count the windowed exec
+case's skip checks: that case asserts once per skip, the recording's
+`NodeExecutionEnv` never skips, and the daemon skips as timing allows; each
+check must pass. The SSH goldens are made through a stand-in for `ssh`, not a
+server: upstream's `ssh.test.ts` starts a disposable `sshd`.
+
+Reason: noel's `ExecutionEnv` has no terminals and noel runs on Linux and
+macOS, so the client covers what noel's interface has and the systems it
+runs on. The protocol is upstream's unchanged, so noel's additions to `exec`
+stay local. The daemon lives outside `~/.noel` because noel imports pi's
+state only where `~/.noel` does not exist, so a deployment must not create it
+on a machine that has `~/.pi/agent`; a cache directory fits a
+content-addressed file that is put back whenever it is missing or changed.

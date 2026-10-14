@@ -13,6 +13,7 @@
 //! `noel-env-daemon` crate (`noel-env serve`), and the client comes later in
 //! this crate.
 
+mod connection;
 mod context;
 mod decode;
 mod error;
@@ -22,6 +23,9 @@ mod line_scan;
 mod local;
 mod path;
 mod process;
+mod remote;
+mod remote_watch;
+pub mod ssh;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +33,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub use connection::{
+    node_platform, CommandFuture, Connection, ConnectionOptions, DaemonCommand, EventCallback,
+    Json, LogCallback, PendingRequest, RemoteError, RemoteInfo, Reply, RequestOptions,
+    StartCallback,
+};
 pub use context::{AbortController, AbortSignal, Context};
 pub use decode::{RangeDecoder, StreamDecoder};
 pub use error::{ExecutionError, ExecutionErrorCode, FileError, FileErrorCode};
@@ -36,6 +45,8 @@ pub use line_scan::LineScanner;
 pub use local::{LocalEnv, LocalEnvOptions, LOCAL_ENV_ID};
 pub use path::resolve_local_path;
 pub use process::{kill_running_tool_groups, spawn_tool_process, ToolProcessGroup};
+pub use remote::{list_files_over, RemoteEnv, RemoteEnvOptions};
+pub use remote_watch::RemoteWatchOptions;
 
 /// The largest integer JavaScript represents exactly. Offsets, lengths and
 /// counts above it are `invalid`, as upstream's `Number.isSafeInteger`
