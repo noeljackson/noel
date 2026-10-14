@@ -23,7 +23,7 @@ such as `durable/docs/spec.md:67` are under upstream's `packages/`.
    - A supervisor runs `noel --mode rpc` inside an environment and messages it through upstream pi's RPC protocol, with noel's extensions: run ids, expected-run ids, request ids, and run resume.
    - Codewire's managed conversations are one supervisor. They are **Built** on trusted Linux hosts; Codewire Sandboxes are **Decided**.
 2. **Mode 2, server and client.**
-   - A long-running `noel server` holds sessions, and clients attach to it from anywhere (§5–§9). **Built** for clients on the same machine (device access, §6): `noel server`, `noel worker` and the line-mode `noel client`.
+   - A long-running `noel server` holds sessions, and clients attach to it from anywhere (§5–§9). **Built** for clients on the same machine (device access, §6): `noel server`, `noel worker`, the line-mode `noel client`, and the TUI attached to a session, `noel --attach` (§7.4).
    - A session's tools run in a workspace chosen through an adapter: local, a remote machine through `pi-env`, a Codewire environment, or anything else that implements the workspace interface (§10).
 
 noel works without Codewire in both modes. Every Codewire path is optional.
@@ -134,7 +134,7 @@ reply stays in the transcript.
   - a worker with no holds, no run and no queued input for `server.workerIdleExitMs` (default 60000) exits, removing its socket and record;
   - a worker outlives its server: it finishes its run, then waits up to that same idle time for a new server to adopt it;
   - a new server reads `workers/*.json`, dials each socket and checks uid, pid and `build`. A match is adopted; another build is told `shutdown` and exits once its run settles; a record whose process is gone is removed.
-- **Clients:** a client starts the server when none listens, after checking the runtime directory and the listening process's uid.
+- **Clients:** a client starts the server when none listens, after checking the runtime directory and the listening process's uid. The clients are the line-mode `noel client` and the TUI, `noel --attach <session-id>` (§7.4).
 
 ## 6. Principals and access
 
@@ -232,6 +232,19 @@ the input names this worker's session.
 
 Partials and tool output reach the view from the journal's records as each is saved (`SessionStore::observe_progress`), so a client sees what a crash would keep. A subscription gets the snapshot, then ops: a splice at the end of `entries` for each message, appends to a streaming reply or a tool's output, and diffs of the documents. Where this differs from Durable is in the non-parity register ("Mode 2 Server, Worker and Client").
 
+### 7.4 The attached TUI
+
+**Built** (`crates/noel-cli/src/attach.rs`). `noel --attach <session-id>` opens the TUI on a session the server holds, starting the server when none listens (§5). It is the local TUI (terminal, editor, keys and transcript rendering) with a remote backend: a `noel.chat` reference through the server instead of a `Runtime` in the process. The local TUI's in-process path is unchanged.
+- **Before the terminal:** the TUI holds the session and waits for its first view before it takes the terminal, so an unknown session (`invalid/session` from the server's route) or an invalid id is an error on the plain terminal, exit status 1. `--attach` takes no prompt, print mode or session flag.
+- **The transcript** is rebuilt from the view's `entries` as reopening a session rebuilds it from saved messages: a reply's thinking, then its text, then `aborted` for an aborted reply; a prompt; a tool's result with its call's command or path. After the entries, what the run streams in `docs["pi.live"]`: the committed partial's thinking and text, a retry it waits out, and each running or interrupted tool with its committed output. Each change of the view updates the rows it touches in place (a text that grows is appended to), so a streaming reply is one entry that becomes the saved reply, and the TUI's own notes stay where they were added.
+- **Input:** Enter while no run is active submits with `whenBusy: "reject"`; during a run Enter queues a follow-up and the steer key (ctrl+s) a steer. Each submission has a new `requestId`, and one that fails `unavailable` is sent again with the same id (§8.1). A prompt refused `busy` because another client started a run meanwhile is queued as a follow-up, as Enter does during a run. Esc (or the interrupt key) during a run sends `abort` with the run as `expectedRunId`, once; Up on an empty draft withdraws the session's last queued submission into the draft.
+- **Commands:** `/model <provider/id>` and `/thinking <level>` are `configure`, `/compact [instructions]` is `compact`, `/interrupt` is `abort`, `/queue` lists `pi.inbox` and `/queue-clear` withdraws it. Tool commands (`/bash`, `/read`, …), skills, templates and other text are prompts, which the worker expands with the session's configuration. The TUI's own display commands work (`/help`, `/hotkeys`, `/history`, `/status`, `/session`, `/clear`, `/copy` of a selection, `/quit`); any other of its commands acts on a session in this process and says it is not available when attached.
+- **The footer** shows, during a run, what it does (from `pi.live`: compacting, a running tool, writing, thinking or waiting) and how many submissions are queued; otherwise the model and thinking level from `pi.agent`, the queue, and the last run when it was aborted, failed or interrupted (`lastRun`). A run that failed is noted with its error, and an abort another client made is noted when no aborted reply shows it.
+- **Resume** is the server's (§8.3): the TUI never continues an interrupted run.
+- **Recovery** follows `noel client watch` (§8.1): a lost worker is noted, then the view is held again and redrawn from its snapshot; a lost server is noted and reconnected, starting a server.
+
+Where the attached TUI differs from the local one is in the non-parity register ("The TUI Attached to a Server Session").
+
 ## 8. Failure handling (Mode 2)
 
 **Built** (§8.1–§8.3).
@@ -239,7 +252,7 @@ Partials and tool output reach the view from the journal's records as each is sa
 ### 8.1 Client
 - **A disconnect:** the server releases everything the client held. The run continues.
 - **A submission's outcome is unknown when the link drops.** The client retries with the same `requestId`, which reports either `repeated` or the outcome. `noel client send` retries a hold or a `submit` that fails `unavailable` up to ten times.
-- **`noel client watch`** holds the view again when its worker is lost, and reconnects (starting a server) when the server is.
+- **`noel client watch`** and the attached TUI (§7.4) hold the view again when its worker is lost, and reconnect (starting a server) when the server is. The TUI sends a `submit` that fails `unavailable` again with the same `requestId`, as `noel client send` does.
 
 ### 8.2 Server
 - **Losing the server stops no run:** a worker finishes its run while no server is attached.
@@ -258,7 +271,7 @@ Partials and tool output reach the view from the journal's records as each is sa
 - RPC mode keeps upstream pi's record format and its abort rule (§3.3), and its goldens (`crates/noel-cli/tests/rpc_parity.rs`) guard both.
 - §4.2 applies to every mode, so RPC mode saves partial output and aborted replies too. Upstream pi also keeps aborted replies. **Built.** Keeping them moved `get_state.messageCount` to upstream's after an abort (the `abort-with-queue` golden now differs from upstream's only by the system message).
 
-**Built:** one session controller (`crates/noel-core/src/controller.rs`) drives runs. It owns, for one open session, the active run with its cancellation and retry backoff, the queue, submissions (§3.1), withdraw (§3.2), abort with a policy per caller (§3.3), resuming an interrupted run, compaction, and changes to the model and thinking level, which wait for no run to be active. It reports what happens as events, in order. RPC mode (`crates/noel-cli/src/rpc.rs`) is a thin adapter over it: commands in, records out, with abort keeping the queue; the Mode 2 worker (`crates/noel-cli/src/server/worker.rs`) is the second caller, with abort withdrawing the queue. The TUI still drives its own loop until its remote backend (PR 6) moves it.
+**Built:** one session controller (`crates/noel-core/src/controller.rs`) drives runs. It owns, for one open session, the active run with its cancellation and retry backoff, the queue, submissions (§3.1), withdraw (§3.2), abort with a policy per caller (§3.3), resuming an interrupted run, compaction, and changes to the model and thinking level, which wait for no run to be active. It reports what happens as events, in order. RPC mode (`crates/noel-cli/src/rpc.rs`) is a thin adapter over it: commands in, records out, with abort keeping the queue; the Mode 2 worker (`crates/noel-cli/src/server/worker.rs`) is the second caller, with abort withdrawing the queue. The TUI on a local session still drives its own loop; attached to a server session (§7.4) it goes through the worker's controller.
 
 ## 10. Workspaces
 
@@ -302,3 +315,5 @@ leaving them out of model requests), and added "Durable Partial Output" for
 where noel's saving differs from Durable's. Building Mode 2's server, worker
 and client added "Mode 2 Server, Worker and Client": noel's own objects, the
 view's subset of Durable's documents, and workers that outlive their server.
+The attached TUI added "The TUI Attached to a Server Session": where it
+differs from the TUI on a local session.
