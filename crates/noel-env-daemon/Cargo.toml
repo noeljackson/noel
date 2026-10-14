@@ -1,0 +1,21 @@
+[package]
+name = "noel-env-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "noel-env serve: the remote workspace daemon, speaking upstream pi-env's protocol 1 over stdin and stdout"
+publish = false
+
+# The binary is `noel-env`, as upstream's is `pi-env`. Its docs would collide
+# with the `noel_env` library's, so it has none.
+[[bin]]
+name = "noel-env"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+ignore = "=0.4.33"
+libc = "=0.2.186"
+noel-env = { path = "../noel-env" }
+notify = "=8.2.0"
+serde_json.workspace = true

@@ -1,0 +1,1442 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "1692bba6347a287ab0f3cb554a4430fafffc474b",
+    "package": "packages/env",
+    "envCommit": "f13c00fb3a4d77ad3faa815057e31d614d42b3f1",
+    "daemon": "pi-env 1.2.0, built from packages/env/daemon at ref (release, musl)",
+    "script": "/ts-parity/pi-env-fixture.ts"
+  },
+  "format": {
+    "scenarios": "Each scenario is one connection: upstream's Connection starts the daemon through a tap, its first request is hello, and the scenario's calls follow, each awaited. The daemon's working directory is the scenario's own mkdtemp directory, <root>.",
+    "steps": "send: a frame the client sent. receive: a frame the daemon sent, in the order the tap saw them. Types: request 1, result 2, error 3, event 4, cancel 5, ping 6.",
+    "output": "A request's output events are merged per stream (stdout, stderr; none for pty) and placed right before its result or error; how output splits into events depends on timing.",
+    "normalized": "In daemon frames, version, os, arch, home, tmpdir, cwd, pid, dev, ino, mtimeSec, mtimeNsec are \"<field>\", a directory's size is \"<size>\", and readdir entries are sorted by name. <root> is the scenario's directory in both directions.",
+    "payload": "Payload bytes as {utf8}, {hex}, or {repeat, length} for content of a short period. No payload: no field.",
+    "pings": "Pings are kept only in the liveness scenario: the first each way, at its end."
+  },
+  "scenarios": [
+    {
+      "name": "files",
+      "description": "hello; write (one frame, and kept open with writeChunk) and lstat; open and pread, fstat, scanLines; readdir; mkdir, rename, truncate, fsync, realpath, rm, listFiles; ENOENT, EISDIR, ERR_FS_EISDIR and EINVAL errors",
+      "steps": [
+        {
+          "send": {
+            "type": "request",
+            "id": 1,
+            "json": {
+              "protocol": 1,
+              "op": "hello"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 1,
+            "json": {
+              "arch": "<arch>",
+              "cwd": "<cwd>",
+              "driveCwds": {},
+              "features": [
+                "listFiles"
+              ],
+              "home": "<home>",
+              "os": "<os>",
+              "pid": "<pid>",
+              "protocol": 1,
+              "separator": "/",
+              "tmpdir": "<tmpdir>",
+              "version": "<version>"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 2,
+            "json": {
+              "path": "<root>/a.txt",
+              "append": false,
+              "keep": false,
+              "op": "write"
+            },
+            "payload": {
+              "utf8": "hello\nworld\n"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 2,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 3,
+            "json": {
+              "path": "<root>/a.txt",
+              "op": "lstat"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 3,
+            "json": {
+              "dev": "<dev>",
+              "ino": "<ino>",
+              "kind": "file",
+              "mtimeNsec": "<mtimeNsec>",
+              "mtimeSec": "<mtimeSec>",
+              "name": "a.txt",
+              "size": 12
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 4,
+            "json": {
+              "path": "<root>/a.txt",
+              "mode": "read",
+              "op": "open"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 4,
+            "json": {
+              "handle": 1,
+              "stat": {
+                "dev": "<dev>",
+                "ino": "<ino>",
+                "kind": "file",
+                "mtimeNsec": "<mtimeNsec>",
+                "mtimeSec": "<mtimeSec>",
+                "name": "a.txt",
+                "size": 12
+              }
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 5,
+            "json": {
+              "offset": 0,
+              "length": 12,
+              "handle": 1,
+              "op": "pread"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 5,
+            "json": {},
+            "payload": {
+              "utf8": "hello\nworld\n"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 6,
+            "json": {
+              "handle": 1,
+              "op": "close"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 6,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 7,
+            "json": {
+              "path": "<root>/big.txt",
+              "append": false,
+              "keep": true,
+              "op": "write"
+            },
+            "payload": {
+              "repeat": "0123456789abcdef\n",
+              "length": 524288
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 7,
+            "json": {
+              "handle": 2
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 8,
+            "json": {
+              "handle": 2,
+              "op": "writeChunk"
+            },
+            "payload": {
+              "repeat": "89abcdef\n01234567",
+              "length": 75712
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 8,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 9,
+            "json": {
+              "handle": 2,
+              "op": "close"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 9,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 10,
+            "json": {
+              "path": "<root>/big.txt",
+              "noFollow": false,
+              "op": "open"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 10,
+            "json": {
+              "handle": 3,
+              "info": {
+                "dev": "<dev>",
+                "ino": "<ino>",
+                "kind": "file",
+                "mtimeNsec": "<mtimeNsec>",
+                "mtimeSec": "<mtimeSec>",
+                "name": "big.txt",
+                "size": 600000
+              }
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 11,
+            "json": {
+              "offset": 524280,
+              "length": 16,
+              "handle": 3,
+              "op": "pread"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 11,
+            "json": {},
+            "payload": {
+              "utf8": "0123456789abcdef"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 12,
+            "json": {
+              "handle": 3,
+              "op": "fstat"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 12,
+            "json": {
+              "dev": "<dev>",
+              "ino": "<ino>",
+              "kind": "file",
+              "mtimeNsec": "<mtimeNsec>",
+              "mtimeSec": "<mtimeSec>",
+              "name": "big.txt",
+              "size": 600000
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 13,
+            "json": {
+              "startLine": 30000,
+              "endLine": 30002,
+              "handle": 3,
+              "op": "scanLines"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 13,
+            "json": {
+              "end": 510033,
+              "firstLineBytes": 16,
+              "firstLineEnd": 510016,
+              "lastLineStart": 510017,
+              "newlines": 35294,
+              "selectedBytes": 33,
+              "start": 510000
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 14,
+            "json": {
+              "handle": 3,
+              "op": "close"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 14,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 15,
+            "json": {
+              "path": "<root>/d/e",
+              "recursive": true,
+              "op": "mkdir"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 15,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 16,
+            "json": {
+              "path": "<root>/d/e/f.txt",
+              "append": false,
+              "keep": false,
+              "op": "write"
+            },
+            "payload": {
+              "utf8": "f"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 16,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 17,
+            "json": {
+              "path": "<root>",
+              "op": "opendir"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 17,
+            "json": {
+              "handle": 4
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 18,
+            "json": {
+              "max": 1000,
+              "handle": 4,
+              "op": "readdir"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 18,
+            "json": {
+              "done": true,
+              "entries": [
+                {
+                  "info": {
+                    "dev": "<dev>",
+                    "ino": "<ino>",
+                    "kind": "file",
+                    "mtimeNsec": "<mtimeNsec>",
+                    "mtimeSec": "<mtimeSec>",
+                    "name": "a.txt",
+                    "size": 12
+                  },
+                  "name": "a.txt"
+                },
+                {
+                  "info": {
+                    "dev": "<dev>",
+                    "ino": "<ino>",
+                    "kind": "file",
+                    "mtimeNsec": "<mtimeNsec>",
+                    "mtimeSec": "<mtimeSec>",
+                    "name": "big.txt",
+                    "size": 600000
+                  },
+                  "name": "big.txt"
+                },
+                {
+                  "info": {
+                    "dev": "<dev>",
+                    "ino": "<ino>",
+                    "kind": "directory",
+                    "mtimeNsec": "<mtimeNsec>",
+                    "mtimeSec": "<mtimeSec>",
+                    "name": "d",
+                    "size": "<size>"
+                  },
+                  "name": "d"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 19,
+            "json": {
+              "handle": 4,
+              "op": "close"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 19,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 20,
+            "json": {
+              "path": "<root>/d/e/f.txt",
+              "to": "<root>/d/g.txt",
+              "op": "rename"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 20,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 21,
+            "json": {
+              "path": "<root>/d/g.txt",
+              "size": 0,
+              "op": "truncate"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 21,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 22,
+            "json": {
+              "path": "<root>/a.txt",
+              "op": "fsync"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 22,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 23,
+            "json": {
+              "path": "<root>/a.txt",
+              "op": "realpath"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 23,
+            "json": {
+              "path": "<root>/a.txt"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 24,
+            "json": {
+              "path": "<root>",
+              "op": "listFiles"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 24,
+            "json": {
+              "count": 5,
+              "truncated": false
+            },
+            "payload": {
+              "utf8": "fa.txt\u0000fbig.txt\u0000dd\u0000dd/e\u0000fd/g.txt\u0000"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 25,
+            "json": {
+              "path": "<root>/d/e",
+              "recursive": true,
+              "force": false,
+              "op": "rm"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 25,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 26,
+            "json": {
+              "path": "<root>/missing",
+              "op": "lstat"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 26,
+            "json": {
+              "code": "ENOENT",
+              "message": "ENOENT: no such file or directory, lstat '<root>/missing'",
+              "path": "<root>/missing",
+              "syscall": "lstat"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 27,
+            "json": {
+              "path": "<root>/d",
+              "mode": "read",
+              "op": "open"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 27,
+            "json": {
+              "handle": 5,
+              "stat": {
+                "dev": "<dev>",
+                "ino": "<ino>",
+                "kind": "directory",
+                "mtimeNsec": "<mtimeNsec>",
+                "mtimeSec": "<mtimeSec>",
+                "name": "d",
+                "size": "<size>"
+              }
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 28,
+            "json": {
+              "length": 65536,
+              "handle": 5,
+              "op": "pread"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 28,
+            "json": {
+              "code": "EISDIR",
+              "message": "EISDIR: illegal operation on a directory, read '<root>/d'",
+              "path": "<root>/d",
+              "syscall": "read"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 29,
+            "json": {
+              "handle": 5,
+              "op": "close"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 29,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 30,
+            "json": {
+              "path": "<root>/d",
+              "noFollow": false,
+              "op": "open"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 30,
+            "json": {
+              "code": "EISDIR",
+              "message": "EISDIR: illegal operation on a directory, read",
+              "path": "<root>/d"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 31,
+            "json": {
+              "path": "<root>/d",
+              "op": "fsync"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 31,
+            "json": {
+              "code": "EISDIR",
+              "message": "EISDIR: illegal operation on a directory, open '<root>/d'",
+              "path": "<root>/d"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 32,
+            "json": {
+              "path": "<root>/d",
+              "recursive": false,
+              "force": false,
+              "op": "rm"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 32,
+            "json": {
+              "code": "ERR_FS_EISDIR",
+              "message": "Path is a directory: rm returned EISDIR (is a directory) <root>/d",
+              "path": "<root>/d"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 33,
+            "json": {
+              "op": "bogus"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 33,
+            "json": {
+              "code": "EINVAL",
+              "message": "unknown operation bogus"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 34,
+            "json": {
+              "op": "lstat"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 34,
+            "json": {
+              "code": "EINVAL",
+              "message": "missing field path"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "exec",
+      "description": "exec of a shell string and of argv with output events, a signal exit and undecodable output; cancel (abort and kill); timeout; spawn_error and shell_unavailable",
+      "steps": [
+        {
+          "send": {
+            "type": "request",
+            "id": 1,
+            "json": {
+              "protocol": 1,
+              "op": "hello"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 1,
+            "json": {
+              "arch": "<arch>",
+              "cwd": "<cwd>",
+              "driveCwds": {},
+              "features": [
+                "listFiles"
+              ],
+              "home": "<home>",
+              "os": "<os>",
+              "pid": "<pid>",
+              "protocol": 1,
+              "separator": "/",
+              "tmpdir": "<tmpdir>",
+              "version": "<version>"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 2,
+            "json": {
+              "command": "echo out; echo err >&2",
+              "cwd": "<root>",
+              "env": {},
+              "inheritEnv": true,
+              "op": "exec"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "event",
+            "id": 2,
+            "json": {
+              "kind": "output",
+              "stream": "stdout"
+            },
+            "payload": {
+              "utf8": "out\n"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "event",
+            "id": 2,
+            "json": {
+              "kind": "output",
+              "stream": "stderr"
+            },
+            "payload": {
+              "utf8": "err\n"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 2,
+            "json": {
+              "exitCode": 0
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 3,
+            "json": {
+              "argv": [
+                "sh",
+                "-c",
+                "printf 'a\\377b'; exit 3"
+              ],
+              "cwd": "<root>",
+              "env": {},
+              "inheritEnv": true,
+              "op": "exec"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "event",
+            "id": 3,
+            "json": {
+              "kind": "output",
+              "stream": "stdout"
+            },
+            "payload": {
+              "utf8": "a�b"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 3,
+            "json": {
+              "exitCode": 3
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 4,
+            "json": {
+              "argv": [
+                "sleep",
+                "30"
+              ],
+              "cwd": "<root>",
+              "env": {},
+              "inheritEnv": true,
+              "op": "exec"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "cancel",
+            "id": 4,
+            "json": {}
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 4,
+            "json": {
+              "code": "aborted",
+              "message": "aborted"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 5,
+            "json": {
+              "argv": [
+                "sleep",
+                "30"
+              ],
+              "cwd": "<root>",
+              "env": {},
+              "inheritEnv": true,
+              "op": "exec"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "cancel",
+            "id": 5,
+            "json": {
+              "mode": "kill"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 5,
+            "json": {
+              "exitCode": 137
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 6,
+            "json": {
+              "argv": [
+                "sleep",
+                "5"
+              ],
+              "cwd": "<root>",
+              "env": {},
+              "inheritEnv": true,
+              "timeoutMs": 300,
+              "op": "exec"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 6,
+            "json": {
+              "code": "timeout",
+              "message": "timeout"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 7,
+            "json": {
+              "command": "true",
+              "cwd": "<root>/missing",
+              "env": {},
+              "inheritEnv": true,
+              "op": "exec"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 7,
+            "json": {
+              "code": "spawn_error",
+              "message": "Working directory does not exist: <root>/missing\nCannot execute bash commands."
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 8,
+            "json": {
+              "argv": [
+                "/nonexistent/program"
+              ],
+              "cwd": "<root>",
+              "env": {},
+              "inheritEnv": true,
+              "op": "exec"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 8,
+            "json": {
+              "code": "spawn_error",
+              "message": "No such file or directory (os error 2)"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 9,
+            "json": {
+              "command": "true",
+              "cwd": "<root>",
+              "env": {},
+              "inheritEnv": true,
+              "shellPath": "/nonexistent/sh",
+              "op": "exec"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 9,
+            "json": {
+              "code": "shell_unavailable",
+              "message": "Custom shell path not found: /nonexistent/sh"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "pty",
+      "description": "pty with started and raw output events; ptyResize, ptyForeground, ptyWrite; EBADF once it has ended",
+      "steps": [
+        {
+          "send": {
+            "type": "request",
+            "id": 1,
+            "json": {
+              "protocol": 1,
+              "op": "hello"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 1,
+            "json": {
+              "arch": "<arch>",
+              "cwd": "<cwd>",
+              "driveCwds": {},
+              "features": [
+                "listFiles"
+              ],
+              "home": "<home>",
+              "os": "<os>",
+              "pid": "<pid>",
+              "protocol": 1,
+              "separator": "/",
+              "tmpdir": "<tmpdir>",
+              "version": "<version>"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 2,
+            "json": {
+              "cwd": "<root>",
+              "argv": [
+                "sh",
+                "-c",
+                "IFS= read -r line; printf \"got %s\\n\" \"$line\"; exit 3"
+              ],
+              "env": {
+                "TERM": "dumb"
+              },
+              "cols": 80,
+              "rows": 24,
+              "op": "pty"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "event",
+            "id": 2,
+            "json": {
+              "kind": "started",
+              "pid": "<pid>"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 3,
+            "json": {
+              "target": 2,
+              "cols": 100,
+              "rows": 30,
+              "op": "ptyResize"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 3,
+            "json": {}
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 4,
+            "json": {
+              "target": 2,
+              "op": "ptyForeground"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 4,
+            "json": {
+              "foreground": null
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 5,
+            "json": {
+              "target": 2,
+              "op": "ptyWrite"
+            },
+            "payload": {
+              "utf8": "abc\n"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 5,
+            "json": {}
+          }
+        },
+        {
+          "receive": {
+            "type": "event",
+            "id": 2,
+            "json": {
+              "kind": "output"
+            },
+            "payload": {
+              "utf8": "abc\r\ngot abc\r\n"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 2,
+            "json": {
+              "exitCode": 3
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 6,
+            "json": {
+              "target": 2,
+              "op": "ptyWrite"
+            },
+            "payload": {
+              "utf8": "late\n"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 6,
+            "json": {
+              "code": "EBADF",
+              "message": "no running terminal with this id"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 7,
+            "json": {
+              "target": 2,
+              "op": "ptyForeground"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "error",
+            "id": 7,
+            "json": {
+              "code": "EBADF",
+              "message": "no running terminal with this id"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "watch",
+      "description": "watch: ready, a change for a written file, and the result once cancelled",
+      "steps": [
+        {
+          "send": {
+            "type": "request",
+            "id": 1,
+            "json": {
+              "protocol": 1,
+              "op": "hello"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 1,
+            "json": {
+              "arch": "<arch>",
+              "cwd": "<cwd>",
+              "driveCwds": {},
+              "features": [
+                "listFiles"
+              ],
+              "home": "<home>",
+              "os": "<os>",
+              "pid": "<pid>",
+              "protocol": 1,
+              "separator": "/",
+              "tmpdir": "<tmpdir>",
+              "version": "<version>"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 2,
+            "json": {
+              "targets": [
+                {
+                  "path": "<root>",
+                  "recursive": true,
+                  "exclude": {
+                    "hidden": false,
+                    "names": []
+                  }
+                }
+              ],
+              "op": "watch"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "event",
+            "id": 2,
+            "json": {
+              "kind": "ready",
+              "mode": "native"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "request",
+            "id": 3,
+            "json": {
+              "path": "<root>/w.txt",
+              "append": false,
+              "keep": false,
+              "op": "write"
+            },
+            "payload": {
+              "utf8": "w"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 3,
+            "json": {}
+          }
+        },
+        {
+          "receive": {
+            "type": "event",
+            "id": 2,
+            "json": {
+              "kind": "change",
+              "paths": [
+                "<root>/w.txt"
+              ]
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "cancel",
+            "id": 2,
+            "json": {}
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 2,
+            "json": {}
+          }
+        }
+      ]
+    },
+    {
+      "name": "liveness",
+      "description": "hello, then a ping each way (both sides ping every 5 s)",
+      "steps": [
+        {
+          "send": {
+            "type": "request",
+            "id": 1,
+            "json": {
+              "protocol": 1,
+              "op": "hello"
+            }
+          }
+        },
+        {
+          "receive": {
+            "type": "result",
+            "id": 1,
+            "json": {
+              "arch": "<arch>",
+              "cwd": "<cwd>",
+              "driveCwds": {},
+              "features": [
+                "listFiles"
+              ],
+              "home": "<home>",
+              "os": "<os>",
+              "pid": "<pid>",
+              "protocol": 1,
+              "separator": "/",
+              "tmpdir": "<tmpdir>",
+              "version": "<version>"
+            }
+          }
+        },
+        {
+          "send": {
+            "type": "ping",
+            "id": 0,
+            "json": {}
+          }
+        },
+        {
+          "receive": {
+            "type": "ping",
+            "id": 0,
+            "json": {}
+          }
+        }
+      ]
+    }
+  ]
+}

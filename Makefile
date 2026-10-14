@@ -6,11 +6,11 @@ RUST_CI_IMAGE ?= noel-rust-ci:1.99.0
 TS_REFERENCE_REPO ?= https://github.com/earendil-works/pi.git
 TS_REFERENCE_REF ?= main
 TS_PARITY_TRACKING_REF ?= main
-# chord-delta.json, chord-link.json and local-env.json are pinned to this
-# upstream commit, whatever TS_REFERENCE_REF is. ts-parity-drift reports
-# commits to packages/chord and to Durable's env (packages/durable/src/env and
-# its conformance cases) on the tracking ref that came after it; move the pin
-# here and regenerate.
+# chord-delta.json, chord-link.json, local-env.json and pi-env.json are pinned
+# to this upstream commit, whatever TS_REFERENCE_REF is. ts-parity-drift
+# reports commits to packages/chord, to Durable's env (packages/durable/src/env
+# and its conformance cases) and to pi-env (packages/env) on the tracking ref
+# that came after it; move the pin here and regenerate.
 CHORD_REFERENCE_REF ?= 1692bba6347a287ab0f3cb554a4430fafffc474b
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
@@ -23,13 +23,14 @@ INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-chord ts-parity-env ts-parity-update ts-parity-drift ts-parity-agent chord-interop smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-update ts-parity-drift ts-parity-agent chord-interop env-interop env-daemon smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  build        Build the workspace' \
 		'  release      Build the noel CLI release binary' \
+		'  env-daemon   Build the noel-env daemon for upload (size-optimized profile)' \
 		'  install      Install the noel CLI release binary to $$(PREFIX)/bin' \
 		'  install-system Install the noel CLI release binary to /usr/local/bin' \
 		'  run          Run the noel CLI; pass RUN_ARGS="..." for CLI args' \
@@ -53,7 +54,9 @@ help:
 		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
 		'  ts-parity-chord     Regenerate only the Chord goldens inside Docker' \
 		'  ts-parity-env       Regenerate only the LocalEnv goldens inside Docker' \
+		'  ts-parity-pi-env    Regenerate only the pi-env daemon goldens inside Docker' \
 		'  chord-interop       Run noel-chord against upstream Chord over WebSockets' \
+		'  env-interop         Run upstream pi-env client tests against noel-env serve' \
 		'  ts-parity-update    Refresh fixtures from moving TS reference inside Docker' \
 		'  ts-parity-drift     Check moving TS reference for fixture drift' \
 		'  ts-parity-agent     Check drift and optionally dispatch NOEL_PARITY_AGENT_COMMAND' \
@@ -65,6 +68,11 @@ build:
 
 release:
 	$(CARGO) build --release -p noel-cli
+
+# The daemon is uploaded to remote machines, so its profile trades build time
+# for size (profile.env-daemon in Cargo.toml).
+env-daemon:
+	$(CARGO) build --profile env-daemon -p noel-env-daemon
 
 install:
 	CARGO="$(CARGO)" $(INSTALL_BUILD_SCRIPT)
@@ -142,6 +150,7 @@ parity-check:
 	$(CARGO) test -p noel-cli --test rpc_parity golden_
 	$(CARGO) test -p noel-chord
 	$(CARGO) test -p noel-env
+	$(CARGO) test -p noel-env-daemon
 	$(MAKE) ts-parity-drift
 
 ts-parity-build:
@@ -167,6 +176,15 @@ ts-parity-env: ts-parity-build
 	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE) \
 		npx tsx /ts-parity/local-env-fixture.ts /fixtures
 
+# Upstream pi-env's client driving its own daemon (both from the pinned
+# checkout) through a tap, for noel-env serve's goldens. Runs as the caller, so
+# the fixture is the caller's.
+ts-parity-pi-env: ts-parity-build
+	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
+	$(DOCKER) run --rm --user "$$(id -u):$$(id -g)" -e HOME=/tmp \
+		-v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE) \
+		node --conditions=source /ts-parity/pi-env-fixture.ts /fixtures
+
 ts-parity-update:
 	$(MAKE) ts-parity-fixtures TS_REFERENCE_REF="$(TS_PARITY_TRACKING_REF)"
 
@@ -174,6 +192,11 @@ ts-parity-update:
 # noel-chord's examples, over WebSockets on Unix sockets.
 chord-interop: ts-parity-build
 	CARGO="$(CARGO)" DOCKER="$(DOCKER)" TS_PARITY_IMAGE="$(TS_PARITY_IMAGE)" scripts/chord-interop.sh
+
+# Upstream pi-env's client tests (in the ts-parity image) against noel-env
+# serve, which they start directly; upstream's daemon runs them first.
+env-interop: ts-parity-build
+	CARGO="$(CARGO)" DOCKER="$(DOCKER)" TS_PARITY_IMAGE="$(TS_PARITY_IMAGE)" scripts/env-interop.sh
 
 ts-parity-drift:
 	scripts/ts-parity-drift.sh
