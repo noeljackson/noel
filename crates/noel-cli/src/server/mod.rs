@@ -116,7 +116,7 @@ impl RuntimeDir {
 
     /// The directory, created with mode 0700 when missing (its parent must
     /// exist). An existing one must be a directory, not a link, owned by
-    /// this user with mode 0700, or nothing runs in it.
+    /// this user with permissions 0700, or nothing runs in it.
     pub fn ensure(root: PathBuf) -> Result<Self> {
         match fs::symlink_metadata(&root) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -126,6 +126,8 @@ impl RuntimeDir {
                 builder
                     .create(&root)
                     .map_err(|error| anyhow!("create {}: {error}", root.display()))?;
+                // A setgid parent passes its bit on; the directory is 0700.
+                set_mode(&root, 0o700)?;
             }
             Err(error) => return Err(anyhow!("{}: {error}", root.display())),
             Ok(_) => {}
@@ -153,8 +155,10 @@ impl RuntimeDir {
                     own_uid()
                 ));
             }
+            // Only the permissions decide who may enter: a setgid or sticky
+            // bit on a 0700 directory of this user lets no one else in.
             let mode = metadata.permissions().mode() & 0o7777;
-            if mode != 0o700 {
+            if mode & 0o777 != 0o700 {
                 return Err(anyhow!(
                     "{} has mode {mode:o}, not 700; refusing to use it",
                     root.display()
@@ -437,6 +441,32 @@ mod tests {
         assert!(RuntimeDir::check(link.clone()).is_err());
         fs::remove_file(link).unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_setgid_parent_leaves_the_runtime_directory_usable() {
+        let parent = temp("sg");
+        fs::create_dir(&parent).unwrap();
+        set_mode(&parent, 0o2755).unwrap();
+        // Only when this system lets a user set the bit on their own directory.
+        if fs::metadata(&parent).unwrap().permissions().mode() & 0o2000 != 0 {
+            let dir = parent.join("noel");
+            let made = RuntimeDir::ensure(dir.clone()).unwrap();
+            let mode = fs::metadata(made.root()).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o700);
+            // One made earlier with the inherited bit is used as it is.
+            set_mode(&dir, 0o2700).unwrap();
+            RuntimeDir::ensure(dir.clone()).unwrap();
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+                0o2700
+            );
+            // Group permissions are still refused.
+            set_mode(&dir, 0o2750).unwrap();
+            let error = RuntimeDir::ensure(dir).unwrap_err().to_string();
+            assert!(error.contains("mode 2750"), "{error}");
+        }
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
