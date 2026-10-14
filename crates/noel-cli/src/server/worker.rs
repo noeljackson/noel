@@ -174,6 +174,9 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     let heard = view.clone();
     let store = store.observe_progress(Arc::new(move |saved| lock(&heard).saved(saved)));
     let mut runtime = Runtime::with_store(state, systems, store);
+    // A session in a workspace on another machine opens it at its first
+    // tool call; one that cannot be opened fails those calls, saying why.
+    crate::workspace::install(&mut runtime, &config.paths.agent_dir, true);
     crate::select_initial_model(&mut runtime, &config, &selection, offline)?;
     if !runtime.session().disabled_tools.is_empty() {
         runtime.set_disabled_tools(BTreeSet::new())?;

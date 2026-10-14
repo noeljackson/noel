@@ -22,6 +22,8 @@ serde_json.workspace = true
 
 # The client tests (RemoteEnv over this daemon) run on tokio; the daemon itself does not.
 [dev-dependencies]
+# The built-in tools over RemoteEnv (tests/tools_over_remote_env.rs).
+noel-tools = { path = "../noel-tools" }
 serde.workspace = true
 sha2.workspace = true
 tokio.workspace = true

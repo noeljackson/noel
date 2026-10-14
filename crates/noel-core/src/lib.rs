@@ -12,6 +12,7 @@ mod system_prompt;
 mod tool_parity_tests;
 #[cfg(test)]
 mod tool_tests;
+mod workspace;
 pub use compaction::RuntimeCompactionSettings;
 pub use input::expand_input;
 pub use progress::{interrupted_output, RuntimeProgressSettings};
@@ -19,6 +20,7 @@ use progress::{ReplyProgress, ToolProgress};
 use session_lock::SessionLock;
 pub use system_prompt::PRODUCT_NAME;
 use system_prompt::{PromptTool, SystemPromptInput};
+pub use workspace::SessionWorkspace;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
@@ -320,6 +322,10 @@ pub struct SessionState {
     /// by call id. An interrupted call's result starts with it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_outputs: BTreeMap<String, SavedToolOutput>,
+    /// Where the session's tools run, when that is not this machine (spec
+    /// §10); `None` runs them in `cwd` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<SessionWorkspace>,
 }
 
 /// A streaming reply as far as the journal saved it (spec §4.2).
@@ -499,6 +505,7 @@ impl SessionState {
             runs: Vec::new(),
             partial: None,
             tool_outputs: BTreeMap::new(),
+            workspace: None,
         }
     }
 }
@@ -655,6 +662,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         runs: Vec::new(),
         partial: None,
         tool_outputs: BTreeMap::new(),
+        // An export carries no workspace: an imported session is local.
+        workspace: None,
     }
 }
 
@@ -688,6 +697,10 @@ pub struct ReloadableSystems {
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
     pub context_files: Vec<ContextFile>,
+    /// Those of `context_files` from noel's agent dir, the user's own: a
+    /// session in a remote workspace keeps them and reads the project's
+    /// from the workspace.
+    pub agent_context_files: Vec<ContextFile>,
     /// The loaded skills, which the system prompt lists.
     pub skills: Vec<Skill>,
     pub available_models: Vec<ModelRef>,
@@ -722,6 +735,7 @@ impl Default for ReloadableSystems {
             system_prompt: None,
             append_system_prompt: Vec::new(),
             context_files: Vec::new(),
+            agent_context_files: Vec::new(),
             skills: Vec::new(),
             available_models: Vec::new(),
             configured_providers: BTreeSet::new(),
@@ -873,6 +887,12 @@ impl ReloadableSystems {
             system_prompt: config.system_prompt.clone(),
             append_system_prompt: config.append_system_prompt.clone(),
             context_files: config.context_files.clone(),
+            agent_context_files: config
+                .context_files
+                .iter()
+                .filter(|file| file.path.parent() == Some(config.paths.agent_dir.as_path()))
+                .cloned()
+                .collect(),
             skills: config.skills.clone(),
             available_models,
             configured_providers,
@@ -1051,6 +1071,10 @@ enum SessionRecord {
         session_id: String,
         cwd: PathBuf,
     },
+    /// Where the session's tools run (spec §10), written with `started` in
+    /// one atomic file, so a session that has one never existed without
+    /// it. Older versions ignore it, and run such a session's tools here.
+    Workspace(SessionWorkspace),
     Metadata {
         name: Option<String>,
         labels: Vec<String>,
@@ -1241,6 +1265,44 @@ impl SessionStore {
         let store = Self::writer(path)?;
         let state = SessionState::new(session_id.clone(), cwd.clone());
         store.append(&SessionRecord::Started { session_id, cwd })?;
+        Ok((store, state))
+    }
+
+    /// A new session, local ([`SessionStore::create`]) or in `workspace`
+    /// ([`SessionStore::create_in_workspace`]).
+    pub fn create_with_workspace(
+        session_dir: &Path,
+        cwd: PathBuf,
+        workspace: Option<SessionWorkspace>,
+    ) -> Result<(Self, SessionState), SessionError> {
+        match workspace {
+            Some(workspace) => {
+                Self::create_in_workspace(session_dir, cwd, new_session_id(), workspace)
+            }
+            None => Self::create(session_dir, cwd),
+        }
+    }
+
+    /// [`SessionStore::create_with_id`] for a session whose tools run in
+    /// `workspace`. The journal starts with its `started` and `workspace`
+    /// records in one atomic write, so it never exists without the second:
+    /// a session must never fall back to running its tools here.
+    pub fn create_in_workspace(
+        session_dir: &Path,
+        cwd: PathBuf,
+        session_id: impl Into<String>,
+        workspace: SessionWorkspace,
+    ) -> Result<(Self, SessionState), SessionError> {
+        fs::create_dir_all(session_dir).map_err(|source| SessionError::CreateDir {
+            path: session_dir.to_path_buf(),
+            source,
+        })?;
+        let session_id = session_id.into();
+        let path = session_dir.join(format!("{session_id}.jsonl"));
+        let store = Self::writer(path)?;
+        let mut state = SessionState::new(session_id, cwd);
+        state.workspace = Some(workspace);
+        store.write_full_state(&state)?;
         Ok((store, state))
     }
 
@@ -1708,11 +1770,12 @@ impl SessionStore {
     /// Replaces the journal with the full state in one atomic rename, so a
     /// crash leaves either the previous journal or the complete new one.
     fn write_full_state(&self, state: &SessionState) -> Result<(), SessionError> {
-        let mut records = vec![
-            SessionRecord::Started {
-                session_id: state.session_id.clone(),
-                cwd: state.cwd.clone(),
-            },
+        let mut records = vec![SessionRecord::Started {
+            session_id: state.session_id.clone(),
+            cwd: state.cwd.clone(),
+        }];
+        records.extend(state.workspace.clone().map(SessionRecord::Workspace));
+        records.extend([
             metadata_record(state),
             SessionRecord::ActiveModel {
                 model: state.active_model.clone(),
@@ -1735,7 +1798,7 @@ impl SessionStore {
             SessionRecord::Usage {
                 usage: state.usage.clone(),
             },
-        ];
+        ]);
         // Fork and import start new sessions, which have no runs yet.
         records.extend(
             state
@@ -1896,6 +1959,7 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
     };
     match record {
         SessionRecord::Started { .. } | SessionRecord::Unknown => {}
+        SessionRecord::Workspace(workspace) => state.workspace = Some(workspace),
         SessionRecord::Metadata {
             name,
             labels,
@@ -2643,15 +2707,27 @@ pub struct EnvTarget<'a> {
 pub type EnvHook =
     Arc<dyn Fn(&EnvTarget<'_>) -> Result<Arc<dyn ExecutionEnv>, String> + Send + Sync>;
 
+/// Opens the workspace a session's journal names ([`SessionWorkspace`]) for
+/// one tool call; an `Err` is that call's error result.
+pub type WorkspaceHook = Arc<
+    dyn Fn(&EnvTarget<'_>, &SessionWorkspace) -> Result<Arc<dyn ExecutionEnv>, String>
+        + Send
+        + Sync,
+>;
+
 /// Chooses the workspace of each tool call (upstream Durable's harness
 /// `env(target)` hook), asked anew for every call.
 #[derive(Clone, Default)]
 pub enum EnvProvider {
     /// A [`LocalEnv`] at the session's working directory, with the
-    /// `shellPath` setting: every mode's default.
+    /// `shellPath` setting: every mode's default. A session whose journal
+    /// names a workspace gets an error instead, never this machine.
     #[default]
     Local,
     Hook(EnvHook),
+    /// [`EnvProvider::Local`] for a session without a workspace record; the
+    /// hook opens the workspace of one that has it.
+    Workspaces(WorkspaceHook),
 }
 
 impl std::fmt::Debug for EnvProvider {
@@ -2659,9 +2735,14 @@ impl std::fmt::Debug for EnvProvider {
         formatter.write_str(match self {
             Self::Local => "EnvProvider::Local",
             Self::Hook(_) => "EnvProvider::Hook",
+            Self::Workspaces(_) => "EnvProvider::Workspaces",
         })
     }
 }
+
+/// How long a run waits for a remote workspace's context files before it
+/// goes on without them; it tries again at the next run.
+const WORKSPACE_CONTEXT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct Runtime {
@@ -2672,6 +2753,12 @@ pub struct Runtime {
     /// commands see as `NOEL_REASONING_LEVEL`.
     thinking_level: Option<String>,
     env_provider: EnvProvider,
+    /// The project context files read from the session's workspace, once a
+    /// run loaded them (spec §10); `None` until then.
+    workspace_context: Option<Vec<ContextFile>>,
+    /// Whether a remote workspace's project context files are read
+    /// (`--no-context-files` turns it off).
+    workspace_context_enabled: bool,
 }
 
 impl Runtime {
@@ -2682,6 +2769,8 @@ impl Runtime {
             store: None,
             thinking_level: None,
             env_provider: EnvProvider::default(),
+            workspace_context: None,
+            workspace_context_enabled: true,
         }
     }
 
@@ -2691,12 +2780,43 @@ impl Runtime {
         store: SessionStore,
     ) -> Self {
         Self {
-            session,
-            systems,
             store: Some(store),
-            thinking_level: None,
-            env_provider: EnvProvider::default(),
+            ..Self::new(session, systems)
         }
+    }
+
+    /// Whether the system prompt of a session with a remote workspace lists
+    /// the project context files found there; default true.
+    pub fn set_workspace_context_enabled(&mut self, enabled: bool) {
+        self.workspace_context_enabled = enabled;
+        self.workspace_context = None;
+    }
+
+    /// Reads the session workspace's project context files for the system
+    /// prompt, unless they were read already. The workspace may be out of
+    /// reach: then the prompt goes without them, and the next run tries
+    /// again, while its tool calls report the failure.
+    async fn load_workspace_context(&mut self, run: &RunControl) -> Result<(), AgentError> {
+        if self.session.workspace.is_none()
+            || self.workspace_context.is_some()
+            || !self.workspace_context_enabled
+        {
+            return Ok(());
+        }
+        let Ok(env) = self.tool_env() else {
+            return Ok(());
+        };
+        let cx = noel_env::Context::background();
+        let loaded = run
+            .until_cancelled(tokio::time::timeout(
+                WORKSPACE_CONTEXT_TIMEOUT,
+                workspace::workspace_context_files(env.as_ref(), &cx),
+            ))
+            .await?;
+        if let Ok(Ok(files)) = loaded {
+            self.workspace_context = Some(files);
+        }
+        Ok(())
     }
 
     pub fn env_provider(&self) -> &EnvProvider {
@@ -2708,19 +2828,29 @@ impl Runtime {
         self.env_provider = provider;
     }
 
-    /// The workspace for one tool call, from the env provider.
+    /// The workspace for one tool call, from the env provider. A session
+    /// whose journal names a workspace runs nowhere else: without a provider
+    /// that opens it, its tool calls fail.
     pub fn tool_env(&self) -> Result<Arc<dyn ExecutionEnv>, String> {
-        match &self.env_provider {
-            EnvProvider::Local => Ok(Arc::new(LocalEnv::with_options(
-                &self.session.cwd,
-                LocalEnvOptions {
-                    shell_path: self.systems.shell_path.clone(),
-                },
-            ))),
-            EnvProvider::Hook(hook) => hook(&EnvTarget {
-                session_id: &self.session.session_id,
-                cwd: &self.session.cwd,
-            }),
+        let target = EnvTarget {
+            session_id: &self.session.session_id,
+            cwd: &self.session.cwd,
+        };
+        match (&self.env_provider, &self.session.workspace) {
+            (EnvProvider::Hook(hook), _) => hook(&target),
+            (EnvProvider::Local | EnvProvider::Workspaces(_), None) => {
+                Ok(Arc::new(LocalEnv::with_options(
+                    &self.session.cwd,
+                    LocalEnvOptions {
+                        shell_path: self.systems.shell_path.clone(),
+                    },
+                )))
+            }
+            (EnvProvider::Workspaces(open), Some(workspace)) => open(&target, workspace),
+            (EnvProvider::Local, Some(workspace)) => Err(format!(
+                "This session's tools run in its {} workspace {}, which this process cannot open",
+                workspace.adapter, workspace.id
+            )),
         }
     }
 
@@ -2881,6 +3011,7 @@ impl Runtime {
     pub fn replace_session(&mut self, session: SessionState, store: Option<SessionStore>) {
         self.session = session;
         self.store = store;
+        self.workspace_context = None;
     }
 
     pub fn rename_session(&mut self, name: Option<String>) -> Result<(), SessionError> {
@@ -3086,6 +3217,8 @@ impl Runtime {
         let mut next = next;
         next.offline |= self.systems.offline;
         self.systems = next;
+        // A reload reads context files again, a workspace's at the next run.
+        self.workspace_context = None;
         Ok(ReloadReport {
             active_model_valid,
             active_account_valid,
@@ -3585,6 +3718,7 @@ async fn run_model_turn_streaming_events(
     mut prompt: Option<ConversationMessage>,
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
+    runtime.load_workspace_context(run).await?;
     let system_prompt = runtime_system_prompt(runtime);
     runtime.thinking_level = provider.thinking_level();
     let mut final_text = String::new();
@@ -4114,13 +4248,34 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// The system prompt for the session as it is now: its tools, prompt
 /// sources, context files, and working directory.
 fn runtime_system_prompt(runtime: &Runtime) -> String {
+    let Some(workspace) = &runtime.session.workspace else {
+        return system_prompt::build_system_prompt(&SystemPromptInput {
+            custom_prompt: runtime.systems.system_prompt.as_deref(),
+            tools: &prompt_tools(runtime),
+            append_system_prompt: &runtime.systems.append_system_prompt.join("\n\n"),
+            context_files: &runtime.systems.context_files,
+            skills: &runtime.systems.skills,
+            cwd: &runtime.session.cwd,
+        });
+    };
+    // A remote workspace (spec §10): its directory, the user's own context
+    // file from noel's agent dir, then the project's, read there. Skills are
+    // files on this machine, which the workspace's `read` cannot reach, so
+    // the prompt does not list them; `/skill:<name>` still expands here.
+    let context_files = runtime
+        .systems
+        .agent_context_files
+        .iter()
+        .chain(runtime.workspace_context.iter().flatten())
+        .cloned()
+        .collect::<Vec<_>>();
     system_prompt::build_system_prompt(&SystemPromptInput {
         custom_prompt: runtime.systems.system_prompt.as_deref(),
         tools: &prompt_tools(runtime),
         append_system_prompt: &runtime.systems.append_system_prompt.join("\n\n"),
-        context_files: &runtime.systems.context_files,
-        skills: &runtime.systems.skills,
-        cwd: &runtime.session.cwd,
+        context_files: &context_files,
+        skills: &[],
+        cwd: Path::new(&workspace.cwd),
     })
 }
 

@@ -2826,3 +2826,121 @@ fn attach_refuses_the_options_that_shape_a_local_session() {
         );
     }
 }
+
+/// `--workspace` (spec §10): a session starts only on a host noel trusts,
+/// keeps its workspace in its journal, and refuses another one on reopen;
+/// `noel workspace forget` withdraws the trust. Nothing here connects: the
+/// faux model calls no tool, and `--no-context-files` reads none there.
+#[test]
+fn workspace_sessions_need_a_trusted_host_and_keep_their_workspace() {
+    let root = test_dir("noel-cli-workspace");
+    fs::create_dir_all(&root).expect("create root");
+    let sessions = root.join("sessions");
+    let run = |args: &[&str]| isolated_noel(&root, args).output().expect("run noel");
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).into_owned();
+    let url = "ssh://me@box:2222/work";
+
+    let untrusted = run(&["-p", "--workspace", url, "hi"]);
+    assert!(!untrusted.status.success());
+    assert!(
+        stderr(&untrusted).contains("noel workspace trust ssh://box:2222"),
+        "{}",
+        stderr(&untrusted)
+    );
+    assert!(!sessions.exists() || fs::read_dir(&sessions).unwrap().next().is_none());
+
+    let invalid = run(&["-p", "--workspace", "box:/work", "hi"]);
+    assert!(stderr(&invalid).contains("ssh://[user@]host[:port]/absolute/path"));
+
+    let known_hosts = root.join("agent/workspaces/known_hosts");
+    fs::create_dir_all(known_hosts.parent().unwrap()).unwrap();
+    fs::write(
+        &known_hosts,
+        "noel-env-[box]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEkTfD9MHTJ17XaccHgmbzbKL4eXWllTUvlX6Loix89\n",
+    )
+    .unwrap();
+    let first = run(&["-p", "--no-context-files", "--workspace", url, "hi"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let journals = fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(journals.len(), 1);
+    let journal = fs::read_to_string(&journals[0]).unwrap();
+    let record: serde_json::Value = serde_json::from_str(journal.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(
+        record,
+        serde_json::json!({
+            "type": "workspace", "adapter": "ssh", "id": "ssh://box:2222", "cwd": "/work",
+            "host": "box", "user": "me", "port": 2222,
+        })
+    );
+
+    let other = run(&[
+        "-p",
+        "-c",
+        "--workspace",
+        "ssh://me@box:2222/other",
+        "again",
+    ]);
+    assert!(!other.status.success());
+    assert!(
+        stderr(&other).contains("runs its tools in ssh://me@box:2222/work"),
+        "{}",
+        stderr(&other)
+    );
+    let same = run(&[
+        "-p",
+        "-c",
+        "--no-context-files",
+        "--workspace",
+        url,
+        "again",
+    ]);
+    assert!(same.status.success(), "{}", stderr(&same));
+    let reopened = run(&["-p", "-c", "--no-context-files", "once more"]);
+    assert!(reopened.status.success(), "{}", stderr(&reopened));
+    assert_eq!(fs::read_dir(&sessions).unwrap().count(), 1);
+
+    let forget = noel_command()
+        .current_dir(&root)
+        .env("NOEL_DIR", root.join("agent"))
+        .args(["workspace", "forget", "ssh://box:2222"])
+        .output()
+        .unwrap();
+    assert!(forget.status.success(), "{}", stderr(&forget));
+    assert_eq!(fs::read_to_string(&known_hosts).unwrap(), "");
+    let forgotten = run(&["-p", "-c", "--no-context-files", "after forgetting"]);
+    assert!(!forgotten.status.success());
+    assert!(
+        stderr(&forgotten).contains("noel workspace trust ssh://box:2222"),
+        "{}",
+        stderr(&forgotten)
+    );
+
+    // A local session keeps running here.
+    let local_root = root.join("local");
+    fs::create_dir_all(&local_root).unwrap();
+    let local = isolated_noel(&local_root, &["-p", "local"])
+        .output()
+        .unwrap();
+    assert!(local.status.success(), "{}", stderr(&local));
+    let local_known_hosts = local_root.join("agent/workspaces/known_hosts");
+    fs::create_dir_all(local_known_hosts.parent().unwrap()).unwrap();
+    fs::write(
+        &local_known_hosts,
+        "noel-env-[box]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEkTfD9MHTJ17XaccHgmbzbKL4eXWllTUvlX6Loix89\n",
+    )
+    .unwrap();
+    let moved = isolated_noel(&local_root, &["-p", "-c", "--workspace", url, "moved"])
+        .output()
+        .unwrap();
+    assert!(!moved.status.success());
+    assert!(
+        stderr(&moved).contains("runs its tools on this machine"),
+        "{}",
+        stderr(&moved)
+    );
+    let _ = fs::remove_dir_all(root);
+}

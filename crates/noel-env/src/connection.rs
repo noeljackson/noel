@@ -373,6 +373,22 @@ struct Started {
 
 type StartResult = Option<Result<Started, RemoteError>>;
 
+/// What a [`Connection`] is doing, for showing it (a noel addition).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    /// No daemon was started yet.
+    #[default]
+    Idle,
+    /// A daemon is starting.
+    Connecting,
+    /// A daemon runs and answered `hello`.
+    Connected,
+    /// The last daemon was lost, or the last start failed, for this reason; the next request starts another.
+    Lost(String),
+    /// [`Connection::close`] stopped it.
+    Closed,
+}
+
 #[derive(Default)]
 struct State {
     session: Option<Arc<Session>>,
@@ -381,6 +397,18 @@ struct State {
     sessions: u32,
     next_id: u32,
     closed: bool,
+    status: ConnectionStatus,
+}
+
+impl State {
+    /// `status`, unless the connection was closed for good.
+    fn set_status(&mut self, status: ConnectionStatus) {
+        self.status = if self.closed {
+            ConnectionStatus::Closed
+        } else {
+            status
+        };
+    }
 }
 
 struct Inner {
@@ -405,6 +433,7 @@ impl Inner {
             if lock(&session.liveness).ready {
                 state.ready = None;
             }
+            state.set_status(ConnectionStatus::Lost(error.message.clone()));
         }
     }
 
@@ -515,11 +544,17 @@ impl Connection {
         let session = {
             let mut state = lock(&self.inner.state);
             state.closed = true;
+            state.status = ConnectionStatus::Closed;
             state.session.clone()
         };
         if let Some(session) = session {
             self.inner.teardown(&session, closed());
         }
+    }
+
+    /// Whether a daemon runs, is starting, or was lost.
+    pub fn status(&self) -> ConnectionStatus {
+        lock(&self.inner.state).status.clone()
     }
 
     /// Kills one `exec` without aborting it, so it settles with the killed process's status.
@@ -595,6 +630,7 @@ impl Connection {
                 None => {
                     let (sender, receiver) = watch::channel(None);
                     state.ready = Some(receiver.clone());
+                    state.set_status(ConnectionStatus::Connecting);
                     let connection = self.clone();
                     // The start runs on its own, as upstream's promise does, so a caller that stops waiting does
                     // not stop it for the others.
@@ -613,15 +649,22 @@ impl Connection {
     /// Runs one start and publishes its outcome. A failed start is not remembered: the next request tries again.
     async fn start(&self, sender: watch::Sender<StartResult>) {
         let result = self.start_session().await;
-        if result.is_err() {
+        {
             let mut state = lock(&self.inner.state);
             let ours = sender.subscribe();
-            if state
+            let current = state
                 .ready
                 .as_ref()
-                .is_some_and(|ready| ready.same_channel(&ours))
-            {
-                state.ready = None;
+                .is_some_and(|ready| ready.same_channel(&ours));
+            match &result {
+                Err(error) if current => {
+                    state.ready = None;
+                    state.set_status(ConnectionStatus::Lost(error.message.clone()));
+                }
+                Ok(started) if current && started.session.is_live() => {
+                    state.set_status(ConnectionStatus::Connected);
+                }
+                _ => {}
             }
         }
         sender.send_replace(Some(result));

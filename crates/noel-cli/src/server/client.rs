@@ -3,7 +3,8 @@
 //! holds the server's objects:
 //!
 //! - `ls`: `noel.sessions`' directory;
-//! - `new [--cwd DIR] [--model M] [--name N] [--thinking L]`: `create`;
+//! - `new [--cwd DIR] [--model M] [--name N] [--thinking L] [--workspace URL]`:
+//!   `create`;
 //! - `send <id> <text> [--steer|--follow-up] [--request-id R]`: `noel.chat`'s
 //!   `submit`. A send that fails `unavailable` (its worker was lost, or is
 //!   starting) is sent again with the same `requestId`, which reports the
@@ -65,6 +66,11 @@ enum ClientCommand {
         /// Its thinking level.
         #[arg(long)]
         thinking: Option<String>,
+        /// Run its tools on another machine:
+        /// ssh://[user@]host[:port]/absolute/path, on a host trusted with
+        /// `noel workspace trust`.
+        #[arg(long, value_name = "URL")]
+        workspace: Option<String>,
         /// The create's id; a repeat returns the same session.
         #[arg(long)]
         request_id: Option<String>,
@@ -130,6 +136,7 @@ async fn command(command: ClientCommand) -> Result<i32> {
             model,
             name,
             thinking,
+            workspace,
             request_id,
         } => {
             let cwd = match cwd {
@@ -144,6 +151,7 @@ async fn command(command: ClientCommand) -> Result<i32> {
                 ("model", model),
                 ("name", name),
                 ("thinkingLevel", thinking),
+                ("workspace", workspace),
             ] {
                 if let Some(value) = value {
                     args[key] = json!(value);
@@ -521,7 +529,11 @@ fn describe_session(session: &Value) -> String {
         "{}  {state:7}  {:>4} msgs  last run {last:11}  {}  {}",
         session["sessionId"].as_str().unwrap_or_default(),
         session["messageCount"],
-        session["cwd"].as_str().unwrap_or_default(),
+        // Where its tools run: a workspace on another machine, else here.
+        session["workspace"]
+            .as_str()
+            .or(session["cwd"].as_str())
+            .unwrap_or_default(),
         title
     )
 }
