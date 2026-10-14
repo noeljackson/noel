@@ -155,6 +155,7 @@ async fn read_of_an_image_attaches_it_to_the_tool_result() {
                 name: "read".to_string(),
                 arguments: json!({ "path": "pixel.png" }).to_string(),
             }],
+            aborted: false,
         })
         .expect("save reply");
     let (output, is_error) = call_tool(&mut runtime, "read", json!({ "path": "pixel.png" })).await;

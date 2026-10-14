@@ -253,7 +253,9 @@ for stop in interrupt quit; do
   fi
   wait_for resume-fixture-shell
   [ "$(grep -Fc '"role":"user"' "${work_dir}/${stop}.jsonl")" = 1 ] || fail 'resumed stop drained a follow-up'
-  if grep -Fq '"role":"assistant"' "${work_dir}/${stop}.jsonl"; then fail 'resumed stop retried generation'; fi
+  # What the stopped reply had streamed is kept as an aborted reply; no
+  # reply may have completed.
+  if grep -F '"role":"assistant"' "${work_dir}/${stop}.jsonl" | grep -Fvq '"aborted":true'; then fail 'resumed stop retried generation'; fi
 done
 # Deterministic offline provider-construction failure: attempt once and stay
 # idle, preserving both the saved prompt and follow-ups (never a paid API).

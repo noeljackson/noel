@@ -116,6 +116,15 @@ impl OutputAccumulator {
         self.tail_truncation().content
     }
 
+    /// Whether the output so far exceeds the limits, so [`tail`] leaves its
+    /// beginning out.
+    ///
+    /// [`tail`]: OutputAccumulator::tail
+    pub fn truncated(&self) -> bool {
+        self.completed_lines + usize::from(self.has_open_line) > DEFAULT_MAX_LINES
+            || self.total_decoded_bytes > DEFAULT_MAX_BYTES
+    }
+
     fn tail_truncation(&self) -> Truncation {
         let text = match self.tail.find('\n') {
             Some(newline) if !self.tail_starts_at_line_boundary => &self.tail[newline + 1..],
