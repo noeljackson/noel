@@ -37,7 +37,7 @@ the TUI, print mode, RPC mode and the server alike.
 - **The journal.** A session is a JSONL journal, `<session-id>.jsonl`. Each record is written with its newline in one write, and a torn final line is truncated when a writer opens the file. Listing skips files it cannot read.
 - **The lock.** One process writes a session at a time. It holds `File::try_lock` on `<id>.jsonl.lock`; the lock is on that file because compaction replaces the journal itself. A second writer waits up to 5 s, then exits with code 75. Listing, forking and import read without the lock.
 - **Runs.** Each run's start (`runId`, `requestId`) is saved with its prompt and fsynced before the prompt is acknowledged. Its end (completed, failed or aborted) is saved before the run is reported settled. A run with a start and no end is *interrupted*.
-- **The queue.** Queued steers and follow-ups are saved with the session, and each enqueue is saved before it is acknowledged.
+- **The queue.** Queued steers and follow-ups are saved with the session, and each enqueue is saved before it is acknowledged. A queued submission with a `requestId` is saved with its identity `{submission_id, request_id, mode}` (the queue record's `items`); the user message that places it into a run names it (`placed`), so it leaves the queue in the same record; a queue record that withdraws it names it too (`withdrawn`). All three fields are additive: older journals lack them and load as before, and a submission without a `requestId` gets a new `submissionId` each time the session opens, since nothing can ask about it after its process ends.
 
 **Decided:** durable partial output (§4.2).
 
@@ -45,25 +45,26 @@ the TUI, print mode, RPC mode and the server alike.
 
 ### 3.1 Submissions
 
-**Built:** a prompt carries an optional `requestId`. A prompt that repeats a `requestId` gets the run the first one started, and nothing is sent again.
-
-**Decided (follows Durable, `durable/docs/spec.md:2329-2360`):**
-- **Every submission can carry a `requestId`:** a prompt, a steer or a follow-up. A repeat returns the first submission and writes nothing. A `requestId` reused for a different kind of submission is refused. Deduplication happens within one session, before any write.
+**Built** in the session controller (§9), following Durable (`durable/docs/spec.md:2329-2360`):
+- **Every submission can carry a `requestId`:** a prompt, a steer or a follow-up. A repeat returns the first submission and writes nothing. A `requestId` reused for a different kind of submission is refused. Deduplication happens within one session, before any write, and holds across restarts: a run's start saves its `requestId` and kind (`kind`, left out for a prompt), and a queued submission's is saved as §2 says.
 - **When the session is busy, a submission says what to do:**
   - `reject` refuses it, and writes nothing;
   - `steer` queues it for the next boundary inside the run, after the current tool round;
   - `followUp` queues it for when the run would answer.
-- **Each queued submission has its own id.** A submission ends either *done*, when it was placed into a run, or *unanswered*, with a reason.
+- **Each queued submission has its own id.** A submission that starts a run is named by the run's id. A submission ends either *done*, when the run it was placed into completed, or *unanswered*: withdrawn, or placed into a run that failed or was aborted.
+- **While no run is active,** a prompt starts one, and what is still queued joins it: steering in its first round, follow-ups after it would answer.
+
+**RPC mode** keeps its wire: only a `prompt`'s `requestId` is read (a repeat replies `started` or `handled` with the run's id, as before), a queued `prompt` cannot carry one, and replies carry no submission ids.
 
 ### 3.2 Withdraw
 
-**Decided (Durable `spec.md:2355-2357`).** `withdraw(submissionId)` removes a submission that is still queued, and reports it unanswered with reason `aborted`. For an input already placed into a run it reports `already_placed`; for a submission that has ended it reports `settled`.
+**Built** in the session controller (Durable `spec.md:2355-2357`). `withdraw(submissionId)` removes a submission that is still queued, and reports it unanswered with reason `aborted`. For an input already placed into a run that has not ended (running or interrupted) it reports `already_placed`; for a submission that has ended it reports `settled`. RPC mode has no withdraw command.
 
 ### 3.3 Abort
 
-**Decided (2026-10-14).** Each mode follows the upstream it mirrors:
-- **Mode 2** (server, worker, client) follows Durable (`spec.md:2357-2358`): aborting a run also withdraws every queued steer and follow-up of that session. Each is reported unanswered with reason `aborted`, and the next prompt starts with an empty queue.
-- **RPC mode, the TUI and print mode** follow published upstream pi: abort stops the run and keeps the queue. Upstream's `Agent.abort()` only cancels the active run, and its queues are cleared only by `reset()` (`agent/src/agent.ts:341-367`). The RPC goldens guard this.
+**Decided (2026-10-14); built** in the session controller as a policy each caller chooses (`AbortPolicy`). Each mode follows the upstream it mirrors:
+- **Mode 2** (server, worker, client) follows Durable (`spec.md:2357-2358`): aborting a run also withdraws every queued steer and follow-up of that session. Each is reported unanswered with reason `aborted`, and the next prompt starts with an empty queue. An abort with no run active withdraws them too. (`WithdrawQueue`, for the worker.)
+- **RPC mode, the TUI and print mode** follow published upstream pi: abort stops the run and keeps the queue. Upstream's `Agent.abort()` only cancels the active run, and its queues are cleared only by `reset()` (`agent/src/agent.ts:341-367`). The RPC goldens guard this. (`KeepQueue`, which RPC mode uses.)
 
 **Built, kept:**
 - An abort may name `expectedRunId`, and then changes nothing unless that run is the active one.
@@ -222,7 +223,7 @@ a submission belongs to this session.
 - RPC mode keeps upstream pi's record format and its abort rule (§3.3), and its goldens (`crates/noel-cli/tests/rpc_parity.rs`) guard both.
 - §4.2 applies to every mode, so RPC mode saves partial output and aborted replies too. Upstream pi also keeps aborted replies.
 
-**Proposed:** one session controller, extracted from `crates/noel-cli/src/rpc.rs`, drives runs for RPC mode and for the worker.
+**Built:** one session controller (`crates/noel-core/src/controller.rs`) drives runs. It owns, for one open session, the active run with its cancellation and retry backoff, the queue, submissions (§3.1), withdraw (§3.2), abort with a policy per caller (§3.3), resuming an interrupted run, compaction, and changes to the model and thinking level, which wait for no run to be active. It reports what happens as events, in order. RPC mode (`crates/noel-cli/src/rpc.rs`) is a thin adapter over it: commands in, records out, with abort keeping the queue; the Mode 2 worker will be the second caller. The TUI still drives its own loop until its remote backend (PR 6) moves it.
 
 ## 10. Workspaces
 

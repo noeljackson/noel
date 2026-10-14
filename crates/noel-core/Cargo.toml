@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+getrandom.workspace = true
 noel-ai = { path = "../noel-ai" }
 noel-agent = { path = "../noel-agent" }
 noel-config = { path = "../noel-config" }

@@ -1048,6 +1048,34 @@ prompt is applied once, a call that is not replay-safe runs at most once, a
 replay-safe one at least once, and a model request cut off by a stop is sent
 (and billed) again.
 
+### Submissions and the Session Controller
+
+One session controller (`crates/noel-core/src/controller.rs`, `docs/spec.md`
+§3 and §9) takes a session's submissions, as Durable's harness does
+(`durable/docs/spec.md:2329-2360`): a `requestId` on a prompt, steer or
+follow-up, `whenBusy`, an id per queued submission, `withdraw`, and an abort
+that keeps or withdraws the queue as the caller chooses. These parts differ:
+
+- The kinds a `requestId` names are the client's verbs: prompt, steer and
+  follow-up. Durable's are its two submission types, input and write; noel has
+  no writes.
+- A submission that starts a run is named by the run's id, and how it ended is
+  the run's end. Durable keeps a submission record of its own, with an answer
+  entry or a reason.
+- While no run is active, a prompt starts a run even with submissions queued,
+  and they join it: steering in its first round, follow-ups when it would
+  answer. Durable queues the new input behind them and places all of them at
+  one boundary.
+- A queued submission without a `requestId` keeps its id only while the
+  process that queued it runs. RPC mode reads no `requestId` but a prompt's
+  and reports no submission ids, so its journal records are the ones it wrote
+  before.
+
+Reason: the controller extends noel's run engine and journal rather than
+replacing them, so RPC mode keeps its records and journals (its goldens are
+unchanged), and Mode 2 gets Durable's exactly-once submissions without a
+second record of what the journal already says.
+
 ### Named noel, With Its State in `~/.noel`
 
 The port is named noel. The binary is `noel`, its state directory is

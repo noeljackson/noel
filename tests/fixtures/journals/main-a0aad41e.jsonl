@@ -1,0 +1,8 @@
+{"type":"started","session_id":"main-journal","cwd":"/"}
+{"type":"active_model","model":{"provider":"faux","id":"script"}}
+{"type":"message","message":{"role":"user","content":"first","media":[],"tool_call_id":null,"tool_name":null,"tool_calls":[]},"run":{"id":"a3418496-a8d4-43c6-b9e4-5ca2d3d77be6","request_id":"m-1"}}
+{"type":"message","message":{"role":"assistant","content":"first answer","media":[],"tool_call_id":null,"tool_name":null,"tool_calls":[]}}
+{"type":"run_finished","run_id":"a3418496-a8d4-43c6-b9e4-5ca2d3d77be6","status":"completed"}
+{"type":"message","message":{"role":"user","content":"second","media":[],"tool_call_id":null,"tool_name":null,"tool_calls":[]},"run":{"id":"0b0deea6-d15a-4d46-9766-b33ddf9c3013","request_id":"m-2"}}
+{"type":"queued_messages_snapshot","messages":["look again"],"steering":1}
+{"type":"queued_messages_snapshot","messages":["look again","then summarize"],"steering":1}
