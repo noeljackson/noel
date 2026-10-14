@@ -27,7 +27,7 @@
       "service.?unavailable",
       "server.?error",
       "internal.?error",
-      "provider.?returned.?error",
+      "provider.?returned.?(?:an.?)?error",
       "exceeded request buffer limit while retrying upstream",
       "network.?error",
       "connection.?error",
