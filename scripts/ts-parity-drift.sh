@@ -26,9 +26,9 @@ mkdir -p "${fresh_fixtures_dir}" "${fixtures_dir}"
   git -C /ts-reference rev-parse HEAD > "${out_dir}/reference-sha"
 reference_sha="$(cat "${out_dir}/reference-sha")"
 
-# chord-delta.json is pinned (CHORD_REFERENCE_REF in the Makefile) rather than
-# made from the tracking ref, so its drift is the packages/chord commits on the
-# tracking ref after the pin.
+# chord-delta.json and chord-link.json are pinned (CHORD_REFERENCE_REF in the
+# Makefile) rather than made from the tracking ref, so their drift is the
+# packages/chord commits on the tracking ref after the pin.
 chord_file="${out_dir}/chord-commits"
 chord_pin="$("${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
   git -C /chord-reference rev-parse HEAD)"
@@ -54,11 +54,11 @@ if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file}" ]; then
     printf -- '- Diff: `%s`\n\n' "${diff_file}"
     if [ -s "${chord_file}" ]; then
       printf '## Chord pin\n\n'
-      printf '`chord-delta.json` is pinned to `%s` (`CHORD_REFERENCE_REF` in the Makefile). `packages/chord` changed after it on the tracked reference:\n\n' "${chord_pin}"
+      printf '`chord-delta.json` and `chord-link.json` are pinned to `%s` (`CHORD_REFERENCE_REF` in the Makefile). `packages/chord` changed after it on the tracked reference:\n\n' "${chord_pin}"
       printf '```text\n'
       cat "${chord_file}"
       printf '```\n\n'
-      printf 'Move the pin to the newest of these commits at which `packages/chord` builds (the image build checks), regenerate with `make ts-parity-fixtures`, and bring `crates/noel-chord` level with the new fixture.\n\n'
+      printf 'Move the pin to the newest of these commits at which `packages/chord` builds (the image build checks), regenerate with `make ts-parity-chord`, bring `crates/noel-chord` level with the new fixtures, and run `make chord-interop`.\n\n'
     fi
     printf '## Constraints\n\n'
     printf -- '- Do not run npm on the host.\n'

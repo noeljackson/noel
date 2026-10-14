@@ -6,9 +6,9 @@ RUST_CI_IMAGE ?= noel-rust-ci:1.99.0
 TS_REFERENCE_REPO ?= https://github.com/earendil-works/pi.git
 TS_REFERENCE_REF ?= main
 TS_PARITY_TRACKING_REF ?= main
-# chord-delta.json is pinned to this upstream commit, whatever TS_REFERENCE_REF
-# is. ts-parity-drift reports packages/chord commits on the tracking ref that
-# came after it; move the pin here and regenerate.
+# chord-delta.json and chord-link.json are pinned to this upstream commit,
+# whatever TS_REFERENCE_REF is. ts-parity-drift reports packages/chord commits
+# on the tracking ref that came after it; move the pin here and regenerate.
 CHORD_REFERENCE_REF ?= 1692bba6347a287ab0f3cb554a4430fafffc474b
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
@@ -21,7 +21,7 @@ INSTALL_BUILD_SCRIPT := scripts/install-build.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-update ts-parity-drift ts-parity-agent smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-chord ts-parity-update ts-parity-drift ts-parity-agent chord-interop smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -49,6 +49,8 @@ help:
 		'  docker-e2e   Build and run Dockerized tmux TTY e2e' \
 		'  parity-check Run committed TS parity checks and drift detection' \
 		'  ts-parity-fixtures  Generate TS reference fixtures inside Docker' \
+		'  ts-parity-chord     Regenerate only the Chord goldens inside Docker' \
+		'  chord-interop       Run noel-chord against upstream Chord over WebSockets' \
 		'  ts-parity-update    Refresh fixtures from moving TS reference inside Docker' \
 		'  ts-parity-drift     Check moving TS reference for fixture drift' \
 		'  ts-parity-agent     Check drift and optionally dispatch NOEL_PARITY_AGENT_COMMAND' \
@@ -149,8 +151,18 @@ ts-parity-fixtures: ts-parity-build
 	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
 	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE)
 
+ts-parity-chord: ts-parity-build
+	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
+	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE) \
+		sh -c 'for fixture in /ts-parity/chord-*-fixture.ts; do npx tsx "$$fixture" /fixtures || exit 1; done'
+
 ts-parity-update:
 	$(MAKE) ts-parity-fixtures TS_REFERENCE_REF="$(TS_PARITY_TRACKING_REF)"
+
+# Upstream's client and server hosts (in the ts-parity image) against
+# noel-chord's examples, over WebSockets on Unix sockets.
+chord-interop: ts-parity-build
+	CARGO="$(CARGO)" DOCKER="$(DOCKER)" TS_PARITY_IMAGE="$(TS_PARITY_IMAGE)" scripts/chord-interop.sh
 
 ts-parity-drift:
 	scripts/ts-parity-drift.sh
