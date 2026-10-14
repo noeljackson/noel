@@ -149,7 +149,7 @@ fn random_characters(count: usize) -> String {
 }
 
 /// A random version 4 UUID, as Node's `randomUUID()` writes it.
-fn random_uuid() -> String {
+pub(crate) fn random_uuid() -> String {
     let high = RandomState::new().build_hasher().finish();
     let low = RandomState::new().build_hasher().finish();
     let mut bytes = [0u8; 16];

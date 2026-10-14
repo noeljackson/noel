@@ -35,6 +35,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "openai-responses-tool-id.json",
     "openai-responses-tools.json",
     "openrouter-kimi.json",
+    "pi-env-ssh.json",
     "pi-env.json",
     "rpc-protocol.json",
     "session-export.json",
@@ -68,6 +69,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "openai-tools-fixture.ts",
     "openrouter-fixture.ts",
     "pi-env-fixture.ts",
+    "pi-env-ssh-fixture.ts",
     "rpc-protocol-fixture.ts",
     "session-export-fixture.ts",
     "settings-fixture.ts",
@@ -219,6 +221,7 @@ fn every_script_output_is_committed() {
             fixture_set(&["openrouter-kimi.json"]),
         ),
         ("pi-env-fixture.ts", fixture_set(&["pi-env.json"])),
+        ("pi-env-ssh-fixture.ts", fixture_set(&["pi-env-ssh.json"])),
         (
             "rpc-protocol-fixture.ts",
             fixture_set(&["rpc-protocol.json"]),
@@ -254,12 +257,16 @@ fn every_script_output_is_committed() {
 }
 
 /// The upstream ref a fixture records: `main`, except for Chord's goldens,
-/// `LocalEnv`'s and the pi-env daemon's, which are pinned to
+/// `LocalEnv`'s and pi-env's (daemon and SSH deployment), which are pinned to
 /// `CHORD_REFERENCE_REF` in the Makefile.
 fn expected_ref(fixture_name: &str) -> String {
     if !matches!(
         fixture_name,
-        "chord-delta.json" | "chord-link.json" | "local-env.json" | "pi-env.json"
+        "chord-delta.json"
+            | "chord-link.json"
+            | "local-env.json"
+            | "pi-env.json"
+            | "pi-env-ssh.json"
     ) {
         return "main".to_string();
     }
@@ -355,6 +362,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         ("openai-responses-tool-id.json", "crates/noel-ai/src/lib.rs"),
         ("openai-responses-tools.json", "crates/noel-ai/src/lib.rs"),
         ("openrouter-kimi.json", "crates/noel-ai/src/lib.rs"),
+        (
+            "pi-env-ssh.json",
+            "crates/noel-env-daemon/tests/ssh_deploy.rs",
+        ),
         (
             "pi-env.json",
             "crates/noel-env-daemon/tests/pi_env_golden.rs",

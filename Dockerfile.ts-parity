@@ -76,6 +76,6 @@ FROM reference
 COPY --from=pi-env-daemon /pi-env/pi-env /usr/local/bin/pi-env
 COPY scripts/ts-parity /ts-parity
 
-# pi-env-fixture.ts loads upstream's packages from their sources (`source`
-# export condition) with Node's own type stripping.
-CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do case \"$fixture\" in */pi-env-fixture.ts) node --conditions=source \"$fixture\" /fixtures ;; *) npx tsx \"$fixture\" /fixtures ;; esac; done"]
+# pi-env-fixture.ts and pi-env-ssh-fixture.ts load upstream's packages from
+# their sources (`source` export condition) with Node's own type stripping.
+CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do case \"$fixture\" in */pi-env-fixture.ts|*/pi-env-ssh-fixture.ts) node --conditions=source \"$fixture\" /fixtures ;; *) npx tsx \"$fixture\" /fixtures ;; esac; done"]
