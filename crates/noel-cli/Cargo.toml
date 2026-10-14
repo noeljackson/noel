@@ -22,6 +22,7 @@ noel-ai = { path = "../noel-ai" }
 noel-chord = { path = "../noel-chord" }
 noel-config = { path = "../noel-config" }
 noel-core = { path = "../noel-core" }
+noel-env = { path = "../noel-env" }
 noel-tui = { path = "../noel-tui" }
 ratatui.workspace = true
 reqwest.workspace = true

@@ -586,3 +586,43 @@ fn a_server_of_another_build_shuts_down_the_old_worker_once_its_run_settles() {
     assert_ne!(record["pid"].as_u64().unwrap() as u32, worker);
     assert_eq!(record["generation"], 2);
 }
+
+/// `noel.sessions.create` with a workspace (spec §10): refused, naming the
+/// trust command, while noel does not trust the host; once it does, the
+/// session is made with its `workspace` record and listed with its URL.
+/// Nothing connects: no prompt is sent.
+#[test]
+fn a_session_is_created_in_a_workspace_only_on_a_trusted_host() {
+    let mode2 = Mode2::new(
+        "ws",
+        json!([]),
+        json!({"idleExitMs": 2500, "workerIdleExitMs": 1500}),
+    );
+    let url = "ssh://me@box:2222/work";
+    let refused = mode2.noel(&["client", "new", "--workspace", url, "--request-id", "ws-1"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("noel workspace trust ssh://box:2222"),
+        "{stderr}"
+    );
+    let known_hosts = mode2.root.join("agent/workspaces/known_hosts");
+    fs::create_dir_all(known_hosts.parent().unwrap()).unwrap();
+    fs::write(
+        &known_hosts,
+        "noel-env-[box]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEkTfD9MHTJ17XaccHgmbzbKL4eXWllTUvlX6Loix89\n",
+    )
+    .unwrap();
+    let session = mode2
+        .client(&["new", "--workspace", url, "--request-id", "ws-2"])
+        .trim()
+        .to_owned();
+    let journal = mode2.journal(&session);
+    let record: Value = serde_json::from_str(journal.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(record["type"], "workspace");
+    assert_eq!(record["id"], "ssh://box:2222");
+    assert_eq!(record["cwd"], "/work");
+    let listed: Value = serde_json::from_str(&mode2.client(&["ls", "--json"])).unwrap();
+    assert_eq!(listed["sessions"][0]["workspace"], url);
+    assert!(mode2.client(&["ls"]).contains(url));
+}

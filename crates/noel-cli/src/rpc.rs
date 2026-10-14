@@ -540,6 +540,7 @@ fn new_session(controller: &mut SessionController<RpcHost>, parent_session: Opti
             session.active_model = current.active_model.clone();
             session.active_thinking_level = current.active_thinking_level.clone();
             session.active_account = current.active_account.clone();
+            session.workspace = current.workspace.clone();
             runtime.replace_session(session, None);
         }
         Ok(Some(Data::Cancelled { cancelled: false }))

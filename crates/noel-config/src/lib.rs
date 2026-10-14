@@ -2543,7 +2543,7 @@ fn discovered_prompt_file(
 
 /// Context file names, first match wins: one file per directory.
 /// `AGENTS.override.md` replaces only its own directory's file.
-const CONTEXT_FILE_NAMES: [&str; 5] = [
+pub const CONTEXT_FILE_NAMES: [&str; 5] = [
     "AGENTS.override.md",
     "AGENTS.md",
     "AGENTS.MD",

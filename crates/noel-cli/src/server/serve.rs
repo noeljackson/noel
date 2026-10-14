@@ -967,8 +967,10 @@ async fn blocking(
 }
 
 impl Sessions {
-    /// `create({requestId, cwd, name?, model?, thinkingLevel?})`: a session
-    /// named by its `requestId`, so a repeat returns it and writes nothing.
+    /// `create({requestId, cwd, name?, model?, thinkingLevel?,
+    /// workspace?})`: a session named by its `requestId`, so a repeat returns
+    /// it and writes nothing. `workspace` (`ssh://…`, as `--workspace`) runs
+    /// its tools on another machine, whose host noel must trust already.
     fn create(&self, args: &Value) -> Result<Value, ChordError> {
         let text = |key: &str| args.get(key).and_then(Value::as_str);
         let request_id = text("requestId").unwrap_or_default();
@@ -979,6 +981,12 @@ impl Sessions {
                 format!("{} is not an absolute path to a directory", cwd.display()),
             ));
         }
+        let workspace = text("workspace")
+            .map(|url| {
+                crate::workspace::from_flag(url, &self.config.paths.agent_dir)
+                    .map_err(|error| ChordError::invalid("workspace", error.to_string()))
+            })
+            .transpose()?;
         let model = text("model")
             .map(|reference| {
                 super::worker::model_reference(&self.config, reference, self.offline).ok_or_else(
@@ -999,8 +1007,13 @@ impl Sessions {
             return Ok(json!({"sessionId": id, "created": false}));
         }
         let failed = |error: &dyn std::fmt::Display| ChordError::unavailable(error.to_string());
-        let (store, state) = SessionStore::create_with_id(&self.session_dir, cwd, &id)
-            .map_err(|error| failed(&error))?;
+        let (store, state) = match workspace {
+            Some(workspace) => {
+                SessionStore::create_in_workspace(&self.session_dir, cwd, &id, workspace)
+            }
+            None => SessionStore::create_with_id(&self.session_dir, cwd, &id),
+        }
+        .map_err(|error| failed(&error))?;
         let mut runtime = Runtime::with_store(
             state,
             ReloadableSystems::from_config(&self.config, 1),
@@ -1142,6 +1155,9 @@ fn directory_entry(state: &SessionState, modified: SystemTime) -> Value {
     });
     if let Some(name) = &state.name {
         entry["name"] = json!(name);
+    }
+    if let Some(workspace) = &state.workspace {
+        entry["workspace"] = json!(crate::workspace::describe(workspace));
     }
     if let Some(prompt) = state
         .messages
