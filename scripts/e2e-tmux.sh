@@ -1142,5 +1142,6 @@ sleep 0.3
 "${repo_root}/scripts/e2e-failover.sh"
 "${repo_root}/scripts/e2e-signals.sh"
 "${repo_root}/scripts/e2e-import.sh"
+"${repo_root}/scripts/e2e-attach.sh"
 
 echo "tmux e2e passed: ${first_session}"
