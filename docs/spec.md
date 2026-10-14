@@ -298,12 +298,21 @@ Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-regi
 - **Proof:** goldens recorded from upstream's `RemoteExecutionEnv` and daemon at a pinned commit, plus interop tests that connect noel's client to upstream's daemon and upstream's client to noel's daemon.
 - **The Codewire adapter** starts `noel-env serve` inside a Sandbox through Codewire's exec API. There is one remote-workspace protocol; SSH, Codewire or another VM system only changes how the daemon is started.
 
+**Built:** the daemon, `noel-env serve --token <hex>` (`crates/noel-env-daemon`, binary `noel-env`), a port of upstream's `env/daemon` at the pinned commit:
+- **the wire** is `pi-env` protocol 1 unchanged (`env/docs/protocol.md`): the `PI-ENV <token>` sync line, the frames, every operation (file operations and handles, `listFiles`, `exec` with output windows and spill files, `pty` with `ptyWrite`, `ptyResize` and `ptyForeground`, `watch`), cancellation, the scheduling of replies before bulk output, and liveness (a ping every 5 seconds; everything it started is killed and it exits after 30 seconds of silence or when stdin ends). `hello` reports noel's version, as `noel-env --version` does. The frame codec is `noel_env::frame`, for the client to share;
+- **its behaviour** is upstream's daemon's (`env/docs/semantics.md`): Node's file rules, each command in a new session killed as a group, output decoded per stream, Durable's `NodeFileWatcher` running next to the files;
+- **platforms:** Linux and macOS. Upstream's Windows and Android paths are not ported;
+- **size:** `make env-daemon` builds it as upstream builds `pi-env` (LTO, one codegen unit, no symbols) in its own profile, so the other binaries keep theirs. Built static for Linux x86-64 (musl), as upstream ships its Linux daemons, it is 2.2 MB, against 2.4 MB for upstream's;
+- **proof:** `tests/fixtures/ts-parity/pi-env.json` records upstream's `Connection`, `RemoteExecutionEnv` and `openTerminal` driving upstream's daemon through a tap (`make ts-parity-pi-env`); `crates/noel-env-daemon/tests/pi_env_golden.rs` sends the recorded client frames to `noel-env serve` and compares its answers. `make env-interop` runs upstream's client tests against it: Durable's env conformance suite over `RemoteExecutionEnv` and `LocalExecutionEnv`, and pi-env's `remote`, `differential` and `terminal` tests, 78 of 78 passing, as against upstream's daemon.
+
+Where it differs from upstream's daemon is listed in `docs/rust-rewrite/non-parity-register.md` ("noel-env Daemon"). The client, SSH deployment and the session's `Workspace` record come next.
+
 ## 11. Compatibility and goldens
 
 **Decided:** compatibility is proved by goldens recorded from upstream, as the RPC goldens are.
 - **No server or client to record.** Upstream publishes no `pi server` or `pi client`, so the Chord goldens drive upstream's public `packages/chord` with noel's contracts, covering delta and canonical-JSON vectors and the link frames.
 - **Interop:** a test in Docker connects an upstream Chord client to a noel server, and the reverse (`make chord-interop`). **Built**, including upstream's client holding `noel.chat` on `noel server` through its relay to a worker, following the view's snapshot and ops.
-- **pi-env goldens** come from upstream's `RemoteExecutionEnv` talking to its own daemon.
+- **pi-env goldens** come from upstream's `RemoteExecutionEnv` talking to its own daemon. **Built** for the daemon (`pi-env.json`), with interop from upstream's client to `noel-env serve` (`make env-interop`); noel's client against upstream's daemon comes with the client.
 - **`LocalEnv`** is checked against the conformance results of upstream's `NodeExecutionEnv` (**Built**: `local-env.json`).
 
 ## 12. Deviations from upstream

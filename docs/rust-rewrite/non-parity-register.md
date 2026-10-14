@@ -1462,3 +1462,45 @@ Reason: the interface is upstream's so that the remote workspace (pi-env
 protocol 1) can follow without changing the tools. Watching waits for the
 features that need it. The additions keep the bash tool's output exactly as
 it was, and the rest are Rust's type system and noel being Unix-only.
+
+### noel-env Daemon
+
+`noel-env serve` (`crates/noel-env-daemon`) is a port of upstream's pi-env
+daemon (`packages/env/daemon`) at the pinned commit and speaks pi-env
+protocol 1 unchanged, so upstream's client and noel's can use either daemon.
+It answers upstream's client as upstream's daemon does in every recorded
+scenario of `pi-env.json`, and passes the same 78 upstream client tests
+(`make env-interop`). These parts differ:
+
+- **Name and version.** The binary is `noel-env`: `noel-env --version` prints
+  `noel-env <version>` and the usage text names `noel-env`. `hello.version`
+  is noel's version (`0.3.0`), not the npm package version upstream's daemon
+  ships with. The `PI-ENV <token>` sync line, the frames and every other
+  `hello` field are upstream's.
+- **Linux and macOS only.** Upstream's Windows paths (job objects, libuv's
+  program search, the `=C:` drive working directories, legacy WSL `bash.exe`
+  reading the command on stdin, `pty` failing with `ENOTSUP`) and its Android
+  (Termux) paths (`$PREFIX/tmp` as the temporary directory, Android's
+  unreliable file systems for watching, process names) are not ported.
+  `hello.driveCwds` is always `{}` and `hello.separator` is `/`.
+- **UTF-8 decoding.** Command output and line scans decode with noel-env's
+  `StreamDecoder` and `LineScanner` (Rust's lossy rule, which replaces
+  maximal subparts as WHATWG does) instead of `encoding_rs`, with the same
+  results. A `scanLines` range whose line numbers are above 2^53 - 1 fails
+  with `EINVAL`, as noel-env's `LineScanner` rejects them; upstream scans
+  such a range, which a JavaScript client cannot send exactly.
+- **Build profile.** Upstream's release profile (LTO, one codegen unit,
+  stripped) is `profile.env-daemon` (`make env-daemon`), so the noel CLI's
+  release build is unchanged.
+
+The goldens compare what does not depend on the machine or on timing:
+`hello`'s description of the machine, process ids, device and inode numbers,
+modification times and the size of a directory are placeholders; `readdir`
+entries are compared by name, not in the file system's order; a request's
+`output` events are compared merged per stream, and `change` events by the
+paths they report, since how they are split depends on timing.
+
+Reason: noel ships its own daemon, versioned with noel; noel runs on Linux
+and macOS; and reusing noel-env's decoder and line scanner keeps one
+implementation of each, checked against the same goldens, and one dependency
+fewer.
