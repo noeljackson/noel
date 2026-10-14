@@ -615,6 +615,24 @@ impl Message {
         })
     }
 
+    /// A tool call's result as a run reports it, before the session that
+    /// saved it is read again.
+    pub fn tool_result(
+        call: &ChatToolCall,
+        output: &str,
+        images: &[MediaInput],
+        is_error: bool,
+    ) -> Self {
+        Message::ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: Content::text_and_images(output, images),
+            is_error,
+            duration_ms: None,
+            timestamp: None,
+        }
+    }
+
     /// A message as the session saved it. The journal keeps no timestamps,
     /// usage, model or timings, so those fields are left out.
     pub fn saved(message: &ConversationMessage, session: &SessionState) -> Self {

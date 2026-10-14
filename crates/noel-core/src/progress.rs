@@ -373,7 +373,7 @@ impl ToolProgress {
 
 /// The result of a tool call that a stop cut off (upstream Durable's
 /// `interrupted` result): the output it had saved, then a block saying so.
-pub(crate) fn interrupted_output(tool: &str, saved: Option<&crate::SavedToolOutput>) -> String {
+pub fn interrupted_output(tool: &str, saved: Option<&crate::SavedToolOutput>) -> String {
     let mut notes = Vec::new();
     if saved.is_some_and(|saved| saved.truncated) {
         notes.push("[warn] Output truncated to its end".to_owned());
@@ -588,6 +588,86 @@ mod tests {
             .record_message(message(MessageRole::Assistant, "Again and again"))
             .unwrap();
         assert_eq!(SessionStore::read(store.path()).unwrap().partial, None);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn an_observer_hears_each_saved_record_after_it_is_saved_and_nothing_else() {
+        let (store, _, base) = store("observer");
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        let path = store.path().to_path_buf();
+        let store = store.observe_progress(std::sync::Arc::new(move |saved| {
+            // Each record is in the journal before the observer hears it.
+            let state = SessionStore::read(&path).unwrap();
+            let committed = match saved {
+                crate::SavedProgress::Partial { .. } => state.partial.is_some(),
+                crate::SavedProgress::ToolOutput { call_id, .. } => {
+                    state.tool_outputs.contains_key(call_id)
+                }
+            };
+            sink.lock().unwrap().push((saved.clone(), committed));
+        }));
+        let start = Instant::now();
+        let mut reply = ReplyProgress::new(Some(store.clone()), Some("run-1".into()), INTERVAL);
+        reply.observe(&text("Hel"), start);
+        // Waiting for the interval: not saved, so not heard.
+        assert!(reply.observe(&text("lo"), start + ms(10)));
+        assert_eq!(heard.lock().unwrap().len(), 1);
+        reply.save_due(start + INTERVAL);
+        let mut tool = ToolProgress::new(
+            Some(store.clone()),
+            Some("run-1".into()),
+            "call-1".into(),
+            INTERVAL,
+        );
+        tool.observe(
+            OutputSoFar {
+                text: "out",
+                truncated: false,
+            },
+            start,
+        );
+        // Other records are not progress.
+        store
+            .record_message(message(MessageRole::Assistant, "Hello"))
+            .unwrap();
+        let heard = heard.lock().unwrap().clone();
+        assert_eq!(
+            heard,
+            [
+                (
+                    crate::SavedProgress::Partial {
+                        run_id: Some("run-1".into()),
+                        attempt: 1,
+                        text: "Hel".into(),
+                        thinking: String::new(),
+                        append: false,
+                    },
+                    true
+                ),
+                (
+                    crate::SavedProgress::Partial {
+                        run_id: Some("run-1".into()),
+                        attempt: 1,
+                        text: "lo".into(),
+                        thinking: String::new(),
+                        append: true,
+                    },
+                    true
+                ),
+                (
+                    crate::SavedProgress::ToolOutput {
+                        run_id: Some("run-1".into()),
+                        call_id: "call-1".into(),
+                        output: "out".into(),
+                        truncated: false,
+                        append: false,
+                    },
+                    true
+                ),
+            ]
+        );
         fs::remove_dir_all(base).unwrap();
     }
 

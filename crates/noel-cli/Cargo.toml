@@ -16,8 +16,10 @@ clap.workspace = true
 crossterm.workspace = true
 getrandom.workspace = true
 image.workspace = true
+libc = "=0.2.186"
 nix.workspace = true
 noel-ai = { path = "../noel-ai" }
+noel-chord = { path = "../noel-chord" }
 noel-config = { path = "../noel-config" }
 noel-core = { path = "../noel-core" }
 noel-tui = { path = "../noel-tui" }
@@ -27,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 time = { workspace = true, features = ["formatting", "parsing"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 unicode-segmentation = "1.13.2"
 unicode-width = "0.2.2"

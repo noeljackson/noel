@@ -6,7 +6,10 @@
 #      subscribes, calls `add`, and sees the snapshot, then ops;
 #   2. the same client holds and is killed: the server log shows its hold
 #      released and its link closed;
-#   3. noel's chord-client does the same against upstream's server host.
+#   3. noel's chord-client does the same against upstream's server host;
+#   4. upstream's client host holds `noel.chat` on `noel server` (relayed to
+#      the session's worker), sees the view's snapshot, then the ops that a
+#      `noel client send` makes.
 #
 # The noel side runs on the host and the upstream side in Docker, sharing a
 # socket directory; the container runs as the caller's uid, which the device
@@ -25,14 +28,31 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/chord-interop.XXXXXX")"
 chmod 700 "${work}"
 server_pid=""
 container="chord-interop-$$"
+noel_bin="${target_dir}/debug/noel"
+noel_env=(
+  HOME="${work}/m2/home" NOEL_DIR="${work}/m2/agent" NOEL_OFFLINE=1
+  NOEL_FAUX_SCRIPT="${work}/m2/script.json" NOEL_FAUX_SCRIPT_LOG="${work}/m2/requests.jsonl"
+  NOEL_RUNTIME_DIR="${work}/run"
+)
+# Kills the noel server and workers step 4 started, by their records.
+stop_noel() {
+  local record pid
+  for record in "${work}/run/server.json" "${work}/run/workers/"*.json; do
+    [ -f "${record}" ] || continue
+    pid="$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "${record}")"
+    if [ -n "${pid}" ]; then kill -9 "${pid}" 2>/dev/null || true; fi
+  done
+}
 cleanup() {
   if [ -n "${server_pid}" ]; then kill "${server_pid}" 2>/dev/null || true; fi
-  "${docker_bin}" rm -f "${container}-hold" "${container}-server" >/dev/null 2>&1 || true
+  stop_noel
+  "${docker_bin}" rm -f "${container}-hold" "${container}-server" "${container}-chat" >/dev/null 2>&1 || true
   rm -rf "${work}"
 }
 trap cleanup EXIT
 
 "${cargo_bin}" build -q -p noel-chord --example device-server --example chord-client
+"${cargo_bin}" build -q -p noel-cli
 
 run_node() {
   "${docker_bin}" run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
@@ -107,5 +127,33 @@ cat "${work}/noel-client.log"
 printf '== upstream server received\n'
 grep -v '^npm ' "${work}/ts-server.log" || true
 [ "${noel_exit}" -eq 0 ] && [ "${ts_server_exit}" -eq 0 ] || status=1
+
+# 4. upstream client -> noel server -> worker: noel.chat's view
+mkdir -p "${work}/m2/home" "${work}/m2/agent" "${work}/m2/cwd"
+mkdir -m 700 "${work}/run"
+printf '%s\n' '{"modelRefresh":{"enabled":false},"retry":{"enabled":false}}' > "${work}/m2/agent/settings.json"
+printf '%s\n' '[[{"text":"first reply"}],[{"text":"second reply"}]]' > "${work}/m2/script.json"
+noel() { (cd "${work}/m2/cwd" && env "${noel_env[@]}" "${noel_bin}" "$@"); }
+session="$(noel client new --model faux/script --request-id interop)"
+noel client send "${session}" "hello from noel" >/dev/null
+for _ in $(seq 1 100); do
+  if grep -q '"run_finished"' "${work}/m2/agent/sessions/${session}.jsonl" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+set +e
+run_node --name "${container}-chat" "${image}" npx tsx /ts-parity/chord-interop-chat.ts \
+  "ws+unix:///sock/run/server.sock:/chord" "${session}" > "${work}/chat.log" 2>&1 &
+chat_pid=$!
+set -e
+wait_for "${work}/chat.log" '"subscribed":true' "the upstream client's snapshot of noel.chat"
+noel client send "${session}" "hello again" >/dev/null
+set +e
+wait "${chat_pid}"
+chat_exit=$?
+set -e
+printf '== upstream client -> noel server noel.chat (session %s): exit %s\n' "${session}" "${chat_exit}"
+grep -v '^npm ' "${work}/chat.log" || true
+[ "${chat_exit}" -eq 0 ] || status=1
+stop_noel
 
 exit "${status}"
