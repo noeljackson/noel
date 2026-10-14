@@ -396,3 +396,62 @@ fn system_prompt_lists_the_tools_the_request_declares() {
         }
     }
 }
+
+/// Each tool call runs in the workspace the runtime's env provider gives it
+/// (Durable's `env(target)` hook), asked anew for every call; a provider
+/// that fails fails that call.
+#[tokio::test]
+async fn tool_calls_run_in_the_workspace_the_env_provider_chooses() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::{EnvProvider, LocalEnv};
+
+    let root = std::env::temp_dir().join(format!("noel-env-hook-{}", std::process::id()));
+    let (session_cwd, workspace) = (root.join("session"), root.join("workspace"));
+    fs::create_dir_all(&session_cwd).expect("create session dir");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    fs::write(workspace.join("notes.txt"), "from the workspace\n").expect("write notes");
+    let mut runtime = Runtime::new(
+        SessionState::new("session-env", session_cwd.clone()),
+        ReloadableSystems::default(),
+    );
+
+    // By default the workspace is local, at the session's directory.
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert!(is_error && output.starts_with("ENOENT"), "{output}");
+
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    runtime.set_env_provider(EnvProvider::Hook(Arc::new({
+        let (targets, workspace) = (targets.clone(), workspace.clone());
+        move |target| {
+            let mut targets = targets.lock().unwrap();
+            targets.push((target.session_id.to_string(), target.cwd.to_path_buf()));
+            Ok(Arc::new(LocalEnv::new(&workspace)))
+        }
+    })));
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert_eq!((output.as_str(), is_error), ("from the workspace\n", false));
+    let (output, is_error) = call_tool(&mut runtime, "bash", json!({"command": "pwd"})).await;
+    assert!(!is_error, "{output}");
+    assert_eq!(
+        PathBuf::from(output.trim()),
+        fs::canonicalize(&workspace).expect("canonical workspace")
+    );
+    assert_eq!(
+        *targets.lock().unwrap(),
+        [
+            ("session-env".to_string(), session_cwd.clone()),
+            ("session-env".to_string(), session_cwd.clone()),
+        ]
+    );
+
+    runtime.set_env_provider(EnvProvider::Hook(Arc::new(|_| {
+        Err("the workspace is unavailable".to_string())
+    })));
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert_eq!(
+        (output.as_str(), is_error),
+        ("the workspace is unavailable", true)
+    );
+    let _ = fs::remove_dir_all(root);
+}

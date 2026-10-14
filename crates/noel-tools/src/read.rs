@@ -1,42 +1,43 @@
 //! The `read` tool (upstream `read.ts`): text with line and byte limits, and
 //! images as attachments.
 
-use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::PathBuf;
 
 use base64::Engine as _;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use noel_env::{Context, ExecutionEnv};
 
 use crate::paths::resolve_read_path;
 use crate::truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use crate::{node_error_code, ToolError, ToolImage, ToolResult, ToolRuntimeOptions};
 
-pub(crate) fn read_tool(
-    cwd: &Path,
+pub(crate) async fn read_tool(
+    env: &dyn ExecutionEnv,
     input_path: &str,
     offset: Option<u64>,
     limit: Option<u64>,
     options: &ToolRuntimeOptions,
+    cx: &Context,
 ) -> Result<ToolResult, ToolError> {
-    let path = resolve_read_path(cwd, input_path);
+    let path = resolve_read_path(env, input_path, cx).await?;
     // The common failures are worded as upstream's (Node's) are.
-    let bytes = fs::read(&path).map_err(|source| match node_error_code(&source) {
-        Some("ENOENT") => ToolError::Failed(format!(
-            "ENOENT: no such file or directory, access '{}'",
-            path.display()
-        )),
-        Some("EACCES") => ToolError::Failed(format!(
-            "EACCES: permission denied, access '{}'",
-            path.display()
-        )),
-        Some("EISDIR") => {
-            ToolError::Failed("EISDIR: illegal operation on a directory, read".to_string())
+    let bytes = env.read_binary_file(&path, cx).await.map_err(|error| {
+        match node_error_code(error.code) {
+            Some("ENOENT") => ToolError::Failed(format!(
+                "ENOENT: no such file or directory, access '{path}'"
+            )),
+            Some("EACCES") => {
+                ToolError::Failed(format!("EACCES: permission denied, access '{path}'"))
+            }
+            Some("EISDIR") => {
+                ToolError::Failed("EISDIR: illegal operation on a directory, read".to_string())
+            }
+            _ => ToolError::Io {
+                path: PathBuf::from(&path),
+                source: error.to_io_error(),
+            },
         }
-        _ => ToolError::Io {
-            path: path.clone(),
-            source,
-        },
     })?;
     if let Some(mime_type) = image_mime_type(&bytes) {
         return Ok(read_image(&bytes, mime_type, options));

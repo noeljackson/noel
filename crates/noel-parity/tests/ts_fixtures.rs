@@ -23,6 +23,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "google-gemini-2.5-pro.json",
     "google-tool-image-routing.json",
     "google-tools.json",
+    "local-env.json",
     "local-tools.json",
     "mistral-devstral.json",
     "mistral-tool-id.json",
@@ -57,6 +58,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "copilot-fixture.ts",
     "error-classification-fixture.ts",
     "google-fixture.ts",
+    "local-env-fixture.ts",
     "local-tools-fixture.ts",
     "mistral-fixture.ts",
     "model-catalog-fixture.ts",
@@ -181,6 +183,7 @@ fn every_script_output_is_committed() {
                 "google-tools.json",
             ]),
         ),
+        ("local-env-fixture.ts", fixture_set(&["local-env.json"])),
         ("local-tools-fixture.ts", fixture_set(&["local-tools.json"])),
         (
             "mistral-fixture.ts",
@@ -247,10 +250,14 @@ fn every_script_output_is_committed() {
     assert_eq!(by_script, expected);
 }
 
-/// The upstream ref a fixture records: `main`, except for Chord's goldens,
-/// which are pinned to `CHORD_REFERENCE_REF` in the Makefile.
+/// The upstream ref a fixture records: `main`, except for Chord's goldens
+/// and `LocalEnv`'s, which are pinned to `CHORD_REFERENCE_REF` in the
+/// Makefile.
 fn expected_ref(fixture_name: &str) -> String {
-    if !matches!(fixture_name, "chord-delta.json" | "chord-link.json") {
+    if !matches!(
+        fixture_name,
+        "chord-delta.json" | "chord-link.json" | "local-env.json"
+    ) {
         return "main".to_string();
     }
     let makefile = fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
@@ -324,6 +331,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "crates/noel-ai/src/lib.rs",
         ),
         ("google-tools.json", "crates/noel-ai/src/lib.rs"),
+        (
+            "local-env.json",
+            "crates/noel-env/tests/local_env_conformance.rs",
+        ),
         ("local-tools.json", "crates/noel-tools/src/lib.rs"),
         ("mistral-devstral.json", "crates/noel-ai/src/lib.rs"),
         ("mistral-tool-id.json", "crates/noel-ai/src/lib.rs"),

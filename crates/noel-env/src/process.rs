@@ -1,4 +1,5 @@
-//! Isolation for tool subprocesses (bash and extension tools).
+//! Isolation for tool subprocesses: commands `LocalEnv` runs, and noel's
+//! extension tools.
 //!
 //! A tool subprocess starts a new session: it leads a fresh process group and
 //! has no controlling terminal. A command that reads or opens the terminal
@@ -34,6 +35,11 @@ pub struct ToolProcessGroup {
 }
 
 impl ToolProcessGroup {
+    /// The process group id, while the group is registered.
+    pub fn pgid(&self) -> Option<i32> {
+        self.pgid
+    }
+
     /// Releases the group without killing it.
     pub fn finish(mut self) {
         if let Some(pgid) = self.pgid.take() {
@@ -90,7 +96,7 @@ pub fn kill_running_tool_groups() {
     }
 }
 
-fn kill_group(pgid: i32) {
+pub(crate) fn kill_group(pgid: i32) {
     if pgid > 1 {
         let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
     }

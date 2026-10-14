@@ -34,10 +34,12 @@ use noel_config::{
     has_auth_for_provider, listed_accounts_for_provider, ContextFile, LoadedConfig, ResourceFile,
     Skill,
 };
+use noel_env::LocalEnvOptions;
+pub use noel_env::{ExecutionEnv, LocalEnv};
 /// Kills every running tool subprocess tree; for noel's fatal-signal handling.
 pub use noel_tools::kill_running_tool_groups;
 use noel_tools::{
-    builtin_tool_definitions, cap_tool_output, execute_tool, execute_tool_streaming,
+    builtin_tool_definitions, cap_tool_output, execute_tool_in, execute_tool_streaming_in,
     spawn_tool_process, ToolError, ToolRequest, ToolResult, ToolRuntimeOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -2041,6 +2043,40 @@ fn trim_summary_text(value: &str) -> String {
     trimmed
 }
 
+/// What a workspace is chosen for (upstream Durable's `EnvTarget`).
+#[derive(Debug, Clone, Copy)]
+pub struct EnvTarget<'a> {
+    /// The session (upstream's conversation).
+    pub session_id: &'a str,
+    /// The session's working directory.
+    pub cwd: &'a Path,
+}
+
+/// Builds the workspace one tool call runs in; an `Err` is that call's
+/// error result.
+pub type EnvHook =
+    Arc<dyn Fn(&EnvTarget<'_>) -> Result<Arc<dyn ExecutionEnv>, String> + Send + Sync>;
+
+/// Chooses the workspace of each tool call (upstream Durable's harness
+/// `env(target)` hook), asked anew for every call.
+#[derive(Clone, Default)]
+pub enum EnvProvider {
+    /// A [`LocalEnv`] at the session's working directory, with the
+    /// `shellPath` setting: every mode's default.
+    #[default]
+    Local,
+    Hook(EnvHook),
+}
+
+impl std::fmt::Debug for EnvProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Local => "EnvProvider::Local",
+            Self::Hook(_) => "EnvProvider::Hook",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Runtime {
     session: SessionState,
@@ -2049,6 +2085,7 @@ pub struct Runtime {
     /// The thinking level of the current turn's provider, which bash
     /// commands see as `NOEL_REASONING_LEVEL`.
     thinking_level: Option<String>,
+    env_provider: EnvProvider,
 }
 
 impl Runtime {
@@ -2058,6 +2095,7 @@ impl Runtime {
             systems,
             store: None,
             thinking_level: None,
+            env_provider: EnvProvider::default(),
         }
     }
 
@@ -2071,6 +2109,32 @@ impl Runtime {
             systems,
             store: Some(store),
             thinking_level: None,
+            env_provider: EnvProvider::default(),
+        }
+    }
+
+    pub fn env_provider(&self) -> &EnvProvider {
+        &self.env_provider
+    }
+
+    /// Chooses the workspace of later tool calls.
+    pub fn set_env_provider(&mut self, provider: EnvProvider) {
+        self.env_provider = provider;
+    }
+
+    /// The workspace for one tool call, from the env provider.
+    pub fn tool_env(&self) -> Result<Arc<dyn ExecutionEnv>, String> {
+        match &self.env_provider {
+            EnvProvider::Local => Ok(Arc::new(LocalEnv::with_options(
+                &self.session.cwd,
+                LocalEnvOptions {
+                    shell_path: self.systems.shell_path.clone(),
+                },
+            ))),
+            EnvProvider::Hook(hook) => hook(&EnvTarget {
+                session_id: &self.session.session_id,
+                cwd: &self.session.cwd,
+            }),
         }
     }
 
@@ -2702,9 +2766,12 @@ pub async fn run_saved_prompt_streaming_events(
             ToolRequest::Edit { path, .. } | ToolRequest::Write { path, .. } => Some(path.clone()),
             _ => None,
         };
+        let env = runtime
+            .tool_env()
+            .map_err(|message| AgentError::Tool(ToolError::Failed(message)))?;
         let result = run
-            .until_cancelled(execute_tool(
-                &runtime.session.cwd,
+            .until_cancelled(execute_tool_in(
+                env.as_ref(),
                 command.request,
                 &tool_runtime_options(runtime, Vec::new()),
             ))
@@ -3834,6 +3901,8 @@ async fn execute_model_tool_call(
             Ok(requests) if model_tool_enabled(runtime, &tool_call.name) => {
                 let mut outputs = Vec::new();
                 let mut edited_paths = Vec::new();
+                // One workspace for the call; failing to get one fails it.
+                let env = runtime.tool_env();
                 for request in requests {
                     let edited_path = match &request {
                         ToolRequest::Edit { path, .. } | ToolRequest::Write { path, .. } => {
@@ -3841,8 +3910,16 @@ async fn execute_model_tool_call(
                         }
                         _ => None,
                     };
-                    let output = match execute_tool_streaming(
-                        &runtime.session.cwd,
+                    let env = match &env {
+                        Ok(env) => env.clone(),
+                        Err(message) => {
+                            is_error = true;
+                            outputs.push(message.clone());
+                            continue;
+                        }
+                    };
+                    let output = match execute_tool_streaming_in(
+                        env.as_ref(),
                         request,
                         &tool_runtime_options(runtime, bash_session_env(runtime)),
                         on_output,
@@ -4199,8 +4276,11 @@ pub async fn run_excluded_bash_result(
     if !model_tool_enabled(runtime, "bash") {
         return Err(AgentError::DisabledTool("bash".to_string()));
     }
-    execute_tool(
-        &runtime.session.cwd,
+    let env = runtime
+        .tool_env()
+        .map_err(|message| AgentError::Tool(ToolError::Failed(message)))?;
+    execute_tool_in(
+        env.as_ref(),
         ToolRequest::Bash {
             command,
             timeout_ms: Some(USER_BASH_TIMEOUT_MS),

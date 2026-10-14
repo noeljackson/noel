@@ -26,14 +26,20 @@ mkdir -p "${fresh_fixtures_dir}" "${fixtures_dir}"
   git -C /ts-reference rev-parse HEAD > "${out_dir}/reference-sha"
 reference_sha="$(cat "${out_dir}/reference-sha")"
 
-# chord-delta.json and chord-link.json are pinned (CHORD_REFERENCE_REF in the
-# Makefile) rather than made from the tracking ref, so their drift is the
-# packages/chord commits on the tracking ref after the pin.
+# chord-delta.json, chord-link.json and local-env.json are pinned
+# (CHORD_REFERENCE_REF in the Makefile) rather than made from the tracking ref,
+# so their drift is the commits on the tracking ref after the pin: to
+# packages/chord, and to Durable's env and its conformance cases.
 chord_file="${out_dir}/chord-commits"
+env_file="${out_dir}/env-commits"
 chord_pin="$("${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
   git -C /chord-reference rev-parse HEAD)"
 "${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
   git -C /ts-reference log --oneline "${chord_pin}..HEAD" -- packages/chord > "${chord_file}"
+"${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
+  git -C /ts-reference log --oneline "${chord_pin}..HEAD" -- \
+  packages/durable/src/env packages/durable/src/testing/env-conformance.ts \
+  packages/env/docs/semantics.md > "${env_file}"
 
 "${docker_bin}" run --rm \
   -v "${repo_root}/${fresh_fixtures_dir}:/fixtures" \
@@ -42,7 +48,7 @@ chord_pin="$("${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
 fixtures_drift=0
 diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}" || fixtures_drift=1
 
-if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file}" ]; then
+if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file}" ] || [ -s "${env_file}" ]; then
   {
     printf '# TS Parity Drift Brief\n\n'
     printf 'The TypeScript reference fixtures changed against the tracked reference.\n\n'
@@ -60,11 +66,19 @@ if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file}" ]; then
       printf '```\n\n'
       printf 'Move the pin to the newest of these commits at which `packages/chord` builds (the image build checks), regenerate with `make ts-parity-chord`, bring `crates/noel-chord` level with the new fixtures, and run `make chord-interop`.\n\n'
     fi
+    if [ -s "${env_file}" ]; then
+      printf '## Durable env pin\n\n'
+      printf '`local-env.json` is pinned to `%s` too. Durable'"'"'s env, its conformance cases or `packages/env/docs/semantics.md` changed after it on the tracked reference:\n\n' "${chord_pin}"
+      printf '```text\n'
+      cat "${env_file}"
+      printf '```\n\n'
+      printf 'After moving the pin, regenerate with `make ts-parity-env`, bring `crates/noel-env`'"'"'s `LocalEnv` and its conformance port (`crates/noel-env/tests/local_env_conformance.rs`) level with the new cases, and run `cargo test -p noel-env`.\n\n'
+    fi
     printf '## Constraints\n\n'
     printf -- '- Do not run npm on the host.\n'
     printf -- '- Execute TypeScript only through Docker targets such as `make ts-parity-fixtures`, `make ts-parity-update`, or `make ts-parity-drift`.\n'
     printf -- '- Keep changes scoped to Rust parity code, fixtures, tests, and docs required by the drift.\n'
-    printf -- '- Run `cargo test -p noel-parity`, `cargo test -p noel-ai --lib matches_ts`, `cargo test -p noel-ai --lib catalog`, `cargo test -p noel-config --lib model`, `cargo test -p noel-cli --test model_parity`, `cargo test -p noel-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools`, `cargo test -p noel-core --lib system_prompt_matches_ts_builder`, `cargo test -p noel-cli --bin noel prompt_and_context_files_match_ts_discovery`, `cargo test -p noel-core --lib tool_parity_tests`, `cargo test -p noel-config --lib _ts`, `cargo test -p noel-core --lib input_expansion_matches_ts_session`, `cargo test -p noel-cli --test rpc_parity get_commands_matches_upstream`, `cargo test -p noel-cli --test rpc_parity golden_`, `cargo test -p noel-chord`, and `make check` before committing.\n'
+    printf -- '- Run `cargo test -p noel-parity`, `cargo test -p noel-ai --lib matches_ts`, `cargo test -p noel-ai --lib catalog`, `cargo test -p noel-config --lib model`, `cargo test -p noel-cli --test model_parity`, `cargo test -p noel-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools`, `cargo test -p noel-core --lib system_prompt_matches_ts_builder`, `cargo test -p noel-cli --bin noel prompt_and_context_files_match_ts_discovery`, `cargo test -p noel-core --lib tool_parity_tests`, `cargo test -p noel-config --lib _ts`, `cargo test -p noel-core --lib input_expansion_matches_ts_session`, `cargo test -p noel-cli --test rpc_parity get_commands_matches_upstream`, `cargo test -p noel-cli --test rpc_parity golden_`, `cargo test -p noel-chord`, `cargo test -p noel-env`, and `make check` before committing.\n'
     printf -- '- If a GitHub issue is provided, include `closes #<number>` in the commit message.\n\n'
     printf '## Suggested Workflow\n\n'
     printf '1. Inspect `tests/fixtures/ts-parity` and the diff below.\n'
@@ -109,6 +123,7 @@ fi
 "${cargo_bin}" test -p noel-cli --test rpc_parity get_commands_matches_upstream
 "${cargo_bin}" test -p noel-cli --test rpc_parity golden_
 "${cargo_bin}" test -p noel-chord
+"${cargo_bin}" test -p noel-env
 "${cargo_bin}" test -p noel-parity
 
 printf 'No TS parity drift detected.\n'
