@@ -3,6 +3,7 @@ pub mod controller;
 #[cfg(test)]
 mod controller_tests;
 mod input;
+mod progress;
 #[cfg(test)]
 mod recovery_tests;
 mod session_lock;
@@ -13,6 +14,8 @@ mod tool_parity_tests;
 mod tool_tests;
 pub use compaction::RuntimeCompactionSettings;
 pub use input::expand_input;
+pub use progress::RuntimeProgressSettings;
+use progress::{ReplyProgress, ToolProgress};
 use session_lock::SessionLock;
 pub use system_prompt::PRODUCT_NAME;
 use system_prompt::{PromptTool, SystemPromptInput};
@@ -24,7 +27,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use noel_agent::RetryPolicy;
@@ -43,7 +46,7 @@ pub use noel_env::{ExecutionEnv, LocalEnv};
 pub use noel_tools::kill_running_tool_groups;
 use noel_tools::{
     builtin_tool_definitions, cap_tool_output, execute_tool_in, execute_tool_streaming_in,
-    spawn_tool_process, ToolError, ToolRequest, ToolResult, ToolRuntimeOptions,
+    spawn_tool_process, OutputSoFar, ToolError, ToolRequest, ToolResult, ToolRuntimeOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -66,6 +69,16 @@ pub struct ConversationMessage {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<ChatToolCall>,
+    /// A reply that was cut off: by an abort, by the failure that ended its
+    /// run, or by a stop, after which recovery saved what it had streamed
+    /// (spec §4.2). It stays in the transcript and is left out of model
+    /// requests. Older versions ignore it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aborted: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +311,56 @@ pub struct SessionState {
     /// The session's runs, oldest first.
     #[serde(default)]
     pub runs: Vec<Run>,
+    /// What a reply had streamed when it was last saved, while nothing has
+    /// superseded it: the reply a stop cut off. Opening the session for
+    /// writing saves it as an aborted reply (spec §4.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialReply>,
+    /// What tool calls without a result had printed when it was last saved,
+    /// by call id. An interrupted call's result starts with it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_outputs: BTreeMap<String, SavedToolOutput>,
+}
+
+/// A streaming reply as far as the journal saved it (spec §4.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The request for the reply, from 1: a retry, or asking again after
+    /// a compaction, is the next attempt.
+    pub attempt: u64,
+    pub text: String,
+    pub thinking: String,
+}
+
+impl PartialReply {
+    /// The reply as an aborted assistant message; `None` if it streamed
+    /// nothing.
+    pub fn aborted_message(&self) -> Option<ConversationMessage> {
+        (!self.text.is_empty() || !self.thinking.is_empty()).then(|| ConversationMessage {
+            role: MessageRole::Assistant,
+            content: self.text.clone(),
+            thinking: self.thinking.clone(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            aborted: true,
+        })
+    }
+}
+
+/// What a running tool call had printed as far as the journal saved it: the
+/// end of its output, within the limits of its result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedToolOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub output: String,
+    /// Whether output before `output` was left out.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 impl SessionState {
@@ -357,6 +420,22 @@ impl SessionState {
         }
     }
 
+    /// Whether the tool call `call_id` of the last reply has a result.
+    fn has_result(&self, call_id: &str) -> bool {
+        let results = self.messages.iter().rev();
+        let mut results = results.take_while(|message| message.role == MessageRole::Tool);
+        results.any(|message| message.tool_call_id.as_deref() == Some(call_id))
+    }
+
+    /// `message` is saved: it supersedes a partial reply, and a tool
+    /// result supersedes its call's saved output.
+    fn supersede_progress(&mut self, message: &ConversationMessage) {
+        self.partial = None;
+        if let Some(call_id) = &message.tool_call_id {
+            self.tool_outputs.remove(call_id);
+        }
+    }
+
     /// The run a prompt with `request_id` started, if one did.
     pub fn run_for_request(&self, request_id: &str) -> Option<&Run> {
         self.runs
@@ -375,37 +454,17 @@ impl SessionState {
     /// that reply, when only tool results follow it: what a turn stopped
     /// during its tool calls still owes.
     pub fn pending_tool_calls(&self) -> Option<(&ConversationMessage, Vec<&ChatToolCall>)> {
-        let results = self
-            .messages
-            .iter()
-            .rev()
-            .take_while(|message| message.role == MessageRole::Tool)
-            .count();
-        let reply_index = self.messages.len().checked_sub(results + 1)?;
-        let (reply, results) = (
-            &self.messages[reply_index],
-            &self.messages[reply_index + 1..],
-        );
-        if reply.role != MessageRole::Assistant {
-            return None;
-        }
-        let pending = reply
-            .tool_calls
-            .iter()
-            .filter(|call| {
-                !results
-                    .iter()
-                    .any(|result| result.tool_call_id.as_deref() == Some(call.id.as_str()))
-            })
-            .collect::<Vec<_>>();
-        (!pending.is_empty()).then_some((reply, pending))
+        pending_tool_calls(&self.messages)
     }
 
     /// Model work awaiting a reply. Direct slash-tool results complete their
-    /// turn without an assistant reply and have no model tool-call id.
+    /// turn without an assistant reply and have no model tool-call id. A
+    /// reply cut off (`aborted`) answered nothing: the work it was for is
+    /// still unfinished.
     pub fn has_unfinished_turn(&self) -> bool {
         self.messages
-            .last()
+            .iter()
+            .rfind(|message| !message.aborted)
             .is_some_and(|message| match message.role {
                 MessageRole::User => true,
                 MessageRole::Assistant => !message.tool_calls.is_empty(),
@@ -438,8 +497,44 @@ impl SessionState {
             edited_files: Vec::new(),
             usage: SessionUsage::default(),
             runs: Vec::new(),
+            partial: None,
+            tool_outputs: BTreeMap::new(),
         }
     }
+}
+
+/// The tool calls of the last reply that have no result in `messages`,
+/// with that reply, when only tool results follow it (aborted replies
+/// aside): what a turn stopped during its tool calls still owes.
+fn pending_tool_calls(
+    messages: &[ConversationMessage],
+) -> Option<(&ConversationMessage, Vec<&ChatToolCall>)> {
+    let aborted = messages
+        .iter()
+        .rev()
+        .take_while(|message| message.aborted)
+        .count();
+    let messages = &messages[..messages.len() - aborted];
+    let results = messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role == MessageRole::Tool)
+        .count();
+    let reply_index = messages.len().checked_sub(results + 1)?;
+    let (reply, results) = (&messages[reply_index], &messages[reply_index + 1..]);
+    if reply.role != MessageRole::Assistant {
+        return None;
+    }
+    let pending = reply
+        .tool_calls
+        .iter()
+        .filter(|call| {
+            !results
+                .iter()
+                .any(|result| result.tool_call_id.as_deref() == Some(call.id.as_str()))
+        })
+        .collect::<Vec<_>>();
+    (!pending.is_empty()).then_some((reply, pending))
 }
 
 pub fn default_active_tool_names() -> BTreeSet<String> {
@@ -558,6 +653,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         usage: export.usage,
         // Runs belong to the session that ran them.
         runs: Vec::new(),
+        partial: None,
+        tool_outputs: BTreeMap::new(),
     }
 }
 
@@ -609,6 +706,8 @@ pub struct ReloadableSystems {
     pub retry: RuntimeRetrySettings,
     pub offline: bool,
     pub compaction: RuntimeCompactionSettings,
+    /// How often a run saves what it has produced so far (spec §4.2).
+    pub progress: RuntimeProgressSettings,
     pub model_context_windows: BTreeMap<String, u64>,
     /// Safety cap on provider rounds per run, including steering. Manual
     /// `Default` keeps the compiled cap; a derived zero would stop every
@@ -638,6 +737,7 @@ impl Default for ReloadableSystems {
             retry: RuntimeRetrySettings::default(),
             offline: false,
             compaction: RuntimeCompactionSettings::default(),
+            progress: RuntimeProgressSettings::default(),
             model_context_windows: BTreeMap::new(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         }
@@ -793,6 +893,16 @@ impl ReloadableSystems {
                     reserve_tokens: settings.reserve_tokens.unwrap_or(16_384),
                     keep_recent_tokens: settings.keep_recent_tokens.unwrap_or(20_000),
                     trigger_percent: settings.trigger_percent.unwrap_or(80).clamp(1, 99),
+                }
+            },
+            progress: {
+                let settings = config.settings.progress.clone().unwrap_or_default();
+                let interval = |ms: Option<u64>| {
+                    ms.map_or(progress::DEFAULT_PROGRESS_INTERVAL, Duration::from_millis)
+                };
+                RuntimeProgressSettings {
+                    partial_interval: interval(settings.partial_interval_ms),
+                    output_interval: interval(settings.output_interval_ms),
                 }
             },
             available_accounts,
@@ -1019,6 +1129,39 @@ enum SessionRecord {
         run_id: String,
         status: RunStatus,
     },
+    /// What a streaming reply has produced so far (spec §4.2), saved at
+    /// most every `progress.partialIntervalMs`. A reply's first record
+    /// holds its text and thinking so far, and supersedes any earlier
+    /// partial; each later one (`append`) holds what streamed since. The
+    /// reply, or any message after it, supersedes them. Older versions
+    /// ignore it.
+    Partial {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        attempt: u64,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        thinking: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        append: bool,
+    },
+    /// What a running tool call has printed so far, within the limits of
+    /// its result, saved at most every `progress.outputIntervalMs`. A
+    /// record supersedes the call's earlier ones, or with `append` extends
+    /// them; the call's result supersedes them all. Older versions ignore
+    /// it.
+    ToolOutput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        call_id: String,
+        output: String,
+        /// Output before `output` was left out.
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        append: bool,
+    },
     /// Records written by other binary versions are ignored on load.
     #[serde(other)]
     Unknown,
@@ -1074,8 +1217,11 @@ impl SessionStore {
         let store = Self::writer(path)?;
         let mut state = source.clone();
         state.session_id = session_id.clone();
-        // A fork is a new session: the source's runs stay with the source.
+        // A fork is a new session: the source's runs, and what they left
+        // unfinished, stay with the source.
         state.runs.clear();
+        state.partial = None;
+        state.tool_outputs.clear();
         state.parent_session_id = if clone_parent {
             source.parent_session_id.clone()
         } else {
@@ -1113,15 +1259,32 @@ impl SessionStore {
     }
 
     /// Opens an existing session for writing: takes the session lock, repairs
-    /// a torn tail, then loads it.
+    /// a torn tail, then loads it. A reply a stop cut off is then saved as
+    /// an aborted reply ([`SessionStore::recover_partial`]).
     pub fn open(path: PathBuf) -> Result<(Self, SessionState), SessionError> {
         fs::metadata(&path).map_err(|source| SessionError::Open {
             path: path.clone(),
             source,
         })?;
         let store = Self::writer(path)?;
-        let state = store.load()?;
+        let mut state = store.load()?;
+        store.recover_partial(&mut state)?;
         Ok((store, state))
+    }
+
+    /// Recovery of a reply a stop cut off (spec §4.2): what the journal
+    /// saved of it becomes an aborted reply in the transcript, which later
+    /// requests leave out, and supersedes the partial. A reply that saved
+    /// nothing leaves nothing.
+    pub fn recover_partial(&self, state: &mut SessionState) -> Result<(), SessionError> {
+        let Some(partial) = state.partial.take() else {
+            return Ok(());
+        };
+        if let Some(message) = partial.aborted_message() {
+            self.record_message(message.clone())?;
+            state.messages.push(message);
+        }
+        Ok(())
     }
 
     /// Loads a session without locking or repairing it, for listing, pickers,
@@ -1199,6 +1362,10 @@ impl SessionStore {
         self.append(&SessionRecord::Tool { event })
     }
 
+    fn record_progress(&self, record: &SessionRecord) -> Result<(), SessionError> {
+        self.append(record)
+    }
+
     pub fn record_active_model(&self, model: Option<ModelRef>) -> Result<(), SessionError> {
         self.append(&SessionRecord::ActiveModel { model })
     }
@@ -1274,6 +1441,10 @@ impl SessionStore {
         record: CompactionRecord,
         messages: Vec<ConversationMessage>,
     ) -> Result<(), SessionError> {
+        // Tool calls whose saved output still stands after the checkpoint.
+        let pending: BTreeSet<String> = pending_tool_calls(&messages)
+            .map(|(_, calls)| calls.into_iter().map(|call| call.id.clone()).collect())
+            .unwrap_or_default();
         let checkpoint =
             serde_json::to_vec(&SessionRecord::CompactionCheckpoint { record, messages }).map_err(
                 |source| SessionError::Parse {
@@ -1292,6 +1463,9 @@ impl SessionStore {
         // a corrupt interior line; a complete record that only lost its
         // newline is terminated.
         noel_session::repair_jsonl_tail_bytes(&mut journal);
+        // The rewrite drops what the checkpoint and the rest of the journal
+        // supersede of what replies and tool calls saved as they ran.
+        let mut journal = progress::drop_superseded(&journal, &pending);
         journal.extend(checkpoint);
         journal.push(b'\n');
         // Rename a synced temporary file: a failed write leaves the old
@@ -1642,6 +1816,7 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             run,
             placed,
         } => {
+            state.supersede_progress(&message);
             state.messages.push(message);
             // Whatever started a run, a load did not: it was interrupted
             // unless a `run_finished` record follows.
@@ -1655,7 +1830,10 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             let run_id = state.runs.last().map(|run| run.id.clone());
             state.place_queued(placed, run_id.as_deref());
         }
-        SessionRecord::MessagesSnapshot { messages } => state.messages = messages,
+        SessionRecord::MessagesSnapshot { messages } => {
+            state.partial = None;
+            state.messages = messages;
+        }
         SessionRecord::Tool { event } => state.tool_history.push(event),
         SessionRecord::ActiveModel { model } => state.active_model = model,
         SessionRecord::ActiveAccount { account } => state.active_account = account,
@@ -1692,12 +1870,68 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         }
         SessionRecord::Compaction { record } => state.compactions.push(record),
         SessionRecord::CompactionCheckpoint { record, messages } => {
+            state.partial = None;
             state.messages = messages;
             state.compactions.push(record);
         }
         SessionRecord::BranchSummary { summary } => state.branch_summaries.push(summary),
         SessionRecord::Usage { usage } => state.usage = usage,
-        SessionRecord::RunFinished { run_id, status } => state.set_run_status(&run_id, status),
+        SessionRecord::RunFinished { run_id, status } => {
+            state.set_run_status(&run_id, status);
+            // The run settled what it left running.
+            state.partial = None;
+            state.tool_outputs.clear();
+        }
+        SessionRecord::Partial {
+            run_id,
+            attempt,
+            text,
+            thinking,
+            append,
+        } => match &mut state.partial {
+            Some(partial) if append => {
+                if partial.run_id == run_id && partial.attempt == attempt {
+                    partial.text.push_str(&text);
+                    partial.thinking.push_str(&thinking);
+                }
+            }
+            // An append without the record it extends has nothing to
+            // extend: a compaction dropped that reply's records.
+            None if append => {}
+            partial => {
+                *partial = Some(PartialReply {
+                    run_id,
+                    attempt,
+                    text,
+                    thinking,
+                })
+            }
+        },
+        SessionRecord::ToolOutput {
+            run_id,
+            call_id,
+            output,
+            truncated,
+            append,
+        } => match state.tool_outputs.get_mut(&call_id) {
+            Some(saved) if append => {
+                if saved.run_id == run_id {
+                    saved.output.push_str(&output);
+                    saved.truncated |= truncated;
+                }
+            }
+            None if append => {}
+            _ => {
+                state.tool_outputs.insert(
+                    call_id,
+                    SavedToolOutput {
+                        run_id,
+                        output,
+                        truncated,
+                    },
+                );
+            }
+        },
     }
 }
 
@@ -1858,7 +2092,7 @@ fn ts_jsonl_message(message: &ConversationMessage) -> Value {
         MessageRole::Tool => "toolResult",
         MessageRole::System => "system",
     };
-    json!({
+    let mut value = json!({
         "role": role,
         "content": message.content,
         "thinking": message.thinking,
@@ -1866,7 +2100,11 @@ fn ts_jsonl_message(message: &ConversationMessage) -> Value {
         "toolCallId": message.tool_call_id,
         "toolName": message.tool_name,
         "toolCalls": message.tool_calls,
-    })
+    });
+    if message.aborted {
+        value["stopReason"] = json!("aborted");
+    }
+    value
 }
 
 fn jsonl_is_ts_session_export(content: &[u8]) -> bool {
@@ -2094,7 +2332,10 @@ fn restore_rust_session_state(state: &mut SessionState, data: &Value) {
 }
 
 fn ts_jsonl_conversation_message(value: &Value) -> Option<ConversationMessage> {
-    if let Ok(message) = serde_json::from_value::<ConversationMessage>(value.clone()) {
+    // Upstream keeps an aborted reply, with this stop reason.
+    let aborted = value.get("stopReason").and_then(Value::as_str) == Some("aborted");
+    if let Ok(mut message) = serde_json::from_value::<ConversationMessage>(value.clone()) {
+        message.aborted |= aborted;
         return Some(message);
     }
     let role = match value.get("role").and_then(Value::as_str)? {
@@ -2147,6 +2388,7 @@ fn ts_jsonl_conversation_message(value: &Value) -> Option<ConversationMessage> {
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default(),
+        aborted: aborted && value.get("role").and_then(Value::as_str) == Some("assistant"),
     })
 }
 
@@ -2204,8 +2446,9 @@ fn write_html_export(state: &SessionState, path: &Path) -> Result<(), SessionErr
             ));
         }
         content.push_str(&format!(
-            "<div class=\"role\">{:?}</div><pre>{}</pre>",
+            "<div class=\"role\">{:?}{}</div><pre>{}</pre>",
             message.role,
+            if message.aborted { " (aborted)" } else { "" },
             escape_html(&message.content)
         ));
         content.push_str("</section>");
@@ -2407,6 +2650,7 @@ impl Runtime {
         if let Some(store) = &self.store {
             store.record_message(message.clone())?;
         }
+        self.session.supersede_progress(&message);
         self.session.messages.push(message);
         Ok(())
     }
@@ -2418,7 +2662,56 @@ impl Runtime {
         if let Some(store) = &self.store {
             store.record_messages_snapshot(messages.clone())?;
         }
+        self.session.partial = None;
         self.session.messages = messages;
+        Ok(())
+    }
+
+    /// Saves `output` as the result of the model's tool call `call`.
+    fn push_tool_result(
+        &mut self,
+        call: &ChatToolCall,
+        output: String,
+        media: Vec<MediaInput>,
+        is_error: bool,
+    ) -> Result<(), SessionError> {
+        self.push_tool_event(ToolEvent {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            result: output.clone(),
+            is_error,
+        })?;
+        self.push_message(ConversationMessage {
+            thinking: String::new(),
+            role: MessageRole::Tool,
+            content: output,
+            media,
+            tool_call_id: Some(call.id.clone()),
+            tool_name: Some(call.name.clone()),
+            tool_calls: Vec::new(),
+            aborted: false,
+        })
+    }
+
+    /// Saves the result of `call`, which a stop cut off (spec §4.2): the
+    /// output it had saved, and that it was interrupted.
+    fn push_interrupted_result(&mut self, call: &ChatToolCall) -> Result<(), SessionError> {
+        let output =
+            progress::interrupted_output(&call.name, self.session.tool_outputs.get(&call.id));
+        self.push_tool_result(call, output, Vec::new(), true)
+    }
+
+    /// Gives every tool call the last reply still owes a result an
+    /// interrupted one: nothing will run them, since the turn they belong
+    /// to is over.
+    fn settle_unanswered_calls(&mut self) -> Result<(), SessionError> {
+        let calls = match self.session.pending_tool_calls() {
+            Some((_, calls)) => calls.into_iter().cloned().collect::<Vec<_>>(),
+            None => return Ok(()),
+        };
+        for call in &calls {
+            self.push_interrupted_result(call)?;
+        }
         Ok(())
     }
 
@@ -2548,6 +2841,7 @@ impl Runtime {
         prompt: String,
         media: Vec<MediaInput>,
     ) -> Result<ConversationMessage, SessionError> {
+        self.settle_unanswered_calls()?;
         let interrupted = self
             .session
             .runs
@@ -2600,6 +2894,8 @@ impl Runtime {
     /// it fails, since this process is no longer running the run.
     pub fn finish_run(&mut self, run_id: &str, status: RunStatus) -> Result<(), SessionError> {
         self.session.set_run_status(run_id, status);
+        self.session.partial = None;
+        self.session.tool_outputs.clear();
         if let Some(store) = &self.store {
             store.append(&SessionRecord::RunFinished {
                 run_id: run_id.to_owned(),
@@ -2851,14 +3147,17 @@ pub const STEERING_JOIN: &str = "\n---\n";
 /// round, cancellation, and the backoff of a retry. Cancelling ends the turn
 /// with [`AgentError::Cancelled`] at once, dropping an in-flight request,
 /// backoff, compaction or tool call (a dropped tool takes its process group
-/// with it). What the turn saved stays saved: a reply whose tool calls have
-/// no results continues with the interrupted-call placeholders. Clones share
-/// all three.
+/// with it). What the turn saved stays saved, and what it was producing is
+/// saved as it ends (spec §4.2): a reply as an aborted reply, a tool call's
+/// output as its aborted result. Clones share all of them.
 #[derive(Debug, Clone, Default)]
 pub struct RunControl {
     pub steering: SteeringMailbox,
     pub cancellation: CancellationToken,
     pub retry: RetryAbort,
+    /// The run the turn belongs to, which names what it saves as it goes
+    /// (spec §4.2); a mode without runs has none.
+    pub run_id: Option<String>,
 }
 
 /// Ends the backoff a turn is waiting out before a retry (upstream
@@ -2939,15 +3238,19 @@ pub async fn run_user_turn_streaming_with_media(
 /// (the prompt or steering), any compaction and the reply's `Provider`
 /// deltas, the reply, then `ToolStarted`, `ToolUpdate`, `ToolOutput` and
 /// `ToolFinished` for each tool call, and `RoundFinished`. A turn that fails
-/// or is cancelled stops mid-round without further events. A continued turn
-/// whose saved reply has replay-safe calls without results first finishes
-/// that round: `RoundResumed`, those calls, `RoundFinished`.
+/// or is cancelled stops mid-round without further events, except the
+/// `ToolOutput` and `ToolFinished` of the aborted result a cancelled tool
+/// call saves. A continued turn whose saved reply has replay-safe calls
+/// without results first finishes that round: `RoundResumed`, those calls,
+/// `RoundFinished`; the interrupted results of its other calls are saved
+/// unreported.
 ///
 /// A round whose reply is dropped ends there instead, and the turn asks
 /// again in a new round: after `RetryStarted`, once the backoff is over;
 /// after `Overflowed`, once its compaction (`CompactionStarted`, then
-/// `CompactionFinished`) is done. A dropped reply is never saved, so its
-/// `Provider` deltas are all that was reported of it.
+/// `CompactionFinished`) is done. A dropped reply is never kept, so its
+/// `Provider` deltas are all that was reported of it. A reply an abort or a
+/// failure cuts off is saved as an aborted reply, unreported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEvent {
     /// A provider round started: one reply and the tool calls it asks for.
@@ -3058,6 +3361,9 @@ pub async fn run_user_turn_streaming_events_with_media(
     run: &RunControl,
     on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
+    // Calls a stop left without a result answer as interrupted: the new
+    // prompt ends their turn.
+    runtime.settle_unanswered_calls()?;
     let message = user_message(prompt, media);
     runtime.push_message(message.clone())?;
     run_saved_prompt_streaming_events(runtime, provider, message, run, on_event).await
@@ -3110,6 +3416,7 @@ pub async fn run_saved_prompt_streaming_events(
             tool_call_id: None,
             tool_name: Some(command.name.clone()),
             tool_calls: Vec::new(),
+            aborted: false,
         })?;
         return Ok(result.output);
     }
@@ -3120,25 +3427,31 @@ pub async fn run_saved_prompt_streaming_events(
 /// Continues an unfinished turn from its saved context, without adding a
 /// user prompt. Saved results go back to the provider. A tool call without
 /// a result runs again only if it is replay-safe ([`Runtime::replay_safe`]);
-/// any other call never runs again and is reported to the provider as
-/// interrupted, so an uncertain edit or command never runs twice. A request
-/// the stop cut off is simply sent again.
+/// any other call never runs again: its result is the output it had saved,
+/// and says it was interrupted, so an uncertain edit or command never runs
+/// twice. A request the stop cut off is sent again; what its reply had
+/// streamed was saved as an aborted reply when the session opened, and is
+/// not part of the request.
 pub async fn continue_turn_streaming_events(
     runtime: &mut Runtime,
     provider: &dyn Provider,
     run: &RunControl,
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
+    if let Some(store) = runtime.store.clone() {
+        store.recover_partial(&mut runtime.session)?;
+    }
     if !runtime.session().has_unfinished_turn() {
         return Ok(String::new());
     }
-    rerun_replay_safe_calls(runtime, run, &mut on_event).await?;
+    settle_pending_calls(runtime, run, &mut on_event).await?;
     run_model_turn_streaming_events(runtime, provider, run, None, on_event).await
 }
 
-/// Runs the replay-safe calls the last reply still owes results for, as the
-/// end of that reply's round.
-async fn rerun_replay_safe_calls(
+/// Settles the calls the last reply still owes results for, in order:
+/// replay-safe calls run again, as the end of that reply's round, and any
+/// other call gets its interrupted result, unreported.
+async fn settle_pending_calls(
     runtime: &mut Runtime,
     run: &RunControl,
     on_event: &mut (impl FnMut(&TurnEvent) + Send),
@@ -3146,22 +3459,26 @@ async fn rerun_replay_safe_calls(
     let Some((reply, pending)) = runtime.session.pending_tool_calls() else {
         return Ok(());
     };
-    let calls = pending
-        .into_iter()
-        .filter(|call| runtime.replay_safe(&call.name))
-        .cloned()
-        .collect::<Vec<_>>();
-    if calls.is_empty() {
-        return Ok(());
+    let reply = reply.clone();
+    let calls = pending.into_iter().cloned().collect::<Vec<_>>();
+    let rerun = calls.iter().any(|call| runtime.replay_safe(&call.name));
+    if rerun {
+        on_event(&TurnEvent::RoundResumed(reply));
     }
-    on_event(&TurnEvent::RoundResumed(reply.clone()));
     for call in calls {
-        // The journal does not record how the reply stopped. A reply cut
-        // off at the output limit gets its calls' error results right after
-        // it is saved, so its calls are not left for here; these only read.
-        run_tool_call(runtime, run, call, false, on_event).await?;
+        if runtime.replay_safe(&call.name) {
+            // The journal does not record how the reply stopped. A reply
+            // cut off at the output limit gets its calls' error results
+            // right after it is saved, so its calls are not left for here;
+            // these only read.
+            run_tool_call(runtime, run, call, false, on_event).await?;
+        } else {
+            runtime.push_interrupted_result(&call)?;
+        }
     }
-    on_event(&TurnEvent::RoundFinished);
+    if rerun {
+        on_event(&TurnEvent::RoundFinished);
+    }
     Ok(())
 }
 
@@ -3186,6 +3503,12 @@ async fn run_model_turn_streaming_events(
     // Replies kept so far. A round whose reply is dropped is not counted.
     let mut rounds = 0;
     let mut recovery = Recovery::default();
+    // What the reply being asked for has streamed, saved as it goes.
+    let mut progress = Mutex::new(ReplyProgress::new(
+        runtime.store.clone(),
+        run.run_id.clone(),
+        runtime.systems.progress.partial_interval,
+    ));
     while rounds < max_tool_rounds {
         if !std::mem::take(&mut round_open) {
             on_event(&TurnEvent::RoundStarted);
@@ -3224,17 +3547,21 @@ async fn run_model_turn_streaming_events(
             }
         }
         let request = provider_request(runtime, system_prompt.clone());
-        let events = match request_reply(provider, request, &run.cancellation, &mut on_event).await
-        {
+        let reply = request_reply(provider, request, run, &progress, &mut on_event).await;
+        let progress = progress.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let events = match reply {
             Ok(events) => events,
             // The failed reply was never saved: recovering only asks again.
             Err(AgentError::Provider(error)) => {
-                recovery
-                    .after_failure(runtime, provider, run, error, &mut on_event)
-                    .await?;
-                continue;
+                let recovered = recovery
+                    .after_failure(runtime, provider, run, error, progress, &mut on_event)
+                    .await;
+                match recovered {
+                    Ok(()) => continue,
+                    Err(error) => return Err(abort_reply(runtime, progress, error)),
+                }
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(abort_reply(runtime, progress, error)),
         };
         let mut text = String::new();
         let mut thinking = String::new();
@@ -3275,6 +3602,7 @@ async fn run_model_turn_streaming_events(
             tool_call_id: None,
             tool_name: None,
             tool_calls: tool_calls.clone(),
+            aborted: false,
         };
         // A final reply cut off below the model's own output limit ran out
         // of context, like a refused request. (One with tool calls goes on:
@@ -3289,6 +3617,9 @@ async fn run_model_turn_streaming_events(
         {
             on_event(&TurnEvent::Overflowed { error: None });
             recovery.finish_retries(None, &mut on_event);
+            // What was saved of the reply no longer stands; the reply is
+            // still saved below if nothing replaces it.
+            progress.dropped()?;
             if recovery
                 .compact(runtime, provider, run, &mut on_event)
                 .await?
@@ -3303,6 +3634,7 @@ async fn run_model_turn_streaming_events(
         rounds += 1;
         final_text.push_str(&reply.content);
         add_message(runtime, reply, &mut on_event)?;
+        progress.kept();
         recovery.finish_retries(None, &mut on_event);
         if !truncated {
             recovery.overflowed = false;
@@ -3321,8 +3653,21 @@ async fn run_model_turn_streaming_events(
             continue;
         }
 
-        for tool_call in tool_calls {
-            run_tool_call(runtime, run, tool_call, truncated, &mut on_event).await?;
+        for (index, tool_call) in tool_calls.iter().enumerate() {
+            let result = run_tool_call(runtime, run, tool_call.clone(), truncated, &mut on_event);
+            if let Err(error) = result.await {
+                if matches!(error, AgentError::Cancelled) {
+                    // The abort stopped this call, which saved what it had
+                    // printed, or kept it and those after it from starting.
+                    for call in &tool_calls[index..] {
+                        if !runtime.session.has_result(&call.id) {
+                            let output = progress::ABORTED_TOOL.to_owned();
+                            runtime.push_tool_result(call, output, Vec::new(), true)?;
+                        }
+                    }
+                }
+                return Err(error);
+            }
         }
         on_event(&TurnEvent::RoundFinished);
     }
@@ -3348,12 +3693,15 @@ struct Recovery {
 impl Recovery {
     /// Recovers from a failed request for a reply: `Ok` when the turn may
     /// ask again, or the error that ends it.
+    /// `progress` is the failed reply's, which is dropped once the turn
+    /// asks again.
     async fn after_failure(
         &mut self,
         runtime: &mut Runtime,
         provider: &dyn Provider,
         run: &RunControl,
         error: ProviderError,
+        progress: &mut ReplyProgress,
         on_event: &mut (impl FnMut(&TurnEvent) + Send),
     ) -> Result<(), AgentError> {
         let model = runtime.session.active_model.as_ref();
@@ -3364,6 +3712,7 @@ impl Recovery {
                     error: Some(error.to_string()),
                 });
                 self.finish_retries(Some(&error), on_event);
+                progress.dropped()?;
                 if self.compact(runtime, provider, run, on_event).await? {
                     return Ok(());
                 }
@@ -3380,6 +3729,7 @@ impl Recovery {
                     delay_ms: delay,
                     error_message: error.to_string(),
                 }));
+                progress.dropped()?;
                 let backoff = run.retry.backoff(Duration::from_millis(delay));
                 if run.until_cancelled(backoff).await? {
                     return Ok(());
@@ -3466,14 +3816,63 @@ async fn run_tool_call(
     let result = if truncated {
         fail_truncated_tool_call(runtime, &tool_call)
     } else {
-        let mut on_output = |output: &str| {
+        // What the call prints, saved as it goes (spec §4.2).
+        let progress = Mutex::new(ToolProgress::new(
+            runtime.store.clone(),
+            run.run_id.clone(),
+            tool_call.id.clone(),
+            runtime.systems.progress.output_interval,
+        ));
+        let put_off = tokio::sync::Notify::new();
+        let mut on_output = |output: OutputSoFar<'_>| {
             on_event(&TurnEvent::ToolUpdate {
                 call: tool_call.clone(),
-                output: output.to_owned(),
-            })
+                output: output.text.to_owned(),
+            });
+            if lock(&progress).observe(output, tokio::time::Instant::now()) {
+                put_off.notify_one();
+            }
         };
         let execution = execute_model_tool_call(runtime, &tool_call, &mut on_output);
-        run.until_cancelled(execution).await?
+        let execution = async {
+            tokio::pin!(execution);
+            loop {
+                let due = lock(&progress).due();
+                tokio::select! {
+                    biased;
+                    result = &mut execution => break result,
+                    () = put_off.notified() => {}
+                    () = sleep_until(due) => lock(&progress).save_due(tokio::time::Instant::now()),
+                }
+            }
+        };
+        let result = run.until_cancelled(execution).await;
+        let mut progress = progress
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(error) = progress.take_error() {
+            return Err(error.into());
+        }
+        match result {
+            Ok(result) => result,
+            Err(cancelled) => {
+                // An abort: the result is what the call had printed.
+                let output = progress::aborted_output(progress.output().0);
+                runtime.push_tool_result(&tool_call, output.clone(), Vec::new(), true)?;
+                on_event(&TurnEvent::ToolOutput {
+                    call: tool_call.clone(),
+                    output,
+                    images: Vec::new(),
+                    is_error: true,
+                    duration: None,
+                });
+                on_event(&TurnEvent::ToolFinished {
+                    name: tool_call.name,
+                    is_error: true,
+                });
+                return Err(cancelled);
+            }
+        }
     };
     let duration = (!truncated).then(|| started.elapsed());
     let event = runtime
@@ -3517,6 +3916,7 @@ fn user_message(prompt: String, media: Vec<MediaInput>) -> ConversationMessage {
         tool_call_id: None,
         tool_name: None,
         tool_calls: Vec::new(),
+        aborted: false,
     }
 }
 
@@ -3552,17 +3952,69 @@ fn add_placed_message(
     Ok(())
 }
 
-/// Requests one reply, reporting its stream events as they arrive. A
-/// request that fails leaves the events of its broken reply reported.
+/// Requests one reply, reporting its stream events as they arrive and
+/// saving its text and thinking as `progress` allows. A request that fails
+/// leaves the events of its broken reply reported, and `progress` holding
+/// what it streamed.
 async fn request_reply(
     provider: &dyn Provider,
     request: ProviderRequest,
-    cancellation: &CancellationToken,
+    run: &RunControl,
+    progress: &Mutex<ReplyProgress>,
     on_event: &mut (impl FnMut(&TurnEvent) + Send),
 ) -> Result<Vec<StreamEvent>, AgentError> {
-    let report = |event: &StreamEvent| on_event(&TurnEvent::Provider(event.clone()));
-    let reply = noel_agent::complete_once(provider, request, cancellation, report).await;
+    let put_off = tokio::sync::Notify::new();
+    let report = |event: &StreamEvent| {
+        on_event(&TurnEvent::Provider(event.clone()));
+        if lock(progress).observe(event, tokio::time::Instant::now()) {
+            put_off.notify_one();
+        }
+    };
+    let reply = noel_agent::complete_once(provider, request, &run.cancellation, report);
+    tokio::pin!(reply);
+    // Saves what streamed meanwhile once a save put off is due.
+    let reply = loop {
+        let due = lock(progress).due();
+        tokio::select! {
+            biased;
+            reply = &mut reply => break reply,
+            () = put_off.notified() => {}
+            () = sleep_until(due) => lock(progress).save_due(tokio::time::Instant::now()),
+        }
+    };
+    if let Some(error) = lock(progress).take_error() {
+        return Err(error.into());
+    }
     reply.map_err(AgentError::from)
+}
+
+/// Ends a turn whose reply an abort or a failure cut off: what the reply
+/// had streamed is saved as an aborted reply (spec §4.2), then the turn
+/// ends with `error`, or with the error saving it.
+fn abort_reply(
+    runtime: &mut Runtime,
+    progress: &mut ReplyProgress,
+    error: AgentError,
+) -> AgentError {
+    match progress
+        .aborted()
+        .map(|message| runtime.push_message(message))
+    {
+        Some(Err(save)) => save.into(),
+        _ => error,
+    }
+}
+
+/// Sleeps until `deadline`, or for ever without one.
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The system prompt for the session as it is now: its tools, prompt
@@ -3620,11 +4072,18 @@ fn provider_request(runtime: &Runtime, system_prompt: String) -> ProviderRequest
     }
 }
 
+/// The messages of a request: the transcript without system messages
+/// (other than compaction checkpoints) and without aborted replies, which
+/// stay in the transcript only. Each tool call is followed by its result.
 fn provider_messages(messages: &[ConversationMessage]) -> Vec<ChatMessage> {
     let mut output = Vec::new();
     let mut index = 0;
     while index < messages.len() {
         let message = &messages[index];
+        if message.aborted {
+            index += 1;
+            continue;
+        }
         if message.role == MessageRole::Assistant && !message.tool_calls.is_empty() {
             output.push(conversation_to_chat_message(message));
             index += 1;
@@ -4163,21 +4622,7 @@ fn fail_truncated_tool_call(
     tool_call: &ChatToolCall,
 ) -> Result<(), AgentError> {
     let output = noel_ai::truncated_tool_call_error(&tool_call.name);
-    runtime.push_tool_event(ToolEvent {
-        id: tool_call.id.clone(),
-        name: tool_call.name.clone(),
-        result: output.clone(),
-        is_error: true,
-    })?;
-    runtime.push_message(ConversationMessage {
-        thinking: String::new(),
-        role: MessageRole::Tool,
-        content: output,
-        media: Vec::new(),
-        tool_call_id: Some(tool_call.id.clone()),
-        tool_name: Some(tool_call.name.clone()),
-        tool_calls: Vec::new(),
-    })?;
+    runtime.push_tool_result(tool_call, output, Vec::new(), true)?;
     Ok(())
 }
 
@@ -4186,7 +4631,7 @@ fn fail_truncated_tool_call(
 async fn execute_model_tool_call(
     runtime: &mut Runtime,
     tool_call: &ChatToolCall,
-    on_output: &mut (dyn FnMut(&str) + Send),
+    on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
 ) -> Result<(), AgentError> {
     let extension_tool = runtime
         .systems
@@ -4288,21 +4733,7 @@ async fn execute_model_tool_call(
         }
     };
     let output = outputs.join("\n");
-    runtime.push_tool_event(ToolEvent {
-        id: tool_call.id.clone(),
-        name: tool_call.name.clone(),
-        result: output.clone(),
-        is_error,
-    })?;
-    runtime.push_message(ConversationMessage {
-        thinking: String::new(),
-        role: MessageRole::Tool,
-        content: output,
-        media: tool_result_media(images),
-        tool_call_id: Some(tool_call.id.clone()),
-        tool_name: Some(tool_call.name.clone()),
-        tool_calls: Vec::new(),
-    })?;
+    runtime.push_tool_result(tool_call, output, tool_result_media(images), is_error)?;
     Ok(())
 }
 
@@ -4801,6 +5232,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         }
     }
 
@@ -4976,6 +5408,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         session.tool_history.push(ToolEvent {
             id: "tool-1".to_string(),
@@ -5135,6 +5568,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         state.active_thinking_level = Some("xhigh".to_string());
         store
@@ -5182,6 +5616,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         state.messages.push(ConversationMessage {
             thinking: "summary <private>".into(),
@@ -5191,6 +5626,13 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
+        });
+        // An aborted reply keeps its mark through every export.
+        state.messages.push(ConversationMessage {
+            content: "cut off".to_string(),
+            aborted: true,
+            ..state.messages[1].clone()
         });
         state.tool_history.push(ToolEvent {
             id: "tool-1".to_string(),
@@ -5225,6 +5667,9 @@ mod tests {
         store
             .record_message(state.messages[1].clone())
             .expect("record assistant");
+        store
+            .record_message(state.messages[2].clone())
+            .expect("record aborted assistant");
         store
             .record_tool(state.tool_history[0].clone())
             .expect("record tool");
@@ -5299,7 +5744,14 @@ mod tests {
         let html_content = fs::read_to_string(&html).expect("read html");
         assert!(html_content.contains("<!doctype html>"));
         assert!(html_content.contains("hello &lt;world&gt;"));
+        assert!(html_content.contains("Assistant (aborted)"));
         assert!(html_content.contains("tool history"));
+        assert_eq!(exported["messages"][2]["aborted"], true);
+        let aborted = jsonl_records
+            .iter()
+            .filter(|record| record["message"]["stopReason"] == "aborted")
+            .count();
+        assert_eq!(aborted, 1);
 
         let import_dir = base.join("imported");
         let (_import_store, imported) =
@@ -5881,6 +6333,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         store.record_metadata(&state).expect("record metadata");
         store
@@ -5917,6 +6370,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                aborted: false,
             });
             store
                 .record_message(state.messages[index].clone())
@@ -5984,6 +6438,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                aborted: false,
             })
             .expect("record message");
         store
@@ -5995,6 +6450,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                aborted: false,
             }])
             .expect("record snapshot");
 
@@ -7099,7 +7555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_a_tool_call_kills_its_process_group_and_keeps_the_call_unanswered() {
+    async fn cancelling_a_tool_call_kills_its_process_group_and_saves_its_output() {
         let base = std::env::temp_dir().join(format!("noel-cancel-tool-{}", new_session_id()));
         fs::create_dir_all(&base).unwrap();
         let pid_file = base.join("child.pid");
@@ -7113,7 +7569,7 @@ mod tests {
             store.clone(),
         );
         let command = format!(
-            "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; wait",
+            "echo started; sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; wait",
             pid_file.display()
         );
         let provider = Script::new([reply(vec![tool_call(
@@ -7122,7 +7578,8 @@ mod tests {
             json!({ "command": command }),
         )])]);
         let run = RunControl::default();
-        // Cancel once the tool's background child runs.
+        // Cancel once the tool's background child runs, and its output
+        // was reported.
         let cancelled = {
             let (run, pid_file) = (run.clone(), pid_file.clone());
             tokio::spawn(async move {
@@ -7132,6 +7589,7 @@ mod tests {
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 };
+                tokio::time::sleep(Duration::from_millis(300)).await;
                 run.cancellation.cancel();
                 (pid, Instant::now())
             })
@@ -7164,8 +7622,17 @@ mod tests {
             ]
         );
         assert!(lines[4].starts_with("tool bash-1 bash"), "{lines:?}");
-        // The command reported that it starts; it printed nothing.
-        assert_eq!(lines[5..], [r#"update bash-1 """#]);
+        // The command reported that it starts and what it printed. Its
+        // result is that output, and that it was aborted.
+        assert_eq!(
+            lines[5..],
+            [
+                r#"update bash-1 """#,
+                r#"update bash-1 "started\n""#,
+                r#"output bash-1 "started\n\n\nOperation aborted" error"#,
+                "finished bash error",
+            ]
+        );
         // A killed process stays a zombie (state Z) until reaped.
         let running = || {
             fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -7181,16 +7648,25 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // The journal keeps the reply and its unanswered call, which the
-        // next request answers with the interrupted-call placeholder.
+        // The journal keeps the reply and that result, which the next
+        // request sends; what the call printed as it ran is superseded.
         assert_eq!(store.load().unwrap(), runtime.session);
-        assert!(runtime.session.tool_history.is_empty());
+        assert!(runtime.session.tool_outputs.is_empty());
+        let journal = fs::read_to_string(store.path()).unwrap();
+        assert!(
+            journal.contains(r#""type":"tool_output","call_id":"bash-1","output":"started\n""#),
+            "{journal}"
+        );
+        assert_eq!(runtime.session.tool_history.len(), 1);
         let request = provider_messages(&runtime.session.messages);
         assert_eq!(
             request.last().unwrap().tool_call_id.as_deref(),
             Some("bash-1")
         );
-        assert!(request.last().unwrap().content.contains("did not complete"));
+        assert_eq!(
+            request.last().unwrap().content,
+            "started\n\n\nOperation aborted"
+        );
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -7362,6 +7838,7 @@ mod tests {
             tool_call_id,
             tool_name: None,
             tool_calls,
+            aborted: false,
         };
         let call = |id: &str, name: &str, arguments: &str| ChatToolCall {
             id: id.into(),
@@ -7483,7 +7960,9 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(reopened.session().tool_history.len(), 3);
+        // The interrupted write's result is saved too, unreported: it had
+        // saved no output.
+        assert_eq!(reopened.session().tool_history.len(), 4);
         let captured = requests.lock().unwrap().clone();
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0].messages[0].media, before.messages[0].media);
@@ -7492,7 +7971,10 @@ mod tests {
             captured[0].messages[3].tool_call_id.as_deref(),
             Some("missing")
         );
-        assert!(captured[0].messages[3].content.contains("did not complete"));
+        assert_eq!(
+            captured[0].messages[3].content,
+            "<harness>\n[error] Tool write was interrupted and may have partially run\n</harness>"
+        );
         assert_eq!(
             captured[0].messages[4].tool_call_id.as_deref(),
             Some("again")
@@ -7533,6 +8015,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                aborted: false,
             })
             .unwrap();
         runtime.queue_message("pending queue".into()).unwrap();
@@ -8376,6 +8859,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                aborted: false,
             },
             ConversationMessage {
                 thinking: String::new(),
@@ -8389,6 +8873,7 @@ mod tests {
                     name: "read".to_string(),
                     arguments: r#"{"path":"."}"#.to_string(),
                 }],
+                aborted: false,
             },
             ConversationMessage {
                 thinking: String::new(),
@@ -8398,6 +8883,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                aborted: false,
             },
         ];
 

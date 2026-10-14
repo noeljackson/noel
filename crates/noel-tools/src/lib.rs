@@ -233,16 +233,27 @@ pub async fn execute_tool_in(
     execute_tool_streaming_in(env, request, options, &mut |_| {}).await
 }
 
+/// What a running tool has printed so far, as [`execute_tool_streaming`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputSoFar<'a> {
+    /// The end of the output, within the limits of the result (the last
+    /// 2000 lines or 50 KB).
+    pub text: &'a str,
+    /// Whether output before `text` was left out to keep within them.
+    pub truncated: bool,
+}
+
 /// [`execute_tool`] that also reports a `bash` command's output while it
 /// runs. `on_output` gets everything printed so far, within the limits of
-/// the result (the last 2000 lines or 50 KB): once, empty, when the command
-/// starts, then as output arrives, at most every [`BASH_UPDATE_THROTTLE`].
-/// Other tools report nothing before their result.
+/// the result (see [`OutputSoFar`]): once, empty, when the command starts,
+/// then as output arrives, at most every [`BASH_UPDATE_THROTTLE`]. Other
+/// tools report nothing before their result.
 pub async fn execute_tool_streaming(
     cwd: &Path,
     request: ToolRequest,
     options: &ToolRuntimeOptions,
-    on_output: &mut (dyn FnMut(&str) + Send),
+    on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
 ) -> Result<ToolResult, ToolError> {
     execute_tool_streaming_in(&local_env(cwd, options), request, options, on_output).await
 }
@@ -253,7 +264,7 @@ pub async fn execute_tool_streaming_in(
     env: &dyn ExecutionEnv,
     request: ToolRequest,
     options: &ToolRuntimeOptions,
-    on_output: &mut (dyn FnMut(&str) + Send),
+    on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
 ) -> Result<ToolResult, ToolError> {
     let cx = Context::background();
     if options.offline
@@ -408,7 +419,7 @@ fn with_status(text: String, status: &str) -> String {
 /// What a running command printed, and when it was last reported.
 struct BashReporter<'a> {
     output: OutputAccumulator,
-    on_output: &'a mut (dyn FnMut(&str) + Send),
+    on_output: &'a mut (dyn FnMut(OutputSoFar<'_>) + Send),
     /// Output not reported yet is reported once the throttle allows.
     unreported: bool,
     last_report: Option<Instant>,
@@ -420,7 +431,10 @@ struct BashReporter<'a> {
 impl BashReporter<'_> {
     fn report(&mut self) {
         (self.unreported, self.report_due, self.last_report) = (false, None, Some(Instant::now()));
-        (self.on_output)(&self.output.tail());
+        (self.on_output)(OutputSoFar {
+            text: &self.output.tail(),
+            truncated: self.output.truncated(),
+        });
     }
 
     /// Keeps a chunk of output and reports it now, or returns true when the
@@ -461,12 +475,15 @@ async fn bash_tool(
     command: &str,
     timeout_ms: Option<u64>,
     options: &ToolRuntimeOptions,
-    on_output: &mut (dyn FnMut(&str) + Send),
+    on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
     cx: &Context,
 ) -> Result<ToolResult, ToolError> {
     // Like upstream, the first report says the command is starting, even if
     // it then cannot start.
-    on_output("");
+    on_output(OutputSoFar {
+        text: "",
+        truncated: false,
+    });
     let command = match &options.shell_command_prefix {
         Some(prefix) if !prefix.trim().is_empty() => format!("{prefix}\n{command}"),
         _ => command.to_string(),
@@ -1157,7 +1174,7 @@ mod tests {
             Path::new("."),
             bash(command),
             &ToolRuntimeOptions::default(),
-            &mut |output| reports.push((output.to_string(), std::time::Instant::now())),
+            &mut |output| reports.push((output.text.to_string(), std::time::Instant::now())),
         )
         .await
         .expect("bash");
@@ -1212,6 +1229,18 @@ mod tests {
             assert!(output.lines().count() <= DEFAULT_MAX_LINES);
             assert!(output.len() <= DEFAULT_MAX_BYTES);
         }
+        // A report says when it has left the beginning out.
+        let mut truncated = Vec::new();
+        execute_tool_streaming(
+            Path::new("."),
+            bash("seq 1 3; sleep 0.3; seq 1 20000"),
+            &ToolRuntimeOptions::default(),
+            &mut |output| truncated.push((output.text.starts_with("1\n"), output.truncated)),
+        )
+        .await
+        .expect("bash");
+        assert_eq!(truncated[..2], [(false, false), (true, false)]);
+        assert_eq!(truncated.last(), Some(&(false, true)));
         let _ = fs::remove_file(rest.trim_end_matches(']'));
     }
 
@@ -1222,7 +1251,7 @@ mod tests {
             Path::new("/nonexistent/noel-tools-cwd"),
             bash("echo never"),
             &ToolRuntimeOptions::default(),
-            &mut |output| reports.push(output.to_string()),
+            &mut |output| reports.push(output.text.to_string()),
         )
         .await
         .unwrap_err();
@@ -1239,7 +1268,7 @@ mod tests {
                 limit: None,
             },
             &ToolRuntimeOptions::default(),
-            &mut |output| reports.push(output.to_string()),
+            &mut |output| reports.push(output.text.to_string()),
         )
         .await
         .expect("ls");
