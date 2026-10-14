@@ -12,6 +12,9 @@
 //!   JSON lines with `--json`). It holds again when the worker is lost, and
 //!   reconnects (starting a server) when the server is;
 //! - `abort <id>`, `resume <id> [<runId>]`, `withdraw <id> <submissionId>`.
+//!
+//! The TUI attached to a session (`noel --attach`, [`crate::attach`]) uses
+//! the same connection: [`Client::follow`] and [`Client::chat_call`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -119,7 +122,7 @@ pub(crate) async fn run(args: ClientArgs) -> i32 {
 }
 
 async fn command(command: ClientCommand) -> Result<i32> {
-    let client = Client::connect().await?;
+    let client = Client::connect(Arc::new(|message| eprintln!("noel client: {message}"))).await?;
     match command {
         ClientCommand::Ls { json } => client.ls(json).await,
         ClientCommand::New {
@@ -240,15 +243,35 @@ fn describe_submit(result: &Value, request_id: &str) -> String {
     }
 }
 
+/// Where a client reports what it does on its own: starting a server,
+/// reconnecting, sending a call again. Line mode prints it; the TUI shows
+/// it in its transcript.
+pub(crate) type Report = Arc<dyn Fn(String) + Send + Sync>;
+
+/// What following a session's view ([`Client::follow`]) yields.
+pub(crate) enum Followed {
+    /// The view: its snapshot (again after each hold), then its changes.
+    Update(StateUpdate),
+    /// The link to the server dropped; reconnecting, starting a server if
+    /// none listens.
+    ServerLost,
+    /// Connected again; the view is held again.
+    Reconnected,
+    /// The hold ended (its worker was lost), for this reason; holding again.
+    ViewEnded(String),
+}
+
 /// A connection to the server, reconnected (and the server started) when
 /// it drops.
-struct Client {
+#[derive(Clone)]
+pub(crate) struct Client {
     host: Host,
     lost: Arc<Notify>,
+    report: Report,
 }
 
 impl Client {
-    async fn connect() -> Result<Self> {
+    pub(crate) async fn connect(report: Report) -> Result<Self> {
         let lost = Arc::new(Notify::new());
         let signal = lost.clone();
         let host = Host::new(HostOptions {
@@ -264,24 +287,29 @@ impl Client {
             })),
             ..HostOptions::client("client")
         });
-        let stream = dial(true).await?;
+        let stream = dial(true, &report).await?;
         host.connect(link(stream).await?, LinkOptions::default());
-        Ok(Self { host, lost })
+        Ok(Self { host, lost, report })
+    }
+
+    /// Closes the connection, releasing what it holds.
+    pub(crate) async fn close(&self) {
+        self.host.close().await;
     }
 
     /// Connects again after the server was lost, starting one if needed.
     async fn reconnect(&self) {
         let mut delay = Duration::from_millis(100);
         loop {
-            match dial(true).await {
+            match dial(true, &self.report).await {
                 Ok(stream) => match link(stream).await {
                     Ok(link) => {
                         self.host.connect(link, LinkOptions::default());
                         return;
                     }
-                    Err(error) => eprintln!("noel client: reconnect: {error:#}"),
+                    Err(error) => (self.report)(format!("reconnect: {error:#}")),
                 },
-                Err(error) => eprintln!("noel client: reconnect: {error:#}"),
+                Err(error) => (self.report)(format!("reconnect: {error:#}")),
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(2));
@@ -298,7 +326,7 @@ impl Client {
 
     /// Calls a `noel.chat` method. With `retry`, a call or hold that fails
     /// `unavailable` is made again, with the same arguments, a few times.
-    async fn chat_call(
+    pub(crate) async fn chat_call(
         &self,
         session: &str,
         method: &str,
@@ -319,7 +347,7 @@ impl Client {
                             .downcast_ref::<ChordError>()
                             .is_some_and(|error| error.code == ErrorCode::Unavailable) =>
                 {
-                    eprintln!("noel client: {method}: {error}; sending again ({attempt})");
+                    (self.report)(format!("{method}: {error}; sending again ({attempt})"));
                     attempt += 1;
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(2));
@@ -380,6 +408,27 @@ impl Client {
     /// Prints the view's snapshot, then each change, holding again when the
     /// worker is lost and reconnecting when the server is.
     async fn watch(&self, session: &str, json: bool) -> Result<i32> {
+        Err(self
+            .follow(session, |followed| match followed {
+                Followed::Update(update) => print_update(&update, json),
+                Followed::ServerLost => print_note("server link lost; reconnecting", json),
+                Followed::Reconnected => print_note("reconnected; holding again", json),
+                Followed::ViewEnded(why) => {
+                    print_note(&format!("view ended ({why}); holding again"), json)
+                }
+            })
+            .await)
+    }
+
+    /// Follows the session's view into `sink`: its snapshot, then each
+    /// change. It holds the view again when the worker is lost, and
+    /// reconnects (starting a server) when the server is. It ends only when
+    /// the first hold fails, with that error.
+    pub(crate) async fn follow(
+        &self,
+        session: &str,
+        mut sink: impl FnMut(Followed),
+    ) -> anyhow::Error {
         let mut first = true;
         loop {
             let chat = self.chat(session);
@@ -387,23 +436,23 @@ impl Client {
             match chat.ready().await {
                 Ok(_) => {}
                 Err(error) if error.code == ErrorCode::Unavailable && !first => {
-                    eprintln!("noel client: watch: {error}; holding again");
+                    (self.report)(format!("watch: {error}; holding again"));
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return error.into(),
             }
             first = false;
             loop {
                 tokio::select! {
                     update = updates.next() => match update {
-                        Some(update) => print_update(&update, json),
+                        Some(update) => sink(Followed::Update(update)),
                         None => break,
                     },
                     () = self.lost.notified() => {
-                        print_note("server link lost; reconnecting", json);
+                        sink(Followed::ServerLost);
                         self.reconnect().await;
-                        print_note("reconnected; holding again", json);
+                        sink(Followed::Reconnected);
                     }
                 }
             }
@@ -411,7 +460,7 @@ impl Client {
                 noel_chord::RefStatus::Gone(error) => error.to_string(),
                 other => format!("{other:?}"),
             };
-            print_note(&format!("view ended ({why}); holding again"), json);
+            sink(Followed::ViewEnded(why));
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
@@ -425,7 +474,7 @@ async fn call(reference: &RemoteRef, method: &str, args: Value) -> Result<Value>
 
 /// The server's socket, checked: the runtime directory is this user's and
 /// so is the process listening. Starts a server when none listens.
-async fn dial(autostart: bool) -> Result<UnixStream> {
+async fn dial(autostart: bool, report: &Report) -> Result<UnixStream> {
     let root = RuntimeDir::locate();
     let connect = |root: PathBuf| async move {
         let dir = RuntimeDir::check(root)?;
@@ -438,7 +487,7 @@ async fn dial(autostart: bool) -> Result<UnixStream> {
         Err(error) if !autostart => Err(error),
         Err(_) => {
             match start_detached().await? {
-                Started::Running(pid) => eprintln!("noel client: started noel server (pid {pid})"),
+                Started::Running(pid) => report(format!("started noel server (pid {pid})")),
                 Started::AlreadyRunning(_) => {}
             }
             connect(root).await
