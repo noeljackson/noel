@@ -56,13 +56,17 @@ raw bytes it was decoded from.
 
 `noel-tools` runs `read`, `write`, `edit`, `ls` and `bash` through an
 `ExecutionEnv`; `edit` and `write` of one file run one at a time per file
-system id and canonical path. `grep` and `find` resolve paths in it and search
-with ripgrep's crates, so they need a local workspace (`is_local`).
+system id and canonical path. `grep` and `find` search with ripgrep's crates:
+in a local workspace (`is_local`) by walking the tree, in another over what
+its `list_files` lists and its reads return.
 
 `noel-core`'s `Runtime` asks its `EnvProvider` for the workspace of every
 tool call, with `EnvTarget { session_id, cwd }`, as Durable's harness
 `env(target)` does. The default is a `LocalEnv` at the session's working
-directory.
+directory; a session whose journal names a workspace (`SessionWorkspace`)
+gets it from `EnvProvider::Workspaces`, which the command line sets to open
+`ssh` workspaces as a `RemoteEnv` over `ssh::ssh_connection`
+(`docs/spec.md` §10).
 
 ## RemoteEnv: the pi-env client
 

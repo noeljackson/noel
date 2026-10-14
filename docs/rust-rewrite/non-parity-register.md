@@ -1450,8 +1450,9 @@ results and error texts are unchanged, except in these corners:
 - `file://` paths resolve as Node's `fileURLToPath` resolves them: a query or
   fragment is dropped, and a URL with a host other than `localhost`, an
   encoded `/`, or an escape that is not UTF-8 is an ordinary relative path.
-- `grep` and `find` search with ripgrep's crates on this machine's files, so
-  in a workspace that is not local they fail and say so.
+- `grep` and `find` search with ripgrep's crates. In a workspace on another
+  machine they list and read through the workspace, with the differences in
+  "Remote Workspaces".
 - `edit` and `write` of one file run one at a time within noel, keyed by the
   workspace id and the canonical path (upstream's file mutation queue). Where
   the canonical path cannot be found for another reason than a missing file,
@@ -1516,8 +1517,9 @@ invocations equal upstream's in `pi-env-ssh.json` except for the names below;
 and its tests pass against upstream's `pi-env` too (`make env-interop`). These
 parts differ:
 
-- **A library for now.** Nothing in noel starts a `RemoteEnv` yet; the
-  session's `Workspace` record and choosing a remote workspace come next.
+- **Connection status.** `Connection::status()` (idle, connecting,
+  connected, lost with why, closed), for the TUI's footer, is noel's;
+  upstream's connection reports nothing between requests.
 - **No terminals.** `openTerminal` and `RemoteTerminal` (`terminal.ts`) are
   not ported, since noel's `ExecutionEnv` has no terminals; the daemon still
   serves `pty`. Upstream's `LocalExecutionEnv` (`NodeExecutionEnv` with
@@ -1582,3 +1584,65 @@ stay local. The daemon lives outside `~/.noel` because noel imports pi's
 state only where `~/.noel` does not exist, so a deployment must not create it
 on a machine that has `~/.pi/agent`; a cache directory fits a
 content-addressed file that is put back whenever it is missing or changed.
+
+### Remote Workspaces
+
+A session can run its tools in a directory on another machine over `ssh`
+(`--workspace ssh://…`, `noel.sessions.create`'s `workspace`; `docs/spec.md`
+§10). Upstream's harness has the hook (Durable's `env(target)`) and its
+container example keeps a conversation's workspace with the conversation, but
+no coding-agent command line chooses a remote workspace, so the selection,
+trust and tool behaviour are noel's. They differ from upstream, and from a
+local workspace, in these parts:
+
+- **Selection is per session, by URL.** One adapter, `ssh`; the URL is saved
+  in the journal as a `workspace` record and cannot change for a session.
+  Older noel versions ignore the record and would run such a session's tools
+  on the local machine.
+- **The id is the machine.** `ssh://host[:port]`, without user or path, so
+  two sessions on one machine wait for each other's `edit` and `write` of the
+  same file; another name for the same machine (an alias, an address) is
+  another id.
+- **Trust is noel's own.** Keys live in `~/.noel/workspaces/known_hosts`
+  under `noel-env-<host>` (`noel-env-[<host>]:<port>` with a port), added
+  only by `noel workspace trust` after a fingerprint check, never on first
+  use; `ssh` still reads `~/.ssh/config`, keys and the agent to log in.
+- **`grep` and `find` list with the daemon.** Its `listFiles` walks with the
+  `ignore` crate like noel's local walk, but never lists `.git` (local `grep`
+  searches `.git/` like any hidden directory), reads only git's ignore rules
+  and only inside a git work tree (local `grep` also reads `.ignore` and
+  `.rgignore`; local `find` reads `.ignore` and `.fdignore`, and `.gitignore`
+  outside a repository too), and stops at 50 000 entries, 4 MiB or 10 s, which
+  the result then says. A `glob` filters the listing, so it cannot bring back
+  a file git ignores, as `rg --glob` can. `grep` reads every listed file
+  through the workspace, 16 at a time, whole, as the local one does.
+- **`bash`'s output** arrives per stream in arrival order (protocol 1 has no
+  merged pipe; see "noel-env Client"), and its complete output, past the
+  limits, is kept in the workspace's temporary directory, as Durable's bash
+  tool keeps it, rather than on this machine.
+- **A lost connection fails the call in flight** with `pi-env connection
+  lost`; for `bash`, `edit` and `write` the outcome is then unknown. The next
+  call starts a new daemon. The `shellPath` setting, a path on this machine,
+  does not apply: the daemon picks its shell.
+- **The system prompt** states the workspace's directory, and lists the
+  project's context files read from it (from the directory up to `/`, once
+  per process, again after `/reload`) after the user's own from the agent
+  dir. The local rule that a linked worktree's file replaces its main
+  checkout's is not applied there. Skills are not listed, since the model's
+  `read` cannot reach their files on this machine; `/skill:<name>` still
+  expands here.
+- **This machine's, not the workspace's:** settings and `.noel/`,
+  extensions (an extension tool runs here, in the session's local
+  directory), skills, prompt templates and themes, `@file` references, path
+  completion, images given with `--image`, and `/diff`, whose `git` runs here
+  and so shows no changes for files edited there.
+- **The footer** shows the workspace's URL and connection state in place of
+  the directory. The TUI attached to a server session and `noel client watch`
+  show neither; `noel client ls` shows the URL.
+- **Daemons.** Linux x86-64 and arm64 (`make env-daemons`); a macOS remote
+  fails its tool calls until a Mac-built daemon is put beside `noel`.
+
+Reason: a remote workspace changes only where tools run. Anything that would
+configure or execute noel itself stays on the machine noel runs on, so a
+remote directory can never make noel load code; and trust is an explicit,
+checked step because the agent will run commands there.
