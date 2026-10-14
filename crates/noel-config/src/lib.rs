@@ -1617,12 +1617,12 @@ pub fn load_config_with_resources(
     // Every known model. `enabledModels` scopes model selection without
     // removing models (`resolve_model_scope`).
     let models = merge_model_definitions(
-        default_models(),
+        with_base_url_env(default_models(), true, read_non_empty_env),
         cache
             .as_ref()
             .map(|cache| cache.models.clone())
             .unwrap_or_default(),
-        explicit_models,
+        with_base_url_env(explicit_models, false, read_non_empty_env),
     );
     let image_models = default_image_models();
     let keybindings = read_optional_json::<KeybindingsFile>(&paths.keybindings_path)?
@@ -2234,6 +2234,37 @@ fn resolve_config_value(value: &str) -> String {
         return env::var(name).unwrap_or_default();
     }
     value.to_string()
+}
+
+/// Each provider's standard base-URL variable, read as Claude Code and the
+/// providers' SDKs read it. In a Codewire Sandbox it names the local
+/// credential proxy, which replaces a placeholder credential with the real
+/// one, so requests that ignored it would reach the provider without one.
+const BASE_URL_ENV: [(&str, &str); 2] = [
+    ("anthropic", "ANTHROPIC_BASE_URL"),
+    ("openai", "OPENAI_BASE_URL"),
+];
+
+/// Points the provider's models at its base-URL variable when that is set:
+/// every built-in model (`replace`), but only those `models.json` entries
+/// that name no `baseUrl` of their own. Listed models derived from a
+/// built-in one inherit the built-in's address.
+fn with_base_url_env(
+    mut models: Vec<ModelDefinition>,
+    replace: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> Vec<ModelDefinition> {
+    for (provider, name) in BASE_URL_ENV {
+        let Some(url) = env(name) else {
+            continue;
+        };
+        for model in models.iter_mut().filter(|model| {
+            canonical_provider(&model.provider) == provider && (replace || model.base_url.is_none())
+        }) {
+            model.base_url = Some(url.trim().to_string());
+        }
+    }
+    models
 }
 
 fn read_non_empty_env(name: &str) -> Option<String> {
@@ -4955,6 +4986,61 @@ mod tests {
     /// `model-catalog.json` in full: every upstream model noel can run is a
     /// default model with upstream's values. (`noel_ai::catalog` compares the
     /// catalog itself; this compares what a config loads.)
+    /// In a Codewire Sandbox the base-URL variables name the local
+    /// credential proxy: the provider's built-in models follow them, a
+    /// `models.json` entry that names its own address keeps it, and other
+    /// providers are untouched.
+    #[test]
+    fn provider_base_url_variables_point_its_models_at_them() {
+        let env = |name: &str| match name {
+            "ANTHROPIC_BASE_URL" => Some("http://127.0.0.1:4141/_codewire/anthropic".to_string()),
+            "OPENAI_BASE_URL" => Some("http://127.0.0.1:4141/_codewire/openai/v1".to_string()),
+            _ => None,
+        };
+        let model = |provider: &str, base_url: Option<&str>| ModelDefinition {
+            provider: provider.to_string(),
+            id: "m".to_string(),
+            base_url: base_url.map(str::to_string),
+            ..ModelDefinition::default()
+        };
+        let urls = |models: Vec<ModelDefinition>| {
+            models
+                .into_iter()
+                .map(|model| model.base_url)
+                .collect::<Vec<_>>()
+        };
+        let builtin = vec![
+            model("anthropic", Some("https://api.anthropic.com/v1")),
+            model("openai", Some("https://api.openai.com/v1")),
+            model("mistral", Some("https://api.mistral.ai/v1")),
+        ];
+        assert_eq!(
+            urls(with_base_url_env(builtin, true, env)),
+            [
+                Some("http://127.0.0.1:4141/_codewire/anthropic".to_string()),
+                Some("http://127.0.0.1:4141/_codewire/openai/v1".to_string()),
+                Some("https://api.mistral.ai/v1".to_string()),
+            ]
+        );
+        let explicit = vec![
+            model("anthropic", Some("https://gateway.example/anthropic")),
+            model("anthropic", None),
+        ];
+        assert_eq!(
+            urls(with_base_url_env(explicit, false, env)),
+            [
+                Some("https://gateway.example/anthropic".to_string()),
+                Some("http://127.0.0.1:4141/_codewire/anthropic".to_string()),
+            ]
+        );
+        // Unset, nothing changes.
+        let builtin = vec![model("anthropic", Some("https://api.anthropic.com/v1"))];
+        assert_eq!(
+            urls(with_base_url_env(builtin, true, |_| None)),
+            [Some("https://api.anthropic.com/v1".to_string())]
+        );
+    }
+
     #[test]
     fn default_models_are_upstreams_catalog_in_full() {
         let fixture = serde_json::from_str::<serde_json::Value>(include_str!(

@@ -937,6 +937,7 @@ behavior exists so the client does not multiply quota by rotation.
 
 Provider-specific environment:
 
+- Anthropic and OpenAI: `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` move the provider's built-in models, and `models.json` entries without a `baseUrl`, to another address, as Claude Code and the OpenAI SDK read them. Anthropic's value has no `/v1` (for example `http://127.0.0.1:4141/_codewire/anthropic`); OpenAI's includes it. A Codewire Sandbox sets both to its credential proxy.
 - Azure OpenAI: set `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`; optionally set `AZURE_OPENAI_DEPLOYMENT_NAME`, `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`, and `AZURE_OPENAI_API_VERSION`.
 - Google Vertex: set `GOOGLE_CLOUD_PROJECT` or `GCLOUD_PROJECT`, plus `GOOGLE_CLOUD_LOCATION`.
 - Cloudflare: set `CLOUDFLARE_ACCOUNT_ID`; AI Gateway also needs `CLOUDFLARE_GATEWAY_ID`. Without them the provider's models do not count as available, whatever key is set.
