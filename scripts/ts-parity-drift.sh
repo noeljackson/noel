@@ -26,11 +26,23 @@ mkdir -p "${fresh_fixtures_dir}" "${fixtures_dir}"
   git -C /ts-reference rev-parse HEAD > "${out_dir}/reference-sha"
 reference_sha="$(cat "${out_dir}/reference-sha")"
 
+# chord-delta.json is pinned (CHORD_REFERENCE_REF in the Makefile) rather than
+# made from the tracking ref, so its drift is the packages/chord commits on the
+# tracking ref after the pin.
+chord_file="${out_dir}/chord-commits"
+chord_pin="$("${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
+  git -C /chord-reference rev-parse HEAD)"
+"${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
+  git -C /ts-reference log --oneline "${chord_pin}..HEAD" -- packages/chord > "${chord_file}"
+
 "${docker_bin}" run --rm \
   -v "${repo_root}/${fresh_fixtures_dir}:/fixtures" \
   "${TS_PARITY_IMAGE:-pi-ts-parity}"
 
-if ! diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}"; then
+fixtures_drift=0
+diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}" || fixtures_drift=1
+
+if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file}" ]; then
   {
     printf '# TS Parity Drift Brief\n\n'
     printf 'The TypeScript reference fixtures changed against the tracked reference.\n\n'
@@ -40,11 +52,19 @@ if ! diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}"; then
     printf -- '- Commit: `%s`\n' "${reference_sha}"
     printf -- '- Fixtures: `%s`\n' "${fixtures_dir}"
     printf -- '- Diff: `%s`\n\n' "${diff_file}"
+    if [ -s "${chord_file}" ]; then
+      printf '## Chord pin\n\n'
+      printf '`chord-delta.json` is pinned to `%s` (`CHORD_REFERENCE_REF` in the Makefile). `packages/chord` changed after it on the tracked reference:\n\n' "${chord_pin}"
+      printf '```text\n'
+      cat "${chord_file}"
+      printf '```\n\n'
+      printf 'Move the pin to the newest of these commits at which `packages/chord` builds (the image build checks), regenerate with `make ts-parity-fixtures`, and bring `crates/noel-chord` level with the new fixture.\n\n'
+    fi
     printf '## Constraints\n\n'
     printf -- '- Do not run npm on the host.\n'
     printf -- '- Execute TypeScript only through Docker targets such as `make ts-parity-fixtures`, `make ts-parity-update`, or `make ts-parity-drift`.\n'
     printf -- '- Keep changes scoped to Rust parity code, fixtures, tests, and docs required by the drift.\n'
-    printf -- '- Run `cargo test -p noel-parity`, `cargo test -p noel-ai --lib matches_ts`, `cargo test -p noel-ai --lib catalog`, `cargo test -p noel-config --lib model`, `cargo test -p noel-cli --test model_parity`, `cargo test -p noel-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools`, `cargo test -p noel-core --lib system_prompt_matches_ts_builder`, `cargo test -p noel-cli --bin noel prompt_and_context_files_match_ts_discovery`, `cargo test -p noel-core --lib tool_parity_tests`, `cargo test -p noel-config --lib _ts`, `cargo test -p noel-core --lib input_expansion_matches_ts_session`, `cargo test -p noel-cli --test rpc_parity get_commands_matches_upstream`, `cargo test -p noel-cli --test rpc_parity golden_`, and `make check` before committing.\n'
+    printf -- '- Run `cargo test -p noel-parity`, `cargo test -p noel-ai --lib matches_ts`, `cargo test -p noel-ai --lib catalog`, `cargo test -p noel-config --lib model`, `cargo test -p noel-cli --test model_parity`, `cargo test -p noel-core --lib upstream_agent_tool_loop_fixture_documents_model_callable_tools`, `cargo test -p noel-core --lib system_prompt_matches_ts_builder`, `cargo test -p noel-cli --bin noel prompt_and_context_files_match_ts_discovery`, `cargo test -p noel-core --lib tool_parity_tests`, `cargo test -p noel-config --lib _ts`, `cargo test -p noel-core --lib input_expansion_matches_ts_session`, `cargo test -p noel-cli --test rpc_parity get_commands_matches_upstream`, `cargo test -p noel-cli --test rpc_parity golden_`, `cargo test -p noel-chord`, and `make check` before committing.\n'
     printf -- '- If a GitHub issue is provided, include `closes #<number>` in the commit message.\n\n'
     printf '## Suggested Workflow\n\n'
     printf '1. Inspect `tests/fixtures/ts-parity` and the diff below.\n'
@@ -88,6 +108,7 @@ fi
 "${cargo_bin}" test -p noel-core --lib input_expansion_matches_ts_session
 "${cargo_bin}" test -p noel-cli --test rpc_parity get_commands_matches_upstream
 "${cargo_bin}" test -p noel-cli --test rpc_parity golden_
+"${cargo_bin}" test -p noel-chord
 "${cargo_bin}" test -p noel-parity
 
 printf 'No TS parity drift detected.\n'
