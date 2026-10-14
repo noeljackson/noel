@@ -1,4 +1,7 @@
 mod compaction;
+pub mod controller;
+#[cfg(test)]
+mod controller_tests;
 mod input;
 #[cfg(test)]
 mod recovery_tests;
@@ -132,6 +135,11 @@ pub struct RunStart {
     /// run instead of starting another.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// What the client called the submission that started the run, so a
+    /// `requestId` reused for another kind is refused. Older versions
+    /// started runs only with prompts, and leave it out.
+    #[serde(default, skip_serializing_if = "SubmissionKind::is_prompt")]
+    pub kind: SubmissionKind,
 }
 
 /// A run: a prompt and the work it caused, until it settled. RPC mode
@@ -142,7 +150,89 @@ pub struct Run {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "SubmissionKind::is_prompt")]
+    pub kind: SubmissionKind,
     pub status: RunStatus,
+}
+
+/// What a client called a submission (spec §3.1): a prompt, a steer or a
+/// follow-up. A `requestId` names one submission of one kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionKind {
+    #[default]
+    Prompt,
+    Steer,
+    FollowUp,
+}
+
+impl SubmissionKind {
+    pub fn is_prompt(&self) -> bool {
+        *self == Self::Prompt
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Steer => "steer",
+            Self::FollowUp => "followUp",
+        }
+    }
+}
+
+impl From<QueueMode> for SubmissionKind {
+    fn from(mode: QueueMode) -> Self {
+        match mode {
+            QueueMode::Steer => Self::Steer,
+            QueueMode::FollowUp => Self::FollowUp,
+        }
+    }
+}
+
+/// Where a queued submission waits: steering joins the active run at its
+/// next provider round, after the current tool round; a follow-up starts
+/// the run's next engine call when the run would answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueMode {
+    Steer,
+    FollowUp,
+}
+
+/// A queued submission's identity, as the journal saves it: in the queue
+/// record while it waits, then with the message that places it into a run,
+/// or in the queue record that withdraws it. Only a submission with a
+/// `requestId` is saved this way: nothing can ask about another one after
+/// the process that queued it ends, so its id lasts only that long.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueItemId {
+    pub submission_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub mode: QueueMode,
+}
+
+impl QueueItemId {
+    /// Whether the journal keeps this identity (see [`QueueItemId`]).
+    pub fn is_durable(&self) -> bool {
+        self.request_id.is_some()
+    }
+}
+
+/// A queued submission: its identity, and its text as it will be placed
+/// (a skill command or a prompt template already expanded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueItem {
+    pub id: QueueItemId,
+    pub content: String,
+}
+
+/// A saved submission that left the queue (see [`QueueItemId`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PastSubmission {
+    pub id: QueueItemId,
+    /// The run it was placed into; `None` if it was withdrawn unanswered.
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +268,15 @@ pub struct SessionState {
     /// queues steering: the TUI turns leftover steering into follow-ups.
     #[serde(default)]
     pub queued_steering: usize,
+    /// The saved identity of each of `queued_messages`, when the queue was
+    /// saved with any (see [`QueueItemId`]); otherwise empty.
+    #[serde(default)]
+    pub queued_ids: Vec<QueueItemId>,
+    /// Saved submissions that left the queue, oldest first, as the journal
+    /// had them when the session was loaded. The session controller keeps
+    /// its own copy current.
+    #[serde(default)]
+    pub past_submissions: Vec<PastSubmission>,
     #[serde(default)]
     pub compactions: Vec<CompactionRecord>,
     #[serde(default)]
@@ -206,6 +305,56 @@ impl SessionState {
     pub fn saved_queue(&self) -> (&[String], &[String]) {
         let steering = self.queued_steering.min(self.queued_messages.len());
         self.queued_messages.split_at(steering)
+    }
+
+    /// The saved queue's items, steering first, with their saved
+    /// identities. An item saved without one (by an older version, by the
+    /// TUI, or without a `requestId`) has `None`.
+    pub fn saved_queue_items(&self) -> Vec<(QueueMode, String, Option<QueueItemId>)> {
+        let steering = self.queued_steering.min(self.queued_messages.len());
+        let ids = (self.queued_ids.len() == self.queued_messages.len())
+            .then_some(self.queued_ids.as_slice());
+        self.queued_messages
+            .iter()
+            .enumerate()
+            .map(|(index, content)| {
+                let mode = if index < steering {
+                    QueueMode::Steer
+                } else {
+                    QueueMode::FollowUp
+                };
+                let id = ids
+                    .map(|ids| &ids[index])
+                    .filter(|id| id.mode == mode)
+                    .cloned();
+                (mode, content.clone(), id)
+            })
+            .collect()
+    }
+
+    /// Takes the queued submissions `placed` out of the saved queue: the
+    /// message that placed them into run `run_id` is saved.
+    fn place_queued(&mut self, placed: Vec<QueueItemId>, run_id: Option<&str>) {
+        for id in placed {
+            let index = (self.queued_ids.len() == self.queued_messages.len())
+                .then(|| {
+                    self.queued_ids
+                        .iter()
+                        .position(|queued| queued.submission_id == id.submission_id)
+                })
+                .flatten();
+            if let Some(index) = index {
+                self.queued_ids.remove(index);
+                self.queued_messages.remove(index);
+                if index < self.queued_steering {
+                    self.queued_steering -= 1;
+                }
+            }
+            self.past_submissions.push(PastSubmission {
+                id,
+                run_id: run_id.map(str::to_owned),
+            });
+        }
     }
 
     /// The run a prompt with `request_id` started, if one did.
@@ -276,6 +425,8 @@ impl SessionState {
             tool_history: Vec::new(),
             queued_messages: Vec::new(),
             queued_steering: 0,
+            queued_ids: Vec::new(),
+            past_submissions: Vec::new(),
             compactions: Vec::new(),
             branch_summaries: Vec::new(),
             active_model: None,
@@ -393,6 +544,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         // An imported session has no run for steering to join.
         queued_messages: export.queued_messages,
         queued_steering: 0,
+        queued_ids: Vec::new(),
+        past_submissions: Vec::new(),
         compactions: export.compactions,
         branch_summaries: export.branch_summaries,
         active_model: export.active_model,
@@ -799,6 +952,11 @@ enum SessionRecord {
         /// never saved without its prompt. Older versions ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run: Option<RunStart>,
+        /// The queued submissions this message places into the run, which
+        /// leave the queue with it: one record, so a submission is never
+        /// both placed and still queued. Older versions ignore it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        placed: Vec<QueueItemId>,
     },
     MessagesSnapshot {
         messages: Vec<ConversationMessage>,
@@ -836,6 +994,14 @@ enum SessionRecord {
         messages: Vec<String>,
         #[serde(default, skip_serializing_if = "is_zero")]
         steering: usize,
+        /// Each message's identity, when any has a `requestId` (see
+        /// [`QueueItemId`]); older versions ignore it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<QueueItemId>,
+        /// The saved submissions this record withdraws from the queue
+        /// unanswered; older versions ignore it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        withdrawn: Vec<QueueItemId>,
     },
     Compaction {
         record: CompactionRecord,
@@ -1004,7 +1170,22 @@ impl SessionStore {
     }
 
     pub fn record_message(&self, message: ConversationMessage) -> Result<(), SessionError> {
-        self.append(&SessionRecord::Message { message, run: None })
+        self.record_placed_message(message, Vec::new())
+    }
+
+    /// Saves `message` with the queued submissions it places into the run;
+    /// only those the journal keeps (see [`QueueItemId`]) are named.
+    pub fn record_placed_message(
+        &self,
+        message: ConversationMessage,
+        placed: Vec<QueueItemId>,
+    ) -> Result<(), SessionError> {
+        let placed = placed.into_iter().filter(QueueItemId::is_durable).collect();
+        self.append(&SessionRecord::Message {
+            message,
+            run: None,
+            placed,
+        })
     }
 
     pub fn record_messages_snapshot(
@@ -1070,6 +1251,18 @@ impl SessionStore {
         follow_ups: Vec<String>,
     ) -> Result<(), SessionError> {
         self.append(&queue_record(steering, follow_ups))
+    }
+
+    /// Saves the whole queue with its items' identities, steering first,
+    /// and the submissions it withdraws. Identities are saved only when the
+    /// journal keeps them (see [`QueueItemId`]), so a queue without any is
+    /// saved as [`SessionStore::record_queue`] saves it.
+    pub fn record_queue_items(
+        &self,
+        items: &[QueueItem],
+        withdrawn: &[QueueItemId],
+    ) -> Result<(), SessionError> {
+        self.append(&queue_items_record(items, withdrawn))
     }
 
     pub fn record_compaction(&self, record: CompactionRecord) -> Result<(), SessionError> {
@@ -1281,7 +1474,11 @@ impl SessionStore {
                 .messages
                 .iter()
                 .cloned()
-                .map(|message| SessionRecord::Message { message, run: None }),
+                .map(|message| SessionRecord::Message {
+                    message,
+                    run: None,
+                    placed: Vec::new(),
+                }),
         );
         records.extend(
             state
@@ -1343,6 +1540,31 @@ fn queue_record(steering: Vec<String>, follow_ups: Vec<String>) -> SessionRecord
     SessionRecord::QueuedMessagesSnapshot {
         messages,
         steering: count,
+        items: Vec::new(),
+        withdrawn: Vec::new(),
+    }
+}
+
+/// The queue record for `items`, steering first.
+fn queue_items_record(items: &[QueueItem], withdrawn: &[QueueItemId]) -> SessionRecord {
+    let steering = items
+        .iter()
+        .take_while(|item| item.id.mode == QueueMode::Steer)
+        .count();
+    let durable = items.iter().any(|item| item.id.is_durable());
+    SessionRecord::QueuedMessagesSnapshot {
+        messages: items.iter().map(|item| item.content.clone()).collect(),
+        steering,
+        items: if durable {
+            items.iter().map(|item| item.id.clone()).collect()
+        } else {
+            Vec::new()
+        },
+        withdrawn: withdrawn
+            .iter()
+            .filter(|id| id.is_durable())
+            .cloned()
+            .collect(),
     }
 }
 
@@ -1415,15 +1637,23 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             state.labels = labels.into_iter().collect();
             state.parent_session_id = parent_session_id;
         }
-        SessionRecord::Message { message, run } => {
+        SessionRecord::Message {
+            message,
+            run,
+            placed,
+        } => {
             state.messages.push(message);
             // Whatever started a run, a load did not: it was interrupted
             // unless a `run_finished` record follows.
             state.runs.extend(run.map(|run| Run {
                 id: run.id,
                 request_id: run.request_id,
+                kind: run.kind,
                 status: RunStatus::Interrupted,
             }));
+            // Submissions are placed only while a run is active: the last.
+            let run_id = state.runs.last().map(|run| run.id.clone());
+            state.place_queued(placed, run_id.as_deref());
         }
         SessionRecord::MessagesSnapshot { messages } => state.messages = messages,
         SessionRecord::Tool { event } => state.tool_history.push(event),
@@ -1436,10 +1666,29 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         }
         SessionRecord::Todos { todos } => state.todos = todos,
         SessionRecord::EditedFiles { paths } => state.edited_files = paths,
-        SessionRecord::QueuedMessage { message } => state.queued_messages.push(message),
-        SessionRecord::QueuedMessagesSnapshot { messages, steering } => {
+        SessionRecord::QueuedMessage { message } => {
+            state.queued_messages.push(message);
+            // Records like this one name no identities.
+            state.queued_ids.clear();
+        }
+        SessionRecord::QueuedMessagesSnapshot {
+            messages,
+            steering,
+            items,
+            withdrawn,
+        } => {
+            state.queued_ids = if items.len() == messages.len() {
+                items
+            } else {
+                Vec::new()
+            };
             state.queued_messages = messages;
             state.queued_steering = steering;
+            state.past_submissions.extend(
+                withdrawn
+                    .into_iter()
+                    .map(|id| PastSubmission { id, run_id: None }),
+            );
         }
         SessionRecord::Compaction { record } => state.compactions.push(record),
         SessionRecord::CompactionCheckpoint { record, messages } => {
@@ -2268,6 +2517,7 @@ impl Runtime {
             store.record_queued_message(message.clone())?;
         }
         self.session.queued_messages.push(message);
+        self.session.queued_ids.clear();
         Ok(())
     }
 
@@ -2278,6 +2528,7 @@ impl Runtime {
         }
         self.session.queued_messages = messages;
         self.session.queued_steering = 0;
+        self.session.queued_ids.clear();
         Ok(())
     }
 
@@ -2311,15 +2562,32 @@ impl Runtime {
             store.append(&SessionRecord::Message {
                 message: message.clone(),
                 run: Some(start.clone()),
+                placed: Vec::new(),
             })?;
         }
         self.session.messages.push(message.clone());
         self.session.runs.push(Run {
             id: start.id,
             request_id: start.request_id,
+            kind: start.kind,
             status: RunStatus::Running,
         });
         Ok(message)
+    }
+
+    /// Saves `message`, a user message that places the queued submissions
+    /// `placed` into the active run, in one record with them (see
+    /// [`SessionStore::record_placed_message`]).
+    pub fn push_placed_message(
+        &mut self,
+        message: ConversationMessage,
+        placed: Vec<QueueItemId>,
+    ) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_placed_message(message.clone(), placed)?;
+        }
+        self.session.messages.push(message);
+        Ok(())
     }
 
     /// This process continues the interrupted run `run_id`. Nothing is
@@ -2479,49 +2747,98 @@ pub async fn run_user_turn_streaming(
 /// Everything queued at an injection point is combined into a single user
 /// message (joined with [`STEERING_JOIN`]) so a burst of steering reads as
 /// one instruction rather than several interruptions.
+///
+/// A message may carry its queued submission's identity
+/// ([`SteeringMailbox::push`]): the turn saves it with the message that
+/// places it, and keeps it for [`SteeringMailbox::take_delivered`].
 #[derive(Debug, Clone, Default)]
 pub struct SteeringMailbox {
-    messages: Arc<Mutex<VecDeque<String>>>,
+    inner: Arc<Mutex<Mailbox>>,
+}
+
+#[derive(Debug, Default)]
+struct Mailbox {
+    messages: VecDeque<(String, Option<QueueItemId>)>,
+    /// The identities of messages a turn has placed, until taken.
+    delivered: Vec<QueueItemId>,
 }
 
 impl SteeringMailbox {
     pub fn new() -> Self {
-        Self {
-            messages: Arc::new(Mutex::new(VecDeque::new())),
-        }
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Mailbox> {
+        self.inner.lock().expect("steering mailbox")
     }
 
     pub fn send(&self, message: String) {
-        self.messages
-            .lock()
-            .expect("steering mailbox")
-            .push_back(message);
+        self.lock().messages.push_back((message, None));
+    }
+
+    /// Queues a submission with its identity.
+    pub fn push(&self, item: QueueItem) {
+        self.lock()
+            .messages
+            .push_back((item.content, Some(item.id)));
     }
 
     pub fn pending(&self) -> usize {
-        self.messages.lock().expect("steering mailbox").len()
+        self.lock().messages.len()
     }
 
     pub fn list(&self) -> Vec<String> {
-        self.messages
-            .lock()
-            .expect("steering mailbox")
+        let mailbox = self.lock();
+        mailbox
+            .messages
             .iter()
-            .cloned()
+            .map(|(text, _)| text.clone())
             .collect()
+    }
+
+    /// The queued messages that carry an identity, in order.
+    pub fn items(&self) -> Vec<QueueItem> {
+        let mailbox = self.lock();
+        let items = mailbox.messages.iter().filter_map(|(content, id)| {
+            id.clone().map(|id| QueueItem {
+                id,
+                content: content.clone(),
+            })
+        });
+        items.collect()
     }
 
     pub fn drain(&self) -> Vec<String> {
-        self.messages
-            .lock()
-            .expect("steering mailbox")
-            .drain(..)
-            .collect()
+        let mut mailbox = self.lock();
+        mailbox.messages.drain(..).map(|(text, _)| text).collect()
     }
 
-    fn take_batch(&self) -> Vec<String> {
-        let mut messages = self.messages.lock().expect("steering mailbox");
-        messages.drain(..).collect()
+    /// Takes the queued message of submission `submission_id`, if it is
+    /// still queued.
+    pub fn remove(&self, submission_id: &str) -> Option<QueueItem> {
+        let mut mailbox = self.lock();
+        let index = mailbox.messages.iter().position(|(_, id)| {
+            id.as_ref()
+                .is_some_and(|id| id.submission_id == submission_id)
+        })?;
+        let (content, id) = mailbox.messages.remove(index)?;
+        id.map(|id| QueueItem { id, content })
+    }
+
+    /// The identities of the messages turns have placed since the last
+    /// call, oldest first.
+    pub fn take_delivered(&self) -> Vec<QueueItemId> {
+        std::mem::take(&mut self.lock().delivered)
+    }
+
+    /// Takes everything queued for a turn to place: the texts, and the
+    /// identities, which are also kept for [`SteeringMailbox::take_delivered`].
+    fn take_batch(&self) -> (Vec<String>, Vec<QueueItemId>) {
+        let mut mailbox = self.lock();
+        let (texts, ids): (Vec<_>, Vec<_>) = mailbox.messages.drain(..).unzip();
+        let ids = ids.into_iter().flatten().collect::<Vec<_>>();
+        mailbox.delivered.extend(ids.iter().cloned());
+        (texts, ids)
     }
 }
 
@@ -2876,8 +3193,8 @@ async fn run_model_turn_streaming_events(
         if let Some(prompt) = prompt.take() {
             on_event(&TurnEvent::MessageAdded(prompt));
         }
-        if let Some(message) = steering_message(&run.steering) {
-            add_message(runtime, message, &mut on_event)?;
+        if let Some((message, placed)) = steering_message(&run.steering) {
+            add_placed_message(runtime, message, placed, &mut on_event)?;
         }
         let fingerprint = (
             runtime.session.messages.len(),
@@ -2995,11 +3312,11 @@ async fn run_model_turn_streaming_events(
             on_event(&TurnEvent::RoundFinished);
             // A steering message that arrived while the final response was
             // streaming keeps the turn going instead of being dropped.
-            let Some(message) = steering_message(&run.steering) else {
+            let Some((message, placed)) = steering_message(&run.steering) else {
                 return Ok(final_text);
             };
             on_event(&TurnEvent::RoundStarted);
-            add_message(runtime, message, &mut on_event)?;
+            add_placed_message(runtime, message, placed, &mut on_event)?;
             round_open = true;
             continue;
         }
@@ -3204,10 +3521,14 @@ fn user_message(prompt: String, media: Vec<MediaInput>) -> ConversationMessage {
 }
 
 /// Pending steering as one user message: a burst reads as one instruction
-/// (joined with [`STEERING_JOIN`]), not several interruptions.
-fn steering_message(steering: &SteeringMailbox) -> Option<ConversationMessage> {
-    let messages = steering.take_batch();
-    (!messages.is_empty()).then(|| user_message(messages.join(STEERING_JOIN), Vec::new()))
+/// (joined with [`STEERING_JOIN`]), not several interruptions. With it come
+/// the queued submissions it places.
+fn steering_message(steering: &SteeringMailbox) -> Option<(ConversationMessage, Vec<QueueItemId>)> {
+    let (messages, placed) = steering.take_batch();
+    (!messages.is_empty()).then(|| {
+        let message = user_message(messages.join(STEERING_JOIN), Vec::new());
+        (message, placed)
+    })
 }
 
 /// Saves `message` to the session and reports it.
@@ -3216,7 +3537,17 @@ fn add_message(
     message: ConversationMessage,
     on_event: &mut impl FnMut(&TurnEvent),
 ) -> Result<(), AgentError> {
-    runtime.push_message(message.clone())?;
+    add_placed_message(runtime, message, Vec::new(), on_event)
+}
+
+/// Saves `message` with the queued submissions it places, and reports it.
+fn add_placed_message(
+    runtime: &mut Runtime,
+    message: ConversationMessage,
+    placed: Vec<QueueItemId>,
+    on_event: &mut impl FnMut(&TurnEvent),
+) -> Result<(), AgentError> {
+    runtime.push_placed_message(message.clone(), placed)?;
     on_event(&TurnEvent::MessageAdded(message));
     Ok(())
 }
@@ -8325,10 +8656,12 @@ mod tests {
         let start = |id: &str, request_id: &str| RunStart {
             id: id.into(),
             request_id: Some(request_id.into()),
+            kind: SubmissionKind::Prompt,
         };
         let run = |id: &str, request_id: &str, status| Run {
             id: id.into(),
             request_id: Some(request_id.into()),
+            kind: SubmissionKind::Prompt,
             status,
         };
         let runs = || SessionStore::read(&path).unwrap().runs;
