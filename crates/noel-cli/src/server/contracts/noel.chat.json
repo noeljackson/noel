@@ -1,0 +1,138 @@
+{
+  "name": "noel.chat",
+  "scope": "remote",
+  "version": 1,
+  "input": {
+    "type": "object",
+    "required": ["session"],
+    "properties": {"session": {"type": "string"}}
+  },
+  "variants": {
+    "viewer": {
+      "view": {
+        "kind": "state",
+        "schema": {
+          "type": "object",
+          "required": ["conversation", "entries", "docs"],
+          "properties": {
+            "conversation": {
+              "type": "object",
+              "required": ["id", "cwd"],
+              "properties": {"id": {"type": "string"}, "cwd": {"type": "string"}, "name": {"type": "string"}}
+            },
+            "entries": {"type": "array"},
+            "docs": {"type": "object"},
+            "lastRun": {"type": "object"}
+          }
+        }
+      }
+    },
+    "participant": {
+      "view": {
+        "kind": "state",
+        "schema": {
+          "type": "object",
+          "required": ["conversation", "entries", "docs"],
+          "properties": {
+            "conversation": {
+              "type": "object",
+              "required": ["id", "cwd"],
+              "properties": {"id": {"type": "string"}, "cwd": {"type": "string"}, "name": {"type": "string"}}
+            },
+            "entries": {"type": "array"},
+            "docs": {"type": "object"},
+            "lastRun": {"type": "object"}
+          }
+        }
+      },
+      "submit": {
+        "kind": "method",
+        "args": {
+          "type": "object",
+          "required": ["requestId", "text"],
+          "properties": {
+            "requestId": {"type": "string", "minLength": 1},
+            "text": {"type": "string"},
+            "images": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["data", "mimeType"],
+                "properties": {"data": {"type": "string"}, "mimeType": {"type": "string"}}
+              }
+            },
+            "whenBusy": {"enum": ["reject", "steer", "followUp"]}
+          }
+        },
+        "result": {
+          "type": "object",
+          "required": ["submissionId", "disposition"],
+          "properties": {
+            "submissionId": {"type": "string"},
+            "runId": {"type": "string"},
+            "disposition": {"enum": ["started", "queued", "repeated"]},
+            "status": {"enum": ["queued", "running", "interrupted", "completed", "failed", "aborted", "withdrawn"]}
+          }
+        }
+      },
+      "withdraw": {
+        "kind": "method",
+        "args": {
+          "type": "object",
+          "required": ["submissionId"],
+          "properties": {"submissionId": {"type": "string"}}
+        },
+        "result": {
+          "type": "object",
+          "required": ["outcome"],
+          "properties": {"outcome": {"enum": ["withdrawn", "already_placed", "settled"]}}
+        }
+      },
+      "abort": {
+        "kind": "method",
+        "args": {"type": "object", "properties": {"expectedRunId": {"type": "string"}}},
+        "result": {
+          "type": "object",
+          "properties": {"runId": {"type": "string"}, "withdrawn": {"type": "integer"}}
+        }
+      },
+      "compact": {
+        "kind": "method",
+        "args": {"type": "object", "properties": {"instructions": {"type": "string"}}},
+        "result": {
+          "type": "object",
+          "required": ["omittedMessages", "retainedMessages"],
+          "properties": {
+            "omittedMessages": {"type": "integer"},
+            "retainedMessages": {"type": "integer"}
+          }
+        }
+      },
+      "configure": {
+        "kind": "method",
+        "args": {
+          "type": "object",
+          "properties": {"model": {"type": "string"}, "thinkingLevel": {"type": "string"}}
+        },
+        "result": {
+          "type": "object",
+          "required": ["thinkingLevel"],
+          "properties": {"model": {"type": "string"}, "thinkingLevel": {"type": "string"}}
+        }
+      },
+      "resume": {
+        "kind": "method",
+        "args": {
+          "type": "object",
+          "required": ["expectedRunId"],
+          "properties": {"expectedRunId": {"type": "string"}}
+        },
+        "result": {
+          "type": "object",
+          "required": ["runId"],
+          "properties": {"runId": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "noel.models",
+  "scope": "remote",
+  "version": 1,
+  "input": {"type": "object", "properties": {}},
+  "variants": {
+    "owner": {
+      "catalog": {
+        "kind": "state",
+        "schema": {
+          "type": "object",
+          "required": ["models"],
+          "properties": {
+            "models": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["provider", "modelId", "name", "reasoning", "thinkingLevels"],
+                "properties": {
+                  "provider": {"type": "string"},
+                  "modelId": {"type": "string"},
+                  "name": {"type": "string"},
+                  "reasoning": {"type": "boolean"},
+                  "thinkingLevels": {"type": "array", "items": {"type": "string"}}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
