@@ -1,0 +1,84 @@
+{
+  "name": "noel.sessions",
+  "scope": "remote",
+  "version": 1,
+  "input": {"type": "object", "properties": {}},
+  "variants": {
+    "owner": {
+      "directory": {
+        "kind": "state",
+        "schema": {
+          "type": "object",
+          "required": ["sessions"],
+          "properties": {
+            "sessions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["sessionId", "cwd", "modified", "messageCount", "live"],
+                "properties": {
+                  "sessionId": {"type": "string"},
+                  "name": {"type": "string"},
+                  "cwd": {"type": "string"},
+                  "modified": {"type": "integer"},
+                  "messageCount": {"type": "integer"},
+                  "firstPrompt": {"type": "string"},
+                  "model": {"type": "string"},
+                  "live": {
+                    "type": "object",
+                    "required": ["worker", "busy", "viewers"],
+                    "properties": {
+                      "worker": {"type": "boolean"},
+                      "busy": {"type": "boolean"},
+                      "viewers": {"type": "integer"}
+                    }
+                  },
+                  "lastRun": {
+                    "type": "object",
+                    "required": ["runId", "status"],
+                    "properties": {"runId": {"type": "string"}, "status": {"type": "string"}}
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "create": {
+        "kind": "method",
+        "args": {
+          "type": "object",
+          "required": ["requestId", "cwd"],
+          "properties": {
+            "requestId": {"type": "string", "minLength": 1},
+            "cwd": {"type": "string"},
+            "name": {"type": "string"},
+            "model": {"type": "string"},
+            "thinkingLevel": {"type": "string"}
+          }
+        },
+        "result": {
+          "type": "object",
+          "required": ["sessionId", "created"],
+          "properties": {"sessionId": {"type": "string"}, "created": {"type": "boolean"}}
+        }
+      },
+      "fork": {
+        "kind": "method",
+        "args": {
+          "type": "object",
+          "required": ["requestId", "sessionId"],
+          "properties": {
+            "requestId": {"type": "string", "minLength": 1},
+            "sessionId": {"type": "string"}
+          }
+        },
+        "result": {
+          "type": "object",
+          "required": ["sessionId", "created"],
+          "properties": {"sessionId": {"type": "string"}, "created": {"type": "boolean"}}
+        }
+      }
+    }
+  }
+}
