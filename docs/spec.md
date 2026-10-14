@@ -135,6 +135,13 @@ Journal shape **(Proposed):**
 
 **Decided:** Chord link protocol version 2 (`chord/docs/spec.md` §9; frames in `chord/src/wire.ts`).
 
+**Built** in `crates/noel-chord`, matching upstream's `packages/chord` at the pinned commit (`CHORD_REFERENCE_REF` in the Makefile) and checked against `tests/fixtures/ts-parity/chord-delta.json`:
+- **the delta codec:** the ops `r`, `s`, `d`, `a`, `t`, `p` and `m` applied immutably, with `t` and `a` counting UTF-16 code units; the wire encoder and decoder, with path definitions, numeric references and short tuples; and `diff`, whose batches are compared by the value they produce;
+- **canonical JSON and `hash64`;**
+- **contracts:** descriptions, their fingerprints, `coverage` and `fits`.
+
+Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-register.md`.
+
 **Proposed:**
 - **Framing:**
   - WebSocket framing over the local socket, Chord's own WebSocket framing unchanged; Chord has no Unix-socket transport;
