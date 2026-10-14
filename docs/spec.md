@@ -215,7 +215,7 @@ the input names this worker's session.
 - **`abort`** follows Mode 2's rule (§3.3): it withdraws the queue, and answers once the run settled.
 - **`compact`, `configure` and `resume`** need no run active (`invalid/busy` otherwise).
 - **`create` and `fork`** name the new session by their `requestId` (`s-` and 24 hex digits of its SHA-256), so a repeat returns the same session with `created: false`. A new session gets its model and thinking level as `noel` would start it; `create` lists it in the directory before answering.
-- **The directory** is read from the session directory (each journal again only when it changed) and the workers' `status`, on each change and every 5 s.
+- **The directory** is read from the session directory (each journal again only when it changed) and the workers' `status`, on each change and every 5 s. Changes that arrive together are read together, so a listing taken the moment a `submit` is answered may not show it yet; the session's view (§7.3) is current.
 
 ### 7.3 The view and late join
 
