@@ -114,6 +114,16 @@ The committed TypeScript parity fixtures are:
 - `openai-responses-tools.json`: OpenAI Responses request shape with function
   tools.
 - `openrouter-kimi.json`: OpenRouter OpenAI-compatible request shape.
+- `pi-env.json`: upstream pi-env's client (`Connection`, `RemoteExecutionEnv`,
+  `openTerminal`) driving upstream's own daemon, both from the same pinned
+  commit as Chord's goldens, through a tap that records the frames both ways:
+  `hello`, file operations and handles, `listFiles`, `exec` with output,
+  cancel, kill and timeout, `pty`, `watch`, pings, and the errors of refused
+  calls. Machine fields, process ids, file identities and times are
+  placeholders; output is merged per stream.
+  `crates/noel-env-daemon/tests/pi_env_golden.rs` sends the client's frames to
+  `noel-env serve` and compares its answers; `make env-interop` runs
+  upstream's client tests against it.
 - `rpc-protocol.json`: upstream `pi --mode rpc` stdout records, in order, for
   scripted runs against a local OpenAI-compatible stub: a text prompt, a tool
   round, steer, follow_up, abort (also with queued messages), prompts while
