@@ -22,6 +22,7 @@ mod oauth_refresh;
 mod resource_commands;
 mod rpc;
 mod rpc_wire;
+mod server;
 mod signals;
 mod transcript_view;
 mod usage;
@@ -1354,6 +1355,11 @@ pub(crate) fn config_paths(cwd: PathBuf, session_dir: Option<PathBuf>) -> Result
 }
 
 async fn run() -> Result<()> {
+    // `noel server`, `noel worker` and `noel client` (Mode 2) handle their
+    // own signals.
+    if let Some(code) = server::try_run(&std::env::args().collect::<Vec<_>>()).await {
+        std::process::exit(code);
+    }
     signals::install();
     if try_run_image_command().await? {
         return Ok(());

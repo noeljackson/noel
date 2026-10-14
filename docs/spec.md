@@ -23,7 +23,7 @@ such as `durable/docs/spec.md:67` are under upstream's `packages/`.
    - A supervisor runs `noel --mode rpc` inside an environment and messages it through upstream pi's RPC protocol, with noel's extensions: run ids, expected-run ids, request ids, and run resume.
    - Codewire's managed conversations are one supervisor. They are **Built** on trusted Linux hosts; Codewire Sandboxes are **Decided**.
 2. **Mode 2, server and client.**
-   - A long-running `noel server` holds sessions, and clients attach to it from anywhere (§5–§9).
+   - A long-running `noel server` holds sessions, and clients attach to it from anywhere (§5–§9). **Built** for clients on the same machine (device access, §6): `noel server`, `noel worker` and the line-mode `noel client`.
    - A session's tools run in a workspace chosen through an adapter: local, a remote machine through `pi-env`, a Codewire environment, or anything else that implements the workspace interface (§10).
 
 noel works without Codewire in both modes. Every Codewire path is optional.
@@ -111,7 +111,7 @@ reply stays in the transcript.
 - `{"type":"tool_output","run_id"?,"call_id","output","truncated"?,"append"?}`: what a call printed. It appends while the output grows. Once the output passes its result's limits, the kept end moves (`truncated`): each record then rewrites it whole, and the wait before the next rewrite doubles, from `progress.outputIntervalMs` up to 2^16 times it, so a command that prints for an hour rewrites its output about fifteen times.
 - **Supersession:** a reply's message (or any message, a messages snapshot, a compaction checkpoint, or the run's end) supersedes the partial; a dropped reply is superseded by an empty partial record; the call's result message (or the run's end) supersedes its tool output.
 - **Compaction** rewrites the journal (§2) without the records it makes stale: every partial, and every tool output except the current one of a call still without a result.
-- `run_id` is the run's id in RPC mode (and the coming worker), and absent in the TUI and print mode, which have no runs.
+- `run_id` is the run's id in RPC mode and in the Mode 2 worker, and absent in the TUI and print mode, which have no runs.
 
 ## 5. Server, worker and client roles (Mode 2)
 
@@ -120,17 +120,21 @@ reply stays in the transcript.
 - **Worker:** one host per session, named `session:<id>`. It is the session's only writer: it holds the journal lock (§2) and runs the run engine.
 - **Client:** the TUI, and a line-mode `noel client`. A client holds remote objects through the server, which relays between clients and workers.
 
-**Proposed:**
+**Built** (`crates/noel-cli/src/server`):
+- **The runtime directory** is `$XDG_RUNTIME_DIR/noel`, else `/tmp/noel-<uid>` (`NOEL_RUNTIME_DIR` overrides both). It must be a directory, not a link, owned by the user with mode 0700; it is made so when missing, and anything else is refused.
 - **The server:**
-  - `noel server` takes `server.lock`, and a second server exits with code 75;
-  - it binds `server.sock` in `$XDG_RUNTIME_DIR/noel` (or `/tmp/noel-<uid>`), a directory it requires to be owned by the user with mode 0700.
+  - `noel server --foreground` takes `server.lock` there (`File::try_lock`); a second server exits with code 75. Without `--foreground`, `noel server` starts a detached server (output in `server.log`) and returns once it listens, or exits 75 if one already runs;
+  - it binds `server.sock` (0600), removing a stale one only when it is a socket the user owns, and writes `server.json` (`pid`, `build`, `startedAt`);
+  - it reads the global settings only, from the home directory, and gives its session directory to its workers;
+  - with no client link and no worker for `server.idleExitMs` (default 600000, ten minutes) it exits, removing its socket.
 - **Workers:**
-  - the server starts each worker as `noel worker --session <id> --generation <g>` in its own process group;
-  - the worker opens the journal under its lock, binds `workers/<id>.sock`, then reports `ready`;
-  - a worker with no holds, no run and no queued input for 60 s shuts down;
+  - the server starts each as `noel worker --session <id> --generation <g> [--resume <runId>]` in its own session (`setsid`), with its output in `workers/<id>.log`;
+  - the worker opens the journal under its lock (`fatal`, reason `locked`, exit 75 if another process holds it), binds `workers/<id>.sock` (0600), writes `workers/<id>.json` (`pid`, `session`, `generation`, `build`), then prints the control line `ready` on stdout;
+  - the server dials the socket, checks the peer's uid and pid, reads `ready` again, and runs the Chord link as the worker's parent, over NDJSON lines `{"chord2": frame}` and `{"chord2control": message}`: `ready` (`pid`, `build`, `session`, `generation`), `status` (`viewers`, `running`, `queued`, `runId`) and `shutdown`;
+  - a worker with no holds, no run and no queued input for `server.workerIdleExitMs` (default 60000) exits, removing its socket and record;
   - a worker outlives its server: it finishes its run, then waits up to that same idle time for a new server to adopt it;
-  - a new server adopts surviving workers of the same build and shuts down the others once their run settles.
-- **Clients:** a client starts the server when none is running.
+  - a new server reads `workers/*.json`, dials each socket and checks uid, pid and `build`. A match is adopted; another build is told `shutdown` and exits once its run settles; a record whose process is gone is removed.
+- **Clients:** a client starts the server when none listens, after checking the runtime directory and the listening process's uid.
 
 ## 6. Principals and access
 
@@ -142,7 +146,7 @@ reply stays in the transcript.
 - **Routing:** a route's `authorize(principal, session)` runs before a worker is resolved or spawned, and again after.
 
 **Build order (Decided):**
-1. **Device.** The owner-only local socket, with no token. The server checks the peer's uid (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and closes any other uid before reading a byte. Any process running as the owner can connect, including the agent's own `bash`; that grants nothing it could not already do.
+1. **Device** (**Built**). The owner-only local socket, with no token. The server checks the peer's uid (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and closes any other uid before reading a byte. Any process running as the owner can connect, including the agent's own `bash`; that grants nothing it could not already do. Accepted links are stamped `{kind:"owner", via:"device"}`; the `session:` route lets the owner reach any session and a guest only its own, and `noel.chat` gives the owner and a `full` guest `participant`, a `view` guest `viewer`. Workers act as `{kind:"worker", session, generation}`. Objects are kept by `principalKey` (`owner@<via>`, `guest:<id>:r<revision>`, `worker:<session>:<generation>`).
 2. **Relay,** after a design pass of its own.
 3. **Remote authentication,** offering both device-code pairing (the server issues and verifies its own token) and an optional Codewire login. A Codewire tailnet connection may be stamped `via:"tunnel"`, because admission to an environment's tailnet already grants shell access there.
 4. **Guests.**
@@ -169,7 +173,7 @@ reply stays in the transcript.
 
 Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-register.md`.
 
-**Proposed:** WebSocket framing over the device socket, and NDJSON between server and worker.
+**Built:** WebSocket framing over the device socket (path `/chord`; packed frames refused from clients), and NDJSON between server and worker (§5).
 
 **Decided (2026-10-14):**
 - noel builds on protocol 2 now, although it is under `[Unreleased]` in Chord's changelog.
@@ -178,51 +182,64 @@ Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-regi
 
 ### 7.2 Objects
 
-**Proposed.** Each object has contract version 1, with JSON Schemas checked into the repository.
+**Built.** Each object has contract version 1; their descriptions, with their JSON Schemas, are checked in as `crates/noel-cli/src/server/contracts/*.json`.
 
 ```text
-noel.sessions  at "server", input {}           owner only
+noel.sessions  at "server", input {}           owner only (variant owner)
   state directory: {sessions: [{sessionId, name?, cwd, modified, messageCount,
-                                live: {worker, busy, viewers}, lastRun?}]}
-  create({requestId, cwd, name?, model?, thinkingLevel?}) -> {sessionId}
-  fork({requestId, sessionId, atMessage?}) -> {sessionId}
+                                firstPrompt?, model?, live: {worker, busy, viewers},
+                                lastRun?: {runId, status}}]}        newest first
+  create({requestId, cwd, name?, model?, thinkingLevel?}) -> {sessionId, created}
+  fork({requestId, sessionId}) -> {sessionId, created}
 
 noel.chat      at "session:<id>", input {session}
   viewer:      state view
   participant: state view
-    submit({requestId, text, images?, whenBusy: "reject"|"steer"|"followUp"})
-        -> {submissionId, runId?, disposition: "started"|"queued"|"repeated"}
+    submit({requestId, text, images?, whenBusy?: "reject"|"steer"|"followUp"})
+        -> {submissionId, runId?, disposition: "started"|"queued"|"repeated", status?}
     withdraw({submissionId}) -> {outcome: "withdrawn"|"already_placed"|"settled"}
-    abort({expectedRunId?}) -> {}
-    compact({requestId, instructions?}) -> {runId}
-    configure({model?, thinkingLevel?}) -> {}
+    abort({expectedRunId?}) -> {runId?, withdrawn}
+    compact({instructions?}) -> {omittedMessages, retainedMessages}
+    configure({model?, thinkingLevel?}) -> {model?, thinkingLevel}
     resume({expectedRunId}) -> {runId}
 
-noel.models    at "server", input {}           owner only
+noel.models    at "server", input {}           owner only (variant owner)
   state catalog: {models: [{provider, modelId, name, reasoning, thinkingLevels}]}
 ```
 
 The owner, and a guest with `mode:"full"`, get `participant`; a guest with
 `mode:"view"` gets `viewer`. Methods check their arguments: for example, that
-a submission belongs to this session.
+the input names this worker's session.
+
+- **`submit`** maps to the session controller (§3.1): `whenBusy` names the kind (`reject` a prompt, `steer`, `followUp`, default `reject`). While idle any submission starts a run. A repeated `requestId` answers `repeated` with the first submission's `status` (`queued`, `running`, `interrupted`, `completed`, `failed`, `aborted`, `withdrawn`) and its `runId`. A refusal writes nothing and is `invalid` with reason `busy`, `queued_prompt`, `request_id_reused` or `refused`.
+- **`abort`** follows Mode 2's rule (§3.3): it withdraws the queue, and answers once the run settled.
+- **`compact`, `configure` and `resume`** need no run active (`invalid/busy` otherwise).
+- **`create` and `fork`** name the new session by their `requestId` (`s-` and 24 hex digits of its SHA-256), so a repeat returns the same session with `created: false`. A new session gets its model and thinking level as `noel` would start it; `create` lists it in the directory before answering.
+- **The directory** is read from the session directory (each journal again only when it changed) and the workers' `status`, on each change and every 5 s. Changes that arrive together are read together, so a listing taken the moment a `submit` is answered may not show it yet; the session's view (§7.3) is current.
 
 ### 7.3 The view and late join
 
 **Decided:** late join follows Durable. A client that joins late or reconnects starts from the current view, and nothing is replayed (`durable/README.md:404`). Subscribing sends the current snapshot first, then deltas; a reconnect is a new hold and a new snapshot.
 
-**Proposed:** the view follows Durable's shape `{conversation, entries, docs}` (`durable/docs/spec.md:4542-4558`):
-- **`entries`:** messages in upstream pi's `Message` JSON;
-- **`docs["pi.agent"]`:** the model, thinking level and working directory;
-- **`docs["pi.live"]`:** the running generation, including its committed partial (§4.2), its tool calls with their output so far, and any compaction in progress;
-- **`docs["pi.inbox"]`:** the queued submissions;
-- **`docs["pi.usage"]`**;
-- **`lastRun`**.
+**Built** (`crates/noel-cli/src/server/view.rs`): the view follows Durable's shape `{conversation, entries, docs}` (`durable/docs/spec.md:4542-4558`), plus `lastRun`:
+- **`conversation`:** `{id, cwd, name?}`;
+- **`entries`:** messages in upstream pi's `Message` JSON, as RPC mode's `get_messages`;
+- **`docs["pi.agent"]`:** `{model?, thinkingLevel, cwd}`;
+- **`docs["pi.live"]`:** `{}` while idle; during a run `run` (`{runId, requestId?, inputs}`), `generation` (`{attempt, message?, retry?}`, where `message` is the committed partial, §4.2), `tools` (`{callId, name, status, output?, truncated?}` with the committed output; `status` is `pending`, `running`, `done`, or `interrupted` for a resumed run's call that does not run again) and `compaction` (`{reason}`);
+- **`docs["pi.inbox"]`:** `{items: [{id, mode, content, requestId?}]}`;
+- **`docs["pi.usage"]`:** `{total: {input, output, requests}}`;
+- **`lastRun`:** `get_state.lastRun`.
+
+Partials and tool output reach the view from the journal's records as each is saved (`SessionStore::observe_progress`), so a client sees what a crash would keep. A subscription gets the snapshot, then ops: a splice at the end of `entries` for each message, appends to a streaming reply or a tool's output, and diffs of the documents. Where this differs from Durable is in the non-parity register ("Mode 2 Server, Worker and Client").
 
 ## 8. Failure handling (Mode 2)
 
+**Built** (§8.1–§8.3).
+
 ### 8.1 Client
 - **A disconnect:** the server releases everything the client held. The run continues.
-- **A submission's outcome is unknown when the link drops.** The client retries with the same `requestId`, which reports either `repeated` or the outcome.
+- **A submission's outcome is unknown when the link drops.** The client retries with the same `requestId`, which reports either `repeated` or the outcome. `noel client send` retries a hold or a `submit` that fails `unavailable` up to ten times.
+- **`noel client watch`** holds the view again when its worker is lost, and reconnects (starting a server) when the server is.
 
 ### 8.2 Server
 - **Losing the server stops no run:** a worker finishes its run while no server is attached.
@@ -231,7 +248,8 @@ a submission belongs to this session.
 ### 8.3 Worker
 - **A worker crash:** the kernel releases its lock, and the run is interrupted.
 - **Restart:** the server starts it again with the next generation. The new worker repairs a torn tail, applies §4.2, and resumes the run.
-- **Resume limit (Proposed):** the server resumes a run by itself at most 3 times. After that the run stays interrupted until a client resumes or aborts it.
+- **Resume limit:** the server resumes a run by itself at most 3 times. After that the run stays interrupted until a client resumes or aborts it.
+- **When:** a worker lost with its run interrupted is started again at once. Any worker the server starts resumes the journal's interrupted last run while its resumes last, so after a machine stopped the first hold resumes it. The count is the server's: a new server counts again.
 - **Clients:** they see `gone`, hold the object again, and get a snapshot.
 
 ## 9. Mode 1 relationship
@@ -240,7 +258,7 @@ a submission belongs to this session.
 - RPC mode keeps upstream pi's record format and its abort rule (§3.3), and its goldens (`crates/noel-cli/tests/rpc_parity.rs`) guard both.
 - §4.2 applies to every mode, so RPC mode saves partial output and aborted replies too. Upstream pi also keeps aborted replies. **Built.** Keeping them moved `get_state.messageCount` to upstream's after an abort (the `abort-with-queue` golden now differs from upstream's only by the system message).
 
-**Built:** one session controller (`crates/noel-core/src/controller.rs`) drives runs. It owns, for one open session, the active run with its cancellation and retry backoff, the queue, submissions (§3.1), withdraw (§3.2), abort with a policy per caller (§3.3), resuming an interrupted run, compaction, and changes to the model and thinking level, which wait for no run to be active. It reports what happens as events, in order. RPC mode (`crates/noel-cli/src/rpc.rs`) is a thin adapter over it: commands in, records out, with abort keeping the queue; the Mode 2 worker will be the second caller. The TUI still drives its own loop until its remote backend (PR 6) moves it.
+**Built:** one session controller (`crates/noel-core/src/controller.rs`) drives runs. It owns, for one open session, the active run with its cancellation and retry backoff, the queue, submissions (§3.1), withdraw (§3.2), abort with a policy per caller (§3.3), resuming an interrupted run, compaction, and changes to the model and thinking level, which wait for no run to be active. It reports what happens as events, in order. RPC mode (`crates/noel-cli/src/rpc.rs`) is a thin adapter over it: commands in, records out, with abort keeping the queue; the Mode 2 worker (`crates/noel-cli/src/server/worker.rs`) is the second caller, with abort withdrawing the queue. The TUI still drives its own loop until its remote backend (PR 6) moves it.
 
 ## 10. Workspaces
 
@@ -271,7 +289,7 @@ Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-regi
 
 **Decided:** compatibility is proved by goldens recorded from upstream, as the RPC goldens are.
 - **No server or client to record.** Upstream publishes no `pi server` or `pi client`, so the Chord goldens drive upstream's public `packages/chord` with noel's contracts, covering delta and canonical-JSON vectors and the link frames.
-- **Interop:** a test in Docker connects an upstream Chord client to a noel server, and the reverse.
+- **Interop:** a test in Docker connects an upstream Chord client to a noel server, and the reverse (`make chord-interop`). **Built**, including upstream's client holding `noel.chat` on `noel server` through its relay to a worker, following the view's snapshot and ops.
 - **pi-env goldens** come from upstream's `RemoteExecutionEnv` talking to its own daemon.
 - **`LocalEnv`** is checked against the conformance results of upstream's `NodeExecutionEnv` (**Built**: `local-env.json`).
 
@@ -281,4 +299,6 @@ Every place noel differs from upstream is listed in
 `docs/rust-rewrite/non-parity-register.md` with its reason. Building §4.2
 removed one entry: aborted replies not being saved (upstream pi keeps them,
 leaving them out of model requests), and added "Durable Partial Output" for
-where noel's saving differs from Durable's.
+where noel's saving differs from Durable's. Building Mode 2's server, worker
+and client added "Mode 2 Server, Worker and Client": noel's own objects, the
+view's subset of Durable's documents, and workers that outlive their server.

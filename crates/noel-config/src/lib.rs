@@ -472,6 +472,9 @@ pub struct Settings {
     /// Failover-only multi-account rotation. Disabled by default.
     #[serde(default)]
     pub failover: Option<FailoverSettings>,
+    /// Mode 2's `noel server` and its workers.
+    #[serde(default)]
+    pub server: Option<ServerSettings>,
 }
 
 impl Settings {
@@ -562,6 +565,7 @@ impl Settings {
             warnings: merge_optional_settings(self.warnings, overrides.warnings),
             model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
             failover: merge_optional_settings(self.failover, overrides.failover),
+            server: merge_optional_settings(self.server, overrides.server),
         }
     }
 }
@@ -858,6 +862,28 @@ impl MergeSettings for AgentSettings {
     fn merge(self, overrides: Self) -> Self {
         Self {
             max_tool_rounds: overrides.max_tool_rounds.or(self.max_tool_rounds),
+        }
+    }
+}
+
+/// How long Mode 2's processes stay without work (`settings.server`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerSettings {
+    /// `noel server` exits after this long with no client link and no
+    /// worker. Default 600000 (10 minutes).
+    pub idle_exit_ms: Option<u64>,
+    /// A worker exits after this long with no holds, no run and nothing
+    /// queued; one that lost its server waits this long to be adopted.
+    /// Default 60000.
+    pub worker_idle_exit_ms: Option<u64>,
+}
+
+impl MergeSettings for ServerSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            idle_exit_ms: overrides.idle_exit_ms.or(self.idle_exit_ms),
+            worker_idle_exit_ms: overrides.worker_idle_exit_ms.or(self.worker_idle_exit_ms),
         }
     }
 }

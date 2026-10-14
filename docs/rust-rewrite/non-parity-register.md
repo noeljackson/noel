@@ -1277,6 +1277,86 @@ Reason: noel needs Chord's protocol, not its runtime: one code version, no
 plugins, and objects whose state it owns directly. The rest are a native
 JSON library and scheduler standing in for JavaScript's.
 
+### Mode 2 Server, Worker and Client
+
+`noel server`, `noel worker` and `noel client` (`crates/noel-cli/src/server`,
+`docs/spec.md` §5–§8) follow the roles of Chord's guide (`chord/docs/guide.md`
+"Hosts and links") and take their submissions and view from Durable. Upstream
+publishes no server or client to match (its application on Chord is
+private), so the objects and processes are noel's, and these parts differ:
+
+- **Objects.** `noel.sessions`, `noel.chat` and `noel.models` are noel's
+  contracts (version 1, `crates/noel-cli/src/server/contracts/`). Upstream's
+  guide shows a `Chat` with `viewer` and `participant` variants and a
+  `Sessions` at `server` only as examples.
+- **The view** has Durable's shape `{conversation, entries, docs}`
+  (`durable/docs/spec.md` §9.3) with what noel's journal holds:
+  - `entries` are upstream pi's `Message` JSON, as RPC mode's `get_messages`
+    reports them (no entry ids, timestamps or usage), not Durable's entry
+    records;
+  - `docs["pi.agent"]` is `{model, thinkingLevel, cwd}`; Durable's stores
+    the chosen extensions, tools and instructions;
+  - `docs["pi.live"]` has `run` (`runId`, `requestId`, `inputs`, where
+    Durable names a task), `generation` (`attempt`, `message`, `retry`; no
+    deferred polls), `tools` (`callId`, `name`, `status`, `output`,
+    `truncated`; no task ids, details, diagnostics or dropped counts) and
+    `compaction` (`reason`), and no nested tools or compaction failure. A
+    tool slot can also be `interrupted`: a resumed run's call that gets its
+    interrupted result. The partial `message` is `{role, content}` only;
+  - `docs["pi.inbox"]` items are `{id, mode, content, requestId?}` with the
+    text as `content`; there are no writes;
+  - `docs["pi.usage"]` is `{total: {input, output, requests}}`: noel counts
+    a session's usage, not per model or tool. There is no `pi.provider`;
+  - `lastRun` is added: RPC mode's `get_state.lastRun`.
+- **Only committed progress, nearly.** A partial reply and a tool's output
+  come from the journal's own records once saved, as Durable's view shows
+  only committed state. Two things are shown as the run engine reports them,
+  just before it saves them: a message it adds, and, as a resumed run
+  starts, the interrupted results of calls that do not run again.
+- **Ops.** The worker makes ops per change: a splice at the end of
+  `entries`, appends to a streaming text, and diffs of the documents. Durable
+  derives view ops from document ops, and bounds a watch to 100 pending
+  frames; noel relies on Chord's four-window reset.
+- **Submissions.** `submit`'s `whenBusy` names the submission's kind
+  (`reject` a prompt, `steer`, `followUp`). A refusal is `invalid` with a
+  reason (`busy`, Durable's `ConversationBusy`; `request_id_reused`;
+  `queued_prompt`; `refused`), never `unavailable`, so a client retries only
+  what may not have happened. A repeat answers `disposition: "repeated"` with
+  the first submission's `status`. `abort` answers once the run settled, with
+  the run and how many queued submissions it withdrew. `compact` takes no
+  `requestId` and answers counts, since noel's compaction is not a run;
+  `configure` answers the model and level in effect; `fork` takes no
+  `atMessage`.
+- **Sessions named by request.** `create` and `fork` name the new session
+  `s-` and 24 hex digits of a SHA-256 of their `requestId`, so a repeat finds
+  it after any restart without a table of requests.
+- **Processes.** A worker is a separate `noel worker` that the server dials
+  on `workers/<id>.sock` and speaks NDJSON to, where upstream's host manager
+  forks a Node child on an IPC channel and kills its process group when the
+  manager exits. A worker outlives its server, and a new server adopts the
+  workers of its build. The worker's kernel lock is its journal's lock
+  (spec §2), not a lock named for Chord. Control messages: `ready` carries
+  `pid`, `build`, `session` and `generation`; `status` carries `viewers`,
+  `running`, `queued` and `runId` (no `activeCalls` or `durableTasks`);
+  `fatal` has reason `locked` for a held journal; `shutdown` is also sent by
+  a worker as it exits.
+- **Resume.** The server resumes a session's interrupted last run whenever it
+  starts its worker (after a crash, or for the first hold after a machine
+  stopped), at most three times per run. The count lives in the server, so a
+  new server counts again.
+- **Access.** Device only: the owner's processes, by the socket's peer uid,
+  with no token. No relay, tunnel, pairing or guests yet (spec §6); a guest
+  principal would get its variant, but nothing stamps one.
+- **The runtime directory** can be named by `NOEL_RUNTIME_DIR`, for tests and
+  scratch servers.
+- **`noel.models`** is the models that can run when the server starts; it is
+  not refreshed while it runs.
+
+Reason: upstream's application on Chord is private, so noel's objects carry
+what its journal and run engine hold, in Durable's shape where it can. The
+process model keeps one writer per session (the journal lock) and lets a run
+finish while no server is attached.
+
 ### Workspaces
 
 `crates/noel-env`'s `ExecutionEnv` has upstream Durable's methods, results

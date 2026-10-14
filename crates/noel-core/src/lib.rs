@@ -14,7 +14,7 @@ mod tool_parity_tests;
 mod tool_tests;
 pub use compaction::RuntimeCompactionSettings;
 pub use input::expand_input;
-pub use progress::RuntimeProgressSettings;
+pub use progress::{interrupted_output, RuntimeProgressSettings};
 use progress::{ReplyProgress, ToolProgress};
 use session_lock::SessionLock;
 pub use system_prompt::PRODUCT_NAME;
@@ -1171,6 +1171,45 @@ fn is_zero(count: &usize) -> bool {
     *count == 0
 }
 
+/// Progress a run committed to the journal (spec §4.2), as a
+/// [`ProgressObserver`] hears it: only what is saved, in the order it is
+/// saved, so whoever shows it shows what a crash would keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedProgress {
+    /// What a streaming reply produced. A record without `append` replaces
+    /// what was saved of the reply before (an empty one drops it); with
+    /// `append` it extends attempt `attempt`'s.
+    Partial {
+        run_id: Option<String>,
+        attempt: u64,
+        text: String,
+        thinking: String,
+        append: bool,
+    },
+    /// What a running tool call printed: with `append` more of it, else all
+    /// of it that is kept (`truncated`: its start was left out).
+    ToolOutput {
+        run_id: Option<String>,
+        call_id: String,
+        output: String,
+        truncated: bool,
+        append: bool,
+    },
+}
+
+/// Hears each [`SavedProgress`] once it is in the journal, on the task that
+/// saved it.
+pub type ProgressObserver = Arc<dyn Fn(&SavedProgress) + Send + Sync>;
+
+#[derive(Clone)]
+struct ObserverSlot(ProgressObserver);
+
+impl std::fmt::Debug for ObserverSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProgressObserver")
+    }
+}
+
 /// A session journal opened for writing. Every constructor takes the session
 /// lock (see [`SessionError::Locked`]) and repairs a torn tail before the
 /// first append; clones share the lock and serialize their writes. Read-only
@@ -1179,6 +1218,8 @@ fn is_zero(count: &usize) -> bool {
 pub struct SessionStore {
     path: PathBuf,
     lock: Arc<SessionLock>,
+    /// Hears the progress this store and its clones save.
+    progress: Option<ObserverSlot>,
 }
 
 impl SessionStore {
@@ -1208,11 +1249,21 @@ impl SessionStore {
         source: &SessionState,
         clone_parent: bool,
     ) -> Result<(Self, SessionState), SessionError> {
+        Self::fork_with_id(session_dir, source, clone_parent, new_session_id())
+    }
+
+    /// [`SessionStore::fork`] into a session named `session_id`.
+    pub fn fork_with_id(
+        session_dir: &Path,
+        source: &SessionState,
+        clone_parent: bool,
+        session_id: impl Into<String>,
+    ) -> Result<(Self, SessionState), SessionError> {
         fs::create_dir_all(session_dir).map_err(|source| SessionError::CreateDir {
             path: session_dir.to_path_buf(),
             source,
         })?;
-        let session_id = new_session_id();
+        let session_id = session_id.into();
         let path = session_dir.join(format!("{session_id}.jsonl"));
         let store = Self::writer(path)?;
         let mut state = source.clone();
@@ -1320,12 +1371,21 @@ impl SessionStore {
         let store = Self {
             lock: session_lock::acquire(&path)?,
             path,
+            progress: None,
         };
         {
             let _writer = store.lock.writer();
             noel_session::repair_jsonl_tail(&store.path)?;
         }
         Ok(store)
+    }
+
+    /// This store, and the clones made of it from now on, tell `observer`
+    /// about each partial and tool output they save, once it is saved.
+    /// Mode 2's worker shows them to clients (spec §7.3).
+    pub fn observe_progress(mut self, observer: ProgressObserver) -> Self {
+        self.progress = Some(ObserverSlot(observer));
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -1363,7 +1423,41 @@ impl SessionStore {
     }
 
     fn record_progress(&self, record: &SessionRecord) -> Result<(), SessionError> {
-        self.append(record)
+        self.append(record)?;
+        let Some(ObserverSlot(observer)) = &self.progress else {
+            return Ok(());
+        };
+        let saved = match record {
+            SessionRecord::Partial {
+                run_id,
+                attempt,
+                text,
+                thinking,
+                append,
+            } => SavedProgress::Partial {
+                run_id: run_id.clone(),
+                attempt: *attempt,
+                text: text.clone(),
+                thinking: thinking.clone(),
+                append: *append,
+            },
+            SessionRecord::ToolOutput {
+                run_id,
+                call_id,
+                output,
+                truncated,
+                append,
+            } => SavedProgress::ToolOutput {
+                run_id: run_id.clone(),
+                call_id: call_id.clone(),
+                output: output.clone(),
+                truncated: *truncated,
+                append: *append,
+            },
+            _ => return Ok(()),
+        };
+        observer(&saved);
+        Ok(())
     }
 
     pub fn record_active_model(&self, model: Option<ModelRef>) -> Result<(), SessionError> {
