@@ -42,6 +42,10 @@ fn text_tokens(text: &str) -> u64 {
 }
 
 fn message_tokens(message: &ConversationMessage) -> u64 {
+    // An aborted reply is not part of any request.
+    if message.aborted {
+        return 0;
+    }
     let mut tokens = 12u64.saturating_add(text_tokens(&message.content));
     for call in &message.tool_calls {
         tokens = tokens.saturating_add(
@@ -58,6 +62,13 @@ fn messages_tokens(messages: &[ConversationMessage]) -> u64 {
         .iter()
         .map(message_tokens)
         .fold(0, u64::saturating_add)
+}
+
+/// Whether a compaction summarizes `message` when it drops it: not a
+/// persistent system message, which it keeps, nor an aborted reply, which no
+/// request contains.
+fn summarized(message: &ConversationMessage) -> bool {
+    (message.role != MessageRole::System || is_checkpoint(message)) && !message.aborted
 }
 
 pub(super) fn is_checkpoint(message: &ConversationMessage) -> bool {
@@ -237,9 +248,9 @@ impl Runtime {
         let messages = &self.session.messages;
         let keep = self.keep_recent_tokens();
         let summarizable = |older: &[ConversationMessage]| {
-            older
-                .iter()
-                .any(|message| message.role != MessageRole::System && !is_checkpoint(message))
+            older.iter().any(|message| {
+                message.role != MessageRole::System && !is_checkpoint(message) && !message.aborted
+            })
         };
         summarizable(&messages[..retained_start(messages, keep)])
             || midturn_retained_start(messages, keep)
@@ -269,7 +280,7 @@ impl Runtime {
         };
         let older = self.session.messages[1..start]
             .iter()
-            .filter(|message| message.role != MessageRole::System || is_checkpoint(message))
+            .filter(|message| summarized(message))
             .cloned()
             .collect::<Vec<_>>();
         let persistent = self.session.messages[..start]
@@ -299,6 +310,7 @@ impl Runtime {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         messages.extend_from_slice(&self.session.messages[start..]);
         if messages_tokens(&messages) >= messages_tokens(&self.session.messages) {
@@ -315,6 +327,7 @@ impl Runtime {
         if let Some(store) = &self.store {
             store.record_compaction_checkpoint(record.clone(), messages.clone())?;
         }
+        self.session.partial = None;
         self.session.messages = messages;
         self.session.compactions.push(record.clone());
         Ok(record)
@@ -331,7 +344,7 @@ impl Runtime {
         // the summarizer. Old deterministic checkpoints are the sole exception.
         let older = self.session.messages[..start]
             .iter()
-            .filter(|message| message.role != MessageRole::System || is_checkpoint(message))
+            .filter(|message| summarized(message))
             .cloned()
             .collect::<Vec<_>>();
         let persistent = self.session.messages[..start]
@@ -368,6 +381,7 @@ impl Runtime {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         messages.extend_from_slice(&self.session.messages[start..]);
         if messages_tokens(&messages) >= messages_tokens(&self.session.messages) {
@@ -414,6 +428,7 @@ impl Runtime {
         if let Some(store) = &self.store {
             store.record_compaction_checkpoint(record.clone(), messages.clone())?;
         }
+        self.session.partial = None;
         self.session.messages = messages;
         self.session.compactions.push(record.clone());
         Ok(record)
@@ -567,6 +582,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         }
     }
 
@@ -916,6 +932,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                aborted: false,
             })
             .collect()
     }

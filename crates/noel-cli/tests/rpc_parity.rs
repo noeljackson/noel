@@ -516,7 +516,7 @@ fn normalize(records: &[Value]) -> Vec<Value> {
 /// `docs/rust-rewrite/non-parity-register.md` under "RPC Mode":
 ///
 /// - Messages noel does not keep: `messageCount` leaves out upstream's
-///   system message and aborted replies.
+///   system message.
 /// - Queue modes: noel delivers queued messages together (`all`).
 /// - Model object: `faux/script` has no `baseUrl`, and accepts and caps
 ///   what upstream's faux provider does rather than what the stub model
@@ -536,9 +536,7 @@ fn expected(upstream: &[Value]) -> Vec<Value> {
         .map(|record| {
             let mut record = record.clone();
             let message = &record["message"];
-            if record["type"] == "message_end"
-                && (message["role"] == "system" || message["stopReason"] == "aborted")
-            {
+            if record["type"] == "message_end" && message["role"] == "system" {
                 unkept += 1;
             }
             visit(&mut record, &mut |object| {
@@ -1797,9 +1795,12 @@ fn run_1(status: &str, more: Value) -> Value {
     run
 }
 
-/// The placeholder result the model gets for a call that did not finish.
+/// The result the model gets for a call a stop cut off that printed
+/// nothing: upstream Durable's interrupted result.
 fn interrupted(id: &str, tool: &str) -> Value {
-    let text = format!("tool call {tool} did not complete before the session continued");
+    let text = format!(
+        "<harness>\n[error] Tool {tool} was interrupted and may have partially run\n</harness>"
+    );
     json!({"role": "tool", "text": text, "toolCallId": id})
 }
 
@@ -2167,6 +2168,177 @@ fn a_read_cut_off_by_a_crash_runs_again() {
         noel.model_requests()[1][2],
         json!({"role": "tool", "text": "alpha\n", "toolCallId": "r1"})
     );
+}
+
+/// Waits until the session's journal holds a record `done` accepts.
+fn wait_for_record(noel: &Noel, what: &str, done: impl Fn(&Value) -> bool) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !noel.journal().iter().any(&done) {
+        assert!(Instant::now() < deadline, "no {what} in the journal");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What a reply streamed and saved before a crash is kept in the transcript
+/// as an aborted reply, which `get_messages` reports as upstream reports an
+/// aborted reply; the request is sent again without it.
+#[test]
+fn a_reply_cut_off_by_a_crash_is_kept_aborted_and_asked_for_again() {
+    let streaming = json!([
+        {"thinking": "plot"},
+        text("Once"),
+        {"delay_ms": 150},
+        text(" upon"),
+        {"delay_ms": 150},
+        text(" a time"),
+        held()
+    ]);
+    let script = json!([streaming, [text("The end.")]]);
+    let mut noel = Noel::session("crash-reply", script, None);
+    noel.command(json!({"id": "run", "type": "prompt", "message": "story", "requestId": "m-1"}));
+    let run_id = noel.response("run")["data"]["runId"].clone();
+    wait_for_record(&noel, "partial", |record| {
+        record["type"] == "partial"
+            && record["text"]
+                .as_str()
+                .is_some_and(|text| text.ends_with("a time"))
+    });
+    // Saving the partial wrote nothing to stdout.
+    noel.wait_for("message_update", 6);
+    let streamed = kinds(&noel.records)
+        .into_iter()
+        .filter(|kind| *kind != "message_update")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        streamed,
+        [
+            "response",
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_end",
+            "message_start"
+        ]
+    );
+    noel.restart();
+
+    // Opening the session saved the reply as aborted; the run still wants
+    // its reply.
+    let stopped =
+        json!({"runId": run_id, "requestId": "m-1", "status": "interrupted", "phase": "model"});
+    assert_eq!(noel.last_run("state"), stopped);
+    noel.command(json!({"id": "messages", "type": "get_messages"}));
+    let messages = noel.response("messages")["data"]["messages"].clone();
+    assert_eq!(
+        messages,
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "story"}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "plot"}, {"type": "text", "text": "Once upon a time"}],
+                "stopReason": "aborted",
+                "errorMessage": "Request was aborted"
+            }
+        ])
+    );
+    assert_eq!(resume(&mut noel, &run_id)["success"], true);
+    noel.wait_for("agent_settled", 1);
+    assert_eq!(noel.last_run("after")["status"], "completed");
+    noel.command(json!({"id": "count", "type": "get_state"}));
+    assert_eq!(noel.response("count")["data"]["messageCount"], 3);
+    assert!(noel.close().success());
+    // The request is sent again, as it was: the aborted reply is not in it.
+    let requests = noel.model_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1], requests[0]);
+    assert_eq!(requests[1], json!([{"role": "user", "text": "story"}]));
+    // The aborted reply superseded the partial records.
+    let journal = noel.journal();
+    let aborted = of_type(&journal, "message")
+        .filter(|record| record["message"]["aborted"] == true)
+        .count();
+    assert_eq!(aborted, 1);
+}
+
+/// A command a crash cut off never runs again: its result is the output it
+/// had saved, and says it was interrupted.
+#[test]
+fn a_command_cut_off_by_a_crash_keeps_its_output_in_its_result() {
+    let command = "for i in 1 2 3; do echo line $i; done; echo $$ > ../sleeper.pid; exec sleep 600";
+    let call =
+        json!({"tool_call": {"id": "b1", "name": "bash", "arguments": {"command": command}}});
+    let mut noel = Noel::session("crash-output", json!([[call], [text("done")]]), None);
+    noel.command(json!({"id": "run", "type": "prompt", "message": "count", "requestId": "m-1"}));
+    let run_id = noel.response("run")["data"]["runId"].clone();
+    let sleeper = wait_for_pid(&noel.root.join("sleeper.pid"));
+    wait_for_record(&noel, "tool output", |record| {
+        record["type"] == "tool_output" && record["call_id"] == "b1"
+    });
+    let saved = noel
+        .journal()
+        .into_iter()
+        .filter(|record| record["type"] == "tool_output")
+        .map(|record| record["output"].as_str().unwrap().to_owned())
+        .collect::<String>();
+    assert_eq!(saved, "line 1\nline 2\nline 3\n");
+    noel.restart();
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(sleeper),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+
+    assert_eq!(noel.last_run("state")["phase"], "tools");
+    assert_eq!(resume(&mut noel, &run_id)["success"], true);
+    noel.wait_for("agent_settled", 1);
+    noel.command(json!({"id": "messages", "type": "get_messages"}));
+    let messages = noel.response("messages")["data"]["messages"].clone();
+    assert!(noel.close().success());
+    let result = "line 1\nline 2\nline 3\n\n\n<harness>\n[error] Tool bash was interrupted and may have partially run\n</harness>";
+    assert_eq!(
+        messages[2],
+        json!({"role": "toolResult", "toolCallId": "b1", "toolName": "bash", "content": [{"type": "text", "text": result}], "isError": true})
+    );
+    assert_eq!(of_type(&noel.records, "tool_execution_start").count(), 0);
+    assert_eq!(
+        noel.model_requests()[1][2],
+        json!({"role": "tool", "text": result, "toolCallId": "b1"})
+    );
+}
+
+/// An aborted reply stays in the session, as upstream's does: in
+/// `get_messages` and `messageCount`, and out of later requests.
+#[test]
+fn an_aborted_reply_is_kept_in_the_session_and_left_out_of_requests() {
+    let script = json!([[text("Once"), held()], [text("Shorter.")]]);
+    let mut noel = Noel::session("aborted-reply", script, None);
+    noel.command(json!({"id": "1", "type": "prompt", "message": "tell a long story"}));
+    noel.wait_for("message_update", 2);
+    noel.command(json!({"id": "abort", "type": "abort"}));
+    noel.response("abort");
+    noel.command(json!({"id": "messages", "type": "get_messages"}));
+    let messages = noel.response("messages")["data"]["messages"].clone();
+    assert_eq!(
+        messages[1],
+        json!({"role": "assistant", "content": [{"type": "text", "text": "Once"}], "stopReason": "aborted", "errorMessage": "Request was aborted"})
+    );
+    noel.command(json!({"id": "2", "type": "prompt", "message": "shorter please"}));
+    noel.wait_for("agent_settled", 2);
+    noel.command(json!({"id": "state", "type": "get_state"}));
+    assert_eq!(noel.response("state")["data"]["messageCount"], 4);
+    assert!(noel.close().success());
+    assert_eq!(
+        noel.model_requests()[1],
+        json!([
+            {"role": "user", "text": "tell a long story"},
+            {"role": "user", "text": "shorter please"}
+        ])
+    );
+    // It outlives the process.
+    noel.restart();
+    noel.command(json!({"id": "again", "type": "get_messages"}));
+    let messages = noel.response("again")["data"]["messages"].clone();
+    assert_eq!(messages[1]["stopReason"], "aborted");
+    assert!(noel.close().success());
 }
 
 #[test]

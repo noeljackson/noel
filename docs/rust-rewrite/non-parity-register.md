@@ -874,12 +874,14 @@ parts differ:
   HTTP library's and not the one the patterns expect. noel's own errors (no
   credential, an invalid header, its configuration, a faux script that ran
   out) are never retried, whatever their text contains.
-- A reply the run drops is not saved. Upstream saves the failed or cut-off
+- A reply the run drops is not kept. Upstream saves the failed or cut-off
   attempt and hides it from the model with a `context_edit` journal entry, so
-  its history and exports still show it. noel saves a reply only once it
-  stands: a retried or overflowed attempt leaves no record, and a noel killed
-  during a recovery resumes from the prompt, or from the compaction
-  checkpoint once that is written.
+  its history and exports still show it. noel keeps a reply in the
+  transcript only once it stands, or once it is cut off for good (see
+  `docs/spec.md` §4.2): what a retried or overflowed attempt streamed is
+  saved as it goes and superseded as the turn asks again, so it leaves
+  nothing in the transcript, and a noel killed during a recovery resumes
+  from the prompt, or from the compaction checkpoint once that is written.
 - A final reply cut off at the output limit stands when nothing replaces it:
   there is nothing to compact, compaction is off, or the compaction fails.
   Upstream hides the reply from the model in those cases too, so its next
@@ -916,6 +918,45 @@ upstream's, so a run survives what upstream's survives and a client sees the
 same protocol. The differences follow from noel's journal, which saves what the
 model will see again and nothing else, and from its own HTTP stack.
 
+### Durable Partial Output
+
+A streaming reply's text and thinking, and a running tool call's output, are
+saved as they arrive, and recovered after a stop, as upstream Durable does
+(`docs/spec.md` §4.2, `durable/docs/spec.md:3735-3745, 3999-4006`): at most
+every `progress.partialIntervalMs` and `progress.outputIntervalMs` (default
+100), a committed partial becomes an aborted reply that later requests leave
+out, and a call that does not run again gets an interrupted result holding
+its saved output. These parts differ:
+
+- Upstream overwrites a live document; noel's journal only grows. So a
+  reply's records append what streamed since the last one, and a tool's
+  output is appended while it grows. Once the output passes its result's
+  limits the kept end moves and each record rewrites it, at intervals that
+  double from one rewrite to the next; upstream waits the interval and the
+  rewrite's size at 100 KiB/s. A crash then loses the output since the last
+  rewrite, which can be more than one interval.
+- A reply's first change after a quiet interval is saved at once; upstream
+  saves a reply's first partial one interval after it arrives.
+- The saved partial holds the reply's text and thinking, not the tool calls
+  it was streaming or its usage. An abort saves everything the reply
+  streamed, including what the last interval had not saved yet; upstream's
+  abort converts what was committed.
+- What a stop left is recovered when the session is next opened for
+  writing, before anything else happens to it; upstream converts it when the
+  request is sent again, or when the run is settled otherwise.
+- A failure that ends the run keeps what the reply streamed as an aborted
+  reply. Upstream keeps the failed reply as an error reply, with its error
+  text and usage.
+- The interrupted result is one text: the saved output, a blank line, and
+  upstream's `<harness>` block. Its truncation line has no line and byte
+  counts (`[warn] Output truncated to its end`), which noel does not save.
+- An abort's result for a tool call is published pi's `Operation aborted`
+  after what the call printed, not Durable's `aborted` diagnostic.
+
+Reason: an append-only journal must not grow with every save of a long reply
+or a chatty command. The rest keeps RPC mode's records published pi's, and
+saves what noel's journal can say.
+
 ### RPC Mode
 
 `noel --mode rpc` speaks upstream's RPC protocol, with four additions listed in
@@ -937,8 +978,8 @@ Differences in the golden records:
   `message_end` and kept in `agent_end` and `get_messages`. noel reports none:
   it sends its system prompt with every request and keeps it out of the
   transcript.
-- `messageCount` counts the messages noel keeps: not upstream's system message,
-  and not an aborted reply (see below).
+- `messageCount` counts the messages noel keeps: not upstream's system
+  message.
 - Queue modes: noel delivers everything queued at once (see Batched Queue and
   Steering Dispatch). `steeringMode` and `followUpMode` are always `all`, and
   setting `one-at-a-time` fails.
@@ -974,11 +1015,10 @@ Other differences:
   `compact`, `new_session`, `switch_session`, and `set_session_name` are
   refused. Upstream takes `set_auto_retry` at any time and saves it in
   `settings.json`; noel's lasts for the process.
-- An aborted reply, and the `Operation aborted` result of a tool call the
-  abort interrupted, are reported but not saved, so `get_messages` and later
-  model requests leave them out. Upstream keeps the aborted reply in the
-  session but also leaves it out of model requests. The same goes for a reply
-  a run drops to ask again (see Run Recovery).
+- A tool call an abort stops keeps what it printed before its result's
+  `Operation aborted`, and the calls after it that the abort kept from
+  starting get `Operation aborted` alone. Upstream's bash ends its output with
+  `Command aborted`.
 - Closing stdin during a run stops it where it is, kills its tool processes,
   and exits without `agent_end` or `agent_settled`; what the run saved stays
   in the session, and the run stays interrupted for `resume_run`. A signal
@@ -990,7 +1030,8 @@ Other differences:
 - A resumed run reports the turn it finishes: the saved reply again, as
   `get_messages` shows it (no model, usage, or timings), then the replay-safe
   calls it runs again, then `turn_end`. Calls that are not replay-safe get no
-  `tool_execution_*` records; the model is told they were interrupted.
+  `tool_execution_*` records: their result, saved unreported, is the output
+  they had saved and says they were interrupted (`docs/spec.md` §4.2).
 - `abort` with no run active ends an interrupted run as `aborted`; upstream's
   does nothing. A new `prompt` ends an interrupted run the same way.
 - The queue is saved with the session: an enqueue is saved before it is

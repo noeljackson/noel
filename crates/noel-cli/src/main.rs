@@ -3619,6 +3619,9 @@ impl TuiApp {
                 message.content.clone()
             };
             self.push(kind, text);
+            if message.aborted {
+                self.push(TuiEntryKind::System, "aborted");
+            }
             for media in &message.media {
                 self.push(TuiEntryKind::System, format_media_fallback(media));
             }
@@ -8257,11 +8260,14 @@ async fn run_turn_tui(
     let activity_started = Instant::now();
     let mut activity = Activity::Waiting;
     let (delta_tx, delta_rx) = std::sync::mpsc::channel::<TurnEvent>();
-    // An interrupt drops the turn future below; the run is never cancelled.
+    // An interrupt cancels the turn and waits for it to stop, which takes
+    // no longer than its next await: it saves what it produced so far (an
+    // aborted reply, a tool call's output) and ends.
     let run = RunControl {
         steering: steering.clone(),
         ..RunControl::default()
     };
+    let cancellation = run.cancellation.clone();
     let stream_end = {
         let turn = async {
             let on_event = move |event: &TurnEvent| {
@@ -8319,6 +8325,11 @@ async fn run_turn_tui(
                         saved_queue = pending;
                     }
                     if let Some(control) = control {
+                        cancellation.cancel();
+                        let _ = (&mut turn).await;
+                        while let Ok(event) = delta_rx.try_recv() {
+                            apply_turn_event(app, &mut live_text_index, &mut text_after_tool, thinking_index, &mut saw_delta, &mut activity, &event);
+                        }
                         break match control {
                             TurnControl::Quit => StreamEnd::Quit,
                             _ => StreamEnd::Interrupted,
@@ -8351,8 +8362,9 @@ async fn run_turn_tui(
     for notice in account_failover::drain_notices() {
         app.push(TuiEntryKind::System, notice);
     }
-    // Interrupt and quit drop the in-flight turn future, which cancels the
-    // provider request; whatever already streamed stays visible.
+    // Interrupt and quit cancel the turn, which cancels the provider
+    // request; whatever already streamed stays visible, and is saved as an
+    // aborted reply.
     let turn_result = match stream_end {
         StreamEnd::Finished(result) => result,
         StreamEnd::Interrupted | StreamEnd::Quit => {
@@ -10690,6 +10702,7 @@ mod tests {
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: Vec::new(),
+                aborted: false,
             })
             .unwrap();
         let mut app = TuiApp::new(&config, &runtime);
@@ -10722,6 +10735,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         };
         runtime.push_message(message("first prompt")).unwrap();
         let mut app = TuiApp::new(&config, &runtime);
@@ -11018,6 +11032,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         session.tool_history.push(noel_core::ToolEvent {
             id: "tool-1".into(),
@@ -12659,6 +12674,7 @@ mod tests {
                         tool_call_id: None,
                         tool_name: None,
                         tool_calls: Vec::new(),
+                        aborted: false,
                     })
                     .unwrap();
             }
@@ -12737,6 +12753,7 @@ mod tests {
                     tool_call_id: None,
                     tool_name: None,
                     tool_calls: Vec::new(),
+                    aborted: false,
                 })
                 .unwrap();
             runtime
@@ -13887,6 +13904,7 @@ mod tests {
             tool_call_id: Some("call_1".to_string()),
             tool_name: Some("bash".to_string()),
             tool_calls: Vec::new(),
+            aborted: false,
         });
         let hint = resume_hint(&Runtime::new(session.clone(), ReloadableSystems::default()))
             .expect("mid-turn hint");
@@ -13911,6 +13929,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         };
         for (role, call_id, calls, unfinished) in [
             (MessageRole::User, None, Vec::new(), true),
@@ -14221,6 +14240,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         session.messages.push(ConversationMessage {
             thinking: "saved summary".into(),
@@ -14230,6 +14250,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         session.messages.push(ConversationMessage {
             thinking: String::new(),
@@ -14239,6 +14260,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         let runtime = Runtime::new(session, ReloadableSystems::default());
         let mut app = TuiApp::default();
@@ -14790,6 +14812,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         session.messages.push(ConversationMessage {
             thinking: String::new(),
@@ -14799,6 +14822,7 @@ mod tests {
             tool_call_id: Some("call_1".to_string()),
             tool_name: Some("read".to_string()),
             tool_calls: Vec::new(),
+            aborted: false,
         });
         session.messages.push(ConversationMessage {
             thinking: String::new(),
@@ -14808,6 +14832,7 @@ mod tests {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            aborted: false,
         });
         session.tool_history.push(noel_core::ToolEvent {
             id: "call_1".into(),
@@ -15819,6 +15844,7 @@ mod tests {
             tool_call_id: Some("read-1".into()),
             tool_name: Some("read".into()),
             tool_calls: Vec::new(),
+            aborted: false,
         });
         let runtime = Runtime::new(session.clone(), ReloadableSystems::default());
         let mut app = TuiApp::default();

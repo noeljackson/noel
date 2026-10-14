@@ -39,7 +39,9 @@ the TUI, print mode, RPC mode and the server alike.
 - **Runs.** Each run's start (`runId`, `requestId`) is saved with its prompt and fsynced before the prompt is acknowledged. Its end (completed, failed or aborted) is saved before the run is reported settled. A run with a start and no end is *interrupted*.
 - **The queue.** Queued steers and follow-ups are saved with the session, and each enqueue is saved before it is acknowledged. A queued submission with a `requestId` is saved with its identity `{submission_id, request_id, mode}` (the queue record's `items`); the user message that places it into a run names it (`placed`), so it leaves the queue in the same record; a queue record that withdraws it names it too (`withdrawn`). All three fields are additive: older journals lack them and load as before, and a submission without a `requestId` gets a new `submissionId` each time the session opens, since nothing can ask about it after its process ends.
 
-**Decided:** durable partial output (§4.2).
+**Built:** durable partial output (§4.2): the journal also saves what a
+streaming reply and a running tool call have produced so far, and an aborted
+reply stays in the transcript.
 
 ## 3. Submissions, the queue and abort
 
@@ -78,23 +80,38 @@ the TUI, print mode, RPC mode and the server alike.
 - A supervisor decides when an interrupted run resumes: the Mode 1 driver, or the Mode 2 server (§8.3). noel never resumes in RPC mode on its own.
 - The TUI continues an unfinished session when you reopen it.
 - **What runs again on resume:**
-  - a model request that a crash cut off is sent again;
+  - a model request that a crash cut off is sent again, after what its reply had streamed is saved as an aborted reply (§4.2);
   - replay-safe tools (`read`, `grep`, `find`, `ls`) run again;
-  - any other interrupted tool call gets an "interrupted" result, and the model is told so.
+  - any other interrupted tool call gets an "interrupted" result holding the output it had saved (§4.2), and never runs again.
 
 ### 4.2 Partial output is durable
 
-**Decided (2026-10-14, follows Durable `spec.md:67`, `README.md:406`, `spec.md:3738, 3999-4006, 4078, 4118`).**
-- **What is saved while a call runs:** a streaming reply's text and thinking so far, and a running tool's output so far. Each is committed to the journal at most every 100 ms, under the setting `progress.partialIntervalMs` / `progress.outputIntervalMs`, default 100. A crash loses at most the last interval.
-- **An interrupted reply:** on recovery, its committed partial becomes an *aborted* assistant entry in the transcript before the request is sent again. Any of a run's failure or fault endings do the same.
-- **An interrupted tool call:** its result is the output saved so far, with an "interrupted" error, so the model sees how far it got.
-- **An aborted reply** is kept in the transcript and left out of later model requests. That matches upstream pi, which keeps it too, and noel's matching non-parity entry goes.
-- **What clients see:** a client that joins late or reconnects sees the committed partial, as part of the current view (§7.3).
+**Decided (2026-10-14, follows Durable `spec.md:67`, `README.md:406`, `spec.md:3738, 3999-4006, 4078, 4118`); built** in every mode (TUI, print, RPC), in the run engine (`crates/noel-core/src/progress.rs`). Where it differs from Durable is listed in the non-parity register ("Durable Partial Output").
+- **What is saved while a call runs:** a streaming reply's text and thinking so far, and a running tool's output so far (the end of it, within its result's limits). Each is committed to the journal at most every 100 ms, under the settings `progress.partialIntervalMs` and `progress.outputIntervalMs` (default 100), and only when it changed. The first change after a quiet interval is saved at once and later ones together at the interval's end, so a crash loses at most the last interval. Saving writes nothing to RPC mode's stdout.
+- **An interrupted reply:** a stop leaves its committed partial in the journal. Opening the session for writing (the next resume, RPC mode starting or switching to it, the TUI reopening it) saves it as an *aborted* assistant entry before anything else happens, so a resumed run sends the request again without it. A reply that streamed nothing leaves nothing.
+- **An aborted or failed reply:** an abort, and a failure that ends the run, save what the reply streamed as an aborted entry. A reply the run drops to ask again (a retry, or a compaction after an overflow) is superseded instead and leaves nothing in the transcript (non-parity register, "Run Recovery").
+- **An interrupted tool call:** its result is the output saved so far, then upstream's diagnostics block, and is an error:
 
-Journal shape **(Proposed):**
-- A `Partial {runId, attempt, text, thinking}` record, and a `ToolOutput {runId, callId, output, truncated}` record, each superseding the last one for the same key.
-- The terminal message or result supersedes both.
-- Compaction drops superseded partials.
+  ```text
+  <output so far>
+
+  <harness>
+  [warn] Output truncated to its end        (only when the start was dropped)
+  [error] Tool bash was interrupted and may have partially run
+  </harness>
+  ```
+
+  A resumed run saves it for each pending call that is not replay-safe, without reporting it; replay-safe calls run again. A new prompt after such calls saves it for each of them, since nothing will run them.
+- **An aborted tool call:** an abort saves its result as what it printed, then `Operation aborted` (published pi's text); calls of the same reply that had not started get `Operation aborted` alone.
+- **Aborted replies** are kept in the transcript and left out of later model requests, of the context estimate and of compaction summaries, as upstream pi does. `get_messages` reports one with `stopReason: "aborted"` and `errorMessage: "Request was aborted"`, `messageCount` counts it, the TUI shows it followed by `aborted`, and a turn whose last reply is aborted is still unfinished.
+- **What clients see (Decided):** a client that joins late or reconnects sees the committed partial, as part of the current view (§7.3).
+
+**Journal shape (built):** two records, additive, which older versions ignore (`#[serde(other)]`); older journals have neither and open as before. A session's journal only grows, so neither record rewrites what an earlier one saved while it can append:
+- `{"type":"partial","run_id"?,"attempt","text"?,"thinking"?,"append"?}`: what a reply streamed. A reply attempt's first record holds everything so far and supersedes any earlier partial; each later one (`append: true`) holds only what streamed since. `attempt` counts the requests for one reply from 1 (a retry or a re-ask after compaction is the next). A long reply therefore adds about its own size to the journal: a 90 000-byte faux reply streamed over 13 s wrote 128 records, 105 376 bytes, where a full snapshot per commit would have written about 5.8 MB.
+- `{"type":"tool_output","run_id"?,"call_id","output","truncated"?,"append"?}`: what a call printed. It appends while the output grows. Once the output passes its result's limits, the kept end moves (`truncated`): each record then rewrites it whole, and the wait before the next rewrite doubles, from `progress.outputIntervalMs` up to 2^16 times it, so a command that prints for an hour rewrites its output about fifteen times.
+- **Supersession:** a reply's message (or any message, a messages snapshot, a compaction checkpoint, or the run's end) supersedes the partial; a dropped reply is superseded by an empty partial record; the call's result message (or the run's end) supersedes its tool output.
+- **Compaction** rewrites the journal (§2) without the records it makes stale: every partial, and every tool output except the current one of a call still without a result.
+- `run_id` is the run's id in RPC mode (and the coming worker), and absent in the TUI and print mode, which have no runs.
 
 ## 5. Server, worker and client roles (Mode 2)
 
@@ -221,7 +238,7 @@ a submission belongs to this session.
 
 **Decided:**
 - RPC mode keeps upstream pi's record format and its abort rule (§3.3), and its goldens (`crates/noel-cli/tests/rpc_parity.rs`) guard both.
-- §4.2 applies to every mode, so RPC mode saves partial output and aborted replies too. Upstream pi also keeps aborted replies.
+- §4.2 applies to every mode, so RPC mode saves partial output and aborted replies too. Upstream pi also keeps aborted replies. **Built.** Keeping them moved `get_state.messageCount` to upstream's after an abort (the `abort-with-queue` golden now differs from upstream's only by the system message).
 
 **Built:** one session controller (`crates/noel-core/src/controller.rs`) drives runs. It owns, for one open session, the active run with its cancellation and retry backoff, the queue, submissions (§3.1), withdraw (§3.2), abort with a policy per caller (§3.3), resuming an interrupted run, compaction, and changes to the model and thinking level, which wait for no run to be active. It reports what happens as events, in order. RPC mode (`crates/noel-cli/src/rpc.rs`) is a thin adapter over it: commands in, records out, with abort keeping the queue; the Mode 2 worker will be the second caller. The TUI still drives its own loop until its remote backend (PR 6) moves it.
 
@@ -262,5 +279,6 @@ Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-regi
 
 Every place noel differs from upstream is listed in
 `docs/rust-rewrite/non-parity-register.md` with its reason. Building §4.2
-removes one entry: aborted replies not being saved. Upstream pi keeps them,
-leaving them out of model requests.
+removed one entry: aborted replies not being saved (upstream pi keeps them,
+leaving them out of model requests), and added "Durable Partial Output" for
+where noel's saving differs from Durable's.
