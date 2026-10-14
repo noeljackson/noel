@@ -1148,3 +1148,62 @@ pinned commit (`chord-delta.json`). These parts differ:
 Reason: Rust strings and integers cannot represent the first two. Matching
 the regex differences would need a JavaScript regex engine, and the float
 parser is a choice for the whole workspace, not for this crate.
+
+### Chord Link and Hosts
+
+`crates/noel-chord`'s links, connections and hosts send the frames upstream
+Chord sends in every scenario of `chord-link.json`, at the pinned commit, and
+interoperate with upstream's client and server hosts (`make chord-interop`).
+noel implements a subset, and these parts differ:
+
+- **No reload, plugins or code versions.** A host runs code version 1. It
+  answers `prepare` with a `vote` carrying `unavailable/not_coordinator` and
+  ignores `commit`, `abort` and `retire`. A child host that announces another
+  code version is closed instead of being fenced and reconciled.
+- **Objects are simpler.** Factories return an implementation (a variant,
+  state cells and methods) and the object is live at once: there are no
+  resources, listeners, tasks, derivations, registries, `lifetime: "host"`
+  objects or `linger`. A subscription that arrives with its hold therefore
+  gets `snap`; upstream sends `reset` when the subscription arrives while
+  the object is still activating, as it does over a real socket.
+- **No `accepts` adapters.** A consumer of another contract version gets
+  `contract_mismatch` (`upgrade_required` for a client).
+- **`Host::get` reaches other hosts only**: a host does not hold its own
+  objects through a reference.
+- **Cell writes are always validated** against the cell's schema; upstream
+  validates them in dev mode only. Values are checked by a subset of JSON
+  Schema (the keywords `noel_chord::validate` lists), not TypeBox's
+  `Value.Check`: `format` and `$ref` are not checked, and `Value.Clean` on a
+  union keeps the first branch the cleaned value fits.
+- **Packed payloads are inflated on receipt.** noel never packs what it
+  sends. A relaying noel host forwards a packed payload inflated, where
+  upstream forwards the deflated bytes unread.
+- **Error messages.** A method that fails with a plain error upstream sends
+  its message bare; a noel method fails with a `ChordError`, whose message
+  carries its `code: ` prefix. Validation messages follow noel's checker.
+  Codes and reasons are the same; the goldens compare no messages.
+- **Tokens.** noel sends its consumer token in its declared member order, but
+  the JSON Schemas inside it, and a token it relays, with sorted keys.
+  Fingerprints are canonical JSON, so they are unchanged; only the first
+  difference upstream's `coverage` names can change.
+- **Frame text.** Frames are written by `serde_json`. A float payload with an
+  exponent is written `1e21` where JavaScript writes `1e+21`, so such a
+  frame's size, as the window counts it, can differ by a character.
+- **Acknowledgements** go out after each batch of queued messages the host
+  processed; upstream sends them from a 0 ms timer. Both acknowledge every
+  frame once processed.
+- **Transports.** NDJSON lines `{"chord2": frame}` and
+  `{"chord2control": message}` carry the shape of Chord's Node IPC messages;
+  upstream serializes them through Node's IPC channel. WebSocket framing
+  over a Unix socket is noel's device transport; Chord has no Unix-socket
+  transport.
+- **Revocation order.** `invalidate_principal` disposes matching objects in
+  address order; upstream disposes holders before what they reference. noel
+  objects hold no references.
+- **Closing.** `Host::close` waits up to two seconds for its links to write
+  what they were sent, so a process that exits after it does not lose its
+  `release` and `bye` frames.
+
+Reason: noel needs Chord's protocol, not its runtime: one code version, no
+plugins, and objects whose state it owns directly. The rest are a native
+JSON library and scheduler standing in for JavaScript's.
