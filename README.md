@@ -1400,6 +1400,13 @@ requests count toward `/usage`. `/export` exports the current checkpoint and
 retained context, not the pre-compaction journal transcript.
 
 
+## Specification
+
+`docs/spec.md` is noel's normative specification for sessions, durability, the
+queue and abort, recovery, and the coming `noel server` and `noel client`. It
+marks what is built, what is decided and what is proposed, and cites upstream
+where noel follows it.
+
 ## RPC Mode
 
 `noel --mode rpc` speaks upstream pi's RPC protocol (upstream's `docs/rpc.md`,
