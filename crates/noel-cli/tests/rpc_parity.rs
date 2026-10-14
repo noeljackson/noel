@@ -2271,16 +2271,20 @@ fn a_command_cut_off_by_a_crash_keeps_its_output_in_its_result() {
     noel.command(json!({"id": "run", "type": "prompt", "message": "count", "requestId": "m-1"}));
     let run_id = noel.response("run")["data"]["runId"].clone();
     let sleeper = wait_for_pid(&noel.root.join("sleeper.pid"));
-    wait_for_record(&noel, "tool output", |record| {
-        record["type"] == "tool_output" && record["call_id"] == "b1"
-    });
-    let saved = noel
-        .journal()
-        .into_iter()
-        .filter(|record| record["type"] == "tool_output")
-        .map(|record| record["output"].as_str().unwrap().to_owned())
-        .collect::<String>();
-    assert_eq!(saved, "line 1\nline 2\nline 3\n");
+    // The first line can be saved on its own and the rest one interval
+    // later, so wait for all three to be saved.
+    let saved = || {
+        noel.journal()
+            .into_iter()
+            .filter(|record| record["type"] == "tool_output" && record["call_id"] == "b1")
+            .map(|record| record["output"].as_str().unwrap().to_owned())
+            .collect::<String>()
+    };
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while saved() != "line 1\nline 2\nline 3\n" && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(saved(), "line 1\nline 2\nline 3\n");
     noel.restart();
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(sleeper),
