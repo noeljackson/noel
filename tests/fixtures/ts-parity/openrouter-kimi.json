@@ -20,7 +20,7 @@
       "x-stainless-package-version": "7.19.0",
       "x-stainless-retry-count": "0",
       "x-stainless-runtime": "node",
-      "x-stainless-runtime-version": "v24.21.0"
+      "x-stainless-runtime-version": "v24.22.0"
     },
     "body": {
       "model": "moonshotai/kimi-k2.6",

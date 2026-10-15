@@ -1,0 +1,667 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "1692bba6347a287ab0f3cb554a4430fafffc474b",
+    "package": "packages/durable",
+    "envCommit": "abfe62928b39414ea2be4d6feb65ae608c67674f",
+    "script": "/ts-parity/local-env-fixture.ts"
+  },
+  "format": {
+    "cases": "createEnvConformance() against new NodeExecutionEnv({cwd}), cwd a fresh mkdtemp directory per case, in the suite's order.",
+    "options": "shell [\"sh\", \"-c\"], symlinks true, listFiles false (NodeExecutionEnv has no listFiles).",
+    "assertions": "Every assertion the case made, in order: the assertion, the actual value and the expected one. The case's cwd is <cwd>, the temporary directory <tmp>, and every mtimeMs <mtime>. Bytes are arrays of numbers; undefined is null.",
+    "outcome": "Watch cases wait for change reports whose number and timing vary, so only their outcome is recorded."
+  },
+  "options": {
+    "shell": [
+      "sh",
+      "-c"
+    ],
+    "symlinks": true,
+    "listFiles": false
+  },
+  "cases": [
+    {
+      "name": "binary reader reads byte ranges of the opened file",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "partialDeepEqual",
+          "actual": {
+            "name": "data.txt",
+            "path": "<cwd>/data.txt",
+            "kind": "file",
+            "size": 11,
+            "mtimeMs": "<mtime>"
+          },
+          "expected": {
+            "name": "data.txt",
+            "kind": "file",
+            "size": 11
+          }
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "hello",
+          "expected": "hello"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "world",
+          "expected": "world"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "invalid",
+          "expected": "invalid"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "invalid",
+          "expected": "invalid"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "aborted",
+          "expected": "aborted"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "invalid",
+          "expected": "invalid"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "invalid",
+          "expected": "invalid"
+        }
+      ]
+    },
+    {
+      "name": "binary reader scans lines like decoding the whole file",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": 4,
+          "expected": 4
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "a\n�\n\n﻿b\né",
+          "expected": "a\n�\n\n﻿b\né"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 14,
+          "expected": 14
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "a",
+          "expected": "a"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 1,
+          "expected": 1
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 4,
+          "expected": 4
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "a",
+          "expected": "a"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 1,
+          "expected": 1
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "a",
+          "expected": "a"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 1,
+          "expected": 1
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 4,
+          "expected": 4
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "�\n",
+          "expected": "�\n"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 4,
+          "expected": 4
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "�",
+          "expected": "�"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 3,
+          "expected": 3
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 4,
+          "expected": 4
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "",
+          "expected": ""
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "",
+          "expected": ""
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 4,
+          "expected": 4
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "﻿b\né",
+          "expected": "﻿b\né"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 7,
+          "expected": 7
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "﻿b",
+          "expected": "﻿b"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 4,
+          "expected": 4
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 4,
+          "expected": 4
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "é",
+          "expected": "é"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 2,
+          "expected": 2
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "é",
+          "expected": "é"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 2,
+          "expected": 2
+        },
+        {
+          "assert": "partialDeepEqual",
+          "actual": {
+            "newlines": 4,
+            "start": 16,
+            "end": 16,
+            "firstLineEnd": 16,
+            "lastLineStart": 16,
+            "selectedBytes": 0,
+            "firstLineBytes": 0
+          },
+          "expected": {
+            "start": 16,
+            "end": 16,
+            "selectedBytes": 0
+          }
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "invalid",
+          "expected": "invalid"
+        }
+      ]
+    },
+    {
+      "name": "binary reader keeps reading the file it opened after a rename",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": "one",
+          "expected": "one"
+        }
+      ]
+    },
+    {
+      "name": "binary reader refuses directories, missing files and aborted opens",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": "is_directory",
+          "expected": "is_directory"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "not_found",
+          "expected": "not_found"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "aborted",
+          "expected": "aborted"
+        }
+      ]
+    },
+    {
+      "name": "directory reader pages every entry exactly once",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "ok",
+          "actual": true,
+          "message": "directory reader reached the end"
+        },
+        {
+          "assert": "ok",
+          "actual": true,
+          "message": "page within maxEntries"
+        },
+        {
+          "assert": "ok",
+          "actual": true,
+          "message": "page within maxEntries"
+        },
+        {
+          "assert": "ok",
+          "actual": true,
+          "message": "page within maxEntries"
+        },
+        {
+          "assert": "ok",
+          "actual": true,
+          "message": "page within maxEntries"
+        },
+        {
+          "assert": "deepEqual",
+          "actual": [
+            "a.txt",
+            "b.txt",
+            "c.txt",
+            "d.txt",
+            "e.txt",
+            "sub"
+          ],
+          "expected": [
+            "a.txt",
+            "b.txt",
+            "c.txt",
+            "d.txt",
+            "e.txt",
+            "sub"
+          ]
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "directory",
+          "expected": "directory"
+        },
+        {
+          "assert": "partialDeepEqual",
+          "actual": {
+            "name": "a.txt",
+            "path": "<cwd>/a.txt",
+            "kind": "file",
+            "size": 5,
+            "mtimeMs": "<mtime>"
+          },
+          "expected": {
+            "kind": "file",
+            "size": 5
+          }
+        }
+      ]
+    },
+    {
+      "name": "directory reader reports the end and refuses use after close",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "deepEqual",
+          "actual": {
+            "entries": [],
+            "done": true
+          },
+          "expected": {
+            "entries": [],
+            "done": true
+          }
+        },
+        {
+          "assert": "deepEqual",
+          "actual": {
+            "entries": [],
+            "done": true
+          },
+          "expected": {
+            "entries": [],
+            "done": true
+          }
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "invalid",
+          "expected": "invalid"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "aborted",
+          "expected": "aborted"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "invalid",
+          "expected": "invalid"
+        }
+      ]
+    },
+    {
+      "name": "directory reader refuses missing paths and files",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": "not_found",
+          "expected": "not_found"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "not_directory",
+          "expected": "not_directory"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "aborted",
+          "expected": "aborted"
+        }
+      ]
+    },
+    {
+      "name": "directory reader skips entries removed during enumeration",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "deepEqual",
+          "actual": [],
+          "expected": []
+        }
+      ]
+    },
+    {
+      "name": "watch reports a missing file's creation, changes, replacement and removal",
+      "outcome": "pass",
+      "recorded": "outcome"
+    },
+    {
+      "name": "watch reports a missing target whose ancestors are created",
+      "outcome": "pass",
+      "recorded": "outcome"
+    },
+    {
+      "name": "watch follows directories created together with their contents",
+      "outcome": "pass",
+      "recorded": "outcome"
+    },
+    {
+      "name": "watch keeps watching a path whose parent is renamed and recreated",
+      "outcome": "pass",
+      "recorded": "outcome"
+    },
+    {
+      "name": "watch skips excluded entries and reports a rename out of them",
+      "outcome": "pass",
+      "recorded": "outcome"
+    },
+    {
+      "name": "watch keeps recursive coverage where a non-recursive target overlaps",
+      "outcome": "pass",
+      "recorded": "outcome"
+    },
+    {
+      "name": "watch follows a directory replaced at the same path",
+      "outcome": "pass",
+      "recorded": "outcome"
+    },
+    {
+      "name": "watch stops reporting once closed",
+      "outcome": "pass",
+      "recorded": "outcome"
+    },
+    {
+      "name": "argv exec passes arguments to the program without shell parsing",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "it's $(touch pwned) `touch pwned` *; touch pwned|a b",
+          "expected": "it's $(touch pwned) `touch pwned` *; touch pwned|a b"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": false,
+          "expected": false
+        }
+      ]
+    },
+    {
+      "name": "exec reports the stream of every chunk in both forms",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "outmore",
+          "expected": "outmore"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "err",
+          "expected": "err"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "outmore",
+          "expected": "outmore"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "err",
+          "expected": "err"
+        }
+      ]
+    },
+    {
+      "name": "argv exec honors cwd and exit codes",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": 3,
+          "expected": 3
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "x",
+          "expected": "x"
+        }
+      ]
+    },
+    {
+      "name": "argv exec reports missing programs and empty argv as spawn errors",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": "spawn_error",
+          "expected": "spawn_error"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "spawn_error",
+          "expected": "spawn_error"
+        }
+      ]
+    },
+    {
+      "name": "windowed exec keeps the exact tail and counts what it skips",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 18890,
+          "expected": 18890
+        },
+        {
+          "assert": "strictEqual",
+          "actual": 2000,
+          "expected": 2000
+        },
+        {
+          "assert": "ok",
+          "actual": true,
+          "message": "the delivered output ends with the tail"
+        }
+      ]
+    },
+    {
+      "name": "argv exec distinguishes timeout from abort",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": "timeout",
+          "expected": "timeout"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "aborted",
+          "expected": "aborted"
+        }
+      ]
+    },
+    {
+      "name": "binary reader follows symlinks unless noFollow refuses the final one",
+      "outcome": "pass",
+      "recorded": "assertions",
+      "assertions": [
+        {
+          "assert": "strictEqual",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "target",
+          "expected": "target"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "invalid",
+          "expected": "invalid"
+        },
+        {
+          "assert": "strictEqual",
+          "actual": "inner",
+          "expected": "inner"
+        }
+      ]
+    },
+    {
+      "name": "watch reports changes to the file a watched symbolic link points to",
+      "outcome": "pass",
+      "recorded": "outcome"
+    }
+  ]
+}

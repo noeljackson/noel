@@ -29,6 +29,7 @@
       "internal.?error",
       "provider.?returned.?(?:an.?)?error",
       "exceeded request buffer limit while retrying upstream",
+      "unable to forward upstream",
       "network.?error",
       "connection.?error",
       "connection.?refused",

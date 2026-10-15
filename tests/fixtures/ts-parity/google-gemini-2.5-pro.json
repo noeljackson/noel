@@ -12,7 +12,7 @@
     "headers": {
       "content-type": "application/json",
       "user-agent": "pi (linux <kernel>; x64)",
-      "x-goog-api-client": "google-genai-sdk/2.21.0 gl-node/v24.21.0",
+      "x-goog-api-client": "google-genai-sdk/2.21.0 gl-node/v24.22.0",
       "x-goog-api-key": "<redacted>"
     },
     "body": {

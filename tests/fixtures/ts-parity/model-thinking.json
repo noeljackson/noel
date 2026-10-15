@@ -847,8 +847,7 @@
         "max": "max"
       },
       "examples": [
-        "deepseek/deepseek-flash",
-        "opencode-go/deepseek-v4-flash"
+        "deepseek/deepseek-flash"
       ],
       "supported": [
         "off",

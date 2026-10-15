@@ -298,8 +298,8 @@
       },
       "expected": {
         "model": {
-          "provider": "amazon-bedrock",
-          "id": "us.anthropic.claude-haiku-5-5"
+          "provider": "anthropic",
+          "id": "claude-haiku-5-5"
         },
         "thinkingLevel": "low",
         "warning": null,
@@ -2380,11 +2380,18 @@
         "models": [
           {
             "provider": "azure",
-            "id": "gpt-5.5-pro",
+            "id": "gpt-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.5",
             "thinkingLevel": null
           }
         ],
-        "diagnostics": []
+        "diagnostics": [
+          "Pattern \"gpt-5.5\" matches several providers: azure, openai. Use provider/id to choose one."
+        ]
       }
     },
     {
@@ -2715,10 +2722,7 @@
           }
         ]
       },
-      "expected": {
-        "provider": "team/Local",
-        "id": "M1"
-      }
+      "expected": null
     },
     {
       "input": {
@@ -4131,13 +4135,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "us.anthropic.claude-sonnet-5-5",
-              "name": "Claude Sonnet 5.5 (US)",
-              "api": "bedrock-converse-stream",
-              "provider": "amazon-bedrock",
-              "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+              "id": "claude-sonnet-5-5",
+              "name": "Claude Sonnet 5.5",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -4146,10 +4155,10 @@
                 "image"
               ],
               "cost": {
-                "input": 2.2,
-                "output": 11,
-                "cacheRead": 0.11,
-                "cacheWrite": 2.75
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -5970,7 +5979,7 @@
                   }
                 ]
               },
-              "contextWindow": 272000,
+              "contextWindow": 500000,
               "maxTokens": 128000
             },
             "thinkingLevel": "medium"
@@ -6030,7 +6039,7 @@
                   }
                 ]
               },
-              "contextWindow": 272000,
+              "contextWindow": 500000,
               "maxTokens": 128000
             },
             "thinkingLevel": "medium"
