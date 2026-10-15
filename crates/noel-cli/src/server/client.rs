@@ -14,11 +14,22 @@
 //!   reconnects (starting a server) when the server is;
 //! - `abort <id>`, `resume <id> [<runId>]`, `withdraw <id> <submissionId>`.
 //!
+//! With `--remote <ssh-destination>`, the server is another machine's: the
+//! client runs `ssh -T <destination> noel bridge` ([`super::bridge`]) and
+//! speaks the same link over its stdin and stdout. ssh authenticates, with
+//! the user's own ssh configuration, keys and known hosts; the server stamps
+//! the link `{kind: "owner", via: "tunnel"}` and starts when none listens. A
+//! lost ssh is a lost link, reconnected as a lost local server is, with ssh
+//! in batch mode so it never asks on the terminal again.
+//!
 //! The TUI attached to a session (`noel --attach`, [`crate::attach`]) uses
 //! the same connection: [`Client::follow`] and [`Client::chat_call`].
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -28,7 +39,9 @@ use noel_chord::host::{Host, HostEvent, HostOptions, LinkOptions, RemoteRef, Sta
 use noel_chord::link::{websocket, WebSocketOptions};
 use noel_chord::{ChordError, ErrorCode};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, Join, ReadBuf};
 use tokio::net::UnixStream;
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Notify;
 
 use super::serve::{start_detached, Started};
@@ -40,6 +53,15 @@ use super::{chat_contract, new_request_id, peer_check, sessions_contract, Runtim
     about = "Use noel server's sessions from the command line"
 )]
 pub(crate) struct ClientArgs {
+    /// Use the server on another machine, through `ssh <DEST> noel bridge`
+    /// (DEST as ssh takes it: a host, user@host, or a Host from
+    /// ~/.ssh/config).
+    #[arg(long, value_name = "DEST", global = true)]
+    remote: Option<String>,
+    /// The noel program on the remote machine (default: `noel` on its
+    /// PATH; a leading ~/ is its home).
+    #[arg(long, value_name = "PATH", requires = "remote", global = true)]
+    remote_noel: Option<String>,
     #[command(subcommand)]
     command: ClientCommand,
 }
@@ -54,7 +76,8 @@ enum ClientCommand {
     },
     /// Create a session and print its id.
     New {
-        /// Its working directory (default: this one).
+        /// Its working directory (default: this one; with --remote, an
+        /// absolute path on that machine, which it needs).
         #[arg(long)]
         cwd: Option<PathBuf>,
         /// Its model, `provider/id`.
@@ -118,7 +141,14 @@ enum ClientCommand {
 }
 
 pub(crate) async fn run(args: ClientArgs) -> i32 {
-    match command(args.command).await {
+    let endpoint = match Endpoint::new(args.remote, args.remote_noel) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            eprintln!("noel client: {error:#}");
+            return 2;
+        }
+    };
+    match command(endpoint, args.command).await {
         Ok(code) => code,
         Err(error) => {
             eprintln!("noel client: {error:#}");
@@ -127,8 +157,22 @@ pub(crate) async fn run(args: ClientArgs) -> i32 {
     }
 }
 
-async fn command(command: ClientCommand) -> Result<i32> {
-    let client = Client::connect(Arc::new(|message| eprintln!("noel client: {message}"))).await?;
+async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
+    // The working directory of `new`: this one only when the server is here.
+    if let ClientCommand::New { cwd, .. } = &command {
+        if let Endpoint::Ssh { destination, .. } = &endpoint {
+            if !cwd.as_ref().is_some_and(|cwd| cwd.is_absolute()) {
+                return Err(anyhow!(
+                    "with --remote, pass --cwd: an absolute path on {destination}"
+                ));
+            }
+        }
+    }
+    let client = Client::connect(
+        endpoint,
+        Arc::new(|message| eprintln!("noel client: {message}")),
+    )
+    .await?;
     match command {
         ClientCommand::Ls { json } => client.ls(json).await,
         ClientCommand::New {
@@ -140,6 +184,7 @@ async fn command(command: ClientCommand) -> Result<i32> {
             request_id,
         } => {
             let cwd = match cwd {
+                Some(cwd) if cwd.is_absolute() => cwd,
                 Some(cwd) => std::path::absolute(cwd)?,
                 None => std::env::current_dir()?,
             };
@@ -269,17 +314,59 @@ pub(crate) enum Followed {
     ViewEnded(String),
 }
 
+/// Where the server is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Endpoint {
+    /// This machine's, on `server.sock`.
+    Local,
+    /// Another machine's, through `ssh -T <destination> <program> bridge`.
+    Ssh {
+        destination: String,
+        program: String,
+    },
+}
+
+impl Endpoint {
+    /// From `--remote` and `--remote-noel`.
+    pub(crate) fn new(remote: Option<String>, program: Option<String>) -> Result<Self> {
+        let Some(destination) = remote else {
+            return Ok(Self::Local);
+        };
+        // ssh would take a leading `-` as an option; a space or a control
+        // character is no destination.
+        if destination.is_empty()
+            || destination.starts_with('-')
+            || destination
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(anyhow!(
+                "--remote: {destination:?} is not an ssh destination"
+            ));
+        }
+        let program = program.unwrap_or_else(|| "noel".to_owned());
+        if program.is_empty() || program.chars().any(char::is_control) {
+            return Err(anyhow!("--remote-noel: {program:?} is not a program"));
+        }
+        Ok(Self::Ssh {
+            destination,
+            program,
+        })
+    }
+}
+
 /// A connection to the server, reconnected (and the server started) when
 /// it drops.
 #[derive(Clone)]
 pub(crate) struct Client {
     host: Host,
+    endpoint: Endpoint,
     lost: Arc<Notify>,
     report: Report,
 }
 
 impl Client {
-    pub(crate) async fn connect(report: Report) -> Result<Self> {
+    pub(crate) async fn connect(endpoint: Endpoint, report: Report) -> Result<Self> {
         let lost = Arc::new(Notify::new());
         let signal = lost.clone();
         let host = Host::new(HostOptions {
@@ -295,9 +382,16 @@ impl Client {
             })),
             ..HostOptions::client("client")
         });
-        let stream = dial(true, &report).await?;
-        host.connect(link(stream).await?, LinkOptions::default());
-        Ok(Self { host, lost, report })
+        host.connect(
+            open(&endpoint, true, &report).await?,
+            LinkOptions::default(),
+        );
+        Ok(Self {
+            host,
+            endpoint,
+            lost,
+            report,
+        })
     }
 
     /// Closes the connection, releasing what it holds.
@@ -309,14 +403,11 @@ impl Client {
     async fn reconnect(&self) {
         let mut delay = Duration::from_millis(100);
         loop {
-            match dial(true, &self.report).await {
-                Ok(stream) => match link(stream).await {
-                    Ok(link) => {
-                        self.host.connect(link, LinkOptions::default());
-                        return;
-                    }
-                    Err(error) => (self.report)(format!("reconnect: {error:#}")),
-                },
+            match open(&self.endpoint, false, &self.report).await {
+                Ok(link) => {
+                    self.host.connect(link, LinkOptions::default());
+                    return;
+                }
                 Err(error) => (self.report)(format!("reconnect: {error:#}")),
             }
             tokio::time::sleep(delay).await;
@@ -480,9 +571,21 @@ async fn call(reference: &RemoteRef, method: &str, args: Value) -> Result<Value>
     Ok(result.unwrap_or(Value::Null))
 }
 
+/// A link to the server at `endpoint`. ssh asks on the terminal (a password,
+/// an unknown host key) only when `interactive`.
+async fn open(endpoint: &Endpoint, interactive: bool, report: &Report) -> Result<noel_chord::Link> {
+    match endpoint {
+        Endpoint::Local => link(dial(true, report).await?).await,
+        Endpoint::Ssh {
+            destination,
+            program,
+        } => open_ssh(destination, program, interactive, report).await,
+    }
+}
+
 /// The server's socket, checked: the runtime directory is this user's and
 /// so is the process listening. Starts a server when none listens.
-async fn dial(autostart: bool, report: &Report) -> Result<UnixStream> {
+pub(crate) async fn dial(autostart: bool, report: &Report) -> Result<UnixStream> {
     let root = RuntimeDir::locate();
     let connect = |root: PathBuf| async move {
         let dir = RuntimeDir::check(root)?;
@@ -503,11 +606,165 @@ async fn dial(autostart: bool, report: &Report) -> Result<UnixStream> {
     }
 }
 
-async fn link(stream: UnixStream) -> Result<noel_chord::Link> {
+async fn link<S>(stream: S) -> Result<noel_chord::Link>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (socket, _) = tokio_tungstenite::client_async("ws://localhost/chord", stream)
         .await
         .map_err(|error| anyhow!("websocket upgrade: {error}"))?;
     Ok(websocket(socket, WebSocketOptions::default()))
+}
+
+/// The remote command: `<program> bridge`, the program quoted for the
+/// remote shell, a leading `~/` left for it to expand to its home.
+fn bridge_command(program: &str) -> String {
+    let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
+    match program.strip_prefix("~/") {
+        Some(rest) => format!("~/{} bridge", quote(rest)),
+        None => format!("{} bridge", quote(program)),
+    }
+}
+
+/// A link through `ssh -T <destination> <program> bridge`. What ssh (and the
+/// bridge) print while it connects is kept: on success it is reported, and
+/// on failure it is the error. Later lines are reported as they come.
+async fn open_ssh(
+    destination: &str,
+    program: &str,
+    interactive: bool,
+    report: &Report,
+) -> Result<noel_chord::Link> {
+    let mut command = tokio::process::Command::new("ssh");
+    command.args(["-T", "-e", "none"]);
+    if !interactive {
+        command.args(["-o", "BatchMode=yes"]);
+    }
+    command
+        .arg("--")
+        .arg(destination)
+        .arg(bridge_command(program))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| anyhow!("run ssh: {error}"))?;
+    let (Some(stdin), Some(stdout), Some(stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        return Err(anyhow!("ssh has no pipes"));
+    };
+    // Until the link is up, ssh's lines are kept; then they are reported.
+    let kept = Arc::new(Mutex::new(Some(Vec::<String>::new())));
+    let lines = {
+        let (kept, report, destination) = (kept.clone(), report.clone(), destination.to_owned());
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+                match kept.as_mut() {
+                    Some(kept) => kept.push(line),
+                    None => report(format!("{destination}: {line}")),
+                }
+            }
+        })
+    };
+    let stream = SshStream {
+        io: Some(tokio::io::join(stdout, stdin)),
+        child: Some(child),
+    };
+    match link(stream).await {
+        Ok(link) => {
+            let said = kept
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .unwrap_or_default();
+            for line in said {
+                report(format!("{destination}: {line}"));
+            }
+            Ok(link)
+        }
+        Err(error) => {
+            // ssh is gone, or ends with its stream: its last words are the
+            // reason.
+            let _ = tokio::time::timeout(Duration::from_secs(6), lines).await;
+            let said = kept
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .unwrap_or_default();
+            if said.is_empty() {
+                Err(anyhow!("ssh {destination}: no server answered ({error})"))
+            } else {
+                Err(anyhow!("ssh {destination}: {}", said.join("; ")))
+            }
+        }
+    }
+}
+
+/// ssh's stdout and stdin as one stream. When it drops, ssh's stdin closes
+/// and ssh has a few seconds to pass that on and exit, so the remote side
+/// ends cleanly; then it is killed.
+struct SshStream {
+    io: Option<Join<ChildStdout, ChildStdin>>,
+    child: Option<Child>,
+}
+
+impl SshStream {
+    fn io(&mut self) -> Pin<&mut Join<ChildStdout, ChildStdin>> {
+        Pin::new(self.io.as_mut().expect("open until dropped"))
+    }
+}
+
+impl Drop for SshStream {
+    fn drop(&mut self) {
+        drop(self.io.take());
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // Without a runtime, `kill_on_drop` kills it at once.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if tokio::time::timeout(Duration::from_secs(5), child.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = child.kill().await;
+                }
+            });
+        }
+    }
+}
+
+impl AsyncRead for SshStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.io().poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SshStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.io().poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.io().poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.io().poll_shutdown(cx)
+    }
 }
 
 fn describe_session(session: &Value) -> String {
@@ -778,6 +1035,29 @@ fn one_line(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_is_an_ssh_destination_and_its_program_is_quoted() {
+        assert_eq!(Endpoint::new(None, None).unwrap(), Endpoint::Local);
+        assert_eq!(
+            Endpoint::new(Some("me@box".into()), None).unwrap(),
+            Endpoint::Ssh {
+                destination: "me@box".into(),
+                program: "noel".into()
+            }
+        );
+        for bad in ["", "-oProxyCommand=x", "a b", "a\nb"] {
+            assert!(Endpoint::new(Some(bad.into()), None).is_err(), "{bad:?}");
+        }
+        assert!(Endpoint::new(Some("box".into()), Some(String::new())).is_err());
+        assert_eq!(bridge_command("noel"), "'noel' bridge");
+        assert_eq!(
+            bridge_command("/opt/it's/noel"),
+            r"'/opt/it'\''s/noel' bridge"
+        );
+        assert_eq!(bridge_command("~/bin/noel"), "~/'bin/noel' bridge");
+        assert_eq!(bridge_command("~me/noel"), "'~me/noel' bridge");
+    }
 
     #[test]
     fn a_view_renders_its_entries_partial_tools_and_queue() {

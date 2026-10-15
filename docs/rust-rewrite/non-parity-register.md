@@ -1344,9 +1344,14 @@ private), so the objects and processes are noel's, and these parts differ:
   starts its worker (after a crash, or for the first hold after a machine
   stopped), at most three times per run. The count lives in the server, so a
   new server counts again.
-- **Access.** Device only: the owner's processes, by the socket's peer uid,
-  with no token. No relay, tunnel, pairing or guests yet (spec §6); a guest
-  principal would get its variant, but nothing stamps one.
+- **Access.** The owner's processes, by the socket's peer uid, with no token
+  (`via: "device"`), and the owner on another machine through `ssh <host> noel
+  bridge` (`via: "tunnel"`). Chord computes a principal from the upgrade
+  request; noel's comes from the peer uid plus a `Noel-Via: tunnel` header
+  that only the bridge sets for the other machine. Upstream has no ssh
+  transport: its v1.1.0 reached other machines through a hosted relay. No
+  relay, pairing or guests yet (spec §6); a guest principal would get its
+  variant, but nothing stamps one.
 - **The runtime directory** can be named by `NOEL_RUNTIME_DIR`, for tests and
   scratch servers.
 - **`noel.models`** is the models that can run when the server starts; it is

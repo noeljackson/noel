@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine;
+use futures_util::future::{select, Either};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -347,6 +348,11 @@ impl Default for WebSocketOptions {
     }
 }
 
+/// How long a peer has to end the socket after this side closed the link
+/// and wrote its close frame; then the socket is dropped. Upstream's `ws`
+/// destroys a socket 30 s after `close()` (its `closeTimeout`).
+const WEBSOCKET_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct WebSocketTransport {
     outbox: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     written: watch::Receiver<bool>,
@@ -384,6 +390,7 @@ where
     let (mut sink, mut source) = stream.split();
     let (outbox, mut queued) = mpsc::unbounded_channel::<Message>();
     let (done, written) = watch::channel(false);
+    let mut closed = written.clone();
     tokio::spawn(async move {
         while let Some(message) = queued.recv().await {
             if sink.send(message).await.is_err() {
@@ -404,7 +411,17 @@ where
     });
     let delivery = reader_delivery.expect("the transport was built");
     tokio::spawn(async move {
-        while let Some(message) = source.next().await {
+        // A peer that never answers the close frame (gone, but its end of
+        // the socket still open) would otherwise hold the socket forever.
+        let mut closing = Box::pin(async move {
+            let _ = closed.wait_for(|done| *done).await;
+            tokio::time::sleep(WEBSOCKET_CLOSE_GRACE).await;
+        });
+        loop {
+            let message = match select(source.next(), closing.as_mut()).await {
+                Either::Left((Some(message), _)) => message,
+                Either::Left((None, _)) | Either::Right(_) => break,
+            };
             match message {
                 Ok(Message::Text(text)) => delivery.deliver_text(text.as_str()),
                 Ok(Message::Binary(bytes)) => {
@@ -554,6 +571,40 @@ mod tests {
     use flate2::Compression;
     use serde_json::json;
     use std::io::Write;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_websocket_drops_the_socket_of_a_peer_that_never_answers() {
+        use tokio::io::AsyncReadExt;
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let accepting = tokio::spawn(tokio_tungstenite::accept_async(server));
+        let (mut peer, _) = tokio_tungstenite::client_async("ws://localhost/chord", client)
+            .await
+            .unwrap();
+        let link = websocket(
+            accepting.await.unwrap().unwrap(),
+            WebSocketOptions::default(),
+        );
+        // The peer reads the socket's bytes and never answers the close.
+        let started = tokio::time::Instant::now();
+        link.close("test");
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 256];
+        let ended = tokio::time::timeout(WEBSOCKET_CLOSE_GRACE * 2, async {
+            loop {
+                match peer.get_mut().read(&mut chunk).await.unwrap() {
+                    0 => break,
+                    read => bytes.extend_from_slice(&chunk[..read]),
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the socket stayed open");
+        assert!(started.elapsed() >= WEBSOCKET_CLOSE_GRACE);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(r#""t":"bye""#),
+            "{bytes:?}"
+        );
+    }
 
     fn deflate(text: &str) -> Vec<u8> {
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());

@@ -1434,6 +1434,36 @@ available when attached. `/quit` detaches, and a run goes on in the server. If
 the session's worker or the server stops, the TUI says so, holds the session
 again and redraws it; the server resumes an interrupted run.
 
+### A server on another machine
+
+`--remote <ssh-destination>` uses the server on another machine, through
+`ssh <destination> noel bridge`. That machine needs `noel` and nothing else;
+its server starts when none listens, and its sessions, models, accounts and
+tools are its own:
+
+```bash
+noel client --remote build-box ls
+noel client --remote build-box new --cwd /srv/app --model anthropic/claude-sonnet-4-5
+noel --attach <session-id> --remote build-box
+```
+
+- **ssh does the authentication,** with your `~/.ssh/config`, keys, agent and
+  known hosts, so `user@host`, a `Host` alias and hosts from `cw config-ssh`
+  all work. There is no token and no relay. The server stamps these links
+  `{kind: "owner", via: "tunnel"}`, since `ssh` admitted the same user that
+  owns it (spec §6).
+- **`noel bridge`** joins its stdin and stdout to the server's socket, after
+  the same checks a local client makes, and exits when either side closes.
+  `--remote-noel <path>` names noel on that machine when it is not on the
+  `PATH` that `ssh host command` gets (`~/` at its start is that machine's
+  home).
+- **`new` needs `--cwd`,** an absolute path on that machine.
+- **A dropped connection** is a lost link: `watch` and the TUI reconnect, and
+  get the view again. The first connection may prompt (a password, a new host
+  key); reconnections run ssh with `BatchMode=yes`, so they never take the
+  terminal. `make bridge-journey` runs the whole flow against `sshd` in an
+  Alpine container with no network.
+
 ## Remote Workspaces
 
 A session can run its tools in a directory on another machine, reached over

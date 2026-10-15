@@ -7,7 +7,9 @@
 //!   owns, and writes `server.json` (`pid`, `build`, `startedAt`).
 //! - Each connection's peer uid is checked before a byte is read; another
 //!   uid is closed. A connection is a WebSocket on `/chord`, accepted as a
-//!   client acting as `{kind: "owner", via: "device"}`.
+//!   client acting as `{kind: "owner", via: "device"}`, or `via: "tunnel"`
+//!   when its upgrade request says `Noel-Via: tunnel` (`noel bridge` sets
+//!   it, and drops one the other machine sent).
 //! - It serves `noel.sessions` (the directory, `create`, `fork`) and
 //!   `noel.models` (the catalog), to the owner only.
 //! - It routes `session:<id>`: `authorize` lets the owner reach any session,
@@ -50,10 +52,10 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::http::StatusCode;
 
 use super::{
-    build_id, control_line, derived_session_id, models_contract, own_exe, own_uid, owner_device,
+    build_id, control_line, derived_session_id, models_contract, own_exe, own_uid, owner,
     parse_control, peer_check, principal_key, remove_stale_socket, sessions_contract, set_mode,
     valid_session_id, worker_principal, write_record, RuntimeDir, DEFAULT_SERVER_IDLE_MS,
-    ENV_RUNTIME_DIR, EXIT_LOCKED,
+    ENV_RUNTIME_DIR, EXIT_LOCKED, VIA_HEADER,
 };
 
 #[derive(Debug, Parser)]
@@ -373,20 +375,30 @@ fn log_event(event: &HostEvent, clients: &Mutex<HashSet<u64>>) {
     }
 }
 
-/// The WebSocket upgrade must ask for `/chord` (tungstenite's error type).
+/// How the owner came in, by the upgrade request: `tunnel` when it says
+/// `Noel-Via: tunnel`, `device` when it has no `Noel-Via`. It must ask for
+/// `/chord` (tungstenite's error type).
 #[allow(clippy::result_large_err)]
-fn check_path(request: &Request, response: Response) -> Result<Response, ErrorResponse> {
-    if request.uri().path() == "/chord" {
-        return Ok(response);
+fn check_upgrade(request: &Request) -> Result<&'static str, ErrorResponse> {
+    let refuse = |status: StatusCode, why: &str| {
+        let mut refusal = ErrorResponse::new(Some(why.to_owned()));
+        *refusal.status_mut() = status;
+        refusal
+    };
+    if request.uri().path() != "/chord" {
+        return Err(refuse(StatusCode::NOT_FOUND, "not found"));
     }
-    let mut refusal = ErrorResponse::new(Some("not found".to_owned()));
-    *refusal.status_mut() = StatusCode::NOT_FOUND;
-    Err(refusal)
+    let mut via = request.headers().get_all(VIA_HEADER).iter();
+    match (via.next(), via.next()) {
+        (None, _) => Ok("device"),
+        (Some(value), None) if value.as_bytes() == b"tunnel" => Ok("tunnel"),
+        _ => Err(refuse(StatusCode::BAD_REQUEST, "bad Noel-Via")),
+    }
 }
 
-/// Accepts clients: a connection whose peer is not `owner` is closed before
-/// a byte is read.
-pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner: u32) {
+/// Accepts clients: a connection whose peer is not the uid `owner_uid` is
+/// closed before a byte is read.
+pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner_uid: u32) {
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -397,7 +409,7 @@ pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner: u3
             }
         };
         match stream.peer_cred() {
-            Ok(credentials) if credentials.uid() == owner => {}
+            Ok(credentials) if credentials.uid() == owner_uid => {}
             Ok(credentials) => {
                 eprintln!(
                     "noel server: refused a connection from uid {} (pid {:?}): not the owner",
@@ -415,7 +427,16 @@ pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner: u3
         }
         let host = host.clone();
         tokio::spawn(async move {
-            match tokio_tungstenite::accept_hdr_async(stream, check_path).await {
+            let via = Arc::new(Mutex::new("device"));
+            let seen = via.clone();
+            // tungstenite's error type.
+            #[allow(clippy::result_large_err)]
+            let upgrade =
+                move |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
+                    *lock(&seen) = check_upgrade(request)?;
+                    Ok(response)
+                };
+            match tokio_tungstenite::accept_hdr_async(stream, upgrade).await {
                 Ok(socket) => {
                     let link = websocket(
                         socket,
@@ -423,7 +444,8 @@ pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner: u3
                             accept_packed: false,
                         },
                     );
-                    host.accept(link, AcceptOptions::client(owner_device()));
+                    let via = *lock(&via);
+                    host.accept(link, AcceptOptions::client(owner(via)));
                 }
                 Err(error) => eprintln!("noel server: refused: websocket upgrade: {error}"),
             }
@@ -1264,6 +1286,59 @@ mod tests {
             .await
             .expect("closed in time");
         assert!(read.is_err() || reply.is_empty(), "{reply:?}");
+        fs::remove_dir_all(dir.root()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_link_is_the_device_s_unless_its_upgrade_says_tunnel() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let dir = std::env::temp_dir().join(format!("nsv-via-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let dir = RuntimeDir::ensure(dir).unwrap();
+        let socket = dir.server_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (opened, mut principals) = mpsc::unbounded_channel();
+        let host = Host::new(HostOptions {
+            observer: Some(Arc::new(move |event| {
+                if let HostEvent::LinkOpened { principal, .. } = event {
+                    let _ = opened.send(principal.clone());
+                }
+            })),
+            ..HostOptions::host("server")
+        });
+        tokio::spawn(accept_clients(listener, host, own_uid()));
+        let upgrade = |via: Option<&str>| {
+            let socket = socket.clone();
+            let via = via.map(str::to_owned);
+            async move {
+                let mut request = "ws://localhost/chord".into_client_request().unwrap();
+                if let Some(via) = via {
+                    request
+                        .headers_mut()
+                        .insert(VIA_HEADER, via.parse().unwrap());
+                }
+                let stream = UnixStream::connect(&socket).await.unwrap();
+                tokio_tungstenite::client_async(request, stream).await
+            }
+        };
+        async fn next(
+            principals: &mut mpsc::UnboundedReceiver<Option<Value>>,
+        ) -> Option<Option<Value>> {
+            tokio::time::timeout(Duration::from_secs(5), principals.recv())
+                .await
+                .ok()
+                .flatten()
+        }
+        let _device = upgrade(None).await.unwrap();
+        assert_eq!(next(&mut principals).await, Some(Some(owner("device"))));
+        let _tunnel = upgrade(Some("tunnel")).await.unwrap();
+        assert_eq!(next(&mut principals).await, Some(Some(owner("tunnel"))));
+        // Any other claim is refused, and opens no link.
+        for claim in ["device", "relay", "Tunnel"] {
+            let error = upgrade(Some(claim)).await.unwrap_err().to_string();
+            assert!(error.contains("400"), "{claim}: {error}");
+        }
+        assert_eq!(next(&mut principals).await, None);
         fs::remove_dir_all(dir.root()).unwrap();
     }
 }

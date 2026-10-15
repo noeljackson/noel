@@ -12,10 +12,15 @@
 //!   of the conversation ([`view`]) and drives runs with the session
 //!   controller. It outlives its server and waits to be adopted.
 //! - **The client** ([`client`]) is line-mode `noel client`.
+//! - **The bridge** ([`bridge`]) is `noel bridge`: the server's socket on
+//!   stdin and stdout, so a client on another machine reaches the server
+//!   with `ssh <host> noel bridge` (`--remote`).
 //!
-//! Only device access is built: the owner's processes on this machine, by
-//! the socket's peer uid. There is no relay, tunnel, pairing or guest yet.
+//! The owner reaches the server two ways: on this machine, by the socket's
+//! peer uid (`via: "device"`), and through the bridge, as the user ssh let
+//! in (`via: "tunnel"`). There is no relay, pairing or guest yet.
 
+pub(crate) mod bridge;
 pub(crate) mod client;
 pub(crate) mod serve;
 mod view;
@@ -39,6 +44,10 @@ pub(crate) const EXIT_LOCKED: i32 = 75;
 
 /// Overrides where the server's socket, lock and worker sockets live.
 pub(crate) const ENV_RUNTIME_DIR: &str = "NOEL_RUNTIME_DIR";
+
+/// The upgrade request header a bridge sets to `tunnel`; without it a link
+/// on the socket is the device's.
+pub(crate) const VIA_HEADER: &str = "Noel-Via";
 
 /// The worker's `ready` and `fatal` lines, and the control lines on a
 /// server–worker link, are `{"chord2control": message}`.
@@ -65,8 +74,9 @@ pub(crate) fn models_contract() -> Description {
     serde_json::from_str(MODELS_CONTRACT).expect("noel.models' contract parses")
 }
 
-/// Runs `noel server`, `noel worker` or `noel client` when the command line
-/// names one, and returns the exit status; `None` for any other command.
+/// Runs `noel server`, `noel worker`, `noel client` or `noel bridge` when
+/// the command line names one, and returns the exit status; `None` for any
+/// other command.
 pub(crate) async fn try_run(args: &[String]) -> Option<i32> {
     use clap::Parser;
     let command = args.get(1)?.as_str();
@@ -82,6 +92,10 @@ pub(crate) async fn try_run(args: &[String]) -> Option<i32> {
         },
         "client" => match client::ClientArgs::try_parse_from(rest) {
             Ok(parsed) => client::run(parsed).await,
+            Err(error) => usage(error),
+        },
+        "bridge" => match bridge::BridgeArgs::try_parse_from(rest) {
+            Ok(parsed) => bridge::run(parsed).await,
             Err(error) => usage(error),
         },
         _ => return None,
@@ -337,9 +351,10 @@ pub(crate) fn derived_session_id(method: &str, request_id: &str) -> String {
     format!("s-{hex}")
 }
 
-/// The principal of the owner's processes on this machine.
-pub(crate) fn owner_device() -> Value {
-    json!({"kind": "owner", "via": "device"})
+/// The owner's principal: `via` is `device` for the owner's processes on
+/// this machine, `tunnel` for a client through `noel bridge`.
+pub(crate) fn owner(via: &str) -> Value {
+    json!({"kind": "owner", "via": via})
 }
 
 /// The principal of a worker's own calls.
@@ -503,7 +518,8 @@ mod tests {
 
     #[test]
     fn principals_get_their_variant_and_key() {
-        assert_eq!(chat_variant(&owner_device(), "s1"), Some("participant"));
+        assert_eq!(chat_variant(&owner("device"), "s1"), Some("participant"));
+        assert_eq!(chat_variant(&owner("tunnel"), "s1"), Some("participant"));
         let guest = |session: &str, mode: &str| json!({"kind": "guest", "id": "g", "name": "G", "session": session, "mode": mode, "revision": 2});
         assert_eq!(chat_variant(&guest("s1", "view"), "s1"), Some("viewer"));
         assert_eq!(
@@ -513,7 +529,8 @@ mod tests {
         assert_eq!(chat_variant(&guest("s2", "full"), "s1"), None);
         assert_eq!(chat_variant(&worker_principal("s1", 1), "s1"), None);
         assert_eq!(chat_variant(&json!({"host": "server"}), "s1"), None);
-        assert_eq!(principal_key(&owner_device()), "owner@device");
+        assert_eq!(principal_key(&owner("device")), "owner@device");
+        assert_eq!(principal_key(&owner("tunnel")), "owner@tunnel");
         assert_eq!(principal_key(&guest("s1", "view")), "guest:g:r2");
         assert_eq!(principal_key(&worker_principal("s1", 3)), "worker:s1:3");
     }
