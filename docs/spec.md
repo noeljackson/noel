@@ -121,7 +121,7 @@ reply stays in the transcript.
 - **Client:** the TUI, and a line-mode `noel client`. A client holds remote objects through the server, which relays between clients and workers.
 
 **Built** (`crates/noel-cli/src/server`):
-- **The runtime directory** is `$XDG_RUNTIME_DIR/noel`, else `/tmp/noel-<uid>` (`NOEL_RUNTIME_DIR` overrides both). It must be a directory, not a link, owned by the user with mode 0700; it is made so when missing, and anything else is refused.
+- **The runtime directory** is `$XDG_RUNTIME_DIR/noel`, else `/tmp/noel-<uid>` (`NOEL_RUNTIME_DIR` overrides both). It must be a directory, not a link, owned by the user with permissions 0700; it is made so when missing (clearing a setgid bit its parent passes on), a setgid or sticky bit on an existing one is allowed, and anything else is refused.
 - **The server:**
   - `noel server --foreground` takes `server.lock` there (`File::try_lock`); a second server exits with code 75. Without `--foreground`, `noel server` starts a detached server (output in `server.log`) and returns once it listens, or exits 75 if one already runs;
   - it binds `server.sock` (0600), removing a stale one only when it is a socket the user owns, and writes `server.json` (`pid`, `build`, `startedAt`);
