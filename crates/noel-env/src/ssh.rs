@@ -740,7 +740,7 @@ pub async fn deploy_daemon(
 ) -> Result<String, SshError> {
     let bytes = fs::read(binary).map_err(|error| {
         other(format!(
-            "No noel-env daemon for {}-{} at {}: {error}; build {} for that system (make env-daemon) and put it there, or set {DAEMON_DIR_VARIABLE}",
+            "No noel-env daemon for {}-{} at {}: {error}; build {} for that system (make env-daemons builds the Linux ones) and put it there, or set {DAEMON_DIR_VARIABLE}",
             remote.platform.as_str(),
             remote.arch.as_str(),
             binary.display(),

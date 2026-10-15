@@ -10,8 +10,8 @@
 //! [`LocalEnv`] runs on this machine and behaves as `NodeExecutionEnv`
 //! (`packages/env/docs/semantics.md`). Remote workspaces speak the `pi-env`
 //! protocol, whose frames are in [`frame`]; the daemon is the
-//! `noel-env-daemon` crate (`noel-env serve`), and the client comes later in
-//! this crate.
+//! `noel-env-daemon` crate (`noel-env serve`), and the client is
+//! [`Connection`] and [`RemoteEnv`], with [`ssh`] deployment.
 
 mod connection;
 mod context;
@@ -34,9 +34,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 pub use connection::{
-    node_platform, CommandFuture, Connection, ConnectionOptions, DaemonCommand, EventCallback,
-    Json, LogCallback, PendingRequest, RemoteError, RemoteInfo, Reply, RequestOptions,
-    StartCallback,
+    node_platform, CommandFuture, Connection, ConnectionOptions, ConnectionStatus, DaemonCommand,
+    EventCallback, Json, LogCallback, PendingRequest, RemoteError, RemoteInfo, Reply,
+    RequestOptions, StartCallback,
 };
 pub use context::{AbortController, AbortSignal, Context};
 pub use decode::{RangeDecoder, StreamDecoder};

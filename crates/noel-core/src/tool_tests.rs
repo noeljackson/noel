@@ -456,3 +456,126 @@ async fn tool_calls_run_in_the_workspace_the_env_provider_chooses() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+/// A session whose journal names a workspace runs its tools there and only
+/// there (spec §10): without a provider that opens it, its calls fail; with
+/// one, the hook gets the record. Its system prompt states the workspace's
+/// directory, keeps the user's own context file, reads the project's from
+/// the workspace once a run loads them, and lists no local skills.
+#[tokio::test]
+async fn sessions_in_a_workspace_run_their_tools_only_there() {
+    use std::sync::{Arc, Mutex};
+
+    use noel_config::{ContextFile, Skill, SourceInfo, SourceScope};
+
+    use crate::{EnvProvider, LocalEnv, RunControl, SessionWorkspace};
+
+    let root = std::env::temp_dir().join(format!("noel-ws-session-{}", std::process::id()));
+    let (here, there) = (root.join("here"), root.join("there"));
+    fs::create_dir_all(&here).expect("create session dir");
+    fs::create_dir_all(there.join("project")).expect("create workspace");
+    fs::write(here.join("notes.txt"), "from here\n").expect("write local notes");
+    fs::write(there.join("project/notes.txt"), "from there\n").expect("write remote notes");
+    fs::write(there.join("AGENTS.md"), "workspace rules").expect("write context");
+    let workspace = SessionWorkspace {
+        adapter: "test".into(),
+        id: "test:there".into(),
+        cwd: there.join("project").display().to_string(),
+        options: serde_json::Map::new(),
+    };
+    let mut session = SessionState::new("session-ws", here.clone());
+    session.workspace = Some(workspace.clone());
+    let mut runtime = Runtime::new(
+        session,
+        ReloadableSystems {
+            context_files: vec![
+                ContextFile {
+                    path: "/agent/AGENTS.md".into(),
+                    content: "my rules".into(),
+                },
+                ContextFile {
+                    path: here.join("AGENTS.md"),
+                    content: "local project rules".into(),
+                },
+            ],
+            agent_context_files: vec![ContextFile {
+                path: "/agent/AGENTS.md".into(),
+                content: "my rules".into(),
+            }],
+            skills: vec![Skill {
+                name: "local-skill".into(),
+                description: "A skill on this machine.".into(),
+                file_path: "/agent/skills/local-skill/SKILL.md".into(),
+                base_dir: "/agent/skills/local-skill".into(),
+                source_info: SourceInfo {
+                    path: "/agent/skills/local-skill/SKILL.md".into(),
+                    source: "auto".into(),
+                    scope: SourceScope::User,
+                    from_package: false,
+                    base_dir: None,
+                },
+                disable_model_invocation: false,
+            }],
+            ..ReloadableSystems::default()
+        },
+    );
+
+    // Never this machine: without a provider that opens it, calls fail.
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert!(is_error, "{output}");
+    assert!(output.contains("test workspace test:there"), "{output}");
+
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    runtime.set_env_provider(EnvProvider::Workspaces(Arc::new({
+        let opened = opened.clone();
+        move |target, record| {
+            opened
+                .lock()
+                .unwrap()
+                .push((target.session_id.to_string(), record.id.clone()));
+            Ok(Arc::new(LocalEnv::new(&record.cwd)))
+        }
+    })));
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert_eq!((output.as_str(), is_error), ("from there\n", false));
+    assert_eq!(
+        *opened.lock().unwrap(),
+        [("session-ws".to_string(), "test:there".to_string())]
+    );
+
+    let prompt = runtime_system_prompt(&runtime);
+    assert!(
+        prompt.ends_with(&format!("<cwd>\n{}\n</cwd>", workspace.cwd)),
+        "{prompt}"
+    );
+    assert!(prompt.contains("my rules"), "{prompt}");
+    assert!(!prompt.contains("local project rules"), "{prompt}");
+    assert!(!prompt.contains("workspace rules"), "{prompt}");
+    assert!(!prompt.contains("local-skill"), "{prompt}");
+    runtime
+        .load_workspace_context(&RunControl::default())
+        .await
+        .expect("load context");
+    let prompt = runtime_system_prompt(&runtime);
+    let (mine, theirs) = (
+        prompt.find("my rules").expect("agent rules"),
+        prompt.find("workspace rules").expect("workspace rules"),
+    );
+    assert!(mine < theirs, "{prompt}");
+
+    // `--no-context-files` reads none there.
+    runtime.set_workspace_context_enabled(false);
+    runtime
+        .load_workspace_context(&RunControl::default())
+        .await
+        .expect("load context");
+    assert!(!runtime_system_prompt(&runtime).contains("workspace rules"));
+
+    // A session without a workspace, under the same provider, is local.
+    let opens = opened.lock().unwrap().len();
+    runtime.replace_session(SessionState::new("session-local", here.clone()), None);
+    let (output, is_error) = call_tool(&mut runtime, "read", json!({"path": "notes.txt"})).await;
+    assert_eq!((output.as_str(), is_error), ("from here\n", false));
+    assert_eq!(opened.lock().unwrap().len(), opens);
+    let _ = fs::remove_dir_all(root);
+}

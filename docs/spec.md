@@ -24,7 +24,7 @@ such as `durable/docs/spec.md:67` are under upstream's `packages/`.
    - Codewire's managed conversations are one supervisor. They are **Built** on trusted Linux hosts; Codewire Sandboxes are **Decided**.
 2. **Mode 2, server and client.**
    - A long-running `noel server` holds sessions, and clients attach to it from anywhere (§5–§9). **Built** for clients on the same machine (device access, §6): `noel server`, `noel worker`, the line-mode `noel client`, and the TUI attached to a session, `noel --attach` (§7.4).
-   - A session's tools run in a workspace chosen through an adapter: local, a remote machine through `pi-env`, a Codewire environment, or anything else that implements the workspace interface (§10).
+   - A session's tools run in a workspace chosen through an adapter: local, a remote machine through `pi-env`, a Codewire environment, or anything else that implements the workspace interface (§10). **Built** for local and for a remote machine over `ssh`, in every mode.
 
 noel works without Codewire in both modes. Every Codewire path is optional.
 
@@ -186,10 +186,12 @@ Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-regi
 
 ```text
 noel.sessions  at "server", input {}           owner only (variant owner)
-  state directory: {sessions: [{sessionId, name?, cwd, modified, messageCount,
-                                firstPrompt?, model?, live: {worker, busy, viewers},
+  state directory: {sessions: [{sessionId, name?, cwd, workspace?, modified,
+                                messageCount, firstPrompt?, model?,
+                                live: {worker, busy, viewers},
                                 lastRun?: {runId, status}}]}        newest first
-  create({requestId, cwd, name?, model?, thinkingLevel?}) -> {sessionId, created}
+  create({requestId, cwd, name?, model?, thinkingLevel?, workspace?})
+      -> {sessionId, created}
   fork({requestId, sessionId}) -> {sessionId, created}
 
 noel.chat      at "session:<id>", input {session}
@@ -214,7 +216,7 @@ the input names this worker's session.
 - **`submit`** maps to the session controller (§3.1): `whenBusy` names the kind (`reject` a prompt, `steer`, `followUp`, default `reject`). While idle any submission starts a run. A repeated `requestId` answers `repeated` with the first submission's `status` (`queued`, `running`, `interrupted`, `completed`, `failed`, `aborted`, `withdrawn`) and its `runId`. A refusal writes nothing and is `invalid` with reason `busy`, `queued_prompt`, `request_id_reused` or `refused`.
 - **`abort`** follows Mode 2's rule (§3.3): it withdraws the queue, and answers once the run settled.
 - **`compact`, `configure` and `resume`** need no run active (`invalid/busy` otherwise).
-- **`create` and `fork`** name the new session by their `requestId` (`s-` and 24 hex digits of its SHA-256), so a repeat returns the same session with `created: false`. A new session gets its model and thinking level as `noel` would start it; `create` lists it in the directory before answering.
+- **`create` and `fork`** name the new session by their `requestId` (`s-` and 24 hex digits of its SHA-256), so a repeat returns the same session with `created: false`. A new session gets its model and thinking level as `noel` would start it; `create` lists it in the directory before answering. `create`'s `workspace` is a URL as `--workspace` takes it (§10): the session's tools run there, and a URL that is not valid, or names a host noel does not trust, is `invalid` with reason `workspace` and a message naming the trust command. A fork keeps its source's workspace. The directory's `workspace` is the URL of a session's workspace, absent for a local one.
 - **The directory** is read from the session directory (each journal again only when it changed) and the workers' `status`, on each change and every 5 s. Changes that arrive together are read together, so a listing taken the moment a `submit` is answered may not show it yet; the session's view (§7.3) is current.
 
 ### 7.3 The view and late join
@@ -285,12 +287,12 @@ Where the attached TUI differs from the local one is in the non-parity register 
 **Built** in `crates/noel-env`, matching upstream's `durable/src/env` at the pinned commit (`CHORD_REFERENCE_REF` in the Makefile):
 - **the interface:** `ExecutionEnv`, a `FileSystem` plus a `Shell` with upstream's methods, results and error codes (`FileErrorCode`, `ExecutionErrorCode`). It is async, object-safe (`Arc<dyn ExecutionEnv>`), and every operation takes a `Context` whose abort signal it checks;
 - **`LocalEnv`** (id `local`), which behaves as `NodeExecutionEnv` (`env/docs/semantics.md`). A string command runs through the shell and an argument list without one, each in a new session with stdin from `/dev/null`; abort, timeout, or dropping the call kills only that command's process group. It is checked against `tests/fixtures/ts-parity/local-env.json`, the observations of upstream's env conformance cases (`durable/src/testing/env-conformance.ts`) on `NodeExecutionEnv`. `watch` and `listFiles` fail with `not_supported` for now;
-- **the tools:** `read`, `write`, `edit`, `ls` and `bash` reach files and run commands only through the workspace, with their limits, results and error texts unchanged; `edit` and `write` of one file run one at a time per file system id and canonical path (`durable/src/tools/file-mutation-queue.ts`). `grep` and `find` resolve their paths in the workspace and search with ripgrep's crates, so they need a local one;
+- **the tools:** `read`, `write`, `edit`, `ls` and `bash` reach files and run commands only through the workspace, with their limits, results and error texts unchanged; `edit` and `write` of one file run one at a time per file system id and canonical path (`durable/src/tools/file-mutation-queue.ts`). `grep` and `find` search with ripgrep's crates: here by walking the tree, and in a workspace on another machine over what its `list_files` lists (the daemon walks with the same `ignore` crate) and, for `grep`, what it reads;
 - **the hook:** `Runtime` asks its `EnvProvider` for the workspace of each tool call with `EnvTarget {session_id, cwd}`, as Durable's harness `env(target)` does; a failure is that call's error result. The default is a `LocalEnv` at the session's working directory, so every mode behaves as before.
 
 Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-register.md` ("Workspaces").
 
-**Proposed:** a session's workspace is saved as a journal record `Workspace {adapter, …}`; when there is none, the workspace is local.
+**Built:** a session's workspace is saved as a journal record `Workspace {adapter, …}`; when there is none, the workspace is local (below, "Remote workspaces").
 
 **Decided (2026-10-14):** noel has its own `noel-env`, a Rust port of upstream's whole `pi-env` package (`env/`), which upstream writes partly in TypeScript and partly in Rust.
 - **The client:** the framed-protocol connection; a remote `ExecutionEnv` whose results match the local one (`env/docs/semantics.md`); and SSH deployment that accepts the host key once, names the daemon by its SHA-256 and verifies it before each start (`env/README.md`).
@@ -307,13 +309,28 @@ Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-regi
 
 Where it differs from upstream's daemon is listed in `docs/rust-rewrite/non-parity-register.md` ("noel-env Daemon").
 
-**Built:** the client and SSH deployment, in `crates/noel-env` (a library; nothing in noel uses them yet), ports of upstream's `env/src` at the pinned commit:
+**Built:** the client and SSH deployment, in `crates/noel-env`, ports of upstream's `env/src` at the pinned commit:
 - **the connection** (`Connection`, `connection.ts`) starts any daemon command with `serve --token <hex>`: a local process, `ssh … noel-env serve`, later Codewire's exec. It discards what a shell prints before the `PI-ENV <token>` line, multiplexes requests by id with results, errors, events, `cancel` and pings, and splits large transfers as upstream does (512 KiB writes, 256 or 512 KiB reads, several in flight), well under the 16 MiB frame limit. It starts lazily, and a command computed at each start may detect and deploy first. A lost daemon (exit, 30 seconds of silence, a corrupt frame) fails its requests in flight with `lost`, requests on its handles fail instead of reaching the next daemon, and the next request starts a new one;
 - **`RemoteEnv`** (`remote-env.ts`, `watch.ts`, `list-files.ts`) implements `ExecutionEnv` over a connection, with `NodeExecutionEnv`'s results on the remote machine (`env/docs/semantics.md`): the client applies Node's path, error, read-size and abort rules, and the daemon makes the system calls. `watch` runs in the daemon and reopens after a lost connection with an overflow; `list_files` lists in the daemon. Upstream's terminals (`terminal.ts`) are not ported, as `ExecutionEnv` has none;
 - **SSH deployment** (`ssh.ts`) for Linux and macOS remotes: `ssh` with `BatchMode`, strict host-key checking against the application's own known-hosts file under a fixed alias and no forwarding; host keys scanned (with `ssh-keygen -lf` fingerprints) and accepted once, a changed key refused; the remote system detected with `uname`; the daemon `noel-env-<platform>-<arch>` taken from a directory (an option, else `NOEL_ENV_DAEMON_DIR`, else beside the running executable), uploaded to a temporary file, renamed to `~/.cache/noel-env/noel-env-<SHA-256 prefix>` only once its SHA-256 matches, verified before every start, and daemons of other contents removed. Upstream's Windows and Android (Termux) paths are not ported;
 - **proof:** the conformance cases `LocalEnv` runs (`local-env.json`) make the same observations over `RemoteEnv` and `noel-env serve`, which also passes upstream's watch and `listFiles` cases (`crates/noel-env-daemon/tests/remote_env_conformance.rs`); the client sends exactly the frames upstream's client sent in `pi-env.json` (`pi_env_client_golden.rs`); every `ssh` invocation equals upstream's through the same stand-in for `ssh`, except for the daemon's names (`pi-env-ssh.json`, `ssh_deploy.rs`), and upstream's SSH and remote tests are ported; `make env-interop` runs these client tests against upstream's `pi-env` too.
 
-Where the client differs from upstream is listed in `docs/rust-rewrite/non-parity-register.md` ("noel-env Client"). The session's `Workspace` record and choosing a remote workspace come next.
+Where the client differs from upstream is listed in `docs/rust-rewrite/non-parity-register.md` ("noel-env Client").
+
+**Built:** remote workspaces over `ssh` (`crates/noel-cli/src/workspace.rs`, `crates/noel-core/src/workspace.rs`):
+- **Choosing one.** `--workspace ssh://[user@]host[:port]/absolute/path` starts a session (the TUI, `-p` and `--mode rpc`) whose tools run there; Mode 2's `noel.sessions.create` takes the same URL as `workspace` (§7.2), and `noel client new --workspace` passes it. The path is percent-decoded and normalized. `?login=1` starts the daemon through the remote login shell (`$SHELL -lc`); without it, as upstream, the daemon runs from the remote `ssh` command, with what that environment has. The option is part of the URL, so it is saved with the workspace and a reopened session starts the daemon the same way.
+- **The journal record** is `{"type":"workspace","adapter":"ssh","id","cwd","host","user"?,"port"?,"login"?}`. A new session in a workspace is written as one atomic file holding `started` then `workspace`, so it never exists without the record; a local session is written as before, one `started` record, and older journals have no record and are local. A fork keeps the record, compaction's rewrite keeps it, an import (an export carries none) is local. `id` is the file namespace, `ssh://host[:port]`: every path and user on one machine see the same files, so `edit` and `write` of one file wait for each other across sessions there. Unknown adapter fields are kept as saved. Older versions ignore the record (`#[serde(other)]`) and so would run such a session's tools here.
+- **Reopening** (`-c`, `-r`, `--session`, `--session-id`, a Mode 2 worker, `/resume`) uses the saved workspace; `--workspace` naming another for an existing session, or any for a local one, is an error. `/new` and RPC's `new_session` keep the workspace, as they keep the model.
+- **Never here by accident.** The run engine opens a session's workspace through `EnvProvider::Workspaces`, which gives a session without a record a `LocalEnv` exactly as before; a session with a record that no provider can open, or with an adapter this version lacks, fails every tool call rather than running it here.
+- **Trust** is never automatic. `noel workspace trust ssh://[user@]host[:port][/path]` connects once with `accept-new` against a temporary file (`scan_host_key`), prints the `ssh-keygen -lf` fingerprints, and on a terminal asks `y/N`; without a terminal it needs `--fingerprint SHA256:…` and trusts only the key with that fingerprint. The key is stored in noel's own known-hosts file, `<agent dir>/workspaces/known_hosts` (`~/.noel` by default), under the alias `noel-env-<host>`, or `noel-env-[<host>]:<port>` with a port; a changed key is refused until `noel workspace forget ssh://host[:port]` removes the old one. `~/.ssh` is never written. Starting a session, or `create`, on a host whose alias has no key fails with a message naming the trust command; nothing prompts mid-session, and `ssh` checks the key strictly at every connection.
+- **Connecting.** The connection is lazy (`ssh_connection`): the first tool call, or the first run's context files, start it, so an unreachable host fails that call with the reason, not the session. Every session on one workspace URL in a process shares one connection. A lost connection (the `ssh` process gone, 30 s of silence) fails the call in flight with `pi-env connection lost`, and the next call starts a new daemon; the daemon kills what it ran when its stdin ends.
+- **What comes from the workspace:** the tools' files and commands; `!` and `/bash` in the TUI; the system prompt's `cwd` (the workspace's directory); and the project context files, read through the workspace from its directory up to `/` as `noel_config` reads local ones, once per process and again after `/reload` or a session switch. A run that cannot read them (the host unreachable) waits up to 10 s and goes on without them, trying again at the next run. The user's own context file from the agent dir still applies. Never from the workspace: settings, `.noel/`, extensions, skills, prompt templates and themes, which would configure or run noel here; extension tools run here, and skills are left out of the system prompt, whose `read` could not reach their files.
+- **The tools** in a remote workspace: `grep` and `find` list with the daemon's `listFiles` (hidden entries, git's ignore rules inside a git work tree, never `.git`) and `grep` reads 16 files at a time through the workspace; `bash` keeps its complete output in the workspace's temporary directory (exec's spill, as Durable's bash tool) so the path it names can be read there; the commands get noel's process markers (`AI_AGENT`, `NOEL_CODING_AGENT`, `PI_CODING_AGENT`).
+- **The TUI footer** shows the workspace's URL and whether it is connected, connecting, lost or not connected yet, in place of the directory.
+- **The daemons** are built by `make env-daemons` (static musl `noel-env-linux-x64`, and `noel-env-linux-arm64` with an aarch64 linker) and installed beside `noel` by `make install`; a remote without its daemon (macOS, for now) fails its tool calls naming the file it needs.
+- **Proof:** `crates/noel-env-daemon/tests/tools_over_remote_env.rs` runs every built-in tool through `RemoteEnv` and `noel-env serve` and compares with `LocalEnv`; `make workspace-journey` (`scripts/e2e-workspace-ssh.sh`, not part of `make e2e`) runs a static `noel` against `sshd` in an Alpine container pinned by digest, with no network, and asserts trust, print-mode tools in the workspace, `grep` and `find`, a killed `ssh` mid-command and the new daemon after it, an untrusted host, `-c`, Mode 2's `create` and `send`, a local session, and the TUI's footer.
+
+Where remote workspaces differ from upstream and from a local workspace is listed in `docs/rust-rewrite/non-parity-register.md` ("Remote Workspaces").
 
 ## 11. Compatibility and goldens
 
@@ -333,4 +350,6 @@ where noel's saving differs from Durable's. Building Mode 2's server, worker
 and client added "Mode 2 Server, Worker and Client": noel's own objects, the
 view's subset of Durable's documents, and workers that outlive their server.
 The attached TUI added "The TUI Attached to a Server Session": where it
-differs from the TUI on a local session.
+differs from the TUI on a local session. Remote workspaces added "Remote
+Workspaces": noel's selection and trust, and where tools there differ from
+local ones.
