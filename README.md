@@ -1470,7 +1470,10 @@ noel client new --workspace ssh://me@build-box/srv/app   # the same through noel
   and `make install` installs them with `noel`. It is uploaded to
   `~/.cache/noel-env/` on the remote machine, named by its SHA-256, and
   checked before every start. macOS remotes need a Mac-built daemon, which
-  is not built yet.
+  is not built yet. `make noel-static` builds a static musl `noel` (clang
+  compiles ring's C for musl), and `make workspace-journey` runs the whole
+  flow (trust, tools, a dropped connection, `-c`, Mode 2, the TUI's footer)
+  against `sshd` in an Alpine container with no network.
 - **Connecting** happens at the first tool call. An unreachable host makes
   that call fail, not the session; the TUI's footer shows the workspace and
   whether it is connected, connecting or lost. If the connection drops, the
