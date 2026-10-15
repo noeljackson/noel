@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use noel_env::frame::{encode_frame, RESULT};
 use noel_env::{
     node_platform, AbortController, AbortSignal, BinaryReaderOptions, Connection,
-    ConnectionOptions, Context, DaemonCommand, ExecOptions, FileErrorCode, FileSystem,
-    ListFilesOptions, LocalEnv, OutputChunk, OutputWindow, RequestOptions, Shell, ShellCommand,
+    ConnectionOptions, ConnectionStatus, Context, DaemonCommand, ExecOptions, FileErrorCode,
+    FileSystem, ListFilesOptions, LocalEnv, OutputChunk, OutputWindow, RequestOptions, Shell,
+    ShellCommand,
 };
 use serde_json::{json, Value};
 use support::{connection, daemon, remote_env, Scratch};
@@ -372,6 +373,12 @@ async fn a_lost_daemon_fails_requests_in_flight_and_the_next_request_starts_a_ne
     assert_eq!(
         (error.code.as_str(), error.message.as_str()),
         ("unknown", "pi-env connection lost")
+    );
+    // By the time a request fails, the connection has forgotten the lost daemon.
+    assert!(
+        matches!(connection.status(), ConnectionStatus::Lost(_)),
+        "{:?}",
+        connection.status()
     );
     let next = env
         .exec(sh("exit 4"), ExecOptions::default(), &cx())
