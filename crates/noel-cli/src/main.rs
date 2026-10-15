@@ -38,9 +38,7 @@ use transcript_view::TranscriptView;
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
-#[cfg(test)]
-use clap::CommandFactory;
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum};
 use crossterm::{
     cursor::MoveTo,
     event::{
@@ -163,6 +161,16 @@ struct Cli {
         ]
     )]
     attach: Option<String>,
+
+    /// With --attach: the session is on another machine's noel server,
+    /// reached through `ssh <DEST> noel bridge`.
+    #[arg(long, value_name = "DEST")]
+    remote: Option<String>,
+
+    /// With --remote: the noel program on that machine (default: `noel` on
+    /// its PATH; a leading ~/ is its home).
+    #[arg(long, value_name = "PATH", requires = "remote")]
+    remote_noel: Option<String>,
 
     /// Run the session's tools in a directory on another machine, over ssh:
     /// ssh://[user@]host[:port]/absolute/path (add ?login=1 to start them
@@ -1402,6 +1410,16 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse_from(normalized_cli_args(std::env::args()));
+    // Not `requires`: clap waives it when an option --attach conflicts with
+    // is given, and --remote would then be ignored.
+    if cli.remote.is_some() && cli.attach.is_none() {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--remote needs --attach <SESSION_ID> (or use `noel client --remote`)",
+            )
+            .exit();
+    }
     validate_session_id_flags(&cli)?;
     if matches!(cli.mode, OutputMode::Rpc) && (cli.print || !cli.messages.is_empty()) {
         return Err(anyhow!(
@@ -1440,7 +1458,8 @@ async fn run() -> Result<()> {
         if !matches!(cli.mode, OutputMode::Text) || !io::stdin().is_terminal() {
             return Err(anyhow!("--attach opens the TUI and needs a terminal"));
         }
-        return attach::run(session, config, cli.owned_screen()).await;
+        let endpoint = server::client::Endpoint::new(cli.remote.clone(), cli.remote_noel.clone())?;
+        return attach::run(session, endpoint, config, cli.owned_screen()).await;
     }
     let offline = offline_enabled(cli.offline);
     apply_cached_claude_code_version(&config);

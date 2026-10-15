@@ -40,7 +40,7 @@ use noel_config::LoadedConfig;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::server::client::{Client, Followed};
+use crate::server::client::{Client, Endpoint, Followed};
 use crate::server::{new_request_id, valid_session_id};
 use crate::{
     Activity, TuiApp, TuiEntry, TuiEntryKind, TuiTerminal, QUIT_CONFIRM_WINDOW,
@@ -50,15 +50,27 @@ use crate::{
 /// How long the first view may take: starting a server and a worker.
 const FIRST_VIEW: Duration = Duration::from_secs(30);
 
-pub(crate) async fn run(session: &str, config: LoadedConfig, owned_screen: bool) -> Result<()> {
+pub(crate) async fn run(
+    session: &str,
+    endpoint: Endpoint,
+    config: LoadedConfig,
+    owned_screen: bool,
+) -> Result<()> {
     if !valid_session_id(session) {
         return Err(anyhow!("--attach: {session:?} is not a session id"));
     }
     let (sender, mut incoming) = mpsc::unbounded_channel();
     let reports = sender.clone();
-    let client = Client::connect(Arc::new(move |message| {
-        let _ = reports.send(Incoming::Report(message));
-    }))
+    let place = match &endpoint {
+        Endpoint::Local => "noel server".to_owned(),
+        Endpoint::Ssh { destination, .. } => format!("noel server on {destination}"),
+    };
+    let client = Client::connect(
+        endpoint,
+        Arc::new(move |message| {
+            let _ = reports.send(Incoming::Report(message));
+        }),
+    )
     .await?;
     let mut follower = {
         let (client, session, sender) = (client.clone(), session.to_owned(), sender.clone());
@@ -119,7 +131,7 @@ pub(crate) async fn run(session: &str, config: LoadedConfig, owned_screen: bool)
     app.push(
         TuiEntryKind::System,
         format!(
-            "{}\nattached to session {session} on noel server · /help for commands, /quit to detach",
+            "{}\nattached to session {session} on {place} · /help for commands, /quit to detach",
             crate::terminal_renderer(&config).banner()
         ),
     );
