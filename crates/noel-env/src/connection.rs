@@ -277,13 +277,25 @@ impl Session {
 
     /// Ends the session and fails its requests with `error`; false if it had ended already.
     fn end(&self, error: &RemoteError) -> bool {
-        {
-            let mut liveness = lock(&self.liveness);
-            if liveness.torn_down {
-                return false;
-            }
-            liveness.torn_down = true;
+        if self.mark_ended().is_none() {
+            return false;
         }
+        self.stop(error);
+        true
+    }
+
+    /// Marks the session ended: `None` if it already was, else whether it had become ready.
+    fn mark_ended(&self) -> Option<bool> {
+        let mut liveness = lock(&self.liveness);
+        if liveness.torn_down {
+            return None;
+        }
+        liveness.torn_down = true;
+        Some(liveness.ready)
+    }
+
+    /// Stops the daemon and fails the requests in flight with `error`.
+    fn stop(&self, error: &RemoteError) {
         // Ending stdin stops the daemon; the signal stops a transport that does not pass the end on.
         lock(&self.writer).take();
         self.kill.notify_one();
@@ -291,7 +303,6 @@ impl Session {
         for (_, request) in pending {
             let _ = request.send(Incoming::Done(Err(error.clone())));
         }
-        true
     }
 }
 
@@ -417,24 +428,29 @@ struct Inner {
 }
 
 impl Inner {
-    /// Ends `session` and forgets it, so the next request starts a new daemon.
+    /// Ends `session` and forgets it, so the next request starts a new daemon. It is forgotten before its requests
+    /// fail: a caller that tries again as soon as its request fails must not get the lost session back, as it cannot
+    /// in upstream's single-threaded runtime, where the rejections run after the teardown.
     fn teardown(&self, session: &Arc<Session>, error: RemoteError) {
-        if !session.end(&error) {
+        let Some(was_ready) = session.mark_ended() else {
             return;
-        }
-        let mut state = lock(&self.state);
-        if state
-            .session
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, session))
+        };
         {
-            state.session = None;
-            // A start in progress publishes its own failure; only a finished one is forgotten here.
-            if lock(&session.liveness).ready {
-                state.ready = None;
+            let mut state = lock(&self.state);
+            if state
+                .session
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, session))
+            {
+                state.session = None;
+                // A start in progress publishes its own failure; only a finished one is forgotten here.
+                if was_ready {
+                    state.ready = None;
+                }
+                state.set_status(ConnectionStatus::Lost(error.message.clone()));
             }
-            state.set_status(ConnectionStatus::Lost(error.message.clone()));
         }
+        session.stop(&error);
     }
 
     fn log(&self, text: &str) {
