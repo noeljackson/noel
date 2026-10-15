@@ -135,6 +135,7 @@ reply stays in the transcript.
   - a worker outlives its server: it finishes its run, then waits up to that same idle time for a new server to adopt it;
   - a new server reads `workers/*.json`, dials each socket and checks uid, pid and `build`. A match is adopted; another build is told `shutdown` and exits once its run settles; a record whose process is gone is removed.
 - **Clients:** a client starts the server when none listens, after checking the runtime directory and the listening process's uid. The clients are the line-mode `noel client` and the TUI, `noel --attach <session-id>` (§7.4).
+- **The bridge** (`noel bridge`, `bridge.rs`) is how a client reaches the server on another machine (§6, tunnel). It dials `server.sock` as a client does, with the same checks, starting the server when none listens. It reads the client's WebSocket upgrade request from stdin (at most 16 KiB), drops every `Noel-Via` header in it and adds `Noel-Via: tunnel`, then copies bytes between stdin and stdout and the socket, and exits when either side closes. Its own notes (starting a server) go to stderr.
 
 ## 6. Principals and access
 
@@ -145,11 +146,12 @@ reply stays in the transcript.
 - **Stamping:** the side that accepts a connection stamps its principal. A principal forwarded from another host is honoured only from the parent link, and principal fields inside payloads are ignored.
 - **Routing:** a route's `authorize(principal, session)` runs before a worker is resolved or spawned, and again after.
 
-**Build order (Decided):**
+**Build order (Decided; the ssh tunnel was added first on 2026-10-15):**
 1. **Device** (**Built**). The owner-only local socket, with no token. The server checks the peer's uid (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and closes any other uid before reading a byte. Any process running as the owner can connect, including the agent's own `bash`; that grants nothing it could not already do. Accepted links are stamped `{kind:"owner", via:"device"}`; the `session:` route lets the owner reach any session and a guest only its own, and `noel.chat` gives the owner and a `full` guest `participant`, a `view` guest `viewer`. Workers act as `{kind:"worker", session, generation}`. Objects are kept by `principalKey` (`owner@<via>`, `guest:<id>:r<revision>`, `worker:<session>:<generation>`).
-2. **Relay,** after a design pass of its own.
-3. **Remote authentication,** offering both device-code pairing (the server issues and verifies its own token) and an optional Codewire login. A Codewire tailnet connection may be stamped `via:"tunnel"`, because admission to an environment's tailnet already grants shell access there.
-4. **Guests.**
+2. **Tunnel over ssh** (**Built**). `--remote <ssh-destination>` on `noel client` and `noel --attach` runs `ssh -T -e none [-o BatchMode=yes] -- <destination> '<program>' bridge` and runs the same WebSocket link over its stdin and stdout. ssh authenticates with the user's own configuration, keys and known hosts; noel adds no token, crypto or service. The server accepts a link as `{kind:"owner", via:"tunnel"}` when its upgrade request carries exactly `Noel-Via: tunnel`, as `via:"device"` when it has none, and refuses any other `Noel-Via` (400). The bridge, being the user's own process on the server's machine, is what sets it: a device process could claim `tunnel` too, which only describes it as remote, but nothing on the other machine can claim `device`. The first connection may let ssh ask on the terminal; reconnections use `BatchMode=yes`. `new` with `--remote` needs `--cwd`, an absolute path there; `--remote-noel` names the remote program (default `noel` on its `PATH`), quoted for the remote shell except a leading `~/`.
+3. **Relay,** after a design pass of its own.
+4. **Remote authentication,** for clients that cannot run ssh, offering both device-code pairing (the server issues and verifies its own token) and an optional Codewire login. A Codewire tailnet connection may be stamped `via:"tunnel"`, because admission to an environment's tailnet already grants shell access there.
+5. **Guests.**
 
 ## 7. Wire protocol and objects
 
@@ -163,7 +165,7 @@ reply stays in the transcript.
 - **contracts:** descriptions, their fingerprints, `coverage` and `fits`;
 - **frames:** every protocol 2 frame, checked on receipt as upstream's frame schema checks it. A malformed frame, a duplicate id or a control frame from the wrong side closes the link;
 - **links:**
-  - WebSocket, one JSON text message per frame, also over a Unix socket (Chord has no Unix-socket transport of its own); packed binary frames are decoded where accepted, never sent, and refused from clients;
+  - WebSocket, one JSON text message per frame, also over a Unix socket (Chord has no Unix-socket transport of its own); packed binary frames are decoded where accepted, never sent, and refused from clients. When this side closes a link, the peer has 30 s to answer its close frame, then the socket is dropped, as upstream's `ws` destroys a socket after its `closeTimeout`;
   - NDJSON lines `{"chord2": frame}`, Chord's IPC encoding, with `{"chord2control": message}` lines for control, unwindowed;
   - an in-memory pair, for tests;
 - **connections:** `hello` with protocol 2, and `bye` with `protocol-version 2` to a peer of another version; holds (`shape`, `gone`, `release`); calls (`result`, `cancel`, `maxCalls`); subscriptions (`snap`, `ops` through one delta encoder per subscription, `reset`, `unsub`); `ping` and `pong` with a configurable interval and timeout; `ack` with the window, where only state waits, coalesced per subscription, and a subscription waiting beyond four windows is reset;
@@ -254,7 +256,7 @@ Where the attached TUI differs from the local one is in the non-parity register 
 ### 8.1 Client
 - **A disconnect:** the server releases everything the client held. The run continues.
 - **A submission's outcome is unknown when the link drops.** The client retries with the same `requestId`, which reports either `repeated` or the outcome. `noel client send` retries a hold or a `submit` that fails `unavailable` up to ten times.
-- **`noel client watch`** and the attached TUI (§7.4) hold the view again when its worker is lost, and reconnect (starting a server) when the server is. The TUI sends a `submit` that fails `unavailable` again with the same `requestId`, as `noel client send` does.
+- **`noel client watch`** and the attached TUI (§7.4) hold the view again when its worker is lost, and reconnect (starting a server) when the server is. Through the bridge (§6), a lost ssh or a lost server both end the link; reconnecting runs ssh again, and the bridge starts a server if none listens. The TUI sends a `submit` that fails `unavailable` again with the same `requestId`, as `noel client send` does.
 
 ### 8.2 Server
 - **Losing the server stops no run:** a worker finishes its run while no server is attached.
