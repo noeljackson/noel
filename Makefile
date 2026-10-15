@@ -27,7 +27,7 @@ ENV_DAEMONS_SCRIPT := scripts/build-env-daemons.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord-interop env-interop env-daemon env-daemons noel-static workspace-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord-interop env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -38,6 +38,7 @@ help:
 		'  env-daemons  Build static noel-env-linux-x64 and -arm64 into $$(ENV_DAEMONS_DIR)' \
 		'  noel-static  Build a static musl noel (x86_64; clang compiles ring'"'"'s C)' \
 		'  workspace-journey Run the remote-workspace journey over ssh in a no-network container' \
+		'  bridge-journey Run the remote-server journey (client --remote over ssh) in a no-network container' \
 		'  install      Install the noel CLI release binary and its daemons to $$(PREFIX)/bin' \
 		'  install-system Install the noel CLI release binary and its daemons to /usr/local/bin' \
 		'  run          Run the noel CLI; pass RUN_ARGS="..." for CLI args' \
@@ -99,6 +100,12 @@ noel-static:
 # or check: it needs Docker and the musl target.
 workspace-journey:
 	CARGO="$(CARGO)" DOCKER="$(DOCKER)" MAKE="$(MAKE)" ENV_DAEMONS_DIR="$(ENV_DAEMONS_DIR)" scripts/e2e-workspace-ssh.sh
+
+# A client reaching a server on another machine through `ssh <host> noel
+# bridge`, end to end, with sshd and both users in one Alpine container with
+# no network (scripts/e2e-bridge-ssh.sh). Needs Docker and the musl target.
+bridge-journey:
+	CARGO="$(CARGO)" DOCKER="$(DOCKER)" MAKE="$(MAKE)" scripts/e2e-bridge-ssh.sh
 
 install:
 	CARGO="$(CARGO)" $(INSTALL_BUILD_SCRIPT)
