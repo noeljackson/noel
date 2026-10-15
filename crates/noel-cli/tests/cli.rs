@@ -2827,6 +2827,50 @@ fn attach_refuses_the_options_that_shape_a_local_session() {
     }
 }
 
+#[test]
+fn remote_is_only_for_attach_and_client() {
+    for args in [&["--remote", "box", "-p", "hi"][..], &["--remote", "box"]] {
+        let output = noel_command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--remote needs --attach"),
+            "{args:?}: {stderr}"
+        );
+    }
+    let output = noel_command()
+        .args(["--remote-noel", "/opt/noel", "--attach", "s-1"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--remote <DEST>"), "{stderr}");
+    // A destination ssh would read as an option is refused before ssh runs.
+    for args in [
+        &["client", "--remote=-oProxyCommand=x", "ls"][..],
+        &["client", "ls", "--remote", "a b"],
+    ] {
+        let output = noel_command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("is not an ssh destination"),
+            "{args:?}: {stderr}"
+        );
+    }
+    // `new` needs a directory on the other machine.
+    let output = noel_command()
+        .args(["client", "--remote", "box", "new", "--model", "faux/echo"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("with --remote, pass --cwd: an absolute path on box"),
+        "{stderr}"
+    );
+}
+
 /// `--workspace` (spec §10): a session starts only on a host noel trusts,
 /// keeps its workspace in its journal, and refuses another one on reopen;
 /// `noel workspace forget` withdraws the trust. Nothing here connects: the
