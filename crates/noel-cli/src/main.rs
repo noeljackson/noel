@@ -27,6 +27,7 @@ mod server;
 mod signals;
 mod transcript_view;
 mod usage;
+mod workspace;
 use model_select::{
     configured_model, effective_thinking_level, find_selectable_model, model_definition,
     normalized_thinking_level, provider_usable, register_cli_model, resolve_cli,
@@ -76,8 +77,8 @@ use noel_core::{
     run_excluded_bash_result, run_user_turn, run_user_turn_streaming_events_with_media,
     run_user_turn_streaming_with_media, write_session_export, AgentError, CompactionKind,
     ConversationMessage, FollowUpQueue, MessageRole, ReloadReport, ReloadableSystems, RunControl,
-    Runtime, SessionError, SessionState, SessionStore, SteeringMailbox, TodoItem, TodoStatus,
-    TurnEvent, PRODUCT_NAME, STEERING_JOIN,
+    Runtime, SessionError, SessionState, SessionStore, SessionWorkspace, SteeringMailbox, TodoItem,
+    TodoStatus, TurnEvent, PRODUCT_NAME, STEERING_JOIN,
 };
 use noel_tui::{
     parse_theme_color, EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector,
@@ -158,10 +159,17 @@ struct Cli {
             "no_builtin_tools", "skill", "no_skills", "prompt_template",
             "no_prompt_templates", "no_context_files", "extension",
             "no_extensions", "no_mcp", "image", "name", "approve", "no_approve",
-            "offline",
+            "offline", "workspace",
         ]
     )]
     attach: Option<String>,
+
+    /// Run the session's tools in a directory on another machine, over ssh:
+    /// ssh://[user@]host[:port]/absolute/path (add ?login=1 to start them
+    /// through the remote login shell). The session keeps it; trust the host
+    /// first with `noel workspace trust ssh://host[:port]`.
+    #[arg(long, value_name = "URL")]
+    workspace: Option<String>,
 
     #[arg(long)]
     provider: Option<String>,
@@ -1380,6 +1388,9 @@ async fn run() -> Result<()> {
     if let Some(code) = server::try_run(&std::env::args().collect::<Vec<_>>()).await {
         std::process::exit(code);
     }
+    if let Some(code) = workspace::try_run(&std::env::args().collect::<Vec<_>>()).await {
+        std::process::exit(code);
+    }
     signals::install();
     if try_run_image_command().await? {
         return Ok(());
@@ -1456,10 +1467,21 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // A workspace on another machine: checked (a valid URL, a trusted host)
+    // before any session is made for it.
+    let requested_workspace = cli
+        .workspace
+        .as_deref()
+        .map(|url| workspace::from_flag(url, &config.paths.agent_dir))
+        .transpose()?;
     let selection = resolve_cli_selection(&cli, &mut config, offline)?;
     let mut systems = ReloadableSystems::from_config(&config, 1);
     systems.offline = offline;
-    let mut runtime = create_runtime_when_unlocked(&cli, &cwd, &config, systems).await?;
+    let mut runtime =
+        create_runtime_when_unlocked(&cli, &cwd, &config, systems, requested_workspace.as_ref())
+            .await?;
+    workspace::check_saved(runtime.session(), &config.paths.agent_dir)?;
+    workspace::install(&mut runtime, &config.paths.agent_dir, !cli.no_context_files);
     select_initial_model(&mut runtime, &config, &selection, offline)?;
     // The tool flags apply to this run (`apply_tool_flags`). Earlier
     // versions saved them in the session as disabled tools; a resumed
@@ -2698,10 +2720,11 @@ async fn create_runtime_when_unlocked(
     cwd: &Path,
     config: &LoadedConfig,
     systems: ReloadableSystems,
+    workspace: Option<&SessionWorkspace>,
 ) -> Result<Runtime> {
     let deadline = Instant::now() + SESSION_LOCK_WAIT;
     loop {
-        let error = match create_runtime(cli, cwd, config, systems.clone()) {
+        let error = match create_runtime(cli, cwd, config, systems.clone(), workspace) {
             Ok(runtime) => return Ok(runtime),
             Err(error) => error,
         };
@@ -2722,22 +2745,31 @@ async fn create_runtime_when_unlocked(
     }
 }
 
+/// Opens or creates the startup session. A new session runs its tools in
+/// `workspace` (`--workspace`), saved in its journal; an existing one keeps
+/// its own, and `--workspace` naming another is refused.
 fn create_runtime(
     cli: &Cli,
     cwd: &Path,
     config: &LoadedConfig,
     systems: ReloadableSystems,
+    workspace: Option<&SessionWorkspace>,
 ) -> Result<Runtime> {
     if cli.no_session {
-        return Ok(Runtime::new(
-            SessionState::new("ephemeral", cwd.to_path_buf()),
-            systems,
-        ));
+        let mut state = SessionState::new("ephemeral", cwd.to_path_buf());
+        state.workspace = workspace.cloned();
+        return Ok(Runtime::new(state, systems));
     }
+    let opened = |store: SessionStore, state: SessionState| -> Result<Runtime> {
+        workspace::check_reopened(&state, workspace)?;
+        Ok(Runtime::with_store(state, systems.clone(), store))
+    };
 
     if let Some(reference) = &cli.fork {
         let path = resolve_session_reference(&config.paths.session_dir, reference)?;
         let source_state = SessionStore::read(&path)?;
+        // A fork keeps its source's workspace.
+        workspace::check_reopened(&source_state, workspace)?;
         let (store, state) = SessionStore::fork(&config.paths.session_dir, &source_state, false)?;
         return Ok(Runtime::with_store(state, systems, store));
     }
@@ -2746,42 +2778,61 @@ fn create_runtime(
         let path = config.paths.session_dir.join(format!("{session_id}.jsonl"));
         if path.exists() {
             let (store, state) = SessionStore::open(path)?;
-            return Ok(Runtime::with_store(state, systems, store));
+            return opened(store, state);
         }
-        let (store, state) =
-            SessionStore::create_with_id(&config.paths.session_dir, cwd.to_path_buf(), session_id)?;
+        let (store, state) = match workspace {
+            Some(workspace) => SessionStore::create_in_workspace(
+                &config.paths.session_dir,
+                cwd.to_path_buf(),
+                session_id,
+                workspace.clone(),
+            )?,
+            None => SessionStore::create_with_id(
+                &config.paths.session_dir,
+                cwd.to_path_buf(),
+                session_id,
+            )?,
+        };
         return Ok(Runtime::with_store(state, systems, store));
     }
 
     if let Some(reference) = &cli.session {
         let path = resolve_session_reference(&config.paths.session_dir, reference)?;
         let (store, state) = SessionStore::open(path)?;
-        return Ok(Runtime::with_store(state, systems, store));
+        return opened(store, state);
     }
 
     if cli.r#continue {
         if let Some(path) = most_recent_session(&config.paths.session_dir, Some(cwd))? {
             let (store, state) = SessionStore::open(path)?;
-            return Ok(Runtime::with_store(state, systems, store));
+            return opened(store, state);
         }
     }
 
     if cli.resume {
         if let Some(path) = most_recent_session(&config.paths.session_dir, None)? {
             let (store, state) = SessionStore::open(path)?;
-            return Ok(Runtime::with_store(state, systems, store));
+            return opened(store, state);
         }
     }
 
-    let (store, state) = SessionStore::create(&config.paths.session_dir, cwd.to_path_buf())?;
+    let (store, state) = SessionStore::create_with_workspace(
+        &config.paths.session_dir,
+        cwd.to_path_buf(),
+        workspace.cloned(),
+    )?;
     Ok(Runtime::with_store(state, systems, store))
 }
 
 /// Start fresh conversation state without changing the current selections.
 /// Persist them before replacing the runtime so reopen/resume agrees with the UI.
 fn start_new_session(runtime: &mut Runtime, config: &LoadedConfig) -> Result<()> {
-    let (store, mut state) =
-        SessionStore::create(&config.paths.session_dir, runtime.session().cwd.clone())?;
+    // The new session keeps the workspace, as it keeps the model.
+    let (store, mut state) = SessionStore::create_with_workspace(
+        &config.paths.session_dir,
+        runtime.session().cwd.clone(),
+        runtime.session().workspace.clone(),
+    )?;
     state.active_model = runtime.session().active_model.clone();
     state.active_thinking_level = runtime.session().active_thinking_level.clone();
     state.active_account = runtime.session().active_account.clone();
@@ -3460,6 +3511,9 @@ struct TuiApp {
     selector: Option<TuiSelectorState>,
     header_title: String,
     header_line: String,
+    /// The session's workspace on another machine, which the footer shows
+    /// with its connection state in place of the directory.
+    workspace: Option<SessionWorkspace>,
     status: String,
     show_hardware_cursor: bool,
     live_entry_index: Option<usize>,
@@ -3600,15 +3654,20 @@ impl TuiApp {
             model
         );
         let session = runtime.session();
-        self.header_line = format!(
-            "{}  {}  queue:{}",
-            session.cwd.display(),
-            session
-                .name
-                .clone()
-                .unwrap_or_else(|| session.session_id.chars().take(8).collect()),
-            session.queued_messages.len()
-        );
+        let name = session
+            .name
+            .clone()
+            .unwrap_or_else(|| session.session_id.chars().take(8).collect());
+        self.workspace = session.workspace.clone();
+        self.header_line = match &self.workspace {
+            // The footer puts the workspace first, as it draws.
+            Some(_) => format!("{name}  queue:{}", session.queued_messages.len()),
+            None => format!(
+                "{}  {name}  queue:{}",
+                session.cwd.display(),
+                session.queued_messages.len()
+            ),
+        };
         self.status = footer_status(config, runtime, &self.editor_state);
         if let Some(since) = self.quit_armed_since {
             if since.elapsed() < QUIT_CONFIRM_WINDOW {
@@ -5598,10 +5657,15 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, palette: &ThemeP
     } else {
         app.status.clone()
     };
-    let line = if app.header_line.is_empty() {
-        status
-    } else {
-        format!("{}  {}", status, app.header_line)
+    let line = match &app.workspace {
+        Some(record) => format!(
+            "{}  {}  {}",
+            status,
+            workspace::footer_label(record),
+            app.header_line
+        ),
+        None if app.header_line.is_empty() => status,
+        None => format!("{}  {}", status, app.header_line),
     };
     let footer = Paragraph::new(line).style(palette.secondary());
     frame.render_widget(footer, area);

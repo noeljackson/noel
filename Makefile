@@ -20,11 +20,14 @@ SYSTEM_PREFIX ?= /usr/local
 SYSTEM_BINDIR ?= $(SYSTEM_PREFIX)/bin
 SUDO ?= sudo
 INSTALL_BUILD_SCRIPT := scripts/install-build.sh
+# The static noel-env daemons remote workspaces upload, installed beside noel.
+ENV_DAEMONS_DIR ?= target/env-daemons
+ENV_DAEMONS_SCRIPT := scripts/build-env-daemons.sh
 
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord-interop env-interop env-daemon smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord-interop env-interop env-daemon env-daemons noel-static workspace-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -32,8 +35,11 @@ help:
 		'  build        Build the workspace' \
 		'  release      Build the noel CLI release binary' \
 		'  env-daemon   Build the noel-env daemon for upload (size-optimized profile)' \
-		'  install      Install the noel CLI release binary to $$(PREFIX)/bin' \
-		'  install-system Install the noel CLI release binary to /usr/local/bin' \
+		'  env-daemons  Build static noel-env-linux-x64 and -arm64 into $$(ENV_DAEMONS_DIR)' \
+		'  noel-static  Build a static musl noel (x86_64; clang compiles ring'"'"'s C)' \
+		'  workspace-journey Run the remote-workspace journey over ssh in a no-network container' \
+		'  install      Install the noel CLI release binary and its daemons to $$(PREFIX)/bin' \
+		'  install-system Install the noel CLI release binary and its daemons to /usr/local/bin' \
 		'  run          Run the noel CLI; pass RUN_ARGS="..." for CLI args' \
 		'  dogfood     Run dev TUI with rebuild/restart watcher' \
 		'  fmt          Check Rust formatting' \
@@ -76,14 +82,35 @@ release:
 env-daemon:
 	$(CARGO) build --profile env-daemon -p noel-env-daemon
 
+# What `noel --workspace ssh://…` uploads, named as noel looks for them beside
+# itself: static musl noel-env-linux-x64, and noel-env-linux-arm64 when an
+# aarch64 linker is there (ENV_DAEMON_ARM64_LINKER; skipped otherwise).
+env-daemons:
+	CARGO="$(CARGO)" ENV_DAEMONS_DIR="$(ENV_DAEMONS_DIR)" $(ENV_DAEMONS_SCRIPT)
+
+# A static noel for x86-64 Linux: target/x86_64-unknown-linux-musl/release/noel.
+# ring's C needs a compiler for musl; clang (NOEL_STATIC_CC) targets it.
+NOEL_STATIC_CC ?= clang
+noel-static:
+	CC_x86_64_unknown_linux_musl="$(NOEL_STATIC_CC)" $(CARGO) build --release -p noel-cli --target x86_64-unknown-linux-musl
+
+# Remote workspaces end to end: noel, sshd and the daemon in one Alpine
+# container with no network (scripts/e2e-workspace-ssh.sh). Not part of e2e
+# or check: it needs Docker and the musl target.
+workspace-journey:
+	CARGO="$(CARGO)" DOCKER="$(DOCKER)" MAKE="$(MAKE)" ENV_DAEMONS_DIR="$(ENV_DAEMONS_DIR)" scripts/e2e-workspace-ssh.sh
+
 install:
 	CARGO="$(CARGO)" $(INSTALL_BUILD_SCRIPT)
+	CARGO="$(CARGO)" ENV_DAEMONS_DIR="$(ENV_DAEMONS_DIR)" $(ENV_DAEMONS_SCRIPT)
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/noel "$(BINDIR)/noel"
+	install -m 0755 $(ENV_DAEMONS_DIR)/noel-env-* "$(BINDIR)/"
 
-install-system: release
+install-system: release env-daemons
 	$(SUDO) install -d "$(SYSTEM_BINDIR)"
 	$(SUDO) install -m 0755 target/release/noel "$(SYSTEM_BINDIR)/noel"
+	$(SUDO) install -m 0755 $(ENV_DAEMONS_DIR)/noel-env-* "$(SYSTEM_BINDIR)/"
 
 run:
 	$(CARGO) run -p noel-cli -- $(RUN_ARGS)

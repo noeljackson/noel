@@ -1,8 +1,8 @@
 //! noel's built-in tools. They work in a workspace, an
 //! [`ExecutionEnv`]: `read`, `write`, `edit`, `ls` and `bash` reach files
-//! and run commands only through it, and `grep` and `find` resolve their
-//! paths in it (they search with ripgrep's crates, so they need a local
-//! workspace).
+//! and run commands only through it. `grep` and `find` search with
+//! ripgrep's crates, here or, in a workspace on another machine, over what
+//! the workspace lists and reads.
 
 mod mutation;
 mod output;
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use noel_env::{
     Context, ExecOptions, ExecutionEnv, ExecutionErrorCode, FileErrorCode, LocalEnv,
-    LocalEnvOptions, OutputChunk, ShellCommand,
+    LocalEnvOptions, OutputChunk, ShellCommand, SpillOptions,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -509,6 +509,10 @@ async fn bash_tool(
         }
         Ok(())
     };
+    // In a workspace on another machine the complete output is kept there
+    // too, as Durable's bash tool keeps it, so the path the result names is
+    // one the workspace's `read` can open.
+    let remote = !noel_env::is_local(env);
     let result = {
         // stdout and stderr share one pipe, so the output is in the order
         // it was written. The command runs in its own session and process
@@ -525,6 +529,10 @@ async fn bash_tool(
                     .map(|timeout_ms| Duration::from_millis(timeout_ms.clamp(1, MAX_TIMEOUT_MS))),
                 on_output: Some(&mut on_chunk),
                 merge_stderr: true,
+                spill: remote.then_some(SpillOptions {
+                    after_bytes: DEFAULT_MAX_BYTES as u64,
+                    after_lines: DEFAULT_MAX_LINES as u64,
+                }),
                 ..ExecOptions::default()
             },
             cx,
@@ -549,6 +557,10 @@ async fn bash_tool(
     let mut reporter = reporter
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
+    let spill_path = match &result {
+        Ok(result) => result.spill_path.clone(),
+        Err(error) => error.spill_path.clone(),
+    };
     let exit_code = match result {
         Ok(result) => Some(result.exit_code),
         Err(error) => match error.code {
@@ -573,7 +585,12 @@ async fn bash_tool(
         reporter.report();
     }
 
-    let snapshot = reporter.output.finish().map_err(io_error)?;
+    let mut snapshot = reporter.output.finish().map_err(io_error)?;
+    if let (Some(spilled), Some(local)) = (spill_path, &snapshot.full_output_path) {
+        // The workspace's copy replaces the one kept here.
+        let _ = std::fs::remove_file(local);
+        snapshot.full_output_path = Some(PathBuf::from(spilled));
+    }
     let Some(code) = exit_code else {
         // Killed at the timeout; what it wrote is kept.
         let seconds = timeout_ms.unwrap_or_default() as f64 / 1000.0;

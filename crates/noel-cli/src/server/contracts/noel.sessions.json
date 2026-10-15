@@ -20,6 +20,7 @@
                   "sessionId": {"type": "string"},
                   "name": {"type": "string"},
                   "cwd": {"type": "string"},
+                  "workspace": {"type": "string"},
                   "modified": {"type": "integer"},
                   "messageCount": {"type": "integer"},
                   "firstPrompt": {"type": "string"},
@@ -54,7 +55,8 @@
             "cwd": {"type": "string"},
             "name": {"type": "string"},
             "model": {"type": "string"},
-            "thinkingLevel": {"type": "string"}
+            "thinkingLevel": {"type": "string"},
+            "workspace": {"type": "string"}
           }
         },
         "result": {
