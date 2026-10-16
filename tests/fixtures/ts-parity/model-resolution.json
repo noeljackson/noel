@@ -1584,11 +1584,6 @@
           },
           {
             "provider": "openrouter",
-            "id": "anthropic/claude-sonnet-4",
-            "thinkingLevel": null
-          },
-          {
-            "provider": "openrouter",
             "id": "anthropic/claude-sonnet-4.5",
             "thinkingLevel": null
           },
@@ -2005,11 +2000,6 @@
           {
             "provider": "openrouter",
             "id": "anthropic/claude-opus-5.5",
-            "thinkingLevel": null
-          },
-          {
-            "provider": "openrouter",
-            "id": "anthropic/claude-sonnet-4",
             "thinkingLevel": null
           },
           {
@@ -3768,7 +3758,6 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -3785,7 +3774,7 @@
               "contextWindow": 1000000,
               "maxTokens": 128000
             },
-            "thinkingLevel": "minimal"
+            "thinkingLevel": "off"
           }
         }
       ]
@@ -5361,7 +5350,7 @@
           "events": [
             {
               "type": "thinking_level_changed",
-              "level": "minimal"
+              "level": "off"
             }
           ],
           "response": {
@@ -5383,7 +5372,6 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -5400,7 +5388,7 @@
               "contextWindow": 1000000,
               "maxTokens": 128000
             },
-            "thinkingLevel": "minimal"
+            "thinkingLevel": "off"
           }
         }
       ]

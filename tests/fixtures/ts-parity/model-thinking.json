@@ -208,6 +208,38 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "minimal": null,
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max"
+      },
+      "examples": [
+        "anthropic/claude-haiku-5-5"
+      ],
+      "supported": [
+        "off",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "low",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "off": null,
         "minimal": null,
         "low": "low",
@@ -217,8 +249,8 @@
         "max": "max"
       },
       "examples": [
-        "anthropic/claude-haiku-5-5",
-        "anthropic/claude-opus-5-5"
+        "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5"
       ],
       "supported": [
         "low",
@@ -1545,6 +1577,39 @@
         "xhigh": "max",
         "max": "max",
         "invalid": "max"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": "none",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": null
+      },
+      "examples": [
+        "opencode/nemotron-3.5-super-vl-free"
+      ],
+      "supported": [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "xhigh",
+        "invalid": "off"
       }
     },
     {
