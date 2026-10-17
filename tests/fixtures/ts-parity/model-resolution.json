@@ -298,8 +298,8 @@
       },
       "expected": {
         "model": {
-          "provider": "amazon-bedrock",
-          "id": "us.anthropic.claude-haiku-5-5"
+          "provider": "anthropic",
+          "id": "claude-haiku-5-5"
         },
         "thinkingLevel": "low",
         "warning": null,
@@ -1584,11 +1584,6 @@
           },
           {
             "provider": "openrouter",
-            "id": "anthropic/claude-sonnet-4",
-            "thinkingLevel": null
-          },
-          {
-            "provider": "openrouter",
             "id": "anthropic/claude-sonnet-4.5",
             "thinkingLevel": null
           },
@@ -1931,6 +1926,11 @@
             "provider": "openrouter",
             "id": "openrouter/fusion",
             "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
+            "id": "openrouter/pareto-code",
+            "thinkingLevel": null
           }
         ],
         "diagnostics": []
@@ -2000,11 +2000,6 @@
           {
             "provider": "openrouter",
             "id": "anthropic/claude-opus-5.5",
-            "thinkingLevel": null
-          },
-          {
-            "provider": "openrouter",
-            "id": "anthropic/claude-sonnet-4",
             "thinkingLevel": null
           },
           {
@@ -2375,11 +2370,18 @@
         "models": [
           {
             "provider": "azure",
-            "id": "gpt-5.5-pro",
+            "id": "gpt-5.5",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.5",
             "thinkingLevel": null
           }
         ],
-        "diagnostics": []
+        "diagnostics": [
+          "Pattern \"gpt-5.5\" matches several providers: azure, openai. Use provider/id to choose one."
+        ]
       }
     },
     {
@@ -2710,10 +2712,7 @@
           }
         ]
       },
-      "expected": {
-        "provider": "team/Local",
-        "id": "M1"
-      }
+      "expected": null
     },
     {
       "input": {
@@ -3759,7 +3758,6 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -3776,7 +3774,7 @@
               "contextWindow": 1000000,
               "maxTokens": 128000
             },
-            "thinkingLevel": "minimal"
+            "thinkingLevel": "off"
           }
         }
       ]
@@ -4126,13 +4124,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "us.anthropic.claude-sonnet-5-5",
-              "name": "Claude Sonnet 5.5 (US)",
-              "api": "bedrock-converse-stream",
-              "provider": "amazon-bedrock",
-              "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+              "id": "claude-sonnet-5-5",
+              "name": "Claude Sonnet 5.5",
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -4141,10 +4144,10 @@
                 "image"
               ],
               "cost": {
-                "input": 2.2,
-                "output": 11,
-                "cacheRead": 0.11,
-                "cacheWrite": 2.75
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -5347,7 +5350,7 @@
           "events": [
             {
               "type": "thinking_level_changed",
-              "level": "minimal"
+              "level": "off"
             }
           ],
           "response": {
@@ -5369,7 +5372,6 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": null,
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -5386,7 +5388,7 @@
               "contextWindow": 1000000,
               "maxTokens": 128000
             },
-            "thinkingLevel": "minimal"
+            "thinkingLevel": "off"
           }
         }
       ]
@@ -5965,7 +5967,7 @@
                   }
                 ]
               },
-              "contextWindow": 272000,
+              "contextWindow": 500000,
               "maxTokens": 128000
             },
             "thinkingLevel": "medium"
@@ -6025,7 +6027,7 @@
                   }
                 ]
               },
-              "contextWindow": 272000,
+              "contextWindow": 500000,
               "maxTokens": 128000
             },
             "thinkingLevel": "medium"

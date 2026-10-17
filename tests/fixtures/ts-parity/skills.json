@@ -3784,6 +3784,8 @@
       {
         "input": "\"\" '' empty",
         "args": [
+          "",
+          "",
           "empty"
         ]
       },
@@ -3898,7 +3900,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": ""
           }
         ]
       },
@@ -3927,7 +3929,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled  "
+            "output": " filled "
           }
         ]
       },
@@ -3956,7 +3958,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": " filled"
           }
         ]
       },
@@ -3985,7 +3987,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": " filled"
           }
         ]
       },
@@ -4014,7 +4016,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "[filled] [filled]"
+            "output": "[ filled] [ filled]"
           }
         ]
       },
@@ -4043,7 +4045,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": "default"
           }
         ]
       },
@@ -4072,7 +4074,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "two words"
+            "output": "filled"
           }
         ]
       },
@@ -4101,7 +4103,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": " filled"
           }
         ]
       },
@@ -4130,7 +4132,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": " filled"
           }
         ]
       },
@@ -4159,7 +4161,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": ""
+            "output": "filled"
           }
         ]
       },
@@ -4188,7 +4190,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": ""
+            "output": "filled"
           }
         ]
       },
@@ -4217,7 +4219,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": " filled"
           }
         ]
       },
@@ -4304,7 +4306,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "az"
+            "output": "afilledz"
           }
         ]
       },
@@ -4420,7 +4422,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": " filled"
+            "output": " "
           }
         ]
       },
@@ -4478,7 +4480,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": ""
           }
         ]
       },
@@ -4536,7 +4538,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "$filled"
+            "output": "$"
           }
         ]
       },
@@ -4594,7 +4596,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filledabc"
+            "output": "abc"
           }
         ]
       },
@@ -4623,7 +4625,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filledx"
+            "output": " filledx"
           }
         ]
       },
@@ -4681,7 +4683,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": ""
           }
         ]
       },
@@ -4710,7 +4712,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filledb}"
+            "output": "ab}"
           }
         ]
       },
@@ -4797,7 +4799,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": " filled"
           }
         ]
       },
@@ -5029,7 +5031,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "\\filled"
+            "output": "\\"
           }
         ]
       },
@@ -5058,7 +5060,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filledfilled"
+            "output": " filled filled"
           }
         ]
       },
@@ -5203,7 +5205,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "filled"
+            "output": " filled"
           }
         ]
       },
@@ -5261,7 +5263,7 @@
           },
           {
             "input": "\"\" filled",
-            "output": "Fix filled.\n\nNotes: \nAll: filled\n"
+            "output": "Fix .\n\nNotes: filled\nAll:  filled\n"
           }
         ]
       }
