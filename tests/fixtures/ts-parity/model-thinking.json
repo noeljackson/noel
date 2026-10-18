@@ -532,6 +532,37 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": "none",
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": "high",
+        "xhigh": null,
+        "max": "max"
+      },
+      "examples": [
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "baseten/zai-org/GLM-5.2"
+      ],
+      "supported": [
+        "off",
+        "high",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "off": "off",
         "minimal": null,
         "low": null,
@@ -556,37 +587,6 @@
         "high": "high",
         "xhigh": "high",
         "max": "high",
-        "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": "none",
-        "minimal": null,
-        "low": null,
-        "medium": null,
-        "high": "high",
-        "xhigh": null,
-        "max": "max"
-      },
-      "examples": [
-        "baseten/zai-org/GLM-5.2",
-        "baseten/zai-org/GLM-5.2-Fast"
-      ],
-      "supported": [
-        "off",
-        "high",
-        "max"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "high",
-        "low": "high",
-        "medium": "high",
-        "high": "high",
-        "xhigh": "max",
-        "max": "max",
         "invalid": "off"
       }
     },
