@@ -542,7 +542,7 @@
       },
       "examples": [
         "baseten/deepseek-ai/DeepSeek-V4.1-Flash-1017",
-        "baseten/zai-org/GLM-5.2"
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-1017-Fast"
       ],
       "supported": [
         "off",
