@@ -216,7 +216,8 @@
         "max": "max"
       },
       "examples": [
-        "anthropic/claude-haiku-5-5"
+        "anthropic/claude-haiku-5-5",
+        "radius/claude-haiku-5-5"
       ],
       "supported": [
         "off",
@@ -327,7 +328,7 @@
       },
       "examples": [
         "azure/gpt-5.2",
-        "azure/gpt-5.2-chat-latest"
+        "azure/gpt-5.2-pro"
       ],
       "supported": [
         "minimal",
@@ -345,30 +346,6 @@
         "xhigh": "xhigh",
         "max": "xhigh",
         "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": false,
-      "thinkingLevelMap": {
-        "off": null,
-        "xhigh": "xhigh"
-      },
-      "examples": [
-        "azure/gpt-5.3-chat-latest",
-        "openai/gpt-5.3-chat-latest"
-      ],
-      "supported": [
-        "off"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "off",
-        "low": "off",
-        "medium": "off",
-        "high": "off",
-        "xhigh": "off",
-        "max": "off",
-        "invalid": "off"
       }
     },
     {
@@ -820,8 +797,8 @@
         "max": null
       },
       "examples": [
-        "cloudflare-workers-ai/@cf/google/gemma-4-26b-a4b-it",
-        "cloudflare-workers-ai/@cf/moonshotai/kimi-k2.6"
+        "cloudflare-workers-ai/@cf/moonshotai/kimi-k2.6",
+        "huggingface/tencent/Hy4-preview"
       ],
       "supported": [
         "off",
@@ -836,6 +813,35 @@
         "xhigh": "high",
         "max": "high",
         "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": null,
+        "minimal": null,
+        "low": "low",
+        "medium": null,
+        "high": "high",
+        "xhigh": null,
+        "max": null
+      },
+      "examples": [
+        "cloudflare-workers-ai/@cf/nvidia/nemotron-3-120b-a12b"
+      ],
+      "supported": [
+        "low",
+        "high"
+      ],
+      "clamp": {
+        "off": "low",
+        "minimal": "low",
+        "low": "low",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high",
+        "invalid": "low"
       }
     },
     {
@@ -1455,35 +1461,6 @@
         "xhigh": "xhigh",
         "max": "max",
         "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": null,
-        "low": null,
-        "medium": "medium",
-        "high": null,
-        "xhigh": "xhigh",
-        "max": null
-      },
-      "examples": [
-        "openai/gpt-5.2-chat-latest"
-      ],
-      "supported": [
-        "medium",
-        "xhigh"
-      ],
-      "clamp": {
-        "off": "medium",
-        "minimal": "medium",
-        "low": "medium",
-        "medium": "medium",
-        "high": "xhigh",
-        "xhigh": "xhigh",
-        "max": "xhigh",
-        "invalid": "medium"
       }
     },
     {

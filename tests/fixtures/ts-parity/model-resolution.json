@@ -459,7 +459,7 @@
       "expected": {
         "model": {
           "provider": "minimax",
-          "id": "MiniMax-M3"
+          "id": "MiniMax-M3.1-Flash"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -2245,17 +2245,7 @@
           },
           {
             "provider": "openai",
-            "id": "gpt-5.2-chat-latest",
-            "thinkingLevel": null
-          },
-          {
-            "provider": "openai",
             "id": "gpt-5.2-pro",
-            "thinkingLevel": null
-          },
-          {
-            "provider": "openai",
-            "id": "gpt-5.3-chat-latest",
             "thinkingLevel": null
           },
           {
@@ -2458,6 +2448,11 @@
           {
             "provider": "minimax",
             "id": "MiniMax-M3",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "minimax",
+            "id": "MiniMax-M3.1-Flash",
             "thinkingLevel": null
           },
           {
