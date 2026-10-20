@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use noel_config::{
-    auth_for_provider, is_expired, listed_accounts_for_provider, read_usage_cache,
-    write_usage_cache, AccountSource, AccountUsage, Balance, LoadedConfig, ResolvedAuth,
+    auth_for_provider, is_expired, listed_accounts_for_provider, read_auth_file, read_usage_cache,
+    write_usage_cache, AccountSource, AccountUsage, AuthData, Balance, LoadedConfig, ResolvedAuth,
     UsageWindow,
 };
 use serde_json::Value;
@@ -610,20 +610,30 @@ pub async fn collect_account_status(
     config: &LoadedConfig,
     refresh: bool,
     endpoint_override: Option<&str>,
+    token_endpoint_override: Option<(&str, &str)>,
     now: i64,
 ) -> Vec<AccountStatusRow> {
     let client = usage_http_client();
     let cache_path = config.paths.agent_dir.join("usage-cache.json");
+    let (auth, refresh_failures) =
+        refresh_stored_oauth(config, token_endpoint_override, now.max(0) as u64).await;
     let mut rows = Vec::new();
+    let context = ProbeContext {
+        client: &client,
+        config,
+        auth: &auth,
+        cache_path: &cache_path,
+        refresh,
+        endpoint_override,
+    };
     for target in account_status_targets(config) {
         rows.push(
             probe_account_row(
-                &client,
-                config,
-                &cache_path,
+                &context,
                 &target,
-                refresh,
-                endpoint_override,
+                refresh_failures
+                    .get(&(target.provider.clone(), target.account.clone()))
+                    .map(String::as_str),
                 now,
             )
             .await,
@@ -632,15 +642,91 @@ pub async fn collect_account_status(
     rows
 }
 
-async fn probe_account_row(
-    client: &reqwest::Client,
+fn refresh_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Rotate every stored OAuth credential that carries a refresh token and is
+/// expiring, so status probes run with live tokens and stored credentials
+/// stay rotated without an active session. Environment and imported-login
+/// credentials are not noel's to rotate and are skipped. Refresh failures
+/// are returned per account and surface as that row's note; the probe then
+/// still runs with the stored token.
+async fn refresh_stored_oauth(
     config: &LoadedConfig,
-    cache_path: &Path,
-    target: &AccountStatusTarget,
+    token_endpoint_override: Option<(&str, &str)>,
+    now: u64,
+) -> (AuthData, BTreeMap<(String, String), String>) {
+    let client = refresh_http_client();
+    let mut failures = BTreeMap::new();
+    let mut touched = false;
+    for target in account_status_targets(config) {
+        if target.source != AccountSource::Stored {
+            continue;
+        }
+        let Some(resolved) =
+            auth_for_provider(&config.auth, &target.provider, Some(&target.account))
+        else {
+            continue;
+        };
+        let window = crate::oauth_refresh::REFRESH_WINDOW_SECONDS;
+        if !crate::oauth_refresh::needs_refresh(&resolved, now, window) {
+            continue;
+        }
+        touched = true;
+        if let Err(error) = crate::oauth_refresh::refresh_expiring_auth(
+            &client,
+            &config.paths.auth_path,
+            &config.auth,
+            &target.provider,
+            Some(&target.account),
+            token_endpoint_override,
+            now,
+        )
+        .await
+        {
+            failures.insert(
+                (target.provider.clone(), target.account.clone()),
+                error.to_string(),
+            );
+        }
+    }
+    let auth = if touched {
+        read_auth_file(&config.paths.auth_path).unwrap_or_else(|_| config.auth.clone())
+    } else {
+        config.auth.clone()
+    };
+    (auth, failures)
+}
+
+/// Per-collection invariants shared by every row probe.
+struct ProbeContext<'a> {
+    client: &'a reqwest::Client,
+    config: &'a LoadedConfig,
+    auth: &'a AuthData,
+    cache_path: &'a Path,
     refresh: bool,
-    endpoint_override: Option<&str>,
+    endpoint_override: Option<&'a str>,
+}
+
+async fn probe_account_row(
+    context: &ProbeContext<'_>,
+    target: &AccountStatusTarget,
+    refresh_failure: Option<&str>,
     now: i64,
 ) -> AccountStatusRow {
+    let ProbeContext {
+        client,
+        config,
+        auth,
+        cache_path,
+        refresh,
+        endpoint_override,
+    } = *context;
     let base_row = |auth_state, usage, unsupported, error| AccountStatusRow {
         provider: target.provider.clone(),
         account: target.account.clone(),
@@ -649,8 +735,7 @@ async fn probe_account_row(
         unsupported,
         error,
     };
-    let Some(auth) = auth_for_provider(&config.auth, &target.provider, Some(&target.account))
-    else {
+    let Some(auth) = auth_for_provider(auth, &target.provider, Some(&target.account)) else {
         return base_row(AuthState::Missing, None, false, None);
     };
     let mut auth_state = if is_expired(auth.expires(), now.max(0) as u64) {
@@ -684,16 +769,22 @@ async fn probe_account_row(
             if reason.contains("status 401") {
                 auth_state = AuthState::Invalid;
             }
-            base_row(auth_state, None, false, Some(short_reason(&reason)))
+            let note = refresh_failure
+                .map(|reason| short_reason_max(reason, 200))
+                .unwrap_or_else(|| short_reason(&reason));
+            base_row(auth_state, None, false, Some(note))
         }
     }
 }
 
 fn short_reason(reason: &str) -> String {
+    short_reason_max(reason, 80)
+}
+
+fn short_reason_max(reason: &str, max_len: usize) -> String {
     let first_line = reason.lines().next().unwrap_or(reason);
-    const MAX_LEN: usize = 80;
-    if first_line.len() > MAX_LEN {
-        format!("{}…", &first_line[..MAX_LEN])
+    if first_line.len() > max_len {
+        format!("{}…", &first_line[..max_len])
     } else {
         first_line.to_string()
     }
@@ -1539,7 +1630,7 @@ mod tests {
         }
         let stub = spawn_stub(200, r#"{"data":{"total_credits":10.0,"total_usage":2.5}}"#);
 
-        let rows = collect_account_status(&config, false, Some(&stub.url), 1_000).await;
+        let rows = collect_account_status(&config, false, Some(&stub.url), None, 1_000).await;
         assert_eq!(rows.len(), 2);
         let faux_row = rows
             .iter()
@@ -1565,11 +1656,11 @@ mod tests {
         );
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
-        let cached = collect_account_status(&config, false, Some(&stub.url), 1_100).await;
+        let cached = collect_account_status(&config, false, Some(&stub.url), None, 1_100).await;
         assert_eq!(cached.len(), 2);
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
-        let refreshed = collect_account_status(&config, true, Some(&stub.url), 1_100).await;
+        let refreshed = collect_account_status(&config, true, Some(&stub.url), None, 1_100).await;
         assert_eq!(refreshed.len(), 2);
         assert_eq!(stub.hits.load(Ordering::SeqCst), 2);
 
@@ -1577,6 +1668,143 @@ mod tests {
             Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
             None => std::env::remove_var("OPENROUTER_API_KEY"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn collect_account_status_rotates_expiring_stored_oauth() {
+        let root = test_dir("noel-cli-accounts-refresh");
+        let auth_path = root.join("agent").join("auth.json");
+        std::fs::create_dir_all(root.join("agent")).expect("create agent dir");
+        let mut auth = AuthData::default();
+        auth.insert(
+            "anthropic",
+            "work",
+            AuthCredential::OAuth {
+                access_token: "stale-access".to_string(),
+                refresh_token: Some("stale-refresh".to_string()),
+                expires: 900,
+                account_id: None,
+            },
+        );
+        std::fs::write(
+            &auth_path,
+            format!("{}\n", serde_json::to_string_pretty(&auth).unwrap()),
+        )
+        .expect("write auth file");
+        let config = status_test_config(&root, auth);
+
+        let token_stub = spawn_stub(
+            200,
+            r#"{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}"#,
+        );
+        let usage_stub = spawn_stub(
+            200,
+            r#"{"five_hour":{"utilization":10.0,"resets_at":"2027-11-24T15:00:00Z"}}"#,
+        );
+
+        let rows = collect_account_status(
+            &config,
+            true,
+            Some(&usage_stub.url),
+            Some((&token_stub.url, "test-client")),
+            1_000,
+        )
+        .await;
+
+        let row = rows
+            .iter()
+            .find(|row| row.provider == "anthropic" && row.account == "work")
+            .expect("stored anthropic row");
+        assert_eq!(row.auth_state, AuthState::Ok, "note: {:?}", row.error);
+        assert!(row.usage.is_some(), "note: {:?}", row.error);
+
+        let token_requests = token_stub.requests.lock().expect("token requests");
+        assert_eq!(token_requests.len(), 1, "one refresh request");
+        assert!(
+            token_requests[0].contains("grant_type=refresh_token"),
+            "{}",
+            token_requests[0]
+        );
+        drop(token_requests);
+
+        let usage_requests = usage_stub.requests.lock().expect("usage requests");
+        assert!(
+            usage_requests
+                .iter()
+                .any(|request| request.contains("authorization: Bearer fresh-access")),
+            "probe must use the rotated token: {usage_requests:?}"
+        );
+        drop(usage_requests);
+
+        let persisted: AuthData =
+            serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap())
+                .expect("persisted auth parses");
+        match persisted.credential("anthropic", "work") {
+            Some(AuthCredential::OAuth {
+                access_token,
+                refresh_token,
+                expires,
+                ..
+            }) => {
+                assert_eq!(access_token, "fresh-access");
+                assert_eq!(refresh_token.as_deref(), Some("fresh-refresh"));
+                assert_eq!(*expires, 4_600);
+            }
+            other => panic!("expected persisted oauth credential, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn collect_account_status_reports_refresh_failure() {
+        let root = test_dir("noel-cli-accounts-refresh-failure");
+        let auth_path = root.join("agent").join("auth.json");
+        std::fs::create_dir_all(root.join("agent")).expect("create agent dir");
+        let mut auth = AuthData::default();
+        auth.insert(
+            "anthropic",
+            "work",
+            AuthCredential::OAuth {
+                access_token: "stale-access".to_string(),
+                refresh_token: Some("revoked-refresh".to_string()),
+                expires: 900,
+                account_id: None,
+            },
+        );
+        std::fs::write(
+            &auth_path,
+            format!("{}\n", serde_json::to_string_pretty(&auth).unwrap()),
+        )
+        .expect("write auth file");
+        let config = status_test_config(&root, auth);
+
+        let token_stub = spawn_stub(400, r#"{"error":"invalid_grant"}"#);
+        let usage_stub = spawn_stub(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+        );
+
+        let rows = collect_account_status(
+            &config,
+            true,
+            Some(&usage_stub.url),
+            Some((&token_stub.url, "test-client")),
+            1_000,
+        )
+        .await;
+
+        let row = rows
+            .iter()
+            .find(|row| row.provider == "anthropic" && row.account == "work")
+            .expect("stored anthropic row");
+        assert_eq!(row.auth_state, AuthState::Invalid);
+        let note = row.error.as_deref().expect("refresh failure note");
+        assert!(note.contains("invalid_grant"), "note: {note}");
+        assert!(note.contains("claude login"), "note: {note}");
+        assert_eq!(token_stub.hits.load(Ordering::SeqCst), 1);
+
         let _ = std::fs::remove_dir_all(root);
     }
 }
