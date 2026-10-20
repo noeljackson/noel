@@ -14,6 +14,10 @@ pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 pub const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// Fallback for the Claude token endpoint: the same OAuth server is also
+/// served from the API host, which some egress filters allow when they block
+/// `platform.claude.com`.
+pub const CLAUDE_TOKEN_FALLBACK_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 
 /// The request path refreshes OAuth tokens this close to expiry.
 pub const REFRESH_WINDOW_SECONDS: u64 = 60;
@@ -127,6 +131,39 @@ pub async fn execute_refresh(
         return Err(anyhow!("token endpoint returned {status}: {body}"));
     }
     parse_refresh_response(&body, refresh_token, now)
+}
+
+/// A transport-level failure (connect error, timeout, TLS) rather than an
+/// OAuth decision: worth retrying against a fallback endpoint.
+fn is_transport_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+        !matches!(
+            error.status(),
+            Some(status) if status.is_client_error() || status.is_server_error()
+        )
+    })
+}
+
+/// Refresh with endpoint fallback: when `token_url` is the canonical Claude
+/// primary, retry once against `api.anthropic.com` if the first attempt never
+/// reached a server (connect error, timeout, TLS). OAuth denials are
+/// returned as-is so callers keep reporting `invalid_grant` instead of
+/// masking it by trying the mirror.
+async fn execute_refresh_with_fallback(
+    client: &reqwest::Client,
+    token_url: &str,
+    fallback_url: Option<&str>,
+    client_id: &str,
+    refresh_token: &str,
+    now: u64,
+) -> Result<RefreshedTokens> {
+    let primary = execute_refresh(client, token_url, client_id, refresh_token, now).await;
+    if let (Some(fallback_url), Err(error)) = (fallback_url, &primary) {
+        if is_transport_failure(error) {
+            return execute_refresh(client, fallback_url, client_id, refresh_token, now).await;
+        }
+    }
+    primary
 }
 
 type RefreshLockMap = BTreeMap<(String, String), Arc<tokio::sync::Mutex<()>>>;
@@ -285,9 +322,11 @@ pub async fn refresh_auth_expiring_within(
         return Ok(Some(resolved));
     };
 
-    match execute_refresh(
+    let fallback_url = (token_url == CLAUDE_TOKEN_URL).then_some(CLAUDE_TOKEN_FALLBACK_URL);
+    match execute_refresh_with_fallback(
         client,
         token_url,
+        fallback_url,
         client_id,
         resolved.refresh_token().unwrap_or(""),
         now,
@@ -541,6 +580,56 @@ mod tests {
             .await
             .expect_err("refresh should fail");
         assert!(error.to_string().contains("400"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn transport_failure_retries_fallback_endpoint() {
+        let fallback = spawn_stub(
+            200,
+            r#"{"access_token":"fresh","refresh_token":"rotated","expires_in":3600}"#,
+        );
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        // Unroutable primary: the request fails before reaching any server.
+        let dead_primary = "https://127.0.0.1:9/v1/oauth/token";
+
+        let tokens = execute_refresh_with_fallback(
+            &client,
+            dead_primary,
+            Some(&fallback.url),
+            CLAUDE_CLIENT_ID,
+            "stale",
+            1_000,
+        )
+        .await
+        .expect("fallback refresh succeeds");
+        assert_eq!(tokens.access_token, "fresh");
+        assert_eq!(tokens.refresh_token, "rotated");
+        assert_eq!(tokens.expires, 4_600);
+        let requests = fallback.requests.lock().expect("requests lock");
+        assert!(requests[0].contains("grant_type=refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn oauth_denial_does_not_retry_fallback_endpoint() {
+        let primary = spawn_stub(400, r#"{"error":"invalid_grant"}"#);
+        let fallback = spawn_stub(200, r#"{"access_token":"should-not-happen"}"#);
+        let client = reqwest::Client::new();
+
+        let error = execute_refresh_with_fallback(
+            &client,
+            &primary.url,
+            Some(&fallback.url),
+            CLAUDE_CLIENT_ID,
+            "revoked",
+            1_000,
+        )
+        .await
+        .expect_err("oauth denial surfaces");
+        assert!(error.to_string().contains("invalid_grant"), "{error}");
+        assert_eq!(fallback.hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
