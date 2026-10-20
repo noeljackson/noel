@@ -870,7 +870,7 @@ async fn run_accounts_status(args: &[String]) -> Result<()> {
     let paths = config_paths(cwd, None)?;
     let config = load_config(paths)?;
     let now = unix_seconds().unwrap_or(0) as i64;
-    let rows = usage::collect_account_status(&config, refresh, None, now).await;
+    let rows = usage::collect_account_status(&config, refresh, None, None, now).await;
     println!("{}", usage::format_account_status(&rows, now));
     Ok(())
 }
@@ -7373,7 +7373,7 @@ async fn handle_tui_submission(
             );
             redraw_tui(surface.terminal, app, config)?;
             let now = unix_seconds().unwrap_or(0) as i64;
-            let rows = usage::collect_account_status(config, false, None, now).await;
+            let rows = usage::collect_account_status(config, false, None, None, now).await;
             app.replace_entry(checking, usage::format_account_status(&rows, now));
         }
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
