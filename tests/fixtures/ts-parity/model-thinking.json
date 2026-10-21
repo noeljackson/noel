@@ -443,41 +443,6 @@
       "reasoning": true,
       "thinkingLevelMap": {
         "off": "none",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "max"
-      },
-      "examples": [
-        "baseten/deepseek-ai/DeepSeek-V4-Flash-0731",
-        "baseten/deepseek-ai/DeepSeek-V4-Pro"
-      ],
-      "supported": [
-        "off",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "max",
-        "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": "none",
         "minimal": null,
         "low": "low",
         "medium": null,
@@ -486,8 +451,8 @@
         "max": "max"
       },
       "examples": [
-        "baseten/deepseek-ai/DeepSeek-V4-Pro-0813",
-        "baseten/deepseek-ai/DeepSeek-V4.1-Flash"
+        "baseten/deepseek-ai/DeepSeek-V4-Flash-0731",
+        "baseten/deepseek-ai/DeepSeek-V4-Pro-0813"
       ],
       "supported": [
         "off",
@@ -518,8 +483,8 @@
         "max": "max"
       },
       "examples": [
-        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-1017",
-        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-1017-Fast"
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash",
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-Fast"
       ],
       "supported": [
         "off",
@@ -540,7 +505,40 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": "none",
+        "minimal": null,
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": null,
+        "max": "max"
+      },
+      "examples": [
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-1017-Fast"
+      ],
+      "supported": [
+        "off",
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "clamp": {
         "off": "off",
+        "minimal": "low",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": "none",
         "minimal": null,
         "low": null,
         "medium": null,
@@ -549,8 +547,8 @@
         "max": null
       },
       "examples": [
-        "baseten/moonshotai/Kimi-K2.5",
-        "baseten/moonshotai/Kimi-K2.6"
+        "baseten/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
+        "cloudflare-workers-ai/@cf/moonshotai/kimi-k2.6"
       ],
       "supported": [
         "off",
@@ -570,6 +568,41 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": "none",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max"
+      },
+      "examples": [
+        "baseten/openai/gpt-oss-120b",
+        "openrouter/upstage/solar-mini4"
+      ],
+      "supported": [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "off": null,
         "minimal": null,
         "low": "low",
@@ -580,7 +613,7 @@
       },
       "examples": [
         "baseten/zai-org/GLM-5.3",
-        "baseten/zai-org/GLM-5.3-Flash"
+        "baseten/zai-org/GLM-5.3-Fast"
       ],
       "supported": [
         "low",
@@ -788,36 +821,6 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
-        "off": "none",
-        "minimal": null,
-        "low": null,
-        "medium": null,
-        "high": "high",
-        "xhigh": null,
-        "max": null
-      },
-      "examples": [
-        "cloudflare-workers-ai/@cf/moonshotai/kimi-k2.6",
-        "huggingface/tencent/Hy4-preview"
-      ],
-      "supported": [
-        "off",
-        "high"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "high",
-        "low": "high",
-        "medium": "high",
-        "high": "high",
-        "xhigh": "high",
-        "max": "high",
-        "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
         "off": null,
         "minimal": null,
         "low": "low",
@@ -911,39 +914,6 @@
         "minimal": null,
         "low": "low",
         "medium": "medium",
-        "high": "high",
-        "xhigh": null,
-        "max": "max"
-      },
-      "examples": [
-        "fireworks/accounts/fireworks/models/ember-1",
-        "fireworks/accounts/fireworks/routers/kimi-fast-latest"
-      ],
-      "supported": [
-        "off",
-        "low",
-        "medium",
-        "high",
-        "max"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "low",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "max",
-        "max": "max",
-        "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": "none",
-        "minimal": null,
-        "low": "low",
-        "medium": "medium",
         "high": null,
         "xhigh": "xhigh",
         "max": null
@@ -977,8 +947,8 @@
         "minimal": "low"
       },
       "examples": [
-        "github-copilot/claude-opus-4.7",
-        "github-copilot/claude-opus-4.8"
+        "github-copilot/claude-opus-4.8",
+        "github-copilot/claude-opus-5"
       ],
       "supported": [
         "off",
@@ -1036,70 +1006,11 @@
         "low": "low",
         "medium": "medium",
         "high": "high",
-        "xhigh": null,
-        "max": null
-      },
-      "examples": [
-        "github-copilot/gpt-5-mini"
-      ],
-      "supported": [
-        "minimal",
-        "low",
-        "medium",
-        "high"
-      ],
-      "clamp": {
-        "off": "minimal",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "high",
-        "max": "high",
-        "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": "low",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
         "xhigh": "xhigh",
         "max": null
       },
       "examples": [
         "github-copilot/gpt-5.3-codex",
-        "github-copilot/gpt-5.4"
-      ],
-      "supported": [
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ],
-      "clamp": {
-        "off": "minimal",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "xhigh",
-        "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": "low",
-        "xhigh": "xhigh"
-      },
-      "examples": [
         "github-copilot/gpt-5.4-nano"
       ],
       "supported": [
@@ -1461,35 +1372,6 @@
         "xhigh": "xhigh",
         "max": "max",
         "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "xhigh": "xhigh",
-        "minimal": "low"
-      },
-      "examples": [
-        "openai-codex/gpt-5.3-codex-spark",
-        "openai-codex/gpt-5.5"
-      ],
-      "supported": [
-        "off",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "xhigh",
-        "invalid": "off"
       }
     },
     {
@@ -2029,6 +1911,36 @@
         "xhigh": "xhigh",
         "max": "xhigh",
         "invalid": "medium"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": "off",
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": "high",
+        "xhigh": null,
+        "max": null
+      },
+      "examples": [
+        "xiaomi/mimo-v2.6-flash",
+        "xiaomi/mimo-v2.6-pro"
+      ],
+      "supported": [
+        "off",
+        "high"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high",
+        "invalid": "off"
       }
     }
   ]
