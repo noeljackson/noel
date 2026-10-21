@@ -2938,6 +2938,8 @@ async fn run_interactive(
     let mut restart = false;
     loop {
         app.refresh_chrome(&config, &runtime);
+        // A mid-turn /accounts probe that outlived its turn still lands.
+        settle_account_status_task(&mut app).await;
         redraw_tui(&mut terminal, &mut app, &config)?;
         // Only schedule once per open/resume, never on every idle tick after
         // an error or explicit interruption. Use the ordinary live turn UI.
@@ -3561,8 +3563,17 @@ struct TuiApp {
     /// Provider name of the active model, kept in sync for pickers that open
     /// while the runtime is borrowed by a streaming turn.
     active_model_provider: Option<String>,
+    /// The session's pinned account, kept in sync the same way for the
+    /// account picker opened mid-turn.
+    active_session_account: Option<String>,
     /// A mid-turn /model <ref> resolved; apply when the turn ends.
     pending_model_switch: Option<String>,
+    /// A mid-turn /account selection; apply when the turn ends.
+    /// `Some(None)` is a queued switch to auto.
+    pending_account_switch: Option<Option<String>>,
+    /// A mid-turn /accounts probe: the transcript placeholder it fills and
+    /// the background task collecting the status rows.
+    account_status_task: Option<(usize, tokio::task::JoinHandle<String>)>,
     /// A mid-turn /resume selection; swap sessions once the turn is torn
     /// down (the picker already closed).
     pending_session_resume: Option<String>,
@@ -3657,6 +3668,7 @@ impl TuiApp {
             .active_model
             .as_ref()
             .map(|model| model.provider.clone());
+        self.active_session_account = runtime.session().active_account.clone();
         let model = runtime
             .session()
             .active_model
@@ -6209,6 +6221,8 @@ enum StreamingKeyOutcome {
     Quit,
     /// A mid-turn /model <ref> resolved; apply after the turn ends.
     SwitchModel(String),
+    /// A mid-turn /account selection; apply after the turn ends.
+    SwitchAccount(Option<String>),
     /// A mid-turn /resume selection: kill the turn and swap sessions.
     ResumeSession(String),
 }
@@ -6415,6 +6429,16 @@ fn handle_streaming_tui_key(
                         }
                         return StreamingKeyOutcome::Changed;
                     }
+                    "account" => {
+                        if let Some(item) = selector.selected_item() {
+                            return StreamingKeyOutcome::SwitchAccount(if item.value.is_empty() {
+                                None
+                            } else {
+                                Some(item.value.clone())
+                            });
+                        }
+                        return StreamingKeyOutcome::Changed;
+                    }
                     _ => return StreamingKeyOutcome::Changed,
                 }
             }
@@ -6440,6 +6464,47 @@ fn handle_streaming_tui_key(
             StreamingKeyOutcome::Changed
         }
         _ => StreamingKeyOutcome::Ignored,
+    }
+}
+
+/// Whether account status is unavailable mid-turn: offline mode (the CLI
+/// flag or `NOEL_OFFLINE`), read without the runtime, which the running
+/// turn borrows.
+fn runtime_offline(_app: &TuiApp, _config: &LoadedConfig) -> bool {
+    offline_enabled(false)
+}
+
+/// Collects account status rows without the runtime, for the mid-turn
+/// `/accounts`: a background task runs it and the transcript placeholder
+/// it filled is replaced with the result on a later render tick.
+async fn collect_account_status_text(config: LoadedConfig) -> String {
+    let now = unix_seconds().unwrap_or(0) as i64;
+    let rows = usage::collect_account_status(&config, false, None, None, now).await;
+    usage::format_account_status(&rows, now)
+}
+
+/// Replaces the transcript placeholder of a finished mid-turn `/accounts`
+/// probe with its rows. Called from every render path while it runs: the
+/// streaming drain during the turn, the idle loop after it, so a probe
+/// that outlives its turn still lands. Returns whether the transcript
+/// changed.
+async fn settle_account_status_task(app: &mut TuiApp) -> bool {
+    let Some((index, task)) = app.account_status_task.take() else {
+        return false;
+    };
+    if !task.is_finished() {
+        app.account_status_task = Some((index, task));
+        return false;
+    }
+    match task.await {
+        Ok(text) => {
+            app.replace_entry(index, text);
+            true
+        }
+        Err(error) => {
+            app.replace_entry(index, format!("account status failed: {error}"));
+            true
+        }
     }
 }
 
@@ -6530,6 +6595,79 @@ fn handle_streaming_command(
                 StreamingKeyOutcome::Changed
             }
         }
+        // Mid-turn account status: the probes run in a background task and
+        // fill the transcript placeholder when they answer; the turn keeps
+        // streaming while they run.
+        "accounts" | "account-status" | "usage" => {
+            if runtime_offline(app, config) {
+                app.push(
+                    TuiEntryKind::System,
+                    "account quotas unavailable in offline mode",
+                );
+                return StreamingKeyOutcome::Changed;
+            }
+            if app.account_status_task.is_some() {
+                app.push(TuiEntryKind::System, "account status already being checked");
+                return StreamingKeyOutcome::Changed;
+            }
+            let checking = app.push_placeholder(TuiEntryKind::System, "checking account status...");
+            let task = tokio::spawn(collect_account_status_text(config.clone()));
+            app.account_status_task = Some((checking, task));
+            StreamingKeyOutcome::Changed
+        }
+        // Mid-turn account switching: the picker opens over the running
+        // turn; the selection applies when the turn ends, like /model.
+        "account" => {
+            let Some(provider) = app.active_provider().map(str::to_string) else {
+                app.push(TuiEntryKind::System, "no model".to_string());
+                return StreamingKeyOutcome::Changed;
+            };
+            let items = account_selector_items_for(
+                config,
+                &provider,
+                app.active_session_account.as_deref(),
+            );
+            if items.is_empty() {
+                app.push(TuiEntryKind::System, "no accounts".to_string());
+            } else {
+                app.push(TuiEntryKind::System, "account selector".to_string());
+                app.selector = Some(TuiSelectorState::new(
+                    "account",
+                    Selector::new("account", items),
+                    "",
+                    None,
+                ));
+            }
+            StreamingKeyOutcome::Changed
+        }
+        command if command.starts_with("account ") => {
+            let account = command.trim_start_matches("account ").trim();
+            let auto = account.is_empty() || account == "auto";
+            let provider = app.active_provider();
+            let known = provider.is_some_and(|provider| {
+                auto || listed_accounts_for_provider(&config.auth, provider)
+                    .into_iter()
+                    .any(|(name, _)| name == account)
+            });
+            if !known {
+                let shown = if account.is_empty() { "auto" } else { account };
+                app.push(TuiEntryKind::Error, format!("account not found: {shown}"));
+            } else {
+                app.push(
+                    TuiEntryKind::System,
+                    format!(
+                        "account switch queued: {} (applies after this turn)",
+                        if auto { "auto" } else { account }
+                    ),
+                );
+                return StreamingKeyOutcome::SwitchAccount(if auto {
+                    None
+                } else {
+                    Some(account.to_string())
+                });
+            }
+            StreamingKeyOutcome::Changed
+        }
         // Mid-turn resume opens the session picker; picking kills the turn.
         "resume" => {
             match session_selector_items(config) {
@@ -6589,6 +6727,8 @@ async fn drain_streaming_tui_events(
     }
     let mut changed = false;
     let mut control = None;
+    // A mid-turn /accounts probe that finished replaces its placeholder.
+    changed |= settle_account_status_task(app).await;
     while event::poll(Duration::ZERO)? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -6608,6 +6748,10 @@ async fn drain_streaming_tui_events(
                     }
                     StreamingKeyOutcome::SwitchModel(reference) => {
                         app.pending_model_switch = Some(reference);
+                        changed = true;
+                    }
+                    StreamingKeyOutcome::SwitchAccount(account) => {
+                        app.pending_account_switch = Some(account);
                         changed = true;
                     }
                     StreamingKeyOutcome::ResumeSession(session_id) => {
@@ -8556,6 +8700,24 @@ async fn run_turn_tui(
             );
         }
     }
+    // A mid-turn /account selection applies now, before the next turn:
+    // `pending_account_switch` holds `Some(None)` for a queued switch to
+    // auto, and `None` when no switch is queued.
+    if let Some(account) = app.pending_account_switch.take() {
+        runtime.set_active_account(account)?;
+        app.refresh_chrome(config, runtime);
+        app.push(
+            TuiEntryKind::System,
+            format!(
+                "account: {}",
+                runtime
+                    .session()
+                    .active_account
+                    .as_deref()
+                    .unwrap_or("auto")
+            ),
+        );
+    }
     redraw_tui(surface.terminal, app, config)?;
     Ok(TurnControl::Completed)
 }
@@ -10018,13 +10180,28 @@ fn account_selector_items(config: &LoadedConfig, runtime: &Runtime) -> Vec<Selec
     let Some(model) = runtime.session().active_model.clone() else {
         return Vec::new();
     };
-    let failover = failover_enabled_for(config, &model.provider);
+    account_selector_items_for(
+        config,
+        &model.provider,
+        runtime.session().active_account.as_deref(),
+    )
+}
+
+/// [`account_selector_items`] without the runtime, for the picker opened
+/// mid-turn while a streaming turn borrows it: the provider of the active
+/// model and the session's pinned account come from the app's chrome.
+fn account_selector_items_for(
+    config: &LoadedConfig,
+    provider: &str,
+    active_account: Option<&str>,
+) -> Vec<SelectorItem> {
+    let failover = failover_enabled_for(config, provider);
     let pinned_note = if failover {
         " (pins account; failover disabled while pinned)"
     } else {
         ""
     };
-    let active = runtime.session().active_account.as_deref();
+    let active = active_account;
     let mut items = vec![SelectorItem {
         label: if failover {
             "auto (failover: sticky account, switches on limits)".to_string()
@@ -10035,7 +10212,7 @@ fn account_selector_items(config: &LoadedConfig, runtime: &Runtime) -> Vec<Selec
         active: active.is_none(),
     }];
     items.extend(
-        listed_accounts_for_provider(&config.auth, &model.provider)
+        listed_accounts_for_provider(&config.auth, provider)
             .into_iter()
             .map(|(account, source)| SelectorItem {
                 label: match source {
@@ -11524,6 +11701,98 @@ mod tests {
                 ("work", "work", true),
             ]
         );
+    }
+
+    /// Mid-turn, /account opens the picker from the app's chrome (no
+    /// runtime borrow), a typed /account <name> queues for turn end, and
+    /// /accounts starts a background probe that fills its placeholder.
+    #[tokio::test]
+    async fn streaming_account_commands_work_during_a_turn() {
+        let mut auth = AuthData::default();
+        auth.insert(
+            "faux",
+            "work",
+            AuthCredential::ApiKey {
+                key: "work-key".to_string(),
+            },
+        );
+        let config = account_test_config(auth);
+        let followups = FollowUpQueue::default();
+        let steering = SteeringMailbox::default();
+        let mut app = TuiApp::default();
+        let runtime = account_test_runtime("faux", Some("work"));
+        app.refresh_chrome(&config, &runtime);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        // A bare /account opens the picker over the running turn.
+        app.set_input("/account");
+        match handle_streaming_tui_key(enter, &mut app, &followups, &steering, &config) {
+            StreamingKeyOutcome::Changed => {}
+            other => panic!("bare /account: {other:?}"),
+        }
+        let selector = app.selector.take().expect("account picker");
+        assert_eq!(selector.kind, "account");
+        assert!(selector
+            .items
+            .iter()
+            .any(|item| item.value == "work" && item.active));
+
+        // Picking an account queues the switch for turn end.
+        let mut picked = TuiSelectorState::new(
+            "account",
+            Selector::new("account", account_selector_items_for(&config, "faux", None)),
+            "",
+            None,
+        );
+        picked.selected = picked
+            .filtered_indices
+            .iter()
+            .position(|&index| picked.items[index].value == "work")
+            .expect("work row in the picker");
+        app.selector = Some(picked);
+        match handle_streaming_tui_key(enter, &mut app, &followups, &steering, &config) {
+            StreamingKeyOutcome::SwitchAccount(Some(account)) => assert_eq!(account, "work"),
+            other => panic!("picker pick: {other:?}"),
+        }
+
+        // A typed reference queues too; an unknown one is refused.
+        app.set_input("/account work");
+        match handle_streaming_tui_key(enter, &mut app, &followups, &steering, &config) {
+            StreamingKeyOutcome::SwitchAccount(Some(account)) => assert_eq!(account, "work"),
+            other => panic!("typed switch: {other:?}"),
+        }
+        app.set_input("/account auto");
+        match handle_streaming_tui_key(enter, &mut app, &followups, &steering, &config) {
+            StreamingKeyOutcome::SwitchAccount(None) => {}
+            other => panic!("typed switch to auto: {other:?}"),
+        }
+        app.set_input("/account nope");
+        match handle_streaming_tui_key(enter, &mut app, &followups, &steering, &config) {
+            StreamingKeyOutcome::Changed => assert!(app
+                .entries
+                .last()
+                .unwrap()
+                .text
+                .contains("account not found: nope")),
+            other => panic!("unknown account: {other:?}"),
+        }
+
+        // /accounts starts the background probe without touching the turn.
+        app.set_input("/accounts");
+        match handle_streaming_tui_key(enter, &mut app, &followups, &steering, &config) {
+            StreamingKeyOutcome::Changed => {}
+            other => panic!("/accounts: {other:?}"),
+        }
+        assert!(app.account_status_task.is_some());
+        assert!(app
+            .entries
+            .last()
+            .unwrap()
+            .text
+            .contains("checking account status"));
+        if let Some((_, task)) = app.account_status_task.take() {
+            task.abort();
+        }
     }
 
     #[test]
