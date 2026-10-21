@@ -114,7 +114,9 @@ install:
 	install -m 0755 target/release/noel "$(BINDIR)/noel"
 	install -m 0755 $(ENV_DAEMONS_DIR)/noel-env-* "$(BINDIR)/"
 
-install-system: release env-daemons
+install-system:
+	CARGO="$(CARGO)" $(INSTALL_BUILD_SCRIPT)
+	CARGO="$(CARGO)" ENV_DAEMONS_DIR="$(ENV_DAEMONS_DIR)" $(ENV_DAEMONS_SCRIPT)
 	$(SUDO) install -d "$(SYSTEM_BINDIR)"
 	$(SUDO) install -m 0755 target/release/noel "$(SYSTEM_BINDIR)/noel"
 	$(SUDO) install -m 0755 $(ENV_DAEMONS_DIR)/noel-env-* "$(SYSTEM_BINDIR)/"

@@ -16,11 +16,16 @@ set -euo pipefail
 
 cargo_cmd="${CARGO:-cargo}"
 
-# Under sudo (make install-system), build as the invoking user.
+# Under sudo (make install / install-system), build as the invoking user: keep
+# their cargo on PATH, not sudo's secure_path (/usr/bin/cargo may be a Rust
+# without the musl std this build needs).
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-  exec sudo -u "${SUDO_USER}" env PATH="${PATH}" CARGO="${cargo_cmd}" \
-    ENV_DAEMONS_DIR="${ENV_DAEMONS_DIR:-}" ENV_DAEMON_ARM64_LINKER="${ENV_DAEMON_ARM64_LINKER:-}" \
-    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}" "$0" "$@"
+  user_home="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
+  reexec=(sudo -u "${SUDO_USER}" env PATH="${user_home}/.cargo/bin:${PATH}" CARGO="${cargo_cmd}"
+    ENV_DAEMONS_DIR="${ENV_DAEMONS_DIR:-}" ENV_DAEMON_ARM64_LINKER="${ENV_DAEMON_ARM64_LINKER:-}")
+  # An empty CARGO_TARGET_DIR makes cargo fail; pass it only when set.
+  [ -n "${CARGO_TARGET_DIR:-}" ] && reexec+=(CARGO_TARGET_DIR="${CARGO_TARGET_DIR}")
+  exec "${reexec[@]}" "$0" "$@"
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,14 +34,32 @@ out="${ENV_DAEMONS_DIR:-target/env-daemons}"
 target_dir="${CARGO_TARGET_DIR:-target}"
 arm64_linker="${ENV_DAEMON_ARM64_LINKER:-aarch64-linux-gnu-gcc}"
 
-# Whether the Rust target is installed; without rustup, assume it is and let
-# cargo say otherwise.
-has_target() {
-  if ! command -v rustup >/dev/null 2>&1; then
-    return 0
-  fi
-  rustup target list --installed | grep -qx "$1"
+# Whether the Rust target's std is installed, straight from the toolchain this
+# cargo uses (works with or without rustup). cargo and rustc normally sit in
+# the same directory; fall back to a PATH lookup.
+# Whether the Rust target's std is installed for the given cargo's toolchain
+# (works with or without rustup). cargo and rustc normally sit in the same
+# directory; fall back to a PATH lookup.
+sysroot_has_target() {
+  rustc_bin="$(dirname "$(command -v "$1")")/rustc"
+  command -v "${rustc_bin}" >/dev/null 2>&1 || rustc_bin=rustc
+  sysroot="$("${rustc_bin}" --print sysroot 2>/dev/null)" || return 1
+  [ -n "${sysroot}" ] && [ -d "${sysroot}/lib/rustlib/$2" ]
 }
+
+has_target() { sysroot_has_target "${cargo_cmd}" "$1"; }
+
+# Shells sometimes lose ~/.cargo/bin (sudo's secure_path, env -i, a stripped
+# rc): if the cargo on PATH can't build the static daemons but the invoking
+# user's rustup can, use it.
+if ! has_target x86_64-unknown-linux-musl; then
+  rustup_cargo="${HOME:-}/.cargo/bin/cargo"
+  if [ -x "${rustup_cargo}" ] && [ "$(command -v "${cargo_cmd}")" != "${rustup_cargo}" ] \
+    && sysroot_has_target "${rustup_cargo}" x86_64-unknown-linux-musl; then
+    printf 'env-daemons: using %s; the cargo on PATH lacks the musl target\n' "${rustup_cargo}" >&2
+    cargo_cmd="${rustup_cargo}"
+  fi
+fi
 
 build() {
   local triple="$1" name="$2"
@@ -49,7 +72,8 @@ mkdir -p "${out}"
 rm -f "${out}"/noel-env-*
 
 if ! has_target x86_64-unknown-linux-musl; then
-  printf 'env-daemons: the x86_64-unknown-linux-musl target is missing; run: rustup target add x86_64-unknown-linux-musl\n' >&2
+  printf 'env-daemons: the x86_64-unknown-linux-musl target is not installed for the toolchain of %s\n' "$(command -v "${cargo_cmd}")" >&2
+  printf "env-daemons: put rustup's cargo first in PATH (or set CARGO), or run: rustup target add x86_64-unknown-linux-musl\n" >&2
   exit 1
 fi
 build x86_64-unknown-linux-musl noel-env-linux-x64
@@ -57,7 +81,7 @@ build x86_64-unknown-linux-musl noel-env-linux-x64
 if ! command -v "${arm64_linker}" >/dev/null 2>&1; then
   printf 'env-daemons: skipping noel-env-linux-arm64: no %s (set ENV_DAEMON_ARM64_LINKER to an aarch64 linker)\n' "${arm64_linker}"
 elif ! has_target aarch64-unknown-linux-musl; then
-  printf 'env-daemons: skipping noel-env-linux-arm64: the aarch64-unknown-linux-musl target is missing (rustup target add aarch64-unknown-linux-musl)\n'
+  printf 'env-daemons: skipping noel-env-linux-arm64: the aarch64-unknown-linux-musl target is not installed for this toolchain (rustup target add aarch64-unknown-linux-musl)\n'
 else
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${arm64_linker}" \
     build aarch64-unknown-linux-musl noel-env-linux-arm64

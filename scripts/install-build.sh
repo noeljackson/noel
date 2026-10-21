@@ -3,11 +3,13 @@ set -euo pipefail
 
 cargo_cmd="${CARGO:-cargo}"
 
+# Under sudo (make install-system), build as the invoking user: keep their
+# cargo on PATH, not sudo's secure_path.
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-  cargo_path="$(command -v "${cargo_cmd}")"
+  user_home="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
   exec sudo -u "${SUDO_USER}" env \
-    PATH="${PATH}" \
-    "${cargo_path}" build --release -p noel-cli
+    PATH="${user_home}/.cargo/bin:${PATH}" \
+    "${cargo_cmd}" build --release -p noel-cli
 fi
 
 exec "${cargo_cmd}" build --release -p noel-cli
