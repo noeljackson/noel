@@ -311,6 +311,19 @@ pub struct ModelTraits {
     pub max_tokens: Option<u64>,
     pub reasoning: Option<bool>,
     pub thinking_level_map: Option<ThinkingLevelMap>,
+    /// The model's catalog `input` modalities (`text`, `image`); `None`
+    /// when the model is not in the catalog and the answer is unknown.
+    pub input_modalities: Option<Vec<String>>,
+}
+
+impl ModelTraits {
+    /// Whether the model's catalog entry lists image input. `None` means
+    /// unknown (a model outside the catalog), and callers decide by API.
+    pub fn accepts_images(&self) -> Option<bool> {
+        self.input_modalities
+            .as_ref()
+            .map(|input| input.iter().any(|entry| entry == "image"))
+    }
 }
 
 impl From<&CatalogModel> for ModelTraits {
@@ -320,6 +333,7 @@ impl From<&CatalogModel> for ModelTraits {
             max_tokens: Some(model.max_tokens),
             reasoning: Some(model.reasoning),
             thinking_level_map: model.thinking_level_map.clone(),
+            input_modalities: Some(model.input.clone()),
         }
     }
 }

@@ -1366,6 +1366,7 @@ impl ModelDefinition {
             max_tokens: self.max_tokens.filter(|tokens| *tokens > 0),
             reasoning: Some(self.reasoning()),
             thinking_level_map: self.thinking_level_map.clone(),
+            input_modalities: self.input.clone(),
         }
     }
 }
