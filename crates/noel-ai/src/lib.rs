@@ -1308,16 +1308,30 @@ fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> V
     if let Some(system_prompt) = &request.system_prompt {
         messages.push(json!({ "role": "system", "content": system_prompt }));
     }
-    messages.extend(request.messages.iter().map(|message| {
+    // A tool result's images, where the model accepts them, follow their
+    // tool round in a user message of their own (upstream's shape): after
+    // the last tool result of the run of tool messages they belong to.
+    let pending_images = openai_chat_tool_image_groups(config, request);
+    let mut image_group = 0usize;
+    let mut messages_iter = request.messages.iter().peekable();
+    while let Some(message) = messages_iter.next() {
         if message.role == ChatRole::Tool {
-            return json!({
-                "role": "tool",
-                "tool_call_id": message.tool_call_id.as_deref().map(|id| normalize_openai_chat_tool_call_id(config, id)),
-                "content": tool_result_text_without_images(message),
-            });
+            let group_has_images =
+                !message.media.is_empty() && matches!(config.traits.accepts_images(), Some(true));
+            let group_continues = messages_iter
+                .peek()
+                .is_some_and(|next| next.role == ChatRole::Tool);
+            messages.push(openai_chat_tool_message(config, message));
+            if group_has_images && !group_continues {
+                if let Some(image_message) = pending_images.get(image_group) {
+                    messages.push(image_message.clone());
+                    image_group += 1;
+                }
+            }
+            continue;
         }
         if message.role == ChatRole::Assistant && !message.tool_calls.is_empty() {
-            return json!({
+            messages.push(json!({
                 "role": "assistant",
                 "content": if message.content.is_empty() { Value::Null } else { json!(message.content) },
                 "tool_calls": message.tool_calls.iter().map(|tool_call| {
@@ -1330,10 +1344,29 @@ fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> V
                         },
                     })
                 }).collect::<Vec<_>>(),
-            });
+            }));
+            continue;
         }
         let content = if message.media.is_empty() {
             json!(message.content)
+        } else if matches!(config.traits.accepts_images(), Some(false)) {
+            // A model whose catalog entry lists no image input: the parts
+            // would be refused by the endpoint, so the message keeps its
+            // text and says the images were left out.
+            let note = if message.media.len() == 1 {
+                "(1 attached image not sent: the current model does not support image input)"
+            } else {
+                "(attached images not sent: the current model does not support image input)"
+            };
+            let mut parts = vec![json!({
+                "type": "text",
+                "text": message.content,
+            })];
+            parts.push(json!({
+                "type": "text",
+                "text": note,
+            }));
+            Value::Array(parts)
         } else {
             let mut parts = vec![json!({
                 "type": "text",
@@ -1349,11 +1382,11 @@ fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> V
             }));
             Value::Array(parts)
         };
-        json!({
+        messages.push(json!({
             "role": role_name(&message.role),
             "content": content,
-        })
-    }));
+        }));
+    }
     messages
 }
 
@@ -1361,18 +1394,84 @@ fn openai_chat_messages(config: &ProviderConfig, request: &ProviderRequest) -> V
 const TOOL_IMAGE_OMITTED: &str =
     "(tool image omitted: this provider API does not accept images in tool results)";
 
+/// What a tool result's images are replaced by for a model whose catalog
+/// entry does not list image input.
+const MODEL_IMAGE_OMITTED: &str =
+    "(tool image omitted: the current model does not support image input)";
+
 /// A tool result for the chat completions API, whose tool messages are text
-/// only. Upstream sends the images in a user message that follows, for
-/// models its catalog lists as accepting images; noel's catalog does not say
-/// which models do, so the images are left out and the model is told.
-fn tool_result_text_without_images(message: &ChatMessage) -> String {
+/// only: the text alone, or with the omission note the model's input
+/// modalities call for. The images themselves, when the model accepts them,
+/// are sent in the user message [`openai_chat_messages`] adds after the tool
+/// results, as upstream does for the models its catalog lists.
+fn tool_result_text_without_images(config: &ProviderConfig, message: &ChatMessage) -> String {
     if message.media.is_empty() {
-        message.content.clone()
-    } else if message.content.is_empty() {
-        TOOL_IMAGE_OMITTED.to_string()
-    } else {
-        format!("{}\n{TOOL_IMAGE_OMITTED}", message.content)
+        return message.content.clone();
     }
+    let note = match config.traits.accepts_images() {
+        Some(false) => MODEL_IMAGE_OMITTED,
+        _ => TOOL_IMAGE_OMITTED,
+    };
+    if message.content.is_empty() {
+        note.to_string()
+    } else {
+        format!("{}\n{note}", message.content)
+    }
+}
+
+/// The user messages that carry tool-result images where a tool message
+/// cannot: one per run of tool messages whose results hold images, each
+/// naming its tool call and then the images as `image_url` parts. Sent only
+/// when the model's catalog entry lists image input (upstream's rule).
+fn openai_chat_tool_image_groups(config: &ProviderConfig, request: &ProviderRequest) -> Vec<Value> {
+    if !matches!(config.traits.accepts_images(), Some(true)) {
+        return Vec::new();
+    }
+    let mut groups = Vec::new();
+    let mut current: Vec<Value> = Vec::new();
+    for message in &request.messages {
+        if message.role != ChatRole::Tool {
+            if !current.is_empty() {
+                groups.push(json!({ "role": "user", "content": current }));
+                current = Vec::new();
+            }
+            continue;
+        }
+        if message.media.is_empty() {
+            continue;
+        }
+        current.push(json!({
+            "type": "text",
+            "text": format!(
+                "(images returned by the {} tool call {})",
+                message.tool_name.as_deref().unwrap_or("tool"),
+                message.tool_call_id.as_deref().unwrap_or("-"),
+            ),
+        }));
+        current.extend(message.media.iter().map(|media| {
+            json!({
+                "type": "image_url",
+                "image_url": { "url": media_data_url(media) },
+            })
+        }));
+    }
+    if !current.is_empty() {
+        groups.push(json!({ "role": "user", "content": current }));
+    }
+    groups
+}
+
+/// One chat completions tool message: the result text, with its images'
+/// omission note when they travel in a user message instead.
+fn openai_chat_tool_message(config: &ProviderConfig, message: &ChatMessage) -> Value {
+    json!({
+        "role": "tool",
+        "tool_call_id": message
+            .tool_call_id
+            .as_deref()
+            .map(|id| normalize_openai_chat_tool_call_id(config, id)),
+        "content": tool_result_text_without_images(config, message),
+    })
 }
 
 fn normalize_openai_chat_tool_call_id(config: &ProviderConfig, id: &str) -> String {
@@ -8275,6 +8374,31 @@ mod tests {
         );
     }
 
+    fn chat_completions_config(api: ProviderApi, accepts_images: Option<bool>) -> ProviderConfig {
+        ProviderConfig {
+            model: ModelRef {
+                provider: "local".to_string(),
+                id: "test".to_string(),
+            },
+            api,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+            traits: ModelTraits {
+                input_modalities: accepts_images.map(|accepts| {
+                    if accepts {
+                        vec!["text".to_string(), "image".to_string()]
+                    } else {
+                        vec!["text".to_string()]
+                    }
+                }),
+                ..ModelTraits::default()
+            },
+        }
+    }
+
     #[test]
     fn chat_completions_tool_results_say_their_images_were_left_out() {
         let request = ProviderRequest {
@@ -8284,25 +8408,116 @@ mod tests {
             tools: Vec::new(),
         };
         for api in [ProviderApi::OpenAi, ProviderApi::Mistral] {
-            let config = ProviderConfig {
-                model: ModelRef {
-                    provider: "local".to_string(),
-                    id: "test".to_string(),
-                },
-                api,
-                base_url: None,
-                auth: ProviderAuth::None,
-                thinking_level: None,
-                thinking_budget_tokens: None,
-                session_id: None,
-                traits: ModelTraits::default(),
-            };
+            // Unknown modalities: the API decides, and a tool message is text only.
+            let config = chat_completions_config(api.clone(), None);
             let messages = openai_chat_messages(&config, &request);
             assert_eq!(messages.len(), 1);
             assert_eq!(
                 messages[0]["content"],
                 "Read image file [image/png]\n(tool image omitted: this provider API does not accept images in tool results)"
             );
+
+            // The catalog says the model takes no images.
+            let config = chat_completions_config(api, Some(false));
+            let messages = openai_chat_messages(&config, &request);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                messages[0]["content"],
+                "Read image file [image/png]\n(tool image omitted: the current model does not support image input)"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_completions_send_tool_result_images_in_a_following_user_message() {
+        let request = ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "read the screenshot".to_string(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    media: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                },
+                image_tool_result("Read image file [image/png]"),
+                image_tool_result("Read image file [image/jpeg]"),
+            ],
+            tools: Vec::new(),
+        };
+        let config = chat_completions_config(ProviderApi::OpenAi, Some(true));
+        let messages = openai_chat_messages(&config, &request);
+        // The two tool results keep their text, and one user message with
+        // both results' images follows the tool round.
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[4]["role"], "user");
+        let parts = messages[4]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 4, "two labels and two images");
+        assert!(parts[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        assert!(parts[3]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        // The tool messages themselves say where the images went.
+        assert_eq!(
+            messages[3]["content"],
+            "Read image file [image/jpeg]\n(tool image omitted: this provider API does not accept images in tool results)"
+        );
+    }
+
+    #[test]
+    fn chat_completions_replace_pasted_images_with_a_note_for_text_only_models() {
+        let request = ProviderRequest {
+            max_output_tokens: None,
+            system_prompt: None,
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "what is this?".to_string(),
+                media: vec![MediaInput {
+                    mime_type: "image/png".to_string(),
+                    data_base64: "aW1hZ2U=".to_string(),
+                    path: None,
+                    width: None,
+                    height: None,
+                }],
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+        };
+        for (modalities, sends_image) in [(Some(true), true), (Some(false), false), (None, true)] {
+            let config = chat_completions_config(ProviderApi::OpenAi, modalities);
+            let messages = openai_chat_messages(&config, &request);
+            let parts = messages[0]["content"].as_array().unwrap();
+            let has_image = parts
+                .iter()
+                .any(|part| part.get("type") == Some(&json!("image_url")));
+            assert_eq!(has_image, sends_image, "modalities {modalities:?}");
+            if !sends_image {
+                assert!(parts.iter().any(|part| part["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("does not support image input")));
+            }
         }
     }
 

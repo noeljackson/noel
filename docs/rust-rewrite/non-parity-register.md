@@ -754,33 +754,35 @@ parts differ:
 Reason: the remaining differences are either invisible to the model or need a
 dependency (Unicode normalization) for a rare case.
 
-### Tool Result Images Depend on the Provider API
+### Tool Result Images Depend on the Provider API and the Catalog
 
 Upstream sends the images of a tool result (`read` of an image file) to every
 model whose catalog entry lists image input, and replaces them with a note for
-other models. Rust's catalog records each model's `input` too, but nothing
-reads it yet, so Rust still decides by provider API:
+other models. Rust's catalog records each model's `input` too, and request
+builders now read it (`ModelTraits::accepts_images`):
 
 - Anthropic Messages, OpenAI Responses (OpenAI, Codex, Azure, GitHub Copilot),
   Google Gemini and Vertex, and Bedrock Converse: the image is sent in the tool
   result (for Gemini 2, in a user turn after it), to every model.
-- OpenAI chat completions and Mistral: the image is not sent. The tool result
-  text ends with `(tool image omitted: this provider API does not accept images
-  in tool results)`. Upstream sends it in a user message after the tool
-  results.
-- Upstream adds `[Current model does not support images. ...]` to the `read`
-  result for a model without image input. Rust never does.
+- OpenAI chat completions and Mistral: a tool message cannot hold an image, so
+  for a model whose catalog entry lists image input the images follow their
+  tool round in a user message of their own (upstream's shape); for any other
+  model the tool result text ends with `(tool image omitted: this provider API
+  does not accept images in tool results)` or, when the catalog says the model
+  takes no images, `(tool image omitted: the current model does not support
+  image input)`. A user message's pasted images get the same gate: sent where
+  the model accepts images, replaced by a note otherwise.
 - With `images.blockImages`, `read` returns `Image reading is disabled.` in
   place of the image. Upstream returns the image and removes it from each
   request, so turning the setting off later sends it; in Rust it is not saved.
 
-Reason: chat completions is the API of most text-only models, and a tool
-message there cannot hold an image. This rule predates the catalog; sending an
-image to a model that does not accept one risks an error on every later
-request of the session, because the image stays in the conversation. The four
-APIs that carry images in tool results serve models that almost all accept
-them. The catalog now says which models accept images; deciding by it is
-separate work.
+Reason: a tool message on the chat completions API cannot hold an image, so
+those images travel in a following user message, and only where the model's
+catalog entry lists image input: sending one to a model that refuses it breaks
+every later request of the session, because the image stays in the
+conversation. The four APIs that carry images in tool results serve models
+that almost all accept them; those paths still send to every model, as
+upstream does for the same reason.
 
 ### No MCP Support
 
