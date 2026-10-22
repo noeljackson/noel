@@ -1448,7 +1448,7 @@ noel --attach <session-id> --remote build-box
 ```
 
 - **ssh does the authentication,** with your `~/.ssh/config`, keys, agent and
-  known hosts, so `user@host`, a `Host` alias and hosts from `cw config-ssh`
+  known hosts, so `user@host`, a `Host` alias and hosts from `cw setup ssh`
   all work. There is no token and no relay. The server stamps these links
   `{kind: "owner", via: "tunnel"}`, since `ssh` admitted the same user that
   owns it (spec §6).
