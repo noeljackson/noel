@@ -1015,7 +1015,7 @@
         "pattern": "needle"
       },
       "result": {
-        "text": ".git/description:1: needle in git metadata\n.github/workflows/ci.yml:2: # needle in workflow\n.hidden/secret.txt:1: needle hidden\ncrlf.txt:1: needle crlf\ndocs/GUIDE.MD:3: needle docs\nsrc/alpha.ts:2: // needle one\nsrc/data.json:1: {\"needle\": true}\nsrc/nested/beta.spec.ts:1: // needle nested",
+        "text": "crlf.txt:1: needle crlf\ndocs/GUIDE.MD:3: needle docs\n.github/workflows/ci.yml:2: # needle in workflow\nsrc/data.json:1: {\"needle\": true}\nsrc/alpha.ts:2: // needle one\n.git/description:1: needle in git metadata\nsrc/nested/beta.spec.ts:1: // needle nested\n.hidden/secret.txt:1: needle hidden",
         "isError": false
       }
     },
@@ -1028,7 +1028,7 @@
         "path": "src"
       },
       "result": {
-        "text": "alpha.ts:2: // needle one\ndata.json:1: {\"needle\": true}\nnested/beta.spec.ts:1: // needle nested",
+        "text": "data.json:1: {\"needle\": true}\nalpha.ts:2: // needle one\nnested/beta.spec.ts:1: // needle nested",
         "isError": false
       }
     },
@@ -1121,7 +1121,7 @@
         "glob": "*.txt"
       },
       "result": {
-        "text": ".hidden/secret.txt:1: needle hidden\ncrlf.txt:1: needle crlf\nignored.txt:1: needle ignored",
+        "text": "crlf.txt:1: needle crlf\n.hidden/secret.txt:1: needle hidden\nignored.txt:1: needle ignored",
         "isError": false
       }
     },
@@ -1134,7 +1134,7 @@
         "glob": "!*.ts"
       },
       "result": {
-        "text": ".git/description:1: needle in git metadata\n.github/workflows/ci.yml:2: # needle in workflow\n.hidden/secret.txt:1: needle hidden\ncrlf.txt:1: needle crlf\ndocs/GUIDE.MD:3: needle docs\nsrc/data.json:1: {\"needle\": true}",
+        "text": "crlf.txt:1: needle crlf\ndocs/GUIDE.MD:3: needle docs\n.github/workflows/ci.yml:2: # needle in workflow\nsrc/data.json:1: {\"needle\": true}\n.git/description:1: needle in git metadata\n.hidden/secret.txt:1: needle hidden",
         "isError": false
       }
     },
@@ -1212,7 +1212,7 @@
         "pattern": "needle"
       },
       "result": {
-        "text": "kept.txt:1: needle kept\nskipped.txt:1: needle skipped",
+        "text": "skipped.txt:1: needle skipped\nkept.txt:1: needle kept",
         "isError": false
       }
     },
