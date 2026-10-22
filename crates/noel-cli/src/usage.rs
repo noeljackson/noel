@@ -869,7 +869,10 @@ fn resets_cell(row: &AccountStatusRow, now: i64) -> String {
 
 pub fn format_account_status(rows: &[AccountStatusRow], now: i64) -> String {
     if rows.is_empty() {
-        return "no accounts configured".to_string();
+        return format!(
+            "no accounts configured\n\n{}",
+            account_howto_lines().join("\n")
+        );
     }
     let headers = [
         "provider", "account", "auth", "windows", "balance", "resets", "note",
@@ -911,7 +914,21 @@ pub fn format_account_status(rows: &[AccountStatusRow], now: i64) -> String {
     lines.extend(cells.iter().map(render));
     lines.push(String::new());
     lines.push("% = share of window quota remaining".to_string());
+    lines.push(String::new());
+    lines.extend(account_howto_lines().into_iter().map(String::from));
     lines.join("\n")
+}
+
+/// The add-and-use hint appended to account status: where another account
+/// comes from, and how to switch to one. The TUI's `/accounts`, mid-turn
+/// `/accounts`, and `noel accounts status` all show it.
+fn account_howto_lines() -> Vec<&'static str> {
+    vec![
+        "add an account: noel login <provider> --account <name> --api-key <key|env:VAR|->",
+        "             or noel login <provider> --account <name>  (OAuth: anthropic, openai-codex)",
+        "in the TUI: /login runs the same flow, /account switches (auto or a named account)",
+        "            /logout <provider> [account] removes one",
+    ]
 }
 
 #[cfg(test)]
@@ -1584,12 +1601,16 @@ mod tests {
         assert_eq!(cell(lines[4], 3), "-");
         assert_eq!(cell(lines[5], 3), "n/a");
         assert_eq!(cell(lines[5], 4), "n/a");
+        assert!(lines[lines.len() - 1]
+            .trim_end()
+            .ends_with("/logout <provider> [account] removes one"));
         assert_eq!(
-            lines[lines.len() - 1],
-            "% = share of window quota remaining"
+            format_account_status(&[], now),
+            format!(
+                "no accounts configured\n\n{}",
+                account_howto_lines().join("\n")
+            )
         );
-
-        assert_eq!(format_account_status(&[], now), "no accounts configured");
     }
 
     #[test]
