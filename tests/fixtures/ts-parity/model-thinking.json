@@ -1412,35 +1412,6 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
-        "off": null,
-        "minimal": null,
-        "low": null,
-        "medium": null,
-        "high": null,
-        "xhigh": null,
-        "max": "max"
-      },
-      "examples": [
-        "opencode/kimi-k3",
-        "opencode-go/kimi-k3"
-      ],
-      "supported": [
-        "max"
-      ],
-      "clamp": {
-        "off": "max",
-        "minimal": "max",
-        "low": "max",
-        "medium": "max",
-        "high": "max",
-        "xhigh": "max",
-        "max": "max",
-        "invalid": "max"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
         "off": "none",
         "minimal": "minimal",
         "low": "low",
@@ -1480,8 +1451,7 @@
         "medium": null
       },
       "examples": [
-        "opencode/grok-build-0.1",
-        "together/MiniMaxAI/MiniMax-M2.7"
+        "opencode/grok-build-0.1"
       ],
       "supported": [
         "high"
@@ -1495,6 +1465,34 @@
         "xhigh": "high",
         "max": "high",
         "invalid": "high"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": null,
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": null,
+        "xhigh": null,
+        "max": "max"
+      },
+      "examples": [
+        "opencode-go/kimi-k3"
+      ],
+      "supported": [
+        "max"
+      ],
+      "clamp": {
+        "off": "max",
+        "minimal": "max",
+        "low": "max",
+        "medium": "max",
+        "high": "max",
+        "xhigh": "max",
+        "max": "max",
+        "invalid": "max"
       }
     },
     {
@@ -1836,13 +1834,42 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": null,
         "minimal": null,
-        "low": null,
-        "medium": null
+        "low": "low",
+        "medium": null,
+        "high": null,
+        "xhigh": null,
+        "max": null
       },
       "examples": [
-        "together/deepseek-ai/DeepSeek-V4-Flash-0731",
-        "together/deepseek-ai/DeepSeek-V4.1-Flash"
+        "radius/recursive/flint"
+      ],
+      "supported": [
+        "low"
+      ],
+      "clamp": {
+        "off": "low",
+        "minimal": "low",
+        "low": "low",
+        "medium": "low",
+        "high": "low",
+        "xhigh": "low",
+        "max": "low",
+        "invalid": "low"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": "high",
+        "xhigh": null
+      },
+      "examples": [
+        "together/deepseek-ai/DeepSeek-V4-Pro-0813"
       ],
       "supported": [
         "off",
@@ -1864,12 +1891,11 @@
       "thinkingLevelMap": {
         "minimal": null,
         "low": null,
-        "medium": null,
-        "high": "high",
-        "xhigh": null
+        "medium": null
       },
       "examples": [
-        "together/deepseek-ai/DeepSeek-V4-Pro-0813"
+        "together/deepseek-ai/DeepSeek-V4.1-Flash",
+        "together/meta-models/Muse-Spark-Open-816B-A42B"
       ],
       "supported": [
         "off",
