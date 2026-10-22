@@ -1275,7 +1275,9 @@ fn accounts_status_prints_table_or_empty_state() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "no accounts configured");
+    assert!(stdout.trim_start().starts_with("no accounts configured"));
+    assert!(stdout.contains("noel login <provider>"), "{stdout}");
+    assert!(stdout.contains("/account switches"), "{stdout}");
 
     let refresh = base(&["accounts", "status", "--refresh"]);
     assert!(
