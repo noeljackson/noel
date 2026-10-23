@@ -1015,7 +1015,7 @@
         "pattern": "needle"
       },
       "result": {
-        "text": "crlf.txt:1: needle crlf\ndocs/GUIDE.MD:3: needle docs\n.github/workflows/ci.yml:2: # needle in workflow\nsrc/data.json:1: {\"needle\": true}\nsrc/alpha.ts:2: // needle one\n.git/description:1: needle in git metadata\nsrc/nested/beta.spec.ts:1: // needle nested\n.hidden/secret.txt:1: needle hidden",
+        "text": "crlf.txt:1: needle crlf\n.hidden/secret.txt:1: needle hidden\ndocs/GUIDE.MD:3: needle docs\n.github/workflows/ci.yml:2: # needle in workflow\nsrc/data.json:1: {\"needle\": true}\nsrc/alpha.ts:2: // needle one\n.git/description:1: needle in git metadata\nsrc/nested/beta.spec.ts:1: // needle nested",
         "isError": false
       }
     },
@@ -1121,7 +1121,7 @@
         "glob": "*.txt"
       },
       "result": {
-        "text": "crlf.txt:1: needle crlf\n.hidden/secret.txt:1: needle hidden\nignored.txt:1: needle ignored",
+        "text": "crlf.txt:1: needle crlf\nignored.txt:1: needle ignored\n.hidden/secret.txt:1: needle hidden",
         "isError": false
       }
     },
@@ -1134,7 +1134,7 @@
         "glob": "!*.ts"
       },
       "result": {
-        "text": "crlf.txt:1: needle crlf\ndocs/GUIDE.MD:3: needle docs\n.github/workflows/ci.yml:2: # needle in workflow\nsrc/data.json:1: {\"needle\": true}\n.git/description:1: needle in git metadata\n.hidden/secret.txt:1: needle hidden",
+        "text": "crlf.txt:1: needle crlf\ndocs/GUIDE.MD:3: needle docs\nsrc/data.json:1: {\"needle\": true}\n.github/workflows/ci.yml:2: # needle in workflow\n.hidden/secret.txt:1: needle hidden\n.git/description:1: needle in git metadata",
         "isError": false
       }
     },
