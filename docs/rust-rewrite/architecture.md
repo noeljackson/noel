@@ -616,6 +616,12 @@ Extension execution supports:
   Registered tools receive `kind: "tool"` protocol requests and return JSON
   command responses. A tool's optional `promptSnippet` and `promptGuidelines`
   become its line and rules in the system prompt.
+- Persistent JSON protocol v2 hosts (`protocolVersion: 2`): one process per
+  extension for the session's life, an `init` handshake with dynamic tool and
+  command registration, `toolCall` gates that run before each model tool call
+  and fail closed, and re-registration from any response. The hosts are
+  runtime state on the `Runtime`, not reloadable systems: reloadable state
+  stays plain data, and `/reload` notifies and replaces hosts.
 - Diagnostics for manifest and lifecycle failures.
 
 Intentionally unsupported:

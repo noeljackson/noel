@@ -602,6 +602,30 @@ Rust supports:
   `kind: "tool"` JSON requests on stdin. A non-zero exit is an error result,
   output is capped at 2000 lines or 50 KB with the whole output saved to a
   temp file, and a tool named like a built-in tool replaces it.
+- Persistent JSON protocol v2 extensions (`protocolVersion: 2` in the
+  adjacent manifest). One long-lived process per extension, started with the
+  first run or command that needs it, replaces v1's one process per request:
+  - An `init` handshake carries the extension's registrations — its tools
+    (name, description, parameters, `replaySafe`, `promptSnippet`,
+    `promptGuidelines`), its `/`-commands (upstream's `registerCommand`),
+    and whether it wants `toolCall` gate requests. The handshake's word
+    replaces the manifest's; what it does not register does not run.
+  - Model tool calls and `/extension:<name>` commands travel as `kind:
+    "tool"`/`kind: "command"` requests over the same pipe, so extension
+    state persists between calls.
+  - Any response can carry new `tools`/`commands`, which replace that
+    extension's registrations (upstream's dynamic tools: a command or a
+    gate decides what the model may call next).
+  - Lifecycle notifications `sessionStart`-adjacent init, `agentSettled`
+    after a run settles, and `reload`/`shutdown`, matching upstream's
+    event names for the events the JSON protocol can carry.
+  - `kind: "toolCall"` gate requests run before a tool the model asked for
+    executes (upstream's `tool_call` handlers, a permission gate). A gate
+    answers `{"allow":bool,"reason":str}`; a blocked call never runs and
+    its reason is the model's error result, and a gate that fails or cannot
+    answer blocks (fail closed), as upstream's gate handlers must.
+  - A `/`-command an extension registered dispatches to its host, after
+    every built-in and resource command.
 
 Rust intentionally does not support:
 
@@ -609,8 +633,9 @@ Rust intentionally does not support:
 - npm extension installation/update workflows.
 - In-process TypeScript UI primitive/custom renderer APIs.
 
-Future Rust extension work can build on the JSON executable protocol with a
-Rust SDK or provider registration helpers.
+Future Rust extension work can build on the v2 protocol with a Rust SDK or
+provider registration helpers; a host that loads TypeScript extensions with
+jiti would run them against this protocol.
 
 ## Validation
 
