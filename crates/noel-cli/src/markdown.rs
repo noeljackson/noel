@@ -318,9 +318,12 @@ pub enum BlockKind {
         language: String,
         closing: bool,
     },
-    /// `- ` or `* ` bullet, or `1. ` ordered.
+    /// `- ` or `* ` bullet, or `1. ` ordered. `marker` carries the source's
+    /// ordered-list number (`1. ` → `Some(1)`) so the display can number the
+    /// list; `None` for bullets.
     ListItem {
         ordered: bool,
+        marker: Option<u64>,
     },
     /// `> text` blockquote.
     Blockquote,
@@ -349,7 +352,10 @@ pub fn classify_line(line: &str) -> BlockKind {
         return BlockKind::Blockquote;
     }
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-        return BlockKind::ListItem { ordered: false };
+        return BlockKind::ListItem {
+            ordered: false,
+            marker: None,
+        };
     }
     // Ordered list: digits followed by `. ` — but not decimals in prose
     // ("3.14") because those have no space after the dot.
@@ -358,7 +364,11 @@ pub fn classify_line(line: &str) -> BlockKind {
         .take_while(|ch| ch.is_ascii_digit())
         .collect();
     if !digits.is_empty() && trimmed[digits.len()..].starts_with(". ") {
-        return BlockKind::ListItem { ordered: true };
+        let number = digits.parse::<u64>().ok().filter(|n| *n > 0);
+        return BlockKind::ListItem {
+            ordered: true,
+            marker: number,
+        };
     }
     BlockKind::Plain
 }
@@ -392,13 +402,27 @@ pub fn block_render(kind: &BlockKind, line: &str) -> BlockRender {
             emphasis_blocks: false,
             inline: false,
         },
-        BlockKind::ListItem { ordered } => BlockRender {
+        BlockKind::ListItem { ordered, marker } => BlockRender {
+            // Ordered items display the number the caller supplies (the
+            // list's sequence, like upstream's list renderer, which numbers
+            // items from the first marker and ignores later source numbers).
             prefix: if *ordered {
-                "  1. ".to_string()
+                format!("  {}. ", marker.unwrap_or(1))
             } else {
                 "  • ".to_string()
             },
-            content_byte: line.len() - line.trim_start().len() + 2,
+            // Skip the marker: two characters for a bullet, or the digits,
+            // dot, and space for an ordered item.
+            content_byte: line.len() - line.trim_start().len()
+                + if *ordered {
+                    line.trim_start()
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_digit())
+                        .count()
+                        + 2
+                } else {
+                    2
+                },
             emphasis_blocks: false,
             inline: true,
         },
@@ -532,23 +556,45 @@ mod block_tests {
         );
         assert_eq!(
             classify_line("- item"),
-            BlockKind::ListItem { ordered: false }
+            BlockKind::ListItem {
+                ordered: false,
+                marker: None
+            }
         );
         assert_eq!(
             classify_line("1. step"),
-            BlockKind::ListItem { ordered: true }
+            BlockKind::ListItem {
+                ordered: true,
+                marker: Some(1)
+            }
         );
         assert_eq!(classify_line("> quoted"), BlockKind::Blockquote);
         assert_eq!(classify_line("plain text"), BlockKind::Plain);
     }
 
     #[test]
-    fn ordered_list_requires_two_digits() {
-        // 1. is one digit — treat as plain per our subset (avoid matching
-        // decimals like 3.14 in prose).
+    fn ordered_lists_carry_their_source_number() {
         assert_eq!(
             classify_line("1. single"),
-            BlockKind::ListItem { ordered: true }
+            BlockKind::ListItem {
+                ordered: true,
+                marker: Some(1)
+            }
+        );
+        assert_eq!(
+            classify_line("10. ten"),
+            BlockKind::ListItem {
+                ordered: true,
+                marker: Some(10)
+            }
+        );
+        // A zero or overflowing number still renders as the first item.
+        assert_eq!(
+            classify_line("0. zero"),
+            BlockKind::ListItem {
+                ordered: true,
+                marker: None
+            }
         );
         assert_eq!(classify_line("3.14 pi"), BlockKind::Plain);
     }
@@ -557,9 +603,24 @@ mod block_tests {
     fn block_render_prefixes_and_content() {
         let heading = block_render(&BlockKind::Heading(2), "## Title");
         assert_eq!(heading.content_byte, 3);
-        let item = block_render(&BlockKind::ListItem { ordered: false }, "- thing");
+        let item = block_render(
+            &BlockKind::ListItem {
+                ordered: false,
+                marker: None,
+            },
+            "- thing",
+        );
         assert_eq!(item.prefix, "  • ");
         assert_eq!(item.content_byte, 2);
+        let ordered = block_render(
+            &BlockKind::ListItem {
+                ordered: true,
+                marker: Some(3),
+            },
+            "10. ten",
+        );
+        assert_eq!(ordered.prefix, "  3. ");
+        assert_eq!(ordered.content_byte, 4);
         let quote = block_render(&BlockKind::Blockquote, "> wisdom");
         assert_eq!(quote.prefix, "  │ ");
         assert_eq!(quote.content_byte, 1);

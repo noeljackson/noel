@@ -5271,6 +5271,11 @@ fn restyle_rows_with_markdown(
     // rows are dimmed between opening and closing fences. The fence marker
     // lines themselves collapse to a dim language label.
     let mut in_fence = false;
+    // Ordered-list state: an ordered item numbers itself from the list's
+    // start marker plus its position (upstream's list renderer), so a
+    // source that numbers every item `1.` still displays `1. 2. 3.`. A
+    // plain line or a bullet ends the sequence.
+    let mut ordered_list: Option<(u64, u64)> = None;
     for row in rows.iter_mut() {
         if row.synthetic {
             continue;
@@ -5313,11 +5318,36 @@ fn restyle_rows_with_markdown(
         } else {
             &source_line
         };
-        let kind = if starts_line {
+        let mut kind = if starts_line {
             markdown::classify_line(classify_target)
         } else {
             markdown::BlockKind::Plain
         };
+        if starts_line {
+            match &mut kind {
+                markdown::BlockKind::ListItem {
+                    ordered: true,
+                    marker,
+                } => {
+                    let (start, position) = match ordered_list {
+                        Some(state) => (state.0, state.1 + 1),
+                        None => (marker.unwrap_or(1), 1),
+                    };
+                    *marker = Some(start + position - 1);
+                    ordered_list = Some((start, position));
+                }
+                markdown::BlockKind::ListItem {
+                    ordered: false,
+                    marker,
+                } => {
+                    *marker = None;
+                    ordered_list = None;
+                }
+                _ => ordered_list = None,
+            }
+        } else if matches!(kind, markdown::BlockKind::ListItem { .. }) {
+            ordered_list = None;
+        }
         // Headings render their content after the markers; compute from the
         // classification target, not the raw source line.
         let heading_content = |kind: &markdown::BlockKind, target: &str| -> String {
