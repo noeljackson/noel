@@ -341,24 +341,26 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "model is at capacity",
     "rate.?limit",
     "too many requests",
-    "429",
-    "500",
-    "502",
-    "503",
-    "504",
-    "520",
-    "524",
-    "service.?unavailable",
+    // Status codes with word boundaries, so "50342" or "gpt-500" in an
+    // id is not a status.
+    r"(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])",
+    "service.?(?:is.?)?(?:temporarily.?)?unavailable",
     "server.?error",
     "internal.?error",
-    "provider.?returned.?error",
+    "provider.?returned.?(?:an.?)?error",
     "exceeded request buffer limit while retrying upstream",
+    "unable to forward upstream",
+    "upstream.?request.?failed",
+    "upstream_stream_read_error",
+    "stream was interrupted",
+    "http/?2 stream failed",
     "network.?error",
     "connection.?error",
     "connection.?refused",
     "connection.?lost",
     "other side closed",
     "fetch failed",
+    r"request to \S+ failed, reason:",
     "getaddrinfo",
     "ENOTFOUND",
     "EAI_AGAIN",
@@ -375,6 +377,7 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "stream ended before message_stop",
     "stream ended before a terminal response event",
     "http2 request did not get a response",
+    "stream disconnected before completion",
     "pending stream has been canceled",
     "retry delay",
     "you can retry your request",
@@ -397,6 +400,7 @@ const NON_RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "quota exceeded",
     "billing",
     "subscription_sharing_usage_limit_exceeded",
+    "subscription_sharing_workplace_individual_usage_limit_exceeded",
 ];
 
 /// Upstream's `OVERFLOW_PATTERNS` (`packages/ai/src/utils/overflow.ts`): how
@@ -427,6 +431,7 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     r"context[_ ]length[_ ]exceeded",
     r"too many tokens",
     r"token limit exceeded",
+    r"^(?:[\w -]+ API error \(413\):|413(?:\s|:|$))",
 ];
 
 /// Upstream's `NON_OVERFLOW_PATTERNS`: throttling errors that would otherwise
@@ -441,12 +446,23 @@ const NON_OVERFLOW_PATTERNS: &[&str] = &[
 fn any_pattern(patterns: &[&str]) -> Regex {
     let alternatives = patterns
         .iter()
-        .map(|pattern| format!("(?:{pattern})"))
+        .map(|pattern| format!("(?:{})", translate_js_lookaround(pattern)))
         .collect::<Vec<_>>();
     RegexBuilder::new(&alternatives.join("|"))
         .case_insensitive(true)
         .build()
         .expect("error patterns are valid regular expressions")
+}
+
+/// JavaScript look-around that the Rust regex crate cannot compile, as an
+/// equivalent without it. Upstream's error patterns use look-around only
+/// for word boundaries around HTTP status codes; a consuming boundary
+/// (with the string's edges) matches the same texts for `is_match`, where
+/// nothing after the pattern depends on what it consumed.
+fn translate_js_lookaround(pattern: &str) -> String {
+    pattern
+        .replace("(?<![a-z0-9])", "(?:^|[^a-z0-9])")
+        .replace("(?![a-z0-9])", "(?:[^a-z0-9]|$)")
 }
 
 /// Upstream's `isRetryableAssistantError` for an error with this text: it
@@ -1573,6 +1589,30 @@ fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
     total
 }
 
+/// Where the request's tools go for a Responses transport
+/// (`getResponsesToolSupport`): in place as `additional_tools` input items
+/// when the model can anchor them mid-conversation, otherwise the
+/// top-level `tools` field.
+fn responses_tools_in_place(config: &ProviderConfig) -> bool {
+    config
+        .traits
+        .supports_mid_convo_system_messages
+        .unwrap_or(false)
+        && config.traits.supports_additional_tools.unwrap_or(false)
+}
+
+/// The leading `additional_tools` item declaring the request's tools in
+/// place, or nothing when the transport keeps them top-level.
+fn additional_tools_item(tools: &[ToolDefinition], strict: Value) -> Option<Value> {
+    (!tools.is_empty()).then(|| {
+        json!({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": openai_responses_tools(tools, strict),
+        })
+    })
+}
+
 fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
     if config.model.provider == "openai-codex" {
         return openai_codex_responses_body(config, request);
@@ -1580,14 +1620,20 @@ fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> 
     if config.model.provider == "github-copilot" {
         return github_copilot_responses_body(config, request);
     }
+    let mut input = openai_responses_input_with_developer_system(request);
+    if responses_tools_in_place(config) {
+        if let Some(item) = additional_tools_item(&request.tools, json!(false)) {
+            input.insert(0, item);
+        }
+    }
     let mut body = json!({
         "model": config.model.id,
-        "input": openai_responses_input_with_developer_system(request),
+        "input": input,
         "stream": true,
         "store": false,
         "include": ["reasoning.encrypted_content"],
     });
-    if !request.tools.is_empty() {
+    if !responses_tools_in_place(config) && !request.tools.is_empty() {
         body["tools"] = json!(openai_responses_tools(&request.tools, json!(false)));
     }
     if let Some(effort) = reasoning_effort(config) {
@@ -1603,9 +1649,15 @@ fn openai_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> 
 }
 
 fn github_copilot_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let mut input = openai_responses_input_with_developer_system(request);
+    if responses_tools_in_place(config) {
+        if let Some(item) = additional_tools_item(&request.tools, Value::Null) {
+            input.insert(0, item);
+        }
+    }
     let mut body = json!({
         "model": config.model.id,
-        "input": openai_responses_input_with_developer_system(request),
+        "input": input,
         "stream": true,
         "store": false,
         "include": ["reasoning.encrypted_content"],
@@ -1621,10 +1673,19 @@ fn github_copilot_responses_body(config: &ProviderConfig, request: &ProviderRequ
     if let Some(max_tokens) = provider_max_tokens(config, request) {
         body["max_output_tokens"] = json!(max_tokens);
     }
+    if !responses_tools_in_place(config) && !request.tools.is_empty() {
+        body["tools"] = json!(openai_responses_tools(&request.tools, json!(false)));
+    }
     body
 }
 
 fn openai_codex_responses_body(config: &ProviderConfig, request: &ProviderRequest) -> Value {
+    let mut input = openai_responses_input(request);
+    if responses_tools_in_place(config) {
+        if let Some(item) = additional_tools_item(&request.tools, Value::Null) {
+            input.insert(0, item);
+        }
+    }
     let mut body = json!({
         "model": config.model.id,
         "store": false,
@@ -1637,7 +1698,7 @@ fn openai_codex_responses_body(config: &ProviderConfig, request: &ProviderReques
             .clone()
             .filter(|prompt| !prompt.trim().is_empty())
             .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
-        "input": openai_responses_input(request),
+        "input": input,
         "text": {
             "verbosity": "low",
         },
@@ -1651,7 +1712,7 @@ fn openai_codex_responses_body(config: &ProviderConfig, request: &ProviderReques
             "summary": "auto",
         });
     }
-    if !request.tools.is_empty() {
+    if !responses_tools_in_place(config) && !request.tools.is_empty() {
         body["tools"] = json!(openai_responses_tools(&request.tools, Value::Null));
     }
     body
@@ -3235,21 +3296,29 @@ fn bearer_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
     Ok(headers)
 }
 
-/// Upstream `getPiUserAgent()` (`packages/ai/src/utils/pi-user-agent.ts`):
-/// `pi (<platform> <release>; <arch>)` using Node's `os` names.
+/// Upstream `formatUserAgent()` (`packages/ai/src/utils/identity.ts`) in
+/// its default detailed form: `pi/<pi-ai version> (<platform>; node/<node
+/// version>; <arch>)`. The version and runtime are pinned to the TS
+/// parity reference (`packages/ai/src/utils/version.ts` and the reference
+/// image's Node), because they are properties of upstream's build, not of
+/// the host running noel; fixtures carry the same values. No kernel release
+/// appears anymore, so nothing is host-specific in the detailed form.
 fn pi_user_agent() -> &'static str {
     static PI_USER_AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PI_USER_AGENT.get_or_init(|| {
-        format_pi_user_agent(
-            node_platform(env::consts::OS),
-            &os_release(),
-            node_arch(env::consts::ARCH),
-        )
+        format_pi_user_agent(node_platform(env::consts::OS), node_arch(env::consts::ARCH))
     })
 }
 
-fn format_pi_user_agent(platform: &str, release: &str, arch: &str) -> String {
-    format!("pi ({platform} {release}; {arch})")
+/// The `@earendil-works/pi-ai` version of the TS parity reference, which
+/// upstream embeds in the detailed `User-Agent`.
+const REFERENCE_PI_AI_VERSION: &str = "1.4.0";
+/// The Node version of the TS parity reference image, which upstream
+/// embeds as the runtime in the detailed `User-Agent`.
+const REFERENCE_NODE_VERSION: &str = "v24.22.1";
+
+fn format_pi_user_agent(platform: &str, arch: &str) -> String {
+    format!("pi/{REFERENCE_PI_AI_VERSION} ({platform}; node/{REFERENCE_NODE_VERSION}; {arch})")
 }
 
 /// Node's `os.platform()` name for a Rust target OS.
@@ -7593,7 +7662,7 @@ mod tests {
         let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "openai-codex".to_string(),
-                id: "gpt-5.5".to_string(),
+                id: "gpt-6.1-sol".to_string(),
             },
             api: ProviderApi::OpenAiCodexResponses,
             base_url: None,
@@ -7982,7 +8051,7 @@ mod tests {
     #[test]
     fn github_copilot_matches_ts_responses_request_shape() {
         let fixture = serde_json::from_str::<Value>(include_str!(
-            "../../../tests/fixtures/ts-parity/github-copilot-gpt-5.4.json"
+            "../../../tests/fixtures/ts-parity/github-copilot-gpt-6.1-sol.json"
         ))
         .expect("parse TS parity fixture");
         let request = ProviderRequest {
@@ -8001,7 +8070,7 @@ mod tests {
         let config = with_catalog(ProviderConfig {
             model: ModelRef {
                 provider: "github-copilot".to_string(),
-                id: "gpt-5.4".to_string(),
+                id: "gpt-6.1-sol".to_string(),
             },
             api: ProviderApi::OpenAiResponses,
             base_url: Some("https://api.individual.githubcopilot.com".to_string()),
@@ -8260,10 +8329,7 @@ mod tests {
             Some(pi_user_agent())
         );
         assert_eq!(
-            Some(
-                format_pi_user_agent(node_platform("linux"), "<kernel>", node_arch("x86_64"))
-                    .as_str()
-            ),
+            Some(format_pi_user_agent(node_platform("linux"), node_arch("x86_64")).as_str()),
             fixture_request["headers"]["user-agent"].as_str()
         );
         assert!(headers.get(AUTHORIZATION).is_some());

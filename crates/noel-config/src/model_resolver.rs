@@ -4,6 +4,7 @@
 //! credentials; `model-resolution.json` holds upstream's answers.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use noel_ai::catalog::{default_models, thinking_level};
 use noel_ai::ModelRef;
@@ -111,12 +112,13 @@ pub fn find_exact_model_reference_match<'a>(
 fn try_match_model<'a>(
     pattern: &str,
     models: &[&'a ModelDefinition],
+    usable: &dyn Fn(&str) -> bool,
 ) -> Option<&'a ModelDefinition> {
     if let Some(exact) = find_exact_model_reference_match(pattern, models) {
         return Some(exact);
     }
     let needle = pattern.to_lowercase();
-    let matches = models
+    let mut matches = models
         .iter()
         .copied()
         .filter(|model| {
@@ -127,6 +129,24 @@ fn try_match_model<'a>(
                     .is_some_and(|name| name.to_lowercase().contains(&needle))
         })
         .collect::<Vec<_>>();
+    // Upstream `selectFuzzy`: when the fuzzy matches span several
+    // providers, only the usable (authenticated) ones compete, so a
+    // credential picks the provider and never leaves the choice to
+    // catalog order.
+    let providers = matches
+        .iter()
+        .map(|model| model.provider.as_str())
+        .collect::<BTreeSet<_>>();
+    if providers.len() > 1 {
+        let usable_matches = matches
+            .iter()
+            .copied()
+            .filter(|model| usable(&model.provider))
+            .collect::<Vec<_>>();
+        if !usable_matches.is_empty() {
+            matches = usable_matches;
+        }
+    }
     // The id that sorts last; of ids that sort alike, the first in catalog
     // order (upstream's sort is stable).
     let highest = |alias: bool| {
@@ -151,6 +171,21 @@ struct ParsedModel<'a> {
     warning: Option<String>,
 }
 
+/// `pattern` without its `:<thinking>` suffix, when it has one.
+fn without_thinking_suffix(pattern: &str) -> &str {
+    match pattern.rsplit_once(':') {
+        Some((base, suffix)) if thinking_level(suffix).is_some() => base,
+        _ => pattern,
+    }
+}
+
+/// The `:<thinking>` suffix of `pattern`, when it has one.
+fn thinking_level_of(pattern: &str) -> Option<&'static str> {
+    pattern
+        .rsplit_once(':')
+        .and_then(|(_, suffix)| thinking_level(suffix))
+}
+
 /// Upstream `parseModelPattern`: the pattern as a model, else with its
 /// last `:suffix` taken as a thinking level. Model ids may contain colons,
 /// so the whole pattern is tried first. With `lenient`, a suffix that is
@@ -160,13 +195,14 @@ fn parse_model_pattern<'a>(
     pattern: &str,
     models: &[&'a ModelDefinition],
     lenient: bool,
+    usable: &dyn Fn(&str) -> bool,
 ) -> ParsedModel<'a> {
     let unmatched = || ParsedModel {
         model: None,
         thinking_level: None,
         warning: None,
     };
-    if let Some(model) = try_match_model(pattern, models) {
+    if let Some(model) = try_match_model(pattern, models, usable) {
         return ParsedModel {
             model: Some(model),
             thinking_level: None,
@@ -177,7 +213,7 @@ fn parse_model_pattern<'a>(
         return unmatched();
     };
     if let Some(level) = thinking_level(suffix) {
-        let parsed = parse_model_pattern(prefix, models, lenient);
+        let parsed = parse_model_pattern(prefix, models, lenient, usable);
         // The level counts only if nothing further in was dropped.
         let thinking_level = (parsed.model.is_some() && parsed.warning.is_none()).then_some(level);
         return ParsedModel {
@@ -188,7 +224,7 @@ fn parse_model_pattern<'a>(
     if !lenient {
         return unmatched();
     }
-    let parsed = parse_model_pattern(prefix, models, lenient);
+    let parsed = parse_model_pattern(prefix, models, lenient, usable);
     if parsed.model.is_none() {
         return parsed;
     }
@@ -243,7 +279,39 @@ pub fn resolve_model_scope(patterns: &[String], available: &[&ModelDefinition]) 
             }
             continue;
         }
-        let parsed = parse_model_pattern(pattern, available, true);
+        // Scope resolution counts every model usable (upstream passes
+        // `() => true`): credentials cannot choose between providers
+        // offering the same id. An exact id several providers have adds
+        // them all, with a warning to pick one with `provider/id`
+        // (upstream's `selectReference` ambiguous branch); a fuzzy match
+        // keeps upstream's own tie rule.
+        let base = without_thinking_suffix(pattern);
+        let exact = available
+            .iter()
+            .copied()
+            .filter(|model| {
+                let lower = base.to_lowercase();
+                model.id.to_lowercase() == lower
+                    || format!("{}/{}", model.provider, model.id).to_lowercase() == lower
+            })
+            .collect::<Vec<_>>();
+        let providers = exact
+            .iter()
+            .map(|model| model.provider.as_str())
+            .collect::<BTreeSet<_>>();
+        if exact.len() > 1 && providers.len() > 1 {
+            let mut names = providers.into_iter().collect::<Vec<_>>();
+            names.sort_by(|left, right| locale_compare(left, right));
+            scope.diagnostics.push(format!(
+                "Pattern \"{pattern}\" matches several providers: {}. Use provider/id to choose one.",
+                names.join(", ")
+            ));
+            for model in exact {
+                add(&mut scope, model, thinking_level_of(pattern));
+            }
+            continue;
+        }
+        let parsed = parse_model_pattern(pattern, available, true, &|_| true);
         scope.diagnostics.extend(parsed.warning);
         match parsed.model {
             Some(model) => add(&mut scope, model, parsed.thinking_level),
@@ -392,7 +460,7 @@ pub fn resolve_cli_model(
         .copied()
         .filter(|model| provider.is_none_or(|provider| model.provider == provider))
         .collect::<Vec<_>>();
-    let parsed = parse_model_pattern(pattern, &candidates, false);
+    let parsed = parse_model_pattern(pattern, &candidates, false, has_auth);
     if let Some(model) = parsed.model {
         // The provider reading matched a provider without credentials: an
         // id that literally starts with that provider's name, at the one
@@ -423,7 +491,7 @@ pub fn resolve_cli_model(
         if let Some(model) = all.iter().copied().find(is_exact) {
             return found(model);
         }
-        let fallback = parse_model_pattern(cli_model, &all, false);
+        let fallback = parse_model_pattern(cli_model, &all, false, has_auth);
         if let Some(model) = fallback.model {
             return CliModel {
                 model: Some(model.clone()),

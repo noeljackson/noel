@@ -14,7 +14,7 @@
       "cf-aig-authorization": "Bearer <redacted>",
       "content-type": "application/json",
       "session_id": "session_ts_parity",
-      "user-agent": "pi (linux <kernel>; x64)",
+      "user-agent": "pi/1.4.0 (linux; node/v24.22.1; x64)",
       "x-client-request-id": "session_ts_parity",
       "x-session-affinity": "session_ts_parity",
       "x-stainless-arch": "x64",
@@ -23,7 +23,7 @@
       "x-stainless-package-version": "7.19.0",
       "x-stainless-retry-count": "0",
       "x-stainless-runtime": "node",
-      "x-stainless-runtime-version": "v24.21.0"
+      "x-stainless-runtime-version": "v24.22.1"
     },
     "body": {
       "model": "workers-ai/@cf/moonshotai/kimi-k2.6",

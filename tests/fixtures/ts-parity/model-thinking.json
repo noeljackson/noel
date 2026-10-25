@@ -208,7 +208,6 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
-        "off": null,
         "minimal": null,
         "low": "low",
         "medium": "medium",
@@ -218,7 +217,41 @@
       },
       "examples": [
         "anthropic/claude-haiku-5-5",
-        "anthropic/claude-opus-5-5"
+        "radius/claude-haiku-5-5"
+      ],
+      "supported": [
+        "off",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "low",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": null,
+        "minimal": null,
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max"
+      },
+      "examples": [
+        "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5"
       ],
       "supported": [
         "low",
@@ -295,7 +328,7 @@
       },
       "examples": [
         "azure/gpt-5.2",
-        "azure/gpt-5.2-chat-latest"
+        "azure/gpt-5.2-pro"
       ],
       "supported": [
         "minimal",
@@ -313,30 +346,6 @@
         "xhigh": "xhigh",
         "max": "xhigh",
         "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": false,
-      "thinkingLevelMap": {
-        "off": null,
-        "xhigh": "xhigh"
-      },
-      "examples": [
-        "azure/gpt-5.3-chat-latest",
-        "openai/gpt-5.3-chat-latest"
-      ],
-      "supported": [
-        "off"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "off",
-        "low": "off",
-        "medium": "off",
-        "high": "off",
-        "xhigh": "off",
-        "max": "off",
-        "invalid": "off"
       }
     },
     {
@@ -434,6 +443,132 @@
       "reasoning": true,
       "thinkingLevelMap": {
         "off": "none",
+        "minimal": null,
+        "low": "low",
+        "medium": null,
+        "high": "high",
+        "xhigh": null,
+        "max": "max"
+      },
+      "examples": [
+        "baseten/deepseek-ai/DeepSeek-V4-Flash-0731",
+        "baseten/deepseek-ai/DeepSeek-V4-Pro-0813"
+      ],
+      "supported": [
+        "off",
+        "low",
+        "high",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "low",
+        "low": "low",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": "none",
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": "high",
+        "xhigh": null,
+        "max": "max"
+      },
+      "examples": [
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash",
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-Fast"
+      ],
+      "supported": [
+        "off",
+        "high",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": "none",
+        "minimal": null,
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": null,
+        "max": "max"
+      },
+      "examples": [
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "baseten/deepseek-ai/DeepSeek-V4.1-Flash-1017-Fast"
+      ],
+      "supported": [
+        "off",
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "low",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": "none",
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": "high",
+        "xhigh": null,
+        "max": null
+      },
+      "examples": [
+        "baseten/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
+        "cloudflare-workers-ai/@cf/moonshotai/kimi-k2.6"
+      ],
+      "supported": [
+        "off",
+        "high"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": "none",
         "minimal": "minimal",
         "low": "low",
         "medium": "medium",
@@ -442,8 +577,8 @@
         "max": "max"
       },
       "examples": [
-        "baseten/deepseek-ai/DeepSeek-V4-Flash-0731",
-        "baseten/deepseek-ai/DeepSeek-V4-Pro"
+        "baseten/openai/gpt-oss-120b",
+        "openrouter/upstage/solar-mini4"
       ],
       "supported": [
         "off",
@@ -468,99 +603,6 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
-        "off": "none",
-        "minimal": null,
-        "low": "low",
-        "medium": null,
-        "high": "high",
-        "xhigh": null,
-        "max": "max"
-      },
-      "examples": [
-        "baseten/deepseek-ai/DeepSeek-V4-Pro-0813",
-        "baseten/deepseek-ai/DeepSeek-V4.1-Flash"
-      ],
-      "supported": [
-        "off",
-        "low",
-        "high",
-        "max"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "low",
-        "low": "low",
-        "medium": "high",
-        "high": "high",
-        "xhigh": "max",
-        "max": "max",
-        "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": "off",
-        "minimal": null,
-        "low": null,
-        "medium": null,
-        "high": "high",
-        "xhigh": null,
-        "max": null
-      },
-      "examples": [
-        "baseten/moonshotai/Kimi-K2.5",
-        "baseten/moonshotai/Kimi-K2.6"
-      ],
-      "supported": [
-        "off",
-        "high"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "high",
-        "low": "high",
-        "medium": "high",
-        "high": "high",
-        "xhigh": "high",
-        "max": "high",
-        "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": "none",
-        "minimal": null,
-        "low": null,
-        "medium": null,
-        "high": "high",
-        "xhigh": null,
-        "max": "max"
-      },
-      "examples": [
-        "baseten/zai-org/GLM-5.2",
-        "baseten/zai-org/GLM-5.2-Fast"
-      ],
-      "supported": [
-        "off",
-        "high",
-        "max"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "high",
-        "low": "high",
-        "medium": "high",
-        "high": "high",
-        "xhigh": "max",
-        "max": "max",
-        "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
         "off": null,
         "minimal": null,
         "low": "low",
@@ -571,7 +613,7 @@
       },
       "examples": [
         "baseten/zai-org/GLM-5.3",
-        "baseten/zai-org/GLM-5.3-Flash"
+        "baseten/zai-org/GLM-5.3-Fast"
       ],
       "supported": [
         "low",
@@ -779,31 +821,30 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
-        "off": "none",
+        "off": null,
         "minimal": null,
-        "low": null,
+        "low": "low",
         "medium": null,
         "high": "high",
         "xhigh": null,
         "max": null
       },
       "examples": [
-        "cloudflare-workers-ai/@cf/google/gemma-4-26b-a4b-it",
-        "cloudflare-workers-ai/@cf/moonshotai/kimi-k2.6"
+        "cloudflare-workers-ai/@cf/nvidia/nemotron-3-120b-a12b"
       ],
       "supported": [
-        "off",
+        "low",
         "high"
       ],
       "clamp": {
-        "off": "off",
-        "minimal": "high",
-        "low": "high",
+        "off": "low",
+        "minimal": "low",
+        "low": "low",
         "medium": "high",
         "high": "high",
         "xhigh": "high",
         "max": "high",
-        "invalid": "off"
+        "invalid": "low"
       }
     },
     {
@@ -847,8 +888,7 @@
         "max": "max"
       },
       "examples": [
-        "deepseek/deepseek-flash",
-        "opencode-go/deepseek-v4-flash"
+        "deepseek/deepseek-flash"
       ],
       "supported": [
         "off",
@@ -861,39 +901,6 @@
         "minimal": "low",
         "low": "low",
         "medium": "high",
-        "high": "high",
-        "xhigh": "max",
-        "max": "max",
-        "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": "none",
-        "minimal": null,
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": null,
-        "max": "max"
-      },
-      "examples": [
-        "fireworks/accounts/fireworks/models/ember-1",
-        "fireworks/accounts/fireworks/routers/kimi-fast-latest"
-      ],
-      "supported": [
-        "off",
-        "low",
-        "medium",
-        "high",
-        "max"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "low",
-        "low": "low",
-        "medium": "medium",
         "high": "high",
         "xhigh": "max",
         "max": "max",
@@ -940,8 +947,8 @@
         "minimal": "low"
       },
       "examples": [
-        "github-copilot/claude-opus-4.7",
-        "github-copilot/claude-opus-4.8"
+        "github-copilot/claude-opus-4.8",
+        "github-copilot/claude-opus-5"
       ],
       "supported": [
         "off",
@@ -999,70 +1006,11 @@
         "low": "low",
         "medium": "medium",
         "high": "high",
-        "xhigh": null,
-        "max": null
-      },
-      "examples": [
-        "github-copilot/gpt-5-mini"
-      ],
-      "supported": [
-        "minimal",
-        "low",
-        "medium",
-        "high"
-      ],
-      "clamp": {
-        "off": "minimal",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "high",
-        "max": "high",
-        "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": "low",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
         "xhigh": "xhigh",
         "max": null
       },
       "examples": [
         "github-copilot/gpt-5.3-codex",
-        "github-copilot/gpt-5.4"
-      ],
-      "supported": [
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ],
-      "clamp": {
-        "off": "minimal",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "xhigh",
-        "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": "low",
-        "xhigh": "xhigh"
-      },
-      "examples": [
         "github-copilot/gpt-5.4-nano"
       ],
       "supported": [
@@ -1405,7 +1353,7 @@
       },
       "examples": [
         "meta/muse-spark-1.3",
-        "openrouter/meta/muse-spark-1.3"
+        "meta/muse-wonder-1.0"
       ],
       "supported": [
         "minimal",
@@ -1424,64 +1372,6 @@
         "xhigh": "xhigh",
         "max": "max",
         "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": null,
-        "low": null,
-        "medium": "medium",
-        "high": null,
-        "xhigh": "xhigh",
-        "max": null
-      },
-      "examples": [
-        "openai/gpt-5.2-chat-latest"
-      ],
-      "supported": [
-        "medium",
-        "xhigh"
-      ],
-      "clamp": {
-        "off": "medium",
-        "minimal": "medium",
-        "low": "medium",
-        "medium": "medium",
-        "high": "xhigh",
-        "xhigh": "xhigh",
-        "max": "xhigh",
-        "invalid": "medium"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "xhigh": "xhigh",
-        "minimal": "low"
-      },
-      "examples": [
-        "openai-codex/gpt-5.3-codex-spark",
-        "openai-codex/gpt-5.5"
-      ],
-      "supported": [
-        "off",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "xhigh",
-        "invalid": "off"
       }
     },
     {
@@ -1522,6 +1412,64 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": "none",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": null
+      },
+      "examples": [
+        "opencode/nemotron-3.5-super-vl-free"
+      ],
+      "supported": [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "xhigh",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": null,
+        "minimal": null,
+        "low": null,
+        "medium": null
+      },
+      "examples": [
+        "opencode/grok-build-0.1"
+      ],
+      "supported": [
+        "high"
+      ],
+      "clamp": {
+        "off": "high",
+        "minimal": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high",
+        "invalid": "high"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "off": null,
         "minimal": null,
         "low": null,
@@ -1531,7 +1479,6 @@
         "max": "max"
       },
       "examples": [
-        "opencode/kimi-k3",
         "opencode-go/kimi-k3"
       ],
       "supported": [
@@ -1546,32 +1493,6 @@
         "xhigh": "max",
         "max": "max",
         "invalid": "max"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": null,
-        "low": null,
-        "medium": null
-      },
-      "examples": [
-        "opencode/grok-build-0.1",
-        "together/MiniMaxAI/MiniMax-M2.7"
-      ],
-      "supported": [
-        "high"
-      ],
-      "clamp": {
-        "off": "high",
-        "minimal": "high",
-        "low": "high",
-        "medium": "high",
-        "high": "high",
-        "xhigh": "high",
-        "max": "high",
-        "invalid": "high"
       }
     },
     {
@@ -1913,13 +1834,42 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "off": null,
         "minimal": null,
-        "low": null,
-        "medium": null
+        "low": "low",
+        "medium": null,
+        "high": null,
+        "xhigh": null,
+        "max": null
       },
       "examples": [
-        "together/deepseek-ai/DeepSeek-V4-Flash-0731",
-        "together/deepseek-ai/DeepSeek-V4.1-Flash"
+        "radius/recursive/flint"
+      ],
+      "supported": [
+        "low"
+      ],
+      "clamp": {
+        "off": "low",
+        "minimal": "low",
+        "low": "low",
+        "medium": "low",
+        "high": "low",
+        "xhigh": "low",
+        "max": "low",
+        "invalid": "low"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": "high",
+        "xhigh": null
+      },
+      "examples": [
+        "together/deepseek-ai/DeepSeek-V4-Pro-0813"
       ],
       "supported": [
         "off",
@@ -1941,12 +1891,11 @@
       "thinkingLevelMap": {
         "minimal": null,
         "low": null,
-        "medium": null,
-        "high": "high",
-        "xhigh": null
+        "medium": null
       },
       "examples": [
-        "together/deepseek-ai/DeepSeek-V4-Pro-0813"
+        "together/deepseek-ai/DeepSeek-V4.1-Flash",
+        "together/meta-models/Muse-Spark-Open-816B-A42B"
       ],
       "supported": [
         "off",
@@ -1988,6 +1937,36 @@
         "xhigh": "xhigh",
         "max": "xhigh",
         "invalid": "medium"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": "off",
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": "high",
+        "xhigh": null,
+        "max": null
+      },
+      "examples": [
+        "xiaomi/mimo-v2.6-flash",
+        "xiaomi/mimo-v2.6-pro"
+      ],
+      "supported": [
+        "off",
+        "high"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "high",
+        "max": "high",
+        "invalid": "off"
       }
     }
   ]

@@ -19,7 +19,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
     "error-classification.json",
-    "github-copilot-gpt-5.4.json",
+    "github-copilot-gpt-6.1-sol.json",
     "google-gemini-2.5-pro.json",
     "google-tool-image-routing.json",
     "google-tools.json",
@@ -173,7 +173,7 @@ fn every_script_output_is_committed() {
         ),
         (
             "copilot-fixture.ts",
-            fixture_set(&["github-copilot-gpt-5.4.json"]),
+            fixture_set(&["github-copilot-gpt-6.1-sol.json"]),
         ),
         (
             "error-classification-fixture.ts",
@@ -334,7 +334,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "crates/noel-ai/src/lib.rs",
         ),
         ("error-classification.json", "crates/noel-ai/src/lib.rs"),
-        ("github-copilot-gpt-5.4.json", "crates/noel-ai/src/lib.rs"),
+        (
+            "github-copilot-gpt-6.1-sol.json",
+            "crates/noel-ai/src/lib.rs",
+        ),
         ("google-gemini-2.5-pro.json", "crates/noel-ai/src/lib.rs"),
         (
             "google-tool-image-routing.json",

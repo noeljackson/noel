@@ -17,10 +17,10 @@
       "content-type": "application/json",
       "openai-beta": "responses=experimental",
       "originator": "pi",
-      "user-agent": "pi (linux <kernel>; x64)"
+      "user-agent": "pi/1.4.0 (linux; node/v24.22.1; x64)"
     },
     "body": {
-      "model": "gpt-5.5",
+      "model": "gpt-6.1-sol",
       "store": false,
       "stream": true,
       "instructions": "pi rust cli",

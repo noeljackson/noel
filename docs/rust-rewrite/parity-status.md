@@ -58,7 +58,7 @@ The committed TypeScript parity fixtures are:
   `isContextOverflow`, and both verdicts for 124 error messages (HTTP
   statuses and bodies as noel words them, the overflow errors of each provider,
   transport failures, and quota and billing limits).
-- `github-copilot-gpt-5.4.json`: GitHub Copilot Responses request shape.
+- `github-copilot-gpt-6.1-sol.json`: GitHub Copilot Responses request shape.
 - `google-gemini-2.5-pro.json`: Gemini request shape and thinking config.
 - `google-tool-image-routing.json`: Gemini 2 versus Gemini 3 tool-result
   image routing.

@@ -76,7 +76,7 @@ async function captureCodexOAuthRequest(): Promise<CapturedRequest> {
 			import("/ts-reference/packages/ai/src/api/openai-codex-responses.ts"),
 			import("/ts-reference/packages/ai/src/utils/transcript.ts"),
 		]);
-		const model = getModel("openai-codex", "gpt-5.5");
+		const model = getModel("openai-codex", "gpt-6.1-sol");
 		const response = stream(
 			model,
 			// The API-level stream takes a transcript: fold the system prompt into
