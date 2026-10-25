@@ -334,6 +334,35 @@ fn scenario(name: &str) -> Value {
 /// Where upstream's stub held a response while a command arrived, `script`
 /// holds it with [`held_until`] that command's index: the release is written
 /// once the command's response arrived.
+/// Appends the stub's final usage (10/5 tokens) to every script response
+/// that does not already carry one, as upstream's stub does for every reply
+/// it finishes.
+fn stub_usage(script: Value) -> Value {
+    match script {
+        Value::Array(responses) => Value::Array(
+            responses
+                .into_iter()
+                .map(|response| match response {
+                    Value::Array(steps)
+                        if !steps.iter().any(|step| step.get("usage").is_some()) =>
+                    {
+                        Value::Array(
+                            steps
+                                .into_iter()
+                                .chain(std::iter::once(json!({
+                                    "usage": {"input": 10, "output": 5}
+                                })))
+                                .collect(),
+                        )
+                    }
+                    other => other,
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn golden(name: &str, script: Value) {
     let requests = golden_records(name, script);
     assert_eq!(
@@ -362,6 +391,11 @@ fn golden_records(name: &str, script: Value) -> Vec<Value> {
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     // The scenario's settings are noel's too: `retry` and `compaction`.
     let settings = scenario.get("settings").cloned().unwrap_or(json!({}));
+    // Upstream's stub sends its usage with the final chunk of every reply
+    // it finishes (10/5 tokens); a reply held or dropped mid-stream never
+    // gets one. The faux script mirrors that: a response without its own
+    // usage step gains one, which a hold or drop before it leaves unsent.
+    let script = stub_usage(script);
     let mut noel = Noel::spawn(root, script, &args, settings);
 
     for (index, command) in scenario["commands"].as_array().unwrap().iter().enumerate() {

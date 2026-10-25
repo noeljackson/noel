@@ -839,14 +839,26 @@ struct Cost {
     cache_read: u64,
     cache_write: u64,
     total: u64,
+    /// Whether `total` is a provider-reported billed cost. Present exactly
+    /// when the usage went through cost accounting (upstream's
+    /// `calculateCost` sets it false); a reply cut off before the final
+    /// usage chunk never has one, and the field stays absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_from_provider: Option<bool>,
 }
 
 impl Usage {
+    /// Usage the provider reported with its final accounting: cost ran, so
+    /// `total` is a computed total and the field says so.
     fn new(input: u64, output: u64) -> Self {
         Self {
             input,
             output,
             total_tokens: input.saturating_add(output),
+            cost: Cost {
+                total_from_provider: Some(false),
+                ..Cost::default()
+            },
             ..Self::default()
         }
     }
@@ -1546,17 +1558,29 @@ impl Streaming {
         self.update(block.delta(index, delta), sink);
     }
 
-    /// Ends the block taking deltas with its whole text.
+    /// Ends the block taking deltas with its whole text. A tool call
+    /// ends here too: upstream's streaming parser ends a tool call with
+    /// the reply's finish, after the final usage chunk, so its
+    /// `toolcall_end` carries the accounted usage.
     fn close(&mut self, sink: Sink) {
         let Some(index) = self.open.take() else {
             return;
         };
         if let Some((block, text)) = self.assistant.content[index].streamed() {
             self.update(block.end(index, text), sink);
+        } else if let Content::ToolCall { .. } = &self.assistant.content[index] {
+            self.update(
+                AssistantEvent::ToolcallEnd {
+                    content_index: index,
+                    tool_call: &self.assistant.content[index],
+                },
+                sink,
+            );
         }
     }
 
-    /// Tool calls arrive whole: their start, their arguments, their end.
+    /// Tool calls arrive whole: their start and their arguments; their end
+    /// comes with the reply's finish, like a text block's.
     fn tool_call(&mut self, id: &str, name: &str, arguments: &str, sink: Sink) {
         self.close(sink);
         let index = self.assistant.content.len();
@@ -1580,13 +1604,8 @@ impl Streaming {
             },
             sink,
         );
-        self.update(
-            AssistantEvent::ToolcallEnd {
-                content_index: index,
-                tool_call: &self.assistant.content[index],
-            },
-            sink,
-        );
+        // The call stays open: `close` ends it with the reply's finish.
+        self.open = Some(index);
     }
 }
 

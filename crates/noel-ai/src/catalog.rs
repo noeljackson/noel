@@ -148,6 +148,12 @@ pub struct CatalogModel {
     pub context_window: u64,
     /// The most output tokens one reply may have.
     pub max_tokens: u64,
+    /// `compat.supportsMidConvoSystemMessages`: the model reads system
+    /// messages mid-conversation, so tools can be declared in place.
+    pub supports_mid_convo_system_messages: bool,
+    /// `compat.supportsAdditionalTools`: the Responses API's
+    /// `additional_tools` input item declares tools in place.
+    pub supports_additional_tools: bool,
 }
 
 impl CatalogModel {
@@ -175,6 +181,18 @@ struct ModelRecord {
     cost: ModelCost,
     context_window: u64,
     max_tokens: u64,
+    #[serde(default)]
+    compat: Option<CompatRecord>,
+}
+
+/// The `compat` fields noel reads; upstream's others stay in the file.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CompatRecord {
+    #[serde(default)]
+    supports_mid_convo_system_messages: Option<bool>,
+    #[serde(default)]
+    supports_additional_tools: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +268,16 @@ fn load(catalog: &mut Catalog, text: &str, name: &str) -> Vec<(String, String)> 
                     cost: model.cost,
                     context_window: model.context_window,
                     max_tokens: model.max_tokens,
+                    supports_mid_convo_system_messages: model
+                        .compat
+                        .as_ref()
+                        .and_then(|compat| compat.supports_mid_convo_system_messages)
+                        .unwrap_or(false),
+                    supports_additional_tools: model
+                        .compat
+                        .as_ref()
+                        .and_then(|compat| compat.supports_additional_tools)
+                        .unwrap_or(false),
                 })
             }));
         if catalog.models.len() > before {
@@ -314,6 +342,12 @@ pub struct ModelTraits {
     /// The model's catalog `input` modalities (`text`, `image`); `None`
     /// when the model is not in the catalog and the answer is unknown.
     pub input_modalities: Option<Vec<String>>,
+    /// `compat.supportsMidConvoSystemMessages` (see [`CatalogModel`]);
+    /// `None` outside the catalog.
+    pub supports_mid_convo_system_messages: Option<bool>,
+    /// `compat.supportsAdditionalTools` (see [`CatalogModel`]); `None`
+    /// outside the catalog.
+    pub supports_additional_tools: Option<bool>,
 }
 
 impl ModelTraits {
@@ -334,6 +368,8 @@ impl From<&CatalogModel> for ModelTraits {
             reasoning: Some(model.reasoning),
             thinking_level_map: model.thinking_level_map.clone(),
             input_modalities: Some(model.input.clone()),
+            supports_mid_convo_system_messages: Some(model.supports_mid_convo_system_messages),
+            supports_additional_tools: Some(model.supports_additional_tools),
         }
     }
 }

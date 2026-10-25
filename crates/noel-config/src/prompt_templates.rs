@@ -163,20 +163,30 @@ pub fn parse_command_args(input: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut quote = None;
+    // Whether a token has started, so a quoted empty string (`""` or
+    // `''`) stays an argument (upstream `hasToken`).
+    let mut has_token = false;
     for ch in input.chars() {
         match quote {
             Some(open) if ch == open => quote = None,
             Some(_) => current.push(ch),
-            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == '"' || ch == '\'' => {
+                quote = Some(ch);
+                has_token = true;
+            }
             None if is_js_whitespace(ch) => {
-                if !current.is_empty() {
+                if has_token {
                     args.push(std::mem::take(&mut current));
+                    has_token = false;
                 }
             }
-            None => current.push(ch),
+            None => {
+                current.push(ch);
+                has_token = true;
+            }
         }
     }
-    if !current.is_empty() {
+    if has_token {
         args.push(current);
     }
     args

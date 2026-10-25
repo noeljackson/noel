@@ -344,7 +344,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -378,7 +379,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -414,7 +416,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -512,7 +515,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -819,7 +823,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -864,7 +869,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "toolUse",
@@ -962,7 +968,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "toolUse",
@@ -1075,7 +1082,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -1109,7 +1117,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -1145,7 +1154,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -1247,7 +1257,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "toolUse",
@@ -1294,7 +1305,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -1618,7 +1630,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -1652,7 +1665,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -1688,7 +1702,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -1817,7 +1832,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -1851,7 +1867,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -1887,7 +1904,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -1985,7 +2003,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -2028,7 +2047,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -2349,7 +2369,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -2383,7 +2404,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -2419,7 +2441,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -2548,7 +2571,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -2582,7 +2606,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -2618,7 +2643,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -2716,7 +2742,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -2759,7 +2786,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -3981,7 +4009,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -4015,7 +4044,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -4051,7 +4081,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -4180,7 +4211,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -4214,7 +4246,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -4250,7 +4283,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -4308,7 +4342,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -4351,7 +4386,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -4780,7 +4816,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -4814,7 +4851,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -4850,7 +4888,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -4981,7 +5020,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -5015,7 +5055,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -5051,7 +5092,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -5180,7 +5222,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -5214,7 +5257,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -5250,7 +5294,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -5348,7 +5393,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -5391,7 +5437,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -5434,7 +5481,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -5864,7 +5912,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -5898,7 +5947,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -5934,7 +5984,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -6032,7 +6083,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -6139,7 +6191,8 @@
                     "output": "<cost>",
                     "cacheRead": "<cost>",
                     "cacheWrite": "<cost>",
-                    "total": "<cost>"
+                    "total": "<cost>",
+                    "totalFromProvider": "<cost>"
                   }
                 },
                 "stopReason": "stop",
@@ -6588,7 +6641,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -6622,7 +6676,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -6658,7 +6713,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -6756,7 +6812,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -7397,7 +7454,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -7431,7 +7489,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -7472,7 +7531,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -7510,7 +7570,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -10185,7 +10246,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -10219,7 +10281,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -10260,7 +10323,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -10298,7 +10362,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -10441,7 +10506,8 @@
                     "output": "<cost>",
                     "cacheRead": "<cost>",
                     "cacheWrite": "<cost>",
-                    "total": "<cost>"
+                    "total": "<cost>",
+                    "totalFromProvider": "<cost>"
                   }
                 },
                 "stopReason": "stop",
@@ -10747,7 +10813,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -10781,7 +10848,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -10817,7 +10885,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -10915,7 +10984,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -11056,7 +11126,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -11090,7 +11161,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -11126,7 +11198,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -11174,7 +11247,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -11397,7 +11471,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "details": {
@@ -11497,7 +11572,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -11531,7 +11607,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -11567,7 +11644,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -11605,7 +11683,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -11956,7 +12035,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -11990,7 +12070,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "length",
@@ -12026,7 +12107,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "length",
@@ -12124,7 +12206,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "length",
@@ -12276,7 +12359,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -12310,7 +12394,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -12346,7 +12431,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -12394,7 +12480,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -12711,7 +12798,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -12756,7 +12844,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "length",
@@ -12853,7 +12942,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "length",
@@ -12966,7 +13056,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -13000,7 +13091,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -13036,7 +13128,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -13138,7 +13231,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "length",
@@ -13185,7 +13279,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",
@@ -13509,7 +13604,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -13554,7 +13650,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "toolUse",
@@ -13702,7 +13799,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "toolUse",
@@ -13815,7 +13913,8 @@
               "output": "<cost>",
               "cacheRead": "<cost>",
               "cacheWrite": "<cost>",
-              "total": "<cost>"
+              "total": "<cost>",
+              "totalFromProvider": "<cost>"
             }
           },
           "assistantMessageEvent": {
@@ -13849,7 +13948,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -13885,7 +13985,8 @@
                 "output": "<cost>",
                 "cacheRead": "<cost>",
                 "cacheWrite": "<cost>",
-                "total": "<cost>"
+                "total": "<cost>",
+                "totalFromProvider": "<cost>"
               }
             },
             "stopReason": "stop",
@@ -13987,7 +14088,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "toolUse",
@@ -14034,7 +14136,8 @@
                   "output": "<cost>",
                   "cacheRead": "<cost>",
                   "cacheWrite": "<cost>",
-                  "total": "<cost>"
+                  "total": "<cost>",
+                  "totalFromProvider": "<cost>"
                 }
               },
               "stopReason": "stop",

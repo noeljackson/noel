@@ -17,24 +17,24 @@
       "model is at capacity",
       "rate.?limit",
       "too many requests",
-      "429",
-      "500",
-      "502",
-      "503",
-      "504",
-      "520",
-      "524",
-      "service.?unavailable",
+      "(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])",
+      "service.?(?:is.?)?(?:temporarily.?)?unavailable",
       "server.?error",
       "internal.?error",
-      "provider.?returned.?error",
+      "provider.?returned.?(?:an.?)?error",
       "exceeded request buffer limit while retrying upstream",
+      "unable to forward upstream",
+      "upstream.?request.?failed",
+      "upstream_stream_read_error",
+      "stream was interrupted",
+      "http/?2 stream failed",
       "network.?error",
       "connection.?error",
       "connection.?refused",
       "connection.?lost",
       "other side closed",
       "fetch failed",
+      "request to \\S+ failed, reason:",
       "getaddrinfo",
       "ENOTFOUND",
       "EAI_AGAIN",
@@ -51,6 +51,7 @@
       "stream ended before message_stop",
       "stream ended before a terminal response event",
       "http2 request did not get a response",
+      "stream disconnected before completion",
       "pending stream has been canceled",
       "retry delay",
       "you can retry your request",
@@ -69,7 +70,8 @@
       "out of budget",
       "quota exceeded",
       "billing",
-      "subscription_sharing_usage_limit_exceeded"
+      "subscription_sharing_usage_limit_exceeded",
+      "subscription_sharing_workplace_individual_usage_limit_exceeded"
     ],
     "overflow": [
       "prompt (?:is )?too long",
@@ -96,7 +98,8 @@
       "range of input length should be",
       "context[_ ]length[_ ]exceeded",
       "too many tokens",
-      "token limit exceeded"
+      "token limit exceeded",
+      "^(?:[\\w -]+ API error \\(413\\):|413(?:\\s|:|$))"
     ],
     "nonOverflow": [
       "^(Throttling error|Service unavailable):",
@@ -322,7 +325,7 @@
     },
     {
       "message": "This endpoint's maximum context length is 200000 tokens. However, you requested about 250000 tokens",
-      "retryable": true,
+      "retryable": false,
       "overflow": true
     },
     {
@@ -347,7 +350,7 @@
     },
     {
       "message": "prompt token count of 150000 exceeds the limit of 128000",
-      "retryable": true,
+      "retryable": false,
       "overflow": true
     },
     {

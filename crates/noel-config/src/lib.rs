@@ -1367,6 +1367,10 @@ impl ModelDefinition {
             reasoning: Some(self.reasoning()),
             thinking_level_map: self.thinking_level_map.clone(),
             input_modalities: self.input.clone(),
+            // A model outside the catalog has no compat flags: its Responses
+            // requests keep tools in the top-level field.
+            supports_mid_convo_system_messages: None,
+            supports_additional_tools: None,
         }
     }
 }
@@ -3658,17 +3662,20 @@ mod tests {
         fs::write(package_dir.join("prompts/other.md"), "other prompt").expect("write prompt");
         fs::write(package_dir.join("themes/dark.json"), r#"{"name":"dark"}"#).expect("write theme");
 
-        let config = load_config(ConfigPaths {
-            cwd: cwd.clone(),
-            agent_dir: agent_dir.clone(),
-            session_dir: agent_dir.join("sessions"),
-            settings_path: agent_dir.join("settings.json"),
-            project_settings_path: cwd.join(".noel/settings.json"),
-            auth_path: root.join("missing-auth.json"),
-            models_path: root.join("missing-models.json"),
-            model_cache_path: root.join("missing-model-cache.json"),
-            keybindings_path: root.join("missing-keybindings.json"),
-        })
+        let config = load_config_hermetic(
+            ConfigPaths {
+                cwd: cwd.clone(),
+                agent_dir: agent_dir.clone(),
+                session_dir: agent_dir.join("sessions"),
+                settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".noel/settings.json"),
+                auth_path: root.join("missing-auth.json"),
+                models_path: root.join("missing-models.json"),
+                model_cache_path: root.join("missing-model-cache.json"),
+                keybindings_path: root.join("missing-keybindings.json"),
+            },
+            true,
+        )
         .expect("load config");
 
         assert!(config
@@ -3726,17 +3733,20 @@ mod tests {
         )
         .expect("write ignored root markdown");
 
-        let config = load_config(ConfigPaths {
-            cwd: cwd.clone(),
-            agent_dir: agent_dir.clone(),
-            session_dir: agent_dir.join("sessions"),
-            settings_path: agent_dir.join("settings.json"),
-            project_settings_path: cwd.join(".noel/settings.json"),
-            auth_path: root.join("missing-auth.json"),
-            models_path: root.join("missing-models.json"),
-            model_cache_path: root.join("missing-model-cache.json"),
-            keybindings_path: root.join("missing-keybindings.json"),
-        })
+        let config = load_config_hermetic(
+            ConfigPaths {
+                cwd: cwd.clone(),
+                agent_dir: agent_dir.clone(),
+                session_dir: agent_dir.join("sessions"),
+                settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".noel/settings.json"),
+                auth_path: root.join("missing-auth.json"),
+                models_path: root.join("missing-models.json"),
+                model_cache_path: root.join("missing-model-cache.json"),
+                keybindings_path: root.join("missing-keybindings.json"),
+            },
+            true,
+        )
         .expect("load config");
 
         // Nearest first; a Markdown file directly in .agents/skills is no skill.
@@ -3775,7 +3785,7 @@ mod tests {
         )
         .expect("write repo skill");
 
-        let config = load_config_with_project_trust(
+        let config = load_config_hermetic(
             ConfigPaths {
                 cwd: cwd.clone(),
                 agent_dir: agent_dir.clone(),
@@ -6118,6 +6128,23 @@ mod tests {
 
     fn test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{name}-{}-{}", std::process::id(), unique_suffix()))
+    }
+
+    /// `load_config` with neither the developer's `~/.agents/skills` nor
+    /// the environment's resource flags: a test's config is its temp tree
+    /// alone, whatever the machine running it has at home.
+    fn load_config_hermetic(
+        paths: ConfigPaths,
+        project_trusted: bool,
+    ) -> Result<LoadedConfig, ConfigError> {
+        load_config_with_resources(
+            paths,
+            project_trusted,
+            &ResourceOptions {
+                home_dir: None,
+                ..ResourceOptions::default()
+            },
+        )
     }
 
     fn unique_suffix() -> u128 {

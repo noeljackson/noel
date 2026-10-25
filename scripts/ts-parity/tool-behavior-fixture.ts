@@ -55,7 +55,7 @@ const NORMALIZATIONS = {
 	digest:
 		"A text longer than 2000 characters is recorded as {bytes, lines, sha256, head, tail}, with head and tail its first and last 200 characters.",
 	"ripgrep-order":
-		"ripgrep searches files in no fixed order, so the fixture runs it with --sort=path (through RIPGREP_CONFIG_PATH).",
+		"ripgrep searches files in no fixed order; upstream's grep passes --no-config, which ignores RIPGREP_CONFIG_PATH, so multi-file grep calls normalize with sorted-lines instead.",
 };
 
 const series = (count: number, prefix: string, pad: number, suffix: string): Series => ({ count, prefix, pad, suffix });
@@ -189,8 +189,8 @@ const CALLS: Call[] = [
 	},
 
 	// grep
-	{ name: "grep-respects-gitignore-and-searches-hidden-files", cwd: "repo", tool: "grep", args: { pattern: "needle" } },
-	{ name: "grep-in-directory", cwd: "repo", tool: "grep", args: { pattern: "needle", path: "src" } },
+	{ name: "grep-respects-gitignore-and-searches-hidden-files", cwd: "repo", tool: "grep", args: { pattern: "needle" }, normalize: "sorted-lines" },
+	{ name: "grep-in-directory", cwd: "repo", tool: "grep", args: { pattern: "needle", path: "src" }, normalize: "sorted-lines" },
 	{ name: "grep-in-file", cwd: "repo", tool: "grep", args: { pattern: "needle", path: "src/alpha.ts" } },
 	{
 		name: "grep-ignore-case",
@@ -198,12 +198,12 @@ const CALLS: Call[] = [
 		tool: "grep",
 		args: { pattern: "needle", path: "src/alpha.ts", ignoreCase: true },
 	},
-	{ name: "grep-regex", cwd: "repo", tool: "grep", args: { pattern: "^const \\w+ = \\d;$", path: "src" } },
+	{ name: "grep-regex", cwd: "repo", tool: "grep", args: { pattern: "^const \\w+ = \\d;$", path: "src" }, normalize: "sorted-lines" },
 	{ name: "grep-literal", cwd: "repo", tool: "grep", args: { pattern: '{"needle"', path: "src", literal: true } },
-	{ name: "grep-glob", cwd: "repo", tool: "grep", args: { pattern: "needle", glob: "*.ts" } },
-	{ name: "grep-glob-with-directory", cwd: "repo", tool: "grep", args: { pattern: "needle", glob: "src/*.ts" } },
-	{ name: "grep-glob-overrides-gitignore", cwd: "repo", tool: "grep", args: { pattern: "needle", glob: "*.txt" } },
-	{ name: "grep-negated-glob", cwd: "repo", tool: "grep", args: { pattern: "needle", glob: "!*.ts" } },
+	{ name: "grep-glob", cwd: "repo", tool: "grep", args: { pattern: "needle", glob: "*.ts" }, normalize: "sorted-lines" },
+	{ name: "grep-glob-with-directory", cwd: "repo", tool: "grep", args: { pattern: "needle", glob: "src/*.ts" }, normalize: "sorted-lines" },
+	{ name: "grep-glob-overrides-gitignore", cwd: "repo", tool: "grep", args: { pattern: "needle", glob: "*.txt" }, normalize: "sorted-lines" },
+	{ name: "grep-negated-glob", cwd: "repo", tool: "grep", args: { pattern: "needle", glob: "!*.ts" }, normalize: "sorted-lines" },
 	{
 		name: "grep-context",
 		cwd: "repo",
@@ -219,7 +219,7 @@ const CALLS: Call[] = [
 	{ name: "grep-crlf-file", cwd: "repo", tool: "grep", args: { pattern: "needle", path: "crlf.txt" } },
 	{ name: "grep-no-matches", cwd: "repo", tool: "grep", args: { pattern: "absent-pattern" } },
 	{ name: "grep-path-not-found", cwd: "repo", tool: "grep", args: { pattern: "needle", path: "missing" } },
-	{ name: "grep-outside-git-ignores-gitignore", cwd: "plain", tool: "grep", args: { pattern: "needle" } },
+	{ name: "grep-outside-git-ignores-gitignore", cwd: "plain", tool: "grep", args: { pattern: "needle" }, normalize: "sorted-lines" },
 	{ name: "grep-default-limit", cwd: "files", tool: "grep", args: { pattern: "needle", path: "many.txt" } },
 	{ name: "grep-limit", cwd: "files", tool: "grep", args: { pattern: "needle", path: "many.txt", limit: 3 } },
 	{
@@ -459,10 +459,6 @@ async function main() {
 			await mkdir(join(tmp, root), { recursive: true });
 			for (const entry of entries) await writeEntry(join(tmp, root), entry);
 		}
-		const ripgrepConfig = join(tmp, "ripgreprc");
-		await writeFile(ripgrepConfig, "--sort=path\n");
-		process.env.RIPGREP_CONFIG_PATH = ripgrepConfig;
-
 		const calls = [];
 		for (const call of CALLS) calls.push(await runCall(tmp, call));
 		process.chdir(tmpdir());

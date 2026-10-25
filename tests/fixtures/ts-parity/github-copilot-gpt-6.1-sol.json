@@ -25,10 +25,10 @@
       "x-stainless-package-version": "7.19.0",
       "x-stainless-retry-count": "0",
       "x-stainless-runtime": "node",
-      "x-stainless-runtime-version": "v24.21.0"
+      "x-stainless-runtime-version": "v24.22.1"
     },
     "body": {
-      "model": "gpt-5.4",
+      "model": "gpt-6.1-sol",
       "input": [
         {
           "role": "developer",
