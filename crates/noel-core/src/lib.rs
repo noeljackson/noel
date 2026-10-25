@@ -2,6 +2,7 @@ mod compaction;
 pub mod controller;
 #[cfg(test)]
 mod controller_tests;
+pub mod extensions;
 mod input;
 mod progress;
 #[cfg(test)]
@@ -709,6 +710,9 @@ pub struct ReloadableSystems {
     pub available_tool_names: BTreeSet<String>,
     pub tool_scope_configured: bool,
     pub extension_tools: BTreeMap<String, ExtensionTool>,
+    /// The loaded extension files, for the v2 persistent hosts: which
+    /// extensions exist this generation and where their programs are.
+    pub extension_files: Vec<noel_config::ResourceFile>,
     pub keybinding_generation: u64,
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
@@ -743,6 +747,7 @@ impl Default for ReloadableSystems {
             available_tool_names: BTreeSet::new(),
             tool_scope_configured: false,
             extension_tools: BTreeMap::new(),
+            extension_files: Vec::new(),
             keybinding_generation: 0,
             shell_path: None,
             shell_command_prefix: None,
@@ -929,6 +934,7 @@ impl ReloadableSystems {
             available_tool_names,
             tool_scope_configured: true,
             extension_tools,
+            extension_files: config.extensions.clone(),
             keybinding_generation: generation,
             shell_path: config.settings.shell_path.clone(),
             shell_command_prefix: config.settings.shell_command_prefix.clone(),
@@ -2744,7 +2750,7 @@ impl std::fmt::Debug for EnvProvider {
 /// goes on without them; it tries again at the next run.
 const WORKSPACE_CONTEXT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Runtime {
     session: SessionState,
     systems: ReloadableSystems,
@@ -2759,6 +2765,20 @@ pub struct Runtime {
     /// Whether a remote workspace's project context files are read
     /// (`--no-context-files` turns it off).
     workspace_context_enabled: bool,
+    /// The persistent JSON-protocol v2 extension hosts and their
+    /// registrations. Durable session state stays plain data; the hosts
+    /// are processes, owned here and dropped with the runtime.
+    extension_hosts: Arc<tokio::sync::Mutex<extensions::ExtensionHosts>>,
+}
+
+impl std::fmt::Debug for Runtime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Runtime")
+            .field("session", &self.session)
+            .field("systems", &self.systems)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Runtime {
@@ -2771,6 +2791,7 @@ impl Runtime {
             env_provider: EnvProvider::default(),
             workspace_context: None,
             workspace_context_enabled: true,
+            extension_hosts: Arc::new(tokio::sync::Mutex::new(extensions::ExtensionHosts::new())),
         }
     }
 
@@ -2866,6 +2887,69 @@ impl Runtime {
         &self.systems
     }
 
+    /// The persistent extension hosts: the v2 extensions of the loaded
+    /// extension set, started on first use, with the registrations their
+    /// handshakes produced overlaid on the manifest tools.
+    pub fn extension_hosts(&self) -> Arc<tokio::sync::Mutex<extensions::ExtensionHosts>> {
+        Arc::clone(&self.extension_hosts)
+    }
+
+    /// Start the v2 hosts of the loaded extensions that have none yet.
+    /// Idempotent: hosts already running keep their state. Returns the
+    /// diagnostics of extensions that failed to start; their tools then
+    /// fail closed when called.
+    pub async fn start_extension_hosts(&mut self) -> Vec<String> {
+        let cwd = self.session.cwd.clone();
+        let session_id = self.session.session_id.clone();
+        let mut hosts = self.extension_hosts.lock().await;
+        let mut diagnostics = Vec::new();
+        // The extension files of this generation, v2 ones first so a tool
+        // name a v2 and a v1 extension both claim goes to the v2 host.
+        let mut started = Vec::new();
+        for extension in &self.systems.extension_files {
+            if extensions::manifest_protocol_version(&extension.path) != Some(2) {
+                continue;
+            }
+            started.push(extension.name.clone());
+            if hosts.host_running(&extension.name) {
+                continue;
+            }
+            if let Err(error) = hosts
+                .start(&extension.name, &extension.path, &cwd, &session_id)
+                .await
+            {
+                diagnostics.push(error);
+            }
+        }
+        // A reload may have removed a v2 extension: stop its host so its
+        // tools stop being offered.
+        hosts.retain_extensions(&started);
+        // Overlay the live registrations on the manifest tools the run
+        // presents to the model and the prompt.
+        overlay_live_registrations(&mut self.systems, &hosts);
+        diagnostics
+    }
+
+    /// Refresh the overlay of live v2 registrations on the reloadable
+    /// systems after a host response changed them.
+    pub async fn refresh_extension_registrations(&mut self) {
+        let hosts = self.extension_hosts.lock().await;
+        overlay_live_registrations(&mut self.systems, &hosts);
+    }
+
+    /// Adopt a registration change a host response carried: the host
+    /// registry takes the set, and the overlay the run presents follows.
+    pub async fn apply_extension_registrations(
+        &mut self,
+        set: extensions::ExtensionRegistrationSet,
+    ) {
+        {
+            let owned = self.extension_hosts();
+            let mut hosts = owned.lock().await;
+            hosts.apply_registrations(set);
+        }
+        self.refresh_extension_registrations().await;
+    }
     pub fn store(&self) -> Option<&SessionStore> {
         self.store.as_ref()
     }
@@ -3719,6 +3803,12 @@ async fn run_model_turn_streaming_events(
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     runtime.load_workspace_context(run).await?;
+    // The v2 hosts start with the run that first needs them, so their
+    // handshakes' registrations reach the prompt and the provider request
+    // of this turn (upstream loads its extensions at startup; noel's are
+    // processes, started when they can affect something). A host that
+    // cannot start stays fail-closed: its tool calls report the failure.
+    runtime.start_extension_hosts().await;
     let system_prompt = runtime_system_prompt(runtime);
     runtime.thinking_level = provider.thinking_level();
     let mut final_text = String::new();
@@ -3873,6 +3963,14 @@ async fn run_model_turn_streaming_events(
             // A steering message that arrived while the final response was
             // streaming keeps the turn going instead of being dropped.
             let Some((message, placed)) = steering_message(&run.steering) else {
+                // The turn settled: the v2 hosts hear it (upstream's
+                // `agent_settled`, notification work after the run).
+                {
+                    let cwd = runtime.session.cwd.clone();
+                    let hosts = runtime.extension_hosts();
+                    let mut hosts = hosts.lock().await;
+                    let _ = hosts.notify("agentSettled", &cwd).await;
+                }
                 return Ok(final_text);
             };
             on_event(&TurnEvent::RoundStarted);
@@ -4044,6 +4142,40 @@ async fn run_tool_call(
     let result = if truncated {
         fail_truncated_tool_call(runtime, &tool_call)
     } else {
+        // The `toolCall` gate of any gate-registered v2 extension runs
+        // first, fail closed: a blocked call never runs and its reason is
+        // the model's error result (upstream's permission gates).
+        if !truncated {
+            let gate = {
+                let hosts = runtime.extension_hosts();
+                let mut hosts = hosts.lock().await;
+                hosts
+                    .gate_tool_call(&tool_call.name, &tool_call.arguments, &runtime.session.cwd)
+                    .await
+            };
+            if let Ok(decision) = &gate {
+                if !decision.allow {
+                    runtime.push_tool_result(
+                        &tool_call,
+                        decision.reason.clone(),
+                        Vec::new(),
+                        true,
+                    )?;
+                    on_event(&TurnEvent::ToolOutput {
+                        call: tool_call.clone(),
+                        output: decision.reason.clone(),
+                        images: Vec::new(),
+                        is_error: true,
+                        duration: Some(started.elapsed()),
+                    });
+                    on_event(&TurnEvent::ToolFinished {
+                        name: tool_call.name.clone(),
+                        is_error: true,
+                    });
+                    return Ok(());
+                }
+            }
+        }
         // What the call prints, saved as it goes (spec §4.2).
         let progress = Mutex::new(ToolProgress::new(
             runtime.store.clone(),
@@ -4751,6 +4883,51 @@ struct ExtensionCommandResponse {
     error: Option<String>,
 }
 
+/// Overlay the live v2 registrations on the manifest tools the run
+/// presents: a live registration replaces the manifest entry of its name
+/// (the handshake's word wins over the manifest's), and a v2 extension's
+/// manifest tools that the handshake did not keep are withdrawn — the
+/// handshake response is the extension's whole registration set, like
+/// upstream's factory: what it does not register does not run.
+fn overlay_live_registrations(systems: &mut ReloadableSystems, hosts: &extensions::ExtensionHosts) {
+    let sets = hosts.registration_sets();
+    if sets.is_empty() {
+        return;
+    }
+    let v2_extensions: BTreeSet<String> =
+        sets.iter().map(|set| set.extension_name.clone()).collect();
+    // Withdraw the manifest tools of v2 extensions that answered.
+    systems
+        .extension_tools
+        .retain(|_, tool| !v2_extensions.contains(&tool.extension_name));
+    for set in sets {
+        for registration in set.tools {
+            systems.extension_tools.insert(
+                registration.name.clone(),
+                ExtensionTool {
+                    name: registration.name.clone(),
+                    description: if registration.description.is_empty() {
+                        format!("Run extension tool {}.", registration.name)
+                    } else {
+                        registration.description.clone()
+                    },
+                    parameters: registration.parameters.clone(),
+                    extension_name: set.extension_name.clone(),
+                    extension_path: PathBuf::new(),
+                    protocol: "2".to_string(),
+                    replay_safe: registration.replay_safe,
+                    prompt_snippet: system_prompt::normalize_snippet(
+                        registration.prompt_snippet.as_deref(),
+                    ),
+                    prompt_guidelines: system_prompt::normalize_guidelines(
+                        &registration.prompt_guidelines,
+                    ),
+                },
+            );
+        }
+    }
+}
+
 fn extension_tools_from_resources(extensions: &[ResourceFile]) -> BTreeMap<String, ExtensionTool> {
     let mut tools = BTreeMap::new();
     for extension in extensions {
@@ -4802,7 +4979,7 @@ fn read_extension_manifest(path: &Path) -> Option<ExtensionManifest> {
     })
 }
 
-fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
+pub(crate) fn extension_manifest_paths(path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(file_name) = path.file_name() {
         paths.push(path.with_file_name(format!(
@@ -4892,14 +5069,50 @@ async fn execute_model_tool_call(
     let outputs = if let Some(extension_tool) =
         extension_tool.filter(|_| model_tool_enabled(runtime, &tool_call.name))
     {
-        match execute_extension_tool(&runtime.session.cwd, &extension_tool, tool_call).await {
-            Ok(result) => {
-                is_error = result.is_error;
-                vec![result.output]
+        // A persistent v2 host serves its tools over one process; v1 runs
+        // one process per call. Both are started lazily, on the call that
+        // needs them.
+        if extension_tool.protocol == "2" {
+            let extension_name = extension_tool.extension_name.clone();
+            let tool_name = extension_tool.name.clone();
+            let call = tool_call.clone();
+            let cwd = runtime.session.cwd.clone();
+            let hosts = runtime.extension_hosts();
+            let mut hosts = hosts.lock().await;
+            let outcome = hosts
+                .call(
+                    &extension_name,
+                    "tool",
+                    &tool_name,
+                    &call.arguments,
+                    &cwd,
+                    Some(&call.id),
+                )
+                .await;
+            match outcome {
+                Ok(outcome) => {
+                    is_error = outcome.is_error;
+                    if let Some(set) = outcome.registrations {
+                        drop(hosts);
+                        runtime.apply_extension_registrations(set).await;
+                    }
+                    vec![outcome.output]
+                }
+                Err(error) => {
+                    is_error = true;
+                    vec![error]
+                }
             }
-            Err(error) => {
-                is_error = true;
-                vec![error.to_string()]
+        } else {
+            match execute_extension_tool(&runtime.session.cwd, &extension_tool, tool_call).await {
+                Ok(result) => {
+                    is_error = result.is_error;
+                    vec![result.output]
+                }
+                Err(error) => {
+                    is_error = true;
+                    vec![error.to_string()]
+                }
             }
         }
     } else if tool_call.name == "todo" {
@@ -9217,6 +9430,182 @@ mod tests {
             Some("ext_echo")
         );
 
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn v2_extension_host_serves_model_tool_calls_from_one_process() {
+        let cwd = std::env::temp_dir().join(format!("noel-extension-v2-loop-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        // A stateful v2 host: init registers a counter tool; each tool call
+        // increments and echoes the count, proving both calls hit one
+        // process.
+        let extension_path = cwd.join("counter.sh");
+        fs::write(
+            &extension_path,
+            concat!(
+                "#!/bin/sh\n",
+                "count=0\n",
+                "while read line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"kind\":\"init\"'*) printf '%s\\n' '{\"output\":\"ready\",\"tools\":[{\"name\":\"counter\",\"replaySafe\":true,\"parameters\":{\"type\":\"object\"}}]}';;\n",
+                "    *) count=$((count+1)); printf '%s\\n' \"{\\\"output\\\":\\\"count is $count\\\"}\";;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .expect("write extension");
+        make_executable(&extension_path);
+        fs::write(
+            cwd.join("counter.sh.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+        let extensions = vec![ResourceFile {
+            name: "counter".to_string(),
+            path: extension_path.clone(),
+            content: String::new(),
+        }];
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems {
+                extension_tools: extension_tools_from_resources(&extensions),
+                extension_files: extensions,
+                ..ReloadableSystems::default()
+            },
+        );
+        // The provider calls the registered tool twice; the second call's
+        // result proves the host process persisted.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        struct TwoCallProvider {
+            calls: Arc<Mutex<Vec<ProviderRequest>>>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for TwoCallProvider {
+            async fn complete(
+                &self,
+                request: ProviderRequest,
+            ) -> Result<Vec<StreamEvent>, ProviderError> {
+                let mut calls = self.calls.lock().expect("calls");
+                let index = calls.len();
+                calls.push(request);
+                if index == 0 {
+                    return Ok(vec![
+                        StreamEvent::ToolCall {
+                            id: "call_1".to_string(),
+                            name: "counter".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                        StreamEvent::Stop {
+                            reason: "toolUse".to_string(),
+                        },
+                    ]);
+                }
+                if index == 1 {
+                    return Ok(vec![
+                        StreamEvent::ToolCall {
+                            id: "call_2".to_string(),
+                            name: "counter".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                        StreamEvent::Stop {
+                            reason: "toolUse".to_string(),
+                        },
+                    ]);
+                }
+                Ok(vec![
+                    StreamEvent::Text("done".to_string()),
+                    StreamEvent::Stop {
+                        reason: "stop".to_string(),
+                    },
+                ])
+            }
+        }
+        let provider = TwoCallProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let response = run_user_turn(&mut runtime, &provider, "count twice".to_string())
+            .await
+            .expect("run v2 extension tool loop");
+
+        assert_eq!(response, "done");
+        let results: Vec<String> = runtime
+            .session()
+            .tool_history
+            .iter()
+            .map(|event| event.result.clone())
+            .collect();
+        assert_eq!(results, vec!["count is 1", "count is 2"]);
+        // The handshake's tool reached the provider's declarations.
+        let first = calls.lock().expect("calls");
+        assert!(first[0].tools.iter().any(|tool| tool.name == "counter"));
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn v2_extension_gate_blocks_tool_calls_fail_closed() {
+        let cwd = std::env::temp_dir().join(format!("noel-extension-v2-gate-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create temp dir");
+        // A gate extension: init registers no tools but takes the gate; it
+        // blocks every call whose input names "secret" and allows the rest.
+        let extension_path = cwd.join("gate.sh");
+        fs::write(
+            &extension_path,
+            concat!(
+                "#!/bin/sh\n",
+                "while read line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"kind\":\"init\"'*) printf '%s\\n' '{\"output\":\"\",\"tools\":[],\"toolGate\":true}'; continue;;\n",
+                "  esac\n",
+                "  case \"$line\" in\n",
+                "    *secret*) printf '%s\\n' '{\"allow\":false,\"reason\":\"secret path is protected\"}';;\n",
+                "    *) printf '%s\\n' '{\"allow\":true}';;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .expect("write extension");
+        make_executable(&extension_path);
+        fs::write(
+            cwd.join("gate.sh.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+        let extensions = vec![ResourceFile {
+            name: "gate".to_string(),
+            path: extension_path,
+            content: String::new(),
+        }];
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", cwd.clone()),
+            ReloadableSystems {
+                extension_files: extensions,
+                ..ReloadableSystems::default()
+            },
+        );
+        runtime.start_extension_hosts().await;
+        let gate = {
+            let hosts = runtime.extension_hosts();
+            let mut hosts = hosts.lock().await;
+            hosts
+                .gate_tool_call("read", r#"{"path":"secret.txt"}"#, &cwd)
+                .await
+        };
+        assert_eq!(
+            gate,
+            Ok(extensions::GateDecision::blocked(
+                "secret path is protected".to_string()
+            ))
+        );
+        let allow = {
+            let hosts = runtime.extension_hosts();
+            let mut hosts = hosts.lock().await;
+            hosts
+                .gate_tool_call("read", r#"{"path":"public.txt"}"#, &cwd)
+                .await
+        };
+        assert_eq!(allow, Ok(extensions::GateDecision::allow()));
         let _ = fs::remove_dir_all(cwd);
     }
 

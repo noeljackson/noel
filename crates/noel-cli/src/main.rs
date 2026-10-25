@@ -7486,6 +7486,15 @@ async fn handle_tui_submission(
         {
             app.push(TuiEntryKind::Error, diagnostic);
         }
+        // The v2 hosts get their shutdown notification, then stop.
+        {
+            let hosts = runtime.extension_hosts();
+            let mut hosts = hosts.lock().await;
+            for diagnostic in hosts.notify("shutdown", &runtime.session().cwd).await {
+                app.push(TuiEntryKind::Error, diagnostic);
+            }
+            hosts.shutdown(&runtime.session().cwd).await;
+        }
         return Ok(true);
     }
     if handle_tui_bang(app, surface, runtime, config, &line).await? {
@@ -7621,8 +7630,17 @@ async fn handle_tui_submission(
             );
         }
         "/reload" => {
-            let lifecycle_diagnostics =
+            // v1 one-shot extensions get their reload notification; the v2
+            // hosts get it too, then are replaced by the next generation's
+            // (a removed extension's host is stopped, a new one starts with
+            // its next run or command).
+            let mut lifecycle_diagnostics =
                 notify_extension_lifecycle(&config.extensions, "reload", &runtime.session().cwd);
+            {
+                let hosts = runtime.extension_hosts();
+                let mut hosts = hosts.lock().await;
+                lifecycle_diagnostics.extend(hosts.notify("reload", &runtime.session().cwd).await);
+            }
             *config = reload_config(config)?;
             start_model_refresh(config, offline, false);
             let next_generation = runtime.systems().config_generation + 1;
@@ -7872,6 +7890,45 @@ async fn handle_tui_submission(
             let extension = find_resource(&config.extensions, name)
                 .ok_or_else(|| anyhow!("extension not found: {name}"))?;
             if is_executable_extension(&extension.path) {
+                // A v2 extension runs its `/extension:` command on the
+                // persistent host, so its state carries between commands
+                // and tools; v1 keeps its one-shot run.
+                if noel_core::extensions::manifest_protocol_version(&extension.path) == Some(2) {
+                    runtime.start_extension_hosts().await;
+                    let hosts = runtime.extension_hosts();
+                    let mut hosts = hosts.lock().await;
+                    let outcome = hosts
+                        .call(
+                            extension.name.as_str(),
+                            "command",
+                            extension.name.as_str(),
+                            input,
+                            &runtime.session().cwd.clone(),
+                            None,
+                        )
+                        .await;
+                    match outcome {
+                        Ok(outcome) => {
+                            if let Some(set) = outcome.registrations {
+                                drop(hosts);
+                                runtime.apply_extension_registrations(set).await;
+                            } else {
+                                drop(hosts);
+                            }
+                            let kind = if outcome.is_error {
+                                TuiEntryKind::Error
+                            } else {
+                                TuiEntryKind::System
+                            };
+                            app.push(kind, outcome.output);
+                        }
+                        Err(error) => {
+                            drop(hosts);
+                            app.push(TuiEntryKind::Error, error);
+                        }
+                    }
+                    return Ok(false);
+                }
                 match run_executable_extension(extension, input, &runtime.session().cwd) {
                     Ok(output) => app.push(TuiEntryKind::System, output),
                     Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
@@ -8082,6 +8139,67 @@ async fn handle_tui_submission(
                 TuiEntryKind::System,
                 format!("share exported {}", path.display()),
             );
+        }
+        // An extension-registered command: `/<name> [args]` runs the v2
+        // host's registered command (upstream `registerCommand`). Built-ins
+        // and resources above win, as upstream's own commands do.
+        _ if line.starts_with('/') && !line.starts_with("//") => {
+            let (name, input) = split_resource_command(&line, "/");
+            let (name, input) = (name.to_string(), input.to_string());
+            let registered = {
+                let hosts = runtime.extension_hosts();
+                let hosts = hosts.lock().await;
+                hosts
+                    .registration_sets()
+                    .iter()
+                    .any(|set| set.commands.iter().any(|command| command.name == name))
+            };
+            if registered {
+                let extension = {
+                    let hosts = runtime.extension_hosts();
+                    let hosts = hosts.lock().await;
+                    hosts
+                        .registration_sets()
+                        .iter()
+                        .find(|set| set.commands.iter().any(|command| command.name == name))
+                        .map(|set| set.extension_name.clone())
+                };
+                if let Some(extension) = extension {
+                    let cwd = runtime.session().cwd.clone();
+                    let hosts = runtime.extension_hosts();
+                    let mut hosts = hosts.lock().await;
+                    let outcome = hosts
+                        .call(&extension, "command", &name, &input, &cwd, None)
+                        .await;
+                    drop(hosts);
+                    match outcome {
+                        Ok(outcome) => {
+                            if let Some(set) = outcome.registrations {
+                                runtime.apply_extension_registrations(set).await;
+                            }
+                            let kind = if outcome.is_error {
+                                TuiEntryKind::Error
+                            } else {
+                                TuiEntryKind::System
+                            };
+                            app.push(kind, outcome.output);
+                        }
+                        Err(error) => app.push(TuiEntryKind::Error, error),
+                    }
+                    return Ok(false);
+                }
+            }
+            let prompt = TypedPrompt::expand(config, line);
+            return Ok(submit_tui_prompt(
+                app,
+                surface,
+                runtime,
+                config,
+                prompt,
+                Vec::new(),
+                offline,
+            )
+            .await);
         }
         // Anything else is a prompt: a skill command or a prompt template
         // expands, and other text goes to the model as typed.
@@ -10923,6 +11041,76 @@ mod tests {
     }
 
     #[test]
+    fn ordered_lists_display_sequential_numbers() {
+        // A source that numbers every item 1. (or restarts numbers) still
+        // displays 1. 2. 3., matching upstream's list renderer; a plain
+        // line ends the sequence and a later list starts over at its own
+        // first marker.
+        let entry = TuiEntry {
+            kind: TuiEntryKind::Assistant,
+            text:
+                "intro:\n1. first\n1. second\n3. third skipped number\n\nplain\n\n5. five\n6. six"
+                    .to_string(),
+        };
+        let palette = ThemePalette::default();
+        let logical = render_entry_lines(std::slice::from_ref(&entry), &palette);
+        let logical_text: Vec<String> = logical
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let mut rows = pending_entry_rows(
+            &entry,
+            0,
+            80,
+            &palette,
+            &PreviewState::default(),
+            EntryScrollback::default(),
+        );
+        restyle_rows_with_markdown(
+            &mut rows,
+            &entry,
+            |line| logical_text.get(line).cloned(),
+            Style::default().fg(palette.foreground),
+            palette.accent,
+        );
+        let display: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row.line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let item_text = |needle: &str| {
+            display
+                .iter()
+                .find(|line| line.contains(needle))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {needle}: {display:?}"))
+        };
+        // The first logical line carries the "● " echo prefix, so the
+        // list starts on the second line.
+        assert_eq!(item_text("intro"), "● intro:");
+        assert_eq!(item_text("first"), "  1. first");
+        assert_eq!(item_text("second"), "  2. second");
+        assert_eq!(
+            item_text("third skipped number"),
+            "  3. third skipped number"
+        );
+        assert_eq!(item_text("plain"), "  plain");
+        // The blank line ended the list, so this one restarts at its own 5.
+        assert_eq!(item_text("five"), "  5. five");
+        assert_eq!(item_text("six"), "  6. six");
+    }
+
+    #[test]
     fn session_picker_label_shows_topic_count_model_and_unfinished() {
         let label = format_session_picker_label(&picker_summary(
             Some("fix the retry loop\nmore details"),
@@ -11937,6 +12125,11 @@ mod tests {
 
     #[test]
     fn reload_keeps_the_trust_decision_and_cli_overrides() {
+        // The developer's own `~/.agents/skills` must not load into the
+        // test's config: isolate like the CLI test harness does, and put
+        // the isolation back afterwards.
+        let saved_isolation = std::env::var_os(noel_config::ENV_TEST_ISOLATION);
+        std::env::set_var(noel_config::ENV_TEST_ISOLATION, "1");
         let root =
             std::env::temp_dir().join(format!("noel-cli-config-source-{}", unique_temp_suffix()));
         let agent = root.join("agent");
@@ -12029,6 +12222,10 @@ mod tests {
             auth_for_provider(&config.auth, "anthropic", None),
             Some(ResolvedAuth::ApiKey("cli-key".to_string()))
         );
+        match saved_isolation {
+            Some(value) => std::env::set_var(noel_config::ENV_TEST_ISOLATION, value),
+            None => std::env::remove_var(noel_config::ENV_TEST_ISOLATION),
+        }
         let _ = fs::remove_dir_all(root);
     }
 
