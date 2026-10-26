@@ -1,7 +1,7 @@
 {
   "source": {
     "repository": "https://github.com/earendil-works/pi",
-    "ref": "1692bba6347a287ab0f3cb554a4430fafffc474b",
+    "ref": "b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb",
     "package": "packages/env",
     "envCommit": "f13c00fb3a4d77ad3faa815057e31d614d42b3f1",
     "script": "/ts-parity/pi-env-ssh-fixture.ts"
