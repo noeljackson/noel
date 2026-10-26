@@ -399,7 +399,12 @@ send_line "/session"
 send_line "/fork"
 send_line "/session"
 send_line "/summaries"
+# /tree opens the branch navigator; esc closes it back to the prompt.
 send_line "/tree"
+tmux send-keys -t "${session_name}" Escape
+absent "esc cancel"
+# The printed tree keeps the fork summary lines.
+send_line "/tree --print"
 # /resume opens the interactive picker; esc closes it back to the prompt.
 send_line "/resume"
 tmux send-keys -t "${session_name}" Escape

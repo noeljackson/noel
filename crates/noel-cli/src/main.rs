@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
+use std::future::Future;
 use std::io::{self, Cursor, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -689,6 +690,28 @@ async fn run_auth_login(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Stores an API key for `provider`/`account` (the tail of the CLI login).
+fn run_store_api_key(auth_path: &Path, provider: &str, account: &str, key: &str) -> Result<()> {
+    if key.trim().is_empty() {
+        return Err(anyhow!("api key is empty"));
+    }
+    noel_config::update_auth_file(auth_path, |auth| {
+        auth.insert(
+            provider,
+            account,
+            AuthCredential::ApiKey {
+                key: key.to_owned(),
+            },
+        )
+    })?;
+    println!(
+        "stored API-key auth for {provider}{} in {}",
+        account_suffix(account),
+        auth_path.display()
+    );
+    Ok(())
+}
+
 fn account_suffix(account: &str) -> String {
     if account == DEFAULT_ACCOUNT_NAME {
         String::new()
@@ -697,12 +720,188 @@ fn account_suffix(account: &str) -> String {
     }
 }
 
+/// Opens a URL in the platform browser, upstream's `openBrowser`: spawn
+/// the platform launcher directly, never a shell (a URL with shell
+/// metacharacters must not be able to inject). Best effort: a missing
+/// launcher is not an error, the URL is printed for copy regardless.
+fn open_browser(url: &str) {
+    #[cfg(unix)]
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    #[cfg(windows)]
+    let (program, args): (&str, Vec<&str>) = ("rundll32", vec!["url.dll,FileProtocolHandler", url]);
+    let _ = std::process::Command::new(program)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|child| {
+            // The launcher must not hold noel's process group hostage: it
+            // never becomes a zombie we wait on.
+            let _ = child.id();
+        });
+}
+
 fn login_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// The TUI's `/login`: suspends the TUI, runs the provider's real login
+/// flow on the plain terminal (the CLI command's own flow, opened browser
+/// included), then reloads the config so the new account is selectable at
+/// once. Returns the line to show in the transcript.
+async fn run_tui_login(
+    surface: &mut TuiSurface<'_>,
+    app: &mut TuiApp,
+    config: &mut LoadedConfig,
+    provider: &str,
+    account: &str,
+) -> Result<String> {
+    let cwd = config.paths.cwd.clone();
+    let auth_path = config.paths.auth_path.clone();
+    let existing = noel_config::read_auth_file(&auth_path)
+        .map(|auth| auth.credential(provider, account).is_some())
+        .unwrap_or(false);
+    let flow: std::pin::Pin<Box<dyn Future<Output = Result<String>> + '_>> = Box::pin(async {
+        if existing {
+            println!("account {account} of {provider} already has stored auth; logging in replaces it with whichever account the browser signs in as");
+            let mut answer = String::new();
+            print!("continue? [y/N] ");
+            let _ = io::Write::flush(&mut io::stdout());
+            io::stdin().read_line(&mut answer)?;
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                return Ok("login cancelled".to_string());
+            }
+        }
+        match provider {
+            "openai-codex" => {
+                run_codex_login_opened(&config_paths(cwd, None)?, account).await?;
+            }
+            "anthropic" => {
+                run_claude_login_opened(&config_paths(cwd, None)?, account).await?;
+            }
+            _ => run_api_key_login_interactive(&auth_path, provider, account).await?,
+        }
+        Ok(format!("logged in {provider} as account {account}"))
+    });
+    let outcome = with_suspended_tui(surface, app, config, flow).await??;
+    // The config reloads so the account appears in /account and the model
+    // pickers without a restart, the same way /reload does.
+    *config = reload_config(config)?;
+    Ok(outcome)
+}
+
+/// [`run_codex_login`] with the browser opened on the device URL.
+async fn run_codex_login_opened(paths: &ConfigPaths, account: &str) -> Result<()> {
+    let client = login_http_client();
+    let tokens = oauth_login::run_codex_device_login(
+        &client,
+        oauth_login::CODEX_ISSUER,
+        oauth_refresh::CODEX_TOKEN_URL,
+        |device| {
+            open_browser(&device.verification_url);
+            println!(
+                "opening {} (copy it if no browser opened) and enter code {}",
+                device.verification_url, device.user_code
+            );
+            println!("waiting for authorization (the code expires in 15 minutes)...");
+        },
+    )
+    .await?;
+    let replaced = noel_config::update_auth_file(&paths.auth_path, |auth| {
+        let replaced = auth.credential("openai-codex", account).is_some();
+        auth.insert(
+            "openai-codex",
+            account,
+            AuthCredential::OAuth {
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                expires: tokens.expires,
+                account_id: tokens.account_id,
+            },
+        );
+        replaced
+    })?;
+    println!(
+        "logged in as account {account}{}",
+        if replaced {
+            " (replaced existing login)"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+/// [`run_claude_login`] with the browser opened on the authorize URL.
+async fn run_claude_login_opened(paths: &ConfigPaths, account: &str) -> Result<()> {
+    let client = login_http_client();
+    let tokens = tokio::time::timeout(
+        oauth_login::LOGIN_TIMEOUT,
+        oauth_login::run_claude_pkce_login(
+            &client,
+            oauth_login::CLAUDE_AUTHORIZE_URL,
+            oauth_refresh::CLAUDE_TOKEN_URL,
+            |url| {
+                open_browser(url);
+                println!("opening the sign-in page (copy it if no browser opened):");
+                println!("{url}");
+                println!("after signing in, paste the full code shown (code#state): ");
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                Ok(input)
+            },
+        ),
+    )
+    .await
+    .map_err(|_| anyhow!("login timed out after 15 minutes"))??;
+    let replaced = noel_config::update_auth_file(&paths.auth_path, |auth| {
+        let replaced = auth.credential("anthropic", account).is_some();
+        auth.insert(
+            "anthropic",
+            account,
+            AuthCredential::OAuth {
+                access_token: tokens.access_token.clone(),
+                refresh_token: tokens.refresh_token.clone(),
+                expires: tokens.expires,
+                account_id: tokens.account_id.clone(),
+            },
+        );
+        replaced
+    })?;
+    println!(
+        "logged in as account {account}{}",
+        if replaced {
+            " (replaced existing login)"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+/// An API-key login read from the plain terminal (the `--api-key -` path).
+async fn run_api_key_login_interactive(
+    auth_path: &Path,
+    provider: &str,
+    account: &str,
+) -> Result<()> {
+    println!("paste the {provider} API key (or an empty line to cancel):");
+    let mut key = String::new();
+    io::stdin().read_line(&mut key)?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(anyhow!("login cancelled"));
+    }
+    run_store_api_key(auth_path, provider, account, key)
 }
 
 async fn run_codex_login(paths: &ConfigPaths, account: &str) -> Result<()> {
@@ -3062,6 +3261,50 @@ fn open_tui_terminal(owned_screen: bool) -> Result<(TerminalRestore, TuiTerminal
     Ok((restore, terminal, viewport_height))
 }
 
+/// Suspends the TUI's terminal modes so an interactive flow can use the
+/// plain terminal (line input, its own output), then takes them back.
+/// `interact` runs with the terminal restored; its output is the message
+/// the TUI shows afterwards. The same claim/release lock the signal path
+/// uses covers the gap, so a fatal signal during the flow still restores
+/// the terminal.
+async fn with_suspended_tui<R>(
+    surface: &mut TuiSurface<'_>,
+    app: &mut TuiApp,
+    config: &LoadedConfig,
+    interact: impl Future<Output = R>,
+) -> Result<R> {
+    // Leave the modes the TUI enabled, in reverse, and show the cursor so
+    // the flow's line input looks right.
+    let mut out = io::stdout();
+    let _ = execute!(
+        &mut out,
+        crossterm::cursor::Show,
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste
+    );
+    if app.owned_screen {
+        let _ = execute!(&mut out, DisableMouseCapture, LeaveAlternateScreen);
+    }
+    disable_raw_mode()?;
+    let result = interact.await;
+    // Take the terminal back exactly as startup did.
+    signals::claim_tui_terminal(app.owned_screen);
+    enable_raw_mode()?;
+    let mut out = io::stdout();
+    if app.owned_screen {
+        execute!(&mut out, EnterAlternateScreen, EnableMouseCapture)?;
+    }
+    execute!(&mut out, EnableBracketedPaste)?;
+    let _ = execute!(
+        &mut out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    surface.terminal.clear()?;
+    *surface.viewport_height = terminal_viewport_height();
+    redraw_tui(surface.terminal, app, config)?;
+    Ok(result)
+}
+
 /// Gives the terminal back, then prints the transcript for the e2e suites
 /// when `NOEL_TUI_E2E_DUMP=1`.
 fn close_tui_terminal(
@@ -3530,6 +3773,9 @@ struct TuiApp {
     last_shell_command: Option<String>,
     multiline: Option<Vec<String>>,
     selector: Option<TuiSelectorState>,
+    /// A login the auth selector picked, waiting for the async key handler
+    /// to suspend the TUI and run it.
+    pending_login: Option<(String, String)>,
     header_title: String,
     header_line: String,
     /// The session's workspace on another machine, which the footer shows
@@ -6000,6 +6246,13 @@ async fn handle_tui_key(
                 format_tui_error(&error, runtime, config),
             );
         }
+        // A login the auth selector picked runs now that the selector has
+        // closed: it suspends the TUI and uses the plain terminal.
+        if let Some((provider, account)) = app.pending_login.take() {
+            if let Err(error) = run_tui_login(surface, app, config, &provider, &account).await {
+                app.push(TuiEntryKind::Error, format!("{error}"));
+            }
+        }
         app.status = footer_status(config, runtime, &app.editor_state);
         return Ok(false);
     }
@@ -7178,11 +7431,19 @@ fn apply_tui_selector_selection(
             }
             app.push(TuiEntryKind::System, format_session(runtime));
         }
-        "auth" | "login" => {
+        "branches" => {
+            // The tree navigator's pick switches the session to that
+            // branch, the resume picker's own path.
+            apply_midturn_session_resume(app, runtime, config, &item.value)?;
             app.push(
                 TuiEntryKind::System,
-                format_login_status(config, &item.value),
+                format!("switched to branch {}", item.value),
             );
+        }
+        "auth" | "login" => {
+            // The real flow needs the terminal suspended and is async: the
+            // pick is recorded here, the key handler runs it (below).
+            app.pending_login = Some((item.value.clone(), DEFAULT_ACCOUNT_NAME.to_string()));
         }
         "account" => {
             let account = if item.value.is_empty() {
@@ -7598,13 +7859,21 @@ async fn handle_tui_submission(
                 format!("interrupted; cleared {cleared} queued message(s)"),
             );
         }
-        "/tree" => app.push(
-            TuiEntryKind::System,
-            format_session_tree(
-                &config.paths.session_dir,
-                Some(&runtime.session().session_id),
-            )?,
-        ),
+        "/tree" | "/tree --print" => {
+            // The navigator; --print keeps the printed form for terminals
+            // and transcripts where a selector cannot run.
+            if line == "/tree --print" {
+                app.push(
+                    TuiEntryKind::System,
+                    format_session_tree(
+                        &config.paths.session_dir,
+                        Some(&runtime.session().session_id),
+                    )?,
+                );
+            } else {
+                open_tui_selector(app, config, runtime, "branches", "")?;
+            }
+        }
         "/summaries" => app.push(TuiEntryKind::System, format_summaries(runtime)),
         "/undo" => undo_tui_turn(app, runtime)?,
         _ if line.split_whitespace().next() == Some("/compact") => {
@@ -8093,11 +8362,23 @@ async fn handle_tui_submission(
             );
         }
         _ if line.starts_with("/login") => {
-            let provider = line.trim_start_matches("/login").trim();
+            // "/login [provider] [account]": with no provider, the selector;
+            // with one, the flow runs at once.
+            let rest = line.trim_start_matches("/login").trim();
+            let mut parts = rest.split_whitespace();
+            let provider = parts.next().unwrap_or_default().to_string();
+            let account = parts.next().unwrap_or(DEFAULT_ACCOUNT_NAME).to_string();
             if provider.is_empty() {
                 open_tui_selector(app, config, runtime, "login", "")?;
+            } else if config.models.iter().any(|model| model.provider == provider) {
+                if let Err(error) = run_tui_login(surface, app, config, &provider, &account).await {
+                    app.push(TuiEntryKind::Error, format!("{error}"));
+                }
             } else {
-                app.push(TuiEntryKind::System, format_login_status(config, provider));
+                app.push(
+                    TuiEntryKind::Error,
+                    format!("unknown provider: {provider} (see /models)"),
+                );
             }
         }
         _ if line.starts_with("/logout") => {
@@ -9711,6 +9992,86 @@ fn changelog_header_has_version(line: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|value| value.is_ascii_digit()))
 }
 
+/// The tree's rows as selector items: value is the session id, label the
+/// tree row (connector + picker label), the current session active.
+fn session_tree_items(config: &LoadedConfig, current: Option<&str>) -> Result<Vec<SelectorItem>> {
+    let sessions = SessionStore::list(&config.paths.session_dir)?;
+    if sessions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let by_id: BTreeMap<&str, &noel_core::SessionSummary> = sessions
+        .iter()
+        .map(|session| (session.session_id.as_str(), session))
+        .collect();
+    let mut children: BTreeMap<String, Vec<&noel_core::SessionSummary>> = BTreeMap::new();
+    let mut roots: Vec<&noel_core::SessionSummary> = Vec::new();
+    for session in &sessions {
+        match session
+            .parent_session_id
+            .as_deref()
+            .filter(|parent| by_id.contains_key(parent))
+        {
+            Some(parent) => children.entry(parent.to_owned()).or_default().push(session),
+            None => roots.push(session),
+        }
+    }
+    let mut items = Vec::new();
+    for root in &roots {
+        session_tree_row(root, &children, current, "", false, &mut items);
+    }
+    Ok(items)
+}
+
+/// One row of the tree selector: the label /tree shows, with the session id
+/// as the value Enter picks.
+fn session_tree_row(
+    session: &noel_core::SessionSummary,
+    children: &BTreeMap<String, Vec<&noel_core::SessionSummary>>,
+    current: Option<&str>,
+    indent: &str,
+    last: bool,
+    items: &mut Vec<SelectorItem>,
+) {
+    let here = current == Some(session.session_id.as_str());
+    let own = children
+        .get(&session.session_id)
+        .map(|kids| kids.len())
+        .unwrap_or(0);
+    let branch_note = if own > 0 {
+        format!(" ({own} branch{})", if own > 1 { "es" } else { "" })
+    } else {
+        String::new()
+    };
+    items.push(SelectorItem {
+        label: format!(
+            "{indent}{}{}{branch_note}",
+            if here { "• " } else { "" },
+            format_session_picker_label(session)
+        ),
+        value: session.session_id.clone(),
+        active: here,
+    });
+    if let Some(kids) = children.get(&session.session_id) {
+        for (index, child) in kids.iter().enumerate() {
+            let child_last = index + 1 == kids.len();
+            let stem = if indent.is_empty() || last {
+                "  "
+            } else {
+                "│ "
+            };
+            let connector = if child_last { "└─ " } else { "├─ " };
+            session_tree_row(
+                child,
+                children,
+                current,
+                &format!("{indent}{stem}{connector}"),
+                child_last,
+                items,
+            );
+        }
+    }
+}
+
 fn format_session_tree(session_dir: &Path, current: Option<&str>) -> Result<String> {
     let sessions = SessionStore::list(session_dir)?;
     if sessions.is_empty() {
@@ -10300,6 +10661,12 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
                 })
                 .collect(),
         )),
+        // The branch navigator: /tree's rows as pickable items; Enter
+        // switches to the picked branch (upstream's tree selector).
+        "branches" => Ok(Selector::new(
+            "branches",
+            session_tree_items(config, Some(&runtime.session().session_id))?,
+        )),
         "session" | "sessions" | "resume" | "tree" => Ok(Selector::new(
             "session",
             SessionStore::list(&config.paths.session_dir)?
@@ -10323,10 +10690,16 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .map(|provider| SelectorItem {
-                    label: if auth_for_provider(&config.auth, &provider, None).is_some() {
-                        format!("{provider}: available")
-                    } else {
-                        format!("{provider}: missing")
+                    label: match (
+                        kind == "logout",
+                        auth_for_provider(&config.auth, &provider, None).is_some(),
+                    ) {
+                        // /logout removes what is there; /login runs the
+                        // provider's flow, so the row says which it has.
+                        (false, true) => format!("{provider}: available (login replaces)"),
+                        (false, false) => format!("{provider}: missing (login)"),
+                        (true, true) => format!("{provider}: available"),
+                        (true, false) => format!("{provider}: missing"),
                     },
                     value: provider.clone(),
                     active: auth_for_provider(&config.auth, &provider, None).is_some(),
@@ -11185,6 +11558,57 @@ mod tests {
     }
 
     #[test]
+    fn branch_selector_nests_children_and_marks_the_current() {
+        let root = std::env::temp_dir().join(format!("noel-cli-tree-sel-{}", unique_temp_suffix()));
+        use serde_json::json;
+        fs::create_dir_all(&root).unwrap();
+        let session_dir = root.join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let write = |id: &str, prompt: &str, parent: Option<&str>| {
+            let path = session_dir.join(format!("{id}.jsonl"));
+            let mut records =
+                vec![json!({"type": "started", "session_id": id, "cwd": root.join("cwd")})];
+            if let Some(parent) = parent {
+                records.push(json!({
+                    "type": "metadata",
+                    "name": null,
+                    "labels": [],
+                    "parent_session_id": parent
+                }));
+            }
+            let message =
+                json!({"type": "message", "message": {"role": "user", "content": prompt}});
+            records.push(message);
+            let mut text = String::new();
+            for record in records {
+                text.push_str(&record.to_string());
+                text.push('\n');
+            }
+            fs::write(path, text).unwrap();
+        };
+        write("parent", "fix the login flow", None);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write("fork-a", "try oauth instead", Some("parent"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write("fork-b", "try device code", Some("parent"));
+
+        let mut config = account_test_config(AuthData::default());
+        config.paths.session_dir = session_dir.clone();
+        let items = session_tree_items(&config, Some("fork-a")).expect("items");
+        assert_eq!(items.len(), 3, "{items:?}");
+        let parent_row = items.iter().find(|i| i.value == "parent").unwrap();
+        assert!(parent_row.label.contains("(2 branches)"), "{items:?}");
+        assert!(!parent_row.active);
+        let fork_a = items.iter().find(|i| i.value == "fork-a").unwrap();
+        assert!(fork_a.label.contains("• "), "{items:?}");
+        assert!(fork_a.active);
+        // Children carry connectors; the last is the corner.
+        assert!(items.iter().any(|i| i.label.contains("├─ ")), "{items:?}");
+        assert!(items.iter().any(|i| i.label.contains("└─ ")), "{items:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn session_tree_renders_branches_with_connectors_and_marks_the_current() {
         let root = std::env::temp_dir().join(format!("noel-cli-tree-{}", unique_temp_suffix()));
         use serde_json::json;
@@ -11239,6 +11663,44 @@ mod tests {
         // Every session appears exactly once.
         assert_eq!(tree.lines().count(), 3, "{tree}");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn login_selector_rows_say_login_and_the_pick_is_recorded() {
+        let mut app = TuiApp::default();
+        let mut config = account_test_config(AuthData::default());
+        config.models = vec![ModelDefinition {
+            provider: "zeta".to_string(),
+            id: "z-1".to_string(),
+            api: ConfigProviderApi::Anthropic,
+            ..ModelDefinition::default()
+        }];
+        let mut runtime = Runtime::new(
+            noel_core::SessionState::new("login-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        let selector = selector_for_kind(&config, &runtime, "login").expect("selector");
+        let missing = selector
+            .items
+            .iter()
+            .find(|item| item.value == "zeta")
+            .expect("zeta row");
+        assert_eq!(missing.label, "zeta: missing (login)");
+        // The pick records the flow to run; the row itself logged nothing.
+        let mut selected = TuiSelectorState::new("auth", selector, "", None);
+        let row = selected
+            .items
+            .iter()
+            .position(|item| item.value == "zeta")
+            .unwrap();
+        selected.selected = row;
+        selected.filtered_indices = vec![row];
+        apply_tui_selector_selection(&mut app, &mut runtime, &mut config, selected).unwrap();
+        assert_eq!(
+            app.pending_login,
+            Some(("zeta".to_string(), "default".to_string()))
+        );
+        assert!(app.entries.is_empty(), "the flow runs outside the selector");
     }
 
     #[test]
