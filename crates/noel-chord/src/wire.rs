@@ -1,11 +1,14 @@
-//! Link protocol 2 frames, as upstream's `chord/src/wire.ts`.
+//! Link protocol 4 frames, as upstream's `chord/src/wire.ts`.
 //!
 //! Every frame type has one direction, so ids never collide: a consumer sends
-//! `hold`, `release`, `call`, `cancel`, `sub` and `unsub`; a provider sends
-//! `shape`, `gone`, `result` and `state`; both send `hello`, `ping`, `pong`,
-//! `bye`, `root_end` and `ack`. Reload and revocation control (`invalidate`,
-//! `prepare`, `commit`, `abort`, `retire`) goes from parent to child, `vote`
-//! from child to parent.
+//! `hold`, `release`, `call`, `cancel`, `sub`, `unsub` and `resync`; a
+//! provider sends `shape`, `gone`, `result` and `state`; both send `hello`,
+//! `ping`, `pong`, `bye`, `root_end` and `ack`. State is addressed by
+//! `(hold id, member)`: a hold implies the state of its variant, sent as a
+//! unit (a shape followed by a snapshot of each member the consumer lacks).
+//! Reload and revocation control (`invalidate`, `prepare`, `commit`,
+//! `abort`, `retire`) goes from parent to child, `vote` from child to
+//! parent.
 //!
 //! [`Frame::parse`] checks a received frame as upstream's frame schema does
 //! (`isFrame`): anything it refuses is a protocol violation. Payloads (hold
@@ -24,8 +27,8 @@ use crate::js;
 
 /// The link protocol version announced in `hello`. Peers of another version
 /// do not talk: the side that notices closes the link with the reason
-/// `protocol-version 2`.
-pub const PROTOCOL_VERSION: u64 = 2;
+/// `protocol-version 4`.
+pub const PROTOCOL_VERSION: u64 = 4;
 
 /// What a peer is: a host (addressable, carries roots) or a client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -102,15 +105,29 @@ pub enum Frame {
     },
     Hold {
         id: u64,
+        /// Target host name, resolved by the consumer from the token's
+        /// `host` and `input`. Relays route on it after checking it against
+        /// both; the target refuses an input its own contract places
+        /// elsewhere.
         at: String,
         token: Token,
         input: Value,
         /// A forwarded principal, honoured only from the parent link.
         #[serde(skip_serializing_if = "Option::is_none")]
         principal: Option<Value>,
-        /// Set by a relay when the hold comes from a client.
+        /// The client connection the hold comes from: an opaque id the
+        /// server assigned to it, forwarded by relays. Honoured only from
+        /// the parent link; present means the hold is a client's.
         #[serde(skip_serializing_if = "Option::is_none")]
-        client: Option<bool>,
+        origin: Option<String>,
+        /// `Some(false)`: no state for this hold until `sub` (a method-only
+        /// binding).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<bool>,
+        /// The consumer already has values (a re-hold after a link loss):
+        /// its unit is not urgent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        again: Option<bool>,
     },
     Release {
         id: u64,
@@ -121,8 +138,9 @@ pub enum Frame {
         variant: Option<String>,
         members: Vec<String>,
         contract: String,
-        #[serde(rename = "codeVersion")]
-        code_version: i64,
+        /// The state members whose snapshots follow this frame; the
+        /// consumer applies the shape once they are here.
+        state: Vec<String>,
     },
     Gone {
         id: u64,
@@ -150,13 +168,20 @@ pub enum Frame {
     Cancel {
         id: u64,
     },
+    /// Starts the state of a hold opened with `state: false` (answered
+    /// with a unit).
     Sub {
-        id: u64,
         hold: u64,
-        member: String,
     },
+    /// Stops the state of a hold.
     Unsub {
-        id: u64,
+        hold: u64,
+    },
+    /// Sends member `m` again as a reset (a relay that had to drop what
+    /// waited for it).
+    Resync {
+        hold: u64,
+        m: String,
     },
     State(StateFrame),
     Ping {
@@ -202,28 +227,49 @@ pub enum Frame {
     },
 }
 
-/// A `state` frame: exactly one of `snap`, `reset`, `ops` and `error` in
-/// practice; the schema does not insist.
+/// A `state` frame, addressed by hold and member: exactly one of `snap`,
+/// `reset`, `ops` and `error` in practice; the schema does not insist.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StateFrame {
-    pub id: u64,
-    pub snap: Option<Value>,
-    pub reset: Option<Value>,
+    pub hold: u64,
+    pub m: String,
+    pub as_kind: StateAs,
+    pub value: Option<Value>,
     /// Wire tuples from the subscription's delta encoder.
     pub ops: Option<Vec<Value>>,
     pub error: Option<WireError>,
+}
+
+/// What a `state` frame carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StateAs {
+    #[default]
+    Snap,
+    Reset,
+    Ops,
+    Error,
+}
+
+impl StateAs {
+    fn as_str(self) -> &'static str {
+        match self {
+            StateAs::Snap => "snap",
+            StateAs::Reset => "reset",
+            StateAs::Ops => "ops",
+            StateAs::Error => "error",
+        }
+    }
 }
 
 impl Serialize for StateFrame {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // Inside the tagged enum: `t` is written by the enum.
         let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("id", &self.id)?;
-        if let Some(snap) = &self.snap {
-            map.serialize_entry("snap", snap)?;
-        }
-        if let Some(reset) = &self.reset {
-            map.serialize_entry("reset", reset)?;
+        map.serialize_entry("hold", &self.hold)?;
+        map.serialize_entry("m", &self.m)?;
+        map.serialize_entry("as", self.as_kind.as_str())?;
+        if let Some(value) = &self.value {
+            map.serialize_entry("value", value)?;
         }
         if let Some(ops) = &self.ops {
             map.serialize_entry("ops", ops)?;
@@ -250,6 +296,7 @@ impl Frame {
             Frame::Cancel { .. } => "cancel",
             Frame::Sub { .. } => "sub",
             Frame::Unsub { .. } => "unsub",
+            Frame::Resync { .. } => "resync",
             Frame::State(_) => "state",
             Frame::Ping { .. } => "ping",
             Frame::Pong { .. } => "pong",
@@ -310,7 +357,19 @@ impl Frame {
                     token: Token::Value(token.clone()),
                     input: fields.required("input")?.clone(),
                     principal: fields.optional("principal")?.cloned(),
-                    client: fields.optional_bool("client")?,
+                    origin: fields.optional_string("origin")?,
+                    state: match fields.optional("state")? {
+                        None | Some(Value::Null) => None,
+                        Some(Value::Bool(false)) => Some(false),
+                        Some(Value::Bool(true)) => return Err("state must be false".to_owned()),
+                        Some(_) => return Err("state must be a boolean".to_owned()),
+                    },
+                    again: match fields.optional("again")? {
+                        None | Some(Value::Null) => None,
+                        Some(Value::Bool(true)) => Some(true),
+                        Some(Value::Bool(false)) => return Err("again must be true".to_owned()),
+                        Some(_) => return Err("again must be a boolean".to_owned()),
+                    },
                 }
             }
             "release" => Frame::Release {
@@ -321,7 +380,7 @@ impl Frame {
                 variant: fields.optional_string("variant")?,
                 members: fields.strings("members")?,
                 contract: fields.string("contract")?.to_owned(),
-                code_version: fields.integer("codeVersion", None)?,
+                state: fields.strings("state")?,
             },
             "gone" => Frame::Gone {
                 id: fields.id("id")?,
@@ -346,24 +405,38 @@ impl Frame {
                 id: fields.id("id")?,
             },
             "sub" => Frame::Sub {
-                id: fields.id("id")?,
                 hold: fields.id("hold")?,
-                member: fields.name("member")?,
             },
             "unsub" => Frame::Unsub {
-                id: fields.id("id")?,
+                hold: fields.id("hold")?,
             },
-            "state" => Frame::State(StateFrame {
-                id: fields.id("id")?,
-                snap: fields.optional("snap")?.cloned(),
-                reset: fields.optional("reset")?.cloned(),
-                ops: match fields.optional("ops")? {
-                    None => None,
-                    Some(Value::Array(ops)) if ops.iter().all(Value::is_array) => Some(ops.clone()),
-                    Some(_) => return Err("ops must be a list of lists".to_owned()),
-                },
-                error: fields.optional("error")?.map(wire_error).transpose()?,
-            }),
+            "resync" => Frame::Resync {
+                hold: fields.id("hold")?,
+                m: fields.name("m")?,
+            },
+            "state" => {
+                let as_kind = match fields.string("as")? {
+                    "snap" => StateAs::Snap,
+                    "reset" => StateAs::Reset,
+                    "ops" => StateAs::Ops,
+                    "error" => StateAs::Error,
+                    other => return Err(format!("as {other}")),
+                };
+                Frame::State(StateFrame {
+                    hold: fields.id("hold")?,
+                    m: fields.name("m")?,
+                    as_kind,
+                    value: fields.optional("value")?.cloned(),
+                    ops: match fields.optional("ops")? {
+                        None => None,
+                        Some(Value::Array(ops)) if ops.iter().all(Value::is_array) => {
+                            Some(ops.clone())
+                        }
+                        Some(_) => return Err("ops must be a list of lists".to_owned()),
+                    },
+                    error: fields.optional("error")?.map(wire_error).transpose()?,
+                })
+            }
             "ping" => Frame::Ping {
                 n: fields.integer("n", None)?,
             },
@@ -554,6 +627,9 @@ fn check_description(value: &Value) -> Result<(), String> {
     if !is_object(fields.required("input")?) {
         return Err("input must be an object".to_owned());
     }
+    if let Some(host) = fields.optional("host")? {
+        check_placement(host)?;
+    }
     let variants = fields
         .required("variants")?
         .as_object()
@@ -565,6 +641,21 @@ fn check_description(value: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A placement: `{name}` or `{prefix, key}`, both non-empty strings.
+fn check_placement(value: &Value) -> Result<(), String> {
+    let object = value.as_object().ok_or("host must be an object")?;
+    let fields = Fields(object);
+    match (fields.optional_string("name")?, object.get("prefix")) {
+        (Some(_), None) => Ok(()),
+        (None, Some(_)) => {
+            fields.name("prefix")?;
+            fields.name("key")?;
+            Ok(())
+        }
+        _ => Err("host must be a name or a prefix and key".to_owned()),
+    }
 }
 
 fn check_member(value: &Value) -> Result<(), String> {
@@ -628,17 +719,21 @@ mod tests {
     #[test]
     fn frames_round_trip_through_their_text() {
         let frames = [
-            json!({"t": "hello", "protocol": 2, "name": "server", "kind": "host", "codeVersion": 1, "acks": true}),
+            json!({"t": "hello", "protocol": 4, "name": "server", "kind": "host", "codeVersion": 1, "acks": true}),
             json!({"t": "ack", "n": 3}),
             json!({"t": "release", "id": 1}),
-            json!({"t": "shape", "id": 1, "variant": "owner", "members": ["count"], "contract": "93ba9f7ef8c79f2b", "codeVersion": 1}),
+            json!({"t": "shape", "id": 1, "variant": "owner", "members": ["count"], "contract": "93ba9f7ef8c79f2b", "state": ["count"]}),
             json!({"t": "gone", "id": 2, "error": {"code": "forbidden", "message": "forbidden: no"}}),
             json!({"t": "call", "id": 3, "hold": 1, "member": "add", "args": 1}),
             json!({"t": "call", "id": 3, "hold": 1, "member": "say", "args": "hi", "root": {"rootId": "server#x:1", "codeVersion": 1}}),
             json!({"t": "result", "id": 3}),
             json!({"t": "result", "id": 3, "value": null}),
-            json!({"t": "state", "id": 2, "ops": [["s", ["n"], 1]]}),
-            json!({"t": "state", "id": 2, "snap": {"n": 0}}),
+            json!({"t": "state", "hold": 2, "m": "count", "as": "ops", "ops": [["s", ["n"], 1]]}),
+            json!({"t": "state", "hold": 2, "m": "count", "as": "snap", "value": {"n": 0}}),
+            json!({"t": "state", "hold": 2, "m": "count", "as": "reset"}),
+            json!({"t": "sub", "hold": 2}),
+            json!({"t": "unsub", "hold": 2}),
+            json!({"t": "resync", "hold": 2, "m": "count"}),
             json!({"t": "ping", "n": -4}),
             json!({"t": "bye", "reason": "host closed"}),
             json!({"t": "root_end", "rootId": "server#x:1"}),
@@ -662,7 +757,9 @@ mod tests {
             json!({"t": "hello", "name": "a", "kind": "browser", "codeVersion": 1}),
             json!({"t": "ack", "n": 0}),
             json!({"t": "ping", "n": 1.5}),
-            json!({"t": "state", "id": 1, "ops": [1]}),
+            json!({"t": "state", "hold": 1, "m": "count", "as": "ops", "ops": [1]}),
+            json!({"t": "state", "hold": 1, "m": "count", "as": "nope"}),
+            json!({"t": "hold", "id": 1, "at": "s", "token": {"name": "x", "scope": "remote", "version": 1, "input": {}, "host": {}, "variants": {"o": {}}}, "input": {}}),
             json!({"t": "gone", "id": 1, "error": {"code": "nope", "message": ""}}),
             json!({"t": "nope"}),
             json!([1]),

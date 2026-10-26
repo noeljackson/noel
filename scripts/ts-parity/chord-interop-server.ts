@@ -3,6 +3,7 @@ import { unlinkSync } from "node:fs";
 import { WebSocketServer } from "/chord-reference/node_modules/ws/wrapper.mjs";
 import { Type } from "/chord-reference/node_modules/typebox/build/index.mjs";
 import {
+	hostNamed,
 	type Ctx,
 	createHost,
 	type Frame,
@@ -28,6 +29,7 @@ import {
 
 const CountSchema = Type.Object({ n: Type.Integer() });
 const Counter = remote("noel.test.counter", {
+	host: hostNamed("server"),
 	version: 1,
 	input: Type.Object({ name: Type.String() }),
 	variants: {
@@ -74,7 +76,7 @@ class Tap implements Link {
 const path = process.argv[2];
 if (path === undefined) throw new Error("usage: chord-interop-server.ts /path/to/socket");
 
-const host = createHost({ name: "server", onError: (error) => console.error("chord:", error) });
+const host = createHost({ name: "server", self: { kind: "owner", via: "device" }, onError: (error) => console.error("chord:", error) });
 host.serve(Counter, (input, principal, self) => {
 	const who = principal as { kind?: string };
 	if (who.kind !== "owner" && who.kind !== "guest") throw forbidden(`${input.name} is not for this principal`);

@@ -157,18 +157,18 @@ reply stays in the transcript.
 
 ### 7.1 Link protocol
 
-**Decided:** Chord link protocol version 2 (`chord/docs/spec.md` §9; frames in `chord/src/wire.ts`).
+**Decided:** Chord link protocol version 4 (`chord/docs/spec.md` §9; frames in `chord/src/wire.ts`): the version upstream pinned as `PROTOCOL_VERSION = 4` at the chord reference (`b45e0ebc`, "references hydrate their state before use").
 
 **Built** in `crates/noel-chord`, matching upstream's `packages/chord` at the pinned commit (`CHORD_REFERENCE_REF` in the Makefile), checked against `tests/fixtures/ts-parity/chord-delta.json` and `chord-link.json`, and against upstream's runtime by `make chord-interop`:
 - **the delta codec:** the ops `r`, `s`, `d`, `a`, `t`, `p` and `m` applied immutably, with `t` and `a` counting UTF-16 code units; the wire encoder and decoder, with path definitions, numeric references and short tuples; and `diff`, whose batches are compared by the value they produce;
 - **canonical JSON and `hash64`;**
-- **contracts:** descriptions, their fingerprints, `coverage` and `fits`;
-- **frames:** every protocol 2 frame, checked on receipt as upstream's frame schema checks it. A malformed frame, a duplicate id or a control frame from the wrong side closes the link;
+- **contracts:** descriptions, their fingerprints, `coverage` and `fits`; remote descriptions carry their `host` placement (`hostNamed`/`hostFamily`), which the consumer resolves to route a hold, never where a request says it is going;
+- **frames:** every protocol 4 frame, checked on receipt as upstream's frame schema checks it. A malformed frame, a duplicate id or a control frame from the wrong side closes the link;
 - **links:**
   - WebSocket, one JSON text message per frame, also over a Unix socket (Chord has no Unix-socket transport of its own); packed binary frames are decoded where accepted, never sent, and refused from clients. When this side closes a link, the peer has 30 s to answer its close frame, then the socket is dropped, as upstream's `ws` destroys a socket after its `closeTimeout`;
   - NDJSON lines `{"chord2": frame}`, Chord's IPC encoding, with `{"chord2control": message}` lines for control, unwindowed;
   - an in-memory pair, for tests;
-- **connections:** `hello` with protocol 2, and `bye` with `protocol-version 2` to a peer of another version; holds (`shape`, `gone`, `release`); calls (`result`, `cancel`, `maxCalls`); subscriptions (`snap`, `ops` through one delta encoder per subscription, `reset`, `unsub`); `ping` and `pong` with a configurable interval and timeout; `ack` with the window, where only state waits, coalesced per subscription, and a subscription waiting beyond four windows is reset;
+- **connections:** `hello` with protocol 4, and `bye` with `protocol-version 4` to a peer of another version; holds (`shape` with its `state` member list, `gone`, `release`), whose state is implied (a unit: the shape, then a snapshot of each member the consumer lacks), addresses by hold and member (`state` frames carry `as` `snap`/`reset`/`ops`/`error`), and carry `origin` (the client connection a relayed hold came from) and `again` (a re-hold after a link loss, whose unit is not urgent); calls (`result`, `cancel`, `maxCalls`); `sub` and `unsub` for a hold opened `state: false`, and `resync` when a relay dropped what waited; `ping` and `pong` with a configurable interval and timeout; `ack` with the window, where only state waits, coalesced per hold and member against one link-wide pending budget (four windows), and a stream whose ops outgrow it flushes as a reset of the current value;
 - **hosts:** object types served with contracts and a variant per principal; principal stamping by the accepting side, with forwarded principals honoured only from the parent link; routes whose `authorize(principal, host)` runs before and after `resolve`; relaying between a client and a child host, with roots and `root_end` on relayed calls; and `invalidate_principal`, which re-stamps or closes links, closes their relays and propagates to child hosts.
 
 **Left out:** hot reload and plugins. noel sends no reload control; a host that receives `prepare` votes `unavailable/not_coordinator`, and ignores `commit`, `abort` and `retire`.
@@ -178,9 +178,9 @@ Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-regi
 **Built:** WebSocket framing over the device socket (path `/chord`; packed frames refused from clients), and NDJSON between server and worker (§5).
 
 **Decided (2026-10-14):**
-- noel builds on protocol 2 now, although it is under `[Unreleased]` in Chord's changelog.
+- noel builds on protocol 4 (Chord 1.3.0's link protocol; the reference is pinned to `b45e0ebc`, the newest commit at which `packages/chord` builds).
 - The goldens are pinned to an exact upstream commit, and `ts-parity-drift` flags drift.
-- Until Chord releases protocol 2, the server offers only device access.
+- Chord commits after the pin that do not build are recorded by `ts-parity-drift` for the next pass.
 
 ### 7.2 Objects
 

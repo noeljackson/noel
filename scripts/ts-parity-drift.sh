@@ -42,6 +42,29 @@ chord_pin="$("${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
   packages/durable/src/env packages/durable/src/testing/env-conformance.ts \
   packages/env > "${env_file}"
 
+# A pin behind the tracked reference is actionable drift only while a newer
+# chord builds there: the pin belongs at the newest commit at which
+# `packages/chord` compiles, and upstream chord is broken between such
+# commits at times. Commits after the pin that do not build are recorded in
+# the brief for the next pass, but do not fail the gate.
+chord_file_actionable="${out_dir}/chord-commits-actionable"
+env_file_actionable="${out_dir}/env-commits-actionable"
+: > "${chord_file_actionable}"
+if [ -s "${chord_file}" ]; then
+  newest_chord="$("${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
+    git -C /ts-reference log --format=%H -1 "${chord_pin}..HEAD" -- packages/chord)"
+  if "${make_bin}" ts-parity-build CHORD_REFERENCE_REF="${newest_chord}" \
+      > "${out_dir}/chord-build-probe.log" 2>&1; then
+    cp "${chord_file}" "${chord_file_actionable}"
+  fi
+  # Restore the image the fixtures were generated with.
+  "${make_bin}" ts-parity-build > /dev/null 2>&1 || true
+fi
+# The env fixtures regenerate from the image's env, which the chord pin's
+# worktree carries: their commits are actionable exactly when the chord
+# pin's are.
+cp "${chord_file_actionable}" "${env_file_actionable}"
+
 "${docker_bin}" run --rm \
   -v "${repo_root}/${fresh_fixtures_dir}:/fixtures" \
   "${TS_PARITY_IMAGE:-pi-ts-parity}"
@@ -49,7 +72,7 @@ chord_pin="$("${docker_bin}" run --rm "${TS_PARITY_IMAGE:-pi-ts-parity}" \
 fixtures_drift=0
 diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}" || fixtures_drift=1
 
-if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file}" ] || [ -s "${env_file}" ]; then
+if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file_actionable}" ] || [ -s "${env_file_actionable}" ]; then
   {
     printf '# TS Parity Drift Brief\n\n'
     printf 'The TypeScript reference fixtures changed against the tracked reference.\n\n'
@@ -61,13 +84,16 @@ if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file}" ] || [ -s "${env_file}"
     printf -- '- Diff: `%s`\n\n' "${diff_file}"
     if [ -s "${chord_file}" ]; then
       printf '## Chord pin\n\n'
+      if [ ! -s "${chord_file_actionable}" ]; then
+        printf 'The pin is at the newest commit at which `packages/chord` builds; the commits below do not build yet. They are recorded for the next pass.\n\n'
+      fi
       printf '`chord-delta.json` and `chord-link.json` are pinned to `%s` (`CHORD_REFERENCE_REF` in the Makefile). `packages/chord` changed after it on the tracked reference:\n\n' "${chord_pin}"
       printf '```text\n'
       cat "${chord_file}"
       printf '```\n\n'
       printf 'Move the pin to the newest of these commits at which `packages/chord` builds (the image build checks), regenerate with `make ts-parity-chord`, bring `crates/noel-chord` level with the new fixtures, and run `make chord-interop`.\n\n'
     fi
-    if [ -s "${env_file}" ]; then
+    if [ -s "${env_file}" ] && [ -s "${env_file_actionable}" ]; then
       printf '## Durable env pin\n\n'
       printf '`local-env.json`, `pi-env.json` and `pi-env-ssh.json` are pinned to `%s` too. Durable'"'"'s env, its conformance cases or pi-env (`packages/env`) changed after it on the tracked reference:\n\n' "${chord_pin}"
       printf '```text\n'

@@ -1,4 +1,4 @@
-//! Chord link protocol 2 for noel, ported from upstream pi's
+//! Chord link protocol 4 for noel, ported from upstream pi's
 //! `packages/chord`:
 //!
 //! - [`wire`]: every frame, checked on receipt as upstream's frame schema
@@ -28,7 +28,8 @@ pub mod validate;
 pub mod wire;
 
 pub use contract::{
-    coverage, fingerprint, ContractError, Description, MemberDescription, PropertyMap, Scope,
+    coverage, fingerprint, ContractError, Description, MemberDescription, Placement, PropertyMap,
+    Scope,
 };
 pub use error::{ChordError, ErrorCode, WireError};
 pub use host::{

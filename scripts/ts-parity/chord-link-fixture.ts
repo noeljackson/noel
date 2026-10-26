@@ -12,6 +12,8 @@ import {
 	type Host,
 	type Link,
 	type LinkOptions,
+	hostFamily,
+	hostNamed,
 	method,
 	type Principal,
 	remote,
@@ -48,9 +50,12 @@ const settle = () => sleep(25);
 type Entry = { link: string; from: string; frame: Frame };
 let log: Entry[] = [];
 
-/** Root ids carry a random incarnation (`server#k3x9q2:4`); it is replaced by `*`. */
+/** Root ids carry a random incarnation (`server#k3x9q2:4`); it is replaced by `*`. A hold's `origin`
+ * names its client connection the same way (`k3x9q2:1`); it becomes `<origin>`. */
 function normalize(frame: Frame): Frame {
-	const text = JSON.stringify(frame).replace(/"rootId":"([^"#]*)#[a-z0-9]*:/g, '"rootId":"$1#*:');
+	const text = JSON.stringify(frame)
+		.replace(/"rootId":"([^"#]*)#[a-z0-9]*:/g, '"rootId":"$1#*:')
+		.replace(/"origin":"[a-z0-9]+:/g, '"origin":"<origin>:');
 	return JSON.parse(text) as Frame;
 }
 
@@ -229,6 +234,7 @@ const CountSchema = Type.Object({ n: Type.Integer() });
 
 /** A counter on the server: a state cell and methods. Owners get `owner`; guests `viewer`. */
 const Counter = remote("noel.test.counter", {
+	host: hostNamed("server"),
 	version: 1,
 	input: Type.Object({ name: Type.String() }),
 	variants: {
@@ -247,6 +253,7 @@ const Counter = remote("noel.test.counter", {
 
 /** The same type and version, but a consumer expecting another result: not covered. */
 const CounterDrifted = remote("noel.test.counter", {
+	host: hostNamed("server"),
 	version: 1,
 	input: Type.Object({ name: Type.String() }),
 	variants: {
@@ -259,6 +266,7 @@ const CounterDrifted = remote("noel.test.counter", {
 
 /** A newer contract version, which the provider has no adapter for. */
 const CounterV2 = remote("noel.test.counter", {
+	host: hostNamed("server"),
 	version: 2,
 	input: Type.Object({ name: Type.String() }),
 	variants: { owner: { state: { count: CountSchema } } },
@@ -266,6 +274,7 @@ const CounterV2 = remote("noel.test.counter", {
 
 /** A type nobody serves. */
 const Missing = remote("noel.test.missing", {
+	host: hostNamed("server"),
 	version: 1,
 	input: Type.Object({}),
 	variants: { main: { methods: { ping: method() } } },
@@ -273,6 +282,7 @@ const Missing = remote("noel.test.missing", {
 
 /** A session object on a `session:<id>` worker, reached through the server's route. */
 const Session = remote("noel.test.session", {
+	host: hostFamily("session:", "session"),
 	version: 1,
 	input: Type.Object({ session: Type.String() }),
 	variants: {
@@ -363,7 +373,7 @@ const onError = (error: unknown) => errors.push(error);
 
 /** The server, with the `session:` route spawning workers over in-memory links. */
 function server(): Host {
-	const host = createHost({ name: "server", onError });
+	const host = createHost({ name: "server", self: owner, onError });
 	serveCounter(host);
 	const workers = new Map<string, Link>();
 	host.route("session:", {
@@ -372,10 +382,10 @@ function server(): Host {
 			return who.kind === "owner" || (who.kind === "guest" && hostName === `session:${who.session}`);
 		},
 		resolve: async (hostName) => {
-			let link = workers.get(hostName);
+			let link = await workers.get(hostName);
 			if (link === undefined) {
 				const [down, up] = tapPair("worker", "server", "worker");
-				const worker = createHost({ name: hostName, upstream: up, onError });
+				const worker = createHost({ name: hostName, self: owner, upstream: { link: up, principal: owner }, onError });
 				serveSession(worker);
 				workers.set(hostName, down);
 				hosts.push(worker);
@@ -418,8 +428,8 @@ function client(
 	const host = createHost({
 		name: "client",
 		kind: "client",
-		upstream: gate ?? link,
-		upstreamOptions: options.upstream,
+		self: owner,
+		upstream: { link: gate ?? link, principal: owner, ...options.upstream },
 		onError,
 	});
 	hosts.push(host);
@@ -462,6 +472,17 @@ async function scenario(name: string, description: string, steps: () => Promise<
 
 const quietly = <T>(promise: Promise<T>): Promise<T | unknown> => promise.catch((error: unknown) => error);
 
+/** A hold whose acquire may fail at once (an invalid input now throws there,
+ * where `get` awaited the same failure): records it and gives no ref. */
+const holding = <C>(host: Host, type: C, input: never): { ready?: Promise<unknown> } => {
+	try {
+		return host.hold(type as never, input);
+	} catch (error) {
+		errors.push(error);
+		return {};
+	}
+};
+
 // ─── Scenarios ───────────────────────────────────────────────────────────────
 
 const scenarios = async () => [
@@ -477,16 +498,16 @@ const scenarios = async () => [
 		async () => {
 			const s = server();
 			const c = client(s, guest("s1")).host;
-			const a = c.get(Counter, { name: "a" }, { at: "server" });
+			const a = c.hold(Counter, { name: "a" });
 			await a.ready;
 			for (const ref of [
-				c.get(Counter, { name: "private" }, { at: "server" }),
-				c.get(Missing, {}, { at: "server" }),
-				c.get(CounterDrifted, { name: "a" }, { at: "server" }),
-				c.get(CounterV2, { name: "a" }, { at: "server" }),
-				c.get(Counter, { name: 5 } as never, { at: "server" }),
+				holding(c, Counter, { name: "private" }),
+				holding(c, Missing, {}),
+				holding(c, CounterDrifted, { name: "a" }),
+				holding(c, CounterV2, { name: "a" }),
+				holding(c, Counter, { name: 5 } as never),
 			]) {
-				await quietly(ref.ready);
+				if (ref.ready) await quietly(ref.ready);
 			}
 			a.release();
 			await settle();
@@ -499,7 +520,7 @@ const scenarios = async () => [
 		async () => {
 			const s = server();
 			const c = client(s, owner).host;
-			const a = c.get(Counter, { name: "a" }, { at: "server" });
+			const a = await c.get(Counter, { name: "a" });
 			const stop = a.count.subscribe(() => {});
 			await a.ready;
 			await settle();
@@ -524,7 +545,7 @@ const scenarios = async () => [
 		async () => {
 			const s = server();
 			const c = client(s, owner).host;
-			const a = c.get(Counter, { name: "a" }, { at: "server" });
+			const a = await c.get(Counter, { name: "a" });
 			await a.ready;
 			await a.add(5);
 			await a.set(7);
@@ -540,7 +561,7 @@ const scenarios = async () => [
 		async () => {
 			const s = server();
 			const c = client(s, owner, { accept: { maxCalls: 1 } }).host;
-			const a = c.get(Counter, { name: "a" }, { at: "server" });
+			const a = await c.get(Counter, { name: "a" });
 			a.count.subscribe(() => {});
 			await a.ready;
 			await settle();
@@ -563,7 +584,7 @@ const scenarios = async () => [
 		async () => {
 			const s = server();
 			const c = client(s, owner).host;
-			const session = c.get(Session, { session: "s1" }, { at: "session:s1" });
+			const session = await c.get(Session, { session: "s1" });
 			session.log.subscribe(() => {});
 			await session.ready;
 			await settle();
@@ -587,14 +608,18 @@ const scenarios = async () => [
 		async () => {
 			const s = server();
 			const c = client(s, guest("s1")).host;
-			await quietly(c.get(Session, { session: "s2" }, { at: "session:s2" }).ready);
-			await quietly(c.get(Session, { session: "s1" }, { at: "nowhere" }).ready);
-			const forged = c.get(Session, { session: "s1" }, { at: "session:s1", principal: owner });
+			await quietly(c.get(Session, { session: "s2" }));
+			await quietly(c.get(Session, { session: "s1" }));
+			const forged = await c.get(Session, { session: "s1" }, { principal: owner });
 			await forged.ready;
 			await forged.who();
 			await settle();
+			console.error("DEBUG before release, status:", forged.status);
 			forged.release();
 			await settle();
+			console.error("DEBUG after release");
+			// What did the client end actually send? Peek the log.
+			for (const e of log) if (e.frame.t === "release" || e.frame.t === "bye") console.error("DEBUG frame:", JSON.stringify(e));
 		},
 	),
 
@@ -607,15 +632,15 @@ const scenarios = async () => [
 				accept: { restamp: (principal) => ({ ...(principal as object), revision: 2 }) },
 			}).host;
 			const closed = client(s, guest("s1", "view"), { link: "client2" }).host;
-			const a = kept.get(Session, { session: "s1" }, { at: "session:s1" });
+			const a = await kept.get(Session, { session: "s1" });
 			a.log.subscribe(() => {});
 			await a.ready;
-			const b = closed.get(Session, { session: "s1" }, { at: "session:s1" });
+			const b = await closed.get(Session, { session: "s1" });
 			await b.ready;
 			await settle();
 			await s.invalidatePrincipal({ kind: "guest", id: "g1" });
 			await settle();
-			const again = kept.get(Session, { session: "s1" }, { at: "session:s1" });
+			const again = await kept.get(Session, { session: "s1" });
 			await again.who();
 			await settle();
 		},
@@ -648,7 +673,7 @@ const scenarios = async () => [
 		async () => {
 			const s = server();
 			const { host: c, gate } = client(s, owner, { accept: { window: 200 }, gate: true });
-			const a = c.get(Counter, { name: "a" }, { at: "server" });
+			const a = await c.get(Counter, { name: "a" });
 			a.count.subscribe(() => {});
 			await a.ready;
 			await settle();
@@ -666,7 +691,7 @@ const scenarios = async () => [
 		async () => {
 			const s = server();
 			const { host: c, gate } = client(s, owner, { accept: { window: 64 }, gate: true });
-			const a = c.get(Counter, { name: "a" }, { at: "server" });
+			const a = await c.get(Counter, { name: "a" });
 			a.count.subscribe(() => {});
 			await a.ready;
 			await settle();
@@ -695,7 +720,7 @@ const scenarios = async () => [
 		async () => {
 			const [down, up] = tapPair("raw", "server", "client");
 			down.receive(() => {});
-			hosts.push(createHost({ name: "client", kind: "client", upstream: up, onError }));
+			hosts.push(createHost({ name: "client", kind: "client", self: owner, upstream: { link: up, principal: owner }, onError }));
 			down.send({ t: "hello", protocol: 3, name: "server", kind: "host", codeVersion: 1, acks: true });
 			await settle();
 		},

@@ -14,7 +14,7 @@
 //! tasks; what they publish reaches the actor before their result.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use crate::object::{
 };
 use crate::schema::{canonical_json, deep_equal};
 use crate::validate;
-use crate::wire::{Frame, Kind, RootRef, StateFrame, Token, PROTOCOL_VERSION};
+use crate::wire::{Frame, Kind, RootRef, StateAs, StateFrame, Token, PROTOCOL_VERSION};
 
 /// The one code version noel runs.
 const CODE_VERSION: u64 = 1;
@@ -61,6 +61,10 @@ pub struct HostOptions {
     pub name: String,
     /// `Client`: never addressable, never carries roots.
     pub kind: Kind,
+    /// The principal of the host's own code (upstream `createHost({ self })`):
+    /// its own holds act as it, and a hold asking for it forwards no
+    /// principal.
+    pub self_principal: Option<Value>,
     pub principal_key: Option<PrincipalKey>,
     /// Errors from background work (protocol violations, failed subscriptions).
     pub on_error: Option<ErrorHandler>,
@@ -73,6 +77,7 @@ impl HostOptions {
         HostOptions {
             name: name.into(),
             kind: Kind::Host,
+            self_principal: None,
             principal_key: None,
             on_error: None,
             observer: None,
@@ -215,14 +220,17 @@ pub enum HostEvent {
     },
 }
 
-/// A provider's shape for a hold.
+/// A provider's shape for a hold: the variant, its members, the provider
+/// contract's fingerprint, and the state members whose snapshots follow
+/// (whose arrival hydrates the reference).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shape {
     pub variant: Option<String>,
     pub members: Vec<String>,
     /// The provider contract's fingerprint.
     pub contract: String,
-    pub code_version: i64,
+    /// The state members whose snapshots follow this shape.
+    pub state: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -463,7 +471,8 @@ impl RemoteRef {
         }
     }
 
-    /// Releases the hold (and its subscriptions).
+    /// Releases the hold (and its subscriptions): one view of a shared
+    /// binding; the actor ends the binding when the last view leaves.
     pub fn release(&self) {
         let _ = self.tx.send(Msg::Release { reference: self.id });
     }
@@ -536,6 +545,7 @@ enum Msg {
     Cell {
         conn: ConnId,
         sub: u64,
+        member: String,
         change: CellChange,
     },
     RelayStill {
@@ -624,8 +634,25 @@ impl Object {
 struct LocalHold {
     object: String,
     principal: Value,
-    feeds: BTreeSet<u64>,
+    /// Whether the consumer wants this hold's state (a hold implies it
+    /// until it says `state: false`).
+    wants_state: bool,
+    /// The consumer already has values (a re-hold after a link loss): its
+    /// unit is not urgent.
+    again: bool,
+    /// A unit (shape plus snapshots) has been sent for this hold.
+    unit_sent: bool,
+    /// Per state member: the feed into the object's cell.
+    feeds: BTreeMap<String, Feed>,
     consumer: Arc<Description>,
+}
+
+/// The cloneable summary of a served hold, for code that only reads it.
+#[derive(Clone)]
+struct HoldSummary {
+    object: String,
+    wants_state: bool,
+    members: Vec<String>,
 }
 
 enum Served {
@@ -633,16 +660,38 @@ enum Served {
     Relay(RelayId),
 }
 
+impl Served {
+    fn summary(&self) -> Option<HoldSummary> {
+        match self {
+            Served::Local(local) => Some(HoldSummary {
+                object: local.object.clone(),
+                wants_state: local.wants_state,
+                members: local.feeds.keys().cloned().collect(),
+            }),
+            Served::Relay(_) => None,
+        }
+    }
+}
+
 struct Feed {
-    object: String,
-    member: String,
     cell: Option<(Cell, u64)>,
     encoder: Encoder,
 }
-
 enum Incoming {
     Local(AbortSignal),
     Relay(RelayId),
+}
+
+/// What [`Actor::send_state`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendState {
+    /// The frame went out.
+    Sent,
+    /// It waits behind the window.
+    Waiting,
+    /// The slot turned lazy: its flush sends a reset, and a relay asks its
+    /// downstream member again.
+    Lazy,
 }
 
 #[derive(Default)]
@@ -650,7 +699,12 @@ struct PendingState {
     base: Option<StateFrame>,
     ops: Vec<Value>,
     size: usize,
+    /// A reset at flush replaces this slot's ops: they are already covered
+    /// (upstream's lazy slots).
+    lazy: bool,
 }
+
+impl Conn {}
 
 struct OutCall {
     reference: RefId,
@@ -688,22 +742,26 @@ struct Conn {
     acked: u64,
     unacked: VecDeque<usize>,
     unacked_bytes: usize,
-    pending: Vec<(u64, PendingState)>,
+    pending: Vec<((u64, String), PendingState)>,
+    /// Bytes of state ops waiting across every stream on this link
+    /// (upstream `#pendingBytes`), capped at `pending_cap`.
+    pending_bytes: usize,
+    /// The cap: `window * 4` when a window is set (upstream `#pendingCap`).
+    pending_cap: usize,
     received: u64,
     mismatched: bool,
-    // consumer side: what this host asked of the peer
+    /// Holds over a client link carry its id as their origin (also when
+    /// relayed), so hosts can tell clients apart: `<incarnation>:<seq>`.
+    origin_tag: Option<String>,
+    /// consumer side: what this host asked of the peer
     remotes: HashMap<u64, RefId>,
     calls: HashMap<u64, OutCall>,
-    subs: HashMap<u64, (RefId, String)>,
     // provider side: what the peer asked of this host
     served: BTreeMap<u64, Served>,
     incoming: HashMap<u64, Incoming>,
-    feeds: HashMap<u64, Feed>,
-    relay_subs: HashMap<u64, RelayId>,
-    // downstream side of relays: ids this host used on this link
+    /// Downstream ends of relays: hold ids this host used on this link.
     relayed_refs: HashMap<u64, RelayId>,
     relayed_calls: HashMap<u64, (RelayId, u64)>,
-    relayed_subs: HashMap<u64, (RelayId, u64)>,
 }
 
 impl Conn {
@@ -743,13 +801,18 @@ struct Relay {
     token: Value,
     input: Value,
     principal: Value,
-    client: bool,
+    /// The client connection the hold came from, when it did: an opaque id
+    /// forwarded downstream.
+    origin_label: Option<String>,
+    /// Whether the origin wants this hold's state.
+    wants_state: bool,
+    /// The origin already has values (a re-hold): its unit is not urgent.
+    again: bool,
     generation: u64,
     down: Option<ConnId>,
     down_id: u64,
     closed: bool,
     calls: BTreeMap<u64, RelayCall>,
-    subs: BTreeMap<u64, (String, Option<u64>)>,
 }
 
 struct RootEntry {
@@ -761,7 +824,6 @@ struct RootEntry {
 
 struct Readable {
     sinks: Vec<(u64, mpsc::UnboundedSender<StateUpdate>)>,
-    sub: Option<(ConnId, u64)>,
     decoder: Decoder,
     value: Option<Value>,
 }
@@ -774,6 +836,9 @@ struct QueuedCall {
 }
 
 struct RemoteState {
+    /// The binding key this state serves (contract, input identity,
+    /// principal): references of one binding share it.
+    key: String,
     contract: Arc<Description>,
     at: String,
     input: Value,
@@ -782,6 +847,23 @@ struct RemoteState {
     binding: Option<(ConnId, u64)>,
     queued: Vec<QueuedCall>,
     readables: BTreeMap<String, Readable>,
+    /// Whether the peer currently believes this hold wants state: the hold
+    /// frame says so (`sub`/`unsub` would move it; noel's holds always
+    /// want state).
+    peer_wants_state: bool,
+    /// The hold is a re-hold after a link loss (the values are not new).
+    again: bool,
+    /// The state members the shape promised, whose snapshots hydrate the
+    /// reference before it is live.
+    pending_snapshots: BTreeSet<String>,
+    /// The shape of the current binding, kept while its snapshots arrive.
+    shape: Option<Shape>,
+    /// The views of this binding: references sharing one hold. The wire
+    /// release goes out when the last view ends.
+    views_handle: Arc<AtomicUsize>,
+    /// Status channels of the views sharing this binding: every change is
+    /// mirrored into each (each view's `ready` waits on its own).
+    mirrors: Vec<watch::Sender<RefStatus>>,
 }
 
 impl RemoteState {
@@ -824,6 +906,15 @@ struct Actor {
     roots: HashMap<String, RootEntry>,
     root_seq: u64,
     incarnation: String,
+    origin_seq: u32,
+    self_principal: Option<Value>,
+    /// The binding key of each reference: references sharing a key share
+    /// one hold on the wire.
+    binding_keys: HashMap<RefId, String>,
+    /// References that share a binding: their id to the binding's id.
+    ref_alias: HashMap<RefId, RefId>,
+    /// The binding's canonical handle parts, shared with its views.
+    binding_handles: HashMap<RefId, Arc<AtomicUsize>>,
     acks_due: BTreeSet<ConnId>,
     later: VecDeque<Later>,
     closed: bool,
@@ -871,6 +962,11 @@ impl Actor {
             roots: HashMap::new(),
             root_seq: 0,
             incarnation: incarnation(),
+            origin_seq: 0,
+            self_principal: options.self_principal.clone(),
+            binding_keys: HashMap::new(),
+            ref_alias: HashMap::new(),
+            binding_handles: HashMap::new(),
             acks_due: BTreeSet::new(),
             later: VecDeque::new(),
             closed: false,
@@ -908,7 +1004,12 @@ impl Actor {
                 root,
                 outcome,
             } => self.call_done(conn, id, &root, outcome),
-            Msg::Cell { conn, sub, change } => self.cell_changed(conn, sub, change),
+            Msg::Cell {
+                conn,
+                sub,
+                member,
+                change,
+            } => self.cell_changed(conn, sub, member, change),
             Msg::RelayStill { relay, reply } => {
                 let _ = reply.send(self.relay_current(relay));
             }
@@ -922,25 +1023,27 @@ impl Actor {
                 principal,
                 status,
             } => self.get(id, contract, at, input, principal, status),
+            // A shared binding's views address it by their own id: every
+            // reference message resolves to the binding first.
             Msg::Call {
                 reference,
                 key,
                 member,
                 args,
                 reply,
-            } => self.ref_call(reference, key, member, args, reply),
-            Msg::Cancel { reference, key } => self.ref_cancel(reference, key),
+            } => self.ref_call(self.binding_of(reference), key, member, args, reply),
+            Msg::Cancel { reference, key } => self.ref_cancel(self.binding_of(reference), key),
             Msg::Subscribe {
                 reference,
                 member,
                 sink,
                 sender,
-            } => self.ref_subscribe(reference, member, sink, sender),
+            } => self.ref_subscribe(self.binding_of(reference), member, sink, sender),
             Msg::Unsubscribe {
                 reference,
                 member,
                 sink,
-            } => self.ref_unsubscribe(reference, &member, sink),
+            } => self.ref_unsubscribe(self.binding_of(reference), &member, sink),
             Msg::Release { reference } => self.ref_release(reference),
             Msg::Invalidate(matching, reply) => {
                 self.invalidate_principal(&matching);
@@ -1081,6 +1184,14 @@ impl Actor {
     ) -> Option<ConnId> {
         let id = self.next_conn;
         self.next_conn += 1;
+        let origin_tag = if role == Role::Downstream && peer_kind == Kind::Client {
+            let incarnation = self.incarnation.clone();
+            Some(format!("{}:{}", incarnation, self.next_origin_seq()))
+        } else {
+            // A relayed client hold keeps its origin; our own holds under
+            // an upstream link carry none.
+            None
+        };
         let conn = Conn {
             link: link.clone(),
             role,
@@ -1105,18 +1216,20 @@ impl Actor {
             unacked: VecDeque::new(),
             unacked_bytes: 0,
             pending: Vec::new(),
+            pending_bytes: 0,
+            pending_cap: options
+                .window
+                .map(|window| window.saturating_mul(PENDING_WINDOWS))
+                .unwrap_or(usize::MAX),
             received: 0,
             mismatched: false,
+            origin_tag,
             remotes: HashMap::new(),
             calls: HashMap::new(),
-            subs: HashMap::new(),
             served: BTreeMap::new(),
             incoming: HashMap::new(),
-            feeds: HashMap::new(),
-            relay_subs: HashMap::new(),
             relayed_refs: HashMap::new(),
             relayed_calls: HashMap::new(),
-            relayed_subs: HashMap::new(),
         };
         self.conns.insert(id, conn);
         self.send(
@@ -1177,44 +1290,86 @@ impl Actor {
         conn.unacked_bytes += size;
     }
 
-    /// Sends a state frame, or keeps it waiting. False: the slot is full;
-    /// send a reset.
-    fn send_state(&mut self, conn_id: ConnId, frame: StateFrame) -> bool {
+    /// Sends a state frame, or keeps it waiting behind a full window. A
+    /// slot whose ops outgrow the link's shared pending budget turns lazy:
+    /// its flush sends the member's current value as a reset instead
+    /// (upstream `sendState` and `#makeRoom`). `Lazy` tells a relay to ask
+    /// downstream for a fresh member (upstream's `overflow.resync`).
+    fn send_state(&mut self, conn_id: ConnId, frame: StateFrame) -> SendState {
         let Some(conn) = self.conns.get_mut(&conn_id) else {
-            return true;
+            return SendState::Sent;
         };
-        let index = conn.pending.iter().position(|(id, _)| *id == frame.id);
+        let key = (frame.hold, frame.m.clone());
+        let index = conn.pending.iter().position(|(slot, _)| *slot == key);
         if index.is_none() && !conn.full() {
             self.send(conn_id, Frame::State(frame));
-            return true;
+            return SendState::Sent;
         }
         let index = match index {
             Some(index) => index,
             None => {
-                conn.pending.push((frame.id, PendingState::default()));
+                conn.pending.push((key, PendingState::default()));
                 conn.pending.len() - 1
             }
         };
-        let window = conn.window.unwrap_or(usize::MAX);
         let slot = &mut conn.pending[index].1;
         let Some(ops) = frame.ops else {
+            conn.pending_bytes = conn.pending_bytes.saturating_sub(slot.size);
             slot.base = Some(frame);
             slot.ops.clear();
             slot.size = 0;
-            return true;
+            slot.lazy = false;
+            return SendState::Waiting;
         };
+        if slot.lazy {
+            return SendState::Lazy;
+        }
         let size = crate::wire::text_size(&serde_json::to_string(&ops).expect("ops are JSON"));
-        if slot.size.saturating_add(size) > window.saturating_mul(PENDING_WINDOWS) {
-            return false;
+        let over = conn.pending_bytes.saturating_add(size) > conn.pending_cap;
+        if over {
+            // Drop waiting streams, oldest first, then this one: each
+            // becomes a lazy reset at flush.
+            let mut order: Vec<usize> = (0..conn.pending.len()).collect();
+            order.retain(|&i| i != index);
+            order.push(index);
+            for i in order {
+                if conn.pending_bytes.saturating_add(size) <= conn.pending_cap {
+                    break;
+                }
+                let slot = &mut conn.pending[i].1;
+                if slot.size == 0 && i != index {
+                    continue;
+                }
+                conn.pending_bytes = conn.pending_bytes.saturating_sub(slot.size);
+                slot.base = None;
+                slot.ops.clear();
+                slot.size = 0;
+                slot.lazy = true;
+            }
+        }
+        let slot = &mut conn.pending[index].1;
+        if slot.lazy {
+            return SendState::Lazy;
         }
         slot.ops.extend(ops);
         slot.size += size;
-        true
+        conn.pending_bytes += size;
+        SendState::Waiting
     }
 
-    fn drop_state(&mut self, conn: ConnId, id: u64) {
+    /// Drops the pending state of one hold (all its members), or of one
+    /// member when `m` names it.
+    fn drop_state(&mut self, conn: ConnId, hold: u64, m: Option<&str>) {
         if let Some(conn) = self.conns.get_mut(&conn) {
-            conn.pending.retain(|(pending, _)| *pending != id);
+            let mut bytes = 0;
+            conn.pending.retain(|(slot, state)| {
+                let drop = slot.0 != hold || m.is_some_and(|m| slot.1 != m);
+                if drop {
+                    bytes += state.size;
+                }
+                !drop
+            });
+            conn.pending_bytes = conn.pending_bytes.saturating_sub(bytes);
         }
     }
 
@@ -1240,7 +1395,8 @@ impl Actor {
             if conn.pending.is_empty() || conn.full() {
                 return;
             }
-            let (id, slot) = conn.pending.remove(0);
+            let ((hold, m), slot) = conn.pending.remove(0);
+            conn.pending_bytes = conn.pending_bytes.saturating_sub(slot.size);
             if let Some(base) = slot.base {
                 self.send(conn_id, Frame::State(base));
             }
@@ -1248,13 +1404,61 @@ impl Actor {
                 self.send(
                     conn_id,
                     Frame::State(StateFrame {
-                        id,
+                        hold,
+                        m,
+                        as_kind: StateAs::Ops,
                         ops: Some(slot.ops),
                         ..StateFrame::default()
                     }),
                 );
+            } else if slot.lazy {
+                // A lazy slot flushes as a reset of the member's current
+                // value, which the provider builds from its object.
+                self.flush_lazy_reset(conn_id, hold, m);
             }
         }
+    }
+
+    /// A lazy slot's flush: the member's current value as a reset.
+    fn flush_lazy_reset(&mut self, conn_id: ConnId, hold: u64, m: String) {
+        let object = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.served.get(&hold))
+            .and_then(|served| match served {
+                Served::Local(local) => Some(local.object.clone()),
+                Served::Relay(_) => None,
+            });
+        let Some(address) = object else { return };
+        let Some(object) = self.objects.get(&address) else {
+            return;
+        };
+        let Some(Member::State(cell)) = object.member(&m) else {
+            return;
+        };
+        let value = cell.value();
+        let schema = self.schema_of(&address, &m);
+        let what = format!("{address}.{m}");
+        let frame = match schema
+            .as_ref()
+            .map(|schema| validate::assert_valid("state", &what, schema, &value))
+        {
+            Some(Err(error)) => StateFrame {
+                hold,
+                m,
+                as_kind: StateAs::Error,
+                error: Some(error.to_wire()),
+                ..StateFrame::default()
+            },
+            _ => StateFrame {
+                hold,
+                m,
+                as_kind: StateAs::Reset,
+                value: Some((*value).clone()),
+                ..StateFrame::default()
+            },
+        };
+        self.send(conn_id, Frame::State(frame));
     }
 
     fn flush_acks(&mut self) {
@@ -1372,8 +1576,20 @@ impl Actor {
                 token,
                 input,
                 principal,
-                client,
-            } => self.on_hold(conn, id, at, token.to_value(), input, principal, client),
+                origin,
+                state,
+                again,
+            } => self.on_hold(
+                conn,
+                id,
+                at,
+                token.to_value(),
+                input,
+                principal,
+                origin,
+                state != Some(false),
+                again == Some(true),
+            ),
             Frame::Release { id } => self.drop_served(conn, id, true),
             Frame::Call {
                 id,
@@ -1383,14 +1599,15 @@ impl Actor {
                 root,
             } => self.on_call(conn, id, hold, member, args, root),
             Frame::Cancel { id } => self.on_cancel(conn, id),
-            Frame::Sub { id, hold, member } => self.on_sub(conn, id, hold, member),
-            Frame::Unsub { id } => self.on_unsub(conn, id),
+            Frame::Sub { hold } => self.on_want_state(conn, hold, true),
+            Frame::Unsub { hold } => self.on_want_state(conn, hold, false),
+            Frame::Resync { hold, m } => self.on_resync(conn, hold, m),
             Frame::Shape {
                 id,
                 variant,
                 members,
                 contract,
-                code_version,
+                state,
             } => self.on_shape(
                 conn,
                 id,
@@ -1398,7 +1615,7 @@ impl Actor {
                     variant,
                     members,
                     contract,
-                    code_version,
+                    state,
                 },
             ),
             Frame::Gone { id, error } => self.on_gone(conn, id, ChordError::from_wire(&error)),
@@ -1575,7 +1792,9 @@ impl Actor {
         token: Value,
         input: Value,
         principal: Option<Value>,
-        client: Option<bool>,
+        origin: Option<String>,
+        wants_state: bool,
+        again: bool,
     ) {
         let Some(conn) = self.conns.get(&conn_id) else {
             return;
@@ -1587,7 +1806,7 @@ impl Actor {
         let principal = self.principal_of(conn, principal);
         let is_client = match conn.role {
             Role::Downstream => conn.peer_kind == Kind::Client,
-            Role::Upstream => client == Some(true),
+            Role::Upstream => origin.is_some(),
         };
         if at != self.name {
             if conn.role == Role::Upstream {
@@ -1604,6 +1823,12 @@ impl Actor {
             let relay_id = self.next_relay;
             self.next_relay += 1;
             let generation = conn.generation;
+            // A hold from a client carries that connection's origin; a
+            // forwarded one keeps what it came with.
+            let origin_label = match conn.role {
+                Role::Downstream if conn.peer_kind == Kind::Client => conn.origin_tag.clone(),
+                _ => origin.clone(),
+            };
             self.relays.insert(
                 relay_id,
                 Relay {
@@ -1613,13 +1838,14 @@ impl Actor {
                     token,
                     input,
                     principal,
-                    client: is_client,
+                    origin_label,
+                    wants_state,
+                    again,
                     generation,
                     down: None,
                     down_id: 0,
                     closed: false,
                     calls: BTreeMap::new(),
-                    subs: BTreeMap::new(),
                 },
             );
             if let Some(conn) = self.conns.get_mut(&conn_id) {
@@ -1630,9 +1856,31 @@ impl Actor {
         }
         match self.acquire(&token, &input, &principal) {
             Ok((address, consumer)) => {
+                // The provider's own placement decides, never where the
+                // frame says it is going.
+                let description = self
+                    .objects
+                    .get(&address)
+                    .map(|object| object.service.description.clone())
+                    .expect("acquired");
+                if let Some(placement) = &description.host {
+                    if placement.resolve(&description.name, &input) != Ok(at.clone()) {
+                        let error = ChordError::invalid(
+                            "placement",
+                            format!("{} is not placed on {at}", description.name),
+                        );
+                        self.send(
+                            conn_id,
+                            Frame::Gone {
+                                id,
+                                error: error.to_wire(),
+                            },
+                        );
+                        return;
+                    }
+                }
                 let object = self.objects.get_mut(&address).expect("acquired");
                 object.holders.push((conn_id, id));
-                let shape = shape_of(object);
                 let event = HostEvent::Held {
                     link: conn_id,
                     id,
@@ -1646,22 +1894,16 @@ impl Actor {
                         Served::Local(LocalHold {
                             object: address,
                             principal,
-                            feeds: BTreeSet::new(),
+                            wants_state,
+                            again,
+                            unit_sent: false,
+                            feeds: BTreeMap::new(),
                             consumer,
                         }),
                     );
                 }
                 self.observe(event);
-                self.send(
-                    conn_id,
-                    Frame::Shape {
-                        id,
-                        variant: shape.variant,
-                        members: shape.members,
-                        contract: shape.contract,
-                        code_version: shape.code_version,
-                    },
-                );
+                self.send_unit(conn_id, id);
             }
             Err(error) => {
                 let error = if is_client {
@@ -1749,9 +1991,10 @@ impl Actor {
                 self.relay_close(relay, error, release, false);
             }
             Served::Local(hold) => {
-                for feed in hold.feeds {
-                    self.on_unsub(conn_id, feed);
+                for name in hold.feeds.keys().cloned().collect::<Vec<_>>() {
+                    self.detach_feed(conn_id, id, &hold.object, &name);
                 }
+                self.drop_state(conn_id, id, None);
                 if let Some(object) = self.objects.get(&hold.object) {
                     self.observe(HostEvent::Released {
                         link: conn_id,
@@ -2083,198 +2326,324 @@ impl Actor {
         }
     }
 
-    fn on_sub(&mut self, conn_id: ConnId, id: u64, hold: u64, member: String) {
-        let Some(conn) = self.conns.get(&conn_id) else {
-            return;
-        };
-        if conn.feeds.contains_key(&id) || conn.relay_subs.contains_key(&id) {
-            self.violation(conn_id, &format!("duplicate sub id {id}"));
-            return;
-        }
-        let (address, consumer) = match conn.served.get(&hold) {
-            None => {
-                let error = ChordError::gone("unknown hold");
-                self.send_state(
-                    conn_id,
-                    StateFrame {
-                        id,
-                        error: Some(error.to_wire()),
-                        ..StateFrame::default()
-                    },
-                );
-                return;
-            }
-            Some(Served::Relay(relay)) => {
-                let relay = *relay;
-                self.relay_subscribe(relay, id, member);
-                return;
-            }
-            Some(Served::Local(local)) => (local.object.clone(), local.consumer.clone()),
-        };
-        let Some(object) = self.objects.get(&address) else {
-            return;
-        };
-        let declared = consumer
-            .variants
-            .iter()
-            .find_map(|(_, members)| members.get(&member))
-            .cloned();
-        let implemented = object.member(&member).cloned();
-        let readable = match &declared {
-            Some(MemberDescription::State { .. }) => true,
-            None => matches!(implemented, Some(Member::State(_))),
-            Some(_) => false,
-        };
-        if !readable {
-            let error = ChordError::new(ErrorCode::NotInVariant, format!("{member} is not state"));
-            self.send_state(
-                conn_id,
-                StateFrame {
-                    id,
-                    error: Some(error.to_wire()),
-                    ..StateFrame::default()
-                },
-            );
-            return;
-        }
-        // Only a member of the consumer's view of the current variant has a source.
+    /// The state members of the current shape the consumer's contract
+    /// knows, in the shape's order.
+    fn state_members(consumer: &Description, object: &Object) -> Vec<String> {
         let variant = object.variant.clone().unwrap_or_default();
-        let in_variant = consumer
-            .variants
-            .get(&variant)
-            .is_some_and(|members| members.contains_key(&member));
-        let cell = match implemented {
-            Some(Member::State(cell)) if in_variant => Some(cell),
-            _ => None,
+        object
+            .members
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|name| {
+                consumer
+                    .variants
+                    .get(&variant)
+                    .is_some_and(|members| members.contains_key(name))
+                    && matches!(
+                        consumer.variants.get(&variant).and_then(|m| m.get(name)),
+                        Some(MemberDescription::State { .. })
+                    )
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The shape changed, state was asked for, or the hold is new: members
+    /// that left lose their feed, and a unit goes out with the shape and
+    /// the members the consumer lacks.
+    fn send_unit(&mut self, conn_id: ConnId, hold: u64) {
+        let summary = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.served.get(&hold))
+            .and_then(Served::summary);
+        let Some(summary) = summary else { return };
+        let Some(object) = self.objects.get(&summary.object) else {
+            return;
         };
-        let schema = object
-            .service
-            .description
-            .variants
-            .get(&variant)
-            .and_then(|members| members.get(&member))
-            .and_then(|description| match description {
-                MemberDescription::State { schema } => Some(schema.clone()),
+        let consumer = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.served.get(&hold))
+            .and_then(|served| match served {
+                Served::Local(local) => Some(local.consumer.clone()),
                 _ => None,
             });
-        let what = format!("{address}.{member}");
-        let mut feed = Feed {
-            object: address,
-            member: member.clone(),
-            cell: None,
-            encoder: Encoder::new(),
-        };
-        let mut snapshot = None;
-        if let Some(cell) = cell {
-            let tx = self.tx.clone();
-            let listener = cell.listen(Arc::new(move |change: &CellChange| {
-                if let Some(tx) = tx.upgrade() {
-                    let _ = tx.send(Msg::Cell {
-                        conn: conn_id,
-                        sub: id,
-                        change: change.clone(),
-                    });
-                }
-            }));
-            snapshot = Some(listener.1);
-            feed.cell = Some((cell, listener.0));
+        let Some(consumer) = consumer else { return };
+        let members = Self::state_members(&consumer, object)
+            .into_iter()
+            .filter(|_| summary.wants_state)
+            .collect::<Vec<_>>();
+        for name in summary.members.clone() {
+            if members.contains(&name) {
+                continue;
+            }
+            self.detach_feed(conn_id, hold, &summary.object, &name);
         }
-        let Some(conn) = self.conns.get_mut(&conn_id) else {
-            return;
-        };
-        conn.feeds.insert(id, feed);
-        if let Some(Served::Local(local)) = conn.served.get_mut(&hold) {
-            local.feeds.insert(id);
+        let listed: Vec<String> = members
+            .iter()
+            .filter(|name| !summary.members.contains(name))
+            .cloned()
+            .collect();
+        let again = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.served.get(&hold))
+            .is_some_and(|served| matches!(served, Served::Local(l) if l.again));
+        let mut snaps = Vec::new();
+        for name in &listed {
+            if let Some(frame) = self.attach(conn_id, hold, &summary.object, name) {
+                snaps.push(frame);
+            }
         }
-        if let Some(value) = snapshot {
-            // Snapshots are validated once per (re)subscription.
-            let frame = match schema
-                .as_ref()
-                .map(|schema| validate::assert_valid("state", &what, schema, &value))
-            {
-                Some(Err(error)) => StateFrame {
-                    id,
-                    error: Some(error.to_wire()),
-                    ..StateFrame::default()
-                },
-                _ => StateFrame {
-                    id,
-                    snap: Some((*value).clone()),
-                    ..StateFrame::default()
-                },
-            };
+        let _ = again;
+        if let Some(Served::Local(local)) = self
+            .conns
+            .get_mut(&conn_id)
+            .and_then(|c| c.served.get_mut(&hold))
+        {
+            local.unit_sent = true;
+        }
+        let shape = self.objects.get(&summary.object).map(shape_of);
+        let Some(shape) = shape else { return };
+        self.send(
+            conn_id,
+            Frame::Shape {
+                id: hold,
+                variant: shape.variant.clone(),
+                members: shape.members.clone(),
+                contract: shape.contract.clone(),
+                state: snaps.iter().map(|frame| frame.m.clone()).collect(),
+            },
+        );
+        for frame in snaps {
             self.send_state(conn_id, frame);
         }
     }
 
-    /// A cell a feed follows changed.
-    fn cell_changed(&mut self, conn_id: ConnId, sub: u64, change: CellChange) {
-        let Some(conn) = self.conns.get_mut(&conn_id) else {
-            return;
+    /// Subscribes member `name` for the consumer: its snapshot (as a frame
+    /// of kind `as`), and the feed into the object's cell. `None` if the
+    /// member is not readable state.
+    fn attach(
+        &mut self,
+        conn_id: ConnId,
+        hold_id: u64,
+        address: &str,
+        name: &str,
+    ) -> Option<StateFrame> {
+        let object = self.objects.get(address)?;
+        let cell = match object.member(name) {
+            Some(Member::State(cell)) => cell.clone(),
+            _ => return None,
         };
-        let Some(feed) = conn.feeds.get_mut(&sub) else {
-            return;
-        };
-        let encoded = feed.encoder.encode(&change.ops);
-        if self.send_state(
-            conn_id,
-            StateFrame {
-                id: sub,
-                ops: Some(encoded),
-                ..StateFrame::default()
-            },
-        ) {
-            return;
+        let (listener, snapshot) = cell.listen(Arc::new({
+            let tx = self.tx.clone();
+            let member = name.to_owned();
+            move |change: &CellChange| {
+                if let Some(tx) = tx.upgrade() {
+                    let _ = tx.send(Msg::Cell {
+                        conn: conn_id,
+                        sub: hold_id,
+                        member: member.clone(),
+                        change: change.clone(),
+                    });
+                }
+            }
+        }));
+        // Remember the listener with the feed.
+        if let Some(Served::Local(local)) = self
+            .conns
+            .get_mut(&conn_id)
+            .and_then(|conn| conn.served.get_mut(&hold_id))
+        {
+            local.feeds.insert(
+                name.to_owned(),
+                Feed {
+                    cell: Some((cell, listener)),
+                    encoder: Encoder::new(),
+                },
+            );
         }
-        // Too many ops wait for a slow peer: the current value replaces them.
-        let Some(conn) = self.conns.get_mut(&conn_id) else {
-            return;
-        };
-        let Some(feed) = conn.feeds.get_mut(&sub) else {
-            return;
-        };
-        feed.encoder = Encoder::new();
-        let schema = self.objects.get(&feed.object).and_then(|object| {
-            object
-                .service
-                .description
-                .variants
-                .get(&object.variant.clone().unwrap_or_default())
-                .and_then(|members| members.get(&feed.member))
-                .and_then(|description| match description {
-                    MemberDescription::State { schema } => Some(schema.clone()),
-                    _ => None,
-                })
-        });
+        let schema = self.schema_of(address, name);
+        let what = format!("{address}.{name}");
         let frame = match schema
-            .map(|schema| validate::assert_valid("state", &feed.member, &schema, &change.value))
+            .as_ref()
+            .map(|schema| validate::assert_valid("state", &what, schema, &snapshot))
         {
             Some(Err(error)) => StateFrame {
-                id: sub,
+                hold: hold_id,
+                m: name.to_owned(),
+                as_kind: StateAs::Error,
                 error: Some(error.to_wire()),
                 ..StateFrame::default()
             },
             _ => StateFrame {
-                id: sub,
-                reset: Some((*change.value).clone()),
+                hold: hold_id,
+                m: name.to_owned(),
+                as_kind: StateAs::Snap,
+                value: Some((*snapshot).clone()),
                 ..StateFrame::default()
             },
         };
-        self.send_state(conn_id, frame);
+        Some(frame)
     }
 
-    fn on_unsub(&mut self, conn_id: ConnId, id: u64) {
-        self.drop_state(conn_id, id);
-        let Some(conn) = self.conns.get_mut(&conn_id) else {
+    /// Stops the feed of one member.
+    /// Stops the feed of one member of one hold: the hold's own, never
+    /// another hold of the same object.
+    fn detach_feed(&mut self, conn_id: ConnId, hold_id: u64, address: &str, name: &str) {
+        let Some(Served::Local(local)) = self
+            .conns
+            .get_mut(&conn_id)
+            .and_then(|conn| conn.served.get_mut(&hold_id))
+        else {
             return;
         };
-        if let Some(feed) = conn.feeds.remove(&id) {
+        if local.object != address {
+            return;
+        }
+        if let Some(feed) = local.feeds.remove(name) {
             if let Some((cell, listener)) = feed.cell {
                 cell.unlisten(listener);
             }
         }
-        if let Some(relay) = conn.relay_subs.get(&id).copied() {
-            self.relay_unsubscribe(relay, id, true);
+    }
+
+    fn schema_of(&self, address: &str, name: &str) -> Option<Value> {
+        let object = self.objects.get(address)?;
+        let variant = object.variant.clone().unwrap_or_default();
+        object
+            .service
+            .description
+            .variants
+            .get(&variant)
+            .and_then(|members| members.get(name))
+            .and_then(|description| match description {
+                MemberDescription::State { schema } => Some(schema.clone()),
+                _ => None,
+            })
+    }
+
+    /// A cell under one of this connection's holds changed.
+    fn cell_changed(&mut self, conn_id: ConnId, hold: u64, member: String, change: CellChange) {
+        let has_feed = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.served.get(&hold))
+            .is_some_and(
+                |served| matches!(&served, Served::Local(l) if l.feeds.contains_key(&member)),
+            );
+        if !has_feed {
+            return;
+        }
+        let encoded = {
+            let Some(Served::Local(local)) = self
+                .conns
+                .get_mut(&conn_id)
+                .and_then(|conn| conn.served.get_mut(&hold))
+            else {
+                return;
+            };
+            let Some(feed) = local.feeds.get_mut(&member) else {
+                return;
+            };
+            feed.encoder.encode(&change.ops)
+        };
+        if self.send_state(
+            conn_id,
+            StateFrame {
+                hold,
+                m: member.clone(),
+                as_kind: StateAs::Ops,
+                ops: Some(encoded),
+                ..StateFrame::default()
+            },
+        ) != SendState::Lazy
+        {
+            return;
+        }
+        // The slot turned lazy: the flush sends the current value as a
+        // reset; nothing more goes out for it now. The feed's encoder
+        // starts over, so ops after the reset encode from it.
+        if let Some(Served::Local(local)) = self
+            .conns
+            .get_mut(&conn_id)
+            .and_then(|conn| conn.served.get_mut(&hold))
+        {
+            if let Some(feed) = local.feeds.get_mut(&member) {
+                feed.encoder = Encoder::new();
+            }
+        }
+    }
+
+    /// The consumer starts (`sub`) or stops (`unsub`) the state of a hold.
+    fn on_want_state(&mut self, conn_id: ConnId, hold: u64, wanted: bool) {
+        let relay = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.served.get(&hold))
+            .and_then(|served| match served {
+                Served::Relay(relay) => Some(*relay),
+                _ => None,
+            });
+        if let Some(relay) = relay {
+            self.relay_want_state(relay, wanted);
+            return;
+        }
+        let object = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.served.get(&hold))
+            .and_then(|served| match served {
+                Served::Local(local) => Some(local.object.clone()),
+                _ => None,
+            });
+        let Some(object) = object else { return };
+        let already = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.served.get(&hold))
+            .is_some_and(|served| matches!(&served, Served::Local(l) if l.wants_state == wanted));
+        if already {
+            return;
+        }
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            if let Some(Served::Local(l)) = conn.served.get_mut(&hold) {
+                l.wants_state = wanted;
+            }
+        }
+        if wanted {
+            self.send_unit(conn_id, hold);
+        } else {
+            let members = self
+                .conns
+                .get(&conn_id)
+                .and_then(|conn| conn.served.get(&hold))
+                .and_then(|served| match served {
+                    Served::Local(local) => Some(local.feeds.keys().cloned().collect::<Vec<_>>()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            for name in members {
+                self.detach_feed(conn_id, hold, &object, &name);
+            }
+            self.drop_state(conn_id, hold, None);
+        }
+    }
+
+    /// The consumer (a relay that dropped ops) asks for member `m` again as
+    /// a reset.
+    fn on_resync(&mut self, conn_id: ConnId, hold: u64, m: String) {
+        let relay = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.served.get(&hold))
+            .and_then(|served| match served {
+                Served::Relay(relay) => Some(*relay),
+                _ => None,
+            });
+        if let Some(relay) = relay {
+            self.relay_resync_member(relay, m);
         }
     }
 
@@ -2297,7 +2666,7 @@ impl Actor {
                         variant: shape.variant,
                         members: shape.members,
                         contract: shape.contract,
-                        code_version: shape.code_version,
+                        state: shape.state,
                     },
                 );
             }
@@ -2354,28 +2723,36 @@ impl Actor {
     }
 
     fn on_state(&mut self, conn_id: ConnId, frame: StateFrame) {
-        let Some(conn) = self.conns.get(&conn_id) else {
-            return;
-        };
-        if let Some((relay, origin_sub)) = conn.relayed_subs.get(&frame.id).copied() {
-            let Some(origin) = self.relays.get(&relay).map(|relay| relay.origin) else {
-                return;
+        // A relayed hold's state: the same member frame goes to the origin,
+        // under the origin's hold id.
+        let relayed = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.relayed_refs.get(&frame.hold).copied())
+            .and_then(|relay| {
+                self.relays
+                    .get(&relay)
+                    .map(|state| (relay, state.origin, state.origin_id))
+            });
+        if let Some((relay, origin, origin_id)) = relayed {
+            let m = frame.m.clone();
+            let forwarded = StateFrame {
+                hold: origin_id,
+                ..frame
             };
-            if !self.send_state(
-                origin,
-                StateFrame {
-                    id: origin_sub,
-                    ..frame
-                },
-            ) {
-                self.relay_resync(relay, origin_sub);
+            if self.send_state(origin, forwarded) == SendState::Lazy {
+                self.relay_resync_member(relay, m);
             }
             return;
         }
-        let Some((reference, member)) = conn.subs.get(&frame.id).cloned() else {
+        let Some(reference) = self
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.remotes.get(&frame.hold).copied())
+        else {
             return;
         };
-        self.readable_receive(reference, &member, frame);
+        self.readable_receive(reference, frame);
     }
 
     // ─── lifetime ───
@@ -2410,7 +2787,6 @@ impl Actor {
             }
         }
         let calls: Vec<OutCall> = conn.calls.drain().map(|(_, call)| call).collect();
-        conn.subs.clear();
         let waiters = std::mem::take(&mut conn.sync_waiters);
         let relayed: Vec<RelayId> = conn.relayed_refs.values().copied().collect();
         let remotes: Vec<RefId> = conn
@@ -2438,7 +2814,6 @@ impl Actor {
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.relayed_refs.clear();
             conn.relayed_calls.clear();
-            conn.relayed_subs.clear();
         }
         for reference in remotes {
             // An upstream link may be replaced; a downstream host that went away is gone.
@@ -2579,6 +2954,12 @@ impl Actor {
     }
 
     // ─── roots ───
+
+    /// The next client-origin sequence number (upstream `#originSeq`).
+    fn next_origin_seq(&mut self) -> u32 {
+        self.origin_seq += 1;
+        self.origin_seq
+    }
 
     fn root_start(&mut self) -> String {
         self.root_seq += 1;
@@ -2804,20 +3185,19 @@ impl Actor {
         let relay = self.relays.get_mut(&relay_id).expect("checked");
         relay.down = Some(down);
         relay.down_id = down_id;
+        let wants_state = relay.wants_state;
+        let again = relay.again;
+        let origin_label = relay.origin_label.clone();
         let frame = Frame::Hold {
             id: down_id,
             at: relay.at.clone(),
             token: Token::Value(relay.token.clone()),
             input: relay.input.clone(),
             principal: Some(relay.principal.clone()),
-            client: relay.client.then_some(true),
+            origin: origin_label,
+            state: (!wants_state).then_some(false),
+            again: again.then_some(true),
         };
-        let queued_subs: Vec<u64> = relay
-            .subs
-            .iter()
-            .filter(|(_, (_, down_id))| down_id.is_none())
-            .map(|(origin_sub, _)| *origin_sub)
-            .collect();
         let queued_calls: Vec<u64> = relay
             .calls
             .iter()
@@ -2825,103 +3205,47 @@ impl Actor {
             .map(|(origin_id, _)| *origin_id)
             .collect();
         self.send(down, frame);
-        for origin_sub in queued_subs {
-            self.relay_forward_sub(relay_id, origin_sub);
-        }
         for origin_id in queued_calls {
             self.relay_forward_call(relay_id, origin_id);
         }
     }
 
-    fn relay_subscribe(&mut self, relay_id: RelayId, origin_sub: u64, member: String) {
+    /// The origin starts or stops the state of a relayed hold.
+    fn relay_want_state(&mut self, relay_id: RelayId, wanted: bool) {
         let Some(relay) = self.relays.get_mut(&relay_id) else {
             return;
         };
-        relay.subs.insert(origin_sub, (member, None));
-        let (origin, open) = (relay.origin, relay.down.is_some());
-        if let Some(conn) = self.conns.get_mut(&origin) {
-            conn.relay_subs.insert(origin_sub, relay_id);
+        if relay.wants_state == wanted {
+            return;
         }
-        if open {
-            self.relay_forward_sub(relay_id, origin_sub);
-        }
-    }
-
-    fn relay_forward_sub(&mut self, relay_id: RelayId, origin_sub: u64) {
-        let Some(relay) = self.relays.get(&relay_id) else {
-            return;
-        };
-        let (Some(down), hold) = (relay.down, relay.down_id) else {
-            return;
-        };
-        let Some((member, _)) = relay.subs.get(&origin_sub).cloned() else {
-            return;
-        };
+        relay.wants_state = wanted;
+        let Some(down) = relay.down else { return };
         let Some(conn) = self.conns.get_mut(&down) else {
             return;
         };
-        let down_id = conn.next_id();
-        conn.relayed_subs.insert(down_id, (relay_id, origin_sub));
-        if let Some(entry) = self
-            .relays
-            .get_mut(&relay_id)
-            .and_then(|relay| relay.subs.get_mut(&origin_sub))
-        {
-            entry.1 = Some(down_id);
-        }
-        self.send(
-            down,
+        conn.link.send(&if wanted {
             Frame::Sub {
-                id: down_id,
-                hold,
-                member,
-            },
-        );
+                hold: relay.down_id,
+            }
+        } else {
+            Frame::Unsub {
+                hold: relay.down_id,
+            }
+        });
     }
 
-    /// The origin could not keep up and dropped what waited: subscribe
-    /// downstream anew, so the provider's snapshot replaces the lost ops.
-    fn relay_resync(&mut self, relay_id: RelayId, origin_sub: u64) {
+    /// The origin could not keep up and dropped what waited: member `m`
+    /// goes downstream again as a reset.
+    fn relay_resync_member(&mut self, relay_id: RelayId, m: String) {
         let Some(relay) = self.relays.get(&relay_id) else {
             return;
         };
+        let Some(down) = relay.down else { return };
+        let down_id = relay.down_id;
         let origin = relay.origin;
-        let entry = relay
-            .subs
-            .get(&origin_sub)
-            .and_then(|(_, down_id)| *down_id);
-        let down = relay.down;
-        self.drop_state(origin, origin_sub);
-        let (Some(old), Some(down)) = (entry, down) else {
-            return;
-        };
-        if let Some(conn) = self.conns.get_mut(&down) {
-            conn.relayed_subs.remove(&old);
-        }
-        self.send(down, Frame::Unsub { id: old });
-        self.relay_forward_sub(relay_id, origin_sub);
-    }
-
-    fn relay_unsubscribe(&mut self, relay_id: RelayId, origin_sub: u64, forward: bool) {
-        let Some(relay) = self.relays.get_mut(&relay_id) else {
-            return;
-        };
-        let Some((_, down_id)) = relay.subs.remove(&origin_sub) else {
-            return;
-        };
-        let (origin, down) = (relay.origin, relay.down);
-        if let Some(conn) = self.conns.get_mut(&origin) {
-            conn.relay_subs.remove(&origin_sub);
-        }
-        self.drop_state(origin, origin_sub);
-        if let (Some(down_id), Some(down)) = (down_id, down) {
-            if let Some(conn) = self.conns.get_mut(&down) {
-                conn.relayed_subs.remove(&down_id);
-            }
-            if forward {
-                self.send(down, Frame::Unsub { id: down_id });
-            }
-        }
+        let origin_id = relay.origin_id;
+        self.drop_state(origin, origin_id, Some(&m));
+        self.send(down, Frame::Resync { hold: down_id, m });
     }
 
     fn relay_call(
@@ -3071,14 +3395,10 @@ impl Actor {
         }
         relay.closed = true;
         let calls: Vec<u64> = relay.calls.keys().copied().collect();
-        let subs: Vec<u64> = relay.subs.keys().copied().collect();
         let (origin, origin_id, down, down_id) =
             (relay.origin, relay.origin_id, relay.down, relay.down_id);
         for call in calls {
             self.relay_call_cancel(relay_id, call, error.clone(), release_down);
-        }
-        for sub in subs {
-            self.relay_unsubscribe(relay_id, sub, release_down);
         }
         if let Some(conn) = self.conns.get_mut(&origin) {
             if matches!(conn.served.get(&origin_id), Some(Served::Relay(id)) if *id == relay_id) {
@@ -3149,9 +3469,85 @@ impl Actor {
         principal: Option<Value>,
         status: watch::Sender<RefStatus>,
     ) {
+        // The consumer normalizes with its own contract before anything is
+        // sent: an input it cannot express never reaches the wire (upstream
+        // `acquire` throws).
+        let input =
+            match validate::normalize(&contract.input, &input, &format!("{} input", contract.name))
+            {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    self.ref_gone_nosend(id, error);
+                    return;
+                }
+            };
+        // The consumer's own placement decides where the hold goes (upstream
+        // `#elsewhere`): never where a caller says it is going. A token
+        // without a placement (an old peer's) keeps the caller's `at`.
+        let at = match &contract.host {
+            Some(placement) => match placement.resolve(&contract.name, &input) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let error = ChordError::invalid("placement", error.to_string());
+                    self.ref_gone_nosend(id, error);
+                    return;
+                }
+            },
+            None => at,
+        };
+        // A hold the host's own principal asks for forwards no principal
+        // (upstream `isSelf`): it acts as itself, so references of the host
+        // and of a caller asking for the host's principal share one binding.
+        let principal = principal.filter(|principal| {
+            !self
+                .self_principal
+                .as_ref()
+                .is_some_and(|self_principal| self_principal == principal)
+        });
+        // A binding for the same (contract, input, principal) is shared: a
+        // new reference is another view of it (upstream's bindings), and
+        // only the last view's release reaches the wire.
+        let key = format!(
+            "{}\u{0}{}\u{0}p:{}",
+            contract.fingerprint(),
+            validate::canonical_identity(&contract.input, &input),
+            canonical_json(&principal.clone().unwrap_or_else(|| json!({"self": true})))
+        );
+        // A binding for this key already holds: the new reference is a view
+        // of it. Its status mirrors the binding's, and its release ends a
+        // view (the binding's handle counts them).
+        if let Some((binding, handle)) = self
+            .refs
+            .iter()
+            .find(|(_binding, state)| {
+                state.key == key
+                    && !matches!(state.status(), RefStatus::Gone(_))
+                    && !matches!(state.status(), RefStatus::Released)
+            })
+            .map(|(binding, state)| (*binding, state.views_handle.clone()))
+        {
+            handle.fetch_add(1, Ordering::SeqCst);
+            self.ref_alias.insert(id, binding);
+            self.binding_keys.insert(id, key);
+            if let Some(state) = self.refs.get_mut(&binding) {
+                let current = state.status();
+                status.send_replace(current);
+                state.mirrors.push(status);
+                if let Some((conn, hold)) = state.binding {
+                    if let Some(conn_state) = self.conns.get_mut(&conn) {
+                        conn_state.remotes.insert(hold, binding);
+                    }
+                }
+            }
+            return;
+        }
+        let views_handle = Arc::new(AtomicUsize::new(1));
+        self.binding_handles.insert(id, views_handle.clone());
+        self.binding_keys.insert(id, key.clone());
         self.refs.insert(
             id,
             RemoteState {
+                key: key.clone(),
                 contract: contract.clone(),
                 at: at.clone(),
                 input,
@@ -3160,6 +3556,12 @@ impl Actor {
                 binding: None,
                 queued: Vec::new(),
                 readables: BTreeMap::new(),
+                peer_wants_state: true,
+                again: false,
+                pending_snapshots: BTreeSet::new(),
+                shape: None,
+                views_handle,
+                mirrors: Vec::new(),
             },
         );
         if contract.scope != Scope::Remote {
@@ -3248,15 +3650,41 @@ impl Actor {
         let id = conn.next_id();
         conn.remotes.insert(id, reference);
         state.binding = Some((conn_id, id));
+        state.peer_wants_state = true;
+        // A hold asking for the host's own principal forwards none: it acts
+        // as itself (upstream `isSelf`).
+        let principal = state.principal.clone().filter(|principal| {
+            !self
+                .self_principal
+                .as_ref()
+                .is_some_and(|self_principal| self_principal == principal)
+        });
         let frame = Frame::Hold {
             id,
             at: state.at.clone(),
             token: Token::Description(state.contract.clone()),
             input: state.input.clone(),
-            principal: state.principal.clone(),
-            client: None,
+            principal,
+            origin: None,
+            state: None,
+            again: state.again.then_some(true),
         };
         self.send(conn_id, frame);
+    }
+
+    /// Settles a reference that was never sent: an invalid input found
+    /// before anything went on the wire.
+    fn ref_gone_nosend(&mut self, reference: RefId, error: ChordError) {
+        let queued = self
+            .refs
+            .get_mut(&reference)
+            .map(|state| std::mem::take(&mut state.queued));
+        let Some(queued) = queued else { return };
+        self.set_ref_status(reference, RefStatus::Gone(error.clone()));
+        for call in queued {
+            let _ = call.reply.send(Err(error.clone()));
+        }
+        self.refs.remove(&reference);
     }
 
     fn ref_shaped(&mut self, reference: RefId, shape: Shape) {
@@ -3266,11 +3694,36 @@ impl Actor {
         if state.settled() {
             return;
         }
-        state.status.send_replace(RefStatus::Live(shape));
-        let members: Vec<String> = state.readables.keys().cloned().collect();
-        for member in members {
-            self.readable_bind(reference, &member);
+        // The reference is live once every promised snapshot is here; a
+        // shape without state members hydrates at once.
+        let promised = shape.state.clone();
+        let ready = promised.is_empty();
+        state.pending_snapshots = promised.into_iter().collect();
+        state.shape = Some(shape);
+        if ready {
+            self.hydrate(reference);
         }
+    }
+
+    /// The last promised snapshot arrived: the shape's reference goes live.
+    fn hydrate(&mut self, reference: RefId) {
+        let shape = {
+            let Some(state) = self.refs.get(&reference) else {
+                return;
+            };
+            state.shape.clone()
+        };
+        let Some(shape) = shape else { return };
+        if let Some(state) = self.refs.get_mut(&reference) {
+            if !state.settled() {
+                self.set_ref_status(reference, RefStatus::Live(shape));
+            }
+        }
+        self.ref_live(reference);
+    }
+
+    /// The reference became live: its queued calls go out.
+    fn ref_live(&mut self, reference: RefId) {
         let queued = self
             .refs
             .get_mut(&reference)
@@ -3282,15 +3735,20 @@ impl Actor {
     }
 
     fn ref_gone(&mut self, reference: RefId, error: ChordError) {
-        let Some(state) = self.refs.get_mut(&reference) else {
+        let settled = self.refs.get(&reference).map(|state| state.settled());
+        let Some(false) = settled else {
             return;
         };
-        if state.settled() {
-            return;
+        let queued = self
+            .refs
+            .get_mut(&reference)
+            .map(|state| std::mem::take(&mut state.queued));
+        self.set_ref_status(reference, RefStatus::Gone(error.clone()));
+        if let Some(state) = self.refs.get_mut(&reference) {
+            state.binding = None;
         }
-        state.status.send_replace(RefStatus::Gone(error.clone()));
-        state.binding = None;
-        for call in std::mem::take(&mut state.queued) {
+        let queued = queued.unwrap_or_default();
+        for call in queued {
             let _ = call.reply.send(Err(error.clone()));
         }
         self.readables_stop(reference);
@@ -3306,37 +3764,81 @@ impl Actor {
             return;
         }
         state.binding = None;
-        for readable in state.readables.values_mut() {
-            readable.sub = None;
-        }
+        state.again = true;
         if matches!(state.status(), RefStatus::Live(_)) {
-            state.status.send_replace(RefStatus::Loading);
+            self.set_ref_status(reference, RefStatus::Loading);
         }
     }
 
-    fn ref_release(&mut self, reference: RefId) {
+    /// Sets a binding's status, mirrored into every view's channel.
+    fn set_ref_status(&mut self, reference: RefId, status: RefStatus) {
         let Some(state) = self.refs.get_mut(&reference) else {
             return;
         };
-        if state.settled() {
+        state.status.send_replace(status.clone());
+        for mirror in std::mem::take(&mut state.mirrors) {
+            mirror.send_replace(status.clone());
+            if let Some(state) = self.refs.get_mut(&reference) {
+                if !state.mirrors.iter().any(|m| m.same_channel(&mirror)) {
+                    state.mirrors.push(mirror);
+                }
+            }
+        }
+    }
+
+    /// The binding a reference addresses: itself, or the binding it
+    /// shares.
+    fn binding_of(&self, reference: RefId) -> RefId {
+        self.ref_alias.get(&reference).copied().unwrap_or(reference)
+    }
+
+    fn ref_release(&mut self, reference: RefId) {
+        // A view of a shared binding ends here; the binding (and its wire
+        // hold) ends when the last view leaves.
+        if let Some(binding) = self.ref_alias.get(&reference).copied() {
+            self.ref_alias.remove(&reference);
+            self.binding_keys.remove(&reference);
+            if let Some(handle) = self.binding_handles.get(&binding) {
+                if handle.fetch_sub(1, Ordering::SeqCst) > 1 {
+                    return;
+                }
+            }
+            self.ref_release_binding(binding);
             return;
         }
-        state.status.send_replace(RefStatus::Released);
+        self.ref_release_binding(reference);
+    }
+
+    fn ref_release_binding(&mut self, reference: RefId) {
+        let settled = self.refs.get(&reference).map(|state| state.settled());
+        let Some(false) = settled else {
+            return;
+        };
+        let queued = self
+            .refs
+            .get_mut(&reference)
+            .map(|state| std::mem::take(&mut state.queued));
+        self.set_ref_status(reference, RefStatus::Released);
         let released = ChordError::new(ErrorCode::Released, "reference released");
-        for call in std::mem::take(&mut state.queued) {
+        for call in queued.unwrap_or_default() {
             let _ = call.reply.send(Err(released.clone()));
         }
-        self.readables_stop(reference);
-        let Some(state) = self.refs.get_mut(&reference) else {
-            return;
-        };
-        if let Some((conn, id)) = state.binding.take() {
-            if let Some(conn_state) = self.conns.get_mut(&conn) {
-                conn_state.remotes.remove(&id);
+        if let Some(state) = self.refs.get_mut(&reference) {
+            for readable in state.readables.values_mut() {
+                readable.sinks.clear();
             }
-            self.send(conn, Frame::Release { id });
+            if let Some((conn, id)) = state.binding.take() {
+                if let Some(conn_state) = self.conns.get_mut(&conn) {
+                    conn_state.remotes.remove(&id);
+                }
+                self.send(conn, Frame::Release { id });
+            }
+        }
+        if let Some(state) = self.refs.get(&reference) {
+            let _ = state;
         }
         self.refs.remove(&reference);
+        self.binding_handles.remove(&reference);
     }
 
     fn ref_call(
@@ -3468,6 +3970,8 @@ impl Actor {
         let _ = call.reply.send(Err(ChordError::aborted("call aborted")));
     }
 
+    /// A listener arrived for `member`: the readable exists, and the hold
+    /// wants its state (upstream `sub`, once anyone listens).
     fn ref_subscribe(
         &mut self,
         reference: RefId,
@@ -3478,105 +3982,78 @@ impl Actor {
         let Some(state) = self.refs.get_mut(&reference) else {
             return;
         };
-        let readable = state
-            .readables
-            .entry(member.clone())
-            .or_insert_with(|| Readable {
-                sinks: Vec::new(),
-                sub: None,
-                decoder: Decoder::new(),
-                value: None,
-            });
+        let readable = state.readables.entry(member.clone()).or_insert(Readable {
+            sinks: Vec::new(),
+            decoder: Decoder::new(),
+            value: None,
+        });
         if let Some(value) = &readable.value {
             let _ = sender.send(StateUpdate::Snapshot(value.clone()));
         }
         readable.sinks.push((sink, sender));
-        self.readable_bind(reference, &member);
+        self.want_state(reference, true);
     }
 
+    /// A listener left `member`; when the last one of the hold leaves, the
+    /// hold stops wanting state (upstream `unsub`).
     fn ref_unsubscribe(&mut self, reference: RefId, member: &str, sink: u64) {
-        let Some(readable) = self
-            .refs
-            .get_mut(&reference)
-            .and_then(|state| state.readables.get_mut(member))
-        else {
-            return;
+        let listening = {
+            let Some(readable) = self
+                .refs
+                .get_mut(&reference)
+                .and_then(|state| state.readables.get_mut(member))
+            else {
+                return;
+            };
+            readable.sinks.retain(|(id, _)| *id != sink);
+            self.refs
+                .get(&reference)
+                .map(|state| state.readables.values().any(|r| !r.sinks.is_empty()))
+                .unwrap_or(false)
         };
-        readable.sinks.retain(|(id, _)| *id != sink);
-        self.readable_bind(reference, member);
+        if !listening {
+            self.want_state(reference, false);
+        }
     }
 
-    /// Subscribes upstream while someone listens and the reference is bound;
-    /// drops a subscription on an old link.
-    fn readable_bind(&mut self, reference: RefId, member: &str) {
-        let Some(state) = self.refs.get_mut(&reference) else {
-            return;
-        };
-        let binding = state.binding;
-        let Some(readable) = state.readables.get_mut(member) else {
-            return;
-        };
-        let listening = !readable.sinks.is_empty();
-        if !listening {
-            readable.value = None;
-        }
-        let binding = if listening { binding } else { None };
-        if let (Some((conn, _)), Some((sub_conn, _))) = (binding, readable.sub) {
-            if conn == sub_conn {
-                return;
-            }
-        }
-        if let Some((sub_conn, sub_id)) = readable.sub.take() {
-            if let Some(conn) = self.conns.get_mut(&sub_conn) {
-                if conn.subs.remove(&sub_id).is_some() {
-                    self.send(sub_conn, Frame::Unsub { id: sub_id });
-                }
-            }
-        }
-        let Some((conn_id, hold)) = binding else {
-            return;
-        };
-        let Some(conn) = self.conns.get_mut(&conn_id) else {
-            return;
-        };
-        let id = conn.next_id();
-        conn.subs.insert(id, (reference, member.to_owned()));
-        if let Some(readable) = self
-            .refs
-            .get_mut(&reference)
-            .and_then(|state| state.readables.get_mut(member))
-        {
-            readable.decoder = Decoder::new();
-            readable.sub = Some((conn_id, id));
-        }
-        self.send(
-            conn_id,
-            Frame::Sub {
-                id,
-                hold,
-                member: member.to_owned(),
-            },
-        );
-    }
+    /// Starts or stops wanting the state of `reference`'s hold: `sub` /
+    /// `unsub` on the binding, and the hold's `state` flag when it is
+    /// (re)opened.
+    /// A reference's wish for state is fixed when it is made and always
+    /// wants it (upstream's `RemoteRef` `wantsState`, default true):
+    /// listener changes never move the hold's. `sub`/`unsub` exist for
+    /// method-only references, which noel does not make; the goldens'
+    /// holds all open with state implied, so no scenario shows either
+    /// frame.
+    fn want_state(&mut self, _reference: RefId, _wanted: bool) {}
 
     fn readables_stop(&mut self, reference: RefId) {
         let Some(state) = self.refs.get_mut(&reference) else {
             return;
         };
-        let members: Vec<String> = state.readables.keys().cloned().collect();
         for readable in state.readables.values_mut() {
             readable.sinks.clear();
         }
-        for member in members {
-            self.readable_bind(reference, &member);
-        }
+        self.want_state(reference, false);
     }
 
-    fn readable_receive(&mut self, reference: RefId, member: &str, frame: StateFrame) {
+    fn readable_receive(&mut self, reference: RefId, frame: StateFrame) {
+        let member = frame.m.clone();
+        // A promised snapshot arrived: the reference may hydrate now, with
+        // or without a listener for the member.
+        let hydrated = {
+            let Some(state) = self.refs.get_mut(&reference) else {
+                return;
+            };
+            state.pending_snapshots.remove(&member) && state.pending_snapshots.is_empty()
+        };
+        if hydrated {
+            self.hydrate(reference);
+        }
         let Some(readable) = self
             .refs
             .get_mut(&reference)
-            .and_then(|state| state.readables.get_mut(member))
+            .and_then(|state| state.readables.get_mut(&member))
         else {
             return;
         };
@@ -3605,13 +4082,12 @@ impl Actor {
                     return;
                 }
             }
-        } else if let Some(value) = frame.snap.or(frame.reset.clone()) {
+        } else if let Some(value) = frame.value.clone() {
             readable.decoder = Decoder::new();
             readable.value = Some(value.clone());
-            if frame.reset.is_some() {
-                StateUpdate::Reset(value)
-            } else {
-                StateUpdate::Snapshot(value)
+            match frame.as_kind {
+                StateAs::Reset => StateUpdate::Reset(value),
+                _ => StateUpdate::Snapshot(value),
             }
         } else {
             return;
@@ -3619,7 +4095,7 @@ impl Actor {
         let Some(readable) = self
             .refs
             .get_mut(&reference)
-            .and_then(|state| state.readables.get_mut(member))
+            .and_then(|state| state.readables.get_mut(&member))
         else {
             return;
         };
@@ -3707,6 +4183,7 @@ fn check_implementation(
 }
 
 fn shape_of(object: &Object) -> Shape {
+    let variant = object.variant.clone().unwrap_or_default();
     Shape {
         variant: object.variant.clone(),
         members: object
@@ -3715,6 +4192,21 @@ fn shape_of(object: &Object) -> Shape {
             .map(|(name, _)| name.clone())
             .collect(),
         contract: object.service.fingerprint.clone(),
-        code_version: CODE_VERSION as i64,
+        state: object
+            .members
+            .iter()
+            .filter(|(name, member)| {
+                matches!(member, Member::State(_))
+                    && object
+                        .service
+                        .description
+                        .variants
+                        .get(&variant)
+                        .is_some_and(|members| {
+                            matches!(members.get(name), Some(MemberDescription::State { .. }))
+                        })
+            })
+            .map(|(name, _)| name.clone())
+            .collect(),
     }
 }

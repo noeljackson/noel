@@ -14,18 +14,27 @@ use noel_chord::delta::{Op, Seg};
 use noel_chord::host::{AcceptOptions, Host, HostOptions, LinkOptions, StateUpdate};
 use noel_chord::link::{ndjson, websocket, WebSocketOptions};
 use noel_chord::object::{Cell, Implementation};
-use noel_chord::{Description, Frame, Link, MemberDescription, Transport};
+use noel_chord::{Description, Frame, Link, MemberDescription, Placement, Transport};
 use serde_json::{json, Value};
 use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::Message;
 
-fn tally() -> Description {
+/// Where this file's tally lives: the tests that serve it on the server say
+/// so; the ndjson worker test overrides it.
+fn where_tally_lives() -> &'static str {
+    "server"
+}
+
+fn tally(host: &str) -> Description {
     let count =
         json!({"type": "object", "required": ["n"], "properties": {"n": {"type": "integer"}}});
     Description::remote(
         "noel.test.tally",
         1,
         json!({"type": "object", "properties": {}}),
+        Placement::Named {
+            name: host.to_string(),
+        },
         [(
             "main",
             vec![
@@ -44,7 +53,11 @@ fn tally() -> Description {
 }
 
 fn serve_tally(host: &Host) {
-    host.serve(tally(), |_input, _principal| {
+    serve_tally_on(host, where_tally_lives());
+}
+
+fn serve_tally_on(host: &Host, at: &str) {
+    host.serve(tally(at), |_input, _principal| {
         let count = Cell::new(
             json!({"type": "object", "required": ["n"], "properties": {"n": {"type": "integer"}}}),
             json!({"n": 0}),
@@ -113,7 +126,7 @@ async fn a_client_holds_subscribes_and_calls_over_websocket_framing_on_a_unix_so
         websocket(client_socket, WebSocketOptions::default()),
         LinkOptions::default(),
     );
-    let tally = client.get(tally(), json!({}), "server");
+    let tally = client.get(tally(where_tally_lives()), json!({}), "server");
     let mut updates = tally.subscribe("count");
     let shape = within(tally.ready()).await.expect("live");
     assert_eq!(shape.members, ["count", "add"]);
@@ -161,9 +174,8 @@ async fn next_frame(socket: &mut tokio_tungstenite::WebSocketStream<UnixStream>,
 #[tokio::test]
 async fn packed_binary_frames_are_decoded_when_accepted_and_close_the_link_when_not() {
     let hello =
-        json!({"t": "hello", "protocol": 2, "name": "peer", "kind": "client", "codeVersion": 1});
-    let hold =
-        json!({"t": "hold", "id": 1, "at": "server", "token": tally().to_value(), "input": {}});
+        json!({"t": "hello", "protocol": 4, "name": "peer", "kind": "client", "codeVersion": 1});
+    let hold = json!({"t": "hold", "id": 1, "at": "server", "token": tally(where_tally_lives()).to_value(), "input": {}});
     let call = packed(
         json!({"t": "call", "id": 2, "hold": 1, "member": "add", "z": "args"}),
         "5",
@@ -207,7 +219,7 @@ async fn an_ndjson_link_joins_a_server_and_its_worker_and_carries_control_lines(
     let (to_worker, _) = ndjson(server_read, server_write, Some(control_sender));
     let (to_server, worker_control) = ndjson(worker_read, worker_write, None);
     let worker = Host::new(HostOptions::host("session:w"));
-    serve_tally(&worker);
+    serve_tally_on(&worker, "session:w");
     worker.connect(to_server, LinkOptions::default());
     assert!(worker_control.send(&json!({"type": "ready"})));
     assert_eq!(within(control.recv()).await, Some(json!({"type": "ready"})));
@@ -219,7 +231,7 @@ async fn an_ndjson_link_joins_a_server_and_its_worker_and_carries_control_lines(
             json!({"kind": "worker", "session": "w", "generation": 1}),
         ),
     );
-    let tally = server.get(tally(), json!({}), "session:w");
+    let tally = server.get(tally("session:w"), json!({}), "session:w");
     within(tally.ready()).await.expect("live");
     assert_eq!(
         within(tally.call("add", Some(json!(4)))).await,
@@ -253,7 +265,7 @@ async fn a_noel_worker_votes_no_to_a_reload_and_ignores_commits() {
     let worker = Host::new(HostOptions::host("session:w"));
     worker.connect(link, LinkOptions::default());
     parent.deliver(
-        json!({"t": "hello", "protocol": 2, "name": "server", "kind": "host", "codeVersion": 1}),
+        json!({"t": "hello", "protocol": 4, "name": "server", "kind": "host", "codeVersion": 1}),
     );
     parent.deliver(
         json!({"t": "prepare", "reload": 7, "codeVersion": 2, "plugins": [], "options": {}}),

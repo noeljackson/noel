@@ -81,10 +81,13 @@ pub struct CallContext {
     pub signal: AbortSignal,
 }
 
-/// One change of a cell: its ops and the value after them.
+/// One change of a cell: its ops and the value after them. The value is
+/// what a listener that keeps its own copy applies the ops to reach; the
+/// provider's own flush reads the cell directly, so nothing here reads it.
 #[derive(Clone, Debug)]
 pub(crate) struct CellChange {
     pub ops: Arc<Vec<Op>>,
+    #[allow(dead_code)]
     pub value: Arc<Value>,
 }
 
