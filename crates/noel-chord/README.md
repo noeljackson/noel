@@ -1,6 +1,6 @@
 # noel-chord
 
-Chord link protocol 2 for noel, ported from upstream pi's `packages/chord`:
+Chord link protocol 4 for noel, ported from upstream pi's `packages/chord`:
 
 - `delta`: the ops `r`, `s`, `d`, `a`, `t`, `p` and `m` over
   `serde_json::Value`, applied without changing the base
@@ -8,7 +8,7 @@ Chord link protocol 2 for noel, ported from upstream pi's `packages/chord`:
   `Encoder` and `Decoder`; and `diff`. `t` and `a` count UTF-16 code units.
 - `schema`: `canonical_json`, `hash64` and `fits`.
 - `contract`: `Description`, its `fingerprint`, and `coverage`.
-- `wire`: every protocol 2 frame (`Frame`), checked on receipt as upstream's
+- `wire`: every protocol 4 frame (`Frame`), checked on receipt as upstream's
   frame schema checks it.
 - `link`: links and their transports: `Link::memory_pair` (tests),
   `websocket` (one JSON text message per frame; packed binary frames are

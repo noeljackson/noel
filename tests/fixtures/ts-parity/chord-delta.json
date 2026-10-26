@@ -1,9 +1,9 @@
 {
   "source": {
     "repository": "https://github.com/earendil-works/pi",
-    "ref": "1692bba6347a287ab0f3cb554a4430fafffc474b",
+    "ref": "b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb",
     "package": "packages/chord",
-    "packageCommit": "301617df7b88951c328f8a7b6a732e590713df07",
+    "packageCommit": "b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb",
     "script": "/ts-parity/chord-delta-fixture.ts"
   },
   "format": {
@@ -6419,9 +6419,9 @@
     },
     {
       "name": "contract description",
-      "json": "{\"name\":\"fixture.chat\",\"scope\":\"remote\",\"version\":1,\"input\":{\"type\":\"object\",\"required\":[\"session\"],\"properties\":{\"session\":{\"type\":\"string\"}}},\"variants\":{\"viewer\":{\"view\":{\"kind\":\"state\",\"schema\":{\"type\":\"object\",\"required\":[\"conversation\",\"entries\",\"docs\"],\"properties\":{\"conversation\":{\"type\":\"object\",\"required\":[\"id\",\"cwd\"],\"properties\":{\"id\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"}}},\"entries\":{\"type\":\"array\",\"items\":{}},\"docs\":{\"type\":\"object\",\"patternProperties\":{\"^.*$\":{}}}}}}},\"participant\":{\"view\":{\"kind\":\"state\",\"schema\":{\"type\":\"object\",\"required\":[\"conversation\",\"entries\",\"docs\"],\"properties\":{\"conversation\":{\"type\":\"object\",\"required\":[\"id\",\"cwd\"],\"properties\":{\"id\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"}}},\"entries\":{\"type\":\"array\",\"items\":{}},\"docs\":{\"type\":\"object\",\"patternProperties\":{\"^.*$\":{}}}}}},\"submit\":{\"kind\":\"method\",\"args\":{\"type\":\"object\",\"required\":[\"requestId\",\"text\",\"whenBusy\"],\"properties\":{\"requestId\":{\"type\":\"string\",\"minLength\":1},\"text\":{\"type\":\"string\"},\"whenBusy\":{\"anyOf\":[{\"type\":\"string\",\"const\":\"reject\"},{\"type\":\"string\",\"const\":\"steer\"},{\"type\":\"string\",\"const\":\"followUp\"}]}}},\"result\":{\"type\":\"object\",\"required\":[\"submissionId\",\"disposition\"],\"properties\":{\"submissionId\":{\"type\":\"string\"},\"runId\":{\"type\":\"string\"},\"disposition\":{\"anyOf\":[{\"type\":\"string\",\"const\":\"started\"},{\"type\":\"string\",\"const\":\"queued\"},{\"type\":\"string\",\"const\":\"repeated\"}]}}}},\"abort\":{\"kind\":\"method\",\"args\":{\"type\":\"object\",\"properties\":{\"expectedRunId\":{\"type\":\"string\"}}},\"result\":{\"type\":\"object\",\"properties\":{}}}}}}",
-      "canonical": "{\"input\":{\"properties\":{\"session\":{\"type\":\"string\"}},\"required\":[\"session\"],\"type\":\"object\"},\"name\":\"fixture.chat\",\"scope\":\"remote\",\"variants\":{\"participant\":{\"abort\":{\"args\":{\"properties\":{\"expectedRunId\":{\"type\":\"string\"}},\"type\":\"object\"},\"kind\":\"method\",\"result\":{\"properties\":{},\"type\":\"object\"}},\"submit\":{\"args\":{\"properties\":{\"requestId\":{\"minLength\":1,\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"whenBusy\":{\"anyOf\":[{\"const\":\"reject\",\"type\":\"string\"},{\"const\":\"steer\",\"type\":\"string\"},{\"const\":\"followUp\",\"type\":\"string\"}]}},\"required\":[\"requestId\",\"text\",\"whenBusy\"],\"type\":\"object\"},\"kind\":\"method\",\"result\":{\"properties\":{\"disposition\":{\"anyOf\":[{\"const\":\"started\",\"type\":\"string\"},{\"const\":\"queued\",\"type\":\"string\"},{\"const\":\"repeated\",\"type\":\"string\"}]},\"runId\":{\"type\":\"string\"},\"submissionId\":{\"type\":\"string\"}},\"required\":[\"submissionId\",\"disposition\"],\"type\":\"object\"}},\"view\":{\"kind\":\"state\",\"schema\":{\"properties\":{\"conversation\":{\"properties\":{\"cwd\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"id\",\"cwd\"],\"type\":\"object\"},\"docs\":{\"patternProperties\":{\"^.*$\":{}},\"type\":\"object\"},\"entries\":{\"items\":{},\"type\":\"array\"}},\"required\":[\"conversation\",\"entries\",\"docs\"],\"type\":\"object\"}}},\"viewer\":{\"view\":{\"kind\":\"state\",\"schema\":{\"properties\":{\"conversation\":{\"properties\":{\"cwd\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"id\",\"cwd\"],\"type\":\"object\"},\"docs\":{\"patternProperties\":{\"^.*$\":{}},\"type\":\"object\"},\"entries\":{\"items\":{},\"type\":\"array\"}},\"required\":[\"conversation\",\"entries\",\"docs\"],\"type\":\"object\"}}}},\"version\":1}",
-      "hash64": "5032a9ebd48fda21"
+      "json": "{\"name\":\"fixture.chat\",\"scope\":\"remote\",\"version\":1,\"input\":{\"type\":\"object\",\"required\":[\"session\"],\"properties\":{\"session\":{\"type\":\"string\"}}},\"host\":{\"name\":\"fixture\"},\"variants\":{\"viewer\":{\"view\":{\"kind\":\"state\",\"schema\":{\"type\":\"object\",\"required\":[\"conversation\",\"entries\",\"docs\"],\"properties\":{\"conversation\":{\"type\":\"object\",\"required\":[\"id\",\"cwd\"],\"properties\":{\"id\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"}}},\"entries\":{\"type\":\"array\",\"items\":{}},\"docs\":{\"type\":\"object\",\"patternProperties\":{\"^.*$\":{}}}}}}},\"participant\":{\"view\":{\"kind\":\"state\",\"schema\":{\"type\":\"object\",\"required\":[\"conversation\",\"entries\",\"docs\"],\"properties\":{\"conversation\":{\"type\":\"object\",\"required\":[\"id\",\"cwd\"],\"properties\":{\"id\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"}}},\"entries\":{\"type\":\"array\",\"items\":{}},\"docs\":{\"type\":\"object\",\"patternProperties\":{\"^.*$\":{}}}}}},\"submit\":{\"kind\":\"method\",\"args\":{\"type\":\"object\",\"required\":[\"requestId\",\"text\",\"whenBusy\"],\"properties\":{\"requestId\":{\"type\":\"string\",\"minLength\":1},\"text\":{\"type\":\"string\"},\"whenBusy\":{\"anyOf\":[{\"type\":\"string\",\"const\":\"reject\"},{\"type\":\"string\",\"const\":\"steer\"},{\"type\":\"string\",\"const\":\"followUp\"}]}}},\"result\":{\"type\":\"object\",\"required\":[\"submissionId\",\"disposition\"],\"properties\":{\"submissionId\":{\"type\":\"string\"},\"runId\":{\"type\":\"string\"},\"disposition\":{\"anyOf\":[{\"type\":\"string\",\"const\":\"started\"},{\"type\":\"string\",\"const\":\"queued\"},{\"type\":\"string\",\"const\":\"repeated\"}]}}}},\"abort\":{\"kind\":\"method\",\"args\":{\"type\":\"object\",\"properties\":{\"expectedRunId\":{\"type\":\"string\"}}},\"result\":{\"type\":\"object\",\"properties\":{}}}}}}",
+      "canonical": "{\"host\":{\"name\":\"fixture\"},\"input\":{\"properties\":{\"session\":{\"type\":\"string\"}},\"required\":[\"session\"],\"type\":\"object\"},\"name\":\"fixture.chat\",\"scope\":\"remote\",\"variants\":{\"participant\":{\"abort\":{\"args\":{\"properties\":{\"expectedRunId\":{\"type\":\"string\"}},\"type\":\"object\"},\"kind\":\"method\",\"result\":{\"properties\":{},\"type\":\"object\"}},\"submit\":{\"args\":{\"properties\":{\"requestId\":{\"minLength\":1,\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"whenBusy\":{\"anyOf\":[{\"const\":\"reject\",\"type\":\"string\"},{\"const\":\"steer\",\"type\":\"string\"},{\"const\":\"followUp\",\"type\":\"string\"}]}},\"required\":[\"requestId\",\"text\",\"whenBusy\"],\"type\":\"object\"},\"kind\":\"method\",\"result\":{\"properties\":{\"disposition\":{\"anyOf\":[{\"const\":\"started\",\"type\":\"string\"},{\"const\":\"queued\",\"type\":\"string\"},{\"const\":\"repeated\",\"type\":\"string\"}]},\"runId\":{\"type\":\"string\"},\"submissionId\":{\"type\":\"string\"}},\"required\":[\"submissionId\",\"disposition\"],\"type\":\"object\"}},\"view\":{\"kind\":\"state\",\"schema\":{\"properties\":{\"conversation\":{\"properties\":{\"cwd\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"id\",\"cwd\"],\"type\":\"object\"},\"docs\":{\"patternProperties\":{\"^.*$\":{}},\"type\":\"object\"},\"entries\":{\"items\":{},\"type\":\"array\"}},\"required\":[\"conversation\",\"entries\",\"docs\"],\"type\":\"object\"}}},\"viewer\":{\"view\":{\"kind\":\"state\",\"schema\":{\"properties\":{\"conversation\":{\"properties\":{\"cwd\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"}},\"required\":[\"id\",\"cwd\"],\"type\":\"object\"},\"docs\":{\"patternProperties\":{\"^.*$\":{}},\"type\":\"object\"},\"entries\":{\"items\":{},\"type\":\"array\"}},\"required\":[\"conversation\",\"entries\",\"docs\"],\"type\":\"object\"}}}},\"version\":1}",
+      "hash64": "9b8e496bca805e65"
     }
   ],
   "numbers": [
@@ -6694,6 +6694,9 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "owner": {
             "count": {
@@ -6725,7 +6728,7 @@
           }
         }
       },
-      "fingerprint": "fc4fbabe645417b2"
+      "fingerprint": "1cad0e3e21079f60"
     },
     {
       "label": "counter, more members",
@@ -6736,6 +6739,9 @@
         "input": {
           "type": "object",
           "properties": {}
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "owner": {
@@ -6792,7 +6798,7 @@
           }
         }
       },
-      "fingerprint": "898790e9ec97b529"
+      "fingerprint": "af8afb699ac66909"
     },
     {
       "label": "counter, version 2",
@@ -6803,6 +6809,9 @@
         "input": {
           "type": "object",
           "properties": {}
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "owner": {
@@ -6835,7 +6844,7 @@
           }
         }
       },
-      "fingerprint": "fc538c5599a02f2f"
+      "fingerprint": "1cb0dfd559fe62a5"
     },
     {
       "label": "counter, string arguments",
@@ -6846,6 +6855,9 @@
         "input": {
           "type": "object",
           "properties": {}
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "owner": {
@@ -6878,7 +6890,7 @@
           }
         }
       },
-      "fingerprint": "b698e522fbdd4d77"
+      "fingerprint": "d6f638a29b182bd1"
     },
     {
       "label": "counter, no arguments",
@@ -6890,6 +6902,9 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "owner": {
             "count": {
@@ -6910,7 +6925,7 @@
           }
         }
       },
-      "fingerprint": "fa0799d377790331"
+      "fingerprint": "0881ec537e6b9b71"
     },
     {
       "label": "counter, no result",
@@ -6922,6 +6937,9 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "owner": {
             "count": {
@@ -6950,7 +6968,7 @@
           }
         }
       },
-      "fingerprint": "f0279b201c7846a2"
+      "fingerprint": "bee775a0feaee197"
     },
     {
       "label": "counter, string result",
@@ -6962,6 +6980,9 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "owner": {
             "count": {
@@ -6993,7 +7014,7 @@
           }
         }
       },
-      "fingerprint": "7d36cc8e8b3166ff"
+      "fingerprint": "9d94200e510d5e97"
     },
     {
       "label": "counter, string state",
@@ -7005,6 +7026,9 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "owner": {
             "count": {
@@ -7036,7 +7060,7 @@
           }
         }
       },
-      "fingerprint": "26b2b8ce07f2461b"
+      "fingerprint": "47100c4eb80a07c7"
     },
     {
       "label": "counter, count as a method",
@@ -7047,6 +7071,9 @@
         "input": {
           "type": "object",
           "properties": {}
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "owner": {
@@ -7076,7 +7103,7 @@
           }
         }
       },
-      "fingerprint": "75dd446a9909957f"
+      "fingerprint": "6de23beaff5b1cf7"
     },
     {
       "label": "counter, input required",
@@ -7095,6 +7122,9 @@
             }
           }
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "owner": {
             "count": {
@@ -7126,7 +7156,7 @@
           }
         }
       },
-      "fingerprint": "cd6a2632a3a55c55"
+      "fingerprint": "7dda0db2467fb52d"
     },
     {
       "label": "counter as local",
@@ -7161,6 +7191,9 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "owner": {
             "count": {
@@ -7192,7 +7225,7 @@
           }
         }
       },
-      "fingerprint": "c62c83d4b686067d"
+      "fingerprint": "d451cb54db90fd43"
     },
     {
       "label": "variants beta and alpha",
@@ -7204,12 +7237,15 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "beta": {},
           "alpha": {}
         }
       },
-      "fingerprint": "311f5c2ec0446e3a"
+      "fingerprint": "293b82ae8c7d7e85"
     },
     {
       "label": "variants x, 10 and 9",
@@ -7221,13 +7257,16 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "9": {},
           "10": {},
           "x": {}
         }
       },
-      "fingerprint": "9a86d330448d80ab"
+      "fingerprint": "aed76eb0bc382f94"
     },
     {
       "label": "variant constructor, empty",
@@ -7239,11 +7278,14 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "constructor": {}
         }
       },
-      "fingerprint": "76f1908a3e402099"
+      "fingerprint": "0b404f0a6769fd1c"
     },
     {
       "label": "variant constructor, with a member",
@@ -7254,6 +7296,9 @@
         "input": {
           "type": "object",
           "properties": {}
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "constructor": {
@@ -7266,7 +7311,7 @@
           }
         }
       },
-      "fingerprint": "2088413682f63344"
+      "fingerprint": "b1ce30b62c68cb4c"
     },
     {
       "label": "variant admin, empty",
@@ -7278,11 +7323,14 @@
           "type": "object",
           "properties": {}
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "admin": {}
         }
       },
-      "fingerprint": "e3bc12f5eb9138a7"
+      "fingerprint": "fe096575b3938a7b"
     },
     {
       "label": "native",
@@ -7361,6 +7409,9 @@
             }
           }
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "viewer": {
             "view": {
@@ -7526,7 +7577,7 @@
           }
         }
       },
-      "fingerprint": "5032a9ebd48fda21"
+      "fingerprint": "9b8e496bca805e65"
     },
     {
       "label": "chat, viewer only",
@@ -7544,6 +7595,9 @@
               "type": "string"
             }
           }
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "viewer": {
@@ -7588,7 +7642,7 @@
           }
         }
       },
-      "fingerprint": "8fb308ce7bd7b737"
+      "fingerprint": "69ce634e0f7c30be"
     },
     {
       "label": "chat, wider input",
@@ -7610,6 +7664,9 @@
             }
           }
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "viewer": {
             "view": {
@@ -7775,7 +7832,7 @@
           }
         }
       },
-      "fingerprint": "3ceef657459ce794"
+      "fingerprint": "922dfcd730e6852e"
     },
     {
       "label": "chat, narrower input",
@@ -7798,6 +7855,9 @@
             }
           }
         },
+        "host": {
+          "name": "fixture"
+        },
         "variants": {
           "viewer": {
             "view": {
@@ -7963,7 +8023,7 @@
           }
         }
       },
-      "fingerprint": "5980c3905def4fab"
+      "fingerprint": "dd33ef10fdc28154"
     },
     {
       "label": "chat, wider whenBusy",
@@ -7981,6 +8041,9 @@
               "type": "string"
             }
           }
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "viewer": {
@@ -8151,7 +8214,7 @@
           }
         }
       },
-      "fingerprint": "c737f1edc4369d94"
+      "fingerprint": "4aeb1d6d92481152"
     },
     {
       "label": "chat, narrower whenBusy",
@@ -8169,6 +8232,9 @@
               "type": "string"
             }
           }
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "viewer": {
@@ -8331,7 +8397,7 @@
           }
         }
       },
-      "fingerprint": "9e829947c17ff843"
+      "fingerprint": "9006c3c783c13ba9"
     },
     {
       "label": "chat, looser requestId",
@@ -8349,6 +8415,9 @@
               "type": "string"
             }
           }
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "viewer": {
@@ -8514,7 +8583,7 @@
           }
         }
       },
-      "fingerprint": "74f7833ef0e4128a"
+      "fingerprint": "77d50ebec181b767"
     },
     {
       "label": "chat, capped requestId",
@@ -8532,6 +8601,9 @@
               "type": "string"
             }
           }
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "viewer": {
@@ -8699,7 +8771,7 @@
           }
         }
       },
-      "fingerprint": "d18fdb779c075063"
+      "fingerprint": "3c310df74b25dcb8"
     },
     {
       "label": "chat, result with more",
@@ -8717,6 +8789,9 @@
               "type": "string"
             }
           }
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "viewer": {
@@ -8887,7 +8962,7 @@
           }
         }
       },
-      "fingerprint": "d3e66a8de08fe837"
+      "fingerprint": "c9b4110de9244a15"
     },
     {
       "label": "chat, result without disposition",
@@ -8905,6 +8980,9 @@
               "type": "string"
             }
           }
+        },
+        "host": {
+          "name": "fixture"
         },
         "variants": {
           "viewer": {
@@ -9054,7 +9132,7 @@
           }
         }
       },
-      "fingerprint": "5976b4dac5f1fde9"
+      "fingerprint": "c5277c5a3698bfa3"
     }
   ],
   "coverage": [

@@ -1,6 +1,7 @@
 import WebSocket from "/chord-reference/node_modules/ws/wrapper.mjs";
 import { Type } from "/chord-reference/node_modules/typebox/build/index.mjs";
 import {
+	hostNamed,
 	createHost,
 	type Frame,
 	type Link,
@@ -24,6 +25,7 @@ import {
 
 const CountSchema = Type.Object({ n: Type.Integer() });
 const Counter = remote("noel.test.counter", {
+	host: hostNamed("server"),
 	version: 1,
 	input: Type.Object({ name: Type.String() }),
 	variants: {
@@ -87,11 +89,12 @@ async function main(): Promise<void> {
 	const host = createHost({
 		name: "client",
 		kind: "client",
-		upstream: tap,
+		self: { kind: "owner", via: "device" },
+		upstream: { link: tap, principal: { kind: "owner", via: "device" } },
 		onError: (error) => console.error("chord:", error),
 	});
 	tap.onClose((reason) => console.log(JSON.stringify({ closed: reason })));
-	const counter = host.get(Counter, { name: "interop" }, { at: "server" });
+	const counter = await host.get(Counter, { name: "interop" });
 	const values: unknown[] = [];
 	counter.count.subscribe((value) => values.push(value));
 	await counter.ready;
@@ -105,12 +108,12 @@ async function main(): Promise<void> {
 	const [snap, first, second] = states();
 	const ok =
 		snap !== undefined &&
-		"snap" in snap &&
-		JSON.stringify(snap.snap) === JSON.stringify({ n: 0 }) &&
+		snap.as === "snap" &&
+		JSON.stringify(snap.value) === JSON.stringify({ n: 0 }) &&
 		first !== undefined &&
-		"ops" in first &&
+		first.as === "ops" &&
 		second !== undefined &&
-		"ops" in second &&
+		second.as === "ops" &&
 		JSON.stringify(results) === "[1,3]" &&
 		JSON.stringify(values.at(-1)) === JSON.stringify({ n: 3 });
 	if (!ok) {

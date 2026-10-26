@@ -88,7 +88,56 @@ pub struct Description {
     pub scope: Scope,
     pub version: i64,
     pub input: Value,
+    /// Where objects of a remote type live: a named host, or a family
+    /// (`prefix` + an input field's value). Absent on local types, and on
+    /// remote descriptions from a peer of protocol 2 and older.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<Placement>,
     pub variants: PropertyMap<PropertyMap<MemberDescription>>,
+}
+
+/// A remote type's placement, as upstream's `hostNamed`/`hostFamily`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Placement {
+    /// Objects live on the host named `name`.
+    Named { name: String },
+    /// Objects live on `prefix` + the input's string field `key`'s value.
+    Family { prefix: String, key: String },
+}
+
+impl Placement {
+    /// The host an input names, as upstream's `resolveHost`.
+    pub fn resolve(&self, contract: &str, input: &Value) -> Result<String, ContractError> {
+        match self {
+            Placement::Named { name } => Ok(name.clone()),
+            Placement::Family { prefix, key } => {
+                let value = input.get(key).and_then(Value::as_str).ok_or_else(|| {
+                    ContractError(format!("{contract}: input field {key} names no host"))
+                })?;
+                Ok(format!("{prefix}{value}"))
+            }
+        }
+    }
+
+    /// Whether the host named `host_name` may serve a type of this
+    /// placement, as upstream's `placedOn`.
+    pub fn placed_on(&self, host_name: &str) -> bool {
+        match self {
+            Placement::Named { name } => name == host_name,
+            Placement::Family { prefix, .. } => {
+                host_name.starts_with(prefix) && host_name.len() > prefix.len()
+            }
+        }
+    }
+
+    /// Upstream's `placementText`, for error messages.
+    pub fn text(&self) -> String {
+        match self {
+            Placement::Named { name } => name.clone(),
+            Placement::Family { prefix, key } => format!("{prefix}<{key}>"),
+        }
+    }
 }
 
 /// Why a description could not be built; the messages are upstream's.
@@ -97,11 +146,13 @@ pub struct Description {
 pub struct ContractError(String);
 
 impl Description {
-    /// A remote contract, as upstream's `remote(name, def)`.
+    /// A remote contract, as upstream's `remote(name, def)`: `host` says
+    /// which host objects of the type live on.
     pub fn remote<V, K, M, N>(
         name: impl Into<String>,
         version: i64,
         input: Value,
+        host: Placement,
         variants: V,
     ) -> Result<Self, ContractError>
     where
@@ -128,6 +179,7 @@ impl Description {
             scope: Scope::Remote,
             version,
             input,
+            host: Some(host),
             variants: described,
         })
     }
@@ -153,6 +205,7 @@ impl Description {
             scope: Scope::Local,
             version,
             input,
+            host: None,
             variants,
         })
     }
@@ -446,6 +499,9 @@ mod tests {
             "",
             1,
             input.clone(),
+            Placement::Named {
+                name: "fixture".to_string()
+            },
             Vec::<(&str, Vec<(&str, MemberDescription)>)>::new()
         )
         .is_err());
@@ -453,6 +509,9 @@ mod tests {
             "fixture.counter",
             1,
             input.clone(),
+            Placement::Named {
+                name: "fixture".to_string(),
+            },
             [(
                 "owner",
                 vec![("then", MemberDescription::method(None, None))],
@@ -464,6 +523,9 @@ mod tests {
             "fixture.counter",
             1,
             input.clone(),
+            Placement::Named {
+                name: "fixture".to_string(),
+            },
             [(
                 "owner",
                 vec![("handle", MemberDescription::opaque("fixture.handle@1"))],

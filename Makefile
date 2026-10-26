@@ -12,7 +12,7 @@ TS_PARITY_TRACKING_REF ?= main
 # (packages/durable/src/env and its conformance cases) and to pi-env
 # (packages/env) on the tracking ref that came after it; move the pin here and
 # regenerate.
-CHORD_REFERENCE_REF ?= 1692bba6347a287ab0f3cb554a4430fafffc474b
+CHORD_REFERENCE_REF ?= b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin

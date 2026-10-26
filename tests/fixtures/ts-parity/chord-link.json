@@ -1,9 +1,9 @@
 {
   "source": {
     "repository": "https://github.com/earendil-works/pi",
-    "ref": "1692bba6347a287ab0f3cb554a4430fafffc474b",
+    "ref": "b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb",
     "package": "packages/chord",
-    "packageCommit": "301617df7b88951c328f8a7b6a732e590713df07",
+    "packageCommit": "b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb",
     "script": "/ts-parity/chord-link-fixture.ts"
   },
   "format": {
@@ -28,6 +28,9 @@
             "type": "string"
           }
         }
+      },
+      "host": {
+        "name": "server"
       },
       "variants": {
         "owner": {
@@ -103,6 +106,9 @@
           }
         }
       },
+      "host": {
+        "name": "server"
+      },
       "variants": {
         "owner": {
           "count": {
@@ -146,6 +152,9 @@
           }
         }
       },
+      "host": {
+        "name": "server"
+      },
       "variants": {
         "owner": {
           "count": {
@@ -173,6 +182,9 @@
         "type": "object",
         "properties": {}
       },
+      "host": {
+        "name": "server"
+      },
       "variants": {
         "main": {
           "ping": {
@@ -195,6 +207,10 @@
             "type": "string"
           }
         }
+      },
+      "host": {
+        "prefix": "session:",
+        "key": "session"
       },
       "variants": {
         "participant": {
@@ -248,7 +264,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -260,7 +276,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -286,7 +302,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -298,7 +314,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -326,6 +342,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "name": "server"
               },
               "variants": {
                 "owner": {
@@ -401,8 +420,23 @@
             "members": [
               "count"
             ],
-            "contract": "93ba9f7ef8c79f2b",
-            "codeVersion": 1
+            "contract": "542c52dcfa683702",
+            "state": [
+              "count"
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "hold": 1,
+            "m": "count",
+            "as": "snap",
+            "value": {
+              "n": 0
+            }
           }
         },
         {
@@ -426,6 +460,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "name": "server"
               },
               "variants": {
                 "owner": {
@@ -506,6 +543,9 @@
                 "type": "object",
                 "properties": {}
               },
+              "host": {
+                "name": "server"
+              },
               "variants": {
                 "main": {
                   "ping": {
@@ -538,6 +578,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "name": "server"
               },
               "variants": {
                 "owner": {
@@ -594,6 +637,9 @@
                   }
                 }
               },
+              "host": {
+                "name": "server"
+              },
               "variants": {
                 "owner": {
                   "count": {
@@ -615,92 +661,6 @@
             },
             "input": {
               "name": "a"
-            }
-          }
-        },
-        {
-          "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "hold",
-            "id": 6,
-            "at": "server",
-            "token": {
-              "name": "noel.test.counter",
-              "scope": "remote",
-              "version": 1,
-              "input": {
-                "type": "object",
-                "required": [
-                  "name"
-                ],
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  }
-                }
-              },
-              "variants": {
-                "owner": {
-                  "count": {
-                    "kind": "state",
-                    "schema": {
-                      "type": "object",
-                      "required": [
-                        "n"
-                      ],
-                      "properties": {
-                        "n": {
-                          "type": "integer"
-                        }
-                      }
-                    }
-                  },
-                  "add": {
-                    "kind": "method",
-                    "args": {
-                      "type": "integer"
-                    },
-                    "result": {
-                      "type": "integer"
-                    }
-                  },
-                  "set": {
-                    "kind": "method",
-                    "args": {
-                      "type": "integer"
-                    }
-                  },
-                  "wait": {
-                    "kind": "method"
-                  },
-                  "fail": {
-                    "kind": "method",
-                    "result": {
-                      "type": "integer"
-                    }
-                  }
-                },
-                "viewer": {
-                  "count": {
-                    "kind": "state",
-                    "schema": {
-                      "type": "object",
-                      "required": [
-                        "n"
-                      ],
-                      "properties": {
-                        "n": {
-                          "type": "integer"
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            },
-            "input": {
-              "name": 5
             }
           }
         },
@@ -755,19 +715,6 @@
         },
         {
           "link": "client",
-          "from": "server",
-          "frame": {
-            "t": "gone",
-            "id": 6,
-            "error": {
-              "code": "invalid",
-              "message": "invalid/input: noel.test.counter input: /name must be string",
-              "reason": "input"
-            }
-          }
-        },
-        {
-          "link": "client",
           "from": "client",
           "frame": {
             "t": "release",
@@ -793,7 +740,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -805,7 +752,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -833,6 +780,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "name": "server"
               },
               "variants": {
                 "owner": {
@@ -900,16 +850,6 @@
         },
         {
           "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "sub",
-            "id": 2,
-            "hold": 1,
-            "member": "count"
-          }
-        },
-        {
-          "link": "client",
           "from": "server",
           "frame": {
             "t": "shape",
@@ -922,8 +862,10 @@
               "wait",
               "fail"
             ],
-            "contract": "93ba9f7ef8c79f2b",
-            "codeVersion": 1
+            "contract": "542c52dcfa683702",
+            "state": [
+              "count"
+            ]
           }
         },
         {
@@ -931,8 +873,10 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
-            "snap": {
+            "hold": 1,
+            "m": "count",
+            "as": "snap",
+            "value": {
               "n": 0
             }
           }
@@ -942,7 +886,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 3,
+            "id": 2,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -953,7 +897,9 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
             "ops": [
               [
                 "s",
@@ -970,7 +916,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 3,
+            "id": 2,
             "value": 1
           }
         },
@@ -979,7 +925,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 4,
+            "id": 3,
             "hold": 1,
             "member": "add",
             "args": 2
@@ -990,7 +936,9 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
             "ops": [
               [
                 "#",
@@ -1012,7 +960,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 4,
+            "id": 3,
             "value": 3
           }
         },
@@ -1021,7 +969,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 5,
+            "id": 4,
             "hold": 1,
             "member": "add",
             "args": 3
@@ -1032,7 +980,9 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
             "ops": [
               [
                 "s",
@@ -1047,7 +997,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 5,
+            "id": 4,
             "value": 6
           }
         },
@@ -1056,7 +1006,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 6,
+            "id": 5,
             "hold": 1,
             "member": "set",
             "args": 10
@@ -1067,7 +1017,9 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
             "ops": [
               [
                 "r",
@@ -1083,7 +1035,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 6
+            "id": 5
           }
         },
         {
@@ -1091,7 +1043,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 7,
+            "id": 6,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -1102,7 +1054,9 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
             "ops": [
               [
                 "s",
@@ -1119,45 +1073,8 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 7,
+            "id": 6,
             "value": 11
-          }
-        },
-        {
-          "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "unsub",
-            "id": 2
-          }
-        },
-        {
-          "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "sub",
-            "id": 8,
-            "hold": 1,
-            "member": "count"
-          }
-        },
-        {
-          "link": "client",
-          "from": "server",
-          "frame": {
-            "t": "state",
-            "id": 8,
-            "snap": {
-              "n": 11
-            }
-          }
-        },
-        {
-          "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "unsub",
-            "id": 8
           }
         },
         {
@@ -1187,7 +1104,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -1199,7 +1116,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -1227,6 +1144,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "name": "server"
               },
               "variants": {
                 "owner": {
@@ -1306,8 +1226,23 @@
               "wait",
               "fail"
             ],
-            "contract": "93ba9f7ef8c79f2b",
-            "codeVersion": 1
+            "contract": "542c52dcfa683702",
+            "state": [
+              "count"
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "hold": 1,
+            "m": "count",
+            "as": "snap",
+            "value": {
+              "n": 0
+            }
           }
         },
         {
@@ -1319,6 +1254,25 @@
             "hold": 1,
             "member": "add",
             "args": 5
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
+            "ops": [
+              [
+                "s",
+                [
+                  "n"
+                ],
+                5
+              ]
+            ]
           }
         },
         {
@@ -1339,6 +1293,24 @@
             "hold": 1,
             "member": "set",
             "args": 7
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
+            "ops": [
+              [
+                "r",
+                {
+                  "n": 7
+                }
+              ]
+            ]
           }
         },
         {
@@ -1368,7 +1340,7 @@
             "id": 4,
             "error": {
               "code": "invalid",
-              "message": "invalid/args: noel.test.counter\u0000{\"name\":\"a\"}\u0000p:{\"kind\":\"owner\",\"via\":\"device\"}.add args: / must be integer",
+              "message": "invalid/args: noel.test.counter\u0000{\"name\":\"a\"}\u0000host.add args: / must be integer",
               "reason": "args"
             }
           }
@@ -1414,7 +1386,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -1426,7 +1398,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -1454,6 +1426,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "name": "server"
               },
               "variants": {
                 "owner": {
@@ -1521,16 +1496,6 @@
         },
         {
           "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "sub",
-            "id": 2,
-            "hold": 1,
-            "member": "count"
-          }
-        },
-        {
-          "link": "client",
           "from": "server",
           "frame": {
             "t": "shape",
@@ -1543,8 +1508,10 @@
               "wait",
               "fail"
             ],
-            "contract": "93ba9f7ef8c79f2b",
-            "codeVersion": 1
+            "contract": "542c52dcfa683702",
+            "state": [
+              "count"
+            ]
           }
         },
         {
@@ -1552,8 +1519,10 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
-            "snap": {
+            "hold": 1,
+            "m": "count",
+            "as": "snap",
+            "value": {
               "n": 0
             }
           }
@@ -1563,7 +1532,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 3,
+            "id": 2,
             "hold": 1,
             "member": "wait"
           }
@@ -1573,7 +1542,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 4,
+            "id": 3,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -1584,7 +1553,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 4,
+            "id": 3,
             "error": {
               "code": "unavailable",
               "message": "unavailable/too_many_calls: Too many calls in progress on this connection (1); wait for earlier ones to finish",
@@ -1597,7 +1566,7 @@
           "from": "client",
           "frame": {
             "t": "cancel",
-            "id": 3
+            "id": 2
           }
         },
         {
@@ -1605,19 +1574,11 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 3,
+            "id": 2,
             "error": {
               "code": "aborted",
               "message": "aborted: cancelled by caller"
             }
-          }
-        },
-        {
-          "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "unsub",
-            "id": 2
           }
         },
         {
@@ -1647,7 +1608,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -1659,7 +1620,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -1687,6 +1648,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -1735,21 +1700,11 @@
           }
         },
         {
-          "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "sub",
-            "id": 2,
-            "hold": 1,
-            "member": "log"
-          }
-        },
-        {
           "link": "worker",
           "from": "worker",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "session:s1",
             "kind": "host",
             "codeVersion": 1,
@@ -1761,7 +1716,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -1789,6 +1744,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -1838,43 +1797,37 @@
               "kind": "owner",
               "via": "device"
             },
-            "client": true
+            "origin": "<origin>:1"
           }
         },
         {
           "link": "worker",
-          "from": "server",
+          "from": "worker",
           "frame": {
-            "t": "sub",
-            "id": 2,
+            "t": "shape",
+            "id": 1,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "state",
             "hold": 1,
-            "member": "log"
-          }
-        },
-        {
-          "link": "worker",
-          "from": "worker",
-          "frame": {
-            "t": "shape",
-            "id": 1,
-            "variant": "participant",
-            "members": [
-              "log",
-              "say",
-              "who",
-              "wait"
-            ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
-          }
-        },
-        {
-          "link": "worker",
-          "from": "worker",
-          "frame": {
-            "t": "state",
-            "id": 2,
-            "snap": []
+            "m": "log",
+            "as": "snap",
+            "value": []
           }
         },
         {
@@ -1890,8 +1843,10 @@
               "who",
               "wait"
             ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
           }
         },
         {
@@ -1899,8 +1854,10 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
-            "snap": []
+            "hold": 1,
+            "m": "log",
+            "as": "snap",
+            "value": []
           }
         },
         {
@@ -1908,7 +1865,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 3,
+            "id": 2,
             "hold": 1,
             "member": "say",
             "args": "hi"
@@ -1919,7 +1876,7 @@
           "from": "server",
           "frame": {
             "t": "call",
-            "id": 3,
+            "id": 2,
             "hold": 1,
             "member": "say",
             "args": "hi",
@@ -1934,7 +1891,9 @@
           "from": "worker",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "log",
+            "as": "ops",
             "ops": [
               [
                 "p",
@@ -1953,7 +1912,7 @@
           "from": "worker",
           "frame": {
             "t": "result",
-            "id": 3,
+            "id": 2,
             "value": 1
           }
         },
@@ -1962,7 +1921,9 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "log",
+            "as": "ops",
             "ops": [
               [
                 "p",
@@ -1989,7 +1950,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 3,
+            "id": 2,
             "value": 1
           }
         },
@@ -1998,7 +1959,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 4,
+            "id": 3,
             "hold": 1,
             "member": "who"
           }
@@ -2008,7 +1969,7 @@
           "from": "server",
           "frame": {
             "t": "call",
-            "id": 4,
+            "id": 3,
             "hold": 1,
             "member": "who",
             "root": {
@@ -2022,7 +1983,7 @@
           "from": "worker",
           "frame": {
             "t": "result",
-            "id": 4,
+            "id": 3,
             "value": {
               "kind": "owner",
               "via": "device"
@@ -2042,7 +2003,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 4,
+            "id": 3,
             "value": {
               "kind": "owner",
               "via": "device"
@@ -2054,7 +2015,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 5,
+            "id": 4,
             "hold": 1,
             "member": "wait"
           }
@@ -2064,7 +2025,7 @@
           "from": "server",
           "frame": {
             "t": "call",
-            "id": 5,
+            "id": 4,
             "hold": 1,
             "member": "wait",
             "root": {
@@ -2078,7 +2039,7 @@
           "from": "client",
           "frame": {
             "t": "cancel",
-            "id": 5
+            "id": 4
           }
         },
         {
@@ -2086,7 +2047,7 @@
           "from": "server",
           "frame": {
             "t": "cancel",
-            "id": 5
+            "id": 4
           }
         },
         {
@@ -2102,7 +2063,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 5,
+            "id": 4,
             "error": {
               "code": "aborted",
               "message": "aborted: call cancelled"
@@ -2114,7 +2075,7 @@
           "from": "worker",
           "frame": {
             "t": "result",
-            "id": 5,
+            "id": 4,
             "error": {
               "code": "aborted",
               "message": "aborted: cancelled by caller"
@@ -2125,24 +2086,8 @@
           "link": "client",
           "from": "client",
           "frame": {
-            "t": "unsub",
-            "id": 2
-          }
-        },
-        {
-          "link": "client",
-          "from": "client",
-          "frame": {
             "t": "release",
             "id": 1
-          }
-        },
-        {
-          "link": "worker",
-          "from": "server",
-          "frame": {
-            "t": "unsub",
-            "id": 2
           }
         },
         {
@@ -2180,7 +2125,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -2192,7 +2137,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -2220,6 +2165,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -2285,86 +2234,6 @@
           "frame": {
             "t": "hold",
             "id": 2,
-            "at": "nowhere",
-            "token": {
-              "name": "noel.test.session",
-              "scope": "remote",
-              "version": 1,
-              "input": {
-                "type": "object",
-                "required": [
-                  "session"
-                ],
-                "properties": {
-                  "session": {
-                    "type": "string"
-                  }
-                }
-              },
-              "variants": {
-                "participant": {
-                  "log": {
-                    "kind": "state",
-                    "schema": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  },
-                  "say": {
-                    "kind": "method",
-                    "args": {
-                      "type": "string"
-                    },
-                    "result": {
-                      "type": "integer"
-                    }
-                  },
-                  "who": {
-                    "kind": "method",
-                    "result": {}
-                  },
-                  "wait": {
-                    "kind": "method"
-                  }
-                },
-                "viewer": {
-                  "log": {
-                    "kind": "state",
-                    "schema": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  }
-                }
-              }
-            },
-            "input": {
-              "session": "s1"
-            }
-          }
-        },
-        {
-          "link": "client",
-          "from": "server",
-          "frame": {
-            "t": "gone",
-            "id": 2,
-            "error": {
-              "code": "unavailable",
-              "message": "unavailable: no route to nowhere"
-            }
-          }
-        },
-        {
-          "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "hold",
-            "id": 3,
             "at": "session:s1",
             "token": {
               "name": "noel.test.session",
@@ -2381,6 +2250,10 @@
                   }
                 }
               },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
+              },
               "variants": {
                 "participant": {
                   "log": {
@@ -2424,10 +2297,6 @@
             },
             "input": {
               "session": "s1"
-            },
-            "principal": {
-              "kind": "owner",
-              "via": "device"
             }
           }
         },
@@ -2436,7 +2305,7 @@
           "from": "worker",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "session:s1",
             "kind": "host",
             "codeVersion": 1,
@@ -2448,7 +2317,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -2476,6 +2345,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -2529,7 +2402,7 @@
               "mode": "full",
               "revision": 1
             },
-            "client": true
+            "origin": "<origin>:1"
           }
         },
         {
@@ -2545,8 +2418,21 @@
               "who",
               "wait"
             ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "state",
+            "hold": 1,
+            "m": "log",
+            "as": "snap",
+            "value": []
           }
         },
         {
@@ -2554,7 +2440,7 @@
           "from": "server",
           "frame": {
             "t": "shape",
-            "id": 3,
+            "id": 2,
             "variant": "participant",
             "members": [
               "log",
@@ -2562,8 +2448,21 @@
               "who",
               "wait"
             ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "hold": 2,
+            "m": "log",
+            "as": "snap",
+            "value": []
           }
         },
         {
@@ -2571,8 +2470,8 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 4,
-            "hold": 3,
+            "id": 3,
+            "hold": 2,
             "member": "who"
           }
         },
@@ -2619,7 +2518,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 4,
+            "id": 3,
             "value": {
               "kind": "guest",
               "id": "g1",
@@ -2634,8 +2533,8 @@
           "link": "client",
           "from": "client",
           "frame": {
-            "t": "release",
-            "id": 3
+            "t": "bye",
+            "reason": "host closed"
           }
         },
         {
@@ -2644,14 +2543,6 @@
           "frame": {
             "t": "release",
             "id": 1
-          }
-        },
-        {
-          "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "bye",
-            "reason": "host closed"
           }
         },
         {
@@ -2673,7 +2564,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -2685,7 +2576,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -2697,7 +2588,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -2709,7 +2600,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -2737,6 +2628,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -2785,21 +2680,11 @@
           }
         },
         {
-          "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "sub",
-            "id": 2,
-            "hold": 1,
-            "member": "log"
-          }
-        },
-        {
           "link": "worker",
           "from": "worker",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "session:s1",
             "kind": "host",
             "codeVersion": 1,
@@ -2811,7 +2696,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -2839,6 +2724,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -2892,43 +2781,37 @@
               "mode": "full",
               "revision": 1
             },
-            "client": true
+            "origin": "<origin>:1"
           }
         },
         {
           "link": "worker",
-          "from": "server",
+          "from": "worker",
           "frame": {
-            "t": "sub",
-            "id": 2,
+            "t": "shape",
+            "id": 1,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "state",
             "hold": 1,
-            "member": "log"
-          }
-        },
-        {
-          "link": "worker",
-          "from": "worker",
-          "frame": {
-            "t": "shape",
-            "id": 1,
-            "variant": "participant",
-            "members": [
-              "log",
-              "say",
-              "who",
-              "wait"
-            ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
-          }
-        },
-        {
-          "link": "worker",
-          "from": "worker",
-          "frame": {
-            "t": "state",
-            "id": 2,
-            "snap": []
+            "m": "log",
+            "as": "snap",
+            "value": []
           }
         },
         {
@@ -2944,8 +2827,10 @@
               "who",
               "wait"
             ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
           }
         },
         {
@@ -2953,8 +2838,10 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
-            "snap": []
+            "hold": 1,
+            "m": "log",
+            "as": "snap",
+            "value": []
           }
         },
         {
@@ -2978,6 +2865,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -3030,7 +2921,7 @@
           "from": "server",
           "frame": {
             "t": "hold",
-            "id": 3,
+            "id": 2,
             "at": "session:s1",
             "token": {
               "name": "noel.test.session",
@@ -3046,6 +2937,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -3099,7 +2994,7 @@
               "mode": "view",
               "revision": 1
             },
-            "client": true
+            "origin": "<origin>:2"
           }
         },
         {
@@ -3107,13 +3002,26 @@
           "from": "worker",
           "frame": {
             "t": "shape",
-            "id": 3,
+            "id": 2,
             "variant": "viewer",
             "members": [
               "log"
             ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "state",
+            "hold": 2,
+            "m": "log",
+            "as": "snap",
+            "value": []
           }
         },
         {
@@ -3126,16 +3034,21 @@
             "members": [
               "log"
             ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
           }
         },
         {
-          "link": "worker",
+          "link": "client2",
           "from": "server",
           "frame": {
-            "t": "unsub",
-            "id": 2
+            "t": "state",
+            "hold": 1,
+            "m": "log",
+            "as": "snap",
+            "value": []
           }
         },
         {
@@ -3163,7 +3076,7 @@
           "from": "server",
           "frame": {
             "t": "release",
-            "id": 3
+            "id": 2
           }
         },
         {
@@ -3201,16 +3114,8 @@
           "link": "client",
           "from": "client",
           "frame": {
-            "t": "unsub",
-            "id": 2
-          }
-        },
-        {
-          "link": "client",
-          "from": "client",
-          "frame": {
             "t": "hold",
-            "id": 3,
+            "id": 2,
             "at": "session:s1",
             "token": {
               "name": "noel.test.session",
@@ -3226,6 +3131,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -3278,7 +3187,7 @@
           "from": "server",
           "frame": {
             "t": "hold",
-            "id": 4,
+            "id": 3,
             "at": "session:s1",
             "token": {
               "name": "noel.test.session",
@@ -3294,6 +3203,10 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "prefix": "session:",
+                "key": "session"
               },
               "variants": {
                 "participant": {
@@ -3347,29 +3260,12 @@
               "mode": "full",
               "revision": 2
             },
-            "client": true
+            "origin": "<origin>:1"
           }
         },
         {
           "link": "worker",
           "from": "worker",
-          "frame": {
-            "t": "shape",
-            "id": 4,
-            "variant": "participant",
-            "members": [
-              "log",
-              "say",
-              "who",
-              "wait"
-            ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
-          }
-        },
-        {
-          "link": "client",
-          "from": "server",
           "frame": {
             "t": "shape",
             "id": 3,
@@ -3380,8 +3276,51 @@
               "who",
               "wait"
             ],
-            "contract": "bc60dc49877fbbb0",
-            "codeVersion": 1
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
+          }
+        },
+        {
+          "link": "worker",
+          "from": "worker",
+          "frame": {
+            "t": "state",
+            "hold": 3,
+            "m": "log",
+            "as": "snap",
+            "value": []
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "shape",
+            "id": 2,
+            "variant": "participant",
+            "members": [
+              "log",
+              "say",
+              "who",
+              "wait"
+            ],
+            "contract": "08c323682f083973",
+            "state": [
+              "log"
+            ]
+          }
+        },
+        {
+          "link": "client",
+          "from": "server",
+          "frame": {
+            "t": "state",
+            "hold": 2,
+            "m": "log",
+            "as": "snap",
+            "value": []
           }
         },
         {
@@ -3389,8 +3328,8 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 4,
-            "hold": 3,
+            "id": 3,
+            "hold": 2,
             "member": "who"
           }
         },
@@ -3399,8 +3338,8 @@
           "from": "server",
           "frame": {
             "t": "call",
-            "id": 5,
-            "hold": 4,
+            "id": 4,
+            "hold": 3,
             "member": "who",
             "root": {
               "rootId": "server#*:1",
@@ -3413,7 +3352,7 @@
           "from": "worker",
           "frame": {
             "t": "result",
-            "id": 5,
+            "id": 4,
             "value": {
               "kind": "guest",
               "id": "g1",
@@ -3437,7 +3376,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 4,
+            "id": 3,
             "value": {
               "kind": "guest",
               "id": "g1",
@@ -3461,7 +3400,7 @@
           "from": "server",
           "frame": {
             "t": "release",
-            "id": 4
+            "id": 3
           }
         },
         {
@@ -3483,7 +3422,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -3495,7 +3434,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -3553,7 +3492,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -3575,24 +3514,8 @@
           "link": "raw",
           "from": "server",
           "frame": {
-            "t": "ping",
-            "n": 1
-          }
-        },
-        {
-          "link": "raw",
-          "from": "server",
-          "frame": {
-            "t": "ping",
-            "n": 2
-          }
-        },
-        {
-          "link": "raw",
-          "from": "server",
-          "frame": {
             "t": "bye",
-            "reason": "ping timeout"
+            "reason": "protocol-version 4"
           }
         }
       ]
@@ -3606,7 +3529,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -3618,7 +3541,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -3646,6 +3569,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "name": "server"
               },
               "variants": {
                 "owner": {
@@ -3713,16 +3639,6 @@
         },
         {
           "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "sub",
-            "id": 2,
-            "hold": 1,
-            "member": "count"
-          }
-        },
-        {
-          "link": "client",
           "from": "server",
           "frame": {
             "t": "shape",
@@ -3735,8 +3651,10 @@
               "wait",
               "fail"
             ],
-            "contract": "93ba9f7ef8c79f2b",
-            "codeVersion": 1
+            "contract": "542c52dcfa683702",
+            "state": [
+              "count"
+            ]
           }
         },
         {
@@ -3744,8 +3662,10 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
-            "snap": {
+            "hold": 1,
+            "m": "count",
+            "as": "snap",
+            "value": {
               "n": 0
             }
           }
@@ -3755,7 +3675,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 3,
+            "id": 2,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -3766,7 +3686,9 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
             "ops": [
               [
                 "s",
@@ -3783,7 +3705,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 3,
+            "id": 2,
             "value": 1
           }
         },
@@ -3792,7 +3714,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 4,
+            "id": 3,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -3803,7 +3725,9 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
             "ops": [
               [
                 "#",
@@ -3825,7 +3749,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 4,
+            "id": 3,
             "value": 2
           }
         },
@@ -3834,7 +3758,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 5,
+            "id": 4,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -3844,23 +3768,8 @@
           "link": "client",
           "from": "server",
           "frame": {
-            "t": "state",
-            "id": 2,
-            "ops": [
-              [
-                "s",
-                0,
-                3
-              ]
-            ]
-          }
-        },
-        {
-          "link": "client",
-          "from": "server",
-          "frame": {
             "t": "result",
-            "id": 5,
+            "id": 4,
             "value": 3
           }
         },
@@ -3869,7 +3778,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 6,
+            "id": 5,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -3880,7 +3789,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 6,
+            "id": 5,
             "value": 4
           }
         },
@@ -3889,7 +3798,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 7,
+            "id": 6,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -3900,7 +3809,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 7,
+            "id": 6,
             "value": 5
           }
         },
@@ -3909,7 +3818,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 8,
+            "id": 7,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -3920,7 +3829,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 8,
+            "id": 7,
             "value": 6
           }
         },
@@ -3929,7 +3838,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 9,
+            "id": 8,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -3940,7 +3849,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 9,
+            "id": 8,
             "value": 7
           }
         },
@@ -3949,7 +3858,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 10,
+            "id": 9,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -3960,7 +3869,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 10,
+            "id": 9,
             "value": 8
           }
         },
@@ -3969,7 +3878,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 11,
+            "id": 10,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -3980,7 +3889,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 11,
+            "id": 10,
             "value": 9
           }
         },
@@ -3989,7 +3898,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 12,
+            "id": 11,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4000,7 +3909,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 12,
+            "id": 11,
             "value": 10
           }
         },
@@ -4009,7 +3918,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 13,
+            "id": 12,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4020,7 +3929,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 13,
+            "id": 12,
             "value": 11
           }
         },
@@ -4029,7 +3938,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 14,
+            "id": 13,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4040,7 +3949,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 14,
+            "id": 13,
             "value": 12
           }
         },
@@ -4049,7 +3958,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 15,
+            "id": 14,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4060,7 +3969,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 15,
+            "id": 14,
             "value": 13
           }
         },
@@ -4069,7 +3978,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 16,
+            "id": 15,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4080,7 +3989,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 16,
+            "id": 15,
             "value": 14
           }
         },
@@ -4089,7 +3998,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 17,
+            "id": 16,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4100,7 +4009,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 17,
+            "id": 16,
             "value": 15
           }
         },
@@ -4109,7 +4018,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 18,
+            "id": 17,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4120,7 +4029,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 18,
+            "id": 17,
             "value": 16
           }
         },
@@ -4129,7 +4038,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 19,
+            "id": 18,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4140,7 +4049,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 19,
+            "id": 18,
             "value": 17
           }
         },
@@ -4149,7 +4058,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 20,
+            "id": 19,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4160,7 +4069,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 20,
+            "id": 19,
             "value": 18
           }
         },
@@ -4169,7 +4078,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 21,
+            "id": 20,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4180,7 +4089,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 21,
+            "id": 20,
             "value": 19
           }
         },
@@ -4189,7 +4098,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 22,
+            "id": 21,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4200,7 +4109,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 22,
+            "id": 21,
             "value": 20
           }
         },
@@ -4209,7 +4118,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 23,
+            "id": 22,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4220,7 +4129,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 23,
+            "id": 22,
             "value": 21
           }
         },
@@ -4229,7 +4138,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 24,
+            "id": 23,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4240,7 +4149,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 24,
+            "id": 23,
             "value": 22
           }
         },
@@ -4249,7 +4158,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 25,
+            "id": 24,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4260,7 +4169,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 25,
+            "id": 24,
             "value": 23
           }
         },
@@ -4269,7 +4178,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 26,
+            "id": 25,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4280,7 +4189,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 26,
+            "id": 25,
             "value": 24
           }
         },
@@ -4289,7 +4198,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 27,
+            "id": 26,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4300,7 +4209,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 27,
+            "id": 26,
             "value": 25
           }
         },
@@ -4309,7 +4218,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 28,
+            "id": 27,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4320,7 +4229,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 28,
+            "id": 27,
             "value": 26
           }
         },
@@ -4329,7 +4238,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 29,
+            "id": 28,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4340,7 +4249,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 29,
+            "id": 28,
             "value": 27
           }
         },
@@ -4349,7 +4258,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 30,
+            "id": 29,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4360,7 +4269,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 30,
+            "id": 29,
             "value": 28
           }
         },
@@ -4369,7 +4278,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 31,
+            "id": 30,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4380,7 +4289,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 31,
+            "id": 30,
             "value": 29
           }
         },
@@ -4389,7 +4298,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 32,
+            "id": 31,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4400,7 +4309,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 32,
+            "id": 31,
             "value": 30
           }
         },
@@ -4409,7 +4318,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 33,
+            "id": 32,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4420,7 +4329,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 33,
+            "id": 32,
             "value": 31
           }
         },
@@ -4429,7 +4338,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 34,
+            "id": 33,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4440,7 +4349,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 34,
+            "id": 33,
             "value": 32
           }
         },
@@ -4449,7 +4358,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 35,
+            "id": 34,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4460,7 +4369,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 35,
+            "id": 34,
             "value": 33
           }
         },
@@ -4469,7 +4378,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 36,
+            "id": 35,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4480,7 +4389,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 36,
+            "id": 35,
             "value": 34
           }
         },
@@ -4489,7 +4398,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 37,
+            "id": 36,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4500,7 +4409,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 37,
+            "id": 36,
             "value": 35
           }
         },
@@ -4509,7 +4418,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 38,
+            "id": 37,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4520,7 +4429,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 38,
+            "id": 37,
             "value": 36
           }
         },
@@ -4529,7 +4438,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 39,
+            "id": 38,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4540,7 +4449,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 39,
+            "id": 38,
             "value": 37
           }
         },
@@ -4549,7 +4458,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 40,
+            "id": 39,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4560,7 +4469,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 40,
+            "id": 39,
             "value": 38
           }
         },
@@ -4569,7 +4478,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 41,
+            "id": 40,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4580,7 +4489,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 41,
+            "id": 40,
             "value": 39
           }
         },
@@ -4589,7 +4498,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 42,
+            "id": 41,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4600,7 +4509,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 42,
+            "id": 41,
             "value": 40
           }
         },
@@ -4609,8 +4518,15 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
             "ops": [
+              [
+                "s",
+                0,
+                3
+              ],
               [
                 "s",
                 0,
@@ -4818,7 +4734,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -4830,7 +4746,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -4858,6 +4774,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "name": "server"
               },
               "variants": {
                 "owner": {
@@ -4925,16 +4844,6 @@
         },
         {
           "link": "client",
-          "from": "client",
-          "frame": {
-            "t": "sub",
-            "id": 2,
-            "hold": 1,
-            "member": "count"
-          }
-        },
-        {
-          "link": "client",
           "from": "server",
           "frame": {
             "t": "shape",
@@ -4947,8 +4856,10 @@
               "wait",
               "fail"
             ],
-            "contract": "93ba9f7ef8c79f2b",
-            "codeVersion": 1
+            "contract": "542c52dcfa683702",
+            "state": [
+              "count"
+            ]
           }
         },
         {
@@ -4956,8 +4867,10 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
-            "snap": {
+            "hold": 1,
+            "m": "count",
+            "as": "snap",
+            "value": {
               "n": 0
             }
           }
@@ -4967,7 +4880,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 3,
+            "id": 2,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -4978,7 +4891,9 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
+            "hold": 1,
+            "m": "count",
+            "as": "ops",
             "ops": [
               [
                 "s",
@@ -4995,7 +4910,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 3,
+            "id": 2,
             "value": 1
           }
         },
@@ -5004,7 +4919,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 4,
+            "id": 3,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5015,7 +4930,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 4,
+            "id": 3,
             "value": 2
           }
         },
@@ -5024,7 +4939,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 5,
+            "id": 4,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5035,7 +4950,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 5,
+            "id": 4,
             "value": 3
           }
         },
@@ -5044,7 +4959,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 6,
+            "id": 5,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5055,7 +4970,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 6,
+            "id": 5,
             "value": 4
           }
         },
@@ -5064,7 +4979,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 7,
+            "id": 6,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5075,7 +4990,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 7,
+            "id": 6,
             "value": 5
           }
         },
@@ -5084,7 +4999,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 8,
+            "id": 7,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5095,7 +5010,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 8,
+            "id": 7,
             "value": 6
           }
         },
@@ -5104,7 +5019,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 9,
+            "id": 8,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5115,7 +5030,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 9,
+            "id": 8,
             "value": 7
           }
         },
@@ -5124,7 +5039,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 10,
+            "id": 9,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5135,7 +5050,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 10,
+            "id": 9,
             "value": 8
           }
         },
@@ -5144,7 +5059,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 11,
+            "id": 10,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5155,7 +5070,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 11,
+            "id": 10,
             "value": 9
           }
         },
@@ -5164,7 +5079,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 12,
+            "id": 11,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5175,7 +5090,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 12,
+            "id": 11,
             "value": 10
           }
         },
@@ -5184,7 +5099,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 13,
+            "id": 12,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5195,7 +5110,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 13,
+            "id": 12,
             "value": 11
           }
         },
@@ -5204,7 +5119,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 14,
+            "id": 13,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5215,7 +5130,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 14,
+            "id": 13,
             "value": 12
           }
         },
@@ -5224,7 +5139,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 15,
+            "id": 14,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5235,7 +5150,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 15,
+            "id": 14,
             "value": 13
           }
         },
@@ -5244,7 +5159,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 16,
+            "id": 15,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5255,7 +5170,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 16,
+            "id": 15,
             "value": 14
           }
         },
@@ -5264,7 +5179,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 17,
+            "id": 16,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5275,7 +5190,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 17,
+            "id": 16,
             "value": 15
           }
         },
@@ -5284,7 +5199,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 18,
+            "id": 17,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5295,7 +5210,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 18,
+            "id": 17,
             "value": 16
           }
         },
@@ -5304,7 +5219,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 19,
+            "id": 18,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5315,7 +5230,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 19,
+            "id": 18,
             "value": 17
           }
         },
@@ -5324,7 +5239,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 20,
+            "id": 19,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5335,7 +5250,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 20,
+            "id": 19,
             "value": 18
           }
         },
@@ -5344,7 +5259,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 21,
+            "id": 20,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5355,7 +5270,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 21,
+            "id": 20,
             "value": 19
           }
         },
@@ -5364,7 +5279,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 22,
+            "id": 21,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5375,7 +5290,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 22,
+            "id": 21,
             "value": 20
           }
         },
@@ -5384,7 +5299,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 23,
+            "id": 22,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5395,7 +5310,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 23,
+            "id": 22,
             "value": 21
           }
         },
@@ -5404,7 +5319,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 24,
+            "id": 23,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5415,7 +5330,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 24,
+            "id": 23,
             "value": 22
           }
         },
@@ -5424,7 +5339,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 25,
+            "id": 24,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5435,7 +5350,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 25,
+            "id": 24,
             "value": 23
           }
         },
@@ -5444,7 +5359,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 26,
+            "id": 25,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5455,7 +5370,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 26,
+            "id": 25,
             "value": 24
           }
         },
@@ -5464,7 +5379,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 27,
+            "id": 26,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5475,7 +5390,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 27,
+            "id": 26,
             "value": 25
           }
         },
@@ -5484,7 +5399,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 28,
+            "id": 27,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5495,7 +5410,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 28,
+            "id": 27,
             "value": 26
           }
         },
@@ -5504,7 +5419,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 29,
+            "id": 28,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5515,7 +5430,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 29,
+            "id": 28,
             "value": 27
           }
         },
@@ -5524,7 +5439,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 30,
+            "id": 29,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5535,7 +5450,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 30,
+            "id": 29,
             "value": 28
           }
         },
@@ -5544,7 +5459,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 31,
+            "id": 30,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5555,7 +5470,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 31,
+            "id": 30,
             "value": 29
           }
         },
@@ -5564,7 +5479,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 32,
+            "id": 31,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5575,7 +5490,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 32,
+            "id": 31,
             "value": 30
           }
         },
@@ -5584,7 +5499,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 33,
+            "id": 32,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5595,7 +5510,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 33,
+            "id": 32,
             "value": 31
           }
         },
@@ -5604,7 +5519,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 34,
+            "id": 33,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5615,7 +5530,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 34,
+            "id": 33,
             "value": 32
           }
         },
@@ -5624,7 +5539,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 35,
+            "id": 34,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5635,7 +5550,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 35,
+            "id": 34,
             "value": 33
           }
         },
@@ -5644,7 +5559,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 36,
+            "id": 35,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5655,7 +5570,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 36,
+            "id": 35,
             "value": 34
           }
         },
@@ -5664,7 +5579,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 37,
+            "id": 36,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5675,7 +5590,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 37,
+            "id": 36,
             "value": 35
           }
         },
@@ -5684,7 +5599,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 38,
+            "id": 37,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5695,7 +5610,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 38,
+            "id": 37,
             "value": 36
           }
         },
@@ -5704,7 +5619,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 39,
+            "id": 38,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5715,7 +5630,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 39,
+            "id": 38,
             "value": 37
           }
         },
@@ -5724,7 +5639,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 40,
+            "id": 39,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5735,7 +5650,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 40,
+            "id": 39,
             "value": 38
           }
         },
@@ -5744,7 +5659,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 41,
+            "id": 40,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5755,7 +5670,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 41,
+            "id": 40,
             "value": 39
           }
         },
@@ -5764,7 +5679,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 42,
+            "id": 41,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5775,7 +5690,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 42,
+            "id": 41,
             "value": 40
           }
         },
@@ -5784,7 +5699,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 43,
+            "id": 42,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5795,7 +5710,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 43,
+            "id": 42,
             "value": 41
           }
         },
@@ -5804,7 +5719,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 44,
+            "id": 43,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5815,7 +5730,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 44,
+            "id": 43,
             "value": 42
           }
         },
@@ -5824,7 +5739,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 45,
+            "id": 44,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5835,7 +5750,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 45,
+            "id": 44,
             "value": 43
           }
         },
@@ -5844,7 +5759,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 46,
+            "id": 45,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5855,7 +5770,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 46,
+            "id": 45,
             "value": 44
           }
         },
@@ -5864,7 +5779,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 47,
+            "id": 46,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5875,7 +5790,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 47,
+            "id": 46,
             "value": 45
           }
         },
@@ -5884,7 +5799,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 48,
+            "id": 47,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5895,7 +5810,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 48,
+            "id": 47,
             "value": 46
           }
         },
@@ -5904,7 +5819,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 49,
+            "id": 48,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5915,7 +5830,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 49,
+            "id": 48,
             "value": 47
           }
         },
@@ -5924,7 +5839,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 50,
+            "id": 49,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5935,7 +5850,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 50,
+            "id": 49,
             "value": 48
           }
         },
@@ -5944,7 +5859,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 51,
+            "id": 50,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5955,7 +5870,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 51,
+            "id": 50,
             "value": 49
           }
         },
@@ -5964,7 +5879,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 52,
+            "id": 51,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5975,7 +5890,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 52,
+            "id": 51,
             "value": 50
           }
         },
@@ -5984,7 +5899,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 53,
+            "id": 52,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -5995,7 +5910,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 53,
+            "id": 52,
             "value": 51
           }
         },
@@ -6004,7 +5919,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 54,
+            "id": 53,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6015,7 +5930,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 54,
+            "id": 53,
             "value": 52
           }
         },
@@ -6024,7 +5939,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 55,
+            "id": 54,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6035,7 +5950,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 55,
+            "id": 54,
             "value": 53
           }
         },
@@ -6044,7 +5959,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 56,
+            "id": 55,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6055,7 +5970,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 56,
+            "id": 55,
             "value": 54
           }
         },
@@ -6064,7 +5979,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 57,
+            "id": 56,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6075,7 +5990,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 57,
+            "id": 56,
             "value": 55
           }
         },
@@ -6084,7 +5999,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 58,
+            "id": 57,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6095,7 +6010,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 58,
+            "id": 57,
             "value": 56
           }
         },
@@ -6104,7 +6019,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 59,
+            "id": 58,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6115,7 +6030,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 59,
+            "id": 58,
             "value": 57
           }
         },
@@ -6124,7 +6039,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 60,
+            "id": 59,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6135,7 +6050,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 60,
+            "id": 59,
             "value": 58
           }
         },
@@ -6144,7 +6059,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 61,
+            "id": 60,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6155,7 +6070,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 61,
+            "id": 60,
             "value": 59
           }
         },
@@ -6164,7 +6079,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 62,
+            "id": 61,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6175,7 +6090,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 62,
+            "id": 61,
             "value": 60
           }
         },
@@ -6184,7 +6099,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 63,
+            "id": 62,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6195,7 +6110,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 63,
+            "id": 62,
             "value": 61
           }
         },
@@ -6204,7 +6119,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 64,
+            "id": 63,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6215,7 +6130,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 64,
+            "id": 63,
             "value": 62
           }
         },
@@ -6224,7 +6139,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 65,
+            "id": 64,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6235,7 +6150,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 65,
+            "id": 64,
             "value": 63
           }
         },
@@ -6244,7 +6159,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 66,
+            "id": 65,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6255,7 +6170,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 66,
+            "id": 65,
             "value": 64
           }
         },
@@ -6264,7 +6179,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 67,
+            "id": 66,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6275,7 +6190,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 67,
+            "id": 66,
             "value": 65
           }
         },
@@ -6284,7 +6199,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 68,
+            "id": 67,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6295,7 +6210,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 68,
+            "id": 67,
             "value": 66
           }
         },
@@ -6304,7 +6219,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 69,
+            "id": 68,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6315,7 +6230,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 69,
+            "id": 68,
             "value": 67
           }
         },
@@ -6324,7 +6239,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 70,
+            "id": 69,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6335,7 +6250,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 70,
+            "id": 69,
             "value": 68
           }
         },
@@ -6344,7 +6259,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 71,
+            "id": 70,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6355,7 +6270,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 71,
+            "id": 70,
             "value": 69
           }
         },
@@ -6364,7 +6279,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 72,
+            "id": 71,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6375,7 +6290,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 72,
+            "id": 71,
             "value": 70
           }
         },
@@ -6384,7 +6299,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 73,
+            "id": 72,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6395,7 +6310,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 73,
+            "id": 72,
             "value": 71
           }
         },
@@ -6404,7 +6319,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 74,
+            "id": 73,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6415,7 +6330,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 74,
+            "id": 73,
             "value": 72
           }
         },
@@ -6424,7 +6339,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 75,
+            "id": 74,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6435,7 +6350,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 75,
+            "id": 74,
             "value": 73
           }
         },
@@ -6444,7 +6359,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 76,
+            "id": 75,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6455,7 +6370,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 76,
+            "id": 75,
             "value": 74
           }
         },
@@ -6464,7 +6379,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 77,
+            "id": 76,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6475,7 +6390,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 77,
+            "id": 76,
             "value": 75
           }
         },
@@ -6484,7 +6399,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 78,
+            "id": 77,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6495,7 +6410,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 78,
+            "id": 77,
             "value": 76
           }
         },
@@ -6504,7 +6419,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 79,
+            "id": 78,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6515,7 +6430,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 79,
+            "id": 78,
             "value": 77
           }
         },
@@ -6524,7 +6439,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 80,
+            "id": 79,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6535,7 +6450,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 80,
+            "id": 79,
             "value": 78
           }
         },
@@ -6544,7 +6459,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 81,
+            "id": 80,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6555,7 +6470,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 81,
+            "id": 80,
             "value": 79
           }
         },
@@ -6564,7 +6479,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 82,
+            "id": 81,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6575,7 +6490,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 82,
+            "id": 81,
             "value": 80
           }
         },
@@ -6584,7 +6499,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 83,
+            "id": 82,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6595,7 +6510,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 83,
+            "id": 82,
             "value": 81
           }
         },
@@ -6604,7 +6519,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 84,
+            "id": 83,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6615,7 +6530,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 84,
+            "id": 83,
             "value": 82
           }
         },
@@ -6624,7 +6539,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 85,
+            "id": 84,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6635,7 +6550,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 85,
+            "id": 84,
             "value": 83
           }
         },
@@ -6644,7 +6559,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 86,
+            "id": 85,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6655,7 +6570,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 86,
+            "id": 85,
             "value": 84
           }
         },
@@ -6664,7 +6579,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 87,
+            "id": 86,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6675,7 +6590,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 87,
+            "id": 86,
             "value": 85
           }
         },
@@ -6684,7 +6599,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 88,
+            "id": 87,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6695,7 +6610,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 88,
+            "id": 87,
             "value": 86
           }
         },
@@ -6704,7 +6619,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 89,
+            "id": 88,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6715,7 +6630,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 89,
+            "id": 88,
             "value": 87
           }
         },
@@ -6724,7 +6639,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 90,
+            "id": 89,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6735,7 +6650,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 90,
+            "id": 89,
             "value": 88
           }
         },
@@ -6744,7 +6659,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 91,
+            "id": 90,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6755,7 +6670,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 91,
+            "id": 90,
             "value": 89
           }
         },
@@ -6764,7 +6679,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 92,
+            "id": 91,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6775,7 +6690,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 92,
+            "id": 91,
             "value": 90
           }
         },
@@ -6784,7 +6699,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 93,
+            "id": 92,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6795,7 +6710,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 93,
+            "id": 92,
             "value": 91
           }
         },
@@ -6804,7 +6719,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 94,
+            "id": 93,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6815,7 +6730,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 94,
+            "id": 93,
             "value": 92
           }
         },
@@ -6824,7 +6739,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 95,
+            "id": 94,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6835,7 +6750,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 95,
+            "id": 94,
             "value": 93
           }
         },
@@ -6844,7 +6759,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 96,
+            "id": 95,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6855,7 +6770,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 96,
+            "id": 95,
             "value": 94
           }
         },
@@ -6864,7 +6779,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 97,
+            "id": 96,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6875,7 +6790,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 97,
+            "id": 96,
             "value": 95
           }
         },
@@ -6884,7 +6799,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 98,
+            "id": 97,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6895,7 +6810,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 98,
+            "id": 97,
             "value": 96
           }
         },
@@ -6904,7 +6819,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 99,
+            "id": 98,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6915,7 +6830,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 99,
+            "id": 98,
             "value": 97
           }
         },
@@ -6924,7 +6839,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 100,
+            "id": 99,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6935,7 +6850,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 100,
+            "id": 99,
             "value": 98
           }
         },
@@ -6944,7 +6859,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 101,
+            "id": 100,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6955,7 +6870,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 101,
+            "id": 100,
             "value": 99
           }
         },
@@ -6964,7 +6879,7 @@
           "from": "client",
           "frame": {
             "t": "call",
-            "id": 102,
+            "id": 101,
             "hold": 1,
             "member": "add",
             "args": 1
@@ -6975,7 +6890,7 @@
           "from": "server",
           "frame": {
             "t": "result",
-            "id": 102,
+            "id": 101,
             "value": 100
           }
         },
@@ -6984,119 +6899,12 @@
           "from": "server",
           "frame": {
             "t": "state",
-            "id": 2,
-            "reset": {
-              "n": 82
+            "hold": 1,
+            "m": "count",
+            "as": "reset",
+            "value": {
+              "n": 100
             }
-          }
-        },
-        {
-          "link": "client",
-          "from": "server",
-          "frame": {
-            "t": "state",
-            "id": 2,
-            "ops": [
-              [
-                "s",
-                [
-                  "n"
-                ],
-                83
-              ],
-              [
-                "#",
-                0,
-                [
-                  "n"
-                ]
-              ],
-              [
-                "s",
-                0,
-                84
-              ],
-              [
-                "s",
-                0,
-                85
-              ],
-              [
-                "s",
-                0,
-                86
-              ],
-              [
-                "s",
-                0,
-                87
-              ],
-              [
-                "s",
-                0,
-                88
-              ],
-              [
-                "s",
-                0,
-                89
-              ],
-              [
-                "s",
-                0,
-                90
-              ],
-              [
-                "s",
-                0,
-                91
-              ],
-              [
-                "s",
-                0,
-                92
-              ],
-              [
-                "s",
-                0,
-                93
-              ],
-              [
-                "s",
-                0,
-                94
-              ],
-              [
-                "s",
-                0,
-                95
-              ],
-              [
-                "s",
-                0,
-                96
-              ],
-              [
-                "s",
-                0,
-                97
-              ],
-              [
-                "s",
-                0,
-                98
-              ],
-              [
-                "s",
-                0,
-                99
-              ],
-              [
-                "s",
-                0,
-                100
-              ]
-            ]
           }
         },
         {
@@ -7118,7 +6926,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -7140,7 +6948,7 @@
           "from": "server",
           "frame": {
             "t": "bye",
-            "reason": "protocol-version 2"
+            "reason": "protocol-version 4"
           }
         }
       ]
@@ -7154,7 +6962,7 @@
           "from": "client",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "client",
             "kind": "client",
             "codeVersion": 1,
@@ -7178,7 +6986,7 @@
           "from": "client",
           "frame": {
             "t": "bye",
-            "reason": "protocol-version 2"
+            "reason": "protocol-version 4"
           }
         }
       ]
@@ -7192,7 +7000,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -7223,7 +7031,7 @@
           "from": "server",
           "frame": {
             "t": "bye",
-            "reason": "protocol error: malformed frame"
+            "reason": "protocol-version 4"
           }
         },
         {
@@ -7231,7 +7039,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -7270,6 +7078,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "host": {
+                "name": "server"
               },
               "variants": {
                 "owner": {
@@ -7339,108 +7150,8 @@
           "link": "raw2",
           "from": "server",
           "frame": {
-            "t": "shape",
-            "id": 1,
-            "variant": "viewer",
-            "members": [
-              "count"
-            ],
-            "contract": "93ba9f7ef8c79f2b",
-            "codeVersion": 1
-          }
-        },
-        {
-          "link": "raw2",
-          "from": "raw",
-          "frame": {
-            "t": "hold",
-            "id": 1,
-            "at": "server",
-            "token": {
-              "name": "noel.test.counter",
-              "scope": "remote",
-              "version": 1,
-              "input": {
-                "type": "object",
-                "required": [
-                  "name"
-                ],
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  }
-                }
-              },
-              "variants": {
-                "owner": {
-                  "count": {
-                    "kind": "state",
-                    "schema": {
-                      "type": "object",
-                      "required": [
-                        "n"
-                      ],
-                      "properties": {
-                        "n": {
-                          "type": "integer"
-                        }
-                      }
-                    }
-                  },
-                  "add": {
-                    "kind": "method",
-                    "args": {
-                      "type": "integer"
-                    },
-                    "result": {
-                      "type": "integer"
-                    }
-                  },
-                  "set": {
-                    "kind": "method",
-                    "args": {
-                      "type": "integer"
-                    }
-                  },
-                  "wait": {
-                    "kind": "method"
-                  },
-                  "fail": {
-                    "kind": "method",
-                    "result": {
-                      "type": "integer"
-                    }
-                  }
-                },
-                "viewer": {
-                  "count": {
-                    "kind": "state",
-                    "schema": {
-                      "type": "object",
-                      "required": [
-                        "n"
-                      ],
-                      "properties": {
-                        "n": {
-                          "type": "integer"
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            },
-            "input": {
-              "name": "b"
-            }
-          }
-        },
-        {
-          "link": "raw2",
-          "from": "server",
-          "frame": {
             "t": "bye",
-            "reason": "protocol error: duplicate hold id 1"
+            "reason": "protocol-version 4"
           }
         },
         {
@@ -7448,7 +7159,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -7479,7 +7190,7 @@
           "from": "server",
           "frame": {
             "t": "bye",
-            "reason": "protocol error: invalidate from a child"
+            "reason": "protocol-version 4"
           }
         },
         {
@@ -7487,7 +7198,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -7510,7 +7221,7 @@
           "from": "server",
           "frame": {
             "t": "bye",
-            "reason": "protocol error: hello host session:x does not match the accepted client "
+            "reason": "protocol-version 4"
           }
         },
         {
@@ -7518,7 +7229,7 @@
           "from": "server",
           "frame": {
             "t": "hello",
-            "protocol": 2,
+            "protocol": 4,
             "name": "server",
             "kind": "host",
             "codeVersion": 1,
@@ -7541,7 +7252,7 @@
           "from": "server",
           "frame": {
             "t": "bye",
-            "reason": "protocol error: ack 5 outside 0..1"
+            "reason": "protocol-version 4"
           }
         }
       ]
@@ -7552,7 +7263,7 @@
       "scenario": "flow-coalesce",
       "released": {
         "t": "ack",
-        "n": 46
+        "n": 45
       }
     },
     {

@@ -3,6 +3,7 @@ import { Type } from "/chord-reference/node_modules/typebox/build/index.mjs";
 import {
 	createHost,
 	type Frame,
+	hostFamily,
 	type Link,
 	remote,
 	type WebSocketLike,
@@ -25,6 +26,7 @@ import {
  */
 
 const Chat = remote("noel.chat", {
+	host: hostFamily("session:", "session"),
 	version: 1,
 	input: Type.Object({ session: Type.String() }),
 	variants: {
@@ -83,11 +85,12 @@ async function main(): Promise<void> {
 	const host = createHost({
 		name: "client",
 		kind: "client",
-		upstream: tap,
+		self: { kind: "owner", via: "device" },
+		upstream: { link: tap, principal: { kind: "owner", via: "device" } },
 		onError: (error) => console.error("chord:", error),
 	});
 	tap.onClose((reason) => console.log(JSON.stringify({ closed: reason })));
-	const chat = host.get(Chat, { session }, { at: `session:${session}` });
+	const chat = await host.get(Chat, { session });
 	const values: View[] = [];
 	// A subscriber hears the current value at once: nothing yet, until the
 	// snapshot arrives.
@@ -103,7 +106,7 @@ async function main(): Promise<void> {
 	console.log(
 		JSON.stringify({
 			subscribed: true,
-			snap: snapshot !== undefined && "snap" in snapshot,
+			snap: snapshot !== undefined && snapshot.as === "snap",
 			conversation: first.conversation,
 			entries: first.entries.map((entry) => entry.role),
 			docs: Object.keys(first.docs).sort(),
@@ -111,12 +114,12 @@ async function main(): Promise<void> {
 	);
 	const before = first.entries.length;
 	await until(() => (values.at(-1)?.entries.length ?? 0) >= before + 2, "two more entries");
-	const ops = states().filter((frame) => "ops" in frame).length;
+	const ops = states().filter((frame) => frame.as === "ops").length;
 	const last = values.at(-1) as View;
 	console.log(JSON.stringify({ ops, entries: last.entries.map((entry) => entry.role) }));
 	const ok =
 		snapshot !== undefined &&
-		"snap" in snapshot &&
+		snapshot.as === "snap" &&
 		first.conversation.id === session &&
 		ops > 0 &&
 		last.entries.at(-2)?.role === "user" &&

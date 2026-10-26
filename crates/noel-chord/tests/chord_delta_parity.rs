@@ -6,7 +6,7 @@
 
 use noel_chord::delta::{apply_owned, diff, Decoder, DeltaError, Encoder, Op};
 use noel_chord::{
-    canonical_json, coverage, fingerprint, fits, hash64, Description, MemberDescription,
+    canonical_json, coverage, fingerprint, fits, hash64, Description, MemberDescription, Placement,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -289,6 +289,7 @@ fn builders_reproduce_upstream_fingerprints() {
         "fixture.counter",
         1,
         input.clone(),
+        Placement::Named { name: "fixture".to_string() },
         [(
             "owner",
             vec![

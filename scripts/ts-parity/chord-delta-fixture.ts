@@ -3,7 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "/chord-reference/node_modules/typebox/build/index.mjs";
-import { coverage, local, method, opaque, remote } from "/chord-reference/packages/chord/src/contract.ts";
+import { coverage, hostNamed, local, method, opaque, remote } from "/chord-reference/packages/chord/src/contract.ts";
 import {
 	applyImmutable,
 	decoder,
@@ -534,6 +534,7 @@ function contracts() {
 	};
 	const counter = (methods: Record<string, unknown>, state: Record<string, unknown> = counterOwner.state) =>
 		remote("fixture.counter", {
+			host: hostNamed("fixture"),
 			version: 1,
 			input: Input,
 			variants: { owner: { state, methods } } as never,
@@ -554,6 +555,7 @@ function contracts() {
 	});
 	const chat = (options: { input?: unknown; submit?: unknown; viewerOnly?: boolean } = {}) =>
 		remote("fixture.chat", {
+			host: hostNamed("fixture"),
 			version: 1,
 			input: (options.input ?? Type.Object({ session: Type.String() })) as never,
 			variants: (options.viewerOnly
@@ -570,11 +572,12 @@ function contracts() {
 					}) as never,
 		});
 	const empty = (variants: Record<string, object>) =>
-		remote("fixture.counter", { version: 1, input: Input, variants: variants as never });
+		remote("fixture.counter", { host: hostNamed("fixture"), version: 1, input: Input, variants: variants as never });
 
 	return {
 		counter: counter(counterOwner.methods),
 		"counter, more members": remote("fixture.counter", {
+			host: hostNamed("fixture"),
 			version: 1,
 			input: Input,
 			variants: {
@@ -589,7 +592,7 @@ function contracts() {
 				guest: { state: { count: Type.Number() } },
 			},
 		}),
-		"counter, version 2": remote("fixture.counter", { version: 2, input: Input, variants: { owner: counterOwner } }),
+		"counter, version 2": remote("fixture.counter", { host: hostNamed("fixture"), version: 2, input: Input, variants: { owner: counterOwner } }),
 		"counter, string arguments": counter({ ...counterOwner.methods, add: method(Type.Object({ n: Type.String() }), Type.Number()) }),
 		"counter, no arguments": counter({ ...counterOwner.methods, add: method(undefined, Type.Number()) }),
 		"counter, no result": counter({ ...counterOwner.methods, add: method(Type.Object({ n: Type.Number() })) }),
@@ -597,12 +600,13 @@ function contracts() {
 		"counter, string state": counter(counterOwner.methods, { count: Type.String() }),
 		"counter, count as a method": counter({ ...counterOwner.methods, count: method() }, {}),
 		"counter, input required": remote("fixture.counter", {
+			host: hostNamed("fixture"),
 			version: 1,
 			input: Type.Object({ owner: Type.String() }),
 			variants: { owner: counterOwner },
 		}),
 		"counter as local": local("fixture.counter", { version: 1, input: Input, members: { count: Type.Number() } }),
-		other: remote("fixture.other", { version: 1, input: Input, variants: { owner: counterOwner } }),
+		other: remote("fixture.other", { host: hostNamed("fixture"), version: 1, input: Input, variants: { owner: counterOwner } }),
 		"variants beta and alpha": empty({ beta: {}, alpha: {} }),
 		"variants x, 10 and 9": empty({ x: {}, "10": {}, "9": {} }),
 		"variant constructor, empty": empty({ constructor: {} }),

@@ -18,7 +18,9 @@ use std::time::Duration;
 use noel_chord::delta::{Op, Seg};
 use noel_chord::host::{AcceptOptions, Host, HostOptions, LinkOptions, PrincipalMatch, Route};
 use noel_chord::object::{BoxFuture, Cell, Implementation};
-use noel_chord::{canonical_json, ChordError, Delivery, Description, Frame, Link, Transport};
+use noel_chord::{
+    canonical_json, ChordError, Delivery, Description, Frame, Link, StateUpdate, Transport,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -64,10 +66,15 @@ struct TapEnd {
     peer: OnceLock<Delivery>,
     paused: AtomicBool,
     held: Mutex<Option<Frame>>,
+    /// A closed end sends nowhere and records nothing.
+    closed: AtomicBool,
 }
 
 impl TapEnd {
     fn transmit_value(&self, frame: Value) -> usize {
+        if self.closed.load(Ordering::SeqCst) {
+            return frame.to_string().encode_utf16().count();
+        }
         let text = frame.to_string();
         if frame["t"] != "ack" {
             self.log
@@ -107,6 +114,7 @@ impl Transport for TapTransport {
     }
 
     fn shutdown(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
         if let Some(peer) = self.0.peer.get() {
             peer.end("peer closed");
         }
@@ -123,6 +131,7 @@ fn tap_pair(log: &Log, link: &str, a: &str, b: &str) -> ((Link, Arc<TapEnd>), (L
             peer: OnceLock::new(),
             paused: AtomicBool::new(false),
             held: Mutex::new(None),
+            closed: AtomicBool::new(false),
         })
     };
     let (left_end, right_end) = (end(a), end(b));
@@ -365,7 +374,10 @@ impl World {
             configure(&mut accept);
         }
         server.accept(down, accept);
-        let host = Host::new(quiet(HostOptions::client("client")));
+        let host = Host::new(quiet(HostOptions {
+            self_principal: Some(owner()),
+            ..HostOptions::client("client")
+        }));
         host.connect(up, options.upstream);
         self.clients.push(host.clone());
         (host, tap)
@@ -518,11 +530,11 @@ async fn run(name: &str, gates: &mut Vec<(String, Value)>) -> Vec<(String, Strin
                 refused.ready().await.unwrap_err().code,
                 noel_chord::ErrorCode::Forbidden
             );
-            let nowhere = client.get(c.session.clone(), json!({"session": "s1"}), "nowhere");
-            assert_eq!(
-                nowhere.ready().await.unwrap_err().code,
-                noel_chord::ErrorCode::Unavailable
-            );
+            // Upstream's scenario: a first get of s1 (whose ref stays
+            // alive), then the same binding as the host's own principal —
+            // the two share one hold, so one release leaves it open.
+            let first = client.get(c.session.clone(), json!({"session": "s1"}), "session:s1");
+            first.ready().await.expect("live");
             let forged = client.get_as(
                 c.session.clone(),
                 json!({"session": "s1"}),
@@ -536,6 +548,9 @@ async fn run(name: &str, gates: &mut Vec<(String, Value)>) -> Vec<(String, Strin
             );
             settle().await;
             forged.release();
+            // `first` still holds the binding: no release reaches the wire,
+            // exactly as upstream's scenario (the host's close ends it).
+            drop(first);
             settle().await;
         }
         "invalidate" => {
@@ -718,6 +733,16 @@ fn normalize(frame: &Value) -> Value {
     if let Some(id) = frame.get_mut("rootId") {
         root(id);
     }
+    // A hold's origin names its client connection: `<incarnation>:<seq>`,
+    // random per run; the incarnation is masked, the sequence kept.
+    if let Some(origin) = frame.get_mut("origin") {
+        let masked = origin
+            .as_str()
+            .and_then(|text| text.split_once(':'))
+            .map(|(_, rest)| format!("<origin>:{rest}"))
+            .unwrap_or_else(|| "<origin>".to_owned());
+        *origin = json!(masked);
+    }
     if let Some(id) = frame
         .get_mut("root")
         .and_then(|root| root.get_mut("rootId"))
@@ -757,6 +782,101 @@ fn show(streams: &Streams) -> String {
         }
     }
     out
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_client_after_a_release_gets_the_state_again() {
+    let mut world = World::new();
+    let c = world.contracts.clone();
+    let s = world.server();
+    let (first, _) = world.client(&s, owner(), ClientOptions::default());
+    let a = first.get(c.counter.clone(), json!({"name": "a"}), "server");
+    let mut stream = a.subscribe("count");
+    a.ready().await.expect("live");
+    // Let a change flow.
+    a.call("add", Some(json!(1))).await.expect("added");
+    settle().await;
+    let _ = stream.next().await;
+    // The first client leaves.
+    a.release();
+    drop(stream);
+    settle().await;
+    // A second client holds the same object: its snapshot must arrive.
+    let (second, _) = world.client(&s, owner(), ClientOptions::default());
+    let b = second.get(c.counter.clone(), json!({"name": "a"}), "server");
+    let mut updates = b.subscribe("count");
+    b.ready().await.expect("live again");
+    let first_value = tokio::time::timeout(std::time::Duration::from_secs(5), updates.next())
+        .await
+        .expect("a snapshot arrives for the second client");
+    assert!(
+        first_value.is_some(),
+        "the second client's state never arrived"
+    );
+    world.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_client_after_a_release_gets_the_state_again_over_a_route() {
+    let mut world = World::new();
+    let c = world.contracts.clone();
+    let s = world.server();
+    let (first, _) = world.client(&s, owner(), ClientOptions::default());
+    let a = first.get(c.session.clone(), json!({"session": "s1"}), "session:s1");
+    let mut stream = a.subscribe("log");
+    a.ready().await.expect("live");
+    a.call("say", Some(json!("hi"))).await.expect("said");
+    settle().await;
+    let _ = stream.next().await;
+    a.release();
+    drop(stream);
+    settle().await;
+    let (second, _) = world.client(&s, owner(), ClientOptions::default());
+    let b = second.get(c.session.clone(), json!({"session": "s1"}), "session:s1");
+    let mut updates = b.subscribe("log");
+    b.ready().await.expect("live again");
+    let first_value = tokio::time::timeout(std::time::Duration::from_secs(5), updates.next())
+        .await
+        .expect("a snapshot arrives for the second client over the route");
+    assert!(
+        first_value.is_some(),
+        "the second client's state never arrived"
+    );
+    world.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watcher_keeps_receiving_state_after_a_caller_leaves() {
+    let mut world = World::new();
+    let c = world.contracts.clone();
+    let s = world.server();
+    // The watcher holds first, before anything happens.
+    let (watcher, _) = world.client(&s, owner(), ClientOptions::default());
+    let watched = watcher.get(c.session.clone(), json!({"session": "s1"}), "session:s1");
+    let mut updates = watched.subscribe("log");
+    watched.ready().await.expect("live");
+    // A short-lived caller holds the same object, calls, and leaves.
+    let (caller, _) = world.client(&s, owner(), ClientOptions::default());
+    let chat = caller.get(c.session.clone(), json!({"session": "s1"}), "session:s1");
+    chat.call("say", Some(json!("one"))).await.expect("said");
+    chat.release();
+    // The caller host stays alive until the end of the test; only its
+    // reference is released, as a short-lived client process would leave.
+    settle().await;
+    // The watcher still receives the change.
+    let next = tokio::time::timeout(std::time::Duration::from_secs(5), updates.next())
+        .await
+        .expect("the watcher hears the change after the caller left");
+    assert!(
+        matches!(
+            next,
+            Some(StateUpdate::Ops { .. })
+                | Some(StateUpdate::Snapshot(_))
+                | Some(StateUpdate::Reset(_))
+        ),
+        "watcher heard nothing: {next:?}"
+    );
+    world.finish().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -879,8 +999,6 @@ fn the_fixture_covers_every_scenario_the_link_needs() {
         "call",
         "result",
         "cancel",
-        "sub",
-        "unsub",
         "state",
         "ping",
         "pong",

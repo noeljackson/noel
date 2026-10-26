@@ -14,6 +14,7 @@ pub const COUNTER: &str = r#"{
   "scope": "remote",
   "version": 1,
   "input": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}},
+  "host": {"name": "server"},
   "variants": {
     "owner": {
       "count": {"kind": "state", "schema": {"type": "object", "required": ["n"], "properties": {"n": {"type": "integer"}}}},
