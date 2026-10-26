@@ -7600,7 +7600,10 @@ async fn handle_tui_submission(
         }
         "/tree" => app.push(
             TuiEntryKind::System,
-            format_session_tree(&config.paths.session_dir)?,
+            format_session_tree(
+                &config.paths.session_dir,
+                Some(&runtime.session().session_id),
+            )?,
         ),
         "/summaries" => app.push(TuiEntryKind::System, format_summaries(runtime)),
         "/undo" => undo_tui_turn(app, runtime)?,
@@ -9708,22 +9711,93 @@ fn changelog_header_has_version(line: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|value| value.is_ascii_digit()))
 }
 
-fn format_session_tree(session_dir: &Path) -> Result<String> {
-    let mut lines = Vec::new();
-    for session in SessionStore::list(session_dir)? {
-        let parent = session.parent_session_id.unwrap_or_else(|| "-".to_string());
-        let summary = session.branch_summary.unwrap_or_else(|| "-".to_string());
-        lines.push(format!(
-            "{}\tparent:{parent}\tsummary:{summary}\t{}",
-            session.session_id,
-            session.cwd.display()
-        ));
+fn format_session_tree(session_dir: &Path, current: Option<&str>) -> Result<String> {
+    let sessions = SessionStore::list(session_dir)?;
+    if sessions.is_empty() {
+        return Ok("no sessions".to_string());
     }
-    Ok(if lines.is_empty() {
-        "no sessions".to_string()
+    // Children by parent, in listing order; roots are sessions without a
+    // parent we know (an unforked session, or one whose parent is gone).
+    let by_id: BTreeMap<&str, &noel_core::SessionSummary> = sessions
+        .iter()
+        .map(|session| (session.session_id.as_str(), session))
+        .collect();
+    let mut children: BTreeMap<String, Vec<&noel_core::SessionSummary>> = BTreeMap::new();
+    let mut roots: Vec<&noel_core::SessionSummary> = Vec::new();
+    for session in &sessions {
+        match session
+            .parent_session_id
+            .as_deref()
+            .filter(|parent| by_id.contains_key(parent))
+        {
+            Some(parent) => children.entry(parent.to_owned()).or_default().push(session),
+            None => roots.push(session),
+        }
+    }
+    // A child listed before its parent (a newer fork of an older id) still
+    // renders under it; every session appears exactly once.
+    let mut lines = Vec::new();
+    for root in &roots {
+        render_session_tree_row(root, &children, current, "", false, &mut lines);
+    }
+    Ok(lines.join("\n"))
+}
+
+/// One row of the session tree, upstream's `/tree` style: connectors,
+/// the current session marked, and the resume picker's label so a row is
+/// recognizable at a glance.
+fn render_session_tree_row(
+    session: &noel_core::SessionSummary,
+    children: &BTreeMap<String, Vec<&noel_core::SessionSummary>>,
+    current: Option<&str>,
+    indent: &str,
+    last: bool,
+    lines: &mut Vec<String>,
+) {
+    let here = current == Some(session.session_id.as_str());
+    let marker = if here { "• " } else { "  " };
+    let own = children
+        .get(session.session_id.as_str())
+        .map(|kids| kids.len())
+        .unwrap_or(0);
+    let branch_note = if own > 0 {
+        format!(" ({own} branch{})", if own > 1 { "es" } else { "" })
     } else {
-        lines.join("\n")
-    })
+        String::new()
+    };
+    let summary_note = session
+        .branch_summary
+        .as_deref()
+        .map(|summary| {
+            let collapsed: String = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+            let truncated: String = collapsed.chars().take(80).collect();
+            if collapsed.chars().count() > 80 {
+                format!("\n    {truncated}…")
+            } else if collapsed.is_empty() {
+                String::new()
+            } else {
+                format!("\n    {truncated}")
+            }
+        })
+        .unwrap_or_default();
+    lines.push(format!(
+        "{indent}{marker}{}{branch_note}{}",
+        format_session_picker_label(session),
+        summary_note
+    ));
+    if let Some(kids) = children.get(&session.session_id) {
+        for (index, child) in kids.iter().enumerate() {
+            let child_last = index + 1 == kids.len();
+            let stem = if indent.is_empty() || last {
+                "  "
+            } else {
+                "│ "
+            };
+            let connector = if child_last { "└─ " } else { "├─ " };
+            let child_indent = format!("{indent}{stem}{connector}");
+            render_session_tree_row(child, children, current, &child_indent, child_last, lines);
+        }
+    }
 }
 
 fn format_session_usage(runtime: &Runtime) -> String {
@@ -11108,6 +11182,63 @@ mod tests {
         // The blank line ended the list, so this one restarts at its own 5.
         assert_eq!(item_text("five"), "  5. five");
         assert_eq!(item_text("six"), "  6. six");
+    }
+
+    #[test]
+    fn session_tree_renders_branches_with_connectors_and_marks_the_current() {
+        let root = std::env::temp_dir().join(format!("noel-cli-tree-{}", unique_temp_suffix()));
+        use serde_json::json;
+        fs::create_dir_all(&root).unwrap();
+        let session_dir = root.join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let write = |id: &str, prompt: &str, parent: Option<&str>| {
+            let path = session_dir.join(format!("{id}.jsonl"));
+            let mut records =
+                vec![json!({"type": "started", "session_id": id, "cwd": root.join("cwd")})];
+            if let Some(parent) = parent {
+                records.push(json!({"type": "metadata", "name": null, "labels": [], "parent_session_id": parent}));
+            }
+            records.push(json!({"type": "message", "message": {"role": "user", "content": prompt, "media": [], "tool_call_id": null, "tool_name": null, "tool_calls": [], "aborted": false, "thinking": ""}}));
+            let mut text = String::new();
+            for record in records {
+                text.push_str(&record.to_string());
+                text.push('\n');
+            }
+            fs::write(path, text).unwrap();
+        };
+        write("parent", "fix the login flow", None);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write("fork-a", "try oauth instead", Some("parent"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write("fork-b", "try device code", Some("parent"));
+        let tree = format_session_tree(&session_dir, Some("fork-a")).unwrap();
+        let parent_row = tree
+            .lines()
+            .find(|line| line.contains("fix the login flow"))
+            .unwrap();
+        let fork_a_row = tree
+            .lines()
+            .find(|line| line.contains("try oauth instead"))
+            .unwrap();
+        let fork_b_row = tree
+            .lines()
+            .find(|line| line.contains("try device code"))
+            .unwrap();
+        // The parent leads with no bullet; both forks are its children with
+        // connectors, the last one a corner.
+        assert!(fork_a_row.contains("• "), "current session marked: {tree}");
+        assert!(fork_b_row.contains("└─ "), "last child corners: {tree}");
+        assert!(
+            tree.lines().any(|line| line.contains("├─ ")),
+            "a non-last child branches: {tree}"
+        );
+        assert!(
+            parent_row.contains("(2 branches)"),
+            "branch count noted: {tree}"
+        );
+        // Every session appears exactly once.
+        assert_eq!(tree.lines().count(), 3, "{tree}");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
