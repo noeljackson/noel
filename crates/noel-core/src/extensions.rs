@@ -822,7 +822,10 @@ mod tests {
                 name: "echo_tool",
                 description: "Echo its input back.",
                 parameters: { type: "object", properties: { text: { type: "string" } } },
-                execute: async (args) => ({ output: "echo: " + args.text }),
+                // Upstream's execute signature; AgentToolResult content.
+                execute: async (_id, params) => ({
+                  content: [{ type: "text", text: "echo: " + params.text }],
+                }),
               });
               pi.registerCommand("greet", { handler: async (args) => "hello, " + (args || "world") });
               pi.on("toolCall", async (event) => {
@@ -965,6 +968,73 @@ mod tests {
             .await
             .expect("gate call");
         assert_eq!(gate, GateDecision::allow());
+        hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// Upstream's `hello.ts`, the minimal `defineTool` example, verbatim:
+    /// its TypeBox parameters reach the handshake as JSON schema and its
+    /// `AgentToolResult` content flattens to the protocol's output.
+    #[tokio::test]
+    async fn upstream_hello_tool_example_runs_under_bun_host() {
+        let Ok(_bun) = which_bun() else {
+            return;
+        };
+        let shim = repo_bun_host_shim();
+        let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../target/ts-reference-pi/packages/coding-agent/examples/extensions/hello.ts",
+        );
+        if !shim.is_file() || !example.is_file() {
+            return;
+        }
+        let cwd = std::env::temp_dir().join(format!("noel-ext-bun-hello-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("mkdir");
+        let extension = cwd.join("hello.ts");
+        fs::copy(&example, &extension).expect("copy example");
+        fs::write(
+            cwd.join("hello.ts.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
+                    None => std::env::remove_var("NOEL_BUN_HOST"),
+                }
+            }
+        }
+        let _guard = EnvGuard(std::env::var_os("NOEL_BUN_HOST"));
+        std::env::set_var("NOEL_BUN_HOST", &shim);
+
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("hello", &extension, &cwd, "session-1")
+            .await
+            .expect("start bun host for upstream example");
+        let sets = hosts.registration_sets();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].tools.len(), 1);
+        let tool = &sets[0].tools[0];
+        assert_eq!(tool.name, "hello");
+        // TypeBox's schema crosses as JSON schema: required name, string.
+        let parameters = tool.parameters.clone();
+        assert_eq!(parameters["required"], serde_json::json!(["name"]));
+        assert_eq!(parameters["properties"]["name"]["type"], "string");
+        let outcome = hosts
+            .call(
+                "hello",
+                "tool",
+                "hello",
+                r#"{"name":"noel"}"#,
+                &cwd,
+                Some("c1"),
+            )
+            .await
+            .expect("call tool");
+        assert_eq!(outcome.output, "Hello, noel!");
         hosts.shutdown(&cwd).await;
         let _ = fs::remove_dir_all(cwd);
     }
