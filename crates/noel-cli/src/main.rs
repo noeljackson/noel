@@ -10797,6 +10797,16 @@ fn account_selector_items_for(
         ""
     };
     let active = active_account;
+    // Auth is read from disk, not the startup snapshot: an account logged
+    // in or refreshed by another process (the CLI, the TUI's own /login)
+    // appears and reads current without a /reload. A missing file keeps
+    // the snapshot (nothing was ever stored; the snapshot may hold
+    // process-only state a unit harness built).
+    let auth = if config.paths.auth_path.exists() {
+        noel_config::read_auth_file(&config.paths.auth_path).unwrap_or_else(|_| config.auth.clone())
+    } else {
+        config.auth.clone()
+    };
     let mut items = vec![SelectorItem {
         label: if failover {
             "auto (failover: sticky account, switches on limits)".to_string()
@@ -10807,20 +10817,44 @@ fn account_selector_items_for(
         active: active.is_none(),
     }];
     items.extend(
-        listed_accounts_for_provider(&config.auth, provider)
+        listed_accounts_for_provider(&auth, provider)
             .into_iter()
-            .map(|(account, source)| SelectorItem {
-                label: match source {
-                    AccountSource::Stored => format!("{account}{pinned_note}"),
+            .map(|(account, source)| {
+                // The token's own expiry state, so a stale snapshot cannot
+                // call a refreshed account expired (the request path
+                // refreshes within its window before use anyway).
+                let state = match &source {
+                    AccountSource::Stored => {
+                        let expiring = auth
+                            .credential(provider, &account)
+                            .and_then(|credential| match credential {
+                                AuthCredential::OAuth { expires, .. } => Some(*expires),
+                                _ => None,
+                            })
+                            .map(|expires| {
+                                expires
+                                    <= unix_seconds().unwrap_or_default()
+                                        + crate::oauth_refresh::REFRESH_WINDOW_SECONDS
+                            })
+                            .unwrap_or(false);
+                        if expiring {
+                            format!("{account} (expires soon; refreshed before use){pinned_note}")
+                        } else {
+                            format!("{account}{pinned_note}")
+                        }
+                    }
                     AccountSource::Environment => {
                         format!("{account} (environment, read-only)")
                     }
                     AccountSource::ImportedFile => {
                         format!("{account} (imported login file, read-only)")
                     }
-                },
-                active: active == Some(account.as_str()),
-                value: account,
+                };
+                SelectorItem {
+                    label: state,
+                    active: active == Some(account.as_str()),
+                    value: account,
+                }
             }),
     );
     items
@@ -12604,6 +12638,53 @@ mod tests {
         if let Some((_, task)) = app.account_status_task.take() {
             task.abort();
         }
+    }
+
+    #[test]
+    fn account_picker_reads_auth_from_disk_not_the_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("noel-cli-acct-disk-{}", unique_temp_suffix()));
+        fs::create_dir_all(&root).unwrap();
+        let auth_path = root.join("auth.json");
+        // The startup snapshot knew one stale account.
+        let mut snapshot = AuthData::default();
+        snapshot.insert("zeta", "old", AuthCredential::ApiKey { key: "old".into() });
+        // Disk has the old one, a new one, and an OAuth token that the
+        // snapshot would call long expired but is fine on disk.
+        let mut disk = AuthData::default();
+        disk.insert("zeta", "old", AuthCredential::ApiKey { key: "old".into() });
+        disk.insert(
+            "zeta",
+            "added-later",
+            AuthCredential::ApiKey { key: "new".into() },
+        );
+        disk.insert(
+            "zeta",
+            "oauth",
+            AuthCredential::OAuth {
+                access_token: "a".into(),
+                refresh_token: Some("r".into()),
+                expires: unix_seconds().unwrap_or_default() + 7 * 3600,
+                account_id: None,
+            },
+        );
+        noel_config::write_auth_file(&auth_path, &disk).unwrap();
+        let mut config = account_test_config(snapshot);
+        config.paths.auth_path = auth_path.clone();
+
+        let items = account_selector_items_for(&config, "zeta", None);
+
+        // Every stored account on disk is offered, including the one added
+        // after startup.
+        assert!(
+            items.iter().any(|item| item.value == "added-later"),
+            "{items:?}"
+        );
+        // The OAuth account is not marked expiring: its disk expiry is hours
+        // away, whatever the snapshot said.
+        let oauth = items.iter().find(|item| item.value == "oauth").unwrap();
+        assert!(!oauth.label.contains("expires soon"), "{}", oauth.label);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
