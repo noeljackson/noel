@@ -16,6 +16,7 @@ session_dir="${e2e_root}/e2e-tmux-sessions"
 work_dir="${e2e_root}/e2e-tmux-work"
 cwd_dir="${work_dir}/cwd"
 agent_dir="${work_dir}/agent"
+bun_host="${repo_root}/crates/noel-cli/src/extension-hosts/noel-bun-host.ts"
 prompt_file="${work_dir}/prompt-ready"
 
 cleanup() {
@@ -56,6 +57,16 @@ printf '{"output":"json-ext saw %s"}\n' "${input}"
 SH
 chmod +x "${agent_dir}/extensions/json-ext"
 printf '{"protocol":"json"}\n' > "${agent_dir}/extensions/json-ext.noel-extension.json"
+# A TypeScript extension under the bun host, when bun is available. The
+# shim is found via NOEL_BUN_HOST so cargo run (no installed binary) works.
+if command -v bun >/dev/null 2>&1; then
+  cat > "${agent_dir}/extensions/bun-ext.ts" <<'TS'
+export default function (pi) {
+  pi.registerCommand("greet", { handler: async (args) => "bun-ext says hello, " + (args || "world") });
+}
+TS
+  printf '{"protocolVersion":2}\n' > "${agent_dir}/extensions/bun-ext.ts.noel-extension.json"
+fi
 printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=' | base64 -d > "${work_dir}/pixel.png"
 
 (cd "${cwd_dir}" && NOEL_DIR="${agent_dir}" "${cargo_bin}" run -q --manifest-path "${repo_root}/Cargo.toml" -p noel-cli -- config disable extension assist) > "${work_dir}/config-disable.txt"
@@ -67,7 +78,7 @@ grep -Fq "disabled extensions: -" "${work_dir}/config-enabled.txt"
 
 tmux new-session -d -s "${session_name}" -x 100 -y 30
 tmux send-keys -t "${session_name}" \
-  "cd '${cwd_dir}' && env -u NO_COLOR NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' NOEL_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' NOEL_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' NOEL_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' NOEL_EDITOR_COMMAND='printf editor-prompt > {file}' '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-dir '${session_dir}' --model faux/echo; printf 'noel-%s\\n' exited" \
+  "cd '${cwd_dir}' && env -u NO_COLOR NOEL_TUI_E2E_DUMP=1 NOEL_DIR='${agent_dir}' NOEL_EXTENSION_EVENTS_LOG='${work_dir}/extension-events.txt' NOEL_CLIPBOARD_COMMAND='cat > ${work_dir}/clipboard.txt' NOEL_CLIPBOARD_IMAGE_COMMAND='cat ${work_dir}/pixel.png' NOEL_EDITOR_COMMAND='printf editor-prompt > {file}' NOEL_BUN_HOST="${NOEL_BUN_HOST:-${bun_host}}" '${cargo_bin}' run -q --manifest-path '${repo_root}/Cargo.toml' -p noel-cli -- --session-dir '${session_dir}' --model faux/echo; printf 'noel-%s\\n' exited" \
   Enter
 
 for _ in $(seq 1 80); do
@@ -357,7 +368,16 @@ send_line "/extensions"
 send_line "/extension:assist extension input"
 send_line "/extension:exec-ext executable input"
 send_line "/extension:json-ext protocol input"
+# Close any selector or completion the earlier commands left open
+# (Escape), so the next typed line reaches the draft, not a picker.
 send_line "/prompts"
+tmux send-keys -t "${session_name}" Escape
+absent "esc cancel"
+# The extension-registered command from the bun host. Its registration
+# surfaces when the unknown /command starts the v2 hosts and looks again.
+if command -v bun >/dev/null 2>&1; then
+  send_line "/greet bun"
+fi
 send_line "/explain tmux panes"
 send_line "/not-a-command stays text"
 send_line "/prompt fix broken thing"
@@ -508,6 +528,9 @@ require_output "extension says {{input}}"
 require_output "extension input"
 require_output "exec-ext saw executable input"
 require_output "json-ext saw protocol input"
+if command -v bun >/dev/null 2>&1; then
+  require_output "bun-ext says hello, bun"
+fi
 require_output "Explain a thing"
 require_output "[faux/echo] explain tmux briefly"
 require_output "[faux/echo] /not-a-command stays text"

@@ -8430,7 +8430,20 @@ async fn handle_tui_submission(
         _ if line.starts_with('/') && !line.starts_with("//") => {
             let (name, input) = split_resource_command(&line, "/");
             let (name, input) = (name.to_string(), input.to_string());
+            // A v2 host's registered commands surface only once its
+            // handshake ran; hosts start lazily, so an unknown /command
+            // starts them once and looks again before falling through to
+            // the model (upstream loads extensions at startup).
             let registered = {
+                let hosts = runtime.extension_hosts();
+                let hosts = hosts.lock().await;
+                hosts
+                    .registration_sets()
+                    .iter()
+                    .any(|set| set.commands.iter().any(|command| command.name == name))
+            };
+            let registered = registered || {
+                runtime.start_extension_hosts().await;
                 let hosts = runtime.extension_hosts();
                 let hosts = hosts.lock().await;
                 hosts
@@ -10986,6 +10999,11 @@ fn find_resource<'a>(resources: &'a [ResourceFile], name: &str) -> Option<&'a Re
 }
 
 fn is_executable_extension(path: &Path) -> bool {
+    // A `.ts` file is not executable on disk; it runs under the bun host
+    // (see `host_command` in noel-core), so it counts as runnable here.
+    if path.extension().and_then(|e| e.to_str()) == Some("ts") {
+        return path.is_file();
+    }
     path.is_file() && is_executable_file(path)
 }
 

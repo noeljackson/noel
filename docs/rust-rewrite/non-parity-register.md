@@ -14,6 +14,34 @@ generate parity fixtures.
 Reason: the product goal is a native Rust CLI/TUI, not a wrapper around the old
 runtime.
 
+#### Amendment: Optional Bun Host for TypeScript Extensions
+
+A `.ts` extension (a v2 manifest beside it, `protocolVersion: 2`) runs under
+an *external* `bun` process: noel spawns `bun <noel-bun-host.ts>
+<extension.ts>` where the shim is a file noel ships (installed beside the
+binary by `make install`, found via `NOEL_BUN_HOST`, or in the agent dir's
+`extension-hosts/`). noel itself stays JavaScript-free: it links no JS engine,
+ships no JS in the binary, and runs its own logic in Rust only. The extension
+code — user-installed, like an executable extension — runs in a separate OS
+process under a runtime the user installed (`bun` on PATH).
+
+Semantics the host keeps either way: the extension speaks protocol v2 over
+stdio (init handshake with registrations, `tool`/`command` requests,
+notifications answered with no response line); gate verdicts fail closed;
+registrations commit only if the factory completes. The shim maps upstream's
+`ExtensionAPI` surface (default-export factory, `registerTool`,
+`registerCommand`, `on("tool_call", …)` with `{block, reason}` results) onto
+that protocol, so upstream example extensions load verbatim (type-only
+imports are erased by bun itself).
+
+Reason: upstream's extension ecosystem is TypeScript; a subprocess host keeps
+parity with what extensions expect without embedding an engine (deno_core's
+stewardship window and V8's size make embedding the wrong trade), and keeps
+noel's binary and build free of any JS runtime. bun is optional: without it,
+a `.ts` extension fails closed with a diagnostic, exactly like a missing
+executable. This is the same class of dependency as `rg`/`fd`: an external
+tool noel invokes deliberately, never a runtime noel depends on.
+
 ### No Web UI Product Path
 
 The old TypeScript web UI is not part of the active Rust product.
