@@ -41,11 +41,19 @@ interface WireResponse {
 interface ToolDefinition {
   name: string;
   description?: string;
+  label?: string;
   parameters?: unknown;
   replaySafe?: boolean;
   promptSnippet?: string;
   promptGuidelines?: string[];
-  execute: (args: unknown, ctx: ExtensionContext) => unknown;
+  // Upstream's signature: (toolCallId, params, signal, onUpdate, ctx).
+  execute: (
+    toolCallId: string,
+    params: unknown,
+    signal: undefined,
+    onUpdate: undefined,
+    ctx: ExtensionContext,
+  ) => unknown;
 }
 
 interface CommandOptions {
@@ -124,21 +132,24 @@ function makeApi(): Record<string, unknown> {
       }
       switch (event) {
         // Upstream's event names; noel's protocol kinds carry the same
-        // three that matter for a host process.
+        // few that matter for a host process (agent_settled is noel's
+        // settled notification, upstream's agent_end).
         case "toolCall":
         case "tool_call":
           toolCallHandlers.push(handler);
           break;
         case "agentSettled":
         case "agent_settled":
+        case "agent_end":
           settledHandlers.push(handler);
           break;
         case "sessionStart":
         case "session_start":
+        case "session_shutdown":
           sessionStartHandlers.push(handler);
           break;
         default:
-          // Upstream has ~40 events; the protocol carries these three and
+          // Upstream has ~40 events; the protocol carries these and
           // ignores the rest of the registrations rather than failing.
           break;
       }
@@ -192,6 +203,23 @@ function textOf(value: unknown): string {
   return JSON.stringify(value);
 }
 
+/// Upstream's AgentToolResult, flattened to the protocol's output string:
+/// every text content item joined, with details kept beside it.
+function textOfToolResult(result: unknown): string {
+  if (result !== null && typeof result === "object" && "content" in (result as object)) {
+    const content = (result as { content: unknown }).content;
+    if (Array.isArray(content)) {
+      const text = content
+        .filter((part) => part?.type === "text")
+        .map((part) => part.text)
+        .filter((text) => typeof text === "string")
+        .join("\n");
+      if (typeof text === "string" && text.length > 0) return text;
+    }
+  }
+  return textOf(result);
+}
+
 async function handle(request: WireRequest): Promise<WireResponse | null> {
   cwd = request.cwd || cwd;
   if (request.sessionId) sessionId = request.sessionId;
@@ -220,11 +248,17 @@ async function handle(request: WireRequest): Promise<WireResponse | null> {
     case "tool": {
       const tool = tools.get(request.command ?? "");
       if (!tool) return errorResponse(`no tool ${request.command}`);
-      const result = await tool.execute(input, { cwd, sessionId });
-      if (result !== null && typeof result === "object" && "output" in (result as object)) {
-        return { output: textOf((result as { output: unknown }).output) };
-      }
-      return { output: textOf(result) };
+      // Upstream's execute signature; the protocol's toolCallId and input
+      // (JSON) become its first two arguments. The result is upstream's
+      // AgentToolResult: { content: [{type:"text", text}], ... }.
+      const result = await tool.execute(
+        request.toolCallId ?? "",
+        input,
+        undefined,
+        undefined,
+        { cwd, sessionId },
+      );
+      return { output: textOfToolResult(result) };
     }
     case "command": {
       let commandName = request.command ?? "";
