@@ -113,6 +113,7 @@ install:
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/noel "$(BINDIR)/noel"
 	install -m 0755 $(ENV_DAEMONS_DIR)/noel-env-* "$(BINDIR)/"
+	install -m 0644 crates/noel-cli/src/extension-hosts/noel-bun-host.ts "$(BINDIR)/noel-bun-host.ts"
 
 install-system:
 	CARGO="$(CARGO)" $(INSTALL_BUILD_SCRIPT)
@@ -120,6 +121,7 @@ install-system:
 	$(SUDO) install -d "$(SYSTEM_BINDIR)"
 	$(SUDO) install -m 0755 target/release/noel "$(SYSTEM_BINDIR)/noel"
 	$(SUDO) install -m 0755 $(ENV_DAEMONS_DIR)/noel-env-* "$(SYSTEM_BINDIR)/"
+	$(SUDO) install -m 0644 crates/noel-cli/src/extension-hosts/noel-bun-host.ts "$(SYSTEM_BINDIR)/noel-bun-host.ts"
 
 run:
 	$(CARGO) run -p noel-cli -- $(RUN_ARGS)

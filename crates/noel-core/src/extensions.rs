@@ -211,12 +211,15 @@ struct HostProcess {
 }
 impl HostProcess {
     async fn spawn(path: &Path, extension_name: &str, cwd: &Path) -> Result<Self, AgentError> {
-        let mut command = tokio::process::Command::new(path);
+        let mut command = host_command(path)?;
         command
             .current_dir(cwd)
             .env("NOEL_EXTENSION_NAME", extension_name)
             .env("NOEL_EXTENSION_PATH", path)
             .env("NOEL_EXTENSION_PROTOCOL", "2")
+            // A TypeScript extension resolves its imports against the
+            // directory noel found it in, not against the shim's own.
+            .env("NOEL_EXTENSION_DIR", path.parent().unwrap_or(cwd))
             // Extensions written for pi read the same values under PI_ names.
             .env("PI_EXTENSION_NAME", extension_name)
             .env("PI_EXTENSION_PATH", path)
@@ -229,8 +232,19 @@ impl HostProcess {
         // finished (released, not killed): the host outlives the call, and
         // the child's kill_on_drop still kills it when the host drops.
         let (mut child, group) = spawn_tool_process(&mut command).map_err(|source| {
+            // Name what actually failed to start: for a `.ts` extension
+            // that is the bun program, not the extension's own file.
+            let program = command.as_std().get_program();
+            let what = if program.to_string_lossy() == "bun" {
+                format!(
+                    "bun (needed for the TypeScript extension {}; install bun or set NOEL_BUN_HOST)",
+                    path.display()
+                )
+            } else {
+                path.display().to_string()
+            };
             AgentError::Tool(ToolError::Io {
-                path: path.to_path_buf(),
+                path: what.into(),
                 source,
             })
         })?;
@@ -325,9 +339,18 @@ impl ExtensionHosts {
         cwd: &Path,
         session_id: &str,
     ) -> Result<(), String> {
-        let mut process = HostProcess::spawn(path, extension_name, cwd)
-            .await
-            .map_err(|error| error.to_string())?;
+        let mut process = match HostProcess::spawn(path, extension_name, cwd).await {
+            Ok(process) => process,
+            Err(error) => {
+                // A spawn failure (bun missing, shim missing) is recorded
+                // like an init failure: later calls report it instead of
+                // "has no host", failing closed with the reason.
+                let message = error.to_string();
+                self.failures
+                    .insert(extension_name.to_string(), message.clone());
+                return Err(message);
+            }
+        };
         let response = process
             .request(&HostRequest {
                 protocol_version: EXTENSION_PROTOCOL_VERSION,
@@ -674,6 +697,54 @@ pub fn host_error_as_agent_error(extension_name: &str, error: String) -> AgentEr
     )))
 }
 
+/// The command that runs one extension. An executable file runs itself
+/// (v1's one-shot programs and v2 hosts); a `.ts` file runs under the bun
+/// host: `bun <noel-bun-host.ts> <extension.ts>`, discovered as
+/// [`find_bun_host`] describes.
+fn host_command(path: &Path) -> Result<tokio::process::Command, AgentError> {
+    let is_typescript = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == "ts");
+    if !is_typescript {
+        // An executable file is its own host, as before.
+        return Ok(tokio::process::Command::new(path));
+    }
+    let shim = find_bun_host().ok_or_else(|| {
+        AgentError::Tool(ToolError::Failed(
+            "a TypeScript extension needs bun (found on PATH) and noel's shim \
+             (shipped beside the noel binary or in the agent dir); \
+             set NOEL_BUN_HOST to the shim's path"
+                .to_string(),
+        ))
+    })?;
+    let mut command = tokio::process::Command::new("bun");
+    command.arg(shim).arg(path);
+    Ok(command)
+}
+
+/// Where noel's bun shim lives: `NOEL_BUN_HOST`, else beside the running
+/// binary, else the agent dir's `extension-hosts/noel-bun-host.ts`, the
+/// same agent dir the config discovers.
+fn find_bun_host() -> Option<PathBuf> {
+    if let Some(override_path) = std::env::var_os("NOEL_BUN_HOST") {
+        let path = PathBuf::from(override_path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let beside = exe.parent().map(|dir| dir.join("noel-bun-host.ts"));
+        if let Some(beside) = beside.filter(|path| path.is_file()) {
+            return Some(beside);
+        }
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let (paths, _import) = noel_config::ConfigPaths::discover(cwd, None).ok()?;
+    let shim = paths.agent_dir.join("extension-hosts/noel-bun-host.ts");
+    shim.is_file().then_some(shim)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,5 +792,197 @@ mod tests {
         assert_eq!(outcome.output, "ran");
         hosts.shutdown(&cwd).await;
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// A `.ts` extension runs under the bun host: the same handshake, tool
+    /// call, and gate as the shell host above, through noel's shipped shim.
+    /// Skipped when bun or the repo's shim is not available (CI without
+    /// bun keeps passing; the drift image covers the full chain).
+    #[tokio::test]
+    async fn v2_typescript_extension_runs_under_bun_host() {
+        let Ok(bun) = which_bun() else {
+            eprintln!("skipping: bun not found");
+            return;
+        };
+        let shim = repo_bun_host_shim();
+        if !shim.is_file() {
+            eprintln!("skipping: shim not found");
+            return;
+        }
+        let cwd = std::env::temp_dir().join(format!("noel-ext-bun-{}", std::process::id()));
+        let agent_dir = cwd.join("agent");
+        let extensions_dir = agent_dir.join("extensions");
+        fs::create_dir_all(&extensions_dir).expect("mkdir");
+        let extension = extensions_dir.join("gate.ts");
+        fs::write(
+            &extension,
+            r#"
+            export default function (pi) {
+              pi.registerTool({
+                name: "echo_tool",
+                description: "Echo its input back.",
+                parameters: { type: "object", properties: { text: { type: "string" } } },
+                execute: async (args) => ({ output: "echo: " + args.text }),
+              });
+              pi.registerCommand("greet", { handler: async (args) => "hello, " + (args || "world") });
+              pi.on("toolCall", async (event) => {
+                if (String(event.input.command ?? "").includes("secret")) {
+                  return { allow: false, reason: "secret path is protected" };
+                }
+                return { allow: true };
+              });
+            }
+            "#,
+        )
+        .expect("write extension");
+        fs::write(
+            extensions_dir.join("gate.ts.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        // The shim lookup checks NOEL_BUN_HOST first; point it at the repo's
+        // shim so the test does not depend on an installed agent dir.
+        // SAFETY: single-threaded test; the guard restores the variable.
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
+                    None => std::env::remove_var("NOEL_BUN_HOST"),
+                }
+            }
+        }
+        let _guard = EnvGuard(std::env::var_os("NOEL_BUN_HOST"));
+        std::env::set_var("NOEL_BUN_HOST", &shim);
+
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("gate", &extension, &cwd, "session-1")
+            .await
+            .expect("start bun host");
+        let sets = hosts.registration_sets();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].tools[0].name, "echo_tool");
+        assert_eq!(sets[0].commands[0].name, "greet");
+        assert!(sets[0].tool_gate);
+        let outcome = hosts
+            .call(
+                "gate",
+                "tool",
+                "echo_tool",
+                r#"{"text":"hi"}"#,
+                &cwd,
+                Some("c1"),
+            )
+            .await
+            .expect("call tool");
+        assert_eq!(outcome.output, "echo: hi");
+        let outcome = hosts
+            .call("gate", "command", "greet", "noel", &cwd, None)
+            .await
+            .expect("call command");
+        assert_eq!(outcome.output, "hello, noel");
+        let gate = hosts
+            .gate_tool_call("bash", r#"{"command":"cat secret.txt"}"#, &cwd)
+            .await
+            .expect("gate call");
+        assert_eq!(
+            gate,
+            GateDecision::blocked("secret path is protected".to_string())
+        );
+        let gate = hosts
+            .gate_tool_call("bash", r#"{"command":"ls"}"#, &cwd)
+            .await
+            .expect("gate call");
+        assert_eq!(gate, GateDecision::allow());
+        hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+        drop(bun);
+    }
+
+    /// Upstream's own example extension, verbatim from the pinned
+    /// reference checkout, runs under the bun host: its `tool_call`
+    /// handler blocks dangerous bash commands with no UI (headless), the
+    /// exact semantics upstream documents. Skipped without bun or the
+    /// reference checkout.
+    #[tokio::test]
+    async fn upstream_permission_gate_example_runs_under_bun_host() {
+        let Ok(_bun) = which_bun() else {
+            return;
+        };
+        let shim = repo_bun_host_shim();
+        let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/ts-reference-pi/packages/coding-agent/examples/extensions/permission-gate.ts");
+        if !shim.is_file() || !example.is_file() {
+            return;
+        }
+        let cwd = std::env::temp_dir().join(format!("noel-ext-bun-pi-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("mkdir");
+        let extension = cwd.join("permission-gate.ts");
+        fs::copy(&example, &extension).expect("copy example");
+        fs::write(
+            cwd.join("permission-gate.ts.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
+                    None => std::env::remove_var("NOEL_BUN_HOST"),
+                }
+            }
+        }
+        let _guard = EnvGuard(std::env::var_os("NOEL_BUN_HOST"));
+        std::env::set_var("NOEL_BUN_HOST", &shim);
+
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("permission-gate", &extension, &cwd, "session-1")
+            .await
+            .expect("start bun host for upstream example");
+        let sets = hosts.registration_sets();
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].tool_gate, "the example takes the tool_call gate");
+        for command in ["rm -rf /tmp/x", "sudo reboot", "chmod 777 /etc"] {
+            let gate = hosts
+                .gate_tool_call("bash", &format!(r#"{{"command":"{command}"}}"#), &cwd)
+                .await
+                .expect("gate call");
+            assert_eq!(
+                gate,
+                GateDecision::blocked(
+                    "Dangerous command blocked (no UI for confirmation)".to_string()
+                ),
+                "the example blocks {command}"
+            );
+        }
+        let gate = hosts
+            .gate_tool_call("bash", r#"{"command":"ls"}"#, &cwd)
+            .await
+            .expect("gate call");
+        assert_eq!(gate, GateDecision::allow());
+        hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    fn which_bun() -> Result<PathBuf, ()> {
+        let path = std::env::var_os("PATH").ok_or(())?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("bun");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+        Err(())
+    }
+
+    /// The repo's shipped shim: `crates/noel-cli/src/extension-hosts/`.
+    fn repo_bun_host_shim() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../noel-cli/src/extension-hosts/noel-bun-host.ts")
     }
 }
