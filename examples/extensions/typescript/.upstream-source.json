@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/earendil-works/pi.git",
+  "ref": "main",
+  "commit": "5f312dac4c4b18ad6b4af05dbd751d2668a4d6d9",
+  "copied": "2026-10-27T20:56:23+00:00",
+  "files": [
+    "hello.ts",
+    "notify.ts",
+    "permission-gate.ts",
+    "protected-paths.ts",
+    "structured-output.ts"
+  ]
+}

@@ -804,11 +804,10 @@ mod tests {
             eprintln!("skipping: bun not found");
             return;
         };
-        let shim = repo_bun_host_shim();
-        if !shim.is_file() {
+        let Some(shim) = repo_bun_host_shim() else {
             eprintln!("skipping: shim not found");
             return;
-        }
+        };
         let cwd = std::env::temp_dir().join(format!("noel-ext-bun-{}", std::process::id()));
         let agent_dir = cwd.join("agent");
         let extensions_dir = agent_dir.join("extensions");
@@ -915,11 +914,11 @@ mod tests {
             return;
         };
         let shim = repo_bun_host_shim();
-        let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/ts-reference-pi/packages/coding-agent/examples/extensions/permission-gate.ts");
-        if !shim.is_file() || !example.is_file() {
-            return;
-        }
+        let example = upstream_example("permission-gate.ts");
+        let (shim, example) = match (shim, example) {
+            (Some(shim), Some(example)) => (shim, example),
+            _ => return,
+        };
         let cwd = std::env::temp_dir().join(format!("noel-ext-bun-pi-{}", std::process::id()));
         fs::create_dir_all(&cwd).expect("mkdir");
         let extension = cwd.join("permission-gate.ts");
@@ -981,12 +980,11 @@ mod tests {
             return;
         };
         let shim = repo_bun_host_shim();
-        let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-            "../../target/ts-reference-pi/packages/coding-agent/examples/extensions/hello.ts",
-        );
-        if !shim.is_file() || !example.is_file() {
-            return;
-        }
+        let example = upstream_example("hello.ts");
+        let (shim, example) = match (shim, example) {
+            (Some(shim), Some(example)) => (shim, example),
+            _ => return,
+        };
         let cwd = std::env::temp_dir().join(format!("noel-ext-bun-hello-{}", std::process::id()));
         fs::create_dir_all(&cwd).expect("mkdir");
         let extension = cwd.join("hello.ts");
@@ -1039,6 +1037,192 @@ mod tests {
         let _ = fs::remove_dir_all(cwd);
     }
 
+    /// A session can host all three extension kinds at once: an
+    /// executable Rust program (this repo's example, compiled on the fly),
+    /// a `.ts` extension under the bun host, and a shell one-shot host.
+    /// Each keeps its own process and registrations; a tool call routes to
+    /// the extension that registered it. Skipped without bun (the Rust
+    /// host alone is covered by the shell-host test's mechanics).
+    #[tokio::test]
+    async fn rust_typescript_and_shell_extensions_host_together() {
+        let Ok(_bun) = which_bun() else {
+            return;
+        };
+        let Some(shim) = repo_bun_host_shim() else {
+            return;
+        };
+        let cwd = std::env::temp_dir().join(format!("noel-ext-mixed-{}", std::process::id()));
+        let extensions_dir = cwd.join("extensions");
+        fs::create_dir_all(&extensions_dir).expect("mkdir");
+
+        // The Rust host: the shipped example, compiled with rustc.
+        let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/rust/host.rs");
+        if !example.is_file() {
+            return;
+        }
+        let rust_host = extensions_dir.join("rust-host");
+        let compiled =
+            std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+                .arg("-O")
+                .arg(&example)
+                .arg("-o")
+                .arg(&rust_host)
+                .output()
+                .expect("spawn rustc");
+        assert!(
+            compiled.status.success(),
+            "rustc failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        make_executable(&rust_host);
+        fs::write(
+            extensions_dir.join("rust-host.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        // The TypeScript host: a counter tool under the bun shim.
+        let ts_host = extensions_dir.join("ts-host.ts");
+        fs::write(
+            &ts_host,
+            r#"
+            export default function (pi) {
+              let calls = 0;
+              pi.registerTool({
+                name: "ts_echo",
+                description: "Echo from the TypeScript host.",
+                parameters: { type: "object", properties: { text: { type: "string" } } },
+                execute: async (_id, params) => ({
+                  content: [{ type: "text", text: "ts says " + params.text + " (call " + (++calls) + ")" }],
+                }),
+              });
+            }
+            "#,
+        )
+        .expect("write extension");
+        fs::write(
+            extensions_dir.join("ts-host.ts.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        // The shell host: a persistent responder, like the v2 shell test.
+        let shell_host = extensions_dir.join("shell-host");
+        fs::write(
+            &shell_host,
+            r#"#!/bin/sh
+while read line; do
+  case "$line" in
+    *'"kind":"init"'*) printf '%s\n' '{"output":"ready","tools":[{"name":"sh_version","parameters":{"type":"object"}}]}';;
+    *) printf '%s\n' '{"output":"sh host alive"}';;
+  esac
+done
+"#,
+        )
+        .expect("write extension");
+        make_executable(&shell_host);
+        fs::write(
+            extensions_dir.join("shell-host.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
+                    None => std::env::remove_var("NOEL_BUN_HOST"),
+                }
+            }
+        }
+        let _guard = EnvGuard(std::env::var_os("NOEL_BUN_HOST"));
+        std::env::set_var("NOEL_BUN_HOST", &shim);
+
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("rust-host", &rust_host, &cwd, "session-1")
+            .await
+            .expect("start rust host");
+        hosts
+            .start("ts-host", &ts_host, &cwd, "session-1")
+            .await
+            .expect("start ts host");
+        hosts
+            .start("shell-host", &shell_host, &cwd, "session-1")
+            .await
+            .expect("start shell host");
+
+        // Every host's registrations landed, each under its own name.
+        let sets = hosts.registration_sets();
+        let names: Vec<&str> = sets.iter().map(|set| set.extension_name.as_str()).collect();
+        assert!(names.contains(&"rust-host"));
+        assert!(names.contains(&"ts-host"));
+        assert!(names.contains(&"shell-host"));
+
+        // Tools route to the host that registered them, with state.
+        let outcome = hosts
+            .call(
+                "rust-host",
+                "tool",
+                "word_count",
+                r#"{"text":"one two three"}"#,
+                &cwd,
+                Some("c1"),
+            )
+            .await
+            .expect("rust tool");
+        assert_eq!(outcome.output, "3 words");
+        let outcome = hosts
+            .call("rust-host", "command", "stats", "", &cwd, None)
+            .await
+            .expect("rust command");
+        assert!(outcome.output.contains("run 1 time(s)"));
+        let outcome = hosts
+            .call(
+                "ts-host",
+                "tool",
+                "ts_echo",
+                r#"{"text":"hi"}"#,
+                &cwd,
+                Some("c2"),
+            )
+            .await
+            .expect("ts tool");
+        assert_eq!(outcome.output, "ts says hi (call 1)");
+        let outcome = hosts
+            .call(
+                "ts-host",
+                "tool",
+                "ts_echo",
+                r#"{"text":"again"}"#,
+                &cwd,
+                Some("c3"),
+            )
+            .await
+            .expect("ts tool again");
+        assert_eq!(outcome.output, "ts says again (call 2)");
+        let outcome = hosts
+            .call("shell-host", "tool", "sh_version", "{}", &cwd, Some("c4"))
+            .await
+            .expect("shell tool");
+        assert_eq!(outcome.output, "sh host alive");
+
+        // The rust host's gate decides; the others registered none.
+        let gate = hosts
+            .gate_tool_call("write", r#"{"path":"/etc/passwd","content":"x"}"#, &cwd)
+            .await
+            .expect("gate");
+        assert_eq!(
+            gate,
+            GateDecision::blocked("/etc is protected by rust-host".to_string())
+        );
+
+        hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+    }
+
     fn which_bun() -> Result<PathBuf, ()> {
         let path = std::env::var_os("PATH").ok_or(())?;
         for dir in std::env::split_paths(&path) {
@@ -1051,8 +1235,25 @@ mod tests {
     }
 
     /// The repo's shipped shim: `crates/noel-cli/src/extension-hosts/`.
-    fn repo_bun_host_shim() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../noel-cli/src/extension-hosts/noel-bun-host.ts")
+    fn repo_bun_host_shim() -> Option<PathBuf> {
+        let shim = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../noel-cli/src/extension-hosts/noel-bun-host.ts");
+        shim.is_file().then_some(shim)
+    }
+
+    /// An upstream example: the vendored copy in `examples/extensions/
+    /// typescript/` (kept current by scripts/sync-upstream-examples.sh),
+    /// else the local reference checkout.
+    fn upstream_example(name: &str) -> Option<PathBuf> {
+        let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/extensions/typescript")
+            .join(name);
+        if vendored.is_file() {
+            return Some(vendored);
+        }
+        let reference = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/ts-reference-pi/packages/coding-agent/examples/extensions")
+            .join(name);
+        reference.is_file().then_some(reference)
     }
 }
