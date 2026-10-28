@@ -356,6 +356,36 @@ fn window(label: &str, used_pct: Option<f64>, resets_at: Option<i64>) -> Option<
         label: label.to_string(),
         used_pct: used_pct?,
         resets_at,
+        active: None,
+        severity: None,
+    })
+}
+
+/// A window from Anthropic's `limits[]`: the kind's display name (scoped
+/// limits name their scope), its used percent, reset, active flag, and
+/// severity.
+fn window_from_limit(
+    kind: &str,
+    scope_model: Option<&str>,
+    percent: Option<f64>,
+    resets_at: Option<i64>,
+    active: Option<bool>,
+    severity: Option<&str>,
+) -> Option<UsageWindow> {
+    let label = match kind {
+        "session" => "5h".to_string(),
+        "weekly_all" => "weekly".to_string(),
+        other => match scope_model {
+            Some(model) => format!("weekly ({model})"),
+            None => other.to_string(),
+        },
+    };
+    Some(UsageWindow {
+        label,
+        used_pct: percent?,
+        resets_at,
+        active,
+        severity: severity.map(str::to_string),
     })
 }
 
@@ -398,19 +428,47 @@ fn parse_codex_usage(body: &str, now: i64) -> Result<AccountUsage, String> {
 
 fn parse_claude_usage(body: &str, now: i64) -> Result<AccountUsage, String> {
     let value = serde_json::from_str::<Value>(body).map_err(|error| error.to_string())?;
+    // The `limits` array is the current truth: it names each limit
+    // (session, weekly_all, and per-model weekly_scoped entries), says which
+    // is active, and how severe it is. Legacy five_hour/seven_day remain the
+    // fallback for responses without it.
     let mut windows = Vec::new();
-    for (key, label) in [("five_hour", "5h"), ("seven_day", "weekly")] {
-        let window_value = value.get(key);
-        if let Some(window) = window(
-            label,
-            window_value
-                .and_then(|window| window.get("utilization"))
-                .and_then(flexible_f64),
-            window_value
-                .and_then(|window| window.get("resets_at"))
-                .and_then(flexible_epoch),
-        ) {
-            windows.push(window);
+    if let Some(limits) = value.get("limits").and_then(Value::as_array) {
+        for limit in limits {
+            let scope_model = limit
+                .get("scope")
+                .and_then(|scope| scope.get("model"))
+                .and_then(|model| model.get("display_name"))
+                .and_then(Value::as_str);
+            if let Some(window) = window_from_limit(
+                limit
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                scope_model,
+                limit.get("percent").and_then(flexible_f64),
+                limit.get("resets_at").and_then(flexible_epoch),
+                limit.get("is_active").and_then(Value::as_bool),
+                limit.get("severity").and_then(Value::as_str),
+            ) {
+                windows.push(window);
+            }
+        }
+    }
+    if windows.is_empty() {
+        for (key, label) in [("five_hour", "5h"), ("seven_day", "weekly")] {
+            let window_value = value.get(key);
+            if let Some(window) = window(
+                label,
+                window_value
+                    .and_then(|window| window.get("utilization"))
+                    .and_then(flexible_f64),
+                window_value
+                    .and_then(|window| window.get("resets_at"))
+                    .and_then(flexible_epoch),
+            ) {
+                windows.push(window);
+            }
         }
     }
     Ok(AccountUsage {
@@ -823,8 +881,17 @@ fn windows_cell(row: &AccountStatusRow) -> String {
         .windows
         .iter()
         .map(|window| {
-            let left = (100.0 - window.used_pct).round().clamp(0.0, 100.0) as i64;
-            format!("{}: {left}% left", window.label)
+            // "% used" reads the way providers' own dashboards do; a
+            // critical active limit is marked so a full window reads as
+            // blocked, not just as a big number.
+            let used = window.used_pct.round().clamp(0.0, 100.0) as i64;
+            let marker = match (window.severity.as_deref(), window.active) {
+                (Some("critical"), Some(true)) => " (critical)",
+                (Some("critical"), _) => " (critical)",
+                (_, Some(true)) => " *",
+                _ => "",
+            };
+            format!("{}: {used}% used{marker}", window.label)
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -913,7 +980,7 @@ pub fn format_account_status(rows: &[AccountStatusRow], now: i64) -> String {
     let mut lines = vec![render(&headers.map(str::to_string))];
     lines.extend(cells.iter().map(render));
     lines.push(String::new());
-    lines.push("% = share of window quota remaining".to_string());
+    lines.push("% = share of window quota used; * = the provider's active limit; (critical) = at its limit".to_string());
     lines.push(String::new());
     lines.extend(account_howto_lines().into_iter().map(String::from));
     lines.join("\n")
@@ -1066,6 +1133,82 @@ mod tests {
         assert_eq!(usage.plan.as_deref(), Some("free"));
         assert!(usage.windows.is_empty());
         assert_eq!(usage.balance, None);
+    }
+
+    #[test]
+    fn parse_claude_usage_prefers_limits_array_with_active_and_severity() {
+        // The live shape (2026-10): limits[] carries session/weekly_all plus
+        // per-model weekly_scoped entries, with is_active and severity.
+        let usage = parse_claude_usage(
+            r#"{"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":100.0,"resets_at":"2026-10-28T17:00:00.059118+00:00"},"limits":[
+                {"kind":"session","group":"session","percent":0,"severity":"normal","resets_at":null,"scope":null,"is_active":false},
+                {"kind":"weekly_all","group":"weekly","percent":100,"severity":"critical","resets_at":"2026-10-28T17:00:00.059118+00:00","scope":null,"is_active":true},
+                {"kind":"weekly_scoped","group":"weekly","percent":8,"severity":"normal","resets_at":"2026-10-28T17:00:00.059263+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}
+            ]}"#,
+            1000,
+        )
+        .expect("parse claude usage");
+        assert_eq!(usage.windows.len(), 3);
+        assert_eq!(usage.windows[0].label, "5h");
+        assert_eq!(usage.windows[0].used_pct, 0.0);
+        assert_eq!(usage.windows[0].active, Some(false));
+        assert_eq!(usage.windows[1].label, "weekly");
+        assert_eq!(usage.windows[1].used_pct, 100.0);
+        assert_eq!(usage.windows[1].active, Some(true));
+        assert_eq!(usage.windows[1].severity.as_deref(), Some("critical"));
+        assert!(usage.windows[1].resets_at.is_some());
+        assert_eq!(usage.windows[2].label, "weekly (Fable)");
+        assert_eq!(usage.windows[2].used_pct, 8.0);
+        assert_eq!(usage.windows[2].active, Some(false));
+    }
+
+    #[test]
+    fn parse_claude_usage_falls_back_to_legacy_windows() {
+        let usage = parse_claude_usage(
+            r#"{"five_hour":{"utilization":42.0,"resets_at":"2027-11-24T15:00:00Z"},"seven_day":{"utilization":8.0,"resets_at":null}}"#,
+            1000,
+        )
+        .expect("parse claude usage");
+        assert_eq!(usage.windows.len(), 2);
+        assert_eq!(usage.windows[0].label, "5h");
+        assert_eq!(usage.windows[0].used_pct, 42.0);
+        assert_eq!(usage.windows[0].active, None);
+    }
+
+    #[test]
+    fn windows_cell_marks_critical_and_active_limits() {
+        let row = AccountStatusRow {
+            provider: "anthropic".to_string(),
+            account: "default".to_string(),
+            auth_state: AuthState::Ok,
+            unsupported: false,
+            error: None,
+            usage: Some(AccountUsage {
+                plan: None,
+                windows: vec![
+                    UsageWindow {
+                        label: "5h".to_string(),
+                        used_pct: 41.0,
+                        resets_at: Some(1793217600),
+                        active: Some(false),
+                        severity: Some("normal".to_string()),
+                    },
+                    UsageWindow {
+                        label: "weekly".to_string(),
+                        used_pct: 100.0,
+                        resets_at: Some(1793343600),
+                        active: Some(true),
+                        severity: Some("critical".to_string()),
+                    },
+                ],
+                balance: None,
+                fetched_at: 1000,
+            }),
+        };
+        assert_eq!(
+            windows_cell(&row),
+            "5h: 41% used, weekly: 100% used (critical)"
+        );
     }
 
     #[test]
@@ -1515,11 +1658,15 @@ mod tests {
                             label: "5h".to_string(),
                             used_pct: 5.0,
                             resets_at: Some(1_800_000_000),
+                            active: None,
+                            severity: None,
                         },
                         UsageWindow {
                             label: "weekly".to_string(),
                             used_pct: 34.0,
                             resets_at: Some(1_800_500_000),
+                            active: None,
+                            severity: None,
                         },
                     ],
                     balance: Some(Balance {
@@ -1541,6 +1688,8 @@ mod tests {
                         label: "5h".to_string(),
                         used_pct: 42.0,
                         resets_at: None,
+                        active: None,
+                        severity: None,
                     }],
                     balance: None,
                     fetched_at: now - 60,
@@ -1589,11 +1738,11 @@ mod tests {
                 .trim()
                 .to_string()
         };
-        assert_eq!(cell(lines[1], 3), "5h: 95% left, weekly: 66% left");
+        assert_eq!(cell(lines[1], 3), "5h: 5% used, weekly: 34% used");
         assert_eq!(cell(lines[1], 4), "10.50 USD");
         assert_eq!(cell(lines[1], 5), "52m, 5d19h");
         assert_eq!(cell(lines[2], 2), "expired");
-        assert_eq!(cell(lines[2], 3), "5h: 58% left");
+        assert_eq!(cell(lines[2], 3), "5h: 42% used");
         assert_eq!(cell(lines[3], 2), "invalid");
         assert_eq!(cell(lines[3], 3), "error");
         assert_eq!(cell(lines[3], 6), "status 401: unauthorized");
