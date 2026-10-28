@@ -716,30 +716,30 @@
           "baseUrl": "https://api.openai.com/v1",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": "none",
+            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": null
+            "max": "max"
           },
           "input": [
             "text",
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 30,
-            "cacheRead": 0.5,
-            "cacheWrite": 0,
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.1,
+            "cacheWrite": 2.5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 10,
-                "output": 45,
-                "cacheRead": 1,
-                "cacheWrite": 0
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               }
             ]
           },
@@ -1050,30 +1050,30 @@
           "baseUrl": "https://api.openai.com/v1",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": "none",
+            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": null
+            "max": "max"
           },
           "input": [
             "text",
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 30,
-            "cacheRead": 0.5,
-            "cacheWrite": 0,
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.1,
+            "cacheWrite": 2.5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 10,
-                "output": 45,
-                "cacheRead": 1,
-                "cacheWrite": 0
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               }
             ]
           },
@@ -1104,30 +1104,30 @@
           "baseUrl": "https://api.openai.com/v1",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": "none",
+            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": null
+            "max": "max"
           },
           "input": [
             "text",
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 30,
-            "cacheRead": 0.5,
-            "cacheWrite": 0,
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.1,
+            "cacheWrite": 2.5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 10,
-                "output": 45,
-                "cacheRead": 1,
-                "cacheWrite": 0
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               }
             ]
           },
@@ -2827,7 +2827,7 @@
       },
       "expected": {
         "provider": "openai",
-        "id": "gpt-5.5"
+        "id": "gpt-6.1-sol"
       }
     }
   ],
@@ -2882,7 +2882,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -2905,7 +2905,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -2957,7 +2957,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -2985,7 +2985,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -3013,7 +3013,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -4294,30 +4294,30 @@
               "baseUrl": "https://api.openai.com/v1",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": "none",
+                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": null
+                "max": "max"
               },
               "input": [
                 "text",
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 30,
-                "cacheRead": 0.5,
-                "cacheWrite": 0,
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
                 "tiers": [
                   {
                     "inputTokensAbove": 272000,
-                    "input": 10,
-                    "output": 45,
-                    "cacheRead": 1,
-                    "cacheWrite": 0
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
                   }
                 ]
               },
@@ -6056,37 +6056,37 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-5.5",
-              "name": "GPT-5.5",
+              "id": "gpt-6.1-sol",
+              "name": "GPT-6.1 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": "none",
+                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": null
+                "max": "max"
               },
               "input": [
                 "text",
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 30,
-                "cacheRead": 0.5,
-                "cacheWrite": 0,
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
                 "tiers": [
                   {
                     "inputTokensAbove": 272000,
-                    "input": 10,
-                    "output": 45,
-                    "cacheRead": 1,
-                    "cacheWrite": 0
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
                   }
                 ]
               },
@@ -6117,37 +6117,37 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-5.5",
-              "name": "GPT-5.5",
+              "id": "gpt-6.1-sol",
+              "name": "GPT-6.1 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": "none",
+                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": null
+                "max": "max"
               },
               "input": [
                 "text",
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 30,
-                "cacheRead": 0.5,
-                "cacheWrite": 0,
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
                 "tiers": [
                   {
                     "inputTokensAbove": 272000,
-                    "input": 10,
-                    "output": 45,
-                    "cacheRead": 1,
-                    "cacheWrite": 0
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
                   }
                 ]
               },
@@ -6177,37 +6177,37 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-5.5",
-              "name": "GPT-5.5",
+              "id": "gpt-6.1-sol",
+              "name": "GPT-6.1 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": "none",
+                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": null
+                "max": "max"
               },
               "input": [
                 "text",
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 30,
-                "cacheRead": 0.5,
-                "cacheWrite": 0,
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
                 "tiers": [
                   {
                     "inputTokensAbove": 272000,
-                    "input": 10,
-                    "output": 45,
-                    "cacheRead": 1,
-                    "cacheWrite": 0
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
                   }
                 ]
               },

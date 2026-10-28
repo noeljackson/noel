@@ -80,6 +80,7 @@
       "input is too long for requested model",
       "exceeds the context window",
       "exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\\d,]+ tokens?|\\s*\\([\\d,]+\\))",
+      "context window exceeded",
       "input token count.*exceeds the maximum",
       "maximum prompt length is \\d+",
       "reduce the length of the messages",
