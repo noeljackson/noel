@@ -515,6 +515,33 @@ impl TerminalRenderer {
         format!("noel rust cli ({})", self.theme.name)
     }
 
+    /// The startup screen: the pixel N mark (8x8, knuckle with a full
+    /// diagonal ramp — the same bitmap as `n-icon.svg`) above the wordmark
+    /// `noel code`. Blank cells are two spaces so the `\u{2588}` runs stay
+    /// on the terminal's own grid; no wide/ambiguous glyphs.
+    pub fn splash(&self) -> String {
+        const MARK: [&str; 8] = [
+            "\u{2588}\u{2588}\u{2588}\u{2588}        \u{2588}\u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}      \u{2588}\u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}\u{2588}    \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}\u{2588}      \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}",
+            "\u{2588}\u{2588}\u{2588}\u{2588}        \u{2588}\u{2588}\u{2588}\u{2588}",
+        ];
+        let mut out = String::new();
+        for row in MARK {
+            out.push_str("        ");
+            out.push_str(row);
+            out.push('\n');
+        }
+        out.push_str("                noel code\n");
+        out.push_str("        ");
+        out.push_str(&self.banner());
+        out
+    }
+
     pub fn prompt(&self) -> &'static str {
         "noel> "
     }
