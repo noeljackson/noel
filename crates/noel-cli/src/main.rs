@@ -227,6 +227,11 @@ struct Cli {
     #[arg(long)]
     no_skills: bool,
 
+    /// Skip the startup splash (the logo); transcript-mechanics tests and
+    /// scripted callers want the plain banner.
+    #[arg(long)]
+    no_splash: bool,
+
     /// Load a prompt template file or directory (can be used multiple times).
     #[arg(long)]
     prompt_template: Vec<PathBuf>,
@@ -1780,7 +1785,7 @@ async fn run() -> Result<()> {
 
     offer_bun_install(&config).await?;
 
-    run_interactive(runtime, config, offline, cli.owned_screen()).await
+    run_interactive(runtime, config, offline, cli.owned_screen(), cli.no_splash).await
 }
 
 /// Before the TUI opens (the terminal is still plain), offer to install
@@ -3190,8 +3195,9 @@ async fn run_interactive(
     mut config: LoadedConfig,
     offline: bool,
     owned_screen: bool,
+    no_splash: bool,
 ) -> Result<()> {
-    let mut app = TuiApp::new(&config, &runtime);
+    let mut app = TuiApp::new(&config, &runtime, no_splash);
     app.owned_screen = owned_screen;
     if let Some(hint) = resume_hint(&runtime) {
         app.push(TuiEntryKind::System, hint);
@@ -3951,18 +3957,23 @@ impl TuiApp {
         self.active_model_provider.as_deref()
     }
 
-    fn new(config: &LoadedConfig, runtime: &Runtime) -> Self {
+    fn new(config: &LoadedConfig, runtime: &Runtime, no_splash: bool) -> Self {
         let mut app = Self {
             resume_pending: runtime.session().has_unfinished_turn(),
             status: "Ready".to_string(),
             ..Self::default()
         };
         app.refresh_chrome(config, runtime);
+        let greeting = if no_splash {
+            terminal_renderer(config).banner()
+        } else {
+            terminal_renderer(config).splash()
+        };
         app.push(
             TuiEntryKind::System,
             format!(
                 "{}\ntype /help for commands, /reload to reload config, /quit to exit",
-                terminal_renderer(config).splash()
+                greeting
             ),
         );
         app.restore_session_messages(runtime);
@@ -11945,7 +11956,7 @@ mod tests {
                 aborted: false,
             })
             .unwrap();
-        let mut app = TuiApp::new(&config, &runtime);
+        let mut app = TuiApp::new(&config, &runtime, false);
         undo_tui_turn(&mut app, &mut runtime).unwrap();
         assert_eq!(app.input, "image question");
         assert_eq!(app.input_media, [media]);
@@ -11978,7 +11989,7 @@ mod tests {
             aborted: false,
         };
         runtime.push_message(message("first prompt")).unwrap();
-        let mut app = TuiApp::new(&config, &runtime);
+        let mut app = TuiApp::new(&config, &runtime, false);
         runtime.push_message(message("steering prompt")).unwrap();
         undo_tui_turn(&mut app, &mut runtime).unwrap();
         assert_eq!(app.input, "steering prompt");
@@ -12282,7 +12293,7 @@ mod tests {
         });
         let mut runtime = Runtime::new(session, ReloadableSystems::from_config(&config, 1));
         let before = runtime.session().clone();
-        let mut app = TuiApp::new(&config, &runtime);
+        let mut app = TuiApp::new(&config, &runtime, false);
         app.set_input("draft");
         let selector = TuiSelectorState::new(
             "theme",
@@ -12371,7 +12382,7 @@ mod tests {
         use ratatui::{backend::TestBackend, buffer::Cell, style::Color};
         let mut config = account_test_config(AuthData::default());
         let runtime = account_test_runtime("faux", None);
-        let mut app = TuiApp::new(&config, &runtime);
+        let mut app = TuiApp::new(&config, &runtime, false);
         app.entries.clear();
         app.push(TuiEntryKind::Assistant, "neutral-answer");
         app.push(TuiEntryKind::Thinking, "secondary-thinking");
@@ -12449,7 +12460,7 @@ mod tests {
             config.settings.accent_color = accent.map(str::to_string);
             assert!(terminal_theme(&config).is_err());
             assert!(format_diagnostics(&config).contains("using system theme"));
-            let app = TuiApp::new(&config, &runtime);
+            let app = TuiApp::new(&config, &runtime, false);
             assert!(app
                 .entries
                 .iter()
@@ -14170,7 +14181,7 @@ mod tests {
                 .record_usage(usage.clone())
                 .unwrap();
             runtime.session_mut().usage = usage;
-            let mut app = TuiApp::new(&config, &runtime);
+            let mut app = TuiApp::new(&config, &runtime, false);
             let mut surface = TuiSurface {
                 terminal: &mut terminal,
                 viewport_height: &mut viewport_height,
@@ -14258,7 +14269,7 @@ mod tests {
             }))
             .unwrap();
         runtime.rename_session(Some("keep me".into())).unwrap();
-        let mut app = TuiApp::new(&config, &runtime);
+        let mut app = TuiApp::new(&config, &runtime, false);
         let mut surface = TuiSurface {
             terminal: &mut terminal,
             viewport_height: &mut viewport_height,
@@ -14372,7 +14383,7 @@ mod tests {
         )
         .unwrap();
         let mut viewport_height = 24;
-        let mut app = TuiApp::new(&config, &runtime);
+        let mut app = TuiApp::new(&config, &runtime, false);
         let mut surface = TuiSurface {
             terminal: &mut terminal,
             viewport_height: &mut viewport_height,
@@ -14470,7 +14481,7 @@ mod tests {
             .set_active_model(Some(test_model_ref("beta", "opus")))
             .unwrap();
         set_thinking_level(&mut runtime, &config, "max").unwrap();
-        let mut app = TuiApp::new(&config, &runtime);
+        let mut app = TuiApp::new(&config, &runtime, false);
         let picker = |config: &LoadedConfig, runtime: &Runtime, query: &str| {
             TuiSelectorState::new(
                 "model",
@@ -15344,7 +15355,7 @@ mod tests {
             let hint = resume_hint(&runtime);
             assert_eq!(hint.is_some(), unfinished);
             let config = minimal_test_config();
-            let mut app = TuiApp::new(&config, &runtime);
+            let mut app = TuiApp::new(&config, &runtime, false);
             assert_eq!(app.resume_pending, unfinished);
             app.resume_pending = false;
             app.refresh_chrome(&config, &runtime);

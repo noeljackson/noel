@@ -21,7 +21,7 @@ tmux new-session -d -s "${session}" -x 80 -y 20
 # Capture raw terminal transitions as well as pane content for teardown checks.
 tmux pipe-pane -t "${session}" -o "cat > '${work_dir}/terminal.raw'"
 tmux send-keys -t "${session}" \
-  "cd '${work_dir}' && printf 'shell-scrollback-before-owned\\n'; for _ in {1..40}; do printf '\\n'; done; printf 'shell-before-owned\\n' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${work_dir}/agent' NOEL_FAUX_STREAM_DELAY_MS=2 NOEL_FAUX_STREAM_CHARS=1 '${noel_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline; stty -a; printf 'shell-after-owned\\n'" Enter
+  "cd '${work_dir}' && printf 'shell-scrollback-before-owned\\n'; for _ in {1..40}; do printf '\\n'; done; printf 'shell-before-owned\\n' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${work_dir}/agent' NOEL_FAUX_STREAM_DELAY_MS=2 NOEL_FAUX_STREAM_CHARS=1 '${noel_bin}' --session '${work_dir}/session.jsonl' --model faux/echo --offline --no-splash; stty -a; printf 'shell-after-owned\\n'" Enter
 capture() { tmux capture-pane -t "${session}" -p > "${work_dir}/pane.txt"; }
 fail() { cat "${work_dir}/pane.txt" >&2; echo "$* (artifacts: ${work_dir})" >&2; exit 1; }
 wait_for() {
