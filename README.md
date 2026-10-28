@@ -1,6 +1,22 @@
 # noel
 
+```
+          ████        ████
+          ██████      ████
+          ████████    ████
+          ████  ████  ████
+          ████  ████  ████
+          ████    ████████
+          ████      ██████
+          ████        ████
+                  noel code
+```
+
 `noel` is a native Rust CLI coding agent.
+
+The mark is an 8x8 pixel N (source bitmap and SVG: `docs/n-icon.svg`; the
+splash and this README render from the same bitmap). A local scratchpad for
+drawing variants lives at `docs/pixel-icon-lab.html`.
 
 The repository has been cut over from the previous TypeScript/npm monorepo to a Rust-only Cargo workspace. The web UI and npm package runtime are no longer part of the product path.
 

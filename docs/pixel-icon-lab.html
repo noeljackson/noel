@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pixel icon lab</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0d0f12;
+    --panel: #14171c;
+    --line: #23272f;
+    --text: #e6e6e6;
+    --dim: #8b929c;
+    --accent: #1f6feb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex;
+    min-height: 100vh;
+  }
+  #left {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    min-width: 0;
+  }
+  canvas {
+    image-rendering: pixelated;
+    cursor: crosshair;
+    touch-action: none;
+    background: #101318;
+    outline: 1px solid var(--line);
+  }
+  #side {
+    width: 340px;
+    background: var(--panel);
+    border-left: 1px solid var(--line);
+    padding: 14px 16px 24px;
+    overflow-y: auto;
+  }
+  h1 { font-size: 14px; margin: 0 0 4px; letter-spacing: .5px; }
+  .sub { color: var(--dim); margin: 0 0 14px; font-size: 12px; }
+  .group { border-top: 1px solid var(--line); padding: 12px 0; }
+  .group > label, .group > .gtitle {
+    display: block;
+    color: var(--dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+  }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  button, select, input[type="number"] {
+    background: #1b1f26;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 5px 9px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover { border-color: #3a4150; }
+  button.primary { background: var(--accent); border-color: var(--accent); }
+  button.active { background: #2a3f63; border-color: var(--accent); }
+  input[type="color"] {
+    width: 34px; height: 28px; padding: 1px 2px;
+    background: #1b1f26; border: 1px solid var(--line); border-radius: 4px;
+    cursor: pointer;
+  }
+  .swatch {
+    width: 22px; height: 22px; border-radius: 4px; border: 1px solid var(--line);
+    cursor: pointer; padding: 0;
+  }
+  .swatch.active { outline: 2px solid var(--accent); outline-offset: 1px; }
+  textarea {
+    width: 100%; min-height: 90px;
+    background: #10131a; color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px;
+    font: inherit; resize: vertical; padding: 6px;
+    white-space: pre;
+  }
+  .hint { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  label.inline { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  .spacer { flex: 1; }
+  a.dl {
+    display: inline-block; text-decoration: none;
+    background: #1b1f26; color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; padding: 5px 9px;
+  }
+  footer { color: var(--dim); font-size: 11px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="left"><canvas id="cv"></canvas></div>
+<div id="side">
+  <h1>pixel icon lab</h1>
+  <p class="sub">draw small pixel marks; export as block text, SVG, or PNG</p>
+
+  <div class="group">
+    <span class="gtitle">canvas</span>
+    <div class="row">
+      <label class="inline">size
+        <select id="size">
+          <option>4</option><option>5</option><option>6</option><option>7</option>
+          <option selected>8</option><option>10</option><option>12</option>
+          <option>16</option><option>24</option><option>32</option>
+        </select>
+      </label>
+      <button id="clear">clear</button>
+      <button id="undo">undo</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label class="inline"><input type="checkbox" id="mirrorX"> mirror x</label>
+      <label class="inline"><input type="checkbox" id="mirrorY"> mirror y</label>
+    </div>
+  </div>
+
+  <div class="group">
+    <span class="gtitle">tool &amp; color</span>
+    <div class="row">
+      <button id="pencil" class="active">pencil (b)</button>
+      <button id="eraser">eraser (e)</button>
+    </div>
+    <div class="row" style="margin-top:10px" id="palette"></div>
+    <div class="row" style="margin-top:8px">
+      <label class="inline">custom <input type="color" id="custom" value="#f5f5f5"></label>
+    </div>
+  </div>
+
+  <div class="group">
+    <span class="gtitle">presets</span>
+    <div class="row">
+      <select id="preset">
+        <option value="">- choose -</option>
+        <option value="n-ramp">N 8x8 (knuckle, full ramp) &mdash; latest</option>
+        <option value="n-final">N 8x8 (knuckle, wide top step)</option>
+        <option value="n-a">N 8x8 (knuckle, original A)</option>
+        <option value="n7">N 7x7</option>
+        <option value="n5">N 5x5</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="group">
+    <span class="gtitle">export</span>
+    <div class="row">
+      <button id="copyDbl">copy text (double)</button>
+      <button id="copySingle">copy text (single)</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="copySvg">copy SVG</button>
+      <label class="inline">px scale
+        <select id="pngScale">
+          <option>8</option><option selected>16</option><option>32</option><option>64</option>
+        </select>
+      </label>
+      <a class="dl" id="pngDl" download="icon.png">PNG</a>
+    </div>
+    <label class="inline" style="margin-top:8px"><input type="checkbox" id="transp"> transparent background (SVG/PNG)</label>
+    <textarea id="preview" readonly spellcheck="false"></textarea>
+  </div>
+
+  <div class="group">
+    <span class="gtitle">import</span>
+    <textarea id="importBox" placeholder="paste block art or 1/0 rows here" spellcheck="false"></textarea>
+    <div class="row" style="margin-top:8px">
+      <select id="importMode">
+        <option value="auto">auto-detect</option>
+        <option value="single">1 char = 1 pixel</option>
+        <option value="double">2 chars = 1 pixel</option>
+      </select>
+      <button id="importBtn" class="primary">import</button>
+    </div>
+    <p class="hint">filled: anything (█ ▓ # 1 *) &middot; empty: space . 0</p>
+  </div>
+
+  <footer>
+    left drag paint &middot; right drag erase &middot; alt-click pick color &middot; ctrl+z undo<br>
+    saves in this browser only (localStorage)
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+const FILLED = new Set(["\u2588", "\u2593", "\u2592", "\u2591", "\u25a0", "\u25cf", "#", "1", "*", "x", "X"]);
+const PALETTE = ["#f5f5f5", "#1f6feb", "#3fb950", "#d29922", "#f85149", "#a371f7", "#39c5cf", "#f778ba"];
+
+const PRESETS = {
+  "n-ramp": {
+    size: 8,
+    rows: ["11000011","11100011","11110011","11011011","11011011","11001111","11000111","11000011"],
+  },
+  "n-final": {
+    size: 8,
+    rows: ["11000011","11100011","11110011","11011011","11001111","11000111","11000011","11000011"],
+  },
+  "n-a": {
+    size: 8,
+    rows: ["11000011","11100011","11010011","11011011","11001111","11000111","11000011","11000011"],
+  },
+  n7: {
+    size: 7,
+    rows: ["1000001","1100001","1010001","1001001","1000101","1000011","1000001"],
+  },
+  n5: {
+    size: 5,
+    rows: ["10001","11001","10101","10011","10001"],
+  },
+};
+
+const LS_KEY = "pixelIconLab.v1";
+
+const state = {
+  size: 8,
+  grid: [], // array of size*size, null or css color
+  tool: "pencil",
+  color: PALETTE[0],
+  undo: [],
+};
+
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+let cell = 40, hover = null;
+
+function makeGrid(size) { return new Array(size * size).fill(null); }
+
+function save() {
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify({ size: state.size, grid: state.grid }));
+  } catch {}
+}
+
+function load() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return false;
+    const data = JSON.parse(raw);
+    if (typeof data.size === "number" && Array.isArray(data.grid)) {
+      state.size = clampSize(data.size);
+      state.grid = data.grid;
+      while (state.grid.length < state.size * state.size) state.grid.push(null);
+      state.grid.length = state.size * state.size;
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function clampSize(n) { return Math.max(4, Math.min(32, Math.round(n))); }
+
+function setSize(n, keep) {
+  n = clampSize(n);
+  const old = state.size, oldG = state.grid;
+  const g = makeGrid(n);
+  if (keep) {
+    for (let y = 0; y < Math.min(old, n); y++)
+      for (let x = 0; x < Math.min(old, n); x++)
+        g[y * n + x] = oldG[y * old + x];
+  }
+  state.size = n; state.grid = g;
+  document.getElementById("size").value = String(n);
+  layout(); render(); save();
+}
+
+function pushUndo() {
+  state.undo.push(JSON.stringify({ size: state.size, grid: state.grid }));
+  if (state.undo.length > 60) state.undo.shift();
+}
+
+function doUndo() {
+  const snap = state.undo.pop();
+  if (!snap) return;
+  const d = JSON.parse(snap);
+  state.size = d.size; state.grid = d.grid;
+  document.getElementById("size").value = String(d.size);
+  layout(); render(); save();
+}
+
+function layout() {
+  const box = document.getElementById("left").getBoundingClientRect();
+  const avail = Math.min(box.width - 48, box.height - 48, 640);
+  cell = Math.max(8, Math.floor(avail / state.size));
+  const px = cell * state.size;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(px * dpr);
+  cv.height = Math.round(px * dpr);
+  cv.style.width = px + "px";
+  cv.style.height = px + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+}
+
+function render() {
+  const n = state.size, px = cell * n;
+  ctx.clearRect(0, 0, px, px);
+  // cell backgrounds (checker for clarity)
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const c = state.grid[y * n + x];
+      if (c) {
+        ctx.fillStyle = c;
+        ctx.fillRect(x * cell, y * cell, cell, cell);
+      } else if ((x + y) % 2 === 0) {
+        ctx.fillStyle = "#151920";
+        ctx.fillRect(x * cell, y * cell, cell, cell);
+      }
+    }
+  }
+  // grid lines
+  ctx.strokeStyle = "rgba(255,255,255,0.07)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 1; i < n; i++) {
+    ctx.moveTo(i * cell + 0.5, 0); ctx.lineTo(i * cell + 0.5, px);
+    ctx.moveTo(0, i * cell + 0.5); ctx.lineTo(px, i * cell + 0.5);
+  }
+  ctx.stroke();
+  // midline guides
+  ctx.strokeStyle = "rgba(31,111,235,0.35)";
+  ctx.beginPath();
+  if (n % 2 === 0) {
+    ctx.moveTo(px / 2 + 0.5, 0); ctx.lineTo(px / 2 + 0.5, px);
+    ctx.moveTo(0, px / 2 + 0.5); ctx.lineTo(px, px / 2 + 0.5);
+  }
+  ctx.stroke();
+  // hover ghost
+  if (hover) {
+    ctx.strokeStyle = "rgba(255,255,255,0.55)";
+    ctx.strokeRect(hover.x * cell + 0.5, hover.y * cell + 0.5, cell - 1, cell - 1);
+  }
+  updatePreview();
+}
+
+function applyCell(x, y, erase) {
+  const n = state.size;
+  const xs = [x], ys = [y];
+  if (document.getElementById("mirrorX").checked) xs.push(n - 1 - x);
+  if (document.getElementById("mirrorY").checked) ys.push(n - 1 - y);
+  for (const yy of ys) for (const xx of xs) {
+    if (xx < 0 || yy < 0 || xx >= n || yy >= n) continue;
+    state.grid[yy * n + xx] = erase ? null : state.color;
+  }
+}
+
+function cellFromEvent(e) {
+  const r = cv.getBoundingClientRect();
+  const x = Math.floor((e.clientX - r.left) / cell);
+  const y = Math.floor((e.clientY - r.top) / cell);
+  if (x < 0 || y < 0 || x >= state.size || y >= state.size) return null;
+  return { x, y };
+}
+
+let stroking = false, strokeErase = false;
+
+cv.addEventListener("pointerdown", (e) => {
+  const c = cellFromEvent(e);
+  if (!c) return;
+  cv.setPointerCapture(e.pointerId);
+  if (e.altKey) {
+    const col = state.grid[c.y * state.size + c.x];
+    if (col) { state.color = col; syncPaletteUI(); }
+    return;
+  }
+  pushUndo();
+  stroking = true;
+  strokeErase = e.button === 2 || state.tool === "eraser";
+  applyCell(c.x, c.y, strokeErase);
+  render();
+});
+cv.addEventListener("pointermove", (e) => {
+  const c = cellFromEvent(e);
+  hover = c;
+  if (stroking && c) { applyCell(c.x, c.y, strokeErase); render(); }
+  else render();
+});
+cv.addEventListener("pointerup", () => { stroking = false; save(); });
+cv.addEventListener("pointerleave", () => { hover = null; render(); });
+cv.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// ---------- palette ----------
+
+function syncPaletteUI() {
+  document.querySelectorAll(".swatch").forEach((b) =>
+    b.classList.toggle("active", b.dataset.c.toLowerCase() === state.color.toLowerCase()));
+  document.getElementById("custom").value = toHex(state.color);
+}
+
+function toHex(c) {
+  if (c.startsWith("#")) return c;
+  const d = document.createElement("div");
+  d.style.color = c;
+  document.body.appendChild(d);
+  const m = getComputedStyle(d).color.match(/\d+/g);
+  d.remove();
+  if (!m) return "#f5f5f5";
+  return "#" + m.slice(0, 3).map((v) => (+v).toString(16).padStart(2, "0")).join("");
+}
+
+const pal = document.getElementById("palette");
+for (const c of PALETTE) {
+  const b = document.createElement("button");
+  b.className = "swatch";
+  b.style.background = c;
+  b.dataset.c = c;
+  b.title = c;
+  b.onclick = () => { state.color = c; state.tool = "pencil"; syncTools(); syncPaletteUI(); };
+  pal.appendChild(b);
+}
+document.getElementById("custom").addEventListener("input", (e) => {
+  state.color = e.target.value; state.tool = "pencil"; syncTools(); syncPaletteUI();
+});
+
+function syncTools() {
+  document.getElementById("pencil").classList.toggle("active", state.tool === "pencil");
+  document.getElementById("eraser").classList.toggle("active", state.tool === "eraser");
+}
+document.getElementById("pencil").onclick = () => { state.tool = "pencil"; syncTools(); };
+document.getElementById("eraser").onclick = () => { state.tool = "eraser"; syncTools(); };
+
+// ---------- exports ----------
+
+function textGrid(single) {
+  const n = state.size, lines = [];
+  for (let y = 0; y < n; y++) {
+    let line = "";
+    for (let x = 0; x < n; x++)
+      line += state.grid[y * n + x] ? "\u2588" : " ";
+    lines.push(single ? line : line.split("").join("") + (true ? "" : ""));
+  }
+  return lines.join("\n");
+}
+
+function textDouble() {
+  const n = state.size, lines = [];
+  for (let y = 0; y < n; y++) {
+    let line = "";
+    for (let x = 0; x < n; x++) line += state.grid[y * n + x] ? "\u2588\u2588" : "  ";
+    lines.push(line);
+  }
+  return lines.join("\n");
+}
+
+function svgText() {
+  const n = state.size;
+  const transp = document.getElementById("transp").checked;
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${n * 16}" height="${n * 16}" viewBox="0 0 ${n} ${n}">\n` + "";
+  if (!transp) s += `  <rect width="${n}" height="${n}" fill="#0d0f12"/>\n`;
+  for (let y = 0; y < n; y++)
+    for (let x = 0; x < n; x++) {
+      const c = state.grid[y * n + x];
+      if (c) s += `  <rect x="${x}" y="${y}" width="1" height="1" fill="${c}"/>\n`;
+    }
+  s += "</svg>";
+  return s;
+}
+
+function updatePreview() {
+  document.getElementById("preview").value = textDouble();
+}
+
+function copy(t) {
+  navigator.clipboard.writeText(t).then(
+    () => flashSource(t.length + " chars copied"),
+    () => { document.getElementById("preview").value = t; }
+  );
+}
+let flashTimer = null;
+function flashSource(msg) {
+  const btns = document.querySelectorAll("button");
+  clearTimeout(flashTimer);
+  document.title = msg;
+  flashTimer = setTimeout(() => (document.title = "pixel icon lab"), 900);
+}
+
+document.getElementById("copyDbl").onclick = () => copy(textDouble());
+document.getElementById("copySingle").onclick = () => copy(textGrid(true));
+document.getElementById("copySvg").onclick = () => copy(svgText());
+
+document.getElementById("pngScale").addEventListener("change", updatePng);
+document.getElementById("transp").addEventListener("change", updatePng);
+
+function updatePng() {
+  const n = state.size, scale = +document.getElementById("pngScale").value;
+  const off = document.createElement("canvas");
+  off.width = n * scale; off.height = n * scale;
+  const c2 = off.getContext("2d");
+  if (!document.getElementById("transp").checked) {
+    c2.fillStyle = "#0d0f12";
+    c2.fillRect(0, 0, off.width, off.height);
+  }
+  for (let y = 0; y < n; y++)
+    for (let x = 0; x < n; x++) {
+      const c = state.grid[y * n + x];
+      if (c) { c2.fillStyle = c; c2.fillRect(x * scale, y * scale, scale, scale); }
+    }
+  document.getElementById("pngDl").href = off.toDataURL("image/png");
+}
+
+// ---------- import ----------
+
+function parseLines(text, mode) {
+  const lines = text.replace(/\r/g, "").split("\n").filter((l) => l.trim().length);
+  if (!lines.length) return null;
+  let dbl = mode === "double";
+  if (mode === "auto") {
+    const even = lines.every((l) => l.length % 2 === 0);
+    const hasPair = lines.some((l) => l.includes("\u2588\u2588"));
+    dbl = even && hasPair;
+  }
+  const rows = lines.map((l) => {
+    if (!dbl) return l;
+    const cells = [];
+    for (let i = 0; i < l.length; i += 2) cells.push(l[i]);
+    return cells.join("");
+  });
+  const cols = Math.max(...rows.map((r) => r.length));
+  const size = clampSize(Math.max(rows.length, cols));
+  const g = makeGrid(size);
+  rows.forEach((r, y) => {
+    for (let x = 0; x < r.length && x < size; x++)
+      if (FILLED.has(r[x])) g[y * size + x] = state.color;
+  });
+  return { size, grid: g };
+}
+
+document.getElementById("importBtn").onclick = () => {
+  const parsed = parseLines(
+    document.getElementById("importBox").value,
+    document.getElementById("importMode").value
+  );
+  if (!parsed) return;
+  pushUndo();
+  state.size = parsed.size; state.grid = parsed.grid;
+  document.getElementById("size").value = String(parsed.size);
+  layout(); render(); save();
+};
+
+// ---------- presets, size, clear, undo ----------
+
+document.getElementById("preset").addEventListener("change", (e) => {
+  const p = PRESETS[e.target.value];
+  e.target.value = "";
+  if (!p) return;
+  pushUndo();
+  state.size = p.size;
+  state.grid = makeGrid(p.size);
+  p.rows.forEach((r, y) => {
+    for (let x = 0; x < r.length; x++)
+      if (r[x] === "1") state.grid[y * p.size + x] = state.color;
+  });
+  document.getElementById("size").value = String(p.size);
+  layout(); render(); save();
+});
+
+document.getElementById("size").addEventListener("change", (e) => setSize(+e.target.value, true));
+document.getElementById("clear").onclick = () => { pushUndo(); state.grid = makeGrid(state.size); render(); save(); };
+document.getElementById("undo").onclick = doUndo;
+
+// ---------- keys ----------
+
+window.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); doUndo(); return; }
+  if (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
+  if (e.key === "b") { state.tool = "pencil"; syncTools(); }
+  if (e.key === "e") { state.tool = "eraser"; syncTools(); }
+});
+
+window.addEventListener("resize", () => { layout(); render(); });
+
+// ---------- boot ----------
+
+if (!load()) {
+  const p = PRESETS["n-ramp"];
+  state.size = p.size;
+  state.grid = makeGrid(p.size);
+  p.rows.forEach((r, y) => {
+    for (let x = 0; x < r.length; x++) if (r[x] === "1") state.grid[y * p.size + x] = state.color;
+  });
+}
+document.getElementById("size").value = String(state.size);
+syncPaletteUI(); syncTools();
+layout(); render(); updatePng();
+</script>
+</body>
+</html>
