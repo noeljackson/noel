@@ -16,6 +16,7 @@ mod account_failover;
 mod attach;
 mod auth_command;
 mod bug_report;
+mod bun_install;
 mod clipboard;
 mod markdown;
 mod model_select;
@@ -593,6 +594,37 @@ async fn try_run_package_command() -> Result<bool> {
         "mcp" => Err(anyhow!(
             "noel mcp is not available: this port has no MCP support (see docs/rust-rewrite/non-parity-register.md)"
         )),
+        // noel's own: install the bun runtime for TypeScript extension
+        // hosts into the agent dir (`bin/bun`). Non-interactive.
+        "bun" => {
+            let rest = &args[1..];
+            match rest.first().map(String::as_str) {
+                Some("install") | None => {
+                    let assume_yes = rest.iter().any(|arg| arg == "-y" || arg == "--yes");
+                    let (paths, _import) = noel_config::ConfigPaths::discover(
+                        std::env::current_dir()?,
+                        None,
+                    )?;
+                    if !assume_yes {
+                        println!(
+                            "this downloads the bun runtime (~50 MB) into {}",
+                            paths.agent_dir.join("bin").display()
+                        );
+                        print!("proceed? [y/N] ");
+                        use std::io::Write as _;
+                        std::io::stdout().flush()?;
+                        let mut answer = String::new();
+                        std::io::stdin().read_line(&mut answer)?;
+                        if !answer.trim().eq_ignore_ascii_case("y") {
+                            return Err(anyhow!("declined: bun was not installed"));
+                        }
+                    }
+                    bun_install::install_bun(&paths.agent_dir, |_| Ok(true), true).await?;
+                    Ok(true)
+                }
+                Some(other) => Err(anyhow!("noel bun: unknown subcommand {other} (expected install)")),
+            }
+        }
         _ => Ok(false),
     }
 }
@@ -1746,7 +1778,40 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    offer_bun_install(&config).await?;
+
     run_interactive(runtime, config, offline, cli.owned_screen()).await
+}
+
+/// Before the TUI opens (the terminal is still plain), offer to install
+/// the bun runtime when a TypeScript extension is loaded and no bun can be
+/// found: one y/n, one download, and the extensions work. Refusing keeps
+/// the fail-closed behavior - the extensions' diagnostics say how to
+/// install later. Non-interactive modes never reach this.
+async fn offer_bun_install(config: &LoadedConfig) -> Result<()> {
+    let typescript = config.extensions.iter().any(|extension| {
+        extension.path.extension().and_then(|e| e.to_str()) == Some("ts")
+            && noel_core::extensions::manifest_protocol_version(&extension.path) == Some(2)
+    });
+    if !typescript || noel_core::extensions::find_bun_binary().is_some() {
+        return Ok(());
+    }
+    println!("a TypeScript extension is loaded but bun was not found.",);
+    println!(
+        "noel can download bun (~50 MB) into {} — the extensions run under it.",
+        config.paths.agent_dir.join("bin").display()
+    );
+    print!("download bun now? [y/N] ");
+    use std::io::Write as _;
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        println!("skipped; run `noel bun install` any time");
+        return Ok(());
+    }
+    bun_install::install_bun(&config.paths.agent_dir, |_| Ok(true), true).await?;
+    Ok(())
 }
 
 /// How startup built this process's config: the project trust decision and
