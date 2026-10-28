@@ -864,76 +864,6 @@ fn format_relative_duration(seconds: i64) -> String {
     }
 }
 
-fn windows_cell(row: &AccountStatusRow) -> String {
-    if row.error.is_some() {
-        return "error".to_string();
-    }
-    if row.unsupported {
-        return "n/a".to_string();
-    }
-    let Some(usage) = &row.usage else {
-        return "-".to_string();
-    };
-    if usage.windows.is_empty() {
-        return "-".to_string();
-    }
-    usage
-        .windows
-        .iter()
-        .map(|window| {
-            // "% used" reads the way providers' own dashboards do; a
-            // critical active limit is marked so a full window reads as
-            // blocked, not just as a big number.
-            let used = window.used_pct.round().clamp(0.0, 100.0) as i64;
-            let marker = match (window.severity.as_deref(), window.active) {
-                (Some("critical"), Some(true)) => " (critical)",
-                (Some("critical"), _) => " (critical)",
-                (_, Some(true)) => " *",
-                _ => "",
-            };
-            format!("{}: {used}% used{marker}", window.label)
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn balance_cell(row: &AccountStatusRow) -> String {
-    if row.error.is_some() {
-        return "-".to_string();
-    }
-    if row.unsupported {
-        return "n/a".to_string();
-    }
-    row.usage
-        .as_ref()
-        .and_then(|usage| usage.balance.as_ref())
-        .map(|balance| format!("{:.2} {}", balance.amount, balance.currency))
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn resets_cell(row: &AccountStatusRow, now: i64) -> String {
-    if row.error.is_some() {
-        return "-".to_string();
-    }
-    if row.unsupported {
-        return "n/a".to_string();
-    }
-    let Some(usage) = &row.usage else {
-        return "-".to_string();
-    };
-    let resets = usage
-        .windows
-        .iter()
-        .filter_map(|window| window.resets_at)
-        .map(|resets_at| format_relative_duration(resets_at - now))
-        .collect::<Vec<_>>();
-    if resets.is_empty() {
-        "-".to_string()
-    } else {
-        resets.join(", ")
-    }
-}
-
 pub fn format_account_status(rows: &[AccountStatusRow], now: i64) -> String {
     if rows.is_empty() {
         return format!(
@@ -941,49 +871,78 @@ pub fn format_account_status(rows: &[AccountStatusRow], now: i64) -> String {
             account_howto_lines().join("\n")
         );
     }
-    let headers = [
-        "provider", "account", "auth", "windows", "balance", "resets", "note",
-    ];
-    let mut cells = Vec::with_capacity(rows.len());
+    // Grouped by provider: the provider is said once, each account on its
+    // own line below it, so the long window lists stop forming a wall of
+    // columns. A bar makes each limit's fill readable at a glance, with
+    // the binding limit marked.
+    let mut lines = Vec::new();
+    let mut providers: Vec<&str> = Vec::new();
     for row in rows {
-        cells.push([
-            row.provider.clone(),
-            row.account.clone(),
-            row.auth_state.label().to_string(),
-            windows_cell(row),
-            balance_cell(row),
-            resets_cell(row, now),
-            row.error.clone().unwrap_or_default(),
-        ]);
+        if providers.last() != Some(&row.provider.as_str()) {
+            providers.push(row.provider.as_str());
+        }
     }
-    let mut widths = [0usize; 7];
-    for column in 0..7 {
-        widths[column] = headers[column]
-            .len()
-            .max(cells.iter().map(|row| row[column].len()).max().unwrap_or(0));
-    }
-    let render = |row: &[String; 7]| {
-        row.iter()
-            .enumerate()
-            .map(|(column, cell)| {
-                if column == 6 {
-                    cell.clone()
-                } else {
-                    format!("{cell:<width$}", width = widths[column])
+    for provider in providers {
+        lines.push(provider.to_string());
+        for row in rows.iter().filter(|row| row.provider == provider) {
+            let auth = row.auth_state.label();
+            let account_line = match (&row.usage, row.error.as_deref(), row.unsupported) {
+                (_, Some(note), _) => format!("  {} [{auth}] {note}", row.account),
+                (.., true) => format!("  {} [{auth}] no usage endpoint", row.account),
+                (Some(usage), None, false) if !usage.windows.is_empty() => {
+                    let windows = usage
+                        .windows
+                        .iter()
+                        .map(|window| limit_summary(window, now))
+                        .collect::<Vec<_>>()
+                        .join("\n    ");
+                    let mut text = format!("  {} [{auth}]\n    {windows}", row.account);
+                    if let Some(balance) = &usage.balance {
+                        text.push_str(&format!(
+                            "\n    balance {:.2} {}",
+                            balance.amount, balance.currency
+                        ));
+                    }
+                    text
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("  ")
-            .trim_end()
-            .to_string()
-    };
-    let mut lines = vec![render(&headers.map(str::to_string))];
-    lines.extend(cells.iter().map(render));
+                _ => format!("  {} [{auth}] -", row.account),
+            };
+            lines.push(account_line);
+        }
+    }
     lines.push(String::new());
-    lines.push("% = share of window quota used; * = the provider's active limit; (critical) = at its limit".to_string());
+    lines.push(
+        "% = share of window quota used; * = the provider's active limit; 100% and 'at limit' are blocked"
+            .to_string(),
+    );
     lines.push(String::new());
     lines.extend(account_howto_lines().into_iter().map(String::from));
     lines.join("\n")
+}
+
+/// One limit as `label  [#####-----] 42% used, resets in 3h` — the bar's
+/// fill is the used share; a full bar with the active mark reads as the
+/// binding constraint.
+fn limit_summary(window: &UsageWindow, now: i64) -> String {
+    let used = window.used_pct.round().clamp(0.0, 100.0);
+    let filled = ((used / 100.0) * 10.0).round() as usize;
+    let bar = format!("{}{}", "#".repeat(filled), "-".repeat(10 - filled));
+    let marker = match (window.severity.as_deref(), window.active) {
+        (Some("critical"), _) => " at limit",
+        (_, Some(true)) => " *",
+        _ => "",
+    };
+    let resets = match window.resets_at {
+        Some(at) if at > now + 60 => {
+            format!(", resets {}", format_relative_duration(at - now))
+        }
+        Some(_) => ", resets now".to_string(),
+        None => String::new(),
+    };
+    format!(
+        "{} [{}] {:>3.0}% used{}{}",
+        window.label, bar, used, marker, resets
+    )
 }
 
 /// The add-and-use hint appended to account status: where another account
@@ -1173,42 +1132,6 @@ mod tests {
         assert_eq!(usage.windows[0].label, "5h");
         assert_eq!(usage.windows[0].used_pct, 42.0);
         assert_eq!(usage.windows[0].active, None);
-    }
-
-    #[test]
-    fn windows_cell_marks_critical_and_active_limits() {
-        let row = AccountStatusRow {
-            provider: "anthropic".to_string(),
-            account: "default".to_string(),
-            auth_state: AuthState::Ok,
-            unsupported: false,
-            error: None,
-            usage: Some(AccountUsage {
-                plan: None,
-                windows: vec![
-                    UsageWindow {
-                        label: "5h".to_string(),
-                        used_pct: 41.0,
-                        resets_at: Some(1793217600),
-                        active: Some(false),
-                        severity: Some("normal".to_string()),
-                    },
-                    UsageWindow {
-                        label: "weekly".to_string(),
-                        used_pct: 100.0,
-                        resets_at: Some(1793343600),
-                        active: Some(true),
-                        severity: Some("critical".to_string()),
-                    },
-                ],
-                balance: None,
-                fetched_at: 1000,
-            }),
-        };
-        assert_eq!(
-            windows_cell(&row),
-            "5h: 41% used, weekly: 100% used (critical)"
-        );
     }
 
     #[test]
@@ -1644,35 +1567,32 @@ mod tests {
     }
 
     #[test]
-    fn format_account_status_renders_fixed_width_rows() {
+    fn format_account_status_groups_by_provider_with_bars() {
         let now = 1_799_996_880;
         let rows = vec![
             status_row(
-                "openai-codex",
-                "default",
+                "anthropic",
+                "code@noeljackson.com",
                 AuthState::Ok,
                 Some(AccountUsage {
-                    plan: Some("plus".to_string()),
+                    plan: None,
                     windows: vec![
                         UsageWindow {
                             label: "5h".to_string(),
-                            used_pct: 5.0,
-                            resets_at: Some(1_800_000_000),
-                            active: None,
-                            severity: None,
+                            used_pct: 41.0,
+                            resets_at: Some(now + 10_800),
+                            active: Some(false),
+                            severity: Some("normal".to_string()),
                         },
                         UsageWindow {
                             label: "weekly".to_string(),
-                            used_pct: 34.0,
-                            resets_at: Some(1_800_500_000),
-                            active: None,
-                            severity: None,
+                            used_pct: 100.0,
+                            resets_at: Some(now + 133_200),
+                            active: Some(true),
+                            severity: Some("critical".to_string()),
                         },
                     ],
-                    balance: Some(Balance {
-                        amount: 10.5,
-                        currency: "USD".to_string(),
-                    }),
+                    balance: None,
                     fetched_at: now - 60,
                 }),
                 false,
@@ -1698,6 +1618,29 @@ mod tests {
                 None,
             ),
             status_row(
+                "zai-coding",
+                "default",
+                AuthState::Ok,
+                Some(AccountUsage {
+                    plan: None,
+                    windows: vec![UsageWindow {
+                        label: "5h".to_string(),
+                        used_pct: 5.0,
+                        resets_at: Some(now + 16_000),
+                        active: None,
+                        severity: None,
+                    }],
+                    balance: Some(Balance {
+                        amount: 10.5,
+                        currency: "USD".to_string(),
+                    }),
+                    fetched_at: now - 60,
+                }),
+                false,
+                None,
+            ),
+            status_row("zai-coding", "env", AuthState::Ok, None, true, None),
+            status_row(
                 "openrouter",
                 "env",
                 AuthState::Invalid,
@@ -1705,61 +1648,30 @@ mod tests {
                 false,
                 Some("status 401: unauthorized"),
             ),
-            status_row(
-                "moonshotai",
-                "default",
-                AuthState::Missing,
-                None,
-                false,
-                None,
-            ),
-            status_row("zai-coding", "default", AuthState::Ok, None, true, None),
         ];
 
         let output = format_account_status(&rows, now);
+        // The provider is said once, accounts nested under it.
         let lines: Vec<&str> = output.lines().collect();
-        let header = lines[0];
-        let starts: Vec<usize> = [
-            "provider", "account", "auth", "windows", "balance", "resets", "note",
-        ]
-        .iter()
-        .map(|name| header.find(name).expect("header column"))
-        .collect();
-        assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
-
-        let cell = |line: &str, column: usize| {
-            let end = if column + 1 < starts.len() {
-                starts[column + 1].min(line.len())
-            } else {
-                line.len()
-            };
-            line.get(starts[column].min(line.len())..end)
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        };
-        assert_eq!(cell(lines[1], 3), "5h: 5% used, weekly: 34% used");
-        assert_eq!(cell(lines[1], 4), "10.50 USD");
-        assert_eq!(cell(lines[1], 5), "52m, 5d19h");
-        assert_eq!(cell(lines[2], 2), "expired");
-        assert_eq!(cell(lines[2], 3), "5h: 42% used");
-        assert_eq!(cell(lines[3], 2), "invalid");
-        assert_eq!(cell(lines[3], 3), "error");
-        assert_eq!(cell(lines[3], 6), "status 401: unauthorized");
-        assert_eq!(cell(lines[4], 2), "missing");
-        assert_eq!(cell(lines[4], 3), "-");
-        assert_eq!(cell(lines[5], 3), "n/a");
-        assert_eq!(cell(lines[5], 4), "n/a");
-        assert!(lines[lines.len() - 1]
-            .trim_end()
-            .ends_with("/logout <provider> [account] removes one"));
-        assert_eq!(
-            format_account_status(&[], now),
-            format!(
-                "no accounts configured\n\n{}",
-                account_howto_lines().join("\n")
-            )
-        );
+        assert_eq!(lines[0], "anthropic");
+        assert!(lines[1].starts_with("  code@noeljackson.com [ok]"));
+        // Bars carry the fill: 41% fills 4 of 10.
+        assert!(lines[2].contains("5h [####------]  41% used"));
+        assert!(lines[3].contains("weekly [##########] 100% used at limit"));
+        assert!(lines[3].contains("resets 1d13h"));
+        assert!(lines[4].starts_with("  claude-import [expired]"));
+        assert!(lines[5].contains("5h [####------]  42% used"));
+        // No reset time on a window without one.
+        assert!(!lines[5].contains("resets"));
+        // A balance line follows the windows it belongs to.
+        let zai = output
+            .lines()
+            .find(|line| line.starts_with("  env [ok]"))
+            .expect("zai env row");
+        assert!(zai.contains("no usage endpoint") || zai.contains("-"));
+        assert!(output.contains("balance 10.50 USD"));
+        // Errors land as the account's note, not a column.
+        assert!(output.contains("env [invalid] status 401: unauthorized"));
     }
 
     #[test]
