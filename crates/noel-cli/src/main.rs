@@ -3962,7 +3962,7 @@ impl TuiApp {
             TuiEntryKind::System,
             format!(
                 "{}\ntype /help for commands, /reload to reload config, /quit to exit",
-                terminal_renderer(config).banner()
+                terminal_renderer(config).splash()
             ),
         );
         app.restore_session_messages(runtime);
