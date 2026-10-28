@@ -210,8 +210,13 @@ struct HostProcess {
     stdin: ChildStdin,
 }
 impl HostProcess {
-    async fn spawn(path: &Path, extension_name: &str, cwd: &Path) -> Result<Self, AgentError> {
-        let mut command = host_command(path)?;
+    async fn spawn(
+        path: &Path,
+        extension_name: &str,
+        cwd: &Path,
+        bun: Option<&Path>,
+    ) -> Result<Self, AgentError> {
+        let mut command = host_command(path, bun)?;
         command
             .current_dir(cwd)
             .env("NOEL_EXTENSION_NAME", extension_name)
@@ -237,7 +242,8 @@ impl HostProcess {
             let program = command.as_std().get_program();
             let what = if program.to_string_lossy() == "bun" {
                 format!(
-                    "bun (needed for the TypeScript extension {}; install bun or set NOEL_BUN_HOST)",
+                    "bun (needed for the TypeScript extension {}; run noel bun install \
+                     or put a bun on PATH)",
                     path.display()
                 )
             } else {
@@ -339,7 +345,7 @@ impl ExtensionHosts {
         cwd: &Path,
         session_id: &str,
     ) -> Result<(), String> {
-        let mut process = match HostProcess::spawn(path, extension_name, cwd).await {
+        let mut process = match HostProcess::spawn(path, extension_name, cwd, None).await {
             Ok(process) => process,
             Err(error) => {
                 // A spawn failure (bun missing, shim missing) is recorded
@@ -564,7 +570,7 @@ impl ExtensionHosts {
         input: &str,
         cwd: &Path,
     ) -> Result<HostOutcome, String> {
-        let mut process = HostProcess::spawn(path, extension_name, cwd)
+        let mut process = HostProcess::spawn(path, extension_name, cwd, None)
             .await
             .map_err(|error| error.to_string())?;
         let outcome = process
@@ -699,9 +705,10 @@ pub fn host_error_as_agent_error(extension_name: &str, error: String) -> AgentEr
 
 /// The command that runs one extension. An executable file runs itself
 /// (v1's one-shot programs and v2 hosts); a `.ts` file runs under the bun
-/// host: `bun <noel-bun-host.ts> <extension.ts>`, discovered as
-/// [`find_bun_host`] describes.
-fn host_command(path: &Path) -> Result<tokio::process::Command, AgentError> {
+/// host: `bun <noel-bun-host.ts> <extension.ts>`, with the bun binary
+/// resolved as [`find_bun_binary`] describes and the shim as
+/// [`find_bun_host`] does.
+fn host_command(path: &Path, bun: Option<&Path>) -> Result<tokio::process::Command, AgentError> {
     let is_typescript = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -712,13 +719,22 @@ fn host_command(path: &Path) -> Result<tokio::process::Command, AgentError> {
     }
     let shim = find_bun_host().ok_or_else(|| {
         AgentError::Tool(ToolError::Failed(
-            "a TypeScript extension needs bun (found on PATH) and noel's shim \
-             (shipped beside the noel binary or in the agent dir); \
-             set NOEL_BUN_HOST to the shim's path"
+            "a TypeScript extension needs noel's shim (shipped beside the noel \
+             binary or in the agent dir); set NOEL_BUN_HOST to the shim's path"
                 .to_string(),
         ))
     })?;
-    let mut command = tokio::process::Command::new("bun");
+    let bun = bun
+        .map(Path::to_path_buf)
+        .or_else(find_bun_binary)
+        .ok_or_else(|| {
+            AgentError::Tool(ToolError::Failed(
+                "a TypeScript extension needs bun; install it (noel bun install \
+                 downloads it into the agent dir) or put a bun on PATH"
+                    .to_string(),
+            ))
+        })?;
+    let mut command = tokio::process::Command::new(bun);
     command.arg(shim).arg(path);
     Ok(command)
 }
@@ -743,6 +759,44 @@ fn find_bun_host() -> Option<PathBuf> {
     let (paths, _import) = noel_config::ConfigPaths::discover(cwd, None).ok()?;
     let shim = paths.agent_dir.join("extension-hosts/noel-bun-host.ts");
     shim.is_file().then_some(shim)
+}
+
+/// The bun binary for a TypeScript host: `NOEL_BUN_BIN` (a path or `path`,
+/// for PATH resolution), else the agent dir's `bin/bun` (what `noel bun
+/// install` puts there), else a `bun` on PATH. Musl and glibc systems both
+/// run the stock release build; the download picks the right asset.
+pub fn find_bun_binary() -> Option<PathBuf> {
+    if let Some(override_value) = std::env::var_os("NOEL_BUN_BIN") {
+        let value = override_value.to_string_lossy().to_string();
+        let value = value.trim();
+        if value == "path" {
+            return which_bun();
+        }
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // The agent dir's install (what `noel bun install` put there): a
+    // discover failure (test isolation, odd HOME) never hides a PATH bun.
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok((paths, _import)) = noel_config::ConfigPaths::discover(cwd, None) {
+            let installed = paths.agent_dir.join("bin/bun");
+            if installed.is_file() {
+                return Some(installed);
+            }
+        }
+    }
+    which_bun()
+}
+
+/// A `bun` on PATH, by direct probe (no `which` crate in the core).
+fn which_bun() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("bun"))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
@@ -1221,6 +1275,61 @@ done
 
         hosts.shutdown(&cwd).await;
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// Bun resolution order: `NOEL_BUN_BIN` (a path, or `path` for PATH),
+    /// else the agent dir's `bin/bun` (what `noel bun install` put there),
+    /// else a `bun` on PATH. The installed copy outranks PATH so the
+    /// private download never shadows - and never is shadowed by - a
+    /// system bun the user did not consent to for extensions.
+    #[test]
+    fn bun_binary_resolution_prefers_override_then_install_dir() {
+        struct EnvGuard {
+            bun_bin: Option<std::ffi::OsString>,
+            dir: std::path::PathBuf,
+            old_dir: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.bun_bin.take() {
+                    Some(value) => std::env::set_var("NOEL_BUN_BIN", value),
+                    None => std::env::remove_var("NOEL_BUN_BIN"),
+                }
+                match self.old_dir.take() {
+                    Some(value) => std::env::set_var("NOEL_DIR", value),
+                    None => std::env::remove_var("NOEL_DIR"),
+                }
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("noel-bun-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).expect("mkdir");
+        std::fs::write(dir.join("bin/bun"), b"stub").expect("stub bun");
+        let guard = EnvGuard {
+            bun_bin: std::env::var_os("NOEL_BUN_BIN"),
+            dir: dir.clone(),
+            old_dir: std::env::var_os("NOEL_DIR"),
+        };
+        // SAFETY: single-threaded test, restored by the guard.
+        std::env::set_var("NOEL_DIR", &dir);
+        std::env::remove_var("NOEL_BUN_BIN");
+
+        // The agent dir's install wins over PATH.
+        let resolved = find_bun_binary().expect("installed bun");
+        assert_eq!(resolved, dir.join("bin/bun"));
+
+        // An explicit path wins over the install.
+        let override_path = dir.join("other-bun");
+        std::fs::write(&override_path, b"stub").expect("stub");
+        std::env::set_var("NOEL_BUN_BIN", &override_path);
+        let resolved = find_bun_binary().expect("override bun");
+        assert_eq!(resolved, override_path);
+
+        // `path` resolves from PATH, ignoring the install.
+        std::env::set_var("NOEL_BUN_BIN", "path");
+        let resolved = find_bun_binary();
+        assert_ne!(resolved.as_ref(), Some(&dir.join("bin/bun")));
+        drop(guard);
     }
 
     fn which_bun() -> Result<PathBuf, ()> {

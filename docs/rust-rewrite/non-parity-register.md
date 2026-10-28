@@ -37,10 +37,16 @@ imports are erased by bun itself).
 Reason: upstream's extension ecosystem is TypeScript; a subprocess host keeps
 parity with what extensions expect without embedding an engine (deno_core's
 stewardship window and V8's size make embedding the wrong trade), and keeps
-noel's binary and build free of any JS runtime. bun is optional: without it,
-a `.ts` extension fails closed with a diagnostic, exactly like a missing
-executable. This is the same class of dependency as `rg`/`fd`: an external
-tool noel invokes deliberately, never a runtime noel depends on.
+noel's binary and build free of any JS runtime. bun is optional: the TUI
+offers a one-time download when a TypeScript extension is loaded and no bun
+exists (before the TUI opens, on the plain terminal), `noel bun install`
+does it non-interactively (`-y`), and the binary lands in the agent dir's
+`bin/bun` — private to noel, outranking PATH so nothing shadows or is
+shadowed. `NOEL_BUN_BIN` (a path, or `path` to force PATH) overrides the
+resolution. Without bun and without consent, a `.ts` extension fails closed
+with a diagnostic, exactly like a missing executable. This is the same class
+of dependency as `rg`/`fd`: an external tool noel invokes deliberately,
+never a runtime noel depends on.
 
 ### No Web UI Product Path
 
