@@ -677,6 +677,8 @@ mod tests {
                     label: "5h".to_string(),
                     used_pct: window_pct,
                     resets_at: Some(resets_at),
+                    active: None,
+                    severity: None,
                 }],
                 balance: None,
                 fetched_at: 0,

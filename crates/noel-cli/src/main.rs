@@ -13722,6 +13722,8 @@ mod tests {
                             label: "5h".to_string(),
                             used_pct,
                             resets_at: Some(now + 3_600),
+                            active: None,
+                            severity: None,
                         }],
                         balance: None,
                         fetched_at: now,

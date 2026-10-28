@@ -1458,6 +1458,15 @@ pub struct UsageWindow {
     pub used_pct: f64,
     #[serde(default)]
     pub resets_at: Option<i64>,
+    /// Whether the provider marks this limit as the binding one right now
+    /// (Anthropic's `limits[].is_active`); `None` when the provider does
+    /// not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    /// The provider's severity for this limit (`normal`/`critical`);
+    /// `None` when not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5717,6 +5726,8 @@ mod tests {
                     label: "5h".to_string(),
                     used_pct: 42.5,
                     resets_at: Some(1_800_000_000),
+                    active: None,
+                    severity: None,
                 }],
                 balance: Some(Balance {
                     amount: 10.5,
