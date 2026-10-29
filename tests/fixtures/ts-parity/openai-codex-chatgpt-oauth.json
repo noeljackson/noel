@@ -17,7 +17,7 @@
       "content-type": "application/json",
       "openai-beta": "responses=experimental",
       "originator": "pi",
-      "user-agent": "pi/1.4.0 (linux; node/v24.22.1; x64)"
+      "user-agent": "pi/1.4.0 (linux; node/v24.22.2; x64)"
     },
     "body": {
       "model": "gpt-6.1-sol",

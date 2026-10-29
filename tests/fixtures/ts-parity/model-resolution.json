@@ -175,7 +175,7 @@
         "model": null,
         "thinkingLevel": null,
         "warning": null,
-        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5, radius/gpt-5.5. No matching provider is authenticated. Use --provider or provider/model."
+        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5. No matching provider is authenticated. Use --provider or provider/model."
       }
     },
     {
@@ -207,7 +207,7 @@
         "model": null,
         "thinkingLevel": null,
         "warning": null,
-        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5, radius/gpt-5.5. More than one matching provider is authenticated. Use --provider or provider/model."
+        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5. More than one matching provider is authenticated. Use --provider or provider/model."
       }
     },
     {
@@ -221,7 +221,7 @@
         "model": null,
         "thinkingLevel": null,
         "warning": null,
-        "error": "Model \"GPT-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5, radius/gpt-5.5. No matching provider is authenticated. Use --provider or provider/model."
+        "error": "Model \"GPT-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5. No matching provider is authenticated. Use --provider or provider/model."
       }
     },
     {
@@ -392,7 +392,7 @@
       "expected": {
         "model": {
           "provider": "openai",
-          "id": "gpt-realtime-2.1"
+          "id": "gpt-daybreak-red-latest"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -424,7 +424,7 @@
       "expected": {
         "model": {
           "provider": "google",
-          "id": "gemini-pro-latest"
+          "id": "gemini-robotics-er-2-preview"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -2278,6 +2278,11 @@
           {
             "provider": "openai",
             "id": "gpt-5.5-pro",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.6-cyber",
             "thinkingLevel": null
           },
           {

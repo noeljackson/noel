@@ -13,7 +13,7 @@
       "accept": "text/event-stream",
       "authorization": "Bearer <redacted>",
       "content-type": "application/json",
-      "user-agent": "pi/1.4.0 (linux; node/v24.22.1; x64)",
+      "user-agent": "pi/1.4.0 (linux; node/v24.22.2; x64)",
       "x-affinity": "session_ts_parity"
     },
     "body": {
