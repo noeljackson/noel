@@ -24,7 +24,7 @@
       "x-stainless-package-version": "0.129.0",
       "x-stainless-retry-count": "0",
       "x-stainless-runtime": "node",
-      "x-stainless-runtime-version": "v24.22.1",
+      "x-stainless-runtime-version": "v24.22.2",
       "x-stainless-timeout": "600"
     },
     "body": {
