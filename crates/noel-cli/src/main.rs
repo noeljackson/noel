@@ -3844,6 +3844,9 @@ struct TuiApp {
     input_media: Vec<MediaInput>,
     input_cursor: usize,
     quit_armed_since: Option<Instant>,
+    /// When the last bare Esc landed (idle, empty input), for Esc-Esc's
+    /// rewind picker (spec §9.2).
+    last_idle_esc: Option<Instant>,
     editor_state: EditorState,
     last_shell_command: Option<String>,
     multiline: Option<Vec<String>>,
@@ -6517,8 +6520,28 @@ async fn handle_tui_key(
     }
     match key.code {
         KeyCode::Esc => {
-            app.clear_input();
-            app.multiline = None;
+            if app.input.is_empty()
+                && app.multiline.is_none()
+                && app.selector.is_none()
+                && app.diff_panel.is_none()
+            {
+                // Esc-Esc (within 400ms, both idle): the rewind picker
+                // (spec §9.2). A lone Esc still clears nothing here (the
+                // input is empty) and disarms it after the window.
+                let now = Instant::now();
+                let double = app
+                    .last_idle_esc
+                    .is_some_and(|at| now.duration_since(at) < Duration::from_millis(400));
+                app.last_idle_esc = Some(now);
+                if double {
+                    app.last_idle_esc = None;
+                    open_tui_selector(app, config, runtime, "rewind", "")?;
+                }
+            } else {
+                app.last_idle_esc = None;
+                app.clear_input();
+                app.multiline = None;
+            }
         }
         KeyCode::Backspace => {
             app.pop_input_char();
@@ -7616,6 +7639,38 @@ fn apply_tui_selector_selection(
                 format!("switched to branch {}", item.value),
             );
         }
+        "rewind" => {
+            // Esc-Esc's pick: restore the conversation (and files) to the
+            // point before that user prompt.
+            let messages: usize = item
+                .value
+                .parse()
+                .map_err(|error| anyhow!("rewind checkpoint value: {error}"))?;
+            let (restored, refused) = runtime.rewind(messages)?;
+            app.clear_visible();
+            app.restore_session_messages(runtime);
+            app.push(
+                TuiEntryKind::System,
+                if restored.is_empty() && refused.is_empty() {
+                    "rewound: conversation only".to_string()
+                } else {
+                    format!(
+                        "rewound: {} file{} restored{}",
+                        restored.len(),
+                        if restored.len() == 1 { "" } else { "s" },
+                        if refused.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                ", {} left (changed on disk): {}",
+                                refused.len(),
+                                refused.join(", ")
+                            )
+                        }
+                    )
+                },
+            );
+        }
         "auth" | "login" => {
             // The real flow needs the terminal suspended and is async: the
             // pick is recorded here, the key handler runs it (below).
@@ -8437,6 +8492,10 @@ async fn handle_tui_submission(
         _ if line.starts_with("/new") => {
             start_new_session(runtime, config)?;
             app.push(TuiEntryKind::System, format_session(runtime));
+        }
+        _ if line.starts_with("/rewind") => {
+            // Esc-Esc's picker as a command: the same checkpoints.
+            open_tui_selector(app, config, runtime, "rewind", "")?;
         }
         _ if line.starts_with("/resume") => {
             let reference = line.trim_start_matches("/resume").trim();
@@ -10986,8 +11045,61 @@ fn selector_for_kind(config: &LoadedConfig, runtime: &Runtime, kind: &str) -> Re
             account_selector_items(config, runtime),
         )),
         "settings" => Ok(Selector::new("settings", settings_selector_items(config))),
+        "rewind" => Ok(rewind_selector(runtime)),
         _ => Err(anyhow!("unknown selector: {kind}")),
     }
+}
+
+/// The Esc-Esc rewind picker (spec §9.2): one checkpoint per user prompt,
+/// newest first, each labeled with its prompt and the files the turns
+/// after it changed. The first item is the current point (no-op pick),
+/// like Claude Code's.
+fn rewind_selector(runtime: &Runtime) -> Selector {
+    let session = runtime.session();
+    let mut items = vec![SelectorItem {
+        label: "(current)".to_string(),
+        value: session.messages.len().to_string(),
+        active: true,
+    }];
+    let mut checkpoints: Vec<(usize, &ConversationMessage)> = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == MessageRole::User)
+        .collect();
+    checkpoints.reverse();
+    for (index, message) in checkpoints {
+        // The files a rewind to this checkpoint would consider: snapshots
+        // taken at or after it.
+        let files = session
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.message_index >= index)
+            .map(|snapshot| snapshot.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let summary: String = message
+            .content
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect();
+        let label = if files.is_empty() {
+            format!("{summary} · no code changes")
+        } else {
+            format!(
+                "{summary} · code: {}",
+                files.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
+        items.push(SelectorItem {
+            label,
+            value: index.to_string(),
+            active: false,
+        });
+    }
+    Selector::new("rewind", items)
 }
 
 fn sorted_models(models: &[ModelDefinition]) -> Vec<&ModelDefinition> {

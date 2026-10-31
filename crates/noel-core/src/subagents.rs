@@ -278,6 +278,8 @@ fn empty_session() -> SessionState {
         partial: None,
         tool_outputs: BTreeMap::new(),
         workspace: None,
+        snapshots: Vec::new(),
+        rewinds: Vec::new(),
     }
 }
 

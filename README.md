@@ -1249,6 +1249,7 @@ managed with `noel config disable <extension|skill|prompt|theme> <name>` and
 - `/share [file]`
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
 - `/undo` (remove the latest conversation turn and restore its prompt; files unchanged)
+- `/rewind` (the checkpoint picker: restore conversation and code to any earlier prompt; also Esc-Esc at idle)
 - `/usage` (recorded session token totals and account quotas)
 - `/login [provider]`
 - `/logout <provider>`
@@ -1355,6 +1356,21 @@ queued messages, or token usage. `/usage` persists provider-reported token total
 for completed requests across resume/reload/compaction/undo; old sessions and
 providers without usage report “no provider token usage reported yet” rather
 than estimated totals. Account quota checks use the same cache as `/accounts`
+
+`/rewind` (or Esc-Esc pressed twice within 400 ms while idle) opens a
+checkpoint picker with one checkpoint per past user prompt, newest first:
+`(current)` at the top, then each prompt labeled with the files the turns
+after it changed. Picking one rewinds the conversation to that prompt — the
+messages, runs, saved partial output, and queue after it are dropped — and
+restores the code: every `edit`/`write` (the model's or a typed command)
+snapshots the file's bytes first into a `*.files` directory beside the
+session journal, and a rewind restores each changed file to what it held
+before the dropped range, deleting files that range created. A file whose
+bytes no longer match what the session last left there (changed outside the
+session) is not restored and is named in a notice. Like `/undo`, rewind never
+reverts shell effects, tool audit history, or token usage. The journal stays
+append-only: the rewind is a record, so a restart loads the rewound state
+while nothing is erased from the file.
 and are skipped offline. Dollar costs are not calculated.
 
 
