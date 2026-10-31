@@ -987,6 +987,55 @@ fn runs_are_listed_with_their_tokens_and_cost_a_forecast() {
     });
 }
 
+/// A background run (spec §9.6): `& <prompt>` forks the session and the
+/// fork runs the prompt in a worker of its own; `/bg` lists the forks.
+#[test]
+fn a_background_run_is_a_fork_with_its_own_worker() {
+    let script = json!([
+        [{"text": "main reply"}],
+        [{"text": "background reply"}],
+        [{"text": "dashed reply"}],
+    ]);
+    let mode2 = Mode2::new("bg", script, json!({}));
+    let session = mode2.new_session("bg");
+    let command = |line: &str| mode2.client(&["command", &session, line]);
+    assert!(command("/bg").starts_with("no background runs"));
+    mode2.client(&["send", &session, "one"]);
+    wait_until("the first run", || {
+        mode2.journal(&session).contains("\"run_finished\"")
+    });
+
+    let started = command("& do it on the side");
+    let fork = started
+        .strip_prefix("background ")
+        .and_then(|rest| rest.split_once(": started"))
+        .map(|(id, _)| id.to_owned())
+        .unwrap_or_else(|| panic!("{started}"));
+    assert_ne!(fork, session);
+    wait_until("the fork's run", || {
+        mode2.journal(&fork).contains("\"run_finished\"")
+    });
+    // The fork has the conversation so far and its own prompt and answer;
+    // this session has neither.
+    let forked = mode2.journal(&fork);
+    assert!(forked.contains("main reply"), "{forked}");
+    assert!(forked.contains("do it on the side"), "{forked}");
+    assert!(forked.contains("background reply"), "{forked}");
+    assert!(!mode2.journal(&session).contains("do it on the side"));
+    let listed = command("/bg");
+    assert_eq!(
+        listed,
+        format!("{fork}  completed · 4 messages · do it on the side\n")
+    );
+
+    // `/bg <prompt>` is the same, and a prompt may start with a dash.
+    let dashed = command("/bg --not-an-option");
+    assert!(dashed.starts_with("background "), "{dashed}");
+    wait_until("the second fork listed", || {
+        command("/bg").lines().count() == 2 && command("/bg").contains("· --not-an-option")
+    });
+}
+
 /// A goal (spec §9.3) starts the work when it is set, and after each turn
 /// that settles the evaluator, the session's own model without tools,
 /// says whether it is met: not met sends the work on, met clears the goal.

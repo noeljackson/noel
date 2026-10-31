@@ -1318,7 +1318,8 @@ impl Remote {
             }
             return Action::None;
         }
-        if line.starts_with('/') || line.starts_with('!') {
+        // `& <prompt>` is a command too: a background run (spec §9.6).
+        if line.starts_with('/') || line.starts_with('!') || line.starts_with('&') {
             return self.command(&line, app, config, steer).await;
         }
         self.prompt(app, line, steer);
@@ -2068,7 +2069,7 @@ fn refused_busy(result: &Result<Value>) -> bool {
 /// own commands (a template, or text for the model), as the local TUI
 /// treats them.
 fn is_prompt_command(line: &str, name: &str) -> bool {
-    if name.starts_with('!') {
+    if name.starts_with('!') || name.starts_with('&') {
         return false;
     }
     if crate::response_kind_for_prompt(line) == TuiEntryKind::Tool || name.starts_with("/skill:") {
