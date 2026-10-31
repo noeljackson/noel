@@ -11,6 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod account_failover;
@@ -50,8 +51,8 @@ pub use media::*;
 #[allow(unused_imports)]
 pub use model_refresh::*;
 use model_select::{
-    configured_model, effective_thinking_level, find_selectable_model, model_definition,
-    normalized_thinking_level, provider_usable, register_cli_model, resolve_cli,
+    configured_model, configured_thinking_level, effective_thinking_level, find_selectable_model,
+    model_definition, normalized_thinking_level, provider_usable, register_cli_model, resolve_cli,
     resolve_cli_selection, resolve_scope, select_initial_model, set_thinking_level, switch_model,
     thinking_label,
 };
@@ -586,6 +587,9 @@ async fn run() -> Result<()> {
     if !runtime.session().disabled_tools.is_empty() {
         runtime.set_disabled_tools(BTreeSet::new())?;
     }
+    // A subagent definition's `model` frontmatter builds its provider
+    // through this factory; the CLI knows the config and the client.
+    install_subagent_provider_factory(&mut runtime, &config, offline);
     if let Some(name) = &cli.name {
         let name = name.trim();
         if name.is_empty() {
@@ -1858,6 +1862,16 @@ fn tool_call_detail(call: &noel_ai::ChatToolCall) -> String {
     let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_default();
     if let Some(command) = args["command"].as_str() {
         return format!("$ {command}");
+    }
+    // A subagent, Claude-style: `researcher(Count files here)`.
+    if call.name == "task" {
+        let subagent = args["subagent"].as_str().unwrap_or("?");
+        let description = args["description"].as_str().unwrap_or("");
+        return if description.is_empty() {
+            subagent.to_string()
+        } else {
+            format!("{subagent}({description})")
+        };
     }
     let detail = ["path", "url", "query", "pattern"]
         .iter()

@@ -252,6 +252,40 @@ text without its frontmatter, in a `<skill>` block that names the file and
 the directory its relative paths start from, followed by the arguments.
 `/skills` lists the loaded skills.
 
+## Subagents
+
+A subagent definition is a Markdown file with YAML frontmatter, loaded from
+`.noel/agents/` of a trusted project and then `agents/` in the agent
+directory, the first of a name winning (as skills load; `/reload` reloads
+them):
+
+```markdown
+---
+description: Reviews Rust changes for correctness and style.
+tools: read, grep, bash
+model: anthropic/claude-sonnet-4-5
+---
+You are a code reviewer. Read the diff, list concrete problems,
+and rank them by severity. Be terse.
+```
+
+- `description` (required) is how the model chooses among them.
+- `tools` scopes the subagent to a comma list of noel tool names; omitted
+  gives it the parent's active tools. The list must resolve to at least
+  one tool the parent has, and `task` is refused: subagents do not nest.
+- `model` names `provider/id` for the subagent's own requests; `thinking`
+  its thinking level.
+- The body is the subagent's system prompt.
+
+When any definition is loaded the model is offered the `task` tool, whose
+description names them. A call runs the named subagent in-process: its own
+provider rounds, its own context window, its scoped tools, in the same
+workspace — it does not see this conversation, so the prompt must carry
+everything it needs. The parent receives only the subagent's final reply,
+as the tool's result, and the transcript shows `● Used Task
+<name>(<description>)` with the reply below (ctrl+o expands it). An abort
+ends the subagent with the turn.
+
 ## Prompt templates
 
 A Markdown file `name.md` is the command `/name`, as in upstream's

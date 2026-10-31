@@ -284,16 +284,18 @@ pub(crate) fn fail_truncated_tool_call(
 #[cfg(test)]
 pub(crate) async fn execute_model_tool_call(
     runtime: &mut Runtime,
+    provider: &dyn Provider,
     tool_call: &ChatToolCall,
     on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
 ) -> Result<(), AgentError> {
-    execute_model_tool_call_with(runtime, tool_call, on_output, &mut |_| {}, None).await
+    execute_model_tool_call_with(runtime, provider, tool_call, on_output, &mut |_| {}, None).await
 }
 
 /// [`execute_model_tool_call`], with a `codemode` call's nested calls
 /// reported to `on_nested` as they change.
 pub(crate) async fn execute_model_tool_call_with(
     runtime: &mut Runtime,
+    provider: &dyn Provider,
     tool_call: &ChatToolCall,
     on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
     on_nested: &mut (dyn FnMut(Vec<NestedToolCall>) + Send),
@@ -410,6 +412,48 @@ pub(crate) async fn execute_model_tool_call_with(
                 Err(error) => {
                     is_error = true;
                     vec![format!("invalid todo arguments: {error}")]
+                }
+            }
+        } else {
+            is_error = true;
+            vec![format!("Tool {} not found", tool_call.name)]
+        }
+    } else if tool_call.name == "task" {
+        if model_tool_enabled(runtime, "task") {
+            match serde_json::from_str::<TaskToolArgs>(&tool_call.arguments) {
+                Ok(args) => {
+                    // The parent's cancellation ends the call (the wrapper
+                    // in `run_tool_call` drops this future), which drops
+                    // the child's turn: an abort ends both, and the parent
+                    // saves its interrupted result as for any tool.
+                    let control = RunControl::default();
+                    match crate::subagents::run_task_tool(
+                        runtime,
+                        provider,
+                        &control,
+                        &args,
+                        &mut |event| {
+                            if let SubagentEvent::Started { agent, description } = event {
+                                on_output(OutputSoFar {
+                                    text: &format!("[{agent}] {description}\n"),
+                                    truncated: false,
+                                });
+                            }
+                        },
+                    )
+                    .await
+                    {
+                        Ok(text) => vec![text],
+                        Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+                        Err(error) => {
+                            is_error = true;
+                            vec![error.to_string()]
+                        }
+                    }
+                }
+                Err(error) => {
+                    is_error = true;
+                    vec![format!("invalid task arguments: {error}")]
                 }
             }
         } else {

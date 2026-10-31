@@ -97,7 +97,7 @@ pub async fn continue_turn_streaming_events(
         Some(attempt) => charge_interrupted_request(runtime, run, attempt, &mut on_event).await?,
         None => 0,
     };
-    settle_pending_calls(runtime, run, &mut on_event).await?;
+    settle_pending_calls(runtime, provider, run, &mut on_event).await?;
     run_model_turn(runtime, provider, run, None, retries, on_event).await
 }
 
@@ -145,6 +145,7 @@ pub(crate) async fn charge_interrupted_request(
 /// other call gets its interrupted result, unreported.
 pub(crate) async fn settle_pending_calls(
     runtime: &mut Runtime,
+    provider: &dyn Provider,
     run: &RunControl,
     on_event: &mut (impl FnMut(&TurnEvent) + Send),
 ) -> Result<(), AgentError> {
@@ -163,7 +164,7 @@ pub(crate) async fn settle_pending_calls(
             // cut off at the output limit gets its calls' error results
             // right after it is saved, so its calls are not left for here;
             // these only read.
-            run_tool_call(runtime, run, call, false, on_event).await?;
+            run_tool_call(runtime, provider, run, call, false, on_event).await?;
         } else {
             runtime.push_interrupted_result(&call)?;
         }
@@ -369,7 +370,14 @@ pub(crate) async fn run_model_turn(
         }
 
         for (index, tool_call) in tool_calls.iter().enumerate() {
-            let result = run_tool_call(runtime, run, tool_call.clone(), truncated, &mut on_event);
+            let result = run_tool_call(
+                runtime,
+                provider,
+                run,
+                tool_call.clone(),
+                truncated,
+                &mut on_event,
+            );
             if let Err(error) = result.await {
                 if matches!(error, AgentError::Cancelled) {
                     // The abort stopped this call, which saved what it had
@@ -533,6 +541,7 @@ impl Recovery {
 /// saved and reported result is the error asking to re-issue it.
 pub(crate) async fn run_tool_call(
     runtime: &mut Runtime,
+    provider: &dyn Provider,
     run: &RunControl,
     tool_call: ChatToolCall,
     truncated: bool,
@@ -607,6 +616,7 @@ pub(crate) async fn run_tool_call(
         let ends_itself = tool_call.name == codemode::CODEMODE;
         let execution = execute_model_tool_call_with(
             runtime,
+            provider,
             &tool_call,
             &mut on_output,
             &mut on_nested,

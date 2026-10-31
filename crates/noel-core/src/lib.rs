@@ -16,6 +16,9 @@ mod recovery_tests;
 mod session_export;
 mod session_lock;
 pub mod storage;
+#[cfg(test)]
+mod subagent_tests;
+mod subagents;
 mod system_prompt;
 mod tool_calls;
 #[cfg(test)]
@@ -36,6 +39,7 @@ use progress::{ReplyProgress, ToolProgress};
 pub use session_export::*;
 #[cfg(test)]
 use session_lock::SessionLock;
+pub use subagents::{run_task_tool, SubagentEvent, TaskToolArgs};
 pub use system_prompt::PRODUCT_NAME;
 use system_prompt::{PromptTool, SystemPromptInput};
 #[allow(unused_imports)]
@@ -60,9 +64,17 @@ use noel_ai::{
     ChatMessage, ChatRole, ChatToolCall, MediaInput, ModelRef, Provider, ProviderError,
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
 };
+
+/// Builds a provider for one model, as a subagent's override asks.
+pub type SubagentProviderFactory = Arc<dyn Fn(&ModelRef) -> BoxProviderFuture + Send + Sync>;
+
+/// A boxed, shared future, as a provider factory returns.
+pub type BoxProviderFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Box<dyn Provider>, String>> + Send + 'static>,
+>;
 use noel_config::{
-    has_auth_for_provider, listed_accounts_for_provider, ContextFile, LoadedConfig, ResourceFile,
-    Skill,
+    has_auth_for_provider, listed_accounts_for_provider, AgentDefinition, ContextFile,
+    LoadedConfig, ResourceFile, Skill,
 };
 use noel_env::LocalEnvOptions;
 pub use noel_env::{ExecutionEnv, LocalEnv};
@@ -850,6 +862,8 @@ pub struct ReloadableSystems {
     pub agent_context_files: Vec<ContextFile>,
     /// The loaded skills, which the system prompt lists.
     pub skills: Vec<Skill>,
+    /// The subagent definitions, which the `task` tool offers.
+    pub agents: Vec<AgentDefinition>,
     pub available_models: Vec<ModelRef>,
     pub configured_providers: BTreeSet<String>,
     pub available_accounts: BTreeMap<String, Vec<String>>,
@@ -895,6 +909,7 @@ impl Default for ReloadableSystems {
             context_files: Vec::new(),
             agent_context_files: Vec::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             available_models: Vec::new(),
             configured_providers: BTreeSet::new(),
             available_accounts: BTreeMap::new(),
@@ -1091,6 +1106,7 @@ impl ReloadableSystems {
                 .cloned()
                 .collect(),
             skills: config.skills.clone(),
+            agents: config.agents.clone(),
             available_models,
             configured_providers,
             model_context_windows: config
@@ -2445,6 +2461,10 @@ pub struct Runtime {
     /// extension tools, and kept across reloads.
     plugin_tools: Vec<plugins::PluginTool>,
     plugin_host: Option<Arc<dyn plugins::PluginToolHost>>,
+    /// Builds a provider for a subagent's model override (the `model`
+    /// frontmatter of an agent definition); `None` means the mode cannot
+    /// (a test runtime, say), and an override then fails with a message.
+    subagent_provider_factory: Option<SubagentProviderFactory>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -2470,7 +2490,14 @@ impl Runtime {
             extension_hosts: Arc::new(tokio::sync::Mutex::new(extensions::ExtensionHosts::new())),
             plugin_tools: Vec::new(),
             plugin_host: None,
+            subagent_provider_factory: None,
         }
+    }
+
+    /// Sets the factory a subagent's `model` override builds its provider
+    /// with (see the field). Each mode sets its own at startup.
+    pub fn set_subagent_provider_factory(&mut self, factory: SubagentProviderFactory) {
+        self.subagent_provider_factory = Some(factory);
     }
 
     /// The plugin tools the run offers from now on, run by `host`; they
@@ -2494,6 +2521,12 @@ impl Runtime {
             store: Some(store),
             ..Self::new(session, systems)
         }
+    }
+
+    /// A subagent's session, for tests of the `task` tool's scoping.
+    #[cfg(test)]
+    pub(crate) fn child_session(&self) -> &SessionState {
+        &self.session
     }
 
     /// Whether the system prompt of a session with a remote workspace lists
@@ -3553,6 +3586,9 @@ fn prompt_tools(runtime: &Runtime) -> Vec<PromptTool> {
         .into_iter()
         .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
         .filter(|tool| model_tool_enabled(runtime, &tool.name))
+        // The `task` tool exists only when a subagent definition is loaded
+        // (its description names them); without one it is not offered.
+        .filter(|tool| tool.name != "task" || !runtime.systems.agents.is_empty())
         .map(|tool| PromptTool::builtin(&tool.name));
     let extension = runtime
         .systems
@@ -3748,11 +3784,12 @@ fn tool_guidelines(runtime: &Runtime) -> BTreeMap<String, Vec<String>> {
 
 /// The enabled tools as they are, before codemode's presentation.
 fn enabled_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
+    let agents = runtime.systems.agents.clone();
     let mut definitions = builtin_tool_definitions()
         .into_iter()
         .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
         .filter(|tool| model_tool_enabled(runtime, &tool.name))
-        .filter_map(|tool| model_tool_definition(&tool.name))
+        .filter_map(|tool| model_tool_definition(&tool.name, &agents))
         .collect::<Vec<_>>();
     definitions.extend(
         runtime
@@ -3981,4 +4018,4 @@ pub fn new_session_id() -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

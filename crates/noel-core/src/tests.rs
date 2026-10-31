@@ -8,6 +8,19 @@ use noel_ai::{create_provider, ProviderApi, ProviderAuth, ProviderConfig};
 
 use super::*;
 
+/// A provider for tool-call tests whose tool never needs one: the
+/// `task` tool is the only tool that calls a provider.
+pub(crate) struct UnusedProvider;
+#[async_trait::async_trait]
+impl noel_ai::Provider for UnusedProvider {
+    async fn complete(&self, _request: ProviderRequest) -> Result<Vec<StreamEvent>, ProviderError> {
+        Err(ProviderError::Config("unused".to_string()))
+    }
+}
+pub(crate) fn unused_provider() -> UnusedProvider {
+    UnusedProvider
+}
+
 fn test_message(role: MessageRole, content: &str) -> ConversationMessage {
     ConversationMessage {
         role,
@@ -827,6 +840,7 @@ async fn web_tool_failures_return_to_model_and_persist_error_status() {
     );
     execute_model_tool_call(
         &mut runtime,
+        &unused_provider(),
         &ChatToolCall {
             id: "bad-url".into(),
             name: "web_fetch".into(),
@@ -845,6 +859,7 @@ async fn web_tool_failures_return_to_model_and_persist_error_status() {
     );
     execute_model_tool_call(
         &mut runtime,
+        &unused_provider(),
         &ChatToolCall {
             id: "bad-search".into(),
             name: "web_search".into(),
@@ -3083,6 +3098,7 @@ fn agent_settings_override_tool_round_limit() {
         context_files: Vec::new(),
         extensions: Vec::new(),
         skills: Vec::new(),
+        agents: Vec::new(),
         prompt_templates: Vec::new(),
         themes: Vec::new(),
         diagnostics: Vec::new(),
@@ -3334,7 +3350,7 @@ async fn plugin_tools_run_through_their_host_and_survive_a_reload() {
         name: "shout".to_string(),
         arguments: serde_json::json!({"text": "hi"}).to_string(),
     };
-    execute_model_tool_call(&mut runtime, &call, &mut |_| {})
+    execute_model_tool_call(&mut runtime, &unused_provider(), &call, &mut |_| {})
         .await
         .expect("the plugin tool runs");
     let event = runtime.session().tool_history.last().expect("tool event");
@@ -3371,7 +3387,7 @@ async fn todo_tool_call_updates_session_todos() {
         .to_string(),
     };
 
-    execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
+    execute_model_tool_call(&mut runtime, &unused_provider(), &tool_call, &mut |_| {})
         .await
         .expect("execute todo tool");
 
@@ -3394,7 +3410,7 @@ async fn todo_tool_call_rejects_invalid_arguments() {
         arguments: "{\"todos\": \"not-a-list\"}".to_string(),
     };
 
-    execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
+    execute_model_tool_call(&mut runtime, &unused_provider(), &tool_call, &mut |_| {})
         .await
         .expect("execute todo tool");
 
@@ -3527,10 +3543,10 @@ async fn write_tool_call_tracks_edited_files() {
         .to_string(),
     };
 
-    execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
+    execute_model_tool_call(&mut runtime, &unused_provider(), &tool_call, &mut |_| {})
         .await
         .expect("execute write tool");
-    execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
+    execute_model_tool_call(&mut runtime, &unused_provider(), &tool_call, &mut |_| {})
         .await
         .expect("execute write tool again");
 
@@ -3575,7 +3591,7 @@ async fn write_and_edit_accept_empty_text_and_edits_as_a_json_string() {
         ),
     ];
     for tool_call in &calls {
-        execute_model_tool_call(&mut runtime, tool_call, &mut |_| {})
+        execute_model_tool_call(&mut runtime, &unused_provider(), tool_call, &mut |_| {})
             .await
             .expect("execute tool call");
     }

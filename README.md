@@ -58,7 +58,7 @@ Current Rust implementation:
 - Config/auth/model loading from `~/.noel`
 - Upstream's default system prompt, with `SYSTEM.md`, `APPEND_SYSTEM.md`,
   and `AGENTS.md`/`CLAUDE.md` context discovery
-- Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `todo`, `web_search`, `web_fetch`
+- Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `todo`, `task` (subagents; offered when an agent definition is loaded), `web_search`, `web_fetch`
 - Models: upstream's built-in catalog (every provider and chat model upstream ships, with thinking levels, limits, and prices), plus the faux test models and three providers of this port's own
 - Provider APIs: OpenAI chat completions, OpenAI Responses, Codex, Azure OpenAI Responses, Anthropic Messages, Google Gemini and Vertex, Amazon Bedrock bearer-token Converse, and Mistral, which between them serve the catalog's providers
 
