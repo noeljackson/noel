@@ -9,8 +9,8 @@
 //! The goal is journaled (`goal` and `goal_cleared` records), so a resumed
 //! session keeps working toward it.
 
-use noel_ai::{ChatMessage, ChatRole, ProviderRequest, StreamEvent};
 use crate::{MessageRole, Runtime};
+use noel_ai::{ChatMessage, ChatRole, ProviderRequest, StreamEvent};
 
 /// How many evaluator-confirmed turns a goal may run. A goal that needs
 /// more than this is wrong or never-satisfiable; it is cleared with a

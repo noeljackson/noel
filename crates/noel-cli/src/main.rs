@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod account_failover;
 mod attach;
 mod auth_command;
+mod background;
 mod bug_report;
 mod bun_install;
 mod clipboard;
@@ -8012,6 +8013,29 @@ async fn handle_tui_submission(
     if handle_tui_bang(app, surface, runtime, config, &line).await? {
         return Ok(false);
     }
+    // `& <prompt>`: a background run (spec §9.6) — a fork of this session
+    // submitted to a `noel server` worker, this TUI staying free.
+    if let Some(prompt) = line.strip_prefix('&').map(str::trim) {
+        if prompt.is_empty() {
+            app.push(
+                TuiEntryKind::System,
+                "usage: & <prompt> — runs it in a background fork of this session",
+            );
+            return Ok(false);
+        }
+        match background::start_background_run(runtime, &config.paths.session_dir, offline, prompt) {
+            Ok(id) => app.push(
+                TuiEntryKind::System,
+                format!(
+                    "background {id}: running — /bg lists it, /resume {id} opens it, noel client watch {id} streams it"
+                ),
+            ),
+            Err(error) => app.push(TuiEntryKind::Error, format!("background: {error:#}")),
+        }
+        app.refresh_chrome(config, runtime);
+        redraw_tui(surface.terminal, app, config)?;
+        return Ok(false);
+    }
     match line.as_str() {
         "/help" => app.push(TuiEntryKind::System, terminal_renderer(config).help()),
         "/clear" => {
@@ -8127,6 +8151,27 @@ async fn handle_tui_submission(
         }
         "/summaries" => app.push(TuiEntryKind::System, format_summaries(runtime)),
         "/undo" => undo_tui_turn(app, runtime)?,
+        "/bg" => {
+            // The background forks of this session (spec §9.6), newest
+            // first, each with its last run's state.
+            let forks = background::background_sessions(
+                &config.paths.session_dir,
+                &runtime.session().session_id,
+            );
+            if forks.is_empty() {
+                app.push(
+                    TuiEntryKind::System,
+                    "no background runs; & <prompt> starts one".to_string(),
+                );
+            } else {
+                let lines = forks
+                    .iter()
+                    .map(|path| background::background_status(path))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                app.push(TuiEntryKind::System, lines);
+            }
+        }
         "/plan" => {
             // Toggle plan mode (spec §9.4): read-only research, then a
             // plan the approval selector accepts.

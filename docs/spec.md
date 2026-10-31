@@ -423,6 +423,33 @@ no host program, as extensions need.
   the settings in noel-config, notices as a `Notice` turn event in every
   mode.
 
+### 9.6 Background runs
+
+**Decided (2026-10-31):** Claude Code's background agents, on noel's own
+  server: a fork of the session, submitted to a worker, the foreground
+  staying free.
+
+- **`& <prompt>`** (as `!` runs a shell command) forks the current
+  session and submits the prompt to the fork through a detached
+  `noel client send <id> <prompt>`: the client starts a server when none
+  listens, the server's worker (idle exit 60 s by default) keeps the run
+  alive after the client exits, and the TUI stays free. The notice names
+  the fork's id. The spawn carries `NOEL_DIR` and `NOEL_OFFLINE` so the
+  detached server works from the same agent dir; its stderr lands in
+  `background.log` beside it.
+- **`/bg`** lists this session's background forks (journals whose
+  `parent_session_id` is this session), newest first, each with its last
+  run's state and message count — a read-only journal peek. `/resume
+  <id>` opens a fork; `noel client watch <id>` streams one live.
+- A background fork is a full session: subagents, hooks, plan mode and
+  goals all work in it; rewind works within it (its own snapshots).
+- **Out of scope (for now):** a live status line while the foreground
+  runs (`/bg` is the check), and completion notices pushed into the
+  foreground.
+
+**Built:** `crates/noel-cli/src/background.rs`, the `&` prefix and `/bg`
+  in the TUI.
+
 ## 10. Workspaces
 
 **Decided (2026-10-14):** workspaces match upstream.

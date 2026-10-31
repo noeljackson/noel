@@ -1252,6 +1252,7 @@ managed with `noel config disable <extension|skill|prompt|theme> <name>` and
 - `/rewind` (the checkpoint picker: restore conversation and code to any earlier prompt; also Esc-Esc at idle)
 - `/goal [condition|clear]` (set the session goal; show it, or stop early)
 - `/plan` (toggle plan mode: read-only research, then approve the plan)
+- `/bg` (list this session's background runs)
 - `/usage` (recorded session token totals and account quotas)
 - `/login [provider]`
 - `/logout <provider>`
@@ -1351,6 +1352,16 @@ steering/follow-ups). Linux needs `wl-paste` (Wayland) or `xclip` (X11); macOS
 uses AppKit via Swift (Xcode command-line tools), and Windows uses PowerShell.
 For remote/headless sessions, `NOEL_CLIPBOARD_IMAGE_COMMAND` can supply encoded
 PNG/JPEG/GIF/WebP bytes on stdout; otherwise use `/image <path>`.
+
+### Background runs
+
+`& <prompt>` (as `!` runs a shell command) submits the prompt to a
+background fork of the current session: the fork runs on a `noel server`
+worker that outlives this TUI, and the foreground stays free. The notice
+names the fork's session id; `/bg` lists this session's background forks
+with each one's last run state, `/resume <id>` opens a fork, and
+`noel client watch <id>` streams one live. A background fork is a full
+session — subagents, hooks, plan mode, goals and rewind all work in it.
 
 ### Hooks
 

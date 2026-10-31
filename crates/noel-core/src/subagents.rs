@@ -281,6 +281,7 @@ fn empty_session() -> SessionState {
         snapshots: Vec::new(),
         rewinds: Vec::new(),
         goal: None,
+        plan_mode: false,
     }
 }
 
