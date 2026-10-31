@@ -2382,13 +2382,14 @@ pub(crate) fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palett
             highlight,
         ));
     } else {
-        spans.push(Span::raw(if failed {
+        let verb = if failed {
             "Failed "
         } else if running {
             "Using "
         } else {
             "Used "
-        }));
+        };
+        spans.push(Span::raw(verb));
         let label = match name {
             "read" => "Read",
             "edit" => "Edit",
@@ -2397,13 +2398,18 @@ pub(crate) fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palett
             "find" => "Find",
             "ls" => "Ls",
             "todo" => "Todo",
+            "task" => "Task",
             "web_search" => "Web Search",
             "web_fetch" => "Web Fetch",
             _ => name,
         };
         spans.push(Span::styled(label.to_string(), highlight));
     }
-    if !detail.is_empty() {
+    // A subagent reads Claude's shape, `Used researcher(Count files)`,
+    // not `Used Task · researcher(...)`: the agent name is its label.
+    if name == "task" && !detail.is_empty() {
+        spans.push(Span::styled(format!(" {detail}"), highlight));
+    } else if !detail.is_empty() {
         spans.push(Span::styled(format!(" · {detail}"), palette.secondary()));
     }
     if name == "read" && !running && !output.is_empty() {

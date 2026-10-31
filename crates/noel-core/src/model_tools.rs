@@ -4,7 +4,10 @@ use super::*;
 
 /// What the model is told about a built-in tool. The definitions of
 /// upstream's tools are upstream's, word for word (`tool-behavior.json`).
-pub(crate) fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
+pub(crate) fn model_tool_definition(
+    name: &str,
+    agents: &[noel_config::AgentDefinition],
+) -> Option<AiToolDefinition> {
     let definition = match name {
         "read" => AiToolDefinition {
             name: "read".to_string(),
@@ -217,6 +220,38 @@ pub(crate) fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
                 "required": ["todos"]
             }),
         },
+        "task" => {
+            // Offered only when an agent definition is loaded; the names in
+            // the description are what the model chooses among.
+            let agents = crate::subagents::available_agents_description(agents);
+            if agents.is_empty() {
+                return None;
+            }
+            AiToolDefinition {
+                name: "task".to_string(),
+                description: format!(
+                    "Run a subagent: a focused assistant with its own instructions, context window and tool scope, working on one task in this workspace. The subagent does not see this conversation; give it everything it needs. Returns the subagent's final reply. Available subagents: {agents}"
+                ),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "subagent": {
+                            "type": "string",
+                            "description": "The subagent to run, by name"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "A short (3-5 word) description of the task, shown in the UI"
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The task: everything the subagent needs, since it starts without this conversation's context"
+                        }
+                    },
+                    "required": ["subagent", "prompt"]
+                }),
+            }
+        }
         _ => return None,
     };
     Some(definition)
@@ -462,7 +497,7 @@ mod schema_tests {
             "web_search",
             "web_fetch",
         ] {
-            let definition = model_tool_definition(name).expect("a definition");
+            let definition = model_tool_definition(name, &[]).expect("a definition");
             let parameters = &definition.parameters;
             let properties = parameters["properties"].as_object().expect("properties");
             let required: Vec<&str> = parameters["required"]

@@ -1710,6 +1710,7 @@ mod tests {
             context_files: Vec::new(),
             extensions: Vec::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             prompt_templates: Vec::new(),
             themes: Vec::new(),
             diagnostics: Vec::new(),

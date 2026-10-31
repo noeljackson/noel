@@ -39,6 +39,65 @@ pub(crate) fn auto_compaction_enabled(config: &LoadedConfig) -> bool {
         .unwrap_or(true)
 }
 
+/// Sets the factory a subagent's `model` frontmatter builds its provider
+/// with: the same construction `provider_for_runtime` does, for the named
+/// model, with the config's defaults and the failover of that provider.
+pub(crate) fn install_subagent_provider_factory(
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    offline: bool,
+) {
+    let config = config.clone();
+    let offline = offline.to_string();
+    runtime.set_subagent_provider_factory(Arc::new(move |model: &ModelRef| {
+        let config = config.clone();
+        let model = model.clone();
+        let offline = offline.clone();
+        Box::pin(async move {
+            if offline == "true" && model.provider != "faux" {
+                return Err(format!(
+                    "offline mode only allows local faux models; the subagent's model is {}/{}",
+                    model.provider, model.id
+                ));
+            }
+            let Some(definition) = model_definition(&config, &model) else {
+                return Err(format!(
+                    "the subagent's model is not in models config: {}/{}",
+                    model.provider, model.id
+                ));
+            };
+            let thinking_level = definition
+                .reasoning()
+                .then(|| configured_thinking_level(&config, &model).to_string());
+            let provider = FreshAuthProvider {
+                config: ProviderConfig {
+                    thinking_budget_tokens: thinking_budget_tokens(
+                        &config,
+                        thinking_level.as_deref(),
+                    ),
+                    thinking_level,
+                    model: definition.model_ref(),
+                    api: AiProviderApi::from(&definition.api),
+                    base_url: definition.base_url.clone(),
+                    auth: ProviderAuth::None,
+                    session_id: None,
+                    traits: definition.traits(),
+                },
+                client: noel_ai::provider_http_client(),
+                refresh_client: reqwest::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new()),
+                auth_path: config.paths.auth_path.clone(),
+                auth: config.auth.clone(),
+                account: None,
+                failover: failover_for_model(&config, &model.provider),
+            };
+            Ok(Box::new(provider) as Box<dyn noel_ai::Provider>)
+        })
+    }));
+}
+
 pub(crate) async fn provider_for_runtime(
     runtime: &Runtime,
     config: &LoadedConfig,
@@ -136,6 +195,23 @@ pub(crate) fn failover_for(
     if !failover_enabled_for(config, provider) || runtime.session().active_account.is_some() {
         return None;
     }
+    failover_pool_settings(config, provider, settings)
+}
+
+/// The pool settings of a subagent's provider, which pins no account.
+fn failover_for_model(config: &LoadedConfig, provider: &str) -> Option<FailoverPoolSettings> {
+    let settings = config.settings.failover.as_ref();
+    if !failover_enabled_for(config, provider) {
+        return None;
+    }
+    failover_pool_settings(config, provider, settings)
+}
+
+fn failover_pool_settings(
+    config: &LoadedConfig,
+    provider: &str,
+    settings: Option<&noel_config::FailoverSettings>,
+) -> Option<FailoverPoolSettings> {
     let provider_settings = settings
         .and_then(|settings| settings.providers.get(provider))
         .cloned()

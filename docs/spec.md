@@ -318,6 +318,41 @@ Where the TUI differs from upstream pi's in-process TUI is in the non-parity reg
 
 **Built:** one session controller (`crates/noel-core/src/controller.rs`) drives runs. It owns, for one open session, the active run with its cancellation and retry backoff, the queue, submissions (§3.1), withdraw (§3.2), abort with a policy per caller (§3.3), resuming an interrupted run, compaction, and changes to the model and thinking level, which wait for no run to be active. It reports what happens as events, in order. RPC mode (`crates/noel-cli/src/rpc.rs`) is a thin adapter over it: commands in, records out, with abort keeping the queue; the Mode 2 worker (`crates/noel-cli/src/server/worker.rs`) is the second caller, with abort withdrawing the queue. The TUI (§7.4) goes through the worker's controller for every session.
 
+### 9.1 Subagents
+
+**Decided (2026-10-31):** noel's own feature (upstream has none), shaped after
+Claude Code's.
+
+- **Definitions:** a Markdown file with frontmatter — `description` (required,
+ how the model chooses), optional `tools` (a comma list of noel tool names;
+ omitted gives the parent's active tools), optional `model` (`provider/id`,
+ built through a provider factory each mode installs), optional `thinking` —
+ and a body that is the subagent's system prompt. They load from the
+ project's `agents/` config directory, then the user's, the first of a name
+ winning, as skills load; `/reload` reloads them.
+- **The `task` tool:** offered to the model only when a definition is loaded;
+ its description names the loaded agents. Its arguments are `subagent`,
+ `description` (shown in the UI) and `prompt`. The subagent does not see the
+ parent's conversation: its prompt must carry what it needs.
+- **The run:** the child runs its own provider rounds in the parent's process,
+ with its own session state (not journaled separately; the tool event is the
+ record), the parent's systems (extension tools, retry, compaction, progress)
+ and its scoped tools. The parent receives only the child's final reply, as
+ the tool's result.
+- **No nesting:** a definition whose `tools` list the `task` tool is refused,
+ and the default scope excludes it.
+- **Refusals like Claude's:** a definition whose tools resolve to nothing is
+ refused with the offending names; an unknown subagent names the loaded ones.
+- **Abort:** the parent's cancellation ends the child (the call's future is
+ dropped); the parent saves its interrupted result, as for any tool.
+- **Out of scope (for now):** parallel fan-out beyond the model's own
+ concurrent tool calls, background subagents, and subagent-to-subagent
+ messaging.
+
+**Built:** `crates/noel-core/src/subagents.rs`, loader in
+`crates/noel-config/src/agents.rs`, TUI label `● Used Task counter(Count
+files)` with the child's reply as the tool output (ctrl+o expands).
+
 ## 10. Workspaces
 
 **Decided (2026-10-14):** workspaces match upstream.

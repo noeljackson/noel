@@ -227,6 +227,7 @@ async fn start(args: WorkerArgs) -> Result<i32, Fatal> {
     // A session in a workspace on another machine opens it at its first
     // tool call; one that cannot be opened fails those calls, saying why.
     crate::workspace::install(&mut runtime, &config.paths.agent_dir, true);
+    crate::install_subagent_provider_factory(&mut runtime, &config, offline);
     crate::select_initial_model(&mut runtime, &config, &selection, offline)?;
     if !runtime.session().disabled_tools.is_empty() {
         runtime.set_disabled_tools(BTreeSet::new())?;
