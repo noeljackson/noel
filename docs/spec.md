@@ -397,6 +397,43 @@ noel's journal. `/undo` is the rewind to the last prompt.
   `crates/noel-cli/src/rewind_commands.rs` (the picker, the choice,
   `/rewind`, `/undo`).
 
+### 9.3 Session goals
+
+**Decided (2026-10-31, revised 2026-11-12):** Claude Code's `/goal`, in
+noel's journal, run by the session's worker.
+
+- **`/goal <condition>`** sets the session's goal — a condition a separate
+  check can verify from the conversation ("all tests in `test/auth`
+  pass"), at most one active; a new one replaces it. Bare `/goal` shows it
+  with its turn count and last evaluation; `/goal clear` stops early. The
+  goal is journaled (`goal`, `goal_cleared`), so a resumed session keeps
+  working toward it.
+- **The evaluator:** after each turn settles, one provider request over
+  the session's transcript — the session's model, **no tools**, a strict
+  first-line `MET`/`NOT MET` answer plus one sentence why. An answer that
+  fails or does not parse changes nothing: the goal stays and the next
+  settle tries again (a flaky evaluator must neither stop the work nor
+  confirm a goal the work did not meet).
+- **The loop:** the worker runs it, so it goes on with no client
+  attached. A goal set on a session with no prompt yet starts the work
+  with the goal as the prompt; otherwise the evaluator reads what is
+  there. `NOT MET` submits a continuation prompt (the condition, the why,
+  an instruction to keep working) and runs it; `MET` clears the goal.
+  Each step is a note in `noel.notices`. A command that arrives while the
+  evaluator is asked goes first and the evaluator is asked again after
+  it. Interrupting the goal's turn, or the evaluator, pauses the goal, as
+  does a run that fails: the goal stays, and the next prompt's turn is
+  judged again. A turn cap ([`GOAL_MAX_TURNS`], 20) clears a wrong or
+  never-satisfiable condition instead of looping. `/goal` is refused
+  while a run is active, like any command.
+- **Out of scope (for now):** the model-proposed goal dialog (Claude's
+  `ProposeGoal` with one-keypress approval); a typed `/goal` covers the
+  core.
+
+**Built:** `crates/noel-core/src/goals.rs`, `Runtime::set_goal`/
+  `clear_goal`/`advance_goal`, `/goal` in `session_commands.rs`, and the
+  loop (`goal_step`) in `crates/noel-cli/src/server/worker.rs`.
+
 ### 9.5 Hooks
 
 **Decided (2026-10-31):** Claude Code's tool hooks, as plain settings —

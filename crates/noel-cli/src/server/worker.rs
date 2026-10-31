@@ -855,14 +855,32 @@ async fn drive(
         }
         early.push_back(command);
     }
+    // Whether the goal's evaluator is owed a look at the turn that just
+    // settled (spec §9.3). What the user sent meanwhile goes first.
+    let mut goal_due = false;
     loop {
         let command = match early.pop_front() {
             Some(command) => command,
+            None if goal_due => {
+                goal_due = false;
+                match goal_step(&mut controller, &mut inbox, &mut early).await {
+                    GoalStep::Continue(start) => {
+                        if !run_session(&mut controller, *start, &mut inbox).await {
+                            return;
+                        }
+                        goal_due = goal_follows(&mut controller);
+                    }
+                    GoalStep::Preempted => goal_due = true,
+                    GoalStep::Done => {}
+                }
+                continue;
+            }
             None => match inbox.recv().await {
                 Some(command) => command,
                 None => break,
             },
         };
+        let goal = controller.runtime().session().goal.clone();
         let status = controller.host().status.clone();
         status.update(|status| status.slot = Slot::Working);
         let start = idle_command_aborting(&mut controller, command, &mut inbox, &mut early).await;
@@ -882,6 +900,168 @@ async fn drive(
             if !finished {
                 return;
             }
+            goal_due = goal_follows(&mut controller);
+        } else {
+            // A goal just set starts its work; one just cleared owes
+            // nothing.
+            let now = controller.runtime().session().goal.clone();
+            goal_due = match (&goal, &now) {
+                (_, None) => false,
+                (Some(before), Some(now)) if before.condition == now.condition => goal_due,
+                (_, Some(_)) => true,
+            };
+        }
+    }
+}
+
+/// What the goal's evaluator decided for the turn that settled.
+enum GoalStep {
+    /// Not met: the continuation's run.
+    Continue(Box<Start>),
+    /// A command arrived first; the evaluator is asked again after it.
+    Preempted,
+    /// Met, cleared, paused, or the evaluator could not be asked.
+    Done,
+}
+
+/// Whether the run that just settled is one the goal's evaluator judges:
+/// a goal is set and the run completed. A run the user interrupted, or
+/// that failed, pauses the goal with a note.
+fn goal_follows(controller: &mut SessionController<WorkerHost>) -> bool {
+    let session = controller.runtime().session();
+    if session.goal.is_none() {
+        return false;
+    }
+    let paused = match session.runs.last().map(|run| run.status) {
+        Some(RunStatus::Completed) => return true,
+        Some(RunStatus::Aborted) => "goal paused: send a prompt to go on, or /goal clear to stop",
+        _ => "goal paused: the run did not finish; send a prompt to go on, or /goal clear to stop",
+    };
+    goal_note(controller, paused.to_owned());
+    false
+}
+
+fn goal_note(controller: &mut SessionController<WorkerHost>, note: String) {
+    lock(&controller.host().view).notice(note);
+    refresh(controller);
+}
+
+/// The goal's turn after a settled run (spec §9.3): a new goal starts its
+/// work; otherwise the evaluator reads the conversation, and the goal is
+/// cleared when met or past its turn cap, or the work goes on. A command
+/// that arrives while the evaluator is asked goes first, and an abort
+/// pauses the goal. An evaluator that fails or answers unparseably leaves
+/// the goal for the next turn to settle.
+async fn goal_step(
+    controller: &mut SessionController<WorkerHost>,
+    inbox: &mut mpsc::UnboundedReceiver<Command>,
+    early: &mut std::collections::VecDeque<Command>,
+) -> GoalStep {
+    let Some(goal) = controller.runtime().session().goal.clone() else {
+        return GoalStep::Done;
+    };
+    let unfinished = controller.runtime().session().has_unfinished_turn();
+    let asked = controller
+        .runtime()
+        .session()
+        .messages
+        .iter()
+        .any(|message| message.role == noel_core::MessageRole::User);
+    let prompt = if !asked {
+        // Nothing to judge yet: the goal itself is the first prompt.
+        noel_core::kickoff_prompt(&goal)
+    } else if unfinished {
+        return GoalStep::Done;
+    } else {
+        if goal.turns >= noel_core::GOAL_MAX_TURNS {
+            let cleared = controller
+                .configure(|runtime, _| runtime.clear_goal(Some("turn cap reached".to_owned())));
+            let note = match cleared {
+                Ok(()) => format!(
+                    "goal cleared: {} turns ran without the condition being met; /goal <condition> to set another",
+                    noel_core::GOAL_MAX_TURNS
+                ),
+                Err(error) => format!("goal: {error}"),
+            };
+            goal_note(controller, note);
+            return GoalStep::Done;
+        }
+        let status = controller.host().status.clone();
+        status.update(|status| status.slot = Slot::Working);
+        let provider = {
+            let (runtime, host) = controller.parts_mut();
+            host.provider(runtime).await
+        };
+        let provider = match provider {
+            Ok(provider) => provider,
+            Err(error) => {
+                status.update(|status| status.slot = Slot::Idle);
+                goal_note(controller, format!("goal evaluator: {error}"));
+                return GoalStep::Done;
+            }
+        };
+        let verdict = {
+            let (runtime, _) = controller.parts_mut();
+            tokio::select! {
+                verdict = noel_core::evaluate_goal(runtime, provider.as_ref(), &goal) => Ok(verdict),
+                Some(next) = inbox.recv() => Err(next),
+            }
+        };
+        status.update(|status| status.slot = Slot::Idle);
+        match verdict {
+            Err(Command::Abort(_, reply)) => {
+                let _ = reply.send(Ok(json!({"withdrawn": 0})));
+                goal_note(
+                    controller,
+                    "goal paused: send a prompt to go on, or /goal clear to stop".to_owned(),
+                );
+                return GoalStep::Done;
+            }
+            Err(next) => {
+                early.push_back(next);
+                return GoalStep::Preempted;
+            }
+            Ok(Some(noel_core::GoalVerdict::Met)) => {
+                let cleared = controller
+                    .configure(|runtime, _| runtime.clear_goal(Some("condition met".to_owned())));
+                let note = match cleared {
+                    Ok(()) => format!("goal met: {}", goal.condition),
+                    Err(error) => format!("goal: {error}"),
+                };
+                goal_note(controller, note);
+                return GoalStep::Done;
+            }
+            Ok(Some(noel_core::GoalVerdict::NotMet { why })) => {
+                if let Err(error) = controller.configure(|runtime, _| runtime.advance_goal(&why)) {
+                    goal_note(controller, format!("goal: {error}"));
+                    return GoalStep::Done;
+                }
+                goal_note(controller, format!("goal not met: {why}"));
+                noel_core::continuation_prompt(&goal, &why)
+            }
+            Ok(None) => {
+                goal_note(
+                    controller,
+                    "goal evaluator did not answer; it is asked again after the next turn"
+                        .to_owned(),
+                );
+                return GoalStep::Done;
+            }
+        }
+    };
+    let submission = Submission {
+        kind: SubmissionKind::Prompt,
+        request_id: None,
+        content: prompt,
+        images: Vec::new(),
+        expected_run_id: None,
+    };
+    match controller.submit(submission).await {
+        Ok(Submitted::Started(start)) => GoalStep::Continue(Box::new(start)),
+        Ok(Submitted::Repeated(_)) => GoalStep::Done,
+        Err(error) => {
+            goal_note(controller, format!("goal: {error:?}"));
+            GoalStep::Done
         }
     }
 }

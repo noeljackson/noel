@@ -275,6 +275,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "write a bug report for the noel developers",
     },
     CommandHelp {
+        command: "/goal [condition|clear]",
+        description: "keep working until an evaluator confirms the condition; show it, or stop early",
+    },
+    CommandHelp {
         command: "/rewind",
         description: "rewind to an earlier prompt, with or without the file changes since; restores its prompt",
     },
