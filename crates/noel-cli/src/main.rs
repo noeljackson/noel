@@ -7640,6 +7640,23 @@ fn apply_tui_selector_selection(
                 format!("switched to branch {}", item.value),
             );
         }
+        "plan-approval" => {
+            // The plan-mode turn's verdict (§9.4): approve leaves plan
+            // mode (the plan stays in context and the next prompt
+            // implements it); keep planning stays in the mode.
+            if item.value == "approve" {
+                runtime.set_plan_mode(false)?;
+                app.push(
+                    TuiEntryKind::System,
+                    "plan approved: plan mode off — prompt to implement it".to_string(),
+                );
+            } else {
+                app.push(
+                    TuiEntryKind::System,
+                    "still planning: research more, then present the plan again".to_string(),
+                );
+            }
+        }
         "rewind" => {
             // Esc-Esc's pick: restore the conversation (and files) to the
             // point before that user prompt.
@@ -8108,6 +8125,21 @@ async fn handle_tui_submission(
         }
         "/summaries" => app.push(TuiEntryKind::System, format_summaries(runtime)),
         "/undo" => undo_tui_turn(app, runtime)?,
+        "/plan" => {
+            // Toggle plan mode (spec §9.4): read-only research, then a
+            // plan the approval selector accepts.
+            let on = !runtime.session().plan_mode;
+            runtime.set_plan_mode(on)?;
+            app.push(
+                TuiEntryKind::System,
+                if on {
+                    "plan mode on: research and present a plan; edit/write are refused, bash is for inspection. The next turn's plan is offered for approval."
+                        .to_string()
+                } else {
+                    "plan mode off".to_string()
+                },
+            );
+        }
         _ if line.split_whitespace().next() == Some("/goal") => {
             // `/goal <condition>` sets one (replacing any earlier);
             // `/goal clear` stops early; bare `/goal` shows it.
@@ -8967,7 +8999,27 @@ async fn submit_tui_prompt(
     }
     app.refresh_diff_panel(runtime);
     if matches!(control, TurnControl::Completed) {
-        if let Err(error) = run_goal_loop_tui(app, surface, runtime, config, offline).await {
+        // A plan-mode turn settles into the approval selector (§9.4);
+        // an approved plan leaves plan mode, and the goal loop (if a
+        // goal is also active) runs only once planning is done.
+        if runtime.session().plan_mode {
+            let selector = Selector::new(
+                "plan",
+                vec![
+                    SelectorItem {
+                        label: "approve plan — leave plan mode and implement it".to_string(),
+                        value: "approve".to_string(),
+                        active: false,
+                    },
+                    SelectorItem {
+                        label: "keep planning".to_string(),
+                        value: "keep".to_string(),
+                        active: false,
+                    },
+                ],
+            );
+            app.selector = Some(TuiSelectorState::new("plan-approval", selector, "", None));
+        } else if let Err(error) = run_goal_loop_tui(app, surface, runtime, config, offline).await {
             app.push(TuiEntryKind::Error, error.to_string());
         }
     }
@@ -10796,6 +10848,9 @@ fn compact_status(config: &LoadedConfig, runtime: &Runtime, editor_state: &Edito
     );
     if !config.diagnostics.is_empty() {
         output.push_str(&format!(" d:{}", config.diagnostics.len()));
+    }
+    if runtime.session().plan_mode {
+        output.push_str(" plan");
     }
     output
 }

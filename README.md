@@ -1251,6 +1251,7 @@ managed with `noel config disable <extension|skill|prompt|theme> <name>` and
 - `/undo` (remove the latest conversation turn and restore its prompt; files unchanged)
 - `/rewind` (the checkpoint picker: restore conversation and code to any earlier prompt; also Esc-Esc at idle)
 - `/goal [condition|clear]` (set the session goal; show it, or stop early)
+- `/plan` (toggle plan mode: read-only research, then approve the plan)
 - `/usage` (recorded session token totals and account quotas)
 - `/login [provider]`
 - `/logout <provider>`
@@ -1350,6 +1351,16 @@ steering/follow-ups). Linux needs `wl-paste` (Wayland) or `xclip` (X11); macOS
 uses AppKit via Swift (Xcode command-line tools), and Windows uses PowerShell.
 For remote/headless sessions, `NOEL_CLIPBOARD_IMAGE_COMMAND` can supply encoded
 PNG/JPEG/GIF/WebP bytes on stdout; otherwise use `/image <path>`.
+
+### Plan mode
+
+`/plan` toggles plan mode (the footer says `plan`): the system prompt tells
+the model to research with read-only tools — `bash` for inspection only —
+and present a concrete plan, and the `edit`/`write` tools are refused
+outright, so planning cannot change files. Each plan-mode turn settles
+into an approval selector: `approve plan` leaves plan mode (the plan stays
+in context; the next prompt implements it) or `keep planning` stays in the
+mode. The mode is journaled, so a resumed session keeps it.
 
 ### Session goals
 

@@ -370,6 +370,31 @@ files)` with the child's reply as the tool output (ctrl+o expands).
 **Built:** `crates/noel-core/src/goals.rs`, `Runtime::set_goal`/
   `clear_goal`/`advance_goal`, the settle loop and `/goal` in the TUI.
 
+### 9.4 Plan mode
+
+**Decided (2026-10-31):** Claude Code's plan mode, as a journaled mode.
+
+- **`/plan`** toggles it (the footer says `plan`). In plan mode the
+  system prompt gains the rules — research with read-only tools, `bash`
+  for inspection only, present a concrete plan and do not implement —
+  and `edit`/`write` are refused outright (`Tool edit not found`, the
+  existing disabled-tool answer), so planning cannot change files.
+  Extension tools are unaffected: their own gates decide them.
+- **Approval:** a plan-mode turn settles into a selector — `approve plan
+  — leave plan mode and implement it` or `keep planning`. Approve
+  journals the mode off and the plan stays in context (the next prompt
+  implements it); keep planning stays in the mode. A goal active under
+  plan mode runs its loop only once planning is done.
+- The mode is journaled (`plan_mode` records), so a resumed session keeps
+  it; it is not part of a session export (a mode of the moment, not
+  durable identity).
+- **Out of scope (for now):** a dedicated plan-approval tool the model
+  calls (Claude's `ExitPlanMode`) — the settle selector covers the loop.
+
+**Built:** `Runtime::set_plan_mode`, the tool refusal in
+  `model_tool_enabled`, the prompt addendum, `/plan` and the approval
+  selector in the TUI.
+
 ## 10. Workspaces
 
 **Decided (2026-10-14):** workspaces match upstream.

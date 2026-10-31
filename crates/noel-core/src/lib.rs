@@ -7,6 +7,8 @@ pub mod extensions;
 mod goal_tests;
 mod goals;
 mod input;
+#[cfg(test)]
+mod plan_tests;
 mod progress;
 #[cfg(test)]
 mod recovery_tests;
@@ -364,6 +366,9 @@ pub struct SessionState {
     /// The session goal, when one is active (spec §9.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<SessionGoal>,
+    /// Plan mode (spec §9.4): research only, until a plan is approved.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub plan_mode: bool,
 }
 
 /// One file snapshot: its id, the file it holds, and what the bytes were
@@ -579,6 +584,7 @@ impl SessionState {
             snapshots: Vec::new(),
             rewinds: Vec::new(),
             goal: None,
+            plan_mode: false,
         }
     }
 }
@@ -740,6 +746,7 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         snapshots: Vec::new(),
         rewinds: Vec::new(),
         goal: None,
+        plan_mode: false,
     }
 }
 
@@ -1271,6 +1278,10 @@ enum SessionRecord {
         #[serde(default, skip_serializing_if = "is_false")]
         append: bool,
     },
+    /// Plan mode entered or left (spec §9.4).
+    PlanMode {
+        on: bool,
+    },
     /// The session goal set (spec §9.3); replaces any earlier one.
     Goal {
         goal: SessionGoal,
@@ -1671,6 +1682,10 @@ impl SessionStore {
 
     pub fn record_goal(&self, goal: SessionGoal) -> Result<(), SessionError> {
         self.append(&SessionRecord::Goal { goal })
+    }
+
+    pub fn record_plan_mode(&self, on: bool) -> Result<(), SessionError> {
+        self.append(&SessionRecord::PlanMode { on })
     }
 
     pub fn record_goal_cleared(&self, reason: Option<String>) -> Result<(), SessionError> {
@@ -2205,6 +2220,7 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             state.messages = messages;
         }
         SessionRecord::Tool { event } => state.tool_history.push(event),
+        SessionRecord::PlanMode { on } => state.plan_mode = on,
         SessionRecord::Goal { goal } => state.goal = Some(goal),
         SessionRecord::GoalCleared { .. } => state.goal = None,
         SessionRecord::FileSnapshot {
@@ -3301,6 +3317,16 @@ impl Runtime {
         }
         self.session.disabled_tools = tools;
         self.session.active_tool_names = active_tools_with(&self.session.disabled_tools);
+        Ok(())
+    }
+
+    /// Enters or leaves plan mode (spec §9.4), journaled so a resumed
+    /// session keeps the mode.
+    pub fn set_plan_mode(&mut self, on: bool) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_plan_mode(on)?;
+        }
+        self.session.plan_mode = on;
         Ok(())
     }
 
@@ -4845,11 +4871,28 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// The system prompt for the session as it is now: its tools, prompt
 /// sources, context files, and working directory.
 fn runtime_system_prompt(runtime: &Runtime) -> String {
+    // Plan mode (spec §9.4) adds its rules as an addendum: research and
+    // present a plan; the mutating tools are refused anyway, and the
+    // instruction keeps `bash` read-only.
+    let plan_addendum = if runtime.session.plan_mode {
+        "\n\nYou are in plan mode. Research the codebase with read-only \
+             tools (bash is for inspection only: no file changes, installs, \
+             or side effects) and present a concrete plan: the steps, the \
+             files each touches, and the risks. Do not present a plan until \
+             you understand the problem; do not start implementing."
+            .to_string()
+    } else {
+        String::new()
+    };
     let Some(workspace) = &runtime.session.workspace else {
         return system_prompt::build_system_prompt(&SystemPromptInput {
             custom_prompt: runtime.systems.system_prompt.as_deref(),
             tools: &prompt_tools(runtime),
-            append_system_prompt: &runtime.systems.append_system_prompt.join("\n\n"),
+            append_system_prompt: &format!(
+                "{}{}",
+                runtime.systems.append_system_prompt.join("\n\n"),
+                plan_addendum
+            ),
             context_files: &runtime.systems.context_files,
             skills: &runtime.systems.skills,
             cwd: &runtime.session.cwd,
@@ -4869,7 +4912,11 @@ fn runtime_system_prompt(runtime: &Runtime) -> String {
     system_prompt::build_system_prompt(&SystemPromptInput {
         custom_prompt: runtime.systems.system_prompt.as_deref(),
         tools: &prompt_tools(runtime),
-        append_system_prompt: &runtime.systems.append_system_prompt.join("\n\n"),
+        append_system_prompt: &format!(
+            "{}{}",
+            runtime.systems.append_system_prompt.join("\n\n"),
+            plan_addendum
+        ),
         context_files: &context_files,
         skills: &[],
         cwd: Path::new(&workspace.cwd),
@@ -5083,11 +5130,21 @@ fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
     definitions
 }
 
+/// `model_tool_enabled` for tests of plan mode's tool blocking.
+#[cfg(test)]
+pub(crate) fn model_tool_enabled_for_tests(runtime: &Runtime, name: &str) -> bool {
+    model_tool_enabled(runtime, name)
+}
+
 fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
     (runtime.session.active_tool_names.contains(name)
         || runtime.systems.extension_tools.contains_key(name))
         && !runtime.session.disabled_tools.contains(name)
         && !(runtime.systems.offline && matches!(name, "web_search" | "web_fetch"))
+        // Plan mode (spec §9.4): research only, so the tools that change
+        // files never run; `bash` stays (the system prompt says read-only)
+        // and every read tool stays.
+        && !(runtime.session.plan_mode && matches!(name, "edit" | "write"))
         && ((runtime.systems.available_tool_names.is_empty()
             && !runtime.systems.tool_scope_configured)
             || runtime.systems.available_tool_names.contains(name))
