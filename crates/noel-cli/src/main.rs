@@ -7431,6 +7431,8 @@ fn apply_turn_event(
             );
         }
         TurnEvent::TodosUpdated(todos) => app.todos = todos.clone(),
+        // A user hook's notice (spec §9.5): a system line, nothing else.
+        TurnEvent::Notice(text) => app.push(TuiEntryKind::System, text.clone()),
         TurnEvent::ToolFinished { .. } => {
             *activity = Activity::Waiting;
         }

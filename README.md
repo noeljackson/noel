@@ -1352,6 +1352,33 @@ uses AppKit via Swift (Xcode command-line tools), and Windows uses PowerShell.
 For remote/headless sessions, `NOEL_CLIPBOARD_IMAGE_COMMAND` can supply encoded
 PNG/JPEG/GIF/WebP bytes on stdout; otherwise use `/image <path>`.
 
+### Hooks
+
+`hooks` in the settings names shell commands that run around tool calls —
+plain settings, no host program:
+
+```json
+{
+  "hooks": {
+    "preToolUse": [
+      {"matcher": "edit|write", "command": "echo 'not today' >&2; exit 2"}
+    ],
+    "postToolUse": [
+      {"matcher": "bash", "command": "date >> ~/noel-tool.log"}
+    ]
+  }
+}
+```
+
+`matcher` is a `|`-separated list of tool names; empty matches every tool.
+A hook runs in the session's cwd with its shell, one JSON object on stdin
+(`tool`, `arguments`, `matcher`, `cwd`, `sessionId`) and `NOEL_SESSION_ID`/
+`NOEL_TOOL` in its environment. A **pre**-hook that exits 2 blocks the
+call, its stderr the reason the model sees; any other exit allows, a
+non-zero one adding a notice. A **post**-hook runs after the result is
+saved; its output is ignored, a non-zero exit is a notice. A hook that
+cannot run at all blocks, fail-closed. Hooks reload with `/reload`.
+
 ### Plan mode
 
 `/plan` toggles plan mode (the footer says `plan`): the system prompt tells

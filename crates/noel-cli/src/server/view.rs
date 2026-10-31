@@ -358,6 +358,14 @@ impl View {
                 true
             }
             TurnEvent::RoundResumed(_) => false,
+            // A user hook's notice: a system entry, nothing else changes.
+            TurnEvent::Notice(text) => {
+                self.push_entry(serde_json::json!({
+                    "kind": "system",
+                    "text": text,
+                }));
+                true
+            }
             TurnEvent::MessageAdded(message) => {
                 let entry = to_json(&Message::saved(message, &self.empty));
                 if self.skip_prompt.take().as_ref() == Some(&entry)
