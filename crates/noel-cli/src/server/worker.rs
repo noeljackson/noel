@@ -929,7 +929,9 @@ enum GoalStep {
 /// that failed, pauses the goal with a note.
 fn goal_follows(controller: &mut SessionController<WorkerHost>) -> bool {
     let session = controller.runtime().session();
-    if session.goal.is_none() {
+    // A plan comes first (spec §9.4): the goal's turns start once it is
+    // approved.
+    if session.goal.is_none() || session.plan_mode {
         return false;
     }
     let paused = match session.runs.last().map(|run| run.status) {
@@ -960,6 +962,10 @@ async fn goal_step(
     let Some(goal) = controller.runtime().session().goal.clone() else {
         return GoalStep::Done;
     };
+    // A plan comes first: the goal's turns start once it is approved.
+    if controller.runtime().session().plan_mode {
+        return GoalStep::Done;
+    }
     let unfinished = controller.runtime().session().has_unfinished_turn();
     let asked = controller
         .runtime()

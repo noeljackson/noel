@@ -54,6 +54,7 @@
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
 - `/undo` (undo the last turn and its file changes; its prompt goes back to the draft)
 - `/rewind` (the checkpoint picker: go back to any earlier prompt, with or without the file changes since; also Esc-Esc at an empty draft)
+- `/plan` (toggle plan mode: read-only research, then approve the plan to have it implemented)
 - `/goal [condition|clear]` (set the session goal and start on it; show it, or stop early)
 - `/usage` (recorded session token totals and account quotas)
 - `/login [provider]`
@@ -177,6 +178,15 @@ tool audit history, queued messages, runs, or token usage, and a rewind does
 not reach past a compaction. The journal stays append-only: a restart loads
 the rewound state while nothing is erased from the file, and the history a
 client shows keeps the dropped entries above a `reset to N messages` line.
+
+`/plan` toggles plan mode (the footer says `plan`): the system prompt tells
+the model to research with read-only tools, `bash` for inspection only, and
+present a concrete plan, and the `edit`/`write` tools are refused outright,
+so planning cannot change files. When a plan-mode turn settles, a choice
+opens: `approve the plan and implement it` leaves plan mode and starts the
+implementation; `keep planning`, or Esc, stays in the mode. The mode is
+journaled, so a restarted session keeps it, and a goal set under it waits
+for the plan to be approved.
 
 `/goal <condition>` sets a goal that keeps the session working until a
 separate evaluator confirms it is met: a condition verifiable from the

@@ -661,6 +661,9 @@ struct Remote {
     /// When the last bare Esc landed at an empty draft, for Esc-Esc's
     /// rewind picker (spec §9.2).
     last_idle_esc: Option<Instant>,
+    /// The run last seen started or active, until the view names it as
+    /// ended: a plan-mode turn's end offers its plan for approval.
+    watched_run: Option<String>,
     session: String,
     client: Client,
     sender: mpsc::UnboundedSender<Incoming>,
@@ -719,6 +722,7 @@ impl Remote {
             withdrawing: Vec::new(),
             last_run: None,
             last_idle_esc: None,
+            watched_run: None,
             waiting: None,
             switch_to: None,
             diff_lines: std::collections::HashMap::new(),
@@ -934,6 +938,31 @@ impl Remote {
         let last_run = self.last_run.as_ref().map(|(run_id, _)| run_id.as_str());
         let run = std::mem::replace(&mut self.run, RunView::Idle);
         self.run = run.advance(live["run"]["runId"].as_str(), tools, last_run);
+        // A plan-mode turn that completed settles into the choice to
+        // approve its plan or keep planning (spec §9.4). The run is
+        // remembered while it is started or shown, and judged once the
+        // view names it as the last run: a short one may never show.
+        match &self.run {
+            RunView::Starting { run_id, .. } | RunView::Running { run_id, .. } => {
+                self.watched_run = Some(run_id.clone());
+            }
+            RunView::Idle => {
+                let ended = self::last_run(&self.view)
+                    .filter(|(run_id, _)| self.watched_run.as_deref() == Some(run_id.as_str()));
+                if let Some((_, status)) = ended {
+                    self.watched_run = None;
+                    if status == "completed"
+                        && docs["pi.agent"]["planMode"] == true
+                        && app.queued_messages.is_empty()
+                        && matches!(app.overlay, crate::Overlay::None)
+                    {
+                        app.overlay = crate::Overlay::Selector(
+                            crate::session_commands::plan_approval_selector(),
+                        );
+                    }
+                }
+            }
+        }
         app.turn_running = matches!(self.run, RunView::Running { .. });
         app.turn_saw_tools = matches!(
             self.run,
@@ -968,6 +997,9 @@ impl Remote {
                 config.settings.theme.as_deref().unwrap_or("system"),
                 app.editor_state.history().len()
             );
+            if agent["planMode"] == true {
+                status.push_str(" · plan");
+            }
             if let Some((_, last)) = &self.last_run
                 && matches!(last.as_str(), "aborted" | "failed" | "interrupted")
             {

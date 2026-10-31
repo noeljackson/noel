@@ -158,6 +158,7 @@ pub(crate) fn apply_session_record(state: &mut Option<SessionState>, record: Ses
         SessionRecord::Tool { event } => state.tool_history.push(event),
         SessionRecord::Goal { goal } => state.goal = Some(goal),
         SessionRecord::GoalCleared { .. } => state.goal = None,
+        SessionRecord::PlanMode { on } => state.plan_mode = on,
         SessionRecord::ActiveModel { model } => state.active_model = model,
         SessionRecord::ActiveAccount { account } => state.active_account = account,
         SessionRecord::ActiveThinkingLevel { level } => state.active_thinking_level = level,
