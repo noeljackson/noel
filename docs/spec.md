@@ -342,6 +342,34 @@ files)` with the child's reply as the tool output (ctrl+o expands).
   `rewound` and `file_snapshot` records, the picker and `/rewind` in the
   TUI.
 
+### 9.3 Session goals
+
+**Decided (2026-10-31):** Claude Code's `/goal`, in noel's journal.
+
+- **`/goal <condition>`** sets the session's goal — a condition a separate
+  check can verify from the conversation ("all tests in `test/auth`
+  pass"), at most one active; a new one replaces it. Bare `/goal` shows it
+  with its turn count and last evaluation; `/goal clear` stops early. The
+  goal is journaled (`goal`, `goal_cleared`), so a resumed session keeps
+  working toward it.
+- **The evaluator:** after each turn settles, one provider request over
+  the session's transcript — the session's model, **no tools**, a strict
+  first-line `MET`/`NOT MET` answer plus one sentence why. An answer that
+  fails or does not parse changes nothing: the goal stays and the next
+  settle tries again (a flaky evaluator must neither stop the work nor
+  confirm a goal the work did not meet).
+- **The loop:** `NOT MET` queues a continuation prompt (the condition, the
+  why, an instruction to keep working) and runs it; `MET` clears the goal
+  with a notice. Interrupting the goal's turn pauses it: the goal stays,
+  the work waits for the next prompt. A turn cap ([`GOAL_MAX_TURNS`], 20)
+  clears a wrong or never-satisfiable condition instead of looping.
+- **Out of scope (for now):** the model-proposed goal dialog (Claude's
+  `ProposeGoal` with one-keypress approval); a typed `/goal` covers the
+  core.
+
+**Built:** `crates/noel-core/src/goals.rs`, `Runtime::set_goal`/
+  `clear_goal`/`advance_goal`, the settle loop and `/goal` in the TUI.
+
 ## 10. Workspaces
 
 **Decided (2026-10-14):** workspaces match upstream.

@@ -1250,6 +1250,7 @@ managed with `noel config disable <extension|skill|prompt|theme> <name>` and
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
 - `/undo` (remove the latest conversation turn and restore its prompt; files unchanged)
 - `/rewind` (the checkpoint picker: restore conversation and code to any earlier prompt; also Esc-Esc at idle)
+- `/goal [condition|clear]` (set the session goal; show it, or stop early)
 - `/usage` (recorded session token totals and account quotas)
 - `/login [provider]`
 - `/logout <provider>`
@@ -1349,6 +1350,21 @@ steering/follow-ups). Linux needs `wl-paste` (Wayland) or `xclip` (X11); macOS
 uses AppKit via Swift (Xcode command-line tools), and Windows uses PowerShell.
 For remote/headless sessions, `NOEL_CLIPBOARD_IMAGE_COMMAND` can supply encoded
 PNG/JPEG/GIF/WebP bytes on stdout; otherwise use `/image <path>`.
+
+### Session goals
+
+`/goal <condition>` sets a goal that keeps the session working until a
+separate evaluator confirms it is met — a condition verifiable from the
+conversation alone ("all tests in `test/auth` pass", "every call site
+migrated"), since the evaluator reads the transcript and cannot run
+commands. After each turn settles, one no-tools request to the session's
+model answers `MET` or `NOT MET` with a sentence why; not met queues and
+runs a continuation automatically, met clears the goal with a notice.
+Interrupting the goal's turn pauses it (the goal stays; `/goal clear`
+stops early; the next prompt resumes), and 20 turns without a met
+condition clears it instead of looping. Bare `/goal` shows the condition,
+its turn count, and the last evaluation. Goals are journaled, so a
+resumed session keeps working toward one.
 
 `/undo` changes only conversation context and restores the prompt, including
 images. It does **not** revert file edits, shell effects, tool audit history,

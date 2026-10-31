@@ -74,12 +74,13 @@ use noel_config::{
     DEFAULT_ACCOUNT_NAME, ENV_SESSION_DIR, MODEL_CACHE_VERSION,
 };
 use noel_core::{
-    continue_turn_streaming_events, default_active_tool_names, expand_input, format_todo_list,
-    run_excluded_bash_result, run_user_turn, run_user_turn_streaming_events_with_media,
-    run_user_turn_streaming_with_media, write_session_export, AgentError, CompactionKind,
-    ConversationMessage, FollowUpQueue, MessageRole, ReloadReport, ReloadableSystems, RunControl,
-    Runtime, SessionError, SessionState, SessionStore, SessionWorkspace, SteeringMailbox, TodoItem,
-    TodoStatus, TurnEvent, PRODUCT_NAME, STEERING_JOIN,
+    continuation_prompt, continue_turn_streaming_events, default_active_tool_names, evaluate_goal,
+    expand_input, format_todo_list, run_excluded_bash_result, run_user_turn,
+    run_user_turn_streaming_events_with_media, run_user_turn_streaming_with_media,
+    write_session_export, AgentError, CompactionKind, ConversationMessage, FollowUpQueue,
+    GoalVerdict, MessageRole, ReloadReport, ReloadableSystems, RunControl, Runtime, SessionError,
+    SessionState, SessionStore, SessionWorkspace, SteeringMailbox, TodoItem, TodoStatus, TurnEvent,
+    GOAL_MAX_TURNS, PRODUCT_NAME, STEERING_JOIN,
 };
 use noel_tui::{
     parse_theme_color, EditorState, Keybinding as TuiKeybinding, KeybindingMap, Selector,
@@ -8107,6 +8108,48 @@ async fn handle_tui_submission(
         }
         "/summaries" => app.push(TuiEntryKind::System, format_summaries(runtime)),
         "/undo" => undo_tui_turn(app, runtime)?,
+        _ if line.split_whitespace().next() == Some("/goal") => {
+            // `/goal <condition>` sets one (replacing any earlier);
+            // `/goal clear` stops early; bare `/goal` shows it.
+            let rest = line.trim_start_matches("/goal").trim();
+            if rest == "clear" {
+                if runtime.session().goal.is_some() {
+                    runtime.clear_goal(None)?;
+                    app.push(TuiEntryKind::System, "goal cleared".to_string());
+                } else {
+                    app.push(TuiEntryKind::System, "no goal is set".to_string());
+                }
+            } else if rest.is_empty() {
+                match &runtime.session().goal {
+                    Some(goal) => app.push(
+                        TuiEntryKind::System,
+                        format!(
+                            "goal ({} turn{}): {}{}",
+                            goal.turns,
+                            if goal.turns == 1 { "" } else { "s" },
+                            goal.condition,
+                            if goal.last_status.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\nlast: {}", goal.last_status)
+                            }
+                        ),
+                    ),
+                    None => app.push(
+                        TuiEntryKind::System,
+                        "/goal <condition> to set one; /goal clear to stop early".to_string(),
+                    ),
+                }
+            } else {
+                runtime.set_goal(rest)?;
+                app.push(
+                    TuiEntryKind::System,
+                    format!(
+                        "goal set: {rest}\nthe session keeps working until an evaluator confirms it is met; /goal clear to stop early"
+                    ),
+                );
+            }
+        }
         _ if line.split_whitespace().next() == Some("/compact") => {
             let focus = line.strip_prefix("/compact").unwrap_or_default().trim();
             if compact_tui_context(app, surface, runtime, config, focus, offline).await? {
@@ -8923,7 +8966,129 @@ async fn submit_tui_prompt(
         }
     }
     app.refresh_diff_panel(runtime);
+    if matches!(control, TurnControl::Completed) {
+        if let Err(error) = run_goal_loop_tui(app, surface, runtime, config, offline).await {
+            app.push(TuiEntryKind::Error, error.to_string());
+        }
+    }
     matches!(control, TurnControl::Quit)
+}
+
+/// After a settled turn, the session goal decides whether the work goes
+/// on (spec §9.3): an evaluator request per settle, a queued continuation
+/// while it answers NOT MET, cleared when MET or past the turn cap. An
+/// evaluator that fails or answers unparseably leaves the goal and tries
+/// again at the next settle; the user's keys still work between turns.
+#[allow(clippy::too_many_arguments)]
+async fn run_goal_loop_tui(
+    app: &mut TuiApp,
+    surface: &mut TuiSurface<'_>,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    offline: bool,
+) -> Result<()> {
+    while runtime.session().goal.is_some() {
+        let goal = runtime.session().goal.clone().expect("checked");
+        if goal.turns >= GOAL_MAX_TURNS {
+            runtime.clear_goal(Some("turn cap reached".to_string()))?;
+            app.push(
+                TuiEntryKind::System,
+                format!(
+                    "goal cleared: {} turns ran without the condition being met; /goal <condition> to set another",
+                    GOAL_MAX_TURNS
+                ),
+            );
+            break;
+        }
+        app.status = format!("evaluating goal · {}", truncate_center(&goal.condition, 40));
+        redraw_tui(surface.terminal, app, config)?;
+        let provider = match provider_for_runtime(runtime, config, offline).await {
+            Ok(provider) => provider,
+            Err(error) => {
+                app.push(TuiEntryKind::Error, format!("goal evaluator: {error}"));
+                break;
+            }
+        };
+        match evaluate_goal(runtime, provider.as_ref(), &goal).await {
+            Some(GoalVerdict::Met) => {
+                runtime.clear_goal(Some("condition met".to_string()))?;
+                app.push(
+                    TuiEntryKind::System,
+                    format!("goal met: {}", goal.condition),
+                );
+            }
+            Some(GoalVerdict::NotMet { why }) => {
+                runtime.advance_goal(&why)?;
+                let prompt = continuation_prompt(&goal, &why);
+                app.push(
+                    TuiEntryKind::System,
+                    format!(
+                        "goal not met · {}: {why}",
+                        truncate_center(&goal.condition, 40)
+                    ),
+                );
+                match run_prompt_once_tui(
+                    app,
+                    surface,
+                    runtime,
+                    config,
+                    prompt,
+                    Vec::new(),
+                    offline,
+                )
+                .await?
+                {
+                    TurnControl::Completed => continue,
+                    control => {
+                        if matches!(control, TurnControl::Interrupted) {
+                            // The user stopped the goal's turn; the goal
+                            // stays, the work waits for the next prompt.
+                            app.push(
+                                TuiEntryKind::System,
+                                "goal paused: /goal clear to stop, or prompt to continue"
+                                    .to_string(),
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+            None => {
+                app.push(
+                    TuiEntryKind::System,
+                    "goal evaluator did not answer; will retry after the next turn".to_string(),
+                );
+                break;
+            }
+        }
+    }
+    app.status = footer_status(config, runtime, &app.editor_state);
+    Ok(())
+}
+
+/// A one-line view of `text` for the footer: the ends with the middle
+/// ellipsized, at `width` display characters.
+fn truncate_center(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let keep = width.saturating_sub(1) / 2;
+    let head_end = text
+        .char_indices()
+        .nth(keep)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    let tail_start = text
+        .char_indices()
+        .rev()
+        .nth(keep)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    format!(
+        "{}…{}",
+        &text[..head_end],
+        &text[tail_start.min(text.len())..]
+    )
 }
 
 /// How a submitted turn ended: normally, interrupted by the user, or with a

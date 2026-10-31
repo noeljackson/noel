@@ -3,6 +3,9 @@ pub mod controller;
 #[cfg(test)]
 mod controller_tests;
 pub mod extensions;
+#[cfg(test)]
+mod goal_tests;
+mod goals;
 mod input;
 mod progress;
 #[cfg(test)]
@@ -20,6 +23,9 @@ mod tool_parity_tests;
 mod tool_tests;
 mod workspace;
 pub use compaction::RuntimeCompactionSettings;
+pub use goals::{
+    continuation_prompt, evaluate_goal, parse_verdict, GoalVerdict, SessionGoal, GOAL_MAX_TURNS,
+};
 pub use input::expand_input;
 pub use progress::{interrupted_output, RuntimeProgressSettings};
 use progress::{ReplyProgress, ToolProgress};
@@ -355,6 +361,9 @@ pub struct SessionState {
     /// (0 = the session's start), for listing checkpoints.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rewinds: Vec<usize>,
+    /// The session goal, when one is active (spec §9.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<SessionGoal>,
 }
 
 /// One file snapshot: its id, the file it holds, and what the bytes were
@@ -569,6 +578,7 @@ impl SessionState {
             workspace: None,
             snapshots: Vec::new(),
             rewinds: Vec::new(),
+            goal: None,
         }
     }
 }
@@ -729,6 +739,7 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         workspace: None,
         snapshots: Vec::new(),
         rewinds: Vec::new(),
+        goal: None,
     }
 }
 
@@ -1260,6 +1271,16 @@ enum SessionRecord {
         #[serde(default, skip_serializing_if = "is_false")]
         append: bool,
     },
+    /// The session goal set (spec §9.3); replaces any earlier one.
+    Goal {
+        goal: SessionGoal,
+    },
+    /// The session goal cleared: by the evaluator (met), by the turn cap,
+    /// or by `/goal clear`.
+    GoalCleared {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// A file snapshot saved before an `edit`/`write` changed it: the
     /// snapshot's id and where its bytes are. Rewind restores by id.
     /// Older versions ignore it.
@@ -1646,6 +1667,14 @@ impl SessionStore {
 
     pub fn record_edited_files(&self, paths: Vec<String>) -> Result<(), SessionError> {
         self.append(&SessionRecord::EditedFiles { paths })
+    }
+
+    pub fn record_goal(&self, goal: SessionGoal) -> Result<(), SessionError> {
+        self.append(&SessionRecord::Goal { goal })
+    }
+
+    pub fn record_goal_cleared(&self, reason: Option<String>) -> Result<(), SessionError> {
+        self.append(&SessionRecord::GoalCleared { reason })
     }
 
     /// Where this session's file snapshots live: `<journal>.files/`, a
@@ -2176,6 +2205,8 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             state.messages = messages;
         }
         SessionRecord::Tool { event } => state.tool_history.push(event),
+        SessionRecord::Goal { goal } => state.goal = Some(goal),
+        SessionRecord::GoalCleared { .. } => state.goal = None,
         SessionRecord::FileSnapshot {
             id,
             path,
@@ -3270,6 +3301,45 @@ impl Runtime {
         }
         self.session.disabled_tools = tools;
         self.session.active_tool_names = active_tools_with(&self.session.disabled_tools);
+        Ok(())
+    }
+
+    /// Sets the session goal (spec §9.3), replacing any earlier one, and
+    /// journals it. A goal persists across resume.
+    pub fn set_goal(&mut self, condition: impl Into<String>) -> Result<(), SessionError> {
+        let goal = SessionGoal {
+            condition: condition.into(),
+            turns: 0,
+            last_status: String::new(),
+        };
+        if let Some(store) = &self.store {
+            store.record_goal(goal.clone())?;
+        }
+        self.session.goal = Some(goal);
+        Ok(())
+    }
+
+    /// Clears the session goal, journaling why (`None` for `/goal clear`).
+    pub fn clear_goal(&mut self, reason: Option<String>) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_goal_cleared(reason)?;
+        }
+        self.session.goal = None;
+        Ok(())
+    }
+
+    /// Advances the goal after the evaluator answered: the turn count and
+    /// the evaluator's sentence, journaled so a resume shows both.
+    pub fn advance_goal(&mut self, status: &str) -> Result<(), SessionError> {
+        let Some(goal) = self.session.goal.as_mut() else {
+            return Ok(());
+        };
+        goal.turns += 1;
+        goal.last_status = status.to_string();
+        let goal = goal.clone();
+        if let Some(store) = &self.store {
+            store.record_goal(goal)?;
+        }
         Ok(())
     }
 
