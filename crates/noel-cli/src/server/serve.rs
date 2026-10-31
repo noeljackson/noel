@@ -1041,6 +1041,7 @@ impl Sessions {
             ReloadableSystems::from_config(&self.config, 1),
             store,
         );
+        crate::install_subagent_provider_factory(&mut runtime, &self.config, self.offline);
         let selection = crate::model_select::CliSelection { model, thinking };
         crate::select_initial_model(&mut runtime, &self.config, &selection, self.offline)
             .map_err(|error| failed(&error))?;

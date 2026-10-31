@@ -1,8 +1,10 @@
+mod agents;
 mod frontmatter;
 mod prompt_templates;
 mod resources;
 mod skills;
 
+pub use agents::AgentDefinition;
 pub use frontmatter::{js_trim, strip_frontmatter};
 pub use prompt_templates::{expand_prompt_template, PromptTemplate};
 pub use resources::{ResourceOptions, SourceInfo, SourceScope};
@@ -1611,6 +1613,8 @@ pub struct LoadedConfig {
     pub extensions: Vec<ResourceFile>,
     /// In the order they loaded; the first of a name won.
     pub skills: Vec<Skill>,
+    /// Subagent definitions, in load order; the first of a name won.
+    pub agents: Vec<AgentDefinition>,
     pub prompt_templates: Vec<PromptTemplate>,
     pub themes: Vec<ResourceFile>,
     pub diagnostics: Vec<String>,
@@ -1752,6 +1756,8 @@ pub fn load_config_with_resources(
             .iter()
             .map(|d| d.describe("prompt template")),
     );
+    let (agents, agent_diagnostics) = agents::load_agents(&paths);
+    diagnostics.extend(agent_diagnostics.iter().map(|d| d.describe("agent")));
     let disabled = settings.disabled_resources.as_ref();
     let enabled = |resource_type, name: &str, path: &Path| {
         !resource_disabled(disabled, resource_type, name, path)
@@ -1800,6 +1806,7 @@ pub fn load_config_with_resources(
         context_files,
         extensions,
         skills,
+        agents,
         prompt_templates,
         themes,
         diagnostics,

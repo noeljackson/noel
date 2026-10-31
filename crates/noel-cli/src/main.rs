@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod account_failover;
@@ -31,8 +32,8 @@ mod transcript_view;
 mod usage;
 mod workspace;
 use model_select::{
-    configured_model, effective_thinking_level, find_selectable_model, model_definition,
-    normalized_thinking_level, provider_usable, register_cli_model, resolve_cli,
+    configured_model, configured_thinking_level, effective_thinking_level, find_selectable_model,
+    model_definition, normalized_thinking_level, provider_usable, register_cli_model, resolve_cli,
     resolve_cli_selection, resolve_scope, select_initial_model, set_thinking_level, switch_model,
     thinking_label,
 };
@@ -1744,6 +1745,9 @@ async fn run() -> Result<()> {
     if !runtime.session().disabled_tools.is_empty() {
         runtime.set_disabled_tools(BTreeSet::new())?;
     }
+    // A subagent definition's `model` frontmatter builds its provider
+    // through this factory; the CLI knows the config and the client.
+    install_subagent_provider_factory(&mut runtime, &config, offline);
     if let Some(name) = &cli.name {
         let name = name.trim();
         if name.is_empty() {
@@ -5789,13 +5793,14 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palette: &ThemePa
             highlight,
         ));
     } else {
-        spans.push(Span::raw(if failed {
+        let verb = if failed {
             "Failed "
         } else if running {
             "Using "
         } else {
             "Used "
-        }));
+        };
+        spans.push(Span::raw(verb));
         let label = match name {
             "read" => "Read",
             "edit" => "Edit",
@@ -5804,13 +5809,18 @@ fn push_tool_lines(lines: &mut Vec<Line<'static>>, text: &str, palette: &ThemePa
             "find" => "Find",
             "ls" => "Ls",
             "todo" => "Todo",
+            "task" => "Task",
             "web_search" => "Web Search",
             "web_fetch" => "Web Fetch",
             _ => name,
         };
         spans.push(Span::styled(label.to_string(), highlight));
     }
-    if !detail.is_empty() {
+    // A subagent reads Claude's shape, `Used researcher(Count files)`,
+    // not `Used Task · researcher(...)`: the agent name is its label.
+    if name == "task" && !detail.is_empty() {
+        spans.push(Span::styled(format!(" {detail}"), highlight));
+    } else if !detail.is_empty() {
         spans.push(Span::styled(format!(" · {detail}"), palette.secondary()));
     }
     if name == "read" && !running && !output.is_empty() {
@@ -9308,6 +9318,16 @@ fn tool_call_detail(call: &noel_ai::ChatToolCall) -> String {
     if let Some(command) = args["command"].as_str() {
         return format!("$ {command}");
     }
+    // A subagent, Claude-style: `researcher(Count files here)`.
+    if call.name == "task" {
+        let subagent = args["subagent"].as_str().unwrap_or("?");
+        let description = args["description"].as_str().unwrap_or("");
+        return if description.is_empty() {
+            subagent.to_string()
+        } else {
+            format!("{subagent}({description})")
+        };
+    }
     let detail = ["path", "url", "query", "pattern"]
         .iter()
         .find_map(|key| args[*key].as_str())
@@ -9570,6 +9590,65 @@ fn auto_compaction_enabled(config: &LoadedConfig) -> bool {
         .unwrap_or(true)
 }
 
+/// Sets the factory a subagent's `model` frontmatter builds its provider
+/// with: the same construction `provider_for_runtime` does, for the named
+/// model, with the config's defaults and the failover of that provider.
+pub(crate) fn install_subagent_provider_factory(
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    offline: bool,
+) {
+    let config = config.clone();
+    let offline = offline.to_string();
+    runtime.set_subagent_provider_factory(Arc::new(move |model: &ModelRef| {
+        let config = config.clone();
+        let model = model.clone();
+        let offline = offline.clone();
+        Box::pin(async move {
+            if offline == "true" && model.provider != "faux" {
+                return Err(format!(
+                    "offline mode only allows local faux models; the subagent's model is {}/{}",
+                    model.provider, model.id
+                ));
+            }
+            let Some(definition) = model_definition(&config, &model) else {
+                return Err(format!(
+                    "the subagent's model is not in models config: {}/{}",
+                    model.provider, model.id
+                ));
+            };
+            let thinking_level = definition
+                .reasoning()
+                .then(|| configured_thinking_level(&config, &model).to_string());
+            let provider = FreshAuthProvider {
+                config: ProviderConfig {
+                    thinking_budget_tokens: thinking_budget_tokens(
+                        &config,
+                        thinking_level.as_deref(),
+                    ),
+                    thinking_level,
+                    model: definition.model_ref(),
+                    api: AiProviderApi::from(&definition.api),
+                    base_url: definition.base_url.clone(),
+                    auth: ProviderAuth::None,
+                    session_id: None,
+                    traits: definition.traits(),
+                },
+                client: noel_ai::provider_http_client(),
+                refresh_client: reqwest::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new()),
+                auth_path: config.paths.auth_path.clone(),
+                auth: config.auth.clone(),
+                account: None,
+                failover: failover_for_model(&config, &model.provider),
+            };
+            Ok(Box::new(provider) as Box<dyn noel_ai::Provider>)
+        })
+    }));
+}
+
 async fn provider_for_runtime(
     runtime: &Runtime,
     config: &LoadedConfig,
@@ -9667,6 +9746,23 @@ fn failover_for(
     if !failover_enabled_for(config, provider) || runtime.session().active_account.is_some() {
         return None;
     }
+    failover_pool_settings(config, provider, settings)
+}
+
+/// The pool settings of a subagent's provider, which pins no account.
+fn failover_for_model(config: &LoadedConfig, provider: &str) -> Option<FailoverPoolSettings> {
+    let settings = config.settings.failover.as_ref();
+    if !failover_enabled_for(config, provider) {
+        return None;
+    }
+    failover_pool_settings(config, provider, settings)
+}
+
+fn failover_pool_settings(
+    config: &LoadedConfig,
+    provider: &str,
+    settings: Option<&noel_config::FailoverSettings>,
+) -> Option<FailoverPoolSettings> {
     let provider_settings = settings
         .and_then(|settings| settings.providers.get(provider))
         .cloned()
@@ -12100,6 +12196,7 @@ mod tests {
             context_files: Vec::new(),
             extensions: vec![test_resource("json-ext")],
             skills: vec![test_skill("review", "Review code.\nCarefully.")],
+            agents: Vec::new(),
             prompt_templates: vec![test_template(
                 "fix",
                 "Fix a bug",
@@ -12550,6 +12647,7 @@ mod tests {
             context_files: Vec::new(),
             extensions: Vec::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             prompt_templates: Vec::new(),
             themes: Vec::new(),
             diagnostics: Vec::new(),
@@ -12590,6 +12688,7 @@ mod tests {
             context_files: Vec::new(),
             extensions: Vec::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             prompt_templates: Vec::new(),
             themes: Vec::new(),
             diagnostics: Vec::new(),
@@ -16176,6 +16275,7 @@ mod tests {
             context_files: Vec::new(),
             extensions: vec![test_resource("json-ext")],
             skills: Vec::new(),
+            agents: Vec::new(),
             prompt_templates: Vec::new(),
             themes: Vec::new(),
             diagnostics: Vec::new(),
@@ -16373,6 +16473,7 @@ mod tests {
             context_files: Vec::new(),
             extensions: Vec::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             prompt_templates: Vec::new(),
             themes: Vec::new(),
             diagnostics: Vec::new(),
@@ -16495,6 +16596,7 @@ mod tests {
             context_files: Vec::new(),
             extensions: Vec::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             prompt_templates: Vec::new(),
             themes: Vec::new(),
             diagnostics: Vec::new(),

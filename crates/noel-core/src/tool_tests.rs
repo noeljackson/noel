@@ -12,8 +12,8 @@ use serde_json::json;
 use crate::{
     active_tool_definitions, available_tool_names, bash_timeout_ms, execute_model_tool_call,
     extension_tools_from_resources, prompt_tools, provider_messages, runtime_system_prompt,
-    ChatToolCall, ConversationMessage, ExtensionTool, MessageRole, ReloadableSystems, ResourceFile,
-    Runtime, SessionState,
+    tests::unused_provider, ChatToolCall, ConversationMessage, ExtensionTool, MessageRole,
+    ReloadableSystems, ResourceFile, Runtime, SessionState,
 };
 
 /// A session in a new directory with one extension, `ext-tool`, whose
@@ -69,7 +69,7 @@ async fn call_tool(
         name: name.to_string(),
         arguments: arguments.to_string(),
     };
-    execute_model_tool_call(runtime, &call, &mut |_| {})
+    execute_model_tool_call(runtime, &unused_provider(), &call, &mut |_| {})
         .await
         .expect("save tool result");
     let event = runtime.session.tool_history.last().expect("tool event");
@@ -257,6 +257,7 @@ fn tool_selection_follows_default_tools_allowlist_and_exclusions() {
         "grep",
         "ls",
         "read",
+        "task",
         "todo",
         "web_fetch",
         "web_search",
@@ -298,7 +299,7 @@ fn tool_selection_follows_default_tools_allowlist_and_exclusions() {
     assert_eq!(
         selected(
             json!({ "enabledTools": ["*"] }),
-            &["web_*", "ext_echo", "todo"]
+            &["web_*", "ext_echo", "todo", "task"]
         ),
         names(&["bash", "edit", "find", "grep", "ls", "read", "write"])
     );

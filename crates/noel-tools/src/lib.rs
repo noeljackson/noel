@@ -191,6 +191,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         "find",
         "ls",
         "todo",
+        "task",
         "web_search",
         "web_fetch",
     ]

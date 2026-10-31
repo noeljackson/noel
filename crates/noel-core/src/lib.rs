@@ -8,6 +8,9 @@ mod progress;
 #[cfg(test)]
 mod recovery_tests;
 mod session_lock;
+#[cfg(test)]
+mod subagent_tests;
+mod subagents;
 mod system_prompt;
 #[cfg(test)]
 mod tool_parity_tests;
@@ -19,6 +22,7 @@ pub use input::expand_input;
 pub use progress::{interrupted_output, RuntimeProgressSettings};
 use progress::{ReplyProgress, ToolProgress};
 use session_lock::SessionLock;
+pub use subagents::{run_task_tool, SubagentEvent, TaskToolArgs};
 pub use system_prompt::PRODUCT_NAME;
 use system_prompt::{PromptTool, SystemPromptInput};
 pub use workspace::SessionWorkspace;
@@ -39,9 +43,17 @@ use noel_ai::{
     ChatMessage, ChatRole, ChatToolCall, MediaInput, ModelRef, Provider, ProviderError,
     ProviderRequest, StreamEvent, ToolDefinition as AiToolDefinition,
 };
+
+/// Builds a provider for one model, as a subagent's override asks.
+pub type SubagentProviderFactory = Arc<dyn Fn(&ModelRef) -> BoxProviderFuture + Send + Sync>;
+
+/// A boxed, shared future, as a provider factory returns.
+pub type BoxProviderFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Box<dyn Provider>, String>> + Send + 'static>,
+>;
 use noel_config::{
-    has_auth_for_provider, listed_accounts_for_provider, ContextFile, LoadedConfig, ResourceFile,
-    Skill,
+    has_auth_for_provider, listed_accounts_for_provider, AgentDefinition, ContextFile,
+    LoadedConfig, ResourceFile, Skill,
 };
 use noel_env::LocalEnvOptions;
 pub use noel_env::{ExecutionEnv, LocalEnv};
@@ -704,6 +716,8 @@ pub struct ReloadableSystems {
     pub agent_context_files: Vec<ContextFile>,
     /// The loaded skills, which the system prompt lists.
     pub skills: Vec<Skill>,
+    /// The subagent definitions, which the `task` tool offers.
+    pub agents: Vec<AgentDefinition>,
     pub available_models: Vec<ModelRef>,
     pub configured_providers: BTreeSet<String>,
     pub available_accounts: BTreeMap<String, Vec<String>>,
@@ -741,6 +755,7 @@ impl Default for ReloadableSystems {
             context_files: Vec::new(),
             agent_context_files: Vec::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             available_models: Vec::new(),
             configured_providers: BTreeSet::new(),
             available_accounts: BTreeMap::new(),
@@ -899,6 +914,7 @@ impl ReloadableSystems {
                 .cloned()
                 .collect(),
             skills: config.skills.clone(),
+            agents: config.agents.clone(),
             available_models,
             configured_providers,
             model_context_windows: config
@@ -2769,6 +2785,10 @@ pub struct Runtime {
     /// registrations. Durable session state stays plain data; the hosts
     /// are processes, owned here and dropped with the runtime.
     extension_hosts: Arc<tokio::sync::Mutex<extensions::ExtensionHosts>>,
+    /// Builds a provider for a subagent's model override (the `model`
+    /// frontmatter of an agent definition); `None` means the mode cannot
+    /// (a test runtime, say), and an override then fails with a message.
+    subagent_provider_factory: Option<SubagentProviderFactory>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -2792,7 +2812,14 @@ impl Runtime {
             workspace_context: None,
             workspace_context_enabled: true,
             extension_hosts: Arc::new(tokio::sync::Mutex::new(extensions::ExtensionHosts::new())),
+            subagent_provider_factory: None,
         }
+    }
+
+    /// Sets the factory a subagent's `model` override builds its provider
+    /// with (see the field). Each mode sets its own at startup.
+    pub fn set_subagent_provider_factory(&mut self, factory: SubagentProviderFactory) {
+        self.subagent_provider_factory = Some(factory);
     }
 
     pub fn with_store(
@@ -2804,6 +2831,12 @@ impl Runtime {
             store: Some(store),
             ..Self::new(session, systems)
         }
+    }
+
+    /// A subagent's session, for tests of the `task` tool's scoping.
+    #[cfg(test)]
+    pub(crate) fn child_session(&self) -> &SessionState {
+        &self.session
     }
 
     /// Whether the system prompt of a session with a remote workspace lists
@@ -3755,7 +3788,7 @@ pub async fn continue_turn_streaming_events(
     if !runtime.session().has_unfinished_turn() {
         return Ok(String::new());
     }
-    settle_pending_calls(runtime, run, &mut on_event).await?;
+    settle_pending_calls(runtime, provider, run, &mut on_event).await?;
     run_model_turn_streaming_events(runtime, provider, run, None, on_event).await
 }
 
@@ -3764,6 +3797,7 @@ pub async fn continue_turn_streaming_events(
 /// other call gets its interrupted result, unreported.
 async fn settle_pending_calls(
     runtime: &mut Runtime,
+    provider: &dyn Provider,
     run: &RunControl,
     on_event: &mut (impl FnMut(&TurnEvent) + Send),
 ) -> Result<(), AgentError> {
@@ -3782,7 +3816,7 @@ async fn settle_pending_calls(
             // cut off at the output limit gets its calls' error results
             // right after it is saved, so its calls are not left for here;
             // these only read.
-            run_tool_call(runtime, run, call, false, on_event).await?;
+            run_tool_call(runtime, provider, run, call, false, on_event).await?;
         } else {
             runtime.push_interrupted_result(&call)?;
         }
@@ -3980,7 +4014,14 @@ async fn run_model_turn_streaming_events(
         }
 
         for (index, tool_call) in tool_calls.iter().enumerate() {
-            let result = run_tool_call(runtime, run, tool_call.clone(), truncated, &mut on_event);
+            let result = run_tool_call(
+                runtime,
+                provider,
+                run,
+                tool_call.clone(),
+                truncated,
+                &mut on_event,
+            );
             if let Err(error) = result.await {
                 if matches!(error, AgentError::Cancelled) {
                     // The abort stopped this call, which saved what it had
@@ -4127,6 +4168,7 @@ impl Recovery {
 /// saved and reported result is the error asking to re-issue it.
 async fn run_tool_call(
     runtime: &mut Runtime,
+    provider: &dyn Provider,
     run: &RunControl,
     tool_call: ChatToolCall,
     truncated: bool,
@@ -4193,7 +4235,7 @@ async fn run_tool_call(
                 put_off.notify_one();
             }
         };
-        let execution = execute_model_tool_call(runtime, &tool_call, &mut on_output);
+        let execution = execute_model_tool_call(runtime, provider, &tool_call, &mut on_output);
         let execution = async {
             tokio::pin!(execution);
             loop {
@@ -4419,6 +4461,9 @@ fn prompt_tools(runtime: &Runtime) -> Vec<PromptTool> {
         .into_iter()
         .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
         .filter(|tool| model_tool_enabled(runtime, &tool.name))
+        // The `task` tool exists only when a subagent definition is loaded
+        // (its description names them); without one it is not offered.
+        .filter(|tool| tool.name != "task" || !runtime.systems.agents.is_empty())
         .map(|tool| PromptTool::builtin(&tool.name));
     let extension = runtime
         .systems
@@ -4593,11 +4638,12 @@ fn tool_result_media(images: Vec<noel_tools::ToolImage>) -> Vec<MediaInput> {
 /// name replaces it: the model is sent one definition per name, the one
 /// that runs.
 fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
+    let agents = runtime.systems.agents.clone();
     let mut definitions = builtin_tool_definitions()
         .into_iter()
         .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
         .filter(|tool| model_tool_enabled(runtime, &tool.name))
-        .filter_map(|tool| model_tool_definition(&tool.name))
+        .filter_map(|tool| model_tool_definition(&tool.name, &agents))
         .collect::<Vec<_>>();
     definitions.extend(
         runtime
@@ -4626,7 +4672,10 @@ fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
 
 /// What the model is told about a built-in tool. The definitions of
 /// upstream's tools are upstream's, word for word (`tool-behavior.json`).
-fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
+fn model_tool_definition(
+    name: &str,
+    agents: &[noel_config::AgentDefinition],
+) -> Option<AiToolDefinition> {
     let definition = match name {
         "read" => AiToolDefinition {
             name: "read".to_string(),
@@ -4839,6 +4888,38 @@ fn model_tool_definition(name: &str) -> Option<AiToolDefinition> {
                 "required": ["todos"]
             }),
         },
+        "task" => {
+            // Offered only when an agent definition is loaded; the names in
+            // the description are what the model chooses among.
+            let agents = crate::subagents::available_agents_description(agents);
+            if agents.is_empty() {
+                return None;
+            }
+            AiToolDefinition {
+                name: "task".to_string(),
+                description: format!(
+                    "Run a subagent: a focused assistant with its own instructions, context window and tool scope, working on one task in this workspace. The subagent does not see this conversation; give it everything it needs. Returns the subagent's final reply. Available subagents: {agents}"
+                ),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "subagent": {
+                            "type": "string",
+                            "description": "The subagent to run, by name"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "A short (3-5 word) description of the task, shown in the UI"
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The task: everything the subagent needs, since it starts without this conversation's context"
+                        }
+                    },
+                    "required": ["subagent", "prompt"]
+                }),
+            }
+        }
         _ => return None,
     };
     Some(definition)
@@ -5056,6 +5137,7 @@ fn fail_truncated_tool_call(
 /// running `bash` command's output so far.
 async fn execute_model_tool_call(
     runtime: &mut Runtime,
+    provider: &dyn Provider,
     tool_call: &ChatToolCall,
     on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
 ) -> Result<(), AgentError> {
@@ -5128,6 +5210,48 @@ async fn execute_model_tool_call(
                 Err(error) => {
                     is_error = true;
                     vec![format!("invalid todo arguments: {error}")]
+                }
+            }
+        } else {
+            is_error = true;
+            vec![format!("Tool {} not found", tool_call.name)]
+        }
+    } else if tool_call.name == "task" {
+        if model_tool_enabled(runtime, "task") {
+            match serde_json::from_str::<TaskToolArgs>(&tool_call.arguments) {
+                Ok(args) => {
+                    // The parent's cancellation ends the call (the wrapper
+                    // in `run_tool_call` drops this future), which drops
+                    // the child's turn: an abort ends both, and the parent
+                    // saves its interrupted result as for any tool.
+                    let control = RunControl::default();
+                    match crate::subagents::run_task_tool(
+                        runtime,
+                        provider,
+                        &control,
+                        &args,
+                        &mut |event| {
+                            if let SubagentEvent::Started { agent, description } = event {
+                                on_output(OutputSoFar {
+                                    text: &format!("[{agent}] {description}\n"),
+                                    truncated: false,
+                                });
+                            }
+                        },
+                    )
+                    .await
+                    {
+                        Ok(text) => vec![text],
+                        Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+                        Err(error) => {
+                            is_error = true;
+                            vec![error.to_string()]
+                        }
+                    }
+                }
+                Err(error) => {
+                    is_error = true;
+                    vec![format!("invalid task arguments: {error}")]
                 }
             }
         } else {
@@ -5674,7 +5798,7 @@ fn new_session_id() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
@@ -5684,6 +5808,22 @@ mod tests {
     use noel_ai::{create_provider, ProviderApi, ProviderAuth, ProviderConfig};
 
     use super::*;
+
+    /// A provider for tool-call tests whose tool never needs one: the
+    /// `task` tool is the only tool that calls a provider.
+    pub(crate) struct UnusedProvider;
+    #[async_trait::async_trait]
+    impl noel_ai::Provider for UnusedProvider {
+        async fn complete(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            Err(ProviderError::Config("unused".to_string()))
+        }
+    }
+    pub(crate) fn unused_provider() -> UnusedProvider {
+        UnusedProvider
+    }
 
     fn test_message(role: MessageRole, content: &str) -> ConversationMessage {
         ConversationMessage {
@@ -6501,6 +6641,7 @@ mod tests {
         );
         execute_model_tool_call(
             &mut runtime,
+            &unused_provider(),
             &ChatToolCall {
                 id: "bad-url".into(),
                 name: "web_fetch".into(),
@@ -6519,6 +6660,7 @@ mod tests {
         );
         execute_model_tool_call(
             &mut runtime,
+            &unused_provider(),
             &ChatToolCall {
                 id: "bad-search".into(),
                 name: "web_search".into(),
@@ -8658,6 +8800,7 @@ mod tests {
             context_files: Vec::new(),
             extensions: Vec::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             prompt_templates: Vec::new(),
             themes: Vec::new(),
             diagnostics: Vec::new(),
@@ -8892,7 +9035,7 @@ mod tests {
             .to_string(),
         };
 
-        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
+        execute_model_tool_call(&mut runtime, &unused_provider(), &tool_call, &mut |_| {})
             .await
             .expect("execute todo tool");
 
@@ -8915,7 +9058,7 @@ mod tests {
             arguments: "{\"todos\": \"not-a-list\"}".to_string(),
         };
 
-        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
+        execute_model_tool_call(&mut runtime, &unused_provider(), &tool_call, &mut |_| {})
             .await
             .expect("execute todo tool");
 
@@ -9051,10 +9194,10 @@ mod tests {
             .to_string(),
         };
 
-        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
+        execute_model_tool_call(&mut runtime, &unused_provider(), &tool_call, &mut |_| {})
             .await
             .expect("execute write tool");
-        execute_model_tool_call(&mut runtime, &tool_call, &mut |_| {})
+        execute_model_tool_call(&mut runtime, &unused_provider(), &tool_call, &mut |_| {})
             .await
             .expect("execute write tool again");
 
@@ -9099,7 +9242,7 @@ mod tests {
             ),
         ];
         for tool_call in &calls {
-            execute_model_tool_call(&mut runtime, tool_call, &mut |_| {})
+            execute_model_tool_call(&mut runtime, &unused_provider(), tool_call, &mut |_| {})
                 .await
                 .expect("execute tool call");
         }

@@ -62,6 +62,13 @@ impl PromptTool {
             "todo" => ("Track multi-step work as a checklist", &[]),
             "web_search" => ("Search the web for current information", &[]),
             "web_fetch" => ("Fetch a web page as readable text", &[]),
+            "task" => (
+                "Run a subagent on one focused subtask",
+                &[
+                    "The subagent does not see this conversation; its prompt must carry everything it needs.",
+                    "It returns only its final reply. Choose it by the descriptions in its definition.",
+                ],
+            ),
             _ => ("", &[]),
         };
         Self {

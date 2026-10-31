@@ -97,7 +97,7 @@ pub(crate) fn normalized_thinking_level(level: &str) -> Option<&'static str> {
 /// The level a session of `model` starts on when nothing set one (upstream
 /// `createAgentSession`): the model's level in `modelThinkingLevels`, else
 /// `defaultThinkingLevel`, else `medium`.
-fn configured_thinking_level(config: &LoadedConfig, model: &ModelRef) -> &'static str {
+pub(crate) fn configured_thinking_level(config: &LoadedConfig, model: &ModelRef) -> &'static str {
     [
         config
             .settings
