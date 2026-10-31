@@ -2141,6 +2141,10 @@ pub(crate) fn restyle_rows_with_markdown(
     // lines themselves collapse to a dim language label.
     // The marker of the code block a row is in, which alone closes it.
     let mut in_fence: Option<&'static str> = None;
+    // A table's rendering: parsed when its header line first starts, then
+    // consumed one rendered line per source line (header, delimiter,
+    // data). `(table, next_rendered_line)`.
+    let mut table: Option<(markdown::Table, usize)> = None;
     // Ordered-list state: an ordered item numbers itself from the list's
     // start marker plus its position (upstream's list renderer), so a
     // source that numbers every item `1.` still displays `1. 2. 3.`. A
@@ -2180,6 +2184,27 @@ pub(crate) fn restyle_rows_with_markdown(
             ]);
             continue;
         }
+        // A table row draws when its source line starts; continuation
+        // (wrapped) rows of a table line are blank: the rendered grid is
+        // one display line per source line. The table is parsed when its
+        // header line starts (a line with a pipe and a delimiter under
+        // it). The state ends when a new source line arrives that the
+        // rendered grid has no line for; that row falls through to the
+        // normal handling.
+        if let Some((rendered, next)) = table.as_mut() {
+            if !starts_line {
+                row.line = Line::from("");
+                continue;
+            }
+            let lines = rendered.render();
+            if *next < lines.len() {
+                row.line = table_line(&lines[*next], base, accent);
+                *next += 1;
+                continue;
+            }
+            // Past the table: drop the state and handle this row normally.
+            table = None;
+        }
         // HTML comments are not shown (upstream tui 54280c4f): what is
         // left of the row is plain text, and a row that was only a comment
         // is blank.
@@ -2204,6 +2229,44 @@ pub(crate) fn restyle_rows_with_markdown(
         } else {
             &source_line
         };
+        // A pipe table starting here takes the rows that follow: gather the
+        // source lines it spans (up to the first line without a pipe) and
+        // parse. Rendered above when the state is live.
+        if starts_line
+            && let Some(parsed) = {
+                let strip_entry_prefix = |line: usize, text: &str| -> String {
+                    // The first logical line carries the entry's bullet and
+                    // the "[provider/model] " echo; tables start after
+                    // either, keeping the bullet when neither applies
+                    // (`classify_target` does the same).
+                    if line == 0 {
+                        let rest = text.strip_prefix("● ").unwrap_or(text);
+                        rest.find("] ")
+                            .map(|i| &rest[i + 2..])
+                            .unwrap_or(rest)
+                            .to_string()
+                    } else {
+                        text.to_string()
+                    }
+                };
+                let mut lines = Vec::new();
+                let mut index = row.start.line;
+                while let Some(line) =
+                    logical_source_line(index).filter(|line| line.trim().contains('|'))
+                {
+                    lines.push(strip_entry_prefix(index, &line));
+                    index += 1;
+                }
+                markdown::parse_table(&lines, 0).map(|(parsed, _)| parsed)
+            }
+        {
+            let rendered = parsed.render();
+            table = Some((parsed, 1));
+            if let Some(segments) = rendered.first() {
+                row.line = table_line(segments, base, accent);
+            }
+            continue;
+        }
         let mut kind = if starts_line {
             markdown::classify_line(classify_target)
         } else {
@@ -2312,6 +2375,33 @@ pub(crate) fn without_html_comments(text: &str, in_comment: bool) -> (String, bo
             None => return (visible, true),
         }
     }
+}
+
+/// One rendered table line to styled spans: borders dim, header cells bold,
+/// cell content with inline emphasis (a cell's padding travels with its
+/// segment so emphasis spans re-parse cleanly over ` text `).
+fn table_line(
+    segments: &[markdown::TableSegment],
+    base: Style,
+    accent: ratatui::style::Color,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    for segment in segments {
+        if segment.border {
+            spans.push(Span::styled(
+                segment.text.clone(),
+                base.add_modifier(Modifier::DIM),
+            ));
+        } else if segment.header {
+            spans.push(Span::styled(
+                segment.text.clone(),
+                base.add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.extend(styled_spans(&segment.text, base, accent));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Convert one markdown line to styled spans over its plain base style.
