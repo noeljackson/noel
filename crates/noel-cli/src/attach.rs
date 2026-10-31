@@ -658,6 +658,9 @@ struct Remote {
     /// The last submission sent: the next waits for its answer, so the
     /// worker queues them in the order typed.
     last_submit: Option<tokio::task::JoinHandle<()>>,
+    /// When the last bare Esc landed at an empty draft, for Esc-Esc's
+    /// rewind picker (spec §9.2).
+    last_idle_esc: Option<Instant>,
     session: String,
     client: Client,
     sender: mpsc::UnboundedSender<Incoming>,
@@ -715,6 +718,7 @@ impl Remote {
             notices_seen: None,
             withdrawing: Vec::new(),
             last_run: None,
+            last_idle_esc: None,
             waiting: None,
             switch_to: None,
             diff_lines: std::collections::HashMap::new(),
@@ -1219,8 +1223,21 @@ impl Remote {
         match key.code {
             KeyCode::Esc if app.turn_running => self.abort(),
             KeyCode::Esc => {
-                app.clear_input();
-                app.close_overlay(|o| matches!(o, crate::Overlay::Multiline(_)));
+                // Esc-Esc within 400 ms at an empty draft: the rewind
+                // picker (spec §9.2). A lone Esc clears the draft as before.
+                let idle = app.input.is_empty() && matches!(app.overlay, crate::Overlay::None);
+                let now = Instant::now();
+                let double = idle
+                    && self
+                        .last_idle_esc
+                        .is_some_and(|at| now.duration_since(at) < Duration::from_millis(400));
+                self.last_idle_esc = (idle && !double).then_some(now);
+                if double {
+                    self.run_command("/rewind".to_owned());
+                } else {
+                    app.clear_input();
+                    app.close_overlay(|o| matches!(o, crate::Overlay::Multiline(_)));
+                }
             }
             KeyCode::Backspace => app.pop_input_char(),
             KeyCode::Delete => app.delete_input_char(),

@@ -506,6 +506,12 @@ pub(crate) async fn execute_model_tool_call_with(
                             continue;
                         }
                     };
+                    // The file as it is now is snapshotted before the tool
+                    // runs, so a rewind can restore it (spec §9.2). A
+                    // snapshot that fails does not fail the edit.
+                    if let Some(path) = &edited_path {
+                        let _ = runtime.snapshot_before_edit(path, env.as_ref()).await;
+                    }
                     let output = match execute_tool_streaming_in(
                         env.as_ref(),
                         request,

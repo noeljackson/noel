@@ -2730,6 +2730,37 @@ fn select_from_selector_message(
             Ok(format_session(runtime))
         }
         "auth" | "login" => Ok(format_login_status(config, &item.value)),
+        "rewind" => {
+            // The pick restores the conversation, and the files, to the
+            // point before that user prompt (spec §9.2).
+            let messages: usize = item
+                .value
+                .strip_prefix('m')
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| anyhow!("rewind checkpoint value: {}", item.value))?;
+            if messages >= runtime.session().messages.len() {
+                return Ok("rewind: already at this point".to_string());
+            }
+            let (restored, refused) = runtime.rewind(messages)?;
+            Ok(if restored.is_empty() && refused.is_empty() {
+                "rewound: conversation only".to_string()
+            } else {
+                format!(
+                    "rewound: {} file{} restored{}",
+                    restored.len(),
+                    if restored.len() == 1 { "" } else { "s" },
+                    if refused.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            ", {} left (changed on disk): {}",
+                            refused.len(),
+                            refused.join(", ")
+                        )
+                    }
+                )
+            })
+        }
         "account" => {
             let account = if item.value.is_empty() {
                 None

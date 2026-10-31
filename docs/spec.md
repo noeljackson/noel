@@ -353,6 +353,36 @@ Claude Code's.
 `crates/noel-config/src/agents.rs`, TUI label `● Used Task counter(Count
 files)` with the child's reply as the tool output (ctrl+o expands).
 
+### 9.2 Rewind
+
+**Decided (2026-10-31):** Claude Code's Esc-Esc, in noel's journal.
+
+- **Checkpoints:** every user prompt is one. The picker (Esc-Esc within
+  400 ms at idle, or `/rewind`) lists them newest first — `(current)` at
+  the top, then each prompt with the files the turns after it changed.
+- **Conversation:** rewinding drops the messages after the checkpoint,
+  the runs that started in the dropped range, saved progress and the
+  queue. The journal stays append-only: a `rewound` record carries the
+  message count the session loads with, so a restart loads the rewound
+  state while the original records stay in the file.
+- **Code:** every `edit`/`write` — the model's or a typed command —
+  snapshots the file's bytes first into `<journal>.files/` (write-atomic,
+  beside the journal; a file that does not exist is a *created* marker).
+  A rewind restores, per path, the oldest snapshot inside the dropped
+  range (the state before the range's first edit), and deletes files the
+  range created. A restore is refused, naming the file, when the bytes no
+  longer match what the session last left there (a later snapshot of the
+  path saw different bytes — an outside change); such a file stays as it
+  is. Files a remote workspace holds are snapshotted through the
+  workspace and restored here only when the path is local — restoring
+  through a workspace is future work.
+- **What rewind never touches:** `edited_files`, tool audit history, and
+  billed usage, like `/undo`.
+
+**Built:** `Runtime::rewind` and `snapshot_before_edit` in noel-core,
+  `rewound` and `file_snapshot` records, the picker and `/rewind` in the
+  TUI.
+
 ### 9.5 Hooks
 
 **Decided (2026-10-31):** Claude Code's tool hooks, as plain settings —

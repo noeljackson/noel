@@ -1457,8 +1457,19 @@ async fn session_command(
     let outcome = {
         let (runtime, host) = controller.parts_mut();
         let offline = host.offline;
-        session_commands::run(&mut output, runtime, &mut host.config, offline, line).await
+        session_commands::run(
+            &mut output,
+            runtime,
+            &mut host.config,
+            offline,
+            line.clone(),
+        )
+        .await
     };
+    // A rewind dropped entries the view holds: it is built again.
+    if line.starts_with("/select rewind ") {
+        refresh(controller);
+    }
     match outcome {
         Ok(CommandOutcome::Handled) => {}
         Ok(CommandOutcome::Submit { prompt, media }) => {
