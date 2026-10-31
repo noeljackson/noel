@@ -545,6 +545,11 @@ impl View {
                 true
             }
             TurnEvent::RoundResumed(_) => false,
+            // A user hook's notice (spec §9.5): a note, nothing else changes.
+            TurnEvent::Notice(text) => {
+                self.notice(text.clone());
+                true
+            }
             // Saved messages are entries through the history.
             TurnEvent::MessageAdded(message) => {
                 if message.role == MessageRole::Assistant {

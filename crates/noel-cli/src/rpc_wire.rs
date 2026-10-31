@@ -1145,6 +1145,17 @@ impl Recorder {
                     round.reply = Some(self.messages.len() - 1);
                 }
             }
+            // A user hook's notice is a system message (Claude's
+            // non-blocking hook error): shown, changing nothing.
+            TurnEvent::Notice(text) => {
+                self.start_round(sink);
+                self.add(
+                    Message::System {
+                        content: text.clone(),
+                    },
+                    sink,
+                );
+            }
             TurnEvent::MessageAdded(message) if message.role == MessageRole::Assistant => {
                 let raw = self
                     .reply

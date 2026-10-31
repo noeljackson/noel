@@ -6,6 +6,7 @@ pub mod controller;
 #[cfg(test)]
 mod controller_tests;
 pub mod extensions;
+mod hooks;
 mod input;
 mod journal;
 mod model_tools;
@@ -74,7 +75,7 @@ pub type BoxProviderFuture = std::pin::Pin<
 >;
 use noel_config::{
     has_auth_for_provider, listed_accounts_for_provider, AgentDefinition, ContextFile,
-    LoadedConfig, ResourceFile, Skill,
+    HooksSettings, LoadedConfig, ResourceFile, Skill,
 };
 use noel_env::LocalEnvOptions;
 pub use noel_env::{ExecutionEnv, LocalEnv};
@@ -890,6 +891,8 @@ pub struct ReloadableSystems {
     pub codemode: codemode::Presentation,
     /// How often a run saves what it has produced so far (spec §4.2).
     pub progress: RuntimeProgressSettings,
+    /// User hooks around tool calls (spec §9.5).
+    pub hooks: HooksSettings,
     pub model_context_windows: BTreeMap<String, u64>,
     /// Safety cap on provider rounds per run, including steering. Manual
     /// `Default` keeps the compiled cap; a derived zero would stop every
@@ -928,6 +931,7 @@ impl Default for ReloadableSystems {
             compaction: RuntimeCompactionSettings::default(),
             codemode: codemode::Presentation::default(),
             progress: RuntimeProgressSettings::default(),
+            hooks: HooksSettings::default(),
             model_context_windows: BTreeMap::new(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
             restart_limit: DEFAULT_RESTART_LIMIT,
@@ -1130,6 +1134,7 @@ impl ReloadableSystems {
                     model_overrides: settings.model_overrides.clone().unwrap_or_default(),
                 }
             },
+            hooks: config.settings.hooks.clone().unwrap_or_default(),
             progress: {
                 let settings = config.settings.progress.clone().unwrap_or_default();
                 let interval = |ms: Option<u64>| {
@@ -3504,6 +3509,9 @@ pub enum TurnEvent {
     CompactionFailed(String),
     /// The round's reply and its tool calls' results are saved.
     RoundFinished,
+    /// A user hook's non-blocking notice (spec §9.5): shown, changing
+    /// nothing.
+    Notice(String),
 }
 
 /// Follow-up prompts typed while a turn streams. Shared between the key

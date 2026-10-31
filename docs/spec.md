@@ -353,6 +353,34 @@ Claude Code's.
 `crates/noel-config/src/agents.rs`, TUI label `● Used Task counter(Count
 files)` with the child's reply as the tool output (ctrl+o expands).
 
+### 9.5 Hooks
+
+**Decided (2026-10-31):** Claude Code's tool hooks, as plain settings —
+no host program, as extensions need.
+
+- **Settings:** `hooks.preToolUse` and `hooks.postToolUse`, each a list of
+  `{matcher, command}`. `matcher` is a `|`-separated list of tool names;
+  empty matches every tool. The user's settings and a trusted project's
+  merge per list (the project's list replaces the user's for a kind it
+  configures), and `/reload` reloads them.
+- **The run:** a hook is a shell one-liner run in the session's cwd
+  (the session's shell) with one JSON object on stdin — `tool`,
+  `arguments` (the raw JSON the model sent), `matcher`, `cwd`,
+  `sessionId` — and `NOEL_SESSION_ID`/`NOEL_TOOL` in its environment.
+- **Pre-hooks** run before the extension gate. **Exit 2 blocks** the
+  call, the hook's stderr the reason the model sees (Claude's rule);
+  any other exit allows, a non-zero one adding a notice line. A hook
+  that cannot run at all blocks, fail-closed like the gate.
+- **Post-hooks** run after the call's result is saved and reported;
+  output is ignored, a non-zero exit is a notice line.
+- **Out of scope (for now):** the other lifecycle events (prompt submit,
+  stop, session start); a hook's stdout as a decision JSON (exit 2
+  covers the blocking case).
+
+**Built:** `crates/noel-core/src/hooks.rs`, the runs in `run_tool_call`,
+  the settings in noel-config, notices as a `Notice` turn event in every
+  mode.
+
 ## 10. Workspaces
 
 **Decided (2026-10-14):** workspaces match upstream.
