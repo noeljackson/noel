@@ -53,6 +53,7 @@
 - `/share [file]`
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
 - `/undo` (undo the last turn and its file changes; its prompt goes back to the draft)
+- `/bg [prompt]` (run a prompt in a background fork of this session, also `& <prompt>`; list the forks)
 - `/runs` (each run's tokens, request count, and estimated cost at catalog prices)
 - `/cost` (a forecast: context size, recent average, queued work priced)
 - `/rewind` (the checkpoint picker: go back to any earlier prompt, with or without the file changes since; also Esc-Esc at an empty draft)
@@ -189,6 +190,13 @@ exist and how to reach them from its bash tool: `noel client ls --json`
 independent work to another session this way — the other session sees
 only what is sent. `/sessions` lists them for you; a subagent (`task`
 tool) is the same-session, scoped-tools alternative for decomposition.
+
+`& <prompt>` (or `/bg <prompt>`) starts a background run: the session is
+forked as it is and the prompt is sent to the fork, which the server runs in
+a worker of its own, so it carries on whatever this session does next and
+after the terminal is closed. `/bg` lists this session's forks with their last
+run's state; `/resume <id>` opens one and `noel client watch <id>` follows it.
+Both need the session to be idle.
 
 `/plan` toggles plan mode (the footer says `plan`): the system prompt tells
 the model to research with read-only tools, `bash` for inspection only, and

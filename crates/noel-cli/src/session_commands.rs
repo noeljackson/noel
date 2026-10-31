@@ -262,6 +262,44 @@ pub(crate) async fn run(
             }
         }
         "/summaries" => ui.push(TuiEntryKind::System, format_summaries(runtime)),
+        "/bg" => {
+            // This session's background forks (spec §9.6), newest first.
+            let forks =
+                crate::background::list(&config.paths.session_dir, &runtime.session().session_id);
+            ui.push(
+                TuiEntryKind::System,
+                if forks.is_empty() {
+                    "no background runs; & <prompt> or /bg <prompt> starts one".to_string()
+                } else {
+                    forks.join("\n")
+                },
+            );
+        }
+        _ if line.starts_with('&') || line.starts_with("/bg ") => {
+            // A background run: a fork of this session with the prompt
+            // sent to it, run by a worker of its own.
+            let prompt = line
+                .strip_prefix('&')
+                .or_else(|| line.strip_prefix("/bg "))
+                .unwrap_or_default()
+                .trim();
+            if prompt.is_empty() {
+                ui.push(
+                    TuiEntryKind::System,
+                    "usage: & <prompt>: runs it in a background fork of this session",
+                );
+            } else {
+                let id =
+                    crate::background::start(runtime, &config.paths.session_dir, offline, prompt)
+                        .await?;
+                ui.push(
+                    TuiEntryKind::System,
+                    format!(
+                        "background {id}: started. /bg lists it, /resume {id} opens it, `noel client watch {id}` follows it"
+                    ),
+                );
+            }
+        }
         // Each run's tokens and estimated cost, newest first, and a
         // forecast of the next work (spec §9.8).
         "/runs" => ui.push(

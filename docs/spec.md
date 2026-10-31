@@ -492,6 +492,29 @@ no host program, as extensions need.
   the settings in noel-config, notices as a `Notice` turn event in every
   mode.
 
+### 9.6 Background runs
+
+**Decided (2026-10-31, revised 2026-11-12):** Claude Code's `&`, on the
+server noel already has.
+
+- **`& <prompt>`**, or `/bg <prompt>`, forks the session as it is and
+  sends the prompt to the fork through `noel client send`, as any client
+  would. The server starts a worker for the fork, so its run does not
+  depend on this session or on a terminal. The fork has the conversation
+  so far; this session gets neither the prompt nor the answer.
+- **`/bg`** lists this session's forks (the journals whose
+  `parent_session_id` names it), newest first: the last run's state, the
+  message count and the prompt it was sent. A journal cannot tell a run
+  in progress from one a stopped worker left, so both read `unfinished`;
+  `noel client ls` has the live state.
+- A fork is an ordinary session: `/resume <id>` opens it and
+  `noel client watch <id>` follows it.
+- Like every command, both are refused while a run is active in this
+  session.
+
+**Built:** `crates/noel-cli/src/background.rs`, and `&` and `/bg` in
+  `session_commands.rs` and `attach.rs`.
+
 ### 9.7 MCP
 
 **Decided (2026-11-01):** port upstream's `packages/mcp` — the stdio

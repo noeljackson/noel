@@ -287,6 +287,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "toggle plan mode: research and a plan to approve, no file edits",
     },
     CommandHelp {
+        command: "/bg [prompt]",
+        description: "run a prompt in a background fork of this session (also & <prompt>); list the forks",
+    },
+    CommandHelp {
         command: "/runs",
         description: "list each run's tokens and estimated cost",
     },

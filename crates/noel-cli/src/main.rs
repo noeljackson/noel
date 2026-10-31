@@ -18,6 +18,7 @@ mod account_failover;
 mod attach;
 mod auth_command;
 mod auth_commands;
+mod background;
 mod bug_report;
 mod bun_install;
 mod clipboard;
