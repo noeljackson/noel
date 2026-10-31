@@ -809,6 +809,53 @@ fn slash_commands_run_on_the_worker_as_the_tui_types_them() {
     assert!(unknown.status.success());
 }
 
+/// A goal (spec §9.3) starts the work when it is set, and after each turn
+/// that settles the evaluator, the session's own model without tools,
+/// says whether it is met: not met sends the work on, met clears the goal.
+#[test]
+fn a_goal_keeps_the_session_working_until_its_evaluator_says_it_is_met() {
+    let script = json!([
+        [{"text": "I will start on it."}],
+        [{"text": "NOT MET\nthe file does not exist yet"}],
+        [{"tool_call": {"name": "write", "arguments": {"path": "goal.txt", "content": "done\n"}}}],
+        [{"text": "The file is written; the goal is met."}],
+        [{"text": "MET\nthe transcript shows the file written"}],
+    ]);
+    let mode2 = Mode2::new("goal", script, json!({}));
+    let session = mode2.new_session("goal");
+    let unset = mode2.client(&["command", &session, "/goal"]);
+    assert!(unset.contains("/goal <condition>"), "{unset}");
+
+    let set = mode2.client(&["command", &session, "/goal goal.txt exists"]);
+    assert!(set.starts_with("goal set: goal.txt exists\n"), "{set}");
+    wait_until("the goal met and cleared", || {
+        mode2.journal(&session).contains("\"goal_cleared\"")
+    });
+    let journal = mode2.journal(&session);
+    assert!(journal.contains(r#""reason":"condition met""#), "{journal}");
+    assert_eq!(journal.matches("\"run_finished\"").count(), 2, "{journal}");
+    assert_eq!(
+        fs::read_to_string(mode2.root.join("cwd/goal.txt")).unwrap(),
+        "done\n"
+    );
+    // The goal's own prompt, the evaluator, the continuation's two rounds,
+    // the evaluator again; the evaluator is offered no tools.
+    let requests = mode2.requests();
+    assert_eq!(requests.len(), 5, "{requests:?}");
+    for (index, tools) in [(0, true), (1, false), (2, true), (4, false)] {
+        let offered = requests[index]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty());
+        assert_eq!(offered, tools, "request {index}: {}", requests[index]);
+    }
+    let after = mode2.client(&["command", &session, "/goal"]);
+    assert!(after.contains("/goal <condition>"), "{after}");
+
+    // One set on a session at rest is cleared without a turn.
+    let again = mode2.client(&["command", &session, "/goal clear"]);
+    assert_eq!(again, "no goal is set\n");
+}
+
 /// The worker expands typed input with the session's configuration, as the
 /// TUI's prompts were expanded in process: a prompt template, whether it
 /// starts a run or is queued during one.

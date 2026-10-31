@@ -238,6 +238,49 @@ pub(crate) async fn run(
             }
         }
         "/summaries" => ui.push(TuiEntryKind::System, format_summaries(runtime)),
+        _ if line.split_whitespace().next() == Some("/goal") => {
+            // `/goal <condition>` sets one (replacing any earlier) and
+            // starts the work; `/goal clear` stops early; bare `/goal`
+            // shows it (spec §9.3). The worker runs the goal's turns.
+            let rest = line.trim_start_matches("/goal").trim();
+            if rest == "clear" {
+                if runtime.session().goal.is_some() {
+                    runtime.clear_goal(None)?;
+                    ui.push(TuiEntryKind::System, "goal cleared");
+                } else {
+                    ui.push(TuiEntryKind::System, "no goal is set");
+                }
+            } else if rest.is_empty() {
+                match &runtime.session().goal {
+                    Some(goal) => ui.push(
+                        TuiEntryKind::System,
+                        format!(
+                            "goal ({} turn{}): {}{}",
+                            goal.turns,
+                            if goal.turns == 1 { "" } else { "s" },
+                            goal.condition,
+                            if goal.last_status.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\nlast: {}", goal.last_status)
+                            }
+                        ),
+                    ),
+                    None => ui.push(
+                        TuiEntryKind::System,
+                        "/goal <condition> to set one; /goal clear to stop early",
+                    ),
+                }
+            } else {
+                runtime.set_goal(rest)?;
+                ui.push(
+                    TuiEntryKind::System,
+                    format!(
+                        "goal set: {rest}\nthe session works until an evaluator confirms it is met; interrupt to pause, /goal clear to stop"
+                    ),
+                );
+            }
+        }
         // The checkpoints, one per user prompt (spec §9.2); Esc-Esc at an
         // empty draft asks for the same. `/undo` is the nearest of them.
         "/rewind" => return crate::rewind_commands::open(ui, runtime),

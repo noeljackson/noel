@@ -54,6 +54,7 @@
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
 - `/undo` (undo the last turn and its file changes; its prompt goes back to the draft)
 - `/rewind` (the checkpoint picker: go back to any earlier prompt, with or without the file changes since; also Esc-Esc at an empty draft)
+- `/goal [condition|clear]` (set the session goal and start on it; show it, or stop early)
 - `/usage` (recorded session token totals and account quotas)
 - `/login [provider]`
 - `/logout <provider>`
@@ -176,6 +177,19 @@ tool audit history, queued messages, runs, or token usage, and a rewind does
 not reach past a compaction. The journal stays append-only: a restart loads
 the rewound state while nothing is erased from the file, and the history a
 client shows keeps the dropped entries above a `reset to N messages` line.
+
+`/goal <condition>` sets a goal that keeps the session working until a
+separate evaluator confirms it is met: a condition verifiable from the
+conversation alone ("all tests in `test/auth` pass", "every call site
+migrated"), since the evaluator reads the transcript and cannot run commands.
+Setting one starts the work. After each turn settles, one no-tools request to
+the session's model answers `MET` or `NOT MET` with a sentence why; not met
+sends a continuation automatically, met clears the goal, and each step is
+noted. The session's worker runs this, so it goes on after the terminal is
+closed. Interrupting pauses the goal (it stays; the next prompt resumes it;
+`/goal clear` stops early), and 20 turns without a met condition clears it
+instead of looping. Bare `/goal` shows the condition, its turn count, and the
+last evaluation. Goals are journaled, so a restarted session keeps its goal.
 
 `/usage` persists provider-reported token totals
 for completed requests across resume/reload/compaction/undo/rewind; old sessions and
