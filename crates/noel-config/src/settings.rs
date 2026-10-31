@@ -54,6 +54,9 @@ pub struct Settings {
     pub disabled_resources: Option<ResourceStateSettings>,
     #[serde(default)]
     pub compaction: Option<CompactionSettings>,
+    /// User hooks (spec §9.5): shell commands around tool calls.
+    #[serde(default)]
+    pub hooks: Option<HooksSettings>,
     #[serde(default)]
     pub branch_summary: Option<BranchSummarySettings>,
     #[serde(default)]
@@ -161,6 +164,7 @@ impl Settings {
                 overrides.disabled_resources,
             ),
             compaction: merge_optional_settings(self.compaction, overrides.compaction),
+            hooks: merge_optional_settings(self.hooks, overrides.hooks),
             branch_summary: merge_optional_settings(self.branch_summary, overrides.branch_summary),
             retry: merge_optional_settings(self.retry, overrides.retry),
             agent: merge_optional_settings(self.agent, overrides.agent),
@@ -420,6 +424,57 @@ pub(crate) fn merge_optional_settings<T: MergeSettings>(
     }
 }
 
+/// User hooks (spec §9.5): plain shell commands around tool calls, run
+/// from the project's or the user's settings, no host program needed.
+/// A pre-hook that exits 2 blocks the call with its stderr as the reason
+/// (Claude's rule); any other exit allows it. A post-hook's output is
+/// ignored, a non-zero exit is a system line.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HooksSettings {
+    /// Run before a tool call; `matcher` is a `|`-separated list of tool
+    /// names (empty matches all).
+    #[serde(default)]
+    pub pre_tool_use: Vec<HookCommand>,
+    /// Run after a tool call finished, before its result is reported.
+    #[serde(default)]
+    pub post_tool_use: Vec<HookCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookCommand {
+    /// Tool names this hook applies to, `|`-separated; empty matches all.
+    #[serde(default)]
+    pub matcher: String,
+    /// The shell command. Its stdin is one JSON object: `tool`,
+    /// `arguments` (the raw JSON string), `cwd`, `sessionId`.
+    pub command: String,
+}
+
+impl HooksSettings {
+    /// The hooks of `event` whose matcher names `tool` (an empty matcher
+    /// matches every tool).
+    pub fn matching(&self, event: &str, tool: &str) -> Vec<&HookCommand> {
+        let hooks = match event {
+            "pre" => &self.pre_tool_use,
+            "post" => &self.post_tool_use,
+            _ => return Vec::new(),
+        };
+        hooks
+            .iter()
+            .filter(|hook| {
+                hook.matcher.is_empty()
+                    || hook
+                        .matcher
+                        .split('|')
+                        .map(str::trim)
+                        .any(|name| name == tool)
+            })
+            .collect()
+    }
+}
+
 /// Compaction settings: of the settings file, or of one conversation
 /// (Durable's `CompactionSettings`, upstream 922c3ff2). `modelOverrides`
 /// is keyed by exact `"provider/modelId"`; each field it sets replaces the
@@ -509,6 +564,25 @@ pub fn resolve_compaction(
         reserve_tokens: first(&|layer| layer.reserve_tokens),
         keep_recent_tokens: first(&|layer| layer.keep_recent_tokens),
         trigger_percent: layers.iter().find_map(|layer| layer.trigger_percent),
+    }
+}
+
+impl MergeSettings for HooksSettings {
+    fn merge(self, overrides: Self) -> Self {
+        // Project hooks replace the user's lists wholesale, as Compaction's
+        // fields do per field: a project that configures hooks owns them.
+        Self {
+            pre_tool_use: if overrides.pre_tool_use.is_empty() {
+                self.pre_tool_use
+            } else {
+                overrides.pre_tool_use
+            },
+            post_tool_use: if overrides.post_tool_use.is_empty() {
+                self.post_tool_use
+            } else {
+                overrides.post_tool_use
+            },
+        }
     }
 }
 

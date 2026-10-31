@@ -354,6 +354,34 @@ noel also marks its own process, and so every command and tool it starts:
 `NOEL_CODING_AGENT=true` is noel's own marker, which it also sets as
 `PI_CODING_AGENT=true`.
 
+## Hooks
+
+`hooks` in the settings names shell commands that run around tool calls —
+plain settings, no host program:
+
+```json
+{
+  "hooks": {
+    "preToolUse": [
+      {"matcher": "edit|write", "command": "echo 'not today' >&2; exit 2"}
+    ],
+    "postToolUse": [
+      {"matcher": "bash", "command": "date >> ~/noel-tool.log"}
+    ]
+  }
+}
+```
+
+`matcher` is a `|`-separated list of tool names; empty matches every tool.
+A hook runs in the session's cwd with its shell, one JSON object on stdin
+(`tool`, `arguments`, `matcher`, `cwd`, `sessionId`) and `NOEL_SESSION_ID`/
+`NOEL_TOOL` in its environment. A **pre**-hook that exits 2 blocks the
+call, its stderr the reason the model sees; any other exit allows, a
+non-zero one adding a notice. A **post**-hook runs after the result is
+saved; its output is ignored, a non-zero exit is a notice. A hook that
+cannot run at all blocks, fail-closed. Hooks reload with `/reload`.
+
+
 ## Tool selection
 
 Every built-in tool is enabled by default. Upstream pi enables only `read`,

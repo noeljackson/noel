@@ -557,6 +557,32 @@ pub(crate) async fn run_tool_call(
     let result = if truncated {
         fail_truncated_tool_call(runtime, &tool_call)
     } else {
+        // The user's pre-hooks (spec §9.5) run before anything else: an
+        // exit-2 hook blocks the call, its stderr the reason, exactly as
+        // the extension gate blocks. A failing hook is a notice, not a
+        // block (Claude's non-blocking error).
+        if !truncated {
+            let (decision, notices) =
+                crate::hooks::run_pre_hooks(runtime, &tool_call.name, &tool_call.arguments).await;
+            for notice in &notices {
+                on_event(&TurnEvent::Notice(notice.clone()));
+            }
+            if let crate::hooks::HookDecision::Block(reason) = decision {
+                runtime.push_tool_result(&tool_call, reason.clone(), Vec::new(), true)?;
+                on_event(&TurnEvent::ToolOutput {
+                    call: tool_call.clone(),
+                    output: reason,
+                    images: Vec::new(),
+                    is_error: true,
+                    duration: Some(started.elapsed()),
+                });
+                on_event(&TurnEvent::ToolFinished {
+                    name: tool_call.name.clone(),
+                    is_error: true,
+                });
+                return Ok(());
+            }
+        }
         // The `toolCall` gate of any gate-registered v2 extension runs
         // first, fail closed: a blocked call never runs and its reason is
         // the model's error result (upstream's permission gates).
@@ -691,6 +717,15 @@ pub(crate) async fn run_tool_call(
     }
     if tool_call.name == "todo" {
         on_event(&TurnEvent::TodosUpdated(runtime.session.todos.clone()));
+    }
+    // The user's post-hooks (spec §9.5): after the result is saved and
+    // reported. Output ignored; a non-zero exit is a notice.
+    if !truncated && result.is_ok() {
+        for notice in
+            crate::hooks::run_post_hooks(runtime, &tool_call.name, &tool_call.arguments).await
+        {
+            on_event(&TurnEvent::Notice(notice));
+        }
     }
     // An aborted codemode call saved its own result; the turn still ends.
     let aborted = tool_call.name == codemode::CODEMODE && run.cancellation.is_cancelled();

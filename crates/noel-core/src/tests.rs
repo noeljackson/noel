@@ -4546,6 +4546,7 @@ pub(crate) fn trace(events: &[TurnEvent]) -> Vec<String> {
         .map(|event| match event {
             TurnEvent::HistoryRewritten(_) => unreachable!("filtered"),
             TurnEvent::RoundStarted => "round started".to_string(),
+            TurnEvent::Notice(text) => format!("notice {text:?}"),
             TurnEvent::RoundResumed(reply) => format!("round resumed: {}", message(reply)),
             TurnEvent::MessageAdded(saved) => message(saved),
             TurnEvent::Provider(StreamEvent::Text(text)) => format!("text {text:?}"),
