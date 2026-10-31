@@ -233,6 +233,9 @@ pub(crate) async fn run(
             }
         }
         "/summaries" => ui.push(TuiEntryKind::System, format_summaries(runtime)),
+        // The checkpoints, one per user prompt (spec §9.2); Esc-Esc at an
+        // empty draft asks for the same.
+        "/rewind" => return open_selector(ui, config, runtime, "rewind", ""),
         "/mcp" => {
             // The configured MCP servers and their live state (§9.7).
             let servers = runtime.systems().mcp_servers.clone();

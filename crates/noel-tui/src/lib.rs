@@ -275,6 +275,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "write a bug report for the noel developers",
     },
     CommandHelp {
+        command: "/rewind",
+        description: "pick an earlier prompt to rewind to; restores the files changed since",
+    },
+    CommandHelp {
         command: "/undo",
         description: "undo last conversation turn; restore prompt (files unchanged)",
     },

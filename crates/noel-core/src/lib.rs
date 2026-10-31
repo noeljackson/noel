@@ -15,6 +15,8 @@ pub mod plugins;
 mod progress;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod rewind_tests;
 mod session_export;
 mod session_lock;
 pub mod storage;
@@ -218,6 +220,11 @@ pub struct Run {
     /// A close stopped the run (not a crash): its resume is not counted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub closed: bool,
+    /// How many messages the session held when the run started; a rewind
+    /// drops the runs that started in the dropped range. Not journaled —
+    /// the record's position gives it on load.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub start_message_index: usize,
 }
 
 fn no_restarts(value: &u32) -> bool {
@@ -225,7 +232,7 @@ fn no_restarts(value: &u32) -> bool {
 }
 
 impl Run {
-    fn started(start: RunStart, status: RunStatus) -> Self {
+    fn started(start: RunStart, status: RunStatus, start_message_index: usize) -> Self {
         Self {
             id: start.id,
             request_id: start.request_id,
@@ -234,6 +241,7 @@ impl Run {
             failure: None,
             restarts: 0,
             closed: false,
+            start_message_index,
         }
     }
 
@@ -487,6 +495,29 @@ pub struct SessionState {
     /// §10); `None` runs them in `cwd` here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<SessionWorkspace>,
+    /// File snapshots this session took before an `edit`/`write` changed a
+    /// file, oldest first: what rewind can restore. Not part of the
+    /// export (the bytes live beside the journal, not in it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<SnapshotRef>,
+    /// Rewinds applied, oldest first; each holds the message count it left
+    /// (0 = the session's start), for listing checkpoints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewinds: Vec<usize>,
+}
+
+/// One file snapshot: its id, the file it holds, and what the bytes were
+/// when it was taken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRef {
+    pub id: String,
+    pub path: String,
+    pub before_sha: String,
+    pub created: bool,
+    /// How many messages the session held when the snapshot was taken;
+    /// rewind restores the newest snapshot per path whose index the
+    /// dropped range covers.
+    pub message_index: usize,
 }
 
 /// A streaming reply as far as the journal saved it (spec §4.2).
@@ -531,6 +562,22 @@ pub struct SavedToolOutput {
 }
 
 impl SessionState {
+    /// Rewinds to the first `messages` messages (spec §9.2): the rest are
+    /// dropped, the runs whose prompts were dropped are removed, saved
+    /// progress and the queue go, and the rewind is remembered for
+    /// checkpoint listings. The snapshot ids named by `restore` are the
+    /// caller's to write back (the state only records them here).
+    pub fn rewind_to(&mut self, messages: usize, restore: &[String]) {
+        let _ = restore;
+        self.messages.truncate(messages);
+        self.partial = None;
+        self.tool_outputs.clear();
+        self.queue.clear();
+        self.past_submissions.clear();
+        self.runs.retain(|run| run.start_message_index < messages);
+        self.rewinds.push(messages);
+    }
+
     /// The saved queue: its steering, then its follow-ups.
     pub fn saved_queue(&self) -> (Vec<String>, Vec<String>) {
         let texts = |mode: QueueMode| {
@@ -662,6 +709,8 @@ impl SessionState {
             partial: None,
             tool_outputs: BTreeMap::new(),
             workspace: None,
+            snapshots: Vec::new(),
+            rewinds: Vec::new(),
         }
     }
 }
@@ -828,6 +877,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         tool_outputs: BTreeMap::new(),
         // An export carries no workspace: an imported session is local.
         workspace: None,
+        snapshots: Vec::new(),
+        rewinds: Vec::new(),
     }
 }
 
@@ -1474,9 +1525,42 @@ enum SessionRecord {
         #[serde(default, skip_serializing_if = "is_false")]
         append: bool,
     },
+    /// A file snapshot saved before an `edit`/`write` changed it: the
+    /// snapshot's id and where its bytes are. Rewind restores by id.
+    /// Older versions ignore it.
+    FileSnapshot {
+        id: String,
+        /// The file as the session saw it, relative or absolute as the
+        /// tool wrote it.
+        path: String,
+        /// SHA-256 of the snapshotted bytes, to notice a file that changed
+        /// since (a snapshot restores only what it saved).
+        before_sha: String,
+        /// Whether the file did not exist (a snapshot of nothing).
+        #[serde(default, skip_serializing_if = "is_false")]
+        created: bool,
+    },
+    /// The conversation rewound: everything after `messages` (user and
+    /// assistant) is dropped, runs that started in the dropped range are
+    /// removed, and the files named by `restore` — the newest snapshot of
+    /// each, taken before the dropped turns changed it — are restored when
+    /// their bytes still match what was snapshotted. The journal keeps
+    /// everything; this is the state that loads. Older versions ignore
+    /// it.
+    Rewound {
+        messages: usize,
+        /// The `FileSnapshot.id`s to restore, newest first per path.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restore: Vec<String>,
+    },
     /// Records written by other binary versions are ignored on load.
     #[serde(other)]
     Unknown,
+}
+
+/// A digest as lowercase hex.
+fn hex_digest(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn is_zero(count: &usize) -> bool {
@@ -1959,6 +2043,91 @@ impl SessionStore {
 
     pub fn record_edited_files(&self, paths: Vec<String>) -> Result<(), SessionError> {
         self.append(&SessionRecord::EditedFiles { paths })
+    }
+
+    /// Where this session's file snapshots live: `<journal>.files/`, a
+    /// directory beside the journal.
+    pub fn snapshot_dir(&self) -> PathBuf {
+        self.path.with_extension("files")
+    }
+
+    /// Saves the file's current bytes as snapshot `id` and journals the
+    /// snapshot. `created` says the file did not exist (an empty snapshot,
+    /// restoring deletes). Returns its reference for rewind.
+    pub fn record_file_snapshot(
+        &self,
+        id: &str,
+        path: &str,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<SnapshotRef, SessionError> {
+        let dir = self.snapshot_dir();
+        std::fs::create_dir_all(&dir).map_err(|source| SessionError::Write {
+            path: dir.clone(),
+            source,
+        })?;
+        let (bytes, created, before_sha) = match bytes {
+            Some(bytes) => {
+                let sha = {
+                    use sha2::Digest;
+                    let mut hasher = sha2::Sha256::new();
+                    hasher.update(&bytes);
+                    hex_digest(&hasher.finalize())
+                };
+                (bytes, false, sha)
+            }
+            None => (Vec::new(), true, String::new()),
+        };
+        // Write-atomic: a temp file, renamed into place (PiImport's rule).
+        let temp = dir.join(format!(".{id}.tmp"));
+        std::fs::write(&temp, &bytes)
+            .and_then(|_| std::fs::rename(&temp, dir.join(id)))
+            .map_err(|source| SessionError::Write {
+                path: dir.join(id),
+                source,
+            })?;
+        self.append(&SessionRecord::FileSnapshot {
+            id: id.to_string(),
+            path: path.to_string(),
+            before_sha: before_sha.clone(),
+            created,
+        })?;
+        Ok(SnapshotRef {
+            id: id.to_string(),
+            path: path.to_string(),
+            before_sha,
+            created,
+            // The caller records with the message count in effect; a load
+            // sets it from the journal's position.
+            message_index: 0,
+        })
+    }
+
+    /// Reads snapshot `id`'s bytes (None for a created-file snapshot).
+    pub fn read_snapshot(&self, id: &str) -> Result<Option<Vec<u8>>, SessionError> {
+        let path = self.snapshot_dir().join(id);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(SessionError::Read { path, source }),
+        }
+    }
+
+    /// Journals a rewind and applies it to `state` (see
+    /// [`SessionState::rewind_to`]). The caller restores the files.
+    pub fn record_rewind(
+        &self,
+        state: &mut SessionState,
+        messages: usize,
+        restore: Vec<String>,
+    ) -> Result<(), SessionError> {
+        // The history a client is shown follows the messages snapshot, as
+        // it does for an undo; the rewind record drops what else belonged
+        // to the dropped range.
+        let kept = messages.min(state.messages.len());
+        self.record_messages_snapshot(state.messages[..kept].to_vec())?;
+        self.append(&SessionRecord::Rewound { messages, restore })?;
+        state.rewind_to(messages, &[]);
+        Ok(())
     }
 
     pub fn record_usage(&self, usage: SessionUsage) -> Result<(), SessionError> {
@@ -2987,9 +3156,10 @@ impl Runtime {
             })?;
         }
         self.session.messages.push(message.clone());
+        let start_message_index = self.session.messages.len() - 1;
         self.session
             .runs
-            .push(Run::started(start, RunStatus::Running));
+            .push(Run::started(start, RunStatus::Running, start_message_index));
         Ok(message)
     }
 
@@ -3083,9 +3253,10 @@ impl Runtime {
         if let Some(store) = &self.store {
             store.append(&SessionRecord::RunStarted { run: start.clone() })?;
         }
+        let start_message_index = self.session.messages.len().saturating_sub(1);
         self.session
             .runs
-            .push(Run::started(start, RunStatus::Running));
+            .push(Run::started(start, RunStatus::Running, start_message_index));
         Ok(())
     }
 
@@ -3144,6 +3315,177 @@ impl Runtime {
         let prompt = self.session.messages[start].clone();
         self.replace_messages(self.session.messages[..start].to_vec())?;
         Ok(Some(prompt))
+    }
+
+    /// Saves the file as it is now, before an `edit`/`write` changes it,
+    /// and journals the snapshot (spec §9.2). `env` is the workspace the
+    /// tool runs in: the bytes are read there. A file that is already
+    /// snapshotted unchanged since is not snapshotted again.
+    pub async fn snapshot_before_edit(
+        &mut self,
+        path: &str,
+        env: &dyn ExecutionEnv,
+    ) -> Result<(), SessionError> {
+        let Some(store) = self.store.clone() else {
+            return Ok(());
+        };
+        // Skip when the newest snapshot of this path still matches its
+        // bytes: no change to restore.
+        let cx = noel_env::Context::background();
+        let bytes = env.read_text_file(path, &cx).await.ok();
+        let existing = self
+            .session
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.path == path)
+            .max_by_key(|snapshot| snapshot.message_index)
+            .cloned();
+        if let (Some(existing), Some(bytes)) = (&existing, &bytes)
+            && !existing.created
+        {
+            let sha = {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(bytes.as_bytes());
+                hex_digest(&hasher.finalize())
+            };
+            if sha == existing.before_sha {
+                return Ok(());
+            }
+        }
+        let id = format!("snap-{}", self.session.snapshots.len() + 1);
+        let mut snapshot = store.record_file_snapshot(&id, path, bytes.map(String::into_bytes))?;
+        snapshot.message_index = self.session.messages.len();
+        self.session.snapshots.push(snapshot);
+        Ok(())
+    }
+
+    /// Rewinds to the first `messages` messages (spec §9.2): drops the
+    /// rest, and restores every file a dropped turn changed, to its
+    /// newest snapshot taken inside the dropped range whose bytes still
+    /// match what was snapshotted. Returns the restored paths and the
+    /// ones that could not be restored (changed on disk since).
+    pub fn rewind(&mut self, messages: usize) -> Result<(Vec<String>, Vec<String>), SessionError> {
+        let Some(store) = self.store.clone() else {
+            self.session.rewind_to(messages, &[]);
+            return Ok((Vec::new(), Vec::new()));
+        };
+        // The newest snapshot per path inside the dropped range.
+        // The state to restore a path to is what it held when the dropped
+        // range *began*: the oldest snapshot of the path inside the range
+        // (each snapshot is before that edit, so the first one in the range
+        // predates the range's first edit).
+        let mut restore: Vec<SnapshotRef> = Vec::new();
+        for (position, snapshot) in self.session.snapshots.iter().enumerate() {
+            if snapshot.message_index >= messages {
+                match restore
+                    .iter()
+                    .position(|picked| picked.path == snapshot.path)
+                {
+                    Some(at) => {
+                        let picked_position = self
+                            .session
+                            .snapshots
+                            .iter()
+                            .position(|other| other.id == restore[at].id)
+                            .unwrap_or(position);
+                        if position < picked_position {
+                            restore[at] = snapshot.clone();
+                        }
+                    }
+                    None => restore.push(snapshot.clone()),
+                }
+            }
+        }
+        let mut restored = Vec::new();
+        let mut refused = Vec::new();
+        let ids: Vec<String> = restore.iter().map(|snapshot| snapshot.id.clone()).collect();
+        let resolve = |path: &str| -> PathBuf {
+            // A tool path is relative to the session's cwd; a snapshot
+            // stores it as the tool wrote it.
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.session.cwd.join(path)
+            }
+        };
+        for snapshot in &restore {
+            let file = resolve(&snapshot.path);
+            if snapshot.created {
+                // The file was created inside the dropped range: delete it
+                // back, when it is still there.
+                if std::fs::remove_file(&file).is_ok() {
+                    restored.push(snapshot.path.clone());
+                } else {
+                    refused.push(snapshot.path.clone());
+                }
+                continue;
+            }
+            match store.read_snapshot(&snapshot.id) {
+                Ok(Some(bytes)) => {
+                    let current = std::fs::read(&file).ok();
+                    let current_sha = current.as_deref().map(|bytes| {
+                        use sha2::Digest;
+                        let mut hasher = sha2::Sha256::new();
+                        hasher.update(bytes);
+                        hex_digest(&hasher.finalize())
+                    });
+                    // The restore is safe when the file still holds what
+                    // the session last left it as. The next snapshot of
+                    // this path (after the one being restored) recorded the
+                    // bytes its edit saw — the state after this snapshot's
+                    // edit; with no later snapshot, the session's edit is
+                    // the last known write and the restore proceeds.
+                    // Safe while the file still holds what the next
+                    // snapshot of this path saw (the state after this
+                    // snapshot's edit): snapshots are in journal order, so
+                    // "next" is by position in the list, not message index
+                    // (a turn may edit the same file twice at one index).
+                    let snapshot_position = self
+                        .session
+                        .snapshots
+                        .iter()
+                        .position(|other| other.id == snapshot.id)
+                        .unwrap_or(0);
+                    let later = self
+                        .session
+                        .snapshots
+                        .iter()
+                        .enumerate()
+                        .filter(|(position, other)| {
+                            *position > snapshot_position && other.path == snapshot.path
+                        })
+                        .map(|(_, other)| other)
+                        .next();
+                    let safe = match &later {
+                        Some(later) if !later.created => {
+                            current_sha.as_deref() == Some(later.before_sha.as_str())
+                        }
+                        _ => true,
+                    };
+                    if !safe {
+                        refused.push(snapshot.path.clone());
+                        continue;
+                    }
+                    if std::fs::write(&file, &bytes).is_ok() {
+                        restored.push(snapshot.path.clone());
+                    } else {
+                        refused.push(snapshot.path.clone());
+                    }
+                }
+                Ok(None) => {
+                    // A snapshot whose bytes are gone: nothing to restore.
+                    refused.push(snapshot.path.clone());
+                }
+                Err(error) => {
+                    let _ = error;
+                    refused.push(snapshot.path.clone());
+                }
+            }
+        }
+        store.record_rewind(&mut self.session, messages, ids)?;
+        Ok((restored, refused))
     }
 
     fn record_usage(&mut self, input_tokens: u64, output_tokens: u64) -> Result<(), SessionError> {

@@ -41,6 +41,10 @@ pub async fn run_saved_prompt_streaming_events(
         let env = runtime
             .tool_env()
             .map_err(|message| AgentError::Tool(ToolError::Failed(message)))?;
+        // A typed edit/write snapshots too, as a model edit does (§9.2).
+        if let Some(path) = &edited_path {
+            let _ = runtime.snapshot_before_edit(path, env.as_ref()).await;
+        }
         let result = run
             .until_cancelled(execute_tool_in(
                 env.as_ref(),

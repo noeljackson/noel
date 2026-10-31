@@ -4347,6 +4347,13 @@ fn runs_are_saved_with_their_prompts_and_outlive_compaction_undo_and_restarts() 
         failure: None,
         restarts: 0,
         closed: false,
+        // The load path derives this; the first prompt of this test's
+        // journal starts at index 0, the second at 1.
+        start_message_index: match id {
+            "run-1" => 0,
+            // After the undo, later prompts start at index 1.
+            _ => 1,
+        },
     };
     let runs = || SessionStore::read(&path).unwrap().runs;
 

@@ -160,8 +160,62 @@ pub(crate) fn selector_for_kind(
             account_selector_items(config, runtime),
         )),
         "settings" => Ok(Selector::new("settings", settings_selector_items(config))),
+        "rewind" => Ok(rewind_selector(runtime)),
         _ => Err(anyhow!("unknown selector: {kind}")),
     }
+}
+
+/// The rewind picker (spec §9.2): one checkpoint per user prompt, newest
+/// first, each labeled with its prompt and the files the turns after it
+/// changed. The first item is the current point (a pick of it does
+/// nothing), like Claude Code's. A value is `m<messages kept>`: a bare
+/// number would be read as a position in the list.
+fn rewind_selector(runtime: &Runtime) -> Selector {
+    let session = runtime.session();
+    let mut items = vec![SelectorItem {
+        label: "(current)".to_string(),
+        value: format!("m{}", session.messages.len()),
+        active: true,
+    }];
+    let mut checkpoints: Vec<(usize, &noel_core::ConversationMessage)> = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == noel_core::MessageRole::User)
+        .collect();
+    checkpoints.reverse();
+    for (index, message) in checkpoints {
+        // The files a rewind to this checkpoint would consider: snapshots
+        // taken at or after it.
+        let files = session
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.message_index >= index)
+            .map(|snapshot| snapshot.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let summary: String = message
+            .content
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect();
+        let label = if files.is_empty() {
+            format!("{summary} · no code changes")
+        } else {
+            format!(
+                "{summary} · code: {}",
+                files.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
+        items.push(SelectorItem {
+            label,
+            value: format!("m{index}"),
+            active: false,
+        });
+    }
+    Selector::new("rewind", items)
 }
 
 pub(crate) fn sorted_models(models: &[ModelDefinition]) -> Vec<&ModelDefinition> {

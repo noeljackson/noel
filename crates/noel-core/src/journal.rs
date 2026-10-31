@@ -144,9 +144,13 @@ pub(crate) fn apply_session_record(state: &mut Option<SessionState>, record: Ses
             }
             // Whatever started a run, a load did not: it was interrupted
             // unless a `run_finished` record follows.
-            state
-                .runs
-                .extend(run.map(|run| Run::started(run, RunStatus::Interrupted)));
+            state.runs.extend(run.map(|run| {
+                Run::started(
+                    run,
+                    RunStatus::Interrupted,
+                    state.messages.len().saturating_sub(1),
+                )
+            }));
             // Submissions are placed only while a run is active: the last.
             let run_id = state.runs.last().map(|run| run.id.clone());
             state.place_queued(placed, run_id.as_deref());
@@ -208,7 +212,27 @@ pub(crate) fn apply_session_record(state: &mut Option<SessionState>, record: Ses
         SessionRecord::Usage { usage } => state.usage = usage,
         SessionRecord::RetryWait { .. } => {}
         SessionRecord::RunStarted { run } => {
-            state.runs.push(Run::started(run, RunStatus::Interrupted));
+            let start_message_index = state.messages.len().saturating_sub(1);
+            state.runs.push(Run::started(
+                run,
+                RunStatus::Interrupted,
+                start_message_index,
+            ));
+        }
+        SessionRecord::FileSnapshot {
+            id,
+            path,
+            before_sha,
+            created,
+        } => state.snapshots.push(SnapshotRef {
+            id,
+            path,
+            before_sha,
+            created,
+            message_index: state.messages.len(),
+        }),
+        SessionRecord::Rewound { messages, restore } => {
+            state.rewind_to(messages, &restore);
         }
         SessionRecord::RunClosed { run_id } => {
             if let Some(run) = state.run_mut(&run_id) {
