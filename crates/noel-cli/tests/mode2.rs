@@ -872,6 +872,74 @@ fn an_undo_and_a_rewind_restore_the_files_the_dropped_turns_changed() {
     assert_eq!(command("/undo"), "nothing to undo\n");
 }
 
+/// Plan mode (spec §9.4): the model is told to research and plan, an
+/// `edit` or `write` is refused, the view says the mode is on, and
+/// approving the plan leaves the mode and has it implemented.
+#[test]
+fn plan_mode_refuses_writes_until_the_plan_is_approved() {
+    let write =
+        json!({"tool_call": {"name": "write", "arguments": {"path": "x.txt", "content": "x\n"}}});
+    let script = json!([
+        [write.clone()],
+        [{"text": "Here is the plan."}],
+        [write],
+        [{"text": "Implemented."}],
+    ]);
+    let mut mode2 = Mode2::new("plan", script, json!({}));
+    let session = mode2.new_session("plan");
+    let mut watch = mode2.watch(&session);
+    watch.snapshot("the snapshot");
+    let runs = || mode2.journal(&session).matches("\"run_finished\"").count();
+    let file = mode2.root.join("cwd/x.txt");
+
+    let on = mode2.client(&["command", &session, "/plan"]);
+    assert!(on.starts_with("plan mode on"), "{on}");
+    watch.settle("plan mode in the view", |view| {
+        view["docs"]["pi.agent"]["planMode"] == true
+    });
+    mode2.client(&["send", &session, "add x.txt"]);
+    wait_until("the planning run", || runs() == 1);
+    assert!(!file.exists());
+    assert!(
+        mode2.journal(&session).contains("Tool write not found"),
+        "{}",
+        mode2.journal(&session)
+    );
+    let planning = mode2.requests()[0]["system_prompt"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(planning.contains("You are in plan mode."), "{planning}");
+    assert!(!planning.contains("\n- write: "), "{planning}");
+
+    // Keeping on planning changes nothing; approving leaves the mode and
+    // sends the plan to be implemented.
+    let keep = mode2.client(&["command", &session, "/select plan-approval keep"]);
+    assert!(keep.starts_with("still planning"), "{keep}");
+    let approved = mode2.client(&["command", &session, "/select plan-approval approve"]);
+    assert!(
+        approved.starts_with("plan approved: plan mode off\nstarted run "),
+        "{approved}"
+    );
+    wait_until("the implementing run", || runs() == 2);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "x\n");
+    let implementing = &mode2.requests()[2];
+    assert!(
+        !implementing["system_prompt"]
+            .as_str()
+            .unwrap()
+            .contains("You are in plan mode."),
+        "{implementing}"
+    );
+    assert_eq!(
+        implementing["messages"].as_array().unwrap().last().unwrap()["content"],
+        "The plan is approved. Implement it."
+    );
+    watch.settle("plan mode gone from the view", |view| {
+        view["docs"]["pi.agent"]["planMode"].is_null()
+    });
+}
+
 /// A goal (spec §9.3) starts the work when it is set, and after each turn
 /// that settles the evaluator, the session's own model without tools,
 /// says whether it is met: not met sends the work on, met clears the goal.

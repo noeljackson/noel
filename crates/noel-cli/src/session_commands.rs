@@ -121,6 +121,30 @@ pub(crate) enum CommandOutcome {
     },
 }
 
+/// What an approved plan is implemented by: the prompt sent for the user.
+const PLAN_APPROVED: &str = "The plan is approved. Implement it.";
+
+/// The choice a plan-mode turn settles into (spec §9.4). A pick comes back
+/// as `/select plan-approval <value>`.
+pub(crate) fn plan_approval_selector() -> TuiSelectorState {
+    let selector = Selector::new(
+        "plan",
+        vec![
+            SelectorItem {
+                label: "approve the plan and implement it".to_string(),
+                value: "approve".to_string(),
+                active: true,
+            },
+            SelectorItem {
+                label: "keep planning".to_string(),
+                value: "keep".to_string(),
+                active: false,
+            },
+        ],
+    );
+    TuiSelectorState::new("plan-approval", selector, "", None)
+}
+
 /// Opens selector `kind`, filtered by `query`: an empty one is a note.
 pub(crate) fn open_selector(
     ui: &mut impl CommandUi,
@@ -238,6 +262,39 @@ pub(crate) async fn run(
             }
         }
         "/summaries" => ui.push(TuiEntryKind::System, format_summaries(runtime)),
+        "/plan" => {
+            // Toggle plan mode (spec §9.4): read-only research, then a
+            // plan the client offers for approval when the turn settles.
+            let on = !runtime.session().plan_mode;
+            runtime.set_plan_mode(on)?;
+            ui.push(
+                TuiEntryKind::System,
+                if on {
+                    "plan mode on: the model researches and presents a plan, and cannot edit or write files. When its turn settles, approve the plan or keep planning; /plan again leaves the mode"
+                } else {
+                    "plan mode off"
+                },
+            );
+        }
+        _ if line.starts_with("/select plan-approval ") => {
+            // The verdict on a plan-mode turn: approving leaves the mode
+            // and has the plan implemented; otherwise the mode stays.
+            match line.trim_start_matches("/select plan-approval ").trim() {
+                "approve" => {
+                    runtime.set_plan_mode(false)?;
+                    ui.push(TuiEntryKind::System, "plan approved: plan mode off");
+                    return Ok(CommandOutcome::Submit {
+                        prompt: TypedPrompt::from(PLAN_APPROVED.to_string()),
+                        media: Vec::new(),
+                    });
+                }
+                "keep" => ui.push(
+                    TuiEntryKind::System,
+                    "still planning: say what to look into, or what to change in the plan",
+                ),
+                other => return Err(anyhow!("plan: not a choice: {other}")),
+            }
+        }
         _ if line.split_whitespace().next() == Some("/goal") => {
             // `/goal <condition>` sets one (replacing any earlier) and
             // starts the work; `/goal clear` stops early; bare `/goal`

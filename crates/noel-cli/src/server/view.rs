@@ -10,7 +10,8 @@
 //!   and past 100 the oldest leave in one splice down to 50. `before` names
 //!   the entry just before the window; `noel.chat`'s `entries` method pages
 //!   back from it.
-//! - `docs["pi.agent"]`: `{model?, thinkingLevel, cwd, compaction?}`.
+//! - `docs["pi.agent"]`: `{model?, thinkingLevel, cwd, compaction?,
+//!   planMode?}`.
 //! - `docs["pi.live"]`: a subset of Durable's `pi.live` v3. While a run is
 //!   active, `run` (`{runId, requestId?, inputs, turns}`), `generation`
 //!   (`{attempt, message?, retry?}`, where `message` is the reply's
@@ -961,6 +962,9 @@ pub(crate) fn agent(runtime: &Runtime, config: &noel_config::LoadedConfig) -> Va
     }
     if let Some(compaction) = &session.compaction {
         doc["compaction"] = json!(compaction);
+    }
+    if session.plan_mode {
+        doc["planMode"] = json!(true);
     }
     doc
 }

@@ -279,6 +279,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "keep working until an evaluator confirms the condition; show it, or stop early",
     },
     CommandHelp {
+        command: "/plan",
+        description: "toggle plan mode: research and a plan to approve, no file edits",
+    },
+    CommandHelp {
         command: "/rewind",
         description: "rewind to an earlier prompt, with or without the file changes since; restores its prompt",
     },

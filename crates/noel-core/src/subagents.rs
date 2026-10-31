@@ -244,6 +244,8 @@ pub(crate) fn child_runtime(
         active_tool_names: scoped,
         disabled_tools: BTreeSet::new(),
         workspace: parent.session.workspace.clone(),
+        // A subagent of a planning session plans too: it changes no file.
+        plan_mode: parent.session.plan_mode,
         ..empty_session()
     };
     Ok(Runtime::new(session, systems))

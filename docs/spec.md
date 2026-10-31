@@ -434,6 +434,36 @@ noel's journal, run by the session's worker.
   `clear_goal`/`advance_goal`, `/goal` in `session_commands.rs`, and the
   loop (`goal_step`) in `crates/noel-cli/src/server/worker.rs`.
 
+### 9.4 Plan mode
+
+**Decided (2026-10-31, revised 2026-11-12):** Claude Code's plan mode, as
+a journaled mode.
+
+- **`/plan`** toggles it (the footer says `plan`). In plan mode the
+  system prompt gains the rules — research with read-only tools, `bash`
+  for inspection only, present a concrete plan and do not implement —
+  and `edit`/`write` are refused outright (`Tool edit not found`, the
+  existing disabled-tool answer), so planning cannot change files.
+  Extension, plugin and MCP tools are unaffected: their own gates decide
+  them. A subagent of a planning session is in plan mode too.
+- **Approval:** the view says the mode is on (`pi.agent.planMode`), and
+  a client opens the choice when a plan-mode run it watched ends
+  completed: `approve the plan and implement it` or `keep planning`. The
+  pick is `/select plan-approval approve|keep`. Approve journals the mode
+  off and submits `The plan is approved. Implement it.`, so the work
+  starts at once; keep planning, or closing the choice, stays in the
+  mode. A goal active under plan mode runs its loop only once planning
+  is done.
+- The mode is journaled (`plan_mode` records), so a resumed session keeps
+  it; it is not part of a session export (a mode of the moment, not
+  durable identity).
+- **Out of scope (for now):** a dedicated plan-approval tool the model
+  calls (Claude's `ExitPlanMode`) — the settle selector covers the loop.
+
+**Built:** `Runtime::set_plan_mode`, the tool refusal in
+  `model_tool_enabled`, the prompt addendum, `/plan` and the pick in
+  `session_commands.rs`, and the choice in `attach.rs`.
+
 ### 9.5 Hooks
 
 **Decided (2026-10-31):** Claude Code's tool hooks, as plain settings —
