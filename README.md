@@ -566,14 +566,17 @@ Project entries replace global entries of the same name; a project entry
 with only `{"enabled": false}` turns a global server off without holding
 its credentials. `${NAME}` in `env` expands from the environment.
 
-Servers connect (stdio) at the first run that needs them, and their tools
-join the session as `mcp__<server>__<tool>`, callable by the model like
-any tool; a server that fails to connect is one system line and its tools
-are simply absent until a later run retries it. `/mcp` lists the servers
-and their live tool counts, `noel mcp list` names them from the shell,
-and `/reload` re-reads `mcp.json`. HTTP entries (`"url": ...`) parse but
-are reported as unsupported until the HTTP transport is ported;
-`--no-mcp` keeps every server from connecting.
+Servers connect — stdio entries by spawning the command, HTTP entries
+(`"url": ...`) over the streamable-HTTP transport (JSON or SSE answers,
+session and protocol-version headers, stream resumption and reconnect)
+— at the first run that needs them, and their tools join the session as
+`mcp__<server>__<tool>`, callable by the model like any tool; a server
+that fails to connect is one system line and its tools are simply
+absent until a later run retries it. `/mcp` lists the servers and their
+live tool counts, `noel mcp list` names them from the shell, and
+`/reload` re-reads `mcp.json`. `--no-mcp` keeps every server from
+connecting. OAuth sign-in for HTTP servers that answer 401 is not
+ported yet.
 
 ### Subagents
 
@@ -965,8 +968,9 @@ refresh: refreshing one spends that CLI's single-use refresh token and signs it
 out, so `noel auth` refreshes them only once they expire, as requests do, and
 prints or reports a token that expires sooner with a warning on stderr. noel's
 own accounts, including saved `claude-import`/`codex-import` copies, refresh
-early. noel's MCP support is stdio-only (see [MCP servers](#mcp-servers));
-`--no-mcp` keeps configured servers from connecting this run.
+early. noel's MCP covers stdio and streamable-HTTP servers (see
+[MCP servers](#mcp-servers)); `--no-mcp` keeps configured servers from
+connecting this run.
 
 ### Account failover
 

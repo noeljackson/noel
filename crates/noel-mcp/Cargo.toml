@@ -11,6 +11,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+bytes = "1"
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "process", "rt", "macros", "time", "sync"] }

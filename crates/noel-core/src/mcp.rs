@@ -177,10 +177,23 @@ impl McpHosts {
     }
 }
 
-/// Connects one configured server (stdio; HTTP entries are reported as
-/// unsupported until the transport is ported).
+/// Connects one configured server: stdio by spawning it, HTTP through
+/// the streamable-HTTP transport.
 async fn connect(server: &McpServer, cwd: &std::path::Path) -> Result<McpClient, String> {
     match &server.config {
+        McpServerConfig::Http { url, headers } => {
+            let options = noel_mcp::HttpOptions {
+                url: url.clone(),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), noel_config::mcp::expand_env(value)))
+                    .collect(),
+                ..Default::default()
+            };
+            McpClient::connect_http(options)
+                .await
+                .map_err(|error| error.to_string())
+        }
         McpServerConfig::Stdio {
             command,
             args,
@@ -210,9 +223,6 @@ async fn connect(server: &McpServer, cwd: &std::path::Path) -> Result<McpClient,
                 .await
                 .map_err(|error| format!("{error}: {}", stderr_hint(&error)))
         }
-        McpServerConfig::Http { url, .. } => Err(format!(
-            "HTTP MCP servers are not supported yet (this entry: {url}); use a stdio command"
-        )),
     }
 }
 
@@ -314,11 +324,13 @@ done
     }
 
     #[tokio::test]
-    async fn an_http_entry_says_unsupported() {
+    async fn an_http_entry_connects_through_the_http_transport() {
+        // A server that answers nothing: the connect fails with a
+        // transport error naming the URL, not an "unsupported" refusal.
         let http = McpServer {
             name: "docs".to_string(),
             config: McpServerConfig::Http {
-                url: "https://example.com/mcp".to_string(),
+                url: "http://127.0.0.1:9/mcp".to_string(),
                 headers: BTreeMap::new(),
             },
         };
@@ -327,6 +339,9 @@ done
             .start(&[http], std::path::Path::new("/tmp"), &mut Vec::new())
             .await;
         assert_eq!(failures.len(), 1);
-        assert!(failures[0].contains("not supported yet"), "{failures:?}");
+        assert!(
+            failures[0].contains("docs") && !failures[0].contains("not supported"),
+            "{failures:?}"
+        );
     }
 }

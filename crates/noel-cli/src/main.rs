@@ -649,10 +649,7 @@ async fn try_run_package_command() -> Result<bool> {
                             println!("{}  stdio: {} {}", server.name, command, args.join(" "));
                         }
                         noel_config::mcp::McpServerConfig::Http { url, .. } => {
-                            println!(
-                                "{}  http: {} (unsupported until the HTTP transport is ported)",
-                                server.name, url
-                            );
+                            println!("{}  http: {}", server.name, url);
                         }
                     }
                 }
@@ -8254,7 +8251,7 @@ async fn handle_tui_submission(
                                 if tools == 1 { "" } else { "s" }
                             ),
                             noel_config::mcp::McpServerConfig::Http { url, .. } => {
-                                format!("{}  {url} (http: not supported yet)", server.name)
+                                format!("{}  {url} (http)", server.name)
                             }
                         }
                     })

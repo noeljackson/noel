@@ -49,11 +49,59 @@ pub enum McpError {
     Invalid(String),
     #[error("MCP server {0}")]
     Spawn(String),
+    /// The server answered 401 (or a 403 asking more scope): the OAuth
+    /// layer's cue. The body is kept for its error payload.
+    #[error("MCP server requires authentication")]
+    AuthRequired { body: String },
+    /// A 404 while holding a session id: the session expired.
+    #[error("MCP session expired")]
+    SessionExpired(String),
 }
 
 /// A connected MCP client over one stdio server.
+/// Which transport a client runs on.
+enum Transport {
+    Stdio(StdioTransport),
+    Http(crate::http::HttpTransport),
+}
+
+impl Transport {
+    async fn send(&mut self, message: &JsonRpcMessage) -> Result<Option<JsonRpcMessage>, McpError> {
+        match self {
+            Self::Stdio(transport) => {
+                // stdio echoes nothing back through send; answers arrive
+                // as events, as the client's request pump reads them.
+                transport.send(message).await?;
+                Ok(None)
+            }
+            Self::Http(transport) => transport.send(message).await,
+        }
+    }
+
+    async fn next_event(&mut self) -> Option<crate::stdio::TransportEvent> {
+        match self {
+            Self::Stdio(transport) => transport.next_event().await,
+            Self::Http(_) => None,
+        }
+    }
+
+    async fn close(&mut self) {
+        match self {
+            Self::Stdio(transport) => transport.close().await,
+            Self::Http(transport) => transport.close().await,
+        }
+    }
+
+    fn stderr_tail(&self) -> String {
+        match self {
+            Self::Stdio(transport) => transport.stderr_tail(),
+            Self::Http(_) => String::new(),
+        }
+    }
+}
+
 pub struct McpClient {
-    transport: StdioTransport,
+    transport: Transport,
     next_id: AtomicI64,
     /// Pending requests by id, with a sender each: answering completes
     /// the caller's future.
@@ -74,11 +122,28 @@ impl McpClient {
         Self::with_timeout(options, DEFAULT_REQUEST_TIMEOUT).await
     }
 
+    /// Connects to a streamable-HTTP server (the handshake the same;
+    /// answers may arrive as JSON or SSE, which the transport splits).
+    pub async fn connect_http(options: crate::http::HttpOptions) -> Result<Self, McpError> {
+        let transport = crate::http::HttpTransport::new(options);
+        let mut client = Self {
+            transport: Transport::Http(transport),
+            next_id: AtomicI64::new(1),
+            pending: HashMap::new(),
+            server_info: None,
+            protocol_version: None,
+            instructions: None,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+        };
+        client.handshake().await?;
+        Ok(client)
+    }
+
     pub async fn with_timeout(options: StdioOptions, timeout: Duration) -> Result<Self, McpError> {
         let transport =
             StdioTransport::start(options).map_err(|error| McpError::Spawn(error.to_string()))?;
         let mut client = Self {
-            transport,
+            transport: Transport::Stdio(transport),
             next_id: AtomicI64::new(1),
             pending: HashMap::new(),
             server_info: None,
@@ -86,7 +151,14 @@ impl McpClient {
             instructions: None,
             timeout,
         };
-        let result: InitializeResult = client
+        client.handshake().await?;
+        Ok(client)
+    }
+
+    /// The initialize exchange: send, check the chosen version, notify
+    /// `notifications/initialized`.
+    async fn handshake(&mut self) -> Result<(), McpError> {
+        let result: InitializeResult = self
             .request_value(
                 "initialize",
                 Some(json!({
@@ -106,11 +178,18 @@ impl McpClient {
                 result.protocol_version
             )));
         }
-        client.server_info = Some(result.server_info.clone());
-        client.protocol_version = Some(result.protocol_version);
-        client.instructions = result.instructions;
-        client.notify("notifications/initialized").await?;
-        Ok(client)
+        self.server_info = Some(result.server_info.clone());
+        self.protocol_version = Some(result.protocol_version.clone());
+        self.instructions = result.instructions;
+        if let Transport::Http(transport) = &mut self.transport {
+            transport.set_protocol_version(
+                self.protocol_version
+                    .as_deref()
+                    .unwrap_or(LATEST_PROTOCOL_VERSION),
+            );
+        }
+        self.notify("notifications/initialized").await?;
+        Ok(())
     }
 
     /// One JSON-RPC request: send, pump events until its answer or the
@@ -129,9 +208,42 @@ impl McpClient {
             method: method.to_string(),
             params,
         });
+        // HTTP carries the answer back through send() (JSON or the SSE
+        // stream it reads to the response); stdio answers arrive as
+        // events the pump below reads.
+        if matches!(self.transport, Transport::Http(_)) {
+            match self.transport.send(&message).await {
+                Ok(Some(JsonRpcMessage::Response(response))) => {
+                    self.pending.remove(&id);
+                    return match response {
+                        JsonRpcResponse::Success { result, .. } => Ok(result),
+                        JsonRpcResponse::Error { error, .. } => Err(McpError::Server {
+                            code: error.code,
+                            message: error.message,
+                        }),
+                    };
+                }
+                Ok(Some(other)) => {
+                    // A server-initiated message before the answer.
+                    let _ = self.dispatch(other).await;
+                }
+                Ok(None) => {
+                    // Notifications answer nothing; a request without a
+                    // response is the stream's internal-error answer.
+                    self.pending.remove(&id);
+                    return Err(McpError::Invalid(
+                        "no answer on the HTTP stream".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    self.pending.remove(&id);
+                    return Err(error);
+                }
+            }
+        }
         if let Err(error) = self.transport.send(&message).await {
             self.pending.remove(&id);
-            return Err(error.into());
+            return Err(error);
         }
         let deadline = tokio::time::Instant::now() + self.timeout;
         loop {
@@ -243,7 +355,7 @@ impl McpClient {
                 params: None,
             }))
             .await
-            .map_err(|error| error.into())
+            .map(|_| ())
     }
 
     /// Every tool the server offers, following `nextCursor` through all

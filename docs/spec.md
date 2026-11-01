@@ -461,11 +461,23 @@ slice first.
   and page guards, `tools/call` with content validated and defaulted as
   upstream's validators do, result content converted for the model
   (text and images through, audio/links/binary as placeholders,
-  `structuredContent` standing in for empty content), and the stdio
-  transport: newline-delimited JSON over the server's stdin/stdout, the
-  server in its own process group, shutdown per the spec (stdin close,
-  SIGTERM, SIGKILL). A request times out (30 s default) and tells the
-  server it was cancelled.
+  `structuredContent` standing in for empty content). A request times
+  out (30 s default) and tells the server it was cancelled.
+- **The stdio transport**: newline-delimited JSON over the server's
+  stdin/stdout, the server in its own process group, shutdown per the
+  spec (stdin close, SIGTERM, SIGKILL).
+- **The streamable-HTTP transport** (upstream's
+  `transports/streamable-http.ts`): JSON-RPC over POST answered as JSON
+  or an SSE stream (whose events the client parses with the spec's line
+  discipline — joined `data:` lines, `id`/`retry` fields, bounded
+  sizes), a server-to-client GET stream opened after initialization
+  (405 means the server offers none), `Mcp-Session-Id` and
+  `MCP-Protocol-Version` headers, resumption by `Last-Event-ID` when a
+  stream drops after the server assigned ids, reconnection with
+  exponential backoff or the server's `retry`, and a best-effort DELETE
+  on close. A 401 (or a 403 asking more scope) surfaces as
+  `AuthRequired` for the OAuth layer; a 404 with a session is
+  `SessionExpired`.
 - **The config**: `mcp.json` in the agent dir and `.noel/mcp.json` of a
   trusted project, the shared `mcpServers` shape; project entries
   replace global ones of a name, and a project entry with only
@@ -478,10 +490,10 @@ slice first.
   tools absent until a later run retries. `/mcp` shows state,
   `noel mcp list` names them, `--no-mcp` connects none, `/reload`
   re-reads the config.
-- **Not ported (yet)**: the streamable-HTTP transport and OAuth,
-  resources and prompts, server push, exposure modes (upstream's
-  codemode/deferred/tool-search), and the `mcp add/remove/login/logout`
-  manager commands.
+- **Not ported (yet)**: OAuth for HTTP servers (the transport surfaces
+  `AuthRequired` for it), resources and prompts, exposure modes
+  (upstream's codemode/deferred/tool-search), and the
+  `mcp add/remove/login/logout` manager commands.
 
 **Built:** `crates/noel-mcp`, `crates/noel-config/src/mcp.rs`,
   `crates/noel-core/src/mcp.rs`, the `mcp` command and `/mcp` in the
