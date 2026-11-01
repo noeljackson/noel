@@ -937,13 +937,13 @@ whose tools join the session as `mcp__<server>__<tool>`, `noel mcp list`
 names them, `/mcp` shows their live state, and `--no-mcp` keeps them
 from connecting.
 
-Not ported: the streamable-HTTP transport and OAuth (upstream's
-`transports/streamable-http.ts`, `oauth/`), resources and prompts,
-server push notifications, and the exposure modes (codemode/deferred/
-tool-search) — an HTTP entry parses and is reported as unsupported.
-`noel mcp` subcommands other than `list` (`add`, `remove`, `login`,
-`logout`) are refused. Reason: HTTP/OAuth is a large surface this port
-has no consumer for yet; stdio covers local servers.
+Not ported: OAuth for HTTP servers (upstream's `oauth/`; the HTTP
+transport surfaces `AuthRequired` for it), resources and prompts, and
+the exposure modes (codemode/deferred/tool-search). `noel mcp`
+subcommands other than `list` (`add`, `remove`, `login`, `logout`) are
+refused. The streamable-HTTP transport itself is ported. Reason: OAuth
+needs the HTTP transport's auth hooks; the rest covers upstream
+surfaces noel's tool surface does not use.
 
 ### Local `/bug` Reports for This Port
 

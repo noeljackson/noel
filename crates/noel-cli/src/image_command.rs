@@ -347,10 +347,7 @@ pub(crate) async fn try_run_package_command() -> Result<bool> {
                             println!("{}  stdio: {} {}", server.name, command, args.join(" "));
                         }
                         noel_config::mcp::McpServerConfig::Http { url, .. } => {
-                            println!(
-                                "{}  http: {} (unsupported until the HTTP transport is ported)",
-                                server.name, url
-                            );
+                            println!("{}  http: {}", server.name, url);
                         }
                     }
                 }
