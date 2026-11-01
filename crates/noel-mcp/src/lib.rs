@@ -17,9 +17,11 @@
 //! prompts, which noel's tool surface does not use.
 
 pub mod client;
+pub mod http;
 pub mod protocol;
 pub mod stdio;
 
 pub use client::{McpClient, McpError, DEFAULT_REQUEST_TIMEOUT};
+pub use http::{consume_sse_stream, HttpOptions, HttpTransport};
 pub use protocol::{to_llm_content, CallToolResult, LlmContent, Tool};
 pub use stdio::{StdioOptions, StdioTransport, TransportEvent};

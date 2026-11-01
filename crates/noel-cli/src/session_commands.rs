@@ -264,7 +264,7 @@ pub(crate) async fn run(
                                 if tools == 1 { "" } else { "s" }
                             ),
                             noel_config::mcp::McpServerConfig::Http { url, .. } => {
-                                format!("{}  {url} (http: not supported yet)", server.name)
+                                format!("{}  {url} (http)", server.name)
                             }
                         }
                     })
