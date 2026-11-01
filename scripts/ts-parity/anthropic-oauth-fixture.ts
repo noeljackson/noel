@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "/ts-reference/packages/ai/src/index.ts";
+import { Type } from "/ts-reference/node_modules/typebox/build/index.mjs";
 import { stableUserAgent } from "./user-agent.ts";
 
 type CapturedRequest = {
@@ -105,6 +105,13 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 	}
 	if (sanitized["user-agent"]) {
 		sanitized["user-agent"] = stableUserAgent(sanitized["user-agent"]);
+	}
+	// The Node patch version churns per release; pin it like the kernel.
+	if (typeof sanitized["x-stainless-runtime-version"] === "string") {
+		sanitized["x-stainless-runtime-version"] = sanitized["x-stainless-runtime-version"].replace(
+			/v[\d.]+/,
+			"v<version>",
+		);
 	}
 	return sanitized;
 }

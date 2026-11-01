@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "/ts-reference/packages/ai/src/index.ts";
+import { Type } from "/ts-reference/node_modules/typebox/build/index.mjs";
 import { getModel, streamSimple } from "/ts-reference/packages/ai/src/compat.ts";
 
 async function captureBedrockPayload(withTools = false): Promise<unknown> {

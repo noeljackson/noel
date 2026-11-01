@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "/ts-reference/packages/ai/src/index.ts";
+import { Type } from "/ts-reference/node_modules/typebox/build/index.mjs";
 import { getModel, streamSimple } from "/ts-reference/packages/ai/src/compat.ts";
 import { convertResponsesMessages } from "/ts-reference/packages/ai/src/api/openai-responses-shared.ts";
 import { stableUserAgent } from "./user-agent.ts";
@@ -96,6 +96,13 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 	}
 	if (sanitized["user-agent"]) {
 		sanitized["user-agent"] = stableUserAgent(sanitized["user-agent"]);
+	}
+	// The Node patch version churns per release; pin it like the kernel.
+	if (typeof sanitized["x-stainless-runtime-version"] === "string") {
+		sanitized["x-stainless-runtime-version"] = sanitized["x-stainless-runtime-version"].replace(
+			/v[\d.]+/,
+			"v<version>",
+		);
 	}
 	return sanitized;
 }

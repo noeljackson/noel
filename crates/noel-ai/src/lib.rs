@@ -412,6 +412,7 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     r"input is too long for requested model",
     r"exceeds the context window",
     r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))",
+    r"context window exceeded",
     r"input token count.*exceeds the maximum",
     r"maximum prompt length is \d+",
     r"reduce the length of the messages",
@@ -3314,8 +3315,10 @@ fn pi_user_agent() -> &'static str {
 /// upstream embeds in the detailed `User-Agent`.
 const REFERENCE_PI_AI_VERSION: &str = "1.4.0";
 /// The Node version of the TS parity reference image, which upstream
-/// embeds as the runtime in the detailed `User-Agent`.
-const REFERENCE_NODE_VERSION: &str = "v24.22.1";
+/// embeds as the runtime in the detailed `User-Agent`. The fixture
+/// harness pins it (`stableUserAgent`), so the patch version here is
+/// arbitrary; `<version>` matches what the goldens carry.
+const REFERENCE_NODE_VERSION: &str = "<version>";
 
 fn format_pi_user_agent(platform: &str, arch: &str) -> String {
     format!("pi/{REFERENCE_PI_AI_VERSION} ({platform}; node/{REFERENCE_NODE_VERSION}; {arch})")

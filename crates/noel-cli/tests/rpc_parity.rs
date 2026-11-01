@@ -455,7 +455,8 @@ fn golden_records(name: &str, script: Value) -> Vec<Value> {
     for request in noel.logged_requests() {
         let prompt = request["system_prompt"].as_str().unwrap_or_default();
         assert!(
-            prompt.starts_with("You are an expert coding assistant") && prompt.contains("<cwd>")
+            prompt.starts_with("You are a coding assistant running inside")
+                && prompt.contains("<cwd>")
                 || prompt.starts_with("Create a concise continuation checkpoint"),
             "{name}: system prompt {prompt:?}"
         );

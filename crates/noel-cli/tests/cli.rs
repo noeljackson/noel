@@ -298,7 +298,7 @@ fn print_mode_sends_the_default_system_prompt_and_the_prompt_files() {
     // Not trusted: the project's .noel/SYSTEM.md is ignored.
     let prompt = system_prompt_sent(&root, &["--no-approve"]);
     let role = format!(
-        "You are an expert coding assistant operating inside {}, a coding agent harness.",
+        "You are a coding assistant running inside {}, a coding agent harness.",
         noel_core::PRODUCT_NAME
     );
     assert!(prompt.starts_with(&role), "{prompt}");
@@ -2317,7 +2317,7 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
     assert!(requests[3]["messages"][0]["content"]
         .as_str()
         .unwrap()
-        .starts_with("You are an expert coding assistant"));
+        .starts_with("You are a coding assistant running inside"));
     assert!(requests[3]["messages"][1]["content"]
         .as_str()
         .unwrap()
@@ -2408,7 +2408,11 @@ fn mcp_command_lists_configured_servers() {
     assert!(stdout.contains("calc"), "{stdout}");
     assert!(stdout.contains("calc-server"), "{stdout}");
 
-    let output = noel_command().args(["mcp", "add"]).current_dir(&root).output().unwrap();
+    let output = noel_command()
+        .args(["mcp", "add"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("mcp list"));
     fs::remove_dir_all(root).unwrap();

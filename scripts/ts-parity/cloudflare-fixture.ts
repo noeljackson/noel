@@ -97,6 +97,13 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 	if (sanitized["user-agent"]) {
 		sanitized["user-agent"] = stableUserAgent(sanitized["user-agent"]);
 	}
+	// The Node patch version churns per release; pin it like the kernel.
+	if (typeof sanitized["x-stainless-runtime-version"] === "string") {
+		sanitized["x-stainless-runtime-version"] = sanitized["x-stainless-runtime-version"].replace(
+			/v[\d.]+/,
+			"v<version>",
+		);
+	}
 	return sanitized;
 }
 

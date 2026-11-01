@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "/ts-reference/packages/ai/src/index.ts";
+import { Type } from "/ts-reference/node_modules/typebox/build/index.mjs";
 import { getModel, streamSimple } from "/ts-reference/packages/ai/src/compat.ts";
 import { convertMessages } from "/ts-reference/packages/ai/src/api/google-shared.ts";
 import { stableUserAgent } from "./user-agent.ts";
@@ -103,6 +103,17 @@ function sanitizeHeaders(headers: Record<string, string>): Record<string, string
 	}
 	if (sanitized["user-agent"]) {
 		sanitized["user-agent"] = stableUserAgent(sanitized["user-agent"]);
+	}
+	// google-genai-sdk embeds the Node version in its client header too.
+	if (typeof sanitized["x-goog-api-client"] === "string") {
+		sanitized["x-goog-api-client"] = sanitized["x-goog-api-client"].replace(/gl-node\/v[\d.]+/, "gl-node/v<version>");
+	}
+	// The Node patch version churns per release; pin it like the kernel.
+	if (typeof sanitized["x-stainless-runtime-version"] === "string") {
+		sanitized["x-stainless-runtime-version"] = sanitized["x-stainless-runtime-version"].replace(
+			/v[\d.]+/,
+			"v<version>",
+		);
 	}
 	return sanitized;
 }

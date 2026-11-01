@@ -46,10 +46,8 @@ impl PromptTool {
             "edit" => (
                 "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
                 &[
-                    "Use edit for precise changes (edits[].oldText must match exactly)",
-                    "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-                    "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-                    "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+                    "Use edit for targeted changes. Batch changes to one file in a single call.",
+                    "Each edits[].oldText must exactly and uniquely match the original file. Keep matches short and non-overlapping; merge nearby changes without including large unchanged regions.",
                 ],
             ),
             "write" => (
@@ -124,7 +122,7 @@ pub fn build_system_prompt(input: &SystemPromptInput<'_>) -> String {
         Some(custom) => sections.push(custom.to_string()),
         None => {
             sections.push(format!(
-                "You are an expert coding assistant operating inside {PRODUCT_NAME}, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files."
+                "You are a coding assistant running inside {PRODUCT_NAME}, a coding agent harness. Help users inspect files, run commands, and modify code."
             ));
             sections.push(section("tools", &tool_list(input.tools)));
             sections.push(section("rules", &rules(input.tools)));
@@ -170,9 +168,7 @@ fn tool_list(tools: &[PromptTool]) -> String {
     } else {
         listed.join("\n")
     };
-    format!(
-        "{listed}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project."
-    )
+    format!("{listed}\n\nAdditional tools may be available.")
 }
 
 fn rules(tools: &[PromptTool]) -> String {
@@ -408,7 +404,7 @@ mod tests {
             runtime_system_prompt(&runtime),
             format!(
                 "\
-You are an expert coding assistant operating inside {PRODUCT_NAME}, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+You are a coding assistant running inside {PRODUCT_NAME}, a coding agent harness. Help users inspect files, run commands, and modify code.
 
 <tools>
 - read: Read file contents
@@ -422,16 +418,14 @@ You are an expert coding assistant operating inside {PRODUCT_NAME}, a coding age
 - web_search: Search the web for current information
 - web_fetch: Fetch a web page as readable text
 
-In addition to the tools above, you may have access to other custom tools depending on the project.
+Additional tools may be available.
 </tools>
 
 <rules>
 - Use read to examine files instead of cat or sed.
 - You can inspect NOEL_* environment variables for current model and session details.
-- Use edit for precise changes (edits[].oldText must match exactly)
-- When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls
-- Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.
-- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.
+- Use edit for targeted changes. Batch changes to one file in a single call.
+- Each edits[].oldText must exactly and uniquely match the original file. Keep matches short and non-overlapping; merge nearby changes without including large unchanged regions.
 - Use write only for new files or complete rewrites.
 - Be concise in your responses
 - Show file paths clearly when working with files
@@ -498,7 +492,7 @@ In addition to the tools above, you may have access to other custom tools depend
             skills: &[],
             cwd: Path::new("C:\\work\\repo"),
         });
-        assert!(prompt.starts_with("You are an expert coding assistant"));
+        assert!(prompt.starts_with("You are a coding assistant running inside"));
         assert!(prompt.ends_with("<cwd>\nC:/work/repo\n</cwd>"));
     }
 }
