@@ -447,7 +447,18 @@ pub(crate) fn run_auth_logout(args: &[String]) -> Result<()> {
 
 pub(crate) async fn try_run_accounts_command() -> Result<bool> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.first().map(String::as_str) != Some("accounts") {
+    // As the package commands: skip leading global flags.
+    let first_word = args.first().map(String::as_str).unwrap_or_default();
+    let named = if first_word.starts_with('-') {
+        args.iter()
+            .position(|arg| !arg.starts_with('-'))
+            .and_then(|at| args.get(at))
+            .map(String::as_str)
+            .unwrap_or_default()
+    } else {
+        first_word
+    };
+    if named != "accounts" {
         return Ok(false);
     }
     run_accounts_status(&args[1..]).await?;

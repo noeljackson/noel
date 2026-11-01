@@ -9,6 +9,7 @@ pub mod extensions;
 mod hooks;
 mod input;
 mod journal;
+mod mcp;
 mod model_tools;
 pub mod plugins;
 mod progress;
@@ -29,11 +30,14 @@ mod tool_tests;
 mod turn;
 mod workspace;
 pub use compaction::RuntimeCompactionSettings;
+pub use hooks::{run_post_hooks, run_pre_hooks, HookDecision};
 pub use input::expand_input;
 #[allow(unused_imports)]
 pub use journal::*;
+pub use mcp::{McpHosts, McpTool, SharedMcpHosts};
 #[allow(unused_imports)]
 pub use model_tools::*;
+pub use noel_mcp::{McpClient, McpError, StdioOptions};
 pub use progress::{interrupted_output, RuntimeProgressSettings};
 use progress::{ReplyProgress, ToolProgress};
 #[allow(unused_imports)]
@@ -893,6 +897,11 @@ pub struct ReloadableSystems {
     pub progress: RuntimeProgressSettings,
     /// User hooks around tool calls (spec §9.5).
     pub hooks: HooksSettings,
+    /// MCP servers from the config (spec §9.7).
+    pub mcp_servers: Vec<noel_config::mcp::McpServer>,
+    /// The MCP tools the last run's connections offer, as the run's
+    /// tool surface holds them.
+    pub mcp_tools: Vec<McpTool>,
     pub model_context_windows: BTreeMap<String, u64>,
     /// Safety cap on provider rounds per run, including steering. Manual
     /// `Default` keeps the compiled cap; a derived zero would stop every
@@ -932,6 +941,8 @@ impl Default for ReloadableSystems {
             codemode: codemode::Presentation::default(),
             progress: RuntimeProgressSettings::default(),
             hooks: HooksSettings::default(),
+            mcp_servers: Vec::new(),
+            mcp_tools: Vec::new(),
             model_context_windows: BTreeMap::new(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
             restart_limit: DEFAULT_RESTART_LIMIT,
@@ -1135,6 +1146,8 @@ impl ReloadableSystems {
                 }
             },
             hooks: config.settings.hooks.clone().unwrap_or_default(),
+            mcp_servers: config.mcp_servers.clone(),
+            mcp_tools: Vec::new(),
             progress: {
                 let settings = config.settings.progress.clone().unwrap_or_default();
                 let interval = |ms: Option<u64>| {
@@ -2470,6 +2483,9 @@ pub struct Runtime {
     /// frontmatter of an agent definition); `None` means the mode cannot
     /// (a test runtime, say), and an override then fails with a message.
     subagent_provider_factory: Option<SubagentProviderFactory>,
+    /// The MCP server connections, started with the run that first
+    /// needs them (as extension hosts are).
+    mcp_hosts: SharedMcpHosts,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -2496,6 +2512,7 @@ impl Runtime {
             plugin_tools: Vec::new(),
             plugin_host: None,
             subagent_provider_factory: None,
+            mcp_hosts: Arc::new(tokio::sync::Mutex::new(McpHosts::default())),
         }
     }
 
@@ -2657,6 +2674,32 @@ impl Runtime {
         overlay_live_registrations(&mut self.systems, &hosts);
         overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
         diagnostics
+    }
+
+    /// Starts the MCP connections of the configured servers (spec §9.7),
+    /// as the run's extension hosts start, and overlays their tools on
+    /// the run's tool surface. One system line per newly-failed server.
+    pub async fn start_mcp_hosts(&mut self) -> Vec<String> {
+        let servers = self.systems.mcp_servers.clone();
+        let cwd = self.session.cwd.clone();
+        let owned = self.mcp_hosts_arc();
+        let mut hosts = owned.lock().await;
+        let mut overlay = std::mem::take(&mut self.systems.mcp_tools);
+        let failures = hosts.start(&servers, &cwd, &mut overlay).await;
+        self.systems.mcp_tools = overlay;
+        failures
+    }
+
+    /// The shared MCP hosts handle.
+    pub fn mcp_hosts_arc(&self) -> SharedMcpHosts {
+        self.mcp_hosts.clone()
+    }
+
+    /// Drops the configured MCP servers (`--no-mcp`): this run connects
+    /// none, and offers none of their tools.
+    pub fn clear_mcp_servers(&mut self) {
+        self.systems.mcp_servers.clear();
+        self.systems.mcp_tools.clear();
     }
 
     /// Refresh the overlay of live v2 registrations on the reloadable
@@ -3811,10 +3854,21 @@ fn enabled_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
                 parameters: tool.parameters.clone(),
             }),
     );
+    definitions.extend(
+        mcp::tool_definitions(&runtime.systems.mcp_tools)
+            .into_iter()
+            .filter(|tool| model_tool_enabled(runtime, &tool.name)),
+    );
     definitions
 }
 
 fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
+    let mcp_offered = name.starts_with("mcp__")
+        && runtime
+            .systems
+            .mcp_tools
+            .iter()
+            .any(|tool| tool.name == name);
     if name == codemode::CODEMODE {
         return codemode::selected(
             &runtime.systems.available_tool_names,
@@ -3822,7 +3876,11 @@ fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
         );
     }
     (runtime.session.active_tool_names.contains(name)
-        || runtime.systems.extension_tools.contains_key(name))
+        || runtime.systems.extension_tools.contains_key(name)
+        // MCP tools exist only through the overlay; the session's active
+        // tools (the built-ins) never name them. `--tools`/`enabledTools`
+        // scoping still applies through the available-name checks below.
+        || mcp_offered)
         && !runtime.session.disabled_tools.contains(name)
         && !(runtime.systems.offline && matches!(name, "web_search" | "web_fetch"))
         && ((runtime.systems.available_tool_names.is_empty()

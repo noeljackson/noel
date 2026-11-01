@@ -187,6 +187,11 @@ pub(crate) async fn run_model_turn(
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     runtime.load_workspace_context(run).await?;
+    // The MCP connections start with the run that first needs them; a
+    // failed server is a system line, its tools simply absent.
+    for failure in runtime.start_mcp_hosts().await {
+        on_event(&TurnEvent::Notice(failure));
+    }
     // The v2 hosts start with the run that first needs them, so their
     // handshakes' registrations reach the prompt and the provider request
     // of this turn (upstream loads its extensions at startup; noel's are

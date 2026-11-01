@@ -1,5 +1,6 @@
 mod agents;
 mod frontmatter;
+pub mod mcp;
 mod prompt_templates;
 mod resources;
 mod skills;
@@ -383,6 +384,18 @@ pub fn save_project_trust(
     Ok(trust_path)
 }
 
+/// A per-call unique id for test temp directories.
+#[cfg(test)]
+pub(crate) fn unique_test_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 pub fn project_is_trusted(agent_dir: &Path, cwd: &Path) -> Result<bool, ConfigError> {
     let trust_path = agent_dir.join(PROJECT_TRUST_FILE_NAME);
     let decisions = read_optional_json::<BTreeMap<String, bool>>(&trust_path)?.unwrap_or_default();
@@ -730,6 +743,8 @@ pub struct LoadedConfig {
     pub skills: Vec<Skill>,
     /// Subagent definitions, in load order; the first of a name won.
     pub agents: Vec<AgentDefinition>,
+    /// MCP servers, in load order; the first of a name won.
+    pub mcp_servers: Vec<mcp::McpServer>,
     pub prompt_templates: Vec<PromptTemplate>,
     pub themes: Vec<ResourceFile>,
     pub diagnostics: Vec<String>,
@@ -873,6 +888,10 @@ pub fn load_config_with_resources(
     );
     let (agents, agent_diagnostics) = agents::load_agents(&paths);
     diagnostics.extend(agent_diagnostics.iter().map(|d| d.describe("agent")));
+    let project_mcp_dir = project_trusted.then(|| project_config_dir(&paths.cwd));
+    let (mcp_servers, mcp_diagnostics) =
+        mcp::load_mcp_servers(&paths.agent_dir, project_mcp_dir.as_deref());
+    diagnostics.extend(mcp_diagnostics);
     let disabled = settings.disabled_resources.as_ref();
     let enabled = |resource_type, name: &str, path: &Path| {
         !resource_disabled(disabled, resource_type, name, path)
@@ -922,6 +941,7 @@ pub fn load_config_with_resources(
         extensions,
         skills,
         agents,
+        mcp_servers,
         prompt_templates,
         themes,
         diagnostics,

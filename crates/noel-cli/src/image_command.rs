@@ -261,6 +261,19 @@ pub(crate) fn image_extension_for_mime_type(mime_type: &str) -> Option<&'static 
 
 pub(crate) async fn try_run_package_command() -> Result<bool> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    // Leading global flags (`noel --approve mcp list`) must still reach
+    // the subcommand, or the run falls through to a session.
+    let Some(first_word) = args.first().cloned() else {
+        return Ok(false);
+    };
+    let args = if first_word.starts_with('-') {
+        args.iter()
+            .position(|arg| !arg.starts_with('-'))
+            .map(|at| args[at..].to_vec())
+            .unwrap_or_default()
+    } else {
+        args
+    };
     let Some(command) = args.first().map(String::as_str) else {
         return Ok(false);
     };
@@ -298,10 +311,55 @@ pub(crate) async fn try_run_package_command() -> Result<bool> {
             crate::exit_with(status)?;
             Ok(true)
         }
-        // Upstream's MCP server manager; refuse instead of prompting the model.
-        "mcp" => Err(anyhow!(
-            "noel mcp is not available: this port has no MCP support (see docs/rust-rewrite/non-parity-register.md)"
-        )),
+        // Upstream's MCP server manager. Slice 1 of this port: `list`
+        // names the configured servers of `mcp.json` and their state;
+        // the manager commands (add/remove/login) are not ported.
+        "mcp" => match args.get(1).map(String::as_str) {
+            Some("list") | None => {
+                let (paths, _) =
+                    noel_config::ConfigPaths::discover(std::env::current_dir()?, None)?;
+                // The project's mcp.json needs a trusted project; --approve
+                // and --no-approve decide, as the session startup does.
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                let trusted = if args.iter().any(|arg| arg == "--approve") {
+                    true
+                } else if args.iter().any(|arg| arg == "--no-approve") {
+                    false
+                } else {
+                    noel_config::project_is_trusted(&paths.agent_dir, &paths.cwd)?
+                };
+                let (servers, diagnostics) = noel_config::mcp::load_mcp_servers(
+                    &paths.agent_dir,
+                    trusted
+                        .then(|| noel_config::project_config_dir(&paths.cwd))
+                        .as_deref(),
+                );
+                for diagnostic in diagnostics {
+                    println!("! {diagnostic}");
+                }
+                if servers.is_empty() {
+                    println!("no MCP servers configured; add one to mcp.json (see the README)");
+                    return Ok(true);
+                }
+                for server in servers {
+                    match &server.config {
+                        noel_config::mcp::McpServerConfig::Stdio { command, args, .. } => {
+                            println!("{}  stdio: {} {}", server.name, command, args.join(" "));
+                        }
+                        noel_config::mcp::McpServerConfig::Http { url, .. } => {
+                            println!(
+                                "{}  http: {} (unsupported until the HTTP transport is ported)",
+                                server.name, url
+                            );
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            Some(other) => Err(anyhow!(
+                "noel mcp {other} is not available (this port ships `mcp list` only)"
+            )),
+        },
         // noel's own: install the bun runtime for TypeScript extension
         // hosts into the agent dir (`bin/bun`). Non-interactive.
         "bun" => {
@@ -309,10 +367,8 @@ pub(crate) async fn try_run_package_command() -> Result<bool> {
             match rest.first().map(String::as_str) {
                 Some("install") | None => {
                     let assume_yes = rest.iter().any(|arg| arg == "-y" || arg == "--yes");
-                    let (paths, _import) = noel_config::ConfigPaths::discover(
-                        std::env::current_dir()?,
-                        None,
-                    )?;
+                    let (paths, _import) =
+                        noel_config::ConfigPaths::discover(std::env::current_dir()?, None)?;
                     if !assume_yes {
                         println!(
                             "this downloads the bun runtime (~50 MB) into {}",
@@ -330,7 +386,9 @@ pub(crate) async fn try_run_package_command() -> Result<bool> {
                     bun_install::install_bun(&paths.agent_dir, |_| Ok(true), true).await?;
                     Ok(true)
                 }
-                Some(other) => Err(anyhow!("noel bun: unknown subcommand {other} (expected install)")),
+                Some(other) => Err(anyhow!(
+                    "noel bun: unknown subcommand {other} (expected install)"
+                )),
             }
         }
         _ => Ok(false),

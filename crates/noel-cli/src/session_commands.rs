@@ -233,6 +233,46 @@ pub(crate) async fn run(
             }
         }
         "/summaries" => ui.push(TuiEntryKind::System, format_summaries(runtime)),
+        "/mcp" => {
+            // The configured MCP servers and their live state (§9.7).
+            let servers = runtime.systems().mcp_servers.clone();
+            let mcp_tools = runtime.systems().mcp_tools.clone();
+            if servers.is_empty() {
+                ui.push(
+                    TuiEntryKind::System,
+                    "no MCP servers configured; add one to mcp.json (see the README)".to_string(),
+                );
+            } else {
+                let lines = servers
+                    .iter()
+                    .map(|server| {
+                        let tools = mcp_tools
+                            .iter()
+                            .filter(|tool| {
+                                tool.name.starts_with(&format!(
+                                    "mcp__{}__",
+                                    server.name.replace('-', "_")
+                                ))
+                            })
+                            .count();
+                        match &server.config {
+                            noel_config::mcp::McpServerConfig::Stdio { command, .. } => format!(
+                                "{}  {} ({} tool{})",
+                                server.name,
+                                command,
+                                tools,
+                                if tools == 1 { "" } else { "s" }
+                            ),
+                            noel_config::mcp::McpServerConfig::Http { url, .. } => {
+                                format!("{}  {url} (http: not supported yet)", server.name)
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ui.push(TuiEntryKind::System, lines);
+            }
+        }
         _ if line.split_whitespace().next() == Some("/compact") => {
             let focus = line.strip_prefix("/compact").unwrap_or_default().trim();
             return Ok(CommandOutcome::Compact {

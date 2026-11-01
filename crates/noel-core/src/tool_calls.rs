@@ -418,6 +418,30 @@ pub(crate) async fn execute_model_tool_call_with(
             is_error = true;
             vec![format!("Tool {} not found", tool_call.name)]
         }
+    } else if tool_call.name.starts_with("mcp__") {
+        if runtime
+            .systems
+            .mcp_tools
+            .iter()
+            .any(|tool| tool.name == tool_call.name)
+        {
+            let owned = runtime.mcp_hosts_arc();
+            let mut hosts = owned.lock().await;
+            match hosts.call(&tool_call.name, &tool_call.arguments).await {
+                Ok(noel_mcp::LlmContent::Text(text)) => vec![text],
+                Ok(noel_mcp::LlmContent::Image { .. }) => {
+                    is_error = true;
+                    vec!["image-only MCP tool result".to_string()]
+                }
+                Err(error) => {
+                    is_error = true;
+                    vec![error]
+                }
+            }
+        } else {
+            is_error = true;
+            vec![format!("Tool {} not found", tool_call.name)]
+        }
     } else if tool_call.name == "task" {
         if model_tool_enabled(runtime, "task") {
             match serde_json::from_str::<TaskToolArgs>(&tool_call.arguments) {
