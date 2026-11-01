@@ -11457,8 +11457,8 @@
           "result": {
             "summary": "Summary of the first turn.",
             "firstKeptEntryId": "<entry-id>",
-            "tokensBefore": 1414,
-            "estimatedTokensAfter": 1415,
+            "tokensBefore": 1302,
+            "estimatedTokensAfter": 1303,
             "usage": {
               "input": "<tokens>",
               "output": "<tokens>",
