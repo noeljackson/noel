@@ -7701,14 +7701,10 @@ fn apply_tui_selector_selection(
             app.push(TuiEntryKind::System, format!("theme: {name}"));
         }
         "session" | "sessions" | "resume" | "tree" => {
-            let path = resolve_session_reference(&config.paths.session_dir, &item.value)?;
-            let (store, state) = SessionStore::open(path)?;
-            runtime.replace_session(state, Some(store));
-            app.resume_pending = runtime.session().has_unfinished_turn();
-            if let Some(hint) = resume_hint(runtime) {
-                app.push(TuiEntryKind::System, hint);
-            }
-            app.push(TuiEntryKind::System, format_session(runtime));
+            // The picked session replaces this one with its transcript
+            // shown, exactly as a mid-turn pick swaps it (see
+            // `apply_midturn_session_resume`).
+            apply_midturn_session_resume(app, runtime, config, &item.value)?;
         }
         "branches" => {
             // The tree navigator's pick switches the session to that
@@ -8583,6 +8579,10 @@ async fn handle_tui_submission(
                 select_from_selector_message(config, runtime, &line)?,
             );
             if resuming {
+                // The transcript shows the session it opened, as a pick
+                // from the resume selector does.
+                app.clear_visible();
+                app.restore_session_messages(runtime);
                 app.resume_pending = runtime.session().has_unfinished_turn();
                 if let Some(hint) = resume_hint(runtime) {
                     app.push(TuiEntryKind::System, hint);
@@ -9074,6 +9074,9 @@ fn apply_midturn_session_resume(
     let (store, state) = SessionStore::open(path)?;
     runtime.replace_session(state, Some(store));
     app.clear_visible();
+    // The opened session's transcript is what the picker leaves on
+    // screen (as `noel -c` opens it), not an empty view of it.
+    app.restore_session_messages(runtime);
     app.resume_pending = runtime.session().has_unfinished_turn();
     if let Some(hint) = resume_hint(runtime) {
         app.push(TuiEntryKind::System, hint);
@@ -16825,6 +16828,49 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// A session swap (`/resume`'s pick, a mid-turn pick, `/select
+    /// session`) shows the opened session's transcript, not an empty
+    /// view: `apply_midturn_session_resume` restores the messages.
+    #[test]
+    fn a_session_swap_restores_the_transcript() {
+        let mut session = SessionState::new("s1", PathBuf::from("."));
+        for (role, content) in [
+            (MessageRole::User, "turn one says alpha"),
+            (MessageRole::Assistant, "[faux/echo] turn one says alpha"),
+            (MessageRole::User, "turn two says beta"),
+        ] {
+            session.messages.push(ConversationMessage {
+                thinking: String::new(),
+                role,
+                content: content.to_string(),
+                media: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                aborted: false,
+            });
+        }
+        let runtime = Runtime::new(session, ReloadableSystems::default());
+        let mut app = TuiApp::default();
+        // The swap: clear, restore, hint lines.
+        app.clear_visible();
+        app.restore_session_messages(&runtime);
+        app.push(TuiEntryKind::System, "session: s1".to_string());
+        let texts = app
+            .entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            texts.contains(&"turn one says alpha"),
+            "the opened session's transcript is shown: {texts:?}"
+        );
+        assert!(texts.contains(&"turn two says beta"));
+        // Prompt history is repopulated too, as a resume deserves.
+        app.history_previous();
+        assert_eq!(app.input, "turn two says beta");
     }
 
     #[test]
