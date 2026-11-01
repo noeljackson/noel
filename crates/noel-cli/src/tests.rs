@@ -569,6 +569,7 @@ fn command_completions_include_loaded_resources() {
         extensions: vec![test_resource("json-ext")],
         skills: vec![test_skill("review", "Review code.\nCarefully.")],
         agents: Vec::new(),
+        mcp_servers: Vec::new(),
         prompt_templates: vec![test_template(
             "fix",
             "Fix a bug",
@@ -735,6 +736,7 @@ fn account_test_config(auth: AuthData) -> LoadedConfig {
         extensions: Vec::new(),
         skills: Vec::new(),
         agents: Vec::new(),
+        mcp_servers: Vec::new(),
         prompt_templates: Vec::new(),
         themes: Vec::new(),
         diagnostics: Vec::new(),
@@ -3241,6 +3243,7 @@ fn slash_command_matches_follow_current_input() {
         extensions: vec![test_resource("json-ext")],
         skills: Vec::new(),
         agents: Vec::new(),
+        mcp_servers: Vec::new(),
         prompt_templates: Vec::new(),
         themes: Vec::new(),
         diagnostics: Vec::new(),
@@ -3387,6 +3390,7 @@ pub(super) fn minimal_test_config() -> LoadedConfig {
         extensions: Vec::new(),
         skills: Vec::new(),
         agents: Vec::new(),
+        mcp_servers: Vec::new(),
         prompt_templates: Vec::new(),
         themes: Vec::new(),
         diagnostics: Vec::new(),
@@ -3510,6 +3514,7 @@ fn persist_default_model_writes_settings_and_preserves_other_keys() {
         extensions: Vec::new(),
         skills: Vec::new(),
         agents: Vec::new(),
+        mcp_servers: Vec::new(),
         prompt_templates: Vec::new(),
         themes: Vec::new(),
         diagnostics: Vec::new(),
@@ -4413,7 +4418,7 @@ fn cli_contract_covers_upstream_ts_options_and_commands() {
 
 /// Upstream CLI commands this port deliberately leaves out, each with
 /// its docs/rust-rewrite/non-parity-register.md heading.
-const UNSUPPORTED_UPSTREAM_CLI_COMMANDS: &[(&str, &str)] = &[("mcp", "### No MCP Support")];
+const UNSUPPORTED_UPSTREAM_CLI_COMMANDS: &[(&str, &str)] = &[];
 
 #[test]
 fn tui_mode_flag_selects_owned_or_native_screen() {
@@ -4482,6 +4487,7 @@ fn rust_cli_command_contract() -> BTreeSet<String> {
         "config",
         "install",
         "list",
+        "mcp",
         "remove",
         "uninstall",
         "update",

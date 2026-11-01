@@ -1871,6 +1871,7 @@ dependencies = [
  "noel-codemode",
  "noel-config",
  "noel-env",
+ "noel-mcp",
  "noel-session",
  "noel-tools",
  "serde",
@@ -1928,6 +1929,18 @@ dependencies = [
 [[package]]
 name = "noel-markdown"
 version = "0.3.0"
+
+[[package]]
+name = "noel-mcp"
+version = "0.3.0"
+dependencies = [
+ "nix 0.29.0",
+ "noel-env",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
 
 [[package]]
 name = "noel-parity"

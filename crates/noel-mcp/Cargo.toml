@@ -1,0 +1,16 @@
+[package]
+name = "noel-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+noel-env = { path = "../noel-env" }
+nix = { workspace = true, default-features = false, features = ["signal"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "process", "rt", "macros", "time", "sync"] }

@@ -284,7 +284,9 @@ struct Cli {
     #[arg(long)]
     no_extensions: bool,
 
-    /// Accepted for upstream compatibility; noel has no MCP support, so this is a no-op.
+    /// Keeps the configured MCP servers from connecting in a run this
+    /// process makes itself (print mode). A session under the server is
+    /// run by its worker, which does not see this flag.
     #[arg(long)]
     no_mcp: bool,
 
@@ -590,6 +592,11 @@ async fn run() -> Result<()> {
     // A subagent definition's `model` frontmatter builds its provider
     // through this factory; the CLI knows the config and the client.
     install_subagent_provider_factory(&mut runtime, &config, offline);
+    // `--no-mcp` keeps the configured MCP servers from connecting this
+    // run, as upstream's flag does.
+    if cli.no_mcp {
+        runtime.clear_mcp_servers();
+    }
     if let Some(name) = &cli.name {
         let name = name.trim();
         if name.is_empty() {

@@ -84,8 +84,18 @@ pub(crate) fn models_contract() -> Arc<Contract> {
 /// other command.
 pub(crate) async fn try_run(args: &[String]) -> Option<i32> {
     use clap::Parser;
-    let command = args.get(1)?.as_str();
-    let rest = std::iter::once(format!("noel {command}")).chain(args[2..].iter().cloned());
+    // Leading global flags (`noel --approve mcp list`) must still reach
+    // the subcommand dispatch, or the run falls through to a session;
+    // skip them and hand both halves to the subcommand parser, whose
+    // globals accept any position clap allows.
+    let mut start = 1;
+    while args.get(start).is_some_and(|arg| arg.starts_with('-')) {
+        start += 1;
+    }
+    let command = args.get(start)?.as_str();
+    let rest = std::iter::once(format!("noel {command}"))
+        .chain(args[1..start].iter().cloned())
+        .chain(args[start + 1..].iter().cloned());
     Some(match command {
         "server" => match serve::ServerArgs::try_parse_from(rest) {
             Ok(parsed) => serve::run(parsed).await,

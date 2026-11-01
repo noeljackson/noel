@@ -2097,7 +2097,6 @@ fn usage_errors_import_nothing_and_the_first_command_that_loads_configuration_im
         &["config", "disable"],
         &["config", "disable", "bogus-kind", "name"],
         &["generate-image", "a prompt without an output"],
-        &["mcp", "list"],
     ] {
         let output = noel_on_default_dir(&root, &home, args);
         assert!(!output.status.success(), "{args:?}: {output:?}");
@@ -2389,12 +2388,35 @@ fn upstream_v1_1_flags_are_accepted_in_print_mode() {
 }
 
 #[test]
-fn mcp_command_reports_missing_support_instead_of_prompting() {
-    let output = noel_command().args(["mcp", "list"]).output().unwrap();
+fn mcp_command_lists_configured_servers() {
+    let root = test_dir("noel-cli-mcp-command");
+    fs::create_dir_all(root.join(".noel")).unwrap();
+    fs::write(
+        root.join(".noel/mcp.json"),
+        r#"{"mcpServers": {"calc": {"command": "calc-server", "args": ["--fast"]}}}"#,
+    )
+    .unwrap();
 
+    // A trusted project lists its server; `mcp` with anything but list
+    // (or nothing) still refuses, as the slice ships list only.
+    let output = noel_command()
+        .args(["--approve", "mcp", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("calc"), "{stdout}");
+    assert!(stdout.contains("calc-server"), "{stdout}");
+
+    let output = noel_command()
+        .args(["mcp", "add"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no MCP support"));
-    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mcp list"));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

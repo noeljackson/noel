@@ -1711,6 +1711,7 @@ mod tests {
             extensions: Vec::new(),
             skills: Vec::new(),
             agents: Vec::new(),
+            mcp_servers: Vec::new(),
             prompt_templates: Vec::new(),
             themes: Vec::new(),
             diagnostics: Vec::new(),
