@@ -1696,6 +1696,7 @@ dependencies = [
  "noel-ai",
  "noel-config",
  "noel-env",
+ "noel-mcp",
  "noel-session",
  "noel-tools",
  "serde",
@@ -1732,6 +1733,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "noel-mcp"
+version = "0.3.0"
+dependencies = [
+ "nix",
+ "noel-env",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "tokio",
 ]
 

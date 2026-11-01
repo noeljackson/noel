@@ -450,6 +450,43 @@ no host program, as extensions need.
 **Built:** `crates/noel-cli/src/background.rs`, the `&` prefix and `/bg`
   in the TUI.
 
+### 9.7 MCP
+
+**Decided (2026-11-01):** port upstream's `packages/mcp` — the stdio
+slice first.
+
+- **The client** (`crates/noel-mcp`): JSON-RPC 2.0 with upstream's
+  discriminators, the initialize handshake (the server's chosen version
+  must be one noel accepts), paged `tools/list` with duplicate-cursor
+  and page guards, `tools/call` with content validated and defaulted as
+  upstream's validators do, result content converted for the model
+  (text and images through, audio/links/binary as placeholders,
+  `structuredContent` standing in for empty content), and the stdio
+  transport: newline-delimited JSON over the server's stdin/stdout, the
+  server in its own process group, shutdown per the spec (stdin close,
+  SIGTERM, SIGKILL). A request times out (30 s default) and tells the
+  server it was cancelled.
+- **The config**: `mcp.json` in the agent dir and `.noel/mcp.json` of a
+  trusted project, the shared `mcpServers` shape; project entries
+  replace global ones of a name, and a project entry with only
+  `enabled: false` overrides the global entry without its credentials.
+  `${NAME}` in `env` expands from the environment.
+- **The surface**: servers connect at the first run that needs them (as
+  extension hosts start); their tools overlay the run's tool surface as
+  `mcp__<server>__<tool>` and execute through the connection, results
+  joined as the tool's text. A failed connect is one system line, its
+  tools absent until a later run retries. `/mcp` shows state,
+  `noel mcp list` names them, `--no-mcp` connects none, `/reload`
+  re-reads the config.
+- **Not ported (yet)**: the streamable-HTTP transport and OAuth,
+  resources and prompts, server push, exposure modes (upstream's
+  codemode/deferred/tool-search), and the `mcp add/remove/login/logout`
+  manager commands.
+
+**Built:** `crates/noel-mcp`, `crates/noel-config/src/mcp.rs`,
+  `crates/noel-core/src/mcp.rs`, the `mcp` command and `/mcp` in the
+  CLI and TUI.
+
 ## 10. Workspaces
 
 **Decided (2026-10-14):** workspaces match upstream.

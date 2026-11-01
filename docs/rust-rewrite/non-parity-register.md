@@ -818,19 +818,24 @@ conversation. The four APIs that carry images in tool results serve models
 that almost all accept them; those paths still send to every model, as
 upstream does for the same reason.
 
-### No MCP Support
+### MCP: stdio slice only
 
-Rust has no Model Context Protocol client. Upstream's `pi mcp` command
-(`list`, `login`, `logout`, `add`, `remove`), the `/mcp` slash command, MCP
-tools, and `mcp.json` are not ported. `noel mcp` exits with an error instead of
-sending "mcp ..." to the model as a prompt, and `--no-mcp` is accepted as a
-documented no-op so upstream invocations keep working. The CLI contract test
-(`cli_contract_covers_upstream_ts_options_and_commands`) exempts exactly the
-`mcp` command and requires this entry.
+noel has an MCP client (`crates/noel-mcp`, ported from upstream's
+`packages/mcp`): the JSON-RPC protocol, the initialize handshake, paged
+tool listings, tool calls, and the stdio transport, with the server in
+its own process group and spec-ordered shutdown. `mcp.json` (agent dir
+and trusted project, the shared `mcpServers` shape) configures servers
+whose tools join the session as `mcp__<server>__<tool>`, `noel mcp list`
+names them, `/mcp` shows their live state, and `--no-mcp` keeps them
+from connecting.
 
-Reason: MCP is a large protocol surface (stdio and HTTP transports, OAuth,
-tool exposure modes, codemode) outside the native CLI/TUI scope today.
-Revisit if noel adds an MCP client.
+Not ported: the streamable-HTTP transport and OAuth (upstream's
+`transports/streamable-http.ts`, `oauth/`), resources and prompts,
+server push notifications, and the exposure modes (codemode/deferred/
+tool-search) — an HTTP entry parses and is reported as unsupported.
+`noel mcp` subcommands other than `list` (`add`, `remove`, `login`,
+`logout`) are refused. Reason: HTTP/OAuth is a large surface this port
+has no consumer for yet; stdio covers local servers.
 
 ### Local `/bug` Reports for This Port
 

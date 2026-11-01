@@ -10,6 +10,7 @@ noel-ai = { path = "../noel-ai" }
 noel-agent = { path = "../noel-agent" }
 noel-config = { path = "../noel-config" }
 noel-env = { path = "../noel-env" }
+noel-mcp = { path = "../noel-mcp" }
 noel-session = { path = "../noel-session" }
 noel-tools = { path = "../noel-tools" }
 serde.workspace = true
