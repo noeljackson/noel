@@ -546,7 +546,10 @@ slice first.
   joined as the tool's text. A failed connect is one system line, its
   tools absent until a later run retries. `/mcp` shows state,
   `noel mcp list` names them, `--no-mcp` connects none, `/reload`
-  re-reads the config.
+  re-reads the config. `noel mcp add <name> --command … | --url … [-l]`
+  and `noel mcp remove <name> [-l]` edit the file (`-l`: the project's),
+  preserving unknown fields, with `--` separating server args that start
+  with `-`; a file that does not parse is refused, not replaced.
 - **Tool-argument validation** (pi-schema's semantics, upstream's
   `packages/ai/src/utils/validation.ts`): an MCP tool's declared schema
   validates the model's arguments before they reach the server —
@@ -558,8 +561,7 @@ slice first.
   hand-written validators, which the tool parity tests guard.
 - **Not ported (yet)**: the Client ID Metadata Document preference of
   registration (upstream's `oauth.clientRegistration`), resources and
-  prompts, exposure modes (upstream's codemode/deferred/tool-search),
-  and the `mcp add/remove` manager commands.
+  prompts, exposure modes (upstream's codemode/deferred/tool-search).
 
 **Built:** `crates/noel-mcp`, `crates/noel-config/src/mcp.rs`,
   `crates/noel-core/src/mcp.rs`, the `mcp` command and `/mcp` in the

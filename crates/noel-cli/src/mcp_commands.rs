@@ -1,6 +1,8 @@
 //! `noel mcp`: upstream's MCP server manager (spec §9.7). `list` names the
-//! servers of `mcp.json`; `login` and `logout` sign in to and out of an
-//! HTTP server with OAuth.
+//! servers of `mcp.json`; `add` and `remove` edit it; `login` and `logout`
+//! sign in to and out of an HTTP server with OAuth.
+
+use serde_json::{json, Value};
 
 use super::*;
 
@@ -63,10 +65,140 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
             }
             mcp_login(&paths.agent_dir, name, url).await
         }
+        Some("add") => add(&args[1..]),
+        Some("remove") => remove(&args[1..]),
         Some(other) => Err(anyhow!(
-            "noel mcp {other} is not available (this port ships `list`, `login` and `logout`)"
+            "noel mcp {other} is not a command: list, add, remove, login, logout"
         )),
     }
+}
+
+const ADD_USAGE: &str = "usage: noel mcp add <name> (--command <cmd> [args...] | --url <url>) [-l]; put server args that start with - after --";
+
+/// `noel mcp add <name> --command <cmd> [args...]` or `--url <url>`
+/// writes the entry to `mcp.json`: the user's, or with `-l` the project's.
+fn add(rest: &[String]) -> Result<()> {
+    let name = rest
+        .first()
+        .filter(|name| !name.starts_with('-'))
+        .ok_or_else(|| anyhow!(ADD_USAGE))?;
+    // Flags are read before a `--`: what follows it is the server's.
+    let own = rest
+        .iter()
+        .position(|arg| arg == "--")
+        .map_or(rest, |at| &rest[..at]);
+    let local = own.iter().any(|arg| arg == "-l" || arg == "--local");
+    let entry = if let Some(at) = own.iter().position(|arg| arg == "--command") {
+        // The command and its args: up to the next flag, and everything
+        // after a `--` (a server arg that starts with `-`).
+        let mut words: Vec<String> = own[at + 1..]
+            .iter()
+            .take_while(|arg| !arg.starts_with('-'))
+            .cloned()
+            .collect();
+        if let Some(split) = rest.iter().position(|arg| arg == "--") {
+            words.extend(rest[split + 1..].iter().cloned());
+        }
+        if words.is_empty() {
+            return Err(anyhow!("mcp add: --command needs a value"));
+        }
+        let command = words.remove(0);
+        println!("adding mcp {name} (stdio: {command})");
+        json!({"command": command, "args": words})
+    } else if let Some(at) = own.iter().position(|arg| arg == "--url") {
+        let url = own
+            .get(at + 1)
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .ok_or_else(|| anyhow!("mcp add: --url needs an http or https URL"))?;
+        println!("adding mcp {name} (http: {url})");
+        json!({"url": url})
+    } else {
+        return Err(anyhow!(ADD_USAGE));
+    };
+    let (path, what) = mcp_json(local)?;
+    let mut servers = read_servers(&path)?;
+    servers.insert(name.clone(), entry);
+    write_servers(&path, servers)?;
+    println!("added mcp {name} to {what}");
+    Ok(())
+}
+
+/// `noel mcp remove <name> [-l]`.
+fn remove(rest: &[String]) -> Result<()> {
+    let name = rest
+        .first()
+        .filter(|name| !name.starts_with('-'))
+        .ok_or_else(|| anyhow!("usage: noel mcp remove <name> [-l]"))?;
+    let local = rest.iter().any(|arg| arg == "-l" || arg == "--local");
+    let (path, what) = mcp_json(local)?;
+    let mut servers = read_servers(&path)?;
+    match servers.remove(name) {
+        Some(_) => {
+            write_servers(&path, servers)?;
+            println!("removed mcp {name} from {what}");
+        }
+        None => println!("no server named {name} in {what}"),
+    }
+    Ok(())
+}
+
+/// The `mcp.json` a command edits: the project's (`-l`) or the user's.
+fn mcp_json(local: bool) -> Result<(PathBuf, &'static str)> {
+    let (paths, _) = noel_config::ConfigPaths::discover(std::env::current_dir()?, None)?;
+    Ok(if local {
+        (
+            noel_config::project_config_dir(&paths.cwd).join("mcp.json"),
+            "the project's mcp.json",
+        )
+    } else {
+        (paths.agent_dir.join("mcp.json"), "the user's mcp.json")
+    })
+}
+
+/// `mcp.json` whole, as it is: an object, or nothing yet. A file that is
+/// there and is not a JSON object is an error, not an empty one: the
+/// write that follows would replace what the user wrote by hand.
+fn read_mcp_json(path: &Path) -> Result<serde_json::Map<String, Value>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(anyhow!("{}: {error}", path.display())),
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(root)) => Ok(root),
+        Ok(_) => Err(anyhow!(
+            "{} is not a JSON object; it is left as it is",
+            path.display()
+        )),
+        Err(error) => Err(anyhow!(
+            "{} does not parse ({error}); it is left as it is",
+            path.display()
+        )),
+    }
+}
+
+/// Its `mcpServers`, `name -> raw entry`, unknown fields kept.
+fn read_servers(path: &Path) -> Result<serde_json::Map<String, Value>> {
+    match read_mcp_json(path)?.remove("mcpServers") {
+        Some(Value::Object(servers)) => Ok(servers),
+        None => Ok(Default::default()),
+        Some(_) => Err(anyhow!(
+            "mcpServers in {} is not an object; it is left as it is",
+            path.display()
+        )),
+    }
+}
+
+/// Writes `mcp.json` with `servers`, its other top-level fields kept.
+fn write_servers(path: &Path, servers: serde_json::Map<String, Value>) -> Result<()> {
+    let mut root = read_mcp_json(path)?;
+    root.insert("mcpServers".to_string(), Value::Object(servers));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(&Value::Object(root))?;
+    noel_config::write_file_atomic(path, format!("{text}\n").as_bytes())?;
+    Ok(())
 }
 
 fn list() -> Result<()> {
