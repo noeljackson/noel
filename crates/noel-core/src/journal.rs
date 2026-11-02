@@ -209,6 +209,9 @@ pub(crate) fn apply_session_record(state: &mut Option<SessionState>, record: Ses
         }
         SessionRecord::BranchSummary { summary } => state.branch_summaries.push(summary),
         SessionRecord::Usage { usage } => state.usage = usage,
+        SessionRecord::RunUsage { run_id, usage } => {
+            state.run_usage.insert(run_id, usage);
+        }
         SessionRecord::RetryWait { .. } => {}
         SessionRecord::RunStarted { run } => {
             state.runs.push(Run::started(run, RunStatus::Interrupted));

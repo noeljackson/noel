@@ -262,6 +262,16 @@ pub(crate) async fn run(
             }
         }
         "/summaries" => ui.push(TuiEntryKind::System, format_summaries(runtime)),
+        // Each run's tokens and estimated cost, newest first, and a
+        // forecast of the next work (spec §9.8).
+        "/runs" => ui.push(
+            TuiEntryKind::System,
+            crate::run_costs::format_run_costs(runtime, config),
+        ),
+        "/cost" => ui.push(
+            TuiEntryKind::System,
+            crate::run_costs::format_cost_forecast(runtime, config),
+        ),
         "/sessions" => {
             // The other noel sessions this one can reach (spec §9.9): the
             // listing `noel client ls` prints, with what the server knows
