@@ -507,6 +507,15 @@ slice first.
   and `noel mcp remove <name> [-l]` edit the file (`-l`: the project's),
   preserving unknown fields, with `--` separating server args that start
   with `-`.
+- **Tool-argument validation** (pi-schema's semantics, upstream's
+  `packages/ai/src/utils/validation.ts`): an MCP tool's declared schema
+  validates the model's arguments before they reach the server —
+  coercion first (a numeric string for a number, a single value for an
+  array, `null` for an omitted optional, TypeBox's convert rules), then
+  upstream's error wording with dotted paths
+  (`- count: expected integer, got string`) and the received arguments
+  in the message the model can act on. Built-in tools keep their
+  hand-written validators, which the tool parity tests guard.
 - **Not ported (yet)**: the Client ID Metadata Document preference of
   registration (upstream's `oauth.clientRegistration`), resources and
   prompts, exposure modes (upstream's codemode/deferred/tool-search).

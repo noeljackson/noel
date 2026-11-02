@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 pub mod catalog;
+pub mod validation;
 
 pub use catalog::{ModelTraits, ThinkingLevelMap};
 

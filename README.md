@@ -579,7 +579,11 @@ that fails to connect is one system line and its tools are simply
 absent until a later run retries it. `/mcp` lists the servers and their
 live tool counts, `noel mcp list` names them from the shell, and
 `/reload` re-reads `mcp.json`. `--no-mcp` keeps every server from
-connecting. An HTTP server that answers 401 signs in with
+connecting. A tool's declared schema validates the model's arguments
+first — with coercion (a numeric string for a number, a lone value for
+an array) and pi-style errors (`- count: expected integer, got string`)
+— so a malformed call fails with a message the model can act on. An
+HTTP server that answers 401 signs in with
 `noel mcp login <name>`: OAuth discovery, client registration, a PKCE
 authorization in the browser against a loopback callback, and tokens
 stored in `mcp-auth.json`; connections send the stored access token
