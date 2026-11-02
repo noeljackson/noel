@@ -26,6 +26,7 @@ mod mistral;
 mod openai_chat;
 mod openai_responses;
 mod thinking;
+pub mod validation;
 
 pub use anthropic::*;
 pub(crate) use bedrock::*;

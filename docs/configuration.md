@@ -280,7 +280,10 @@ that fails to connect is one system line and its tools are simply
 absent until a later run retries it. `/mcp` lists the servers and their
 live tool counts, `noel mcp list` names them from the shell, and
 `/reload` re-reads `mcp.json`. `--no-mcp` keeps every server from
-connecting. OAuth sign-in for HTTP servers that answer 401 is not
+connecting. A tool's declared schema validates the model's arguments
+first — with coercion (a numeric string for a number, a lone value for
+an array) and pi-style errors (`- count: expected integer, got string`)
+— so a malformed call fails with a message the model can act on. OAuth sign-in for HTTP servers that answer 401 is not
 ported yet.
 
 ## Subagents
