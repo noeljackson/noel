@@ -239,6 +239,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "list session tree",
     },
     CommandHelp {
+        command: "/sessions",
+        description: "list the server's sessions, as noel client ls does",
+    },
+    CommandHelp {
         command: "/summaries",
         description: "show compaction and branch summaries",
     },

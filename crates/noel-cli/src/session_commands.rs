@@ -262,6 +262,34 @@ pub(crate) async fn run(
             }
         }
         "/summaries" => ui.push(TuiEntryKind::System, format_summaries(runtime)),
+        "/sessions" => {
+            // The other noel sessions this one can reach (spec §9.9): the
+            // listing `noel client ls` prints, with what the server knows
+            // of each (whether it is running).
+            let listed = tokio::process::Command::new(crate::server::own_exe())
+                .args(["client", "ls"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .await;
+            match listed {
+                Ok(listed) if listed.status.success() => {
+                    let text = String::from_utf8_lossy(&listed.stdout);
+                    let text = text.trim();
+                    ui.push(
+                        TuiEntryKind::System,
+                        if text.is_empty() {
+                            "no other sessions".to_string()
+                        } else {
+                            text.to_string()
+                        },
+                    );
+                }
+                _ => ui.push(
+                    TuiEntryKind::Error,
+                    "could not list sessions; `noel client ls` from a shell lists them",
+                ),
+            }
+        }
         "/plan" => {
             // Toggle plan mode (spec §9.4): read-only research, then a
             // plan the client offers for approval when the turn settles.
