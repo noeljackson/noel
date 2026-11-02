@@ -564,7 +564,11 @@ servers with the `mcpServers` shape shared by other MCP clients:
 
 Project entries replace global entries of the same name; a project entry
 with only `{"enabled": false}` turns a global server off without holding
-its credentials. `${NAME}` in `env` expands from the environment.
+its credentials. `${NAME}` in `env` expands from the environment. Or
+skip the file: `noel mcp add <name> --command <cmd> [args...]` and
+`noel mcp add <name> --url <url>` write it (`-l` for the project's,
+`--` before server args that start with `-`), `noel mcp remove <name>`
+removes, and `noel mcp list` names them all.
 
 Servers connect — stdio entries by spawning the command, HTTP entries
 (`"url": ...`) over the streamable-HTTP transport (JSON or SSE answers,

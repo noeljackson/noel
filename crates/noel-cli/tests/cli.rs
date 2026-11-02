@@ -2387,6 +2387,71 @@ fn upstream_v1_1_flags_are_accepted_in_print_mode() {
 }
 
 #[test]
+fn mcp_add_remove_round_trips() {
+    let root = test_dir("noel-cli-mcp-manager");
+    let agent = root.join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::create_dir_all(root.join(".noel")).unwrap();
+
+    // stdio with args after --; http; then list names both, remove drops one.
+    let run = |args: &[&str]| {
+        noel_command()
+            .args(args)
+            .env("NOEL_DIR", agent.to_str().unwrap())
+            .current_dir(&root)
+            .output()
+            .unwrap()
+    };
+    let out = run(&[
+        "mcp",
+        "add",
+        "calc",
+        "--command",
+        "calc-server",
+        "--",
+        "--fast",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = run(&["mcp", "add", "docs", "--url", "https://example.com/mcp"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let listed = run(&["mcp", "list"]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.contains("calc") && stdout.contains("calc-server --fast"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("docs"), "{stdout}");
+
+    // The stored shape round-trips with the dash-prefixed arg.
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(agent.join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(stored["mcpServers"]["calc"]["args"][0], "--fast");
+
+    // -l writes the project's .noel/mcp.json.
+    let out = run(&["mcp", "add", "ptool", "--command", "pt", "-l"]);
+    assert!(out.status.success());
+    assert!(root.join(".noel/mcp.json").exists());
+
+    // remove drops the entry and keeps the rest.
+    let out = run(&["mcp", "remove", "calc"]);
+    assert!(out.status.success());
+    let listed = run(&["mcp", "list"]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(!stdout.contains("calc-server"), "{stdout}");
+    assert!(stdout.contains("docs"), "{stdout}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn mcp_command_lists_configured_servers() {
     let root = test_dir("noel-cli-mcp-command");
     fs::create_dir_all(root.join(".noel")).unwrap();
@@ -2408,13 +2473,23 @@ fn mcp_command_lists_configured_servers() {
     assert!(stdout.contains("calc"), "{stdout}");
     assert!(stdout.contains("calc-server"), "{stdout}");
 
+    // `mcp add` without a shape prints usage and changes nothing; an
+    // unknown subcommand is still an error.
     let output = noel_command()
         .args(["mcp", "add"])
         .current_dir(&root)
         .output()
         .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("usage"));
+    assert!(!root.join("agent/mcp.json").exists());
+    let output = noel_command()
+        .args(["mcp", "frobnicate"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("noel mcp add"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("noel mcp frobnicate"));
     fs::remove_dir_all(root).unwrap();
 }
 

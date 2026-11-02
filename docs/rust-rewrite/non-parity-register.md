@@ -831,8 +831,7 @@ from connecting.
 
 Not ported: the Client ID Metadata Document preference of registration
 (upstream's `oauth.clientRegistration`), resources and prompts, and the
-exposure modes (codemode/deferred/tool-search). `noel mcp add` and
-`noel mcp remove` are refused; `list`, `login` and `logout` ship. The
+exposure modes (codemode/deferred/tool-search). `noel mcp` ships `list`, `add`, `remove`, `login` and `logout`. The
 streamable-HTTP transport and OAuth (discovery, dynamic registration,
 PKCE flow, loopback callback, token refresh) are ported. Reason: the
 rest covers upstream surfaces noel's tool surface does not use.

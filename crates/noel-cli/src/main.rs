@@ -655,6 +655,45 @@ async fn try_run_package_command() -> Result<bool> {
                 }
                 Ok(true)
             }
+            Some("add") => {
+                // `noel mcp add <name> --command ... [args]` or
+                // `--url ...` writes mcp.json; `-l` the project's.
+                let rest = &args[2..];
+                let Some(name) = rest.first().map(String::as_str) else {
+                    eprintln!("usage: noel mcp add <name> (--command <cmd> [args...] | --url <url>) [-l] [-- after --, server args that start with -]");
+                    return Ok(true);
+                };
+                let local = rest.iter().any(|arg| arg == "-l" || arg == "--local");
+                if rest.iter().any(|arg| arg == "--command") {
+                    mcp_add_stdio(name, rest, local)?;
+                } else if rest.iter().any(|arg| arg == "--url") {
+                    mcp_add_http(name, rest, local)?;
+                } else {
+                    eprintln!("mcp add needs --command <cmd> [args...] or --url <url>");
+                    return Ok(true);
+                }
+                Ok(true)
+            }
+            Some("remove") => {
+                let rest = &args[2..];
+                let Some(name) = rest.first().map(String::as_str) else {
+                    eprintln!("usage: noel mcp remove <name> [-l]");
+                    return Ok(true);
+                };
+                let local = rest.iter().any(|arg| arg == "-l" || arg == "--local");
+                let (paths, _) =
+                    noel_config::ConfigPaths::discover(std::env::current_dir()?, None)?;
+                let (path, what) = mcp_json_path(&paths, local)?;
+                let mut servers = read_mcp_json(&path);
+                match servers.remove(name) {
+                    Some(_) => {
+                        write_mcp_json(&path, &servers)?;
+                        println!("removed mcp {name} from {what}");
+                    }
+                    None => println!("no server named {name} in {what}"),
+                }
+                Ok(true)
+            }
             Some("login") | Some("logout") => {
                 let name = args.get(2).map(String::as_str);
                 let (paths, _) =
@@ -1692,6 +1731,131 @@ fn print_package_help(command: &str) {
         ),
         _ => {}
     }
+}
+
+/// The mcp.json a command edits: the project's (`-l`) or the user's.
+fn mcp_json_path(
+    paths: &noel_config::ConfigPaths,
+    local: bool,
+) -> Result<(std::path::PathBuf, String)> {
+    if local {
+        let dir = noel_config::project_config_dir(&paths.cwd);
+        std::fs::create_dir_all(&dir)?;
+        Ok((
+            dir.join("mcp.json"),
+            "the project's .noel/mcp.json".to_string(),
+        ))
+    } else {
+        Ok((
+            paths.agent_dir.join("mcp.json"),
+            "the user's mcp.json".to_string(),
+        ))
+    }
+}
+
+/// mcp.json as `name -> raw entry`, preserving unknown fields.
+fn read_mcp_json(path: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("mcpServers")
+                .and_then(|servers| servers.as_object().cloned())
+        })
+        .unwrap_or_default()
+}
+
+/// Writes mcp.json with `servers`, preserving other top-level fields.
+fn write_mcp_json(
+    path: &std::path::Path,
+    servers: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let mut root: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    root.insert(
+        "mcpServers".to_string(),
+        serde_json::Value::Object(servers.clone()),
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&serde_json::Value::Object(root))?,
+    )?;
+    Ok(())
+}
+
+fn mcp_add_stdio(name: &str, rest: &[String], local: bool) -> Result<()> {
+    let at = rest
+        .iter()
+        .position(|arg| arg == "--command")
+        .ok_or_else(|| anyhow!("mcp add: --command needs a value"))?;
+    // The command, then its args: either up to the next flag, or after
+    // a `--` separator everything that follows (a server arg that starts
+    // with `-`).
+    let after = &rest[at + 1..];
+    let split = after.iter().position(|arg| arg == "--");
+    let args = match split {
+        Some(at_split) => after[..at_split]
+            .iter()
+            .take_while(|arg| !arg.starts_with('-'))
+            .chain(&after[at_split + 1..])
+            .cloned()
+            .collect::<Vec<_>>(),
+        None => after
+            .iter()
+            .take_while(|arg| !arg.starts_with('-'))
+            .cloned()
+            .collect::<Vec<_>>(),
+    };
+    let mut args = args;
+    let Some(command) = args.first().cloned() else {
+        return Err(anyhow!("mcp add: --command needs a value"));
+    };
+    args.remove(0);
+    let (paths, _) = noel_config::ConfigPaths::discover(std::env::current_dir()?, None)?;
+    let (path, what) = mcp_json_path(&paths, local)?;
+    let mut servers = read_mcp_json(&path);
+    servers.insert(
+        name.to_string(),
+        serde_json::json!({"command": command, "args": args}),
+    );
+    write_mcp_json(&path, &servers)?;
+    println!("added mcp {name} (stdio: {command}) to {what}");
+    Ok(())
+}
+
+fn mcp_add_http(name: &str, rest: &[String], local: bool) -> Result<()> {
+    let at = rest
+        .iter()
+        .position(|arg| arg == "--url")
+        .ok_or_else(|| anyhow!("mcp add: --url needs a value"))?;
+    let url = rest
+        .get(at + 1)
+        .ok_or_else(|| anyhow!("mcp add: --url needs a value"))?
+        .trim_start_matches('-')
+        .to_string();
+    // --url <url>: the next non-flag arg; handle `--url=https://x` too.
+    let url = if url.starts_with("https://") || url.starts_with("http://") {
+        url
+    } else {
+        rest.get(at + 1).cloned().unwrap_or_default()
+    };
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(anyhow!("mcp add: --url needs an http or https URL"));
+    }
+    let (paths, _) = noel_config::ConfigPaths::discover(std::env::current_dir()?, None)?;
+    let (path, what) = mcp_json_path(&paths, local)?;
+    let mut servers = read_mcp_json(&path);
+    servers.insert(name.to_string(), serde_json::json!({"url": url}));
+    write_mcp_json(&path, &servers)?;
+    println!("added mcp {name} (http: {url}) to {what}");
+    Ok(())
 }
 
 /// `noel mcp login <server>`: discovery, client registration (or the
