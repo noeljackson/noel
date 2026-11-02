@@ -1436,6 +1436,16 @@ non-zero one adding a notice. A **post**-hook runs after the result is
 saved; its output is ignored, a non-zero exit is a notice. A hook that
 cannot run at all blocks, fail-closed. Hooks reload with `/reload`.
 
+### Sessions the model can reach
+
+A journaled session's system prompt tells the model other noel sessions
+exist and how to reach them from its bash tool: `noel client ls --json`
+(idle/busy state), `noel client send <id> <text>` (with `--steer` or
+`--follow-up`), `noel client watch <id>`. The model can delegate
+independent work to another session this way — the other session sees
+only what is sent. `/sessions` lists them for you; a subagent (`task`
+tool) is the same-session, scoped-tools alternative for decomposition.
+
 ### Plan mode
 
 `/plan` toggles plan mode (the footer says `plan`): the system prompt tells

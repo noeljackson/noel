@@ -8517,6 +8517,31 @@ async fn handle_tui_submission(
                 });
             }
         }
+        "/sessions" => {
+            // The other noel sessions this one can reach (spec §9.9):
+            // the same listing `noel client ls` prints.
+            let output = std::process::Command::new(crate::server::own_exe())
+                .args(["client", "ls"])
+                .output();
+            match output {
+                Ok(output) if output.status.success() => {
+                    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+                    let text = text.trim();
+                    app.push(
+                        TuiEntryKind::System,
+                        if text.is_empty() {
+                            "no other sessions; noel client ls lists them".to_string()
+                        } else {
+                            text.to_string()
+                        },
+                    );
+                }
+                _ => app.push(
+                    TuiEntryKind::System,
+                    "could not list sessions; noel client ls from a shell works".to_string(),
+                ),
+            }
+        }
         "/runs" => {
             // Each run's tokens and cost (spec §9.8), newest first.
             let lines = format_run_costs(runtime, config);

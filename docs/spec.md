@@ -547,6 +547,27 @@ slice first.
 **Built:** `run_usage` records and `Runtime::push_message_run`/
   `finish_prompt_run` in noel-core, `/runs` and `/cost` in the TUI.
 
+### 9.9 Sessions the model can reach
+
+**Decided (2026-11-02):** Claude Code's roster, taught through the
+  system prompt — no new protocol.
+
+- A **journaled** session's prompt gains a `<sessions>` section naming
+  the `noel client` verbs (`ls --json`, `send` with `--steer`/
+  `--follow-up`, `watch`) and the rule of thumb: check the listing for
+  an idle session, delegate work that can proceed without this
+  conversation's context, name yours so others can reach it. Ephemeral
+  runs, subagent children (whose ids end `-task`) and the TS parity
+  fixtures (no store) get no section, so prompt parity stays clean.
+- `/sessions` lists the other sessions in the TUI (what `noel client
+  ls` prints).
+- No new wire: the messaging is the Mode 2 server's own (§5–§8),
+  reached from the model's `bash`. A first-class `message` tool and a
+  live status footer are future work.
+
+**Built:** the section in `runtime_system_prompt`, `/sessions` in the
+  TUI.
+
 ## 10. Workspaces
 
 **Decided (2026-10-14):** workspaces match upstream.

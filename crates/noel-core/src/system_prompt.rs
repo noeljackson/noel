@@ -111,6 +111,11 @@ pub struct SystemPromptInput<'a> {
     /// active, as the tool to load a skill's file with, and without the
     /// skills that disable model invocation.
     pub skills: &'a [Skill],
+    /// This session can reach other noel sessions through `bash`
+    /// (`noel client ...`): a sessions section tells the model so. False
+    /// for ephemeral (`--no-session`) runs and the subagents' children,
+    /// which have no session of their own to be reached at.
+    pub sessions: bool,
     pub cwd: &'a Path,
 }
 
@@ -148,6 +153,18 @@ pub fn build_system_prompt(input: &SystemPromptInput<'_>) -> String {
         if !listing.trim().is_empty() {
             sections.push(section("skills", listing.trim()));
         }
+    }
+    // Other sessions, reached through bash (spec §9.9): the model learns
+    // the mechanism exists, as Claude's roster does for its agents.
+    if input.sessions && has("bash") {
+        sections.push(section(
+            "sessions",
+            "Other noel sessions can be reached from the bash tool:\n\
+- `noel client ls --json` lists sessions (their ids, live state, message counts)\n\
+- `noel client send <session-id> <text>` prompts another session (--steer interrupts its running turn; --follow-up queues)\n\
+- `noel client watch <session-id>` streams another session's transcript (it does not end on its own)\n\
+Delegate independent work to another session this way when it can proceed without this conversation's context: the other session sees only what you send. Check `noel client ls --json` first for busy/idle state and pick an idle session; name yours so others can reach it (`/rename <name>`).",
+        ));
     }
     let cwd = input.cwd.display().to_string().replace('\\', "/");
     sections.push(section("cwd", &cwd));
@@ -463,6 +480,7 @@ Additional tools may be available.
                 append_system_prompt: "",
                 context_files: &[],
                 skills,
+                sessions: false,
                 cwd: Path::new("/work"),
             })
         };
@@ -482,6 +500,36 @@ Additional tools may be available.
         assert!(!prompt(&["read"], &[hidden]).contains("<skills>"));
     }
 
+    /// A session with a journal learns it can reach others (spec §9.9):
+    /// the builder's `sessions` flag adds the section.
+    #[test]
+    fn a_journaled_session_tells_the_model_about_sessions() {
+        let tools = [PromptTool::builtin("bash")];
+        let with = build_system_prompt(&SystemPromptInput {
+            custom_prompt: None,
+            tools: &tools,
+            append_system_prompt: "",
+            context_files: &[],
+            skills: &[],
+            sessions: true,
+            cwd: Path::new("/work"),
+        });
+        assert!(with.contains("<sessions>"));
+        assert!(with.contains("noel client ls --json"));
+        assert!(with.contains("noel client send"));
+        // Without the flag (no journal, subagent child), nothing.
+        let without = build_system_prompt(&SystemPromptInput {
+            custom_prompt: None,
+            tools: &tools,
+            append_system_prompt: "",
+            context_files: &[],
+            skills: &[],
+            sessions: false,
+            cwd: Path::new("/work"),
+        });
+        assert!(!without.contains("<sessions>"));
+    }
+
     #[test]
     fn an_empty_custom_prompt_keeps_the_default_and_cwd_uses_forward_slashes() {
         let prompt = build_system_prompt(&SystemPromptInput {
@@ -490,6 +538,7 @@ Additional tools may be available.
             append_system_prompt: "",
             context_files: &[],
             skills: &[],
+            sessions: false,
             cwd: Path::new("C:\\work\\repo"),
         });
         assert!(prompt.starts_with("You are a coding assistant running inside"));

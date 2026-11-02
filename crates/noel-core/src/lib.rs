@@ -5105,6 +5105,13 @@ fn runtime_system_prompt(runtime: &Runtime) -> String {
             ),
             context_files: &runtime.systems.context_files,
             skills: &runtime.systems.skills,
+            // Other sessions are reachable through `bash` (`noel client
+            // ...`); a journaled session can be reached back, so its
+            // prompt says so (spec §9.9). Ephemeral runs, subagent
+            // children and the parity fixtures (no store) say nothing.
+            sessions: runtime.store.is_some()
+                && runtime.session.session_id != "ephemeral"
+                && !runtime.session.session_id.ends_with("-task"),
             cwd: &runtime.session.cwd,
         });
     };
@@ -5129,6 +5136,7 @@ fn runtime_system_prompt(runtime: &Runtime) -> String {
         ),
         context_files: &context_files,
         skills: &[],
+        sessions: false,
         cwd: Path::new(&workspace.cwd),
     })
 }
