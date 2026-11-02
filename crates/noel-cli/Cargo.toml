@@ -33,6 +33,7 @@ noel-plugin = { path = "../noel-plugin" }
 noel-config = { path = "../noel-config" }
 noel-codemode = { path = "../noel-codemode" }
 noel-core = { path = "../noel-core" }
+noel-mcp = { path = "../noel-mcp" }
 noel-env = { path = "../noel-env" }
 noel-tui = { path = "../noel-tui" }
 ratatui.workspace = true

@@ -24,6 +24,7 @@ mod clipboard;
 mod diagnostics;
 mod image_command;
 mod markdown;
+mod mcp_commands;
 mod media;
 mod model_refresh;
 mod model_select;
