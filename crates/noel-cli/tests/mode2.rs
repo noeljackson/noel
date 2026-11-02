@@ -770,6 +770,9 @@ fn slash_commands_run_on_the_worker_as_the_tui_types_them() {
     });
     let shown = mode2.client(&["command", &session, "/session"]);
     assert!(shown.contains(&session), "{shown}");
+    // The server's sessions, as `noel client ls` lists them.
+    let listed = mode2.client(&["command", &session, "/sessions"]);
+    assert!(listed.contains(&session), "{listed}");
     assert_eq!(
         mode2.client(&["command", &session, "/queue"]),
         "queue is empty\n"

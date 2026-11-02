@@ -54,6 +54,7 @@
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
 - `/undo` (undo the last turn and its file changes; its prompt goes back to the draft)
 - `/rewind` (the checkpoint picker: go back to any earlier prompt, with or without the file changes since; also Esc-Esc at an empty draft)
+- `/sessions` (list the server's sessions, as `noel client ls` does)
 - `/plan` (toggle plan mode: read-only research, then approve the plan to have it implemented)
 - `/goal [condition|clear]` (set the session goal and start on it; show it, or stop early)
 - `/usage` (recorded session token totals and account quotas)
@@ -178,6 +179,14 @@ tool audit history, queued messages, runs, or token usage, and a rewind does
 not reach past a compaction. The journal stays append-only: a restart loads
 the rewound state while nothing is erased from the file, and the history a
 client shows keeps the dropped entries above a `reset to N messages` line.
+
+A journaled session's system prompt tells the model other noel sessions
+exist and how to reach them from its bash tool: `noel client ls --json`
+(idle/busy state), `noel client send <id> <text>` (with `--steer` or
+`--follow-up`), `noel client watch <id>`. The model can delegate
+independent work to another session this way — the other session sees
+only what is sent. `/sessions` lists them for you; a subagent (`task`
+tool) is the same-session, scoped-tools alternative for decomposition.
 
 `/plan` toggles plan mode (the footer says `plan`): the system prompt tells
 the model to research with read-only tools, `bash` for inspection only, and

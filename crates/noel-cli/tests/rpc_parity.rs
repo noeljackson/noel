@@ -2708,7 +2708,7 @@ fn skills_and_templates_expand_in_prompt_steer_and_follow_up() {
     let system_prompt = noel.logged_requests()[0]["system_prompt"].clone();
     let system_prompt = system_prompt.as_str().unwrap();
     let listing = format!(
-        "<available_skills>\n  <skill>\n    <name>review</name>\n    <description>Review code for bugs.</description>\n    <location>{}</location>\n  </skill>\n</available_skills>\n</skills>\n\n<cwd>",
+        "<available_skills>\n  <skill>\n    <name>review</name>\n    <description>Review code for bugs.</description>\n    <location>{}</location>\n  </skill>\n</available_skills>\n</skills>\n\n<sessions>",
         skill_file.display()
     );
     assert!(system_prompt.contains("\n\n<skills>\nThe following skills provide"));
