@@ -575,8 +575,12 @@ that fails to connect is one system line and its tools are simply
 absent until a later run retries it. `/mcp` lists the servers and their
 live tool counts, `noel mcp list` names them from the shell, and
 `/reload` re-reads `mcp.json`. `--no-mcp` keeps every server from
-connecting. OAuth sign-in for HTTP servers that answer 401 is not
-ported yet.
+connecting. An HTTP server that answers 401 signs in with
+`noel mcp login <name>`: OAuth discovery, client registration, a PKCE
+authorization in the browser against a loopback callback, and tokens
+stored in `mcp-auth.json`; connections send the stored access token
+(trying one refresh after a 401), and `noel mcp logout <name>` clears
+them. Connections never open a browser on their own.
 
 ### Subagents
 

@@ -32,7 +32,7 @@ pub use goals::{
 };
 pub use hooks::{run_post_hooks, run_pre_hooks, HookDecision};
 pub use input::expand_input;
-pub use mcp::{McpHosts, McpTool, SharedMcpHosts};
+pub use mcp::{read_mcp_auth, write_mcp_auth, McpAuthEntry, McpHosts, McpTool, SharedMcpHosts};
 pub use noel_mcp::{McpClient, McpError, StdioOptions};
 pub use progress::{interrupted_output, RuntimeProgressSettings};
 use progress::{ReplyProgress, ToolProgress};
@@ -818,6 +818,8 @@ pub struct ReloadableSystems {
     pub hooks: HooksSettings,
     /// MCP servers from the config (spec §9.7).
     pub mcp_servers: Vec<noel_config::mcp::McpServer>,
+    /// The agent directory, where `mcp-auth.json` lives (spec §9.7).
+    pub mcp_agent_dir: Option<std::path::PathBuf>,
     /// The MCP tools the last run's connections offer, as the run's
     /// tool surface holds them.
     pub mcp_tools: Vec<McpTool>,
@@ -856,6 +858,7 @@ impl Default for ReloadableSystems {
             progress: RuntimeProgressSettings::default(),
             hooks: HooksSettings::default(),
             mcp_servers: Vec::new(),
+            mcp_agent_dir: None,
             mcp_tools: Vec::new(),
             model_context_windows: BTreeMap::new(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
@@ -1023,6 +1026,7 @@ impl ReloadableSystems {
             },
             hooks: config.settings.hooks.clone().unwrap_or_default(),
             mcp_servers: config.mcp_servers.clone(),
+            mcp_agent_dir: Some(config.paths.agent_dir.clone()),
             mcp_tools: Vec::new(),
             progress: {
                 let settings = config.settings.progress.clone().unwrap_or_default();
@@ -3214,10 +3218,13 @@ impl Runtime {
     pub async fn start_mcp_hosts(&mut self) -> Vec<String> {
         let servers = self.systems.mcp_servers.clone();
         let cwd = self.session.cwd.clone();
+        let agent_dir = self.systems.mcp_agent_dir.clone();
         let owned = self.mcp_hosts_arc();
         let mut hosts = owned.lock().await;
         let mut overlay = std::mem::take(&mut self.systems.mcp_tools);
-        let failures = hosts.start(&servers, &cwd, &mut overlay).await;
+        let failures = hosts
+            .start(&servers, &cwd, agent_dir.as_deref(), &mut overlay)
+            .await;
         self.systems.mcp_tools = overlay;
         failures
     }

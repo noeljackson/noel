@@ -13,6 +13,7 @@ use noel_config::mcp::{mcp_tool_name, McpServer, McpServerConfig};
 use tokio::sync::Mutex;
 
 use crate::AiToolDefinition;
+use noel_mcp::HttpOptions;
 use noel_mcp::{McpClient, StdioOptions};
 
 /// One connected server's live state: its client and cached tools.
@@ -47,6 +48,7 @@ impl McpHosts {
         &mut self,
         servers: &[McpServer],
         cwd: &std::path::Path,
+        agent_dir: Option<&std::path::Path>,
         overlay: &mut Vec<McpTool>,
     ) -> Vec<String> {
         let mut failures = Vec::new();
@@ -64,7 +66,7 @@ impl McpHosts {
             if self.failed.contains_key(name) {
                 continue;
             }
-            match connect(server, cwd).await {
+            match connect(server, cwd, agent_dir).await {
                 Ok(mut client) => match client.list_tools().await {
                     Ok(tools) => {
                         self.hosts.insert(name.clone(), Host { client, tools });
@@ -177,9 +179,47 @@ impl McpHosts {
     }
 }
 
+/// The stored credentials of one MCP server: its registered client and
+/// tokens (`<agent dir>/mcp-auth.json`, keyed by server name).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct McpAuthEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<noel_mcp::ClientInformation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<noel_mcp::OAuthTokens>,
+    /// The redirect URI of the stored grant, for refreshes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_url: Option<String>,
+}
+
+/// Reads `<agent dir>/mcp-auth.json`; missing is empty.
+pub fn read_mcp_auth(agent_dir: &std::path::Path) -> BTreeMap<String, McpAuthEntry> {
+    std::fs::read_to_string(agent_dir.join("mcp-auth.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Writes `<agent dir>/mcp-auth.json` whole.
+pub fn write_mcp_auth(
+    agent_dir: &std::path::Path,
+    auth: &BTreeMap<String, McpAuthEntry>,
+) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(auth).map_err(|error| error.to_string())?;
+    std::fs::write(agent_dir.join("mcp-auth.json"), text).map_err(|error| error.to_string())
+}
+
 /// Connects one configured server: stdio by spawning it, HTTP through
-/// the streamable-HTTP transport.
-async fn connect(server: &McpServer, cwd: &std::path::Path) -> Result<McpClient, String> {
+/// the streamable-HTTP transport. The stored access token is sent when
+/// one exists; a 401 during the handshake tries one refresh of the
+/// stored refresh token before giving up (the interactive sign-in is
+/// `noel mcp login`, as upstream keeps connections from opening
+/// browsers).
+async fn connect(
+    server: &McpServer,
+    cwd: &std::path::Path,
+    agent_dir: Option<&std::path::Path>,
+) -> Result<McpClient, String> {
     match &server.config {
         McpServerConfig::Http { url, headers } => {
             let options = noel_mcp::HttpOptions {
@@ -190,10 +230,96 @@ async fn connect(server: &McpServer, cwd: &std::path::Path) -> Result<McpClient,
                     .collect(),
                 ..Default::default()
             };
-            McpClient::connect_http(options)
+            let auth = agent_dir.map(read_mcp_auth).unwrap_or_default();
+            let entry = auth.get(&server.name);
+            let token = entry
+                .and_then(|entry| entry.tokens.as_ref())
+                .map(|tokens| tokens.access_token.clone());
+            let headers = options.headers.clone();
+            let connect_url = options.url.clone();
+            let discover_url = connect_url.clone();
+            async fn attempt(
+                connect_url: &str,
+                headers: &[(String, String)],
+                token: Option<String>,
+            ) -> Result<McpClient, String> {
+                let mut client = McpClient::connect_http(HttpOptions {
+                    url: connect_url.to_string(),
+                    headers: headers.to_vec(),
+                    token,
+                    ..Default::default()
+                })
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+                // A handshake over an authorized server: list to prove it.
+                client
+                    .list_tools()
+                    .await
+                    .map(|_| client)
+                    .map_err(|error| error.to_string())
+            }
+            match attempt(&connect_url, &headers, token.clone()).await {
+                Ok(client) => Ok(client),
+                Err(first) => {
+                    // 401: one refresh, then retry with the new token.
+                    let refreshable = entry.and_then(|entry| {
+                        let tokens = entry.tokens.as_ref()?;
+                        let client = entry.client.as_ref()?;
+                        Some((tokens.refresh_token.clone()?, client.clone()))
+                    });
+                    let refreshable = if first.contains("requires authentication") {
+                        refreshable
+                    } else {
+                        None
+                    };
+                    if let Some((refresh_token, client_information)) = refreshable {
+                        let _ = refresh_token;
+                        let _ = client_information;
+                        // The token endpoint comes from discovery; the
+                        // stored client alone is not enough for a blind
+                        // refresh, so the retry re-discovers.
+                        if let Ok((_, Some(metadata), _)) = noel_mcp::discover(
+                            &reqwest::Client::new(),
+                            &discover_url,
+                            noel_mcp::LATEST_PROTOCOL_VERSION,
+                        )
+                        .await
+                        {
+                            let entry_refresh = entry
+                                .and_then(|entry| entry.tokens.as_ref())
+                                .and_then(|tokens| tokens.refresh_token.clone());
+                            if let Some(refresh_token) = entry_refresh {
+                                if let Ok(tokens) = noel_mcp::refresh(
+                                    &reqwest::Client::new(),
+                                    &metadata.token_endpoint,
+                                    &client_information,
+                                    &refresh_token,
+                                )
+                                .await
+                                {
+                                    let new_token = tokens.access_token.clone();
+                                    // Store the refreshed tokens.
+                                    if let Some(agent_dir) = agent_dir {
+                                        let mut auth = read_mcp_auth(agent_dir);
+                                        if let Some(entry) = auth.get_mut(&server.name) {
+                                            entry.tokens = Some(tokens);
+                                        }
+                                        let _ = write_mcp_auth(agent_dir, &auth);
+                                    }
+                                    if let Ok(client) =
+                                        attempt(&connect_url, &headers, Some(new_token)).await
+                                    {
+                                        return Ok(client);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(first)
+                }
+            }
         }
+
         McpServerConfig::Stdio {
             command,
             args,
@@ -288,7 +414,12 @@ done
         let mut hosts = McpHosts::default();
         let mut overlay = Vec::new();
         let failures = hosts
-            .start(&[server()], std::path::Path::new("/tmp"), &mut overlay)
+            .start(
+                &[server()],
+                std::path::Path::new("/tmp"),
+                None,
+                &mut overlay,
+            )
             .await;
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(overlay.len(), 1);
@@ -312,12 +443,12 @@ done
         let mut hosts = McpHosts::default();
         let mut overlay = Vec::new();
         let failures = hosts
-            .start(&[broken], std::path::Path::new("/tmp"), &mut overlay)
+            .start(&[broken], std::path::Path::new("/tmp"), None, &mut overlay)
             .await;
         assert_eq!(failures.len(), 1);
         // The second start does not retry it.
         let failures = hosts
-            .start(&[], std::path::Path::new("/tmp"), &mut overlay)
+            .start(&[], std::path::Path::new("/tmp"), None, &mut overlay)
             .await;
         assert!(failures.is_empty());
         hosts.shutdown().await;
@@ -336,7 +467,7 @@ done
         };
         let mut hosts = McpHosts::default();
         let failures = hosts
-            .start(&[http], std::path::Path::new("/tmp"), &mut Vec::new())
+            .start(&[http], std::path::Path::new("/tmp"), None, &mut Vec::new())
             .await;
         assert_eq!(failures.len(), 1);
         assert!(

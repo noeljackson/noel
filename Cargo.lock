@@ -1660,6 +1660,7 @@ dependencies = [
  "noel-config",
  "noel-core",
  "noel-env",
+ "noel-mcp",
  "noel-tui",
  "ratatui",
  "reqwest",
@@ -1699,6 +1700,7 @@ dependencies = [
  "noel-mcp",
  "noel-session",
  "noel-tools",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -1740,13 +1742,16 @@ dependencies = [
 name = "noel-mcp"
 version = "0.3.0"
 dependencies = [
+ "base64",
  "bytes",
  "futures-util",
+ "getrandom 0.2.17",
  "nix",
  "noel-env",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
 ]

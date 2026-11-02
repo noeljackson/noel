@@ -2414,7 +2414,7 @@ fn mcp_command_lists_configured_servers() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("mcp list"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("noel mcp add"));
     fs::remove_dir_all(root).unwrap();
 }
 
