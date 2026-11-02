@@ -1298,6 +1298,8 @@ managed with `noel config disable <extension|skill|prompt|theme> <name>` and
 - `/plan` (toggle plan mode: read-only research, then approve the plan)
 - `/bg` (list this session's background runs)
 - `/usage` (recorded session token totals and account quotas)
+- `/runs` (each run's tokens, request count, and cost at catalog prices)
+- `/cost` (a forecast: context size, recent average, queued work priced)
 - `/login [provider]`
 - `/logout <provider>`
 - `/account [name]`
@@ -1458,6 +1460,12 @@ stops early; the next prompt resumes), and 20 turns without a met
 condition clears it instead of looping. Bare `/goal` shows the condition,
 its turn count, and the last evaluation. Goals are journaled, so a
 resumed session keeps working toward one.
+
+`/runs` costs each turn at the active model's catalog prices (per million
+tokens, `free` for unpriced models), with a session total; the runs are
+journaled (`run_usage` records), so they survive resume. `/cost`
+forecasts the next work: the context estimate, the average cost of the
+last five runs, and the queued follow-ups priced at that average.
 
 `/undo` changes only conversation context and restores the prompt, including
 images. It does **not** revert file edits, shell effects, tool audit history,

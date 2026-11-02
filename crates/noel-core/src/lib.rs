@@ -368,6 +368,10 @@ pub struct SessionState {
     /// (0 = the session's start), for listing checkpoints.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rewinds: Vec<usize>,
+    /// Token usage per run id, oldest first (spec §9.8): a run's
+    /// requests' input/output tokens and request count.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub run_usage: BTreeMap<String, SessionUsage>,
     /// The session goal, when one is active (spec §9.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<SessionGoal>,
@@ -588,6 +592,7 @@ impl SessionState {
             workspace: None,
             snapshots: Vec::new(),
             rewinds: Vec::new(),
+            run_usage: BTreeMap::new(),
             goal: None,
             plan_mode: false,
         }
@@ -750,6 +755,7 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         workspace: None,
         snapshots: Vec::new(),
         rewinds: Vec::new(),
+        run_usage: BTreeMap::new(),
         goal: None,
         plan_mode: false,
     }
@@ -1304,6 +1310,12 @@ enum SessionRecord {
     PlanMode {
         on: bool,
     },
+    /// Tokens a run's requests used, accumulated as they complete
+    /// (spec §9.8). Older versions ignore it.
+    RunUsage {
+        run_id: String,
+        usage: SessionUsage,
+    },
     /// The session goal set (spec §9.3); replaces any earlier one.
     Goal {
         goal: SessionGoal,
@@ -1708,6 +1720,13 @@ impl SessionStore {
 
     pub fn record_plan_mode(&self, on: bool) -> Result<(), SessionError> {
         self.append(&SessionRecord::PlanMode { on })
+    }
+
+    pub fn record_run_usage(&self, run_id: &str, usage: SessionUsage) -> Result<(), SessionError> {
+        self.append(&SessionRecord::RunUsage {
+            run_id: run_id.to_string(),
+            usage,
+        })
     }
 
     pub fn record_goal_cleared(&self, reason: Option<String>) -> Result<(), SessionError> {
@@ -2243,6 +2262,9 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         }
         SessionRecord::Tool { event } => state.tool_history.push(event),
         SessionRecord::PlanMode { on } => state.plan_mode = on,
+        SessionRecord::RunUsage { run_id, usage } => {
+            state.run_usage.insert(run_id, usage);
+        }
         SessionRecord::Goal { goal } => state.goal = Some(goal),
         SessionRecord::GoalCleared { .. } => state.goal = None,
         SessionRecord::FileSnapshot {
@@ -3265,6 +3287,69 @@ impl Runtime {
         self.store.as_ref()
     }
 
+    /// Saves a user prompt message that starts a run (`run_id` when the
+    /// caller drives one), journaling both in one record as `start_run`
+    /// does, for the modes that stream their own turns.
+    pub fn push_message_run(
+        &mut self,
+        message: ConversationMessage,
+        run_id: Option<String>,
+    ) -> Result<(), SessionError> {
+        if let Some(run_id) = run_id {
+            let kind = self
+                .session
+                .runs
+                .last()
+                .filter(|run| run.status == RunStatus::Interrupted)
+                .map(|_| ())
+                .map(|_| RunStatus::Aborted);
+            if let Some(status) = kind {
+                let interrupted = self.session.runs.last().map(|run| run.id.clone());
+                if let Some(id) = interrupted {
+                    self.finish_run(&id, status)?;
+                }
+            }
+            let start = RunStart {
+                id: run_id,
+                request_id: None,
+                kind: SubmissionKind::Prompt,
+            };
+            if let Some(store) = &self.store {
+                store.append(&SessionRecord::Message {
+                    message: message.clone(),
+                    run: Some(start.clone()),
+                    placed: Vec::new(),
+                })?;
+            }
+            self.session.runs.push(Run {
+                id: start.id,
+                request_id: None,
+                kind: start.kind,
+                status: RunStatus::Running,
+                start_message_index: self.session.messages.len(),
+            });
+            self.session.supersede_progress(&message);
+            self.session.messages.push(message);
+            return Ok(());
+        }
+        self.push_message(message)
+    }
+
+    /// Ends the newest run with `status` (the modes that stream their own
+    /// turns; the controller ends its runs itself).
+    pub fn finish_prompt_run(&mut self, status: RunStatus) {
+        let Some(run) = self.session.runs.last_mut() else {
+            return;
+        };
+        if run.status == RunStatus::Running {
+            run.status = status;
+            if let Some(store) = &self.store {
+                let id = run.id.clone();
+                let _ = store.append(&SessionRecord::RunFinished { run_id: id, status });
+            }
+        }
+    }
+
     pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
         if let Some(store) = &self.store {
             store.record_message(message.clone())?;
@@ -3787,6 +3872,23 @@ impl Runtime {
         if let Some(store) = &self.store {
             store.record_usage(usage.clone())?;
         }
+        // The active run accumulates the same tokens (spec §9.8), so
+        // /runs can cost each run from the catalog's prices.
+        if let Some(run) = self.session.runs.last().map(|run| run.id.clone()) {
+            let mut run_usage = self
+                .session
+                .run_usage
+                .get(&run)
+                .cloned()
+                .unwrap_or_default();
+            run_usage.input_tokens = run_usage.input_tokens.saturating_add(input_tokens);
+            run_usage.output_tokens = run_usage.output_tokens.saturating_add(output_tokens);
+            run_usage.requests = run_usage.requests.saturating_add(1);
+            if let Some(store) = &self.store {
+                store.record_run_usage(&run, run_usage.clone())?;
+            }
+            self.session.run_usage.insert(run, run_usage);
+        }
         self.session.usage = usage;
         Ok(())
     }
@@ -4212,8 +4314,18 @@ pub async fn run_user_turn_streaming_events_with_media(
     // prompt ends their turn.
     runtime.settle_unanswered_calls()?;
     let message = user_message(prompt, media);
-    runtime.push_message(message.clone())?;
-    run_saved_prompt_streaming_events(runtime, provider, message, run, on_event).await
+    runtime.push_message_run(message.clone(), run.run_id.clone())?;
+    let outcome =
+        run_saved_prompt_streaming_events(runtime, provider, message, run, on_event).await;
+    // The run the prompt started ends with the turn's outcome (spec
+    // §9.2's statuses), so /runs can cost each turn.
+    let status = match &outcome {
+        Ok(_) => RunStatus::Completed,
+        Err(AgentError::Cancelled) => RunStatus::Aborted,
+        Err(_) => RunStatus::Failed,
+    };
+    runtime.finish_prompt_run(status);
+    outcome
 }
 
 /// Runs `message`, a user prompt the caller has just saved (as
@@ -6540,6 +6652,49 @@ pub(crate) mod tests {
         assert_eq!(record.omitted_messages, 2);
         assert_eq!(record.retained_messages, 6);
         assert_eq!(runtime.session.messages[1].role, MessageRole::User);
+    }
+
+    /// The TUI's streaming turns journal a run per prompt, and the
+    /// journal reloads it (spec §9.8).
+    #[tokio::test]
+    async fn usage_groups_under_the_prompt_run() {
+        let dir = durable_test_dir("run-usage");
+        let (store, state) = SessionStore::create(&dir, PathBuf::from(".")).unwrap();
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
+        let run = RunControl {
+            run_id: Some("run-x".to_string()),
+            ..RunControl::default()
+        };
+        let provider = create_provider(ProviderConfig {
+            model: ModelRef {
+                provider: "faux".to_string(),
+                id: "echo".to_string(),
+            },
+            api: ProviderApi::Faux,
+            base_url: None,
+            auth: ProviderAuth::None,
+            thinking_level: None,
+            thinking_budget_tokens: None,
+            session_id: None,
+            traits: Default::default(),
+        });
+        run_user_turn_streaming_events_with_media(
+            &mut runtime,
+            provider.as_ref(),
+            "hello".to_string(),
+            Vec::new(),
+            &run,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let last = runtime.session().runs.last().unwrap();
+        assert_eq!(last.status, RunStatus::Completed);
+        assert_eq!(last.id, "run-x");
+        let path = dir.join(format!("{}.jsonl", runtime.session().session_id));
+        let (_, state) = SessionStore::open(path).unwrap();
+        assert!(state.runs.iter().any(|run| run.id == "run-x"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
