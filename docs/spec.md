@@ -525,6 +525,21 @@ slice first.
   replace global ones of a name, and a project entry with only
   `enabled: false` overrides the global entry without its credentials.
   `${NAME}` in `env` expands from the environment.
+- **OAuth for HTTP servers** (upstream's `packages/mcp/src/oauth`, adapted
+  from the MCP TypeScript SDK): protected-resource and
+  authorization-server metadata discovery (both well-known paths, with
+  issuer validation and http(s)-only URLs), dynamic client registration,
+  the authorization-code flow with PKCE S256 against a loopback callback
+  (RFC 8252), token exchange and refresh with `client_secret_basic`,
+  `client_secret_post` or `none` as the server supports, and the
+  `WWW-Authenticate` challenge parsed for `resource_metadata`/`scope`.
+  The callback answers only the redirect that carries the sign-in's
+  random `state`. Credentials live in `<agent dir>/mcp-auth.json`, mode
+  `0600`, keyed by server name (client, tokens, redirect URI). Connections never open a browser: the
+  stored access token is sent from the handshake on, a 401 during
+  connect tries one refresh of the stored refresh token, and the
+  interactive sign-in is `noel mcp login <server>` (`logout` clears the
+  stored credentials).
 - **The surface**: servers connect at the first run that needs them (as
   extension hosts start); their tools overlay the run's tool surface as
   `mcp__<server>__<tool>` and execute through the connection, results
@@ -541,10 +556,10 @@ slice first.
   (`- count: expected integer, got string`) and the received arguments
   in the message the model can act on. Built-in tools keep their
   hand-written validators, which the tool parity tests guard.
-- **Not ported (yet)**: OAuth for HTTP servers (the transport surfaces
-  `AuthRequired` for it), resources and prompts, exposure modes
-  (upstream's codemode/deferred/tool-search), and the
-  `mcp add/remove/login/logout` manager commands.
+- **Not ported (yet)**: the Client ID Metadata Document preference of
+  registration (upstream's `oauth.clientRegistration`), resources and
+  prompts, exposure modes (upstream's codemode/deferred/tool-search),
+  and the `mcp add/remove` manager commands.
 
 **Built:** `crates/noel-mcp`, `crates/noel-config/src/mcp.rs`,
   `crates/noel-core/src/mcp.rs`, the `mcp` command and `/mcp` in the

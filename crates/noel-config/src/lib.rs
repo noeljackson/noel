@@ -997,6 +997,12 @@ pub fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError
     write_file_atomic_with_mode(path, contents, None)
 }
 
+/// Writes a file only its owner may read (`0600` from before its first
+/// byte), atomically: for credentials kept beside `auth.json`.
+pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
+    write_file_atomic_with_mode(path, contents, Some(0o600))
+}
+
 /// `mode` holds Unix permission bits for the new file, set before any
 /// content is written.
 fn write_file_atomic_with_mode(

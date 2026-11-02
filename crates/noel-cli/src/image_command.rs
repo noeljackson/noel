@@ -311,52 +311,11 @@ pub(crate) async fn try_run_package_command() -> Result<bool> {
             crate::exit_with(status)?;
             Ok(true)
         }
-        // Upstream's MCP server manager. Slice 1 of this port: `list`
-        // names the configured servers of `mcp.json` and their state;
-        // the manager commands (add/remove/login) are not ported.
-        "mcp" => match args.get(1).map(String::as_str) {
-            Some("list") | None => {
-                let (paths, _) =
-                    noel_config::ConfigPaths::discover(std::env::current_dir()?, None)?;
-                // The project's mcp.json needs a trusted project; --approve
-                // and --no-approve decide, as the session startup does.
-                let args: Vec<String> = std::env::args().skip(1).collect();
-                let trusted = if args.iter().any(|arg| arg == "--approve") {
-                    true
-                } else if args.iter().any(|arg| arg == "--no-approve") {
-                    false
-                } else {
-                    noel_config::project_is_trusted(&paths.agent_dir, &paths.cwd)?
-                };
-                let (servers, diagnostics) = noel_config::mcp::load_mcp_servers(
-                    &paths.agent_dir,
-                    trusted
-                        .then(|| noel_config::project_config_dir(&paths.cwd))
-                        .as_deref(),
-                );
-                for diagnostic in diagnostics {
-                    println!("! {diagnostic}");
-                }
-                if servers.is_empty() {
-                    println!("no MCP servers configured; add one to mcp.json (see the README)");
-                    return Ok(true);
-                }
-                for server in servers {
-                    match &server.config {
-                        noel_config::mcp::McpServerConfig::Stdio { command, args, .. } => {
-                            println!("{}  stdio: {} {}", server.name, command, args.join(" "));
-                        }
-                        noel_config::mcp::McpServerConfig::Http { url, .. } => {
-                            println!("{}  http: {}", server.name, url);
-                        }
-                    }
-                }
-                Ok(true)
-            }
-            Some(other) => Err(anyhow!(
-                "noel mcp {other} is not available (this port ships `mcp list` only)"
-            )),
-        },
+        // Upstream's MCP server manager (`mcp_commands`).
+        "mcp" => {
+            crate::mcp_commands::run(&args[1..]).await?;
+            Ok(true)
+        }
         // noel's own: install the bun runtime for TypeScript extension
         // hosts into the agent dir (`bin/bun`). Non-interactive.
         "bun" => {

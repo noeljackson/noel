@@ -937,16 +937,16 @@ whose tools join the session as `mcp__<server>__<tool>`, `noel mcp list`
 names them, `/mcp` shows their live state, and `--no-mcp` keeps them
 from connecting.
 
-Not ported: OAuth for HTTP servers (upstream's `oauth/`; the HTTP
-transport surfaces `AuthRequired` for it), resources and prompts, and
-the exposure modes (codemode/deferred/tool-search). `noel mcp`
-subcommands other than `list` (`add`, `remove`, `login`, `logout`) are
-refused. The streamable-HTTP transport itself is ported. Tool-argument
+Not ported: the Client ID Metadata Document preference of registration
+(upstream's `oauth.clientRegistration`), resources and prompts, and the
+exposure modes (codemode/deferred/tool-search). `noel mcp add` and
+`noel mcp remove` are refused; `list`, `login` and `logout` ship. The
+streamable-HTTP transport and OAuth (discovery, dynamic registration,
+PKCE flow, loopback callback, token refresh) are ported. Tool-argument
 validation carries pi-schema's semantics for MCP tools (coercion, and
 upstream's error wording); built-in tools keep their hand validators.
-Reason: OAuth
-needs the HTTP transport's auth hooks; the rest covers upstream
-surfaces noel's tool surface does not use.
+Reason: the rest covers upstream surfaces noel's tool surface does not
+use.
 
 ### Local `/bug` Reports for This Port
 

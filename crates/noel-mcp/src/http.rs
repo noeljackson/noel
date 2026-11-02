@@ -34,6 +34,9 @@ pub struct HttpOptions {
     pub url: String,
     /// Extra headers (an `Authorization` from config; OAuth sets its own).
     pub headers: Vec<(String, String)>,
+    /// A bearer token every request carries from the start, including
+    /// the handshake (the OAuth layer's stored access token).
+    pub token: Option<String>,
     /// Open the server-to-client GET stream after initialization.
     pub open_get_stream: bool,
     /// Reconnection of dropped SSE streams.
@@ -47,6 +50,7 @@ impl Default for HttpOptions {
         Self {
             url: String::new(),
             headers: Vec::new(),
+            token: None,
             open_get_stream: true,
             reconnect_initial_delay_ms: DEFAULT_RECONNECT_INITIAL_DELAY_MS,
             reconnect_max_delay_ms: DEFAULT_RECONNECT_MAX_DELAY_MS,
@@ -225,6 +229,9 @@ pub struct HttpTransport {
 impl HttpTransport {
     pub fn new(options: HttpOptions) -> Self {
         let (event_sink, events) = mpsc::unbounded_channel();
+        // A token in the options rides every request from the start,
+        // including the handshake (the OAuth layer's stored token).
+        let token = options.token.clone();
         Self {
             client: reqwest::Client::builder().build().unwrap_or_default(),
             options,
@@ -233,7 +240,7 @@ impl HttpTransport {
             session_id: Mutex::new(None),
             protocol_version: Mutex::new(LATEST_PROTOCOL_VERSION.to_string()),
             closed: AtomicBool::new(false),
-            last_token: Mutex::new(None),
+            last_token: Mutex::new(token),
         }
     }
 

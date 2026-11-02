@@ -408,6 +408,27 @@ impl McpClient {
     }
 
     /// The server's stderr so far, for a failed connect's diagnostics.
+    /// Sets the bearer token HTTP requests carry (the OAuth layer's
+    /// stored or refreshed access token).
+    pub fn set_token(&mut self, token: Option<String>) {
+        if let Transport::Http(transport) = &mut self.transport {
+            transport.set_token(token);
+        }
+    }
+
+    /// Refreshes authorization after an `AuthRequired` failure using
+    /// `refresh`: the stored client against the token endpoint the
+    /// discovery found. `Ok(true)` means retry with the new token set.
+    pub async fn refresh_after_auth_required(
+        &mut self,
+        refresh_token: &str,
+        client_information: &crate::oauth::ClientInformation,
+        token_endpoint: &str,
+    ) -> Result<crate::oauth::OAuthTokens, crate::oauth::OAuthError> {
+        let http = reqwest::Client::new();
+        crate::oauth::refresh(&http, token_endpoint, client_information, refresh_token).await
+    }
+
     pub fn stderr_tail(&self) -> String {
         self.transport.stderr_tail()
     }

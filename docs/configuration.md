@@ -283,8 +283,13 @@ live tool counts, `noel mcp list` names them from the shell, and
 connecting. A tool's declared schema validates the model's arguments
 first — with coercion (a numeric string for a number, a lone value for
 an array) and pi-style errors (`- count: expected integer, got string`)
-— so a malformed call fails with a message the model can act on. OAuth sign-in for HTTP servers that answer 401 is not
-ported yet.
+— so a malformed call fails with a message the model can act on. An
+HTTP server that answers 401 signs in with `noel mcp login <name>`: OAuth
+discovery, client registration, a PKCE authorization in the browser
+against a loopback callback, and tokens stored in `mcp-auth.json`;
+connections send the stored access token (trying one refresh after a
+401), and `noel mcp logout <name>` clears them. Connections never open a
+browser on their own.
 
 ## Subagents
 

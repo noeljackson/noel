@@ -297,3 +297,55 @@ fn a_401_surfaces_auth_required() {
         transport.close().await;
     });
 }
+
+#[test]
+fn a_token_in_options_is_sent_on_the_handshake() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let saw_token = Arc::new(std::sync::Mutex::new(false));
+    let saw = Arc::clone(&saw_token);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            if request
+                .headers
+                .to_lowercase()
+                .contains("authorization: bearer tok")
+            {
+                *saw.lock().unwrap() = true;
+            }
+            write_response(
+                &mut stream,
+                200,
+                "content-type: application/json\r\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            );
+        }
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let mut transport = HttpTransport::new(HttpOptions {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            token: Some("tok".to_string()),
+            ..Default::default()
+        });
+        let request = noel_mcp::protocol::jsonrpc::JsonRpcMessage::Request(
+            noel_mcp::protocol::jsonrpc::JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: noel_mcp::protocol::jsonrpc::JsonRpcId::Number(1),
+                method: "initialize".to_string(),
+                params: None,
+            },
+        );
+        let answer = transport.send(&request).await.unwrap().expect("answered");
+        let _ = serde_json::to_string(&answer).unwrap();
+        transport.close().await;
+    });
+    assert!(
+        *saw_token.lock().unwrap(),
+        "the Authorization header reached the server"
+    );
+}
