@@ -53,6 +53,8 @@
 - `/share [file]`
 - `/compact [focus]` (model-generated checkpoint, retaining complete recent turns)
 - `/undo` (undo the last turn and its file changes; its prompt goes back to the draft)
+- `/runs` (each run's tokens, request count, and estimated cost at catalog prices)
+- `/cost` (a forecast: context size, recent average, queued work priced)
 - `/rewind` (the checkpoint picker: go back to any earlier prompt, with or without the file changes since; also Esc-Esc at an empty draft)
 - `/sessions` (list the server's sessions, as `noel client ls` does)
 - `/plan` (toggle plan mode: read-only research, then approve the plan to have it implemented)
@@ -214,4 +216,11 @@ last evaluation. Goals are journaled, so a restarted session keeps its goal.
 for completed requests across resume/reload/compaction/undo/rewind; old sessions and
 providers without usage report “no provider token usage reported yet” rather
 than estimated totals. Account quota checks use the same cache as `/accounts`
-and are skipped offline. Dollar costs are not calculated.
+and are skipped offline. `/usage` shows tokens, not dollars.
+
+`/runs` estimates each run's cost at the active model's catalog list prices
+(per million tokens, `free` for unpriced models), with a session total; the
+runs' tokens are journaled (`run_usage` records), so they survive a restart.
+Cache discounts and price tiers are not counted. `/cost` forecasts the next
+work: the context estimate, the average cost of the last five runs, and the
+queued follow-ups priced at that average.

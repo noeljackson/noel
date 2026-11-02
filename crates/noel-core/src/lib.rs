@@ -508,6 +508,10 @@ pub struct SessionState {
     /// The session goal, when one is active (spec §9.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<SessionGoal>,
+    /// Token usage per run id (spec §9.8): its requests' input and
+    /// output tokens and how many there were.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub run_usage: BTreeMap<String, SessionUsage>,
     /// Plan mode (spec §9.4): research only, until a plan is approved.
     #[serde(default, skip_serializing_if = "is_false")]
     pub plan_mode: bool,
@@ -743,6 +747,7 @@ impl SessionState {
             workspace: None,
             snapshots: Vec::new(),
             goal: None,
+            run_usage: BTreeMap::new(),
             plan_mode: false,
         }
     }
@@ -912,6 +917,7 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         workspace: None,
         snapshots: Vec::new(),
         goal: None,
+        run_usage: BTreeMap::new(),
         plan_mode: false,
     }
 }
@@ -1571,6 +1577,12 @@ enum SessionRecord {
     PlanMode {
         on: bool,
     },
+    /// Tokens a run's requests used, accumulated as they complete
+    /// (spec §9.8). Older versions ignore it.
+    RunUsage {
+        run_id: String,
+        usage: SessionUsage,
+    },
     /// The session goal set (spec §9.3); replaces any earlier one.
     Goal {
         goal: SessionGoal,
@@ -2120,6 +2132,13 @@ impl SessionStore {
 
     pub fn record_plan_mode(&self, on: bool) -> Result<(), SessionError> {
         self.append(&SessionRecord::PlanMode { on })
+    }
+
+    pub fn record_run_usage(&self, run_id: &str, usage: SessionUsage) -> Result<(), SessionError> {
+        self.append(&SessionRecord::RunUsage {
+            run_id: run_id.to_string(),
+            usage,
+        })
     }
 
     pub fn record_goal_cleared(&self, reason: Option<String>) -> Result<(), SessionError> {
@@ -3446,6 +3465,30 @@ impl Runtime {
         usage.requests = usage.requests.saturating_add(1);
         if let Some(store) = &self.store {
             store.record_usage(usage.clone())?;
+        }
+        // The run in progress accumulates the same tokens (spec §9.8), so
+        // each run can be costed. A request outside a run (print mode)
+        // counts toward the session only.
+        let active = self
+            .session
+            .runs
+            .last()
+            .filter(|run| run.status == RunStatus::Running)
+            .map(|run| run.id.clone());
+        if let Some(run) = active {
+            let mut run_usage = self
+                .session
+                .run_usage
+                .get(&run)
+                .cloned()
+                .unwrap_or_default();
+            run_usage.input_tokens = run_usage.input_tokens.saturating_add(input_tokens);
+            run_usage.output_tokens = run_usage.output_tokens.saturating_add(output_tokens);
+            run_usage.requests = run_usage.requests.saturating_add(1);
+            if let Some(store) = &self.store {
+                store.record_run_usage(&run, run_usage.clone())?;
+            }
+            self.session.run_usage.insert(run, run_usage);
         }
         self.session.usage = usage;
         Ok(())

@@ -567,6 +567,32 @@ slice first.
   `crates/noel-core/src/mcp.rs`, the `mcp` command and `/mcp` in the
   CLI and TUI.
 
+### 9.8 Run costs and forecasts
+
+**Decided (2026-11-01, revised 2026-11-12):** noel's own feature; upstream
+lacks it.
+
+- **Per-run usage** is journaled: each provider round's tokens land under
+  the run in progress (`run_usage` records). A session's runs are the
+  controller's, so a request outside one (print mode) counts toward the
+  session's usage only.
+- **`/runs`** lists the session's runs newest first: status, in/out
+  tokens, request count, and an estimated cost at the active model's
+  catalog list prices (per million tokens; `free` for unpriced models),
+  with a total.
+- **`/cost`** forecasts: the context estimate (the same per-message
+  character/4 approximation compaction uses), the average cost of the
+  last five runs, and the queued follow-ups priced at that average.
+  No finished runs yet: the first run sets the baseline.
+- The costs are estimates: cache-token pricing (the catalog has cache
+  read/write prices but providers report cache tokens unevenly), price
+  tiers, a subagent's own requests and a change of model mid-session
+  are not counted. Per-workspace rollups are not included.
+
+**Built:** `run_usage` records and their accumulation in
+  `Runtime::record_usage`, `crates/noel-cli/src/run_costs.rs`, and
+  `/runs` and `/cost` in `session_commands.rs`.
+
 ### 9.9 Sessions the model can reach
 
 **Decided (2026-11-02):** Claude Code's roster, taught through the

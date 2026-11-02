@@ -36,6 +36,7 @@ mod resource_commands;
 mod rewind_commands;
 mod rpc;
 mod rpc_wire;
+mod run_costs;
 mod selectors;
 mod server;
 mod session_commands;

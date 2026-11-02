@@ -943,6 +943,50 @@ fn plan_mode_refuses_writes_until_the_plan_is_approved() {
     });
 }
 
+/// `/runs` and `/cost` (spec §9.8): the tokens of a run's requests are
+/// journaled under it, listed per run, and averaged for a forecast.
+#[test]
+fn runs_are_listed_with_their_tokens_and_cost_a_forecast() {
+    let script = json!([
+        [{"usage": {"input": 120, "output": 30}}, {"text": "first"}],
+        [{"usage": {"input": 200, "output": 10}}, {"text": "second"}],
+    ]);
+    let mode2 = Mode2::new("runs", script, json!({}));
+    let session = mode2.new_session("runs");
+    let runs = || mode2.journal(&session).matches("\"run_finished\"").count();
+    let command = |line: &str| mode2.client(&["command", &session, line]);
+    let none = command("/runs");
+    assert!(none.starts_with("runs: none yet"), "{none}");
+
+    mode2.client(&["send", &session, "one"]);
+    wait_until("the first run", || runs() == 1);
+    mode2.client(&["send", &session, "two"]);
+    wait_until("the second run", || runs() == 2);
+    let listed = command("/runs");
+    let lines: Vec<&str> = listed.lines().collect();
+    // Newest first, then the total.
+    assert!(
+        lines[1].contains("completed · 200 in / 10 out · 1 request ·"),
+        "{listed}"
+    );
+    assert!(
+        lines[2].contains("completed · 120 in / 30 out · 1 request ·"),
+        "{listed}"
+    );
+    assert!(listed.contains("total: 320 in / 40 out"), "{listed}");
+    let forecast = command("/cost");
+    assert!(forecast.contains("recent runs: 2 averaged"), "{forecast}");
+    assert!(forecast.contains("queue empty"), "{forecast}");
+    // A restart reads the same from the journal.
+    kill(mode2.server_pid(), "TERM");
+    wait_until("the listing after a restart", || {
+        mode2
+            .noel(&["client", "command", &session, "/runs"])
+            .stdout
+            .starts_with(listed.as_bytes())
+    });
+}
+
 /// A goal (spec §9.3) starts the work when it is set, and after each turn
 /// that settles the evaluator, the session's own model without tools,
 /// says whether it is met: not met sends the work on, met clears the goal.
