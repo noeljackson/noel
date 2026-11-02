@@ -421,6 +421,15 @@ slice first.
   tools absent until a later run retries. `/mcp` shows state,
   `noel mcp list` names them, `--no-mcp` connects none, `/reload`
   re-reads the config.
+- **Tool-argument validation** (pi-schema's semantics, upstream's
+  `packages/ai/src/utils/validation.ts`): an MCP tool's declared schema
+  validates the model's arguments before they reach the server —
+  coercion first (a numeric string for a number, a single value for an
+  array, `null` for an omitted optional, TypeBox's convert rules), then
+  upstream's error wording with dotted paths
+  (`- count: expected integer, got string`) and the received arguments
+  in the message the model can act on. Built-in tools keep their
+  hand-written validators, which the tool parity tests guard.
 - **Not ported (yet)**: OAuth for HTTP servers (the transport surfaces
   `AuthRequired` for it), resources and prompts, exposure modes
   (upstream's codemode/deferred/tool-search), and the

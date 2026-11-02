@@ -941,7 +941,10 @@ Not ported: OAuth for HTTP servers (upstream's `oauth/`; the HTTP
 transport surfaces `AuthRequired` for it), resources and prompts, and
 the exposure modes (codemode/deferred/tool-search). `noel mcp`
 subcommands other than `list` (`add`, `remove`, `login`, `logout`) are
-refused. The streamable-HTTP transport itself is ported. Reason: OAuth
+refused. The streamable-HTTP transport itself is ported. Tool-argument
+validation carries pi-schema's semantics for MCP tools (coercion, and
+upstream's error wording); built-in tools keep their hand validators.
+Reason: OAuth
 needs the HTTP transport's auth hooks; the rest covers upstream
 surfaces noel's tool surface does not use.
 

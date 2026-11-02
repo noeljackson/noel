@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use noel_config::mcp::{mcp_tool_name, McpServer, McpServerConfig};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::AiToolDefinition;
@@ -121,11 +122,57 @@ impl McpHosts {
             .get_mut(server)
             .ok_or_else(|| format!("no MCP server {server} is connected"))?;
         let arguments = if arguments.trim().is_empty() {
-            None
+            Value::Object(serde_json::Map::new())
         } else {
             serde_json::from_str(arguments)
                 .map_err(|error| format!("invalid tool arguments: {error}"))?
         };
+        // The server's declared schema validates the arguments first
+        // (pi-schema semantics: coercion, then upstream's error wording
+        // with dotted paths), so a malformed call fails here with the
+        // message the model can act on instead of on the server.
+        let received = arguments.clone();
+        if let Some(schema) = host
+            .tools
+            .iter()
+            .find(|offered| offered.name == tool)
+            .map(|offered| offered.input_schema.clone())
+        {
+            match noel_ai::validation::parse(&schema, arguments) {
+                Ok(validated) => {
+                    let empty = serde_json::Map::new();
+                    let validated = validated.as_object().unwrap_or(&empty).clone();
+                    let arguments = if validated.is_empty() {
+                        None
+                    } else {
+                        Some(Value::Object(validated))
+                    };
+                    return Self::call_validated(self, tool, server, arguments).await;
+                }
+                Err(errors) => {
+                    let name = format!("mcp__{server}__{tool}");
+                    return Err(format!(
+                        "\n{}",
+                        noel_ai::validation::tool_arguments_error(&name, &received, &errors)
+                    ));
+                }
+            }
+        }
+        let arguments = Some(arguments);
+        Self::call_validated(self, tool, server, arguments).await
+    }
+
+    /// The call after validation: `None` arguments send none.
+    async fn call_validated(
+        &mut self,
+        tool: &str,
+        server: &str,
+        arguments: Option<Value>,
+    ) -> Result<noel_mcp::LlmContent, String> {
+        let host = self
+            .hosts
+            .get_mut(server)
+            .ok_or_else(|| format!("no MCP server {server} is connected"))?;
         // The tool name the server knows: the part after the namespace.
         let result = host
             .client
@@ -281,6 +328,52 @@ done
                 cwd: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn validation_blocks_bad_calls() {
+        // A server whose tool wants an integer >= 1: "zero" is refused
+        // with upstream's wording, a coercible "3" passes through.
+        let script = r##"
+while read -r line; do
+    m=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+    i=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+    case "$m" in
+        initialize) printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$i,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"t\",\"version\":\"1\"}}}" ;;
+        notifications/*) ;;
+        tools/list) printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$i,\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"count\"]}}]}}" ;;
+        tools/call) printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$i,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}" ;;
+    esac
+done
+"##;
+        let server = McpServer {
+            name: "val".to_string(),
+            config: McpServerConfig::Stdio {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                env: BTreeMap::new(),
+                cwd: None,
+            },
+        };
+        let mut hosts = McpHosts::default();
+        let failures = hosts
+            .start(&[server], std::path::Path::new("/tmp"), &mut Vec::new())
+            .await;
+        assert!(failures.is_empty(), "{failures:?}");
+        let bad = hosts.call("mcp__val__echo", r#"{"count": "zero"}"#).await;
+        assert!(bad.is_err(), "non-numeric count refused");
+        let message = bad.unwrap_err();
+        assert!(
+            message.contains("Validation failed for tool \"mcp__val__echo\""),
+            "{message}"
+        );
+        assert!(
+            message.contains("count: expected integer, got string"),
+            "{message}"
+        );
+        let good = hosts.call("mcp__val__echo", r#"{"count": "3"}"#).await;
+        assert!(good.is_ok(), "coercible count passes: {good:?}");
+        hosts.shutdown().await;
     }
 
     #[tokio::test]
