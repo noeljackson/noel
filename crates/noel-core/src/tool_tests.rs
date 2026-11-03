@@ -302,6 +302,141 @@ fn tool_selection_follows_default_tools_allowlist_and_exclusions() {
         ),
         names(&["bash", "edit", "find", "grep", "ls", "read", "write"])
     );
+    // Codemode is never on by default, nor matched by a pattern: `+codemode`
+    // or its name selects it.
+    assert!(!selected(json!({ "defaultTools": ["-bash"] }), &[]).contains("codemode"));
+    assert!(selected(json!({ "defaultTools": ["+codemode"] }), &[]).contains("codemode"));
+    assert_eq!(
+        selected(json!({ "defaultTools": ["read", "codemode"] }), &[]),
+        names(&["codemode", "ext_echo", "read"])
+    );
+    assert!(selected(json!({ "enabledTools": ["codemode"] }), &[]).contains("codemode"));
+}
+
+/// A session in a new directory with codemode and the given tools selected.
+fn runtime_with_codemode(test: &str, tools: &[&str]) -> (Runtime, PathBuf) {
+    let cwd = std::env::current_dir()
+        .expect("current dir")
+        .join("target")
+        .join(format!("noel-codemode-tests-{test}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&cwd);
+    fs::create_dir_all(&cwd).expect("create test dir");
+    let mut session = SessionState::new("session-1", cwd.clone());
+    session.active_tool_names = crate::default_active_tool_names();
+    let runtime = Runtime::new(
+        session,
+        ReloadableSystems {
+            available_tool_names: tools.iter().map(ToString::to_string).collect(),
+            tool_scope_configured: true,
+            ..ReloadableSystems::default()
+        },
+    );
+    (runtime, cwd)
+}
+
+#[tokio::test]
+async fn codemode_is_declared_only_when_selected_and_lists_its_nested_tools() {
+    let (runtime, _) = runtime_with_codemode("declared", &["read", "write", "todo", "codemode"]);
+    let definitions = active_tool_definitions(&runtime);
+    let codemode = definitions
+        .iter()
+        .find(|definition| definition.name == "codemode")
+        .expect("codemode declared");
+    assert!(codemode
+        .description
+        .starts_with("Run JavaScript that calls other tools."));
+    assert!(codemode.description.contains("- `tools.read(args)`"));
+    assert!(codemode.description.contains("- `tools.write(args)`"));
+    // Model-only tools are not callable from scripts.
+    assert!(!codemode.description.contains("tools.todo("));
+    assert!(!codemode.description.contains("tools.codemode("));
+    assert_eq!(codemode.parameters["required"], json!(["code"]));
+
+    let (runtime, _) = runtime_with_codemode("not-selected", &["read", "write"]);
+    assert!(!active_tool_definitions(&runtime)
+        .iter()
+        .any(|definition| definition.name == "codemode"));
+}
+
+#[tokio::test]
+async fn a_codemode_script_runs_tools_in_parallel_and_reports_its_output() {
+    let (mut runtime, cwd) = runtime_with_codemode("run", &["read", "write", "codemode"]);
+    fs::write(cwd.join("a.txt"), "alpha\n").expect("write a");
+    fs::write(cwd.join("b.txt"), "beta\n").expect("write b");
+    let code = r#"
+        const [a, b] = await Promise.all([
+          tools.read({ path: "a.txt" }),
+          tools.read({ path: "b.txt" }),
+        ]);
+        await tools.write({ path: "joined.txt", content: a.trim() + "+" + b.trim() });
+        console.log("wrote");
+        return { a: a.trim(), b: b.trim() };
+    "#;
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(!is_error, "{output}");
+    assert!(
+        output.starts_with("Script completed\nWall time "),
+        "{output}"
+    );
+    assert!(
+        output.ends_with(" seconds\nOutput:\n{\"a\":\"alpha\",\"b\":\"beta\"}\n<console_output>\nwrote\n</console_output>"),
+        "{output}"
+    );
+    assert_eq!(
+        fs::read_to_string(cwd.join("joined.txt")).unwrap(),
+        "alpha+beta"
+    );
+    assert_eq!(runtime.session.edited_files, ["joined.txt".to_string()]);
+    // Nested calls are not results of their own.
+    assert_eq!(runtime.session.tool_history.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_codemode_script_names_the_calls_it_made() {
+    let (mut runtime, _) = runtime_with_codemode("failed", &["read", "codemode"]);
+    let code = "await tools.read({ path: 'missing.txt' }).catch(() => {});
+throw new Error('stop here');";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(is_error);
+    assert!(output.starts_with("Script failed\n"), "{output}");
+    assert!(
+        output.contains("Script error:\nError: stop here"),
+        "{output}"
+    );
+    assert!(
+        output.ends_with("Tool calls made before the failure (they are not undone): read (error)"),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn the_codemode_store_lasts_across_calls_and_scripts_cannot_call_codemode() {
+    let (mut runtime, _) = runtime_with_codemode("store", &["read", "codemode"]);
+    let first = "store('count', (load('count') ?? 0) + 1);\n\
+                 try { tools.codemode; return 'callable'; } catch (e) { return e.name; }";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": first })).await;
+    assert!(!is_error, "{output}");
+    assert!(output.ends_with("Output:\nTypeError"), "{output}");
+    let second = "store('count', load('count') + 1); return load('count');";
+    let (output, _) = call_tool(&mut runtime, "codemode", json!({ "code": second })).await;
+    assert!(output.ends_with("Output:\n2"), "{output}");
+    assert_eq!(runtime.session.codemode_store.get("count"), Some(&json!(2)));
+    // A failed script keeps nothing it stored.
+    let failed = "store('count', 99); throw new Error('no');";
+    call_tool(&mut runtime, "codemode", json!({ "code": failed })).await;
+    assert_eq!(runtime.session.codemode_store.get("count"), Some(&json!(2)));
+}
+
+#[tokio::test]
+async fn codemode_rejects_options_that_are_not_on_the_first_line() {
+    let (mut runtime, _) = runtime_with_codemode("options", &["codemode"]);
+    let code = "text(1)\n// @options: {\"timeout_ms\": 5}";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(is_error);
+    assert_eq!(
+        output,
+        "The // @options: line must be the first line of the input; found one on line 2"
+    );
 }
 
 #[test]
