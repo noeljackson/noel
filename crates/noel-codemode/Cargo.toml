@@ -6,6 +6,7 @@ license.workspace = true
 description = "Upstream pi's codemode on the djs engine: model-written JavaScript or TypeScript that calls tools, run in a sandboxed VM with fuel, memory and output limits."
 
 [dependencies]
+base64.workspace = true
 # The djs engine (earendil-works/djs), pinned by commit: a `no_std` Rust
 # JavaScript/TypeScript interpreter with fuel, memory limits and no JIT, so it
 # also runs on iOS. djs-prelude's build script makes the base snapshot.
