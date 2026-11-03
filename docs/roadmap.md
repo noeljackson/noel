@@ -51,15 +51,17 @@ v1 pin `@earendil-works/chord@1.5.0`).
 - Done when the owner approves both and the non-parity register and spec
   citations are updated.
 
-### 3. Codemode (Planned, #118)
-- djs spike (done, see #118): `djs-core` embeds natively (async host
-  functions, parallel calls, fuel, abort) and type-checks for
-  `aarch64-apple-ios`.
-- `noel-codemode` crate and a `codemode` tool, off by default, matching
-  upstream's `packages/codemode` and `durable/src/codemode`.
-- Tests with the faux provider; goldens recorded from upstream.
-- Done: `make check` and `make e2e` pass; codemode leaves the non-parity
-  register.
+### 3. Codemode (First version done, #118)
+- Done: `crates/noel-codemode` runs upstream's prelude on djs (pinned by
+  commit; type-checks for iOS), with upstream's source options, execution
+  layer and result format. The built-in `codemode` tool is off unless
+  selected by name; nested calls go through the gate and run in parallel;
+  the store is saved in the journal. Spec: `docs/codemode-port.md`;
+  differences: the register's Codemode section.
+- Next: nested-call events and TUI rows, structured `bash`/`read` results,
+  upstream's `Script aborted` result on abort, goldens recorded from
+  upstream's `packages/codemode` tests, the declarations catalog and the
+  discovery globals (with `tool_search`).
 
 ### 4. Chord v2 port (Planned, #119)
 - `noel-chord` speaks v2's link protocol; server, worker and client move to v2
