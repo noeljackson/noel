@@ -1,6 +1,8 @@
 # Contributing to noel
 
-This repository is now a Rust-only Cargo workspace.
+This repository is a Rust Cargo workspace. Swift is allowed for native Apple
+clients built on shared Rust bindings, and TypeScript is allowed only for the
+Bun-run extension engine. Use Bun, not npm or Node.js.
 
 ## Before Submitting
 
