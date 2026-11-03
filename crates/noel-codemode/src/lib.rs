@@ -8,3 +8,4 @@ pub mod source;
 
 pub use identifier::to_codemode_identifier;
 pub use source::{parse_codemode_source, CodemodeSourceError, ParsedCodemodeSource, SourceOptions};
+pub mod vm;
