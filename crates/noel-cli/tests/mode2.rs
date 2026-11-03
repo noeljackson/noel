@@ -157,6 +157,12 @@ impl Mode2 {
 
 impl Drop for Mode2 {
     fn drop(&mut self) {
+        // A failed test shows what the server said before its directory goes.
+        if std::thread::panicking() {
+            if let Ok(log) = fs::read_to_string(self.run_dir().join("server.log")) {
+                eprintln!("--- server.log ---\n{log}--- end of server.log ---");
+            }
+        }
         for watch in &mut self.watches {
             let _ = watch.kill();
             let _ = watch.wait();

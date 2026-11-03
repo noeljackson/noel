@@ -4050,11 +4050,19 @@ impl Actor {
         if hydrated {
             self.hydrate(reference);
         }
-        let Some(readable) = self
-            .refs
-            .get_mut(&reference)
-            .and_then(|state| state.readables.get_mut(&member))
-        else {
+        // The member's state is kept from its first frame, listener or not:
+        // a listener that subscribes later (its `subscribe` may reach the
+        // actor after the snapshot) gets the value it would have missed.
+        let Some(readable) = self.refs.get_mut(&reference).map(|state| {
+            state
+                .readables
+                .entry(member.clone())
+                .or_insert_with(|| Readable {
+                    sinks: Vec::new(),
+                    decoder: Decoder::new(),
+                    value: None,
+                })
+        }) else {
             return;
         };
         let update = if let Some(error) = &frame.error {
