@@ -688,8 +688,11 @@ upstream merges them (`settings.json` fixture). These parts differ:
   `defaultTools` is gone after `/reload`.
 - `enabledTools` is a Rust-only setting: a persistent allowlist, like `--tools`
   with plain names.
-- Upstream's `defaultActive: false` extension tools (`codemode`,
-  `tool_search`) and its MCP rules for `--tools` do not exist in Rust; every
+- `codemode` is a built-in tool that is off unless selected by name
+  (`--tools`, `enabledTools`, or `defaultTools: ["+codemode"]`), as
+  upstream registers it inactive; a pattern such as `*` never selects it
+  (see Codemode). Upstream's other `defaultActive: false` tool,
+  `tool_search`, and its MCP rules for `--tools` do not exist in Rust; every
   extension tool is on unless an allowlist or `--exclude-tools` leaves it out.
 - Tool flags are not saved with the session. Earlier Rust versions saved them
   as the session's disabled tools; a saved list is cleared when the session is
@@ -703,6 +706,43 @@ Reason: Rust's reloadable systems are rebuilt from configuration, and durable
 session state is kept apart from them (see the reload rules in `AGENTS.md`).
 A selection computed from settings and flags needs no session record, and the
 flags mean the same on every run.
+
+### Codemode
+
+`codemode` (`crates/noel-codemode`, `crates/noel-core/src/codemode.rs`) runs
+upstream's script environment on the djs engine (`earendil-works/djs`,
+pinned by commit) instead of QuickJS in a worker thread. The prelude is
+upstream's, byte for byte (`docs/codemode-port.md`). These parts differ:
+
+- **Engine.** djs is always strict and `eval` is always indirect; one
+  upstream sandbox test depends on sloppy mode. Interrupts are polled every
+  10,000 units of fuel. Scripts are JavaScript only, as upstream's.
+- **Description.** Upstream's introduction and globals lines, without the
+  discovery globals (`searchTools`, `describeTool`, `describeNamespace`) and
+  `models`, which noel does not have; the nested tools are a plain list of
+  `tools.<id>(args)` with each tool's first description line, not upstream's
+  declarations, budgeted catalog or `codemode.mode`. The tool proxy's error
+  for an unknown tool still mentions `searchTools`, as upstream's prelude
+  words it.
+- **Nested tools.** Scripts call the active built-in and extension tools
+  except `todo` (it changes the session; model-only here) and codemode
+  itself. Every call goes through the extension `toolCall` gate and runs in
+  parallel; extension v2 calls share one host lock, so they run one at a
+  time. A nested call resolves to its text output: `bash` and `read` have no
+  structured results, and `read` of an image gives its text, not an image
+  block. Nested calls are not reported as tool events (no live rows) and the
+  result carries no `nestedCalls`.
+- **Result.** The text items are joined into the tool result's text and
+  images are attached after it, not interleaved. Spill and image files are
+  `noel-codemode-<random>.<ext>` in the temp directory.
+- **Store.** Saved as a `codemode_store` journal record holding the whole
+  store after each script that wrote to it, not as upstream's `codemode-store`
+  custom entries per branch.
+- **Abort and deadline.** No deadline unless `timeout_ms` is given, as
+  upstream. An abort ends the call like other tools: the result is the
+  aborted-output text, not `Script failed ... Script aborted: <reason>`.
+- **Not present:** worker admission limits, `models.*`, MCP exposure,
+  durable replay, grammar-constrained input.
 
 ### Built-in Tools Run In-Process
 
@@ -829,7 +869,7 @@ documented no-op so upstream invocations keep working. The CLI contract test
 `mcp` command and requires this entry.
 
 Reason: MCP is a large protocol surface (stdio and HTTP transports, OAuth,
-tool exposure modes, codemode) outside the native CLI/TUI scope today.
+tool exposure modes, MCP tools in codemode) outside the native CLI/TUI scope today.
 Revisit if noel adds an MCP client.
 
 ### Local `/bug` Reports for This Port

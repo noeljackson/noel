@@ -1,6 +1,6 @@
 // Writes upstream codemode's prelude, as the VM evaluates it, for noel-codemode to vendor.
 //
-// Usage: bun scripts/ts-parity/codemode-prelude-fixture.ts <pi-reference-root> <output-dir>
+// Usage: bun scripts/ts-parity/vendor-codemode-prelude.ts <pi-reference-root> <output-dir>
 // Writes <output-dir>/prelude.js (PRELUDE_SOURCE with its constants filled in) and
 // <output-dir>/prelude.json (the limits it embeds and its source commit).
 import { execFileSync } from "node:child_process";
@@ -10,7 +10,7 @@ import { join } from "node:path";
 async function main() {
 	const [reference, outputDir] = process.argv.slice(2);
 	if (!reference || !outputDir) {
-		throw new Error("usage: codemode-prelude-fixture.ts <pi-reference-root> <output-dir>");
+		throw new Error("usage: vendor-codemode-prelude.ts <pi-reference-root> <output-dir>");
 	}
 	const module = await import(join(reference, "packages/codemode/src/runtime/prelude-source.ts"));
 	const commit = execFileSync("git", ["-C", reference, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();

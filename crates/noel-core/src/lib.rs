@@ -1,3 +1,4 @@
+mod codemode;
 mod compaction;
 pub mod controller;
 #[cfg(test)]
@@ -309,6 +310,9 @@ pub struct SessionState {
     pub todos: Vec<TodoItem>,
     #[serde(default)]
     pub edited_files: Vec<String>,
+    /// What codemode scripts keep with `store()` (key to JSON value).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub codemode_store: BTreeMap<String, Value>,
     #[serde(default)]
     pub usage: SessionUsage,
     /// The session's runs, oldest first.
@@ -502,6 +506,7 @@ impl SessionState {
             disabled_tools: BTreeSet::new(),
             todos: Vec::new(),
             edited_files: Vec::new(),
+            codemode_store: BTreeMap::new(),
             usage: SessionUsage::default(),
             runs: Vec::new(),
             partial: None,
@@ -606,6 +611,8 @@ pub struct SessionExport {
     pub todos: Vec<TodoItem>,
     #[serde(default)]
     pub edited_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub codemode_store: BTreeMap<String, Value>,
     #[serde(default)]
     pub usage: SessionUsage,
 }
@@ -629,6 +636,7 @@ impl From<&SessionState> for SessionExport {
             disabled_tools: state.disabled_tools.clone(),
             todos: state.todos.clone(),
             edited_files: state.edited_files.clone(),
+            codemode_store: state.codemode_store.clone(),
             usage: state.usage.clone(),
         }
     }
@@ -658,6 +666,7 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         disabled_tools: export.disabled_tools,
         todos: export.todos,
         edited_files: export.edited_files,
+        codemode_store: export.codemode_store,
         usage: export.usage,
         // Runs belong to the session that ran them.
         runs: Vec::new(),
@@ -779,16 +788,30 @@ fn available_tool_names(
         .into_iter()
         .map(|definition| definition.name)
         .collect::<Vec<_>>();
+    // Built-in tools that are off unless selected: codemode, as upstream
+    // registers it inactive.
+    let selectable = builtin
+        .iter()
+        .cloned()
+        .chain([codemode::CODEMODE.to_owned()])
+        .collect::<Vec<_>>();
     let selected: BTreeSet<String> = match (&settings.enabled_tools, &settings.default_tools) {
-        (Some(allowed), _) => builtin
+        (Some(allowed), _) => selectable
             .iter()
             .chain(extension_tools.keys())
-            .filter(|name| noel_config::tool_name_matches(allowed, name))
+            .filter(|name| {
+                // Off unless selected by name: a pattern never turns it on.
+                if name.as_str() == codemode::CODEMODE {
+                    allowed.iter().any(|entry| entry == codemode::CODEMODE)
+                } else {
+                    noel_config::tool_name_matches(allowed, name)
+                }
+            })
             .cloned()
             .collect(),
         (None, Some(entries)) => noel_config::resolve_default_tools(entries, &builtin)
             .into_iter()
-            .filter(|name| builtin.contains(name))
+            .filter(|name| selectable.contains(name))
             .chain(extension_tools.keys().cloned())
             .collect(),
         (None, None) => builtin
@@ -1121,6 +1144,11 @@ enum SessionRecord {
     },
     EditedFiles {
         paths: Vec<String>,
+    },
+    /// The codemode store as it is after a script wrote to it. Older
+    /// versions ignore it.
+    CodemodeStore {
+        store: BTreeMap<String, Value>,
     },
     Usage {
         usage: SessionUsage,
@@ -1548,6 +1576,13 @@ impl SessionStore {
         self.append(&SessionRecord::Todos { todos })
     }
 
+    pub fn record_codemode_store(
+        &self,
+        store: BTreeMap<String, Value>,
+    ) -> Result<(), SessionError> {
+        self.append(&SessionRecord::CodemodeStore { store })
+    }
+
     pub fn record_edited_files(&self, paths: Vec<String>) -> Result<(), SessionError> {
         self.append(&SessionRecord::EditedFiles { paths })
     }
@@ -1801,6 +1836,9 @@ impl SessionStore {
             SessionRecord::EditedFiles {
                 paths: state.edited_files.clone(),
             },
+            SessionRecord::CodemodeStore {
+                store: state.codemode_store.clone(),
+            },
             SessionRecord::Usage {
                 usage: state.usage.clone(),
             },
@@ -2008,6 +2046,7 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         }
         SessionRecord::Todos { todos } => state.todos = todos,
         SessionRecord::EditedFiles { paths } => state.edited_files = paths,
+        SessionRecord::CodemodeStore { store } => state.codemode_store = store,
         SessionRecord::QueuedMessage { message } => {
             state.queued_messages.push(message);
             // Records like this one name no identities.
@@ -3069,6 +3108,18 @@ impl Runtime {
             store.record_todos(todos.clone())?;
         }
         self.session.todos = todos;
+        Ok(())
+    }
+
+    /// Saves the codemode store a script changed.
+    pub fn set_codemode_store(
+        &mut self,
+        store: BTreeMap<String, Value>,
+    ) -> Result<(), SessionError> {
+        if let Some(session_store) = &self.store {
+            session_store.record_codemode_store(store.clone())?;
+        }
+        self.session.codemode_store = store;
         Ok(())
     }
 
@@ -4611,10 +4662,20 @@ fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
                 parameters: tool.parameters.clone(),
             }),
     );
+    if model_tool_enabled(runtime, codemode::CODEMODE) {
+        let callable = codemode::callable(&definitions);
+        definitions.push(codemode::definition(&callable));
+    }
     definitions
 }
 
 fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
+    if name == codemode::CODEMODE {
+        return codemode::selected(
+            &runtime.systems.available_tool_names,
+            &runtime.session.disabled_tools,
+        );
+    }
     (runtime.session.active_tool_names.contains(name)
         || runtime.systems.extension_tools.contains_key(name))
         && !runtime.session.disabled_tools.contains(name)
@@ -5114,6 +5175,17 @@ async fn execute_model_tool_call(
                     vec![error.to_string()]
                 }
             }
+        }
+    } else if tool_call.name == codemode::CODEMODE {
+        if model_tool_enabled(runtime, codemode::CODEMODE) {
+            let callable = codemode::callable(&active_tool_definitions(runtime));
+            let result = codemode::run(runtime, tool_call, &callable).await?;
+            is_error = result.is_error;
+            images = result.images;
+            vec![result.output]
+        } else {
+            is_error = true;
+            vec![format!("Tool {} not found", tool_call.name)]
         }
     } else if tool_call.name == "todo" {
         if model_tool_enabled(runtime, "todo") {
@@ -9110,6 +9182,24 @@ mod tests {
         assert_eq!(fs::read_to_string(cwd.join("empty.txt")).unwrap(), "");
         assert_eq!(fs::read_to_string(cwd.join("a.rs")).unwrap(), "keep\nend\n");
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn session_store_restores_the_codemode_store_on_load() {
+        let base =
+            std::env::temp_dir().join(format!("noel-session-codemode-test-{}", new_session_id()));
+        let (store, _state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        let mut values = BTreeMap::new();
+        values.insert("seen".to_string(), serde_json::json!(["a", 1]));
+        store
+            .record_codemode_store(values.clone())
+            .expect("record codemode store");
+
+        let loaded = store.load().expect("load session");
+
+        assert_eq!(loaded.codemode_store, values);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
