@@ -1721,8 +1721,10 @@ version = "0.3.0"
 dependencies = [
  "djs-core",
  "djs-prelude",
+ "futures-util",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
