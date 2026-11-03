@@ -13,7 +13,7 @@
       "accept": "application/json",
       "authorization": "Bearer <redacted>",
       "content-type": "application/json",
-      "user-agent": "pi/1.4.0 (linux; node/v24.22.2; x64)",
+      "user-agent": "pi/1.5.0 (linux; node/v24.22.2; x64)",
       "x-stainless-arch": "x64",
       "x-stainless-lang": "js",
       "x-stainless-os": "Linux",
