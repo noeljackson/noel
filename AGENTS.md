@@ -6,14 +6,15 @@
 - No emojis in commits, issues, PR comments, docs, or code.
 - Answer direct questions before making changes.
 
-## Rust Workflow
+## Languages and Workflow
 
-- This repository is Rust-only.
-- Do not add npm, Node.js, TypeScript, Vite, React, or web UI code.
-- Do not run `npm install`.
-- Do not run npm scripts as a validation path.
+- Rust is the core: agent, providers, tools, session, TUI, and shared bindings.
+- Swift is allowed for native Apple clients (iOS, macOS) that consume Rust through shared bindings (for example UniFFI) or the chord protocol.
+- TypeScript is allowed only for the Bun-run extension engine (for example `crates/noel-cli/src/extension-hosts/noel-bun-host.ts`) and its parity fixtures under `scripts/ts-parity/`.
+- Use Bun, not npm or Node.js, for TypeScript. Do not run `npm install` or npm scripts.
+- Do not add Vite, React, or web UI code.
 
-After code changes, run:
+After Rust code changes, run:
 
 ```bash
 make check
