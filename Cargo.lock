@@ -1719,6 +1719,7 @@ dependencies = [
 name = "noel-codemode"
 version = "0.3.0"
 dependencies = [
+ "base64",
  "djs-core",
  "djs-prelude",
  "futures-util",
