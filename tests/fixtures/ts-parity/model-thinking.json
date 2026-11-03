@@ -1382,6 +1382,36 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "xhigh": "xhigh",
+        "max": "max",
+        "off": null
+      },
+      "examples": [
+        "opencode/claude-opus-5-5",
+        "opencode/claude-sonnet-5-5"
+      ],
+      "supported": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "clamp": {
+        "off": "minimal",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+        "invalid": "minimal"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "off": "none",
         "minimal": "minimal",
         "low": "low",
