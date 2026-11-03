@@ -40,7 +40,7 @@ use noel_config::LoadedConfig;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::server::client::{Client, Endpoint, Followed};
+use crate::server::client::{connect, Client, Endpoint, Followed};
 use crate::server::{new_request_id, valid_session_id};
 use crate::{
     Activity, TuiApp, TuiEntry, TuiEntryKind, TuiTerminal, QUIT_CONFIRM_WINDOW,
@@ -65,7 +65,7 @@ pub(crate) async fn run(
         Endpoint::Local => "noel server".to_owned(),
         Endpoint::Ssh { destination, .. } => format!("noel server on {destination}"),
     };
-    let client = Client::connect(
+    let client = connect(
         endpoint,
         Arc::new(move |message| {
             let _ = reports.send(Incoming::Report(message));

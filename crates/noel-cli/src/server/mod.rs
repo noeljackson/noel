@@ -58,20 +58,17 @@ pub(crate) const DEFAULT_SERVER_IDLE_MS: u64 = 10 * 60 * 1000;
 /// Default for `server.workerIdleExitMs`.
 pub(crate) const DEFAULT_WORKER_IDLE_MS: u64 = 60 * 1000;
 
-const CHAT_CONTRACT: &str = include_str!("contracts/noel.chat.json");
-const SESSIONS_CONTRACT: &str = include_str!("contracts/noel.sessions.json");
-const MODELS_CONTRACT: &str = include_str!("contracts/noel.models.json");
-
+// The contracts live in noel-client, which every front end shares.
 pub(crate) fn chat_contract() -> Description {
-    serde_json::from_str(CHAT_CONTRACT).expect("noel.chat's contract parses")
+    noel_client::contracts::chat()
 }
 
 pub(crate) fn sessions_contract() -> Description {
-    serde_json::from_str(SESSIONS_CONTRACT).expect("noel.sessions' contract parses")
+    noel_client::contracts::sessions()
 }
 
 pub(crate) fn models_contract() -> Description {
-    serde_json::from_str(MODELS_CONTRACT).expect("noel.models' contract parses")
+    noel_client::contracts::models()
 }
 
 /// Runs `noel server`, `noel worker`, `noel client` or `noel bridge` when
@@ -414,7 +411,7 @@ pub(crate) fn parse_control(line: &str) -> Option<Value> {
 
 /// A random id for a `requestId`.
 pub(crate) fn new_request_id() -> String {
-    noel_core::controller::new_id()
+    noel_client::new_request_id()
 }
 
 /// Milliseconds since the epoch.
