@@ -146,6 +146,40 @@ async fn a_client_holds_subscribes_and_calls_over_websocket_framing_on_a_unix_so
     server.close().await;
 }
 
+/// A listener that subscribes after the snapshot arrived still gets it, then
+/// the ops after it: the reference keeps a member's state from the first
+/// frame, listener or not. (A client whose `subscribe` reached its actor
+/// after the snapshot lost it, and `noel client ls` waited 30 s.)
+#[tokio::test]
+async fn a_listener_that_subscribes_after_the_snapshot_still_gets_it() {
+    let (server_link, client_link) = Link::memory_pair();
+    let server = Host::new(HostOptions::host("server"));
+    serve_tally(&server);
+    server.accept(server_link, AcceptOptions::client(owner()));
+    let client = Host::new(HostOptions::client("client"));
+    client.connect(client_link, LinkOptions::default());
+
+    let tally = client.get(tally(where_tally_lives()), json!({}), "server");
+    // `ready` resolves once the promised snapshot arrived, before anyone
+    // listens to `count`.
+    within(tally.ready()).await.expect("live");
+    let mut updates = tally.subscribe("count");
+    assert_eq!(
+        within(updates.next()).await,
+        Some(StateUpdate::Snapshot(json!({"n": 0})))
+    );
+    assert_eq!(
+        within(tally.call("add", Some(json!(3)))).await,
+        Ok(Some(json!(3)))
+    );
+    match within(updates.next()).await {
+        Some(StateUpdate::Ops { value, .. }) => assert_eq!(value, json!({"n": 3})),
+        other => panic!("expected ops, got {other:?}"),
+    }
+    client.close().await;
+    server.close().await;
+}
+
 fn packed(envelope: Value, payload: &str) -> Vec<u8> {
     let envelope = envelope.to_string();
     let mut message = (envelope.len() as u32).to_be_bytes().to_vec();

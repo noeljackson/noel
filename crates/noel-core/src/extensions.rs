@@ -239,11 +239,12 @@ impl HostProcess {
         let (mut child, group) = spawn_tool_process(&mut command).map_err(|source| {
             // Name what actually failed to start: for a `.ts` extension
             // that is the bun program, not the extension's own file.
-            let program = command.as_std().get_program();
-            let what = if program.to_string_lossy() == "bun" {
+            let program = Path::new(command.as_std().get_program());
+            let what = if program != path {
                 format!(
-                    "bun (needed for the TypeScript extension {}; run noel bun install \
+                    "{} (needed for the TypeScript extension {}; run noel bun install \
                      or put a bun on PATH)",
+                    program.display(),
                     path.display()
                 )
             } else {
@@ -804,6 +805,63 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Serializes the tests that change how bun and its shim are found
+    /// (`NOEL_BUN_HOST`, `NOEL_BUN_BIN`, `NOEL_DIR`): the variables are
+    /// process-wide, so a test pointing them at stubs must not run while
+    /// another test starts a real bun host.
+    static BUN_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Holds [`BUN_ENV`] with `NOEL_BUN_HOST` set to `shim`; dropping
+    /// it restores the variable, then releases the lock.
+    struct BunHostEnv {
+        previous: Option<std::ffi::OsString>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for BunHostEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
+                None => std::env::remove_var("NOEL_BUN_HOST"),
+            }
+        }
+    }
+
+    /// The pi release the vendored examples (`examples/extensions/
+    /// typescript/`, synced from upstream 5f312dac) run against. With no
+    /// `node_modules`, bun installs an example's imports on first run; a
+    /// `package.json` beside it pins them, so a new pi release on npm cannot
+    /// change what these tests run (pi-ai 1.5.0 dropped `Type`, which
+    /// `hello.ts` imports). Move it with the next example sync.
+    const VENDORED_PI_VERSION: &str = "1.4.0";
+
+    /// Pins the pi packages the vendored examples import, in `dir`.
+    fn pin_vendored_pi_packages(dir: &Path) {
+        let dependencies: serde_json::Map<String, serde_json::Value> = [
+            "@earendil-works/pi-ai",
+            "@earendil-works/pi-coding-agent",
+            "@earendil-works/pi-tui",
+        ]
+        .into_iter()
+        .map(|name| (name.to_string(), VENDORED_PI_VERSION.into()))
+        .collect();
+        fs::write(
+            dir.join("package.json"),
+            serde_json::json!({ "private": true, "dependencies": dependencies }).to_string(),
+        )
+        .expect("write package.json");
+    }
+
+    async fn bun_host_env(shim: &Path) -> BunHostEnv {
+        let lock = BUN_ENV.lock().await;
+        let previous = std::env::var_os("NOEL_BUN_HOST");
+        std::env::set_var("NOEL_BUN_HOST", shim);
+        BunHostEnv {
+            previous,
+            _lock: lock,
+        }
+    }
+
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = fs::metadata(path).expect("metadata").permissions();
@@ -899,18 +957,7 @@ mod tests {
 
         // The shim lookup checks NOEL_BUN_HOST first; point it at the repo's
         // shim so the test does not depend on an installed agent dir.
-        // SAFETY: single-threaded test; the guard restores the variable.
-        struct EnvGuard(Option<std::ffi::OsString>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
-                    None => std::env::remove_var("NOEL_BUN_HOST"),
-                }
-            }
-        }
-        let _guard = EnvGuard(std::env::var_os("NOEL_BUN_HOST"));
-        std::env::set_var("NOEL_BUN_HOST", &shim);
+        let _guard = bun_host_env(&shim).await;
 
         let mut hosts = ExtensionHosts::new();
         hosts
@@ -977,23 +1024,14 @@ mod tests {
         fs::create_dir_all(&cwd).expect("mkdir");
         let extension = cwd.join("permission-gate.ts");
         fs::copy(&example, &extension).expect("copy example");
+        pin_vendored_pi_packages(&cwd);
         fs::write(
             cwd.join("permission-gate.ts.noel-extension.json"),
             serde_json::json!({ "protocolVersion": 2 }).to_string(),
         )
         .expect("write manifest");
 
-        struct EnvGuard(Option<std::ffi::OsString>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
-                    None => std::env::remove_var("NOEL_BUN_HOST"),
-                }
-            }
-        }
-        let _guard = EnvGuard(std::env::var_os("NOEL_BUN_HOST"));
-        std::env::set_var("NOEL_BUN_HOST", &shim);
+        let _guard = bun_host_env(&shim).await;
 
         let mut hosts = ExtensionHosts::new();
         hosts
@@ -1043,23 +1081,14 @@ mod tests {
         fs::create_dir_all(&cwd).expect("mkdir");
         let extension = cwd.join("hello.ts");
         fs::copy(&example, &extension).expect("copy example");
+        pin_vendored_pi_packages(&cwd);
         fs::write(
             cwd.join("hello.ts.noel-extension.json"),
             serde_json::json!({ "protocolVersion": 2 }).to_string(),
         )
         .expect("write manifest");
 
-        struct EnvGuard(Option<std::ffi::OsString>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
-                    None => std::env::remove_var("NOEL_BUN_HOST"),
-                }
-            }
-        }
-        let _guard = EnvGuard(std::env::var_os("NOEL_BUN_HOST"));
-        std::env::set_var("NOEL_BUN_HOST", &shim);
+        let _guard = bun_host_env(&shim).await;
 
         let mut hosts = ExtensionHosts::new();
         hosts
@@ -1182,17 +1211,7 @@ done
         )
         .expect("write manifest");
 
-        struct EnvGuard(Option<std::ffi::OsString>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => std::env::set_var("NOEL_BUN_HOST", value),
-                    None => std::env::remove_var("NOEL_BUN_HOST"),
-                }
-            }
-        }
-        let _guard = EnvGuard(std::env::var_os("NOEL_BUN_HOST"));
-        std::env::set_var("NOEL_BUN_HOST", &shim);
+        let _guard = bun_host_env(&shim).await;
 
         let mut hosts = ExtensionHosts::new();
         hosts
@@ -1302,6 +1321,7 @@ done
                 let _ = std::fs::remove_dir_all(&self.dir);
             }
         }
+        let _lock = BUN_ENV.blocking_lock();
         let dir = std::env::temp_dir().join(format!("noel-bun-resolve-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("bin")).expect("mkdir");
         std::fs::write(dir.join("bin/bun"), b"stub").expect("stub bun");
@@ -1310,7 +1330,6 @@ done
             dir: dir.clone(),
             old_dir: std::env::var_os("NOEL_DIR"),
         };
-        // SAFETY: single-threaded test, restored by the guard.
         std::env::set_var("NOEL_DIR", &dir);
         std::env::remove_var("NOEL_BUN_BIN");
 

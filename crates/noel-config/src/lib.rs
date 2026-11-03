@@ -4029,8 +4029,26 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Runs `test` with no provider base-URL variable ([`BASE_URL_ENV`]) set,
+    /// so models keep the addresses the test gives them wherever it runs.
+    fn without_base_url_env(test: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let saved = BASE_URL_ENV.map(|(_, name)| save_env(name));
+        for (_, name) in BASE_URL_ENV {
+            env::remove_var(name);
+        }
+        test();
+        for (name, value) in saved {
+            restore_env(name, value);
+        }
+    }
+
     #[test]
     fn model_cache_extends_builtin_and_explicit_models() {
+        without_base_url_env(model_cache_extends_builtin_and_explicit_models_here);
+    }
+
+    fn model_cache_extends_builtin_and_explicit_models_here() {
         let root = test_dir("noel-config-model-cache");
         let agent_dir = root.join("agent");
         let cwd = root.join("repo");
