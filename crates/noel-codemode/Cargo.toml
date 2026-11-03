@@ -11,5 +11,10 @@ description = "Upstream pi's codemode on the djs engine: model-written JavaScrip
 # also runs on iOS. djs-prelude's build script makes the base snapshot.
 djs-core = { git = "https://github.com/earendil-works/djs", rev = "16b7438f433890dae1589eeaee972afbee073104", default-features = false, features = ["full", "unicode"] }
 djs-prelude = { git = "https://github.com/earendil-works/djs", rev = "16b7438f433890dae1589eeaee972afbee073104", default-features = false, features = ["raw", "full", "unicode"] }
+futures-util = { version = "=0.3.32", default-features = false, features = ["std"] }
 serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

@@ -3,6 +3,7 @@
 //!
 //! The specification is `docs/codemode-port.md`.
 
+pub mod execution;
 pub mod identifier;
 pub mod source;
 

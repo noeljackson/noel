@@ -178,6 +178,8 @@ pub struct VmSession {
     prepared: Option<Prepared>,
     interrupt: Arc<AtomicBool>,
     outbox: Vec<VmMessage>,
+    /// Where messages go as they happen, when set (see [`VmSession::stream_to`]).
+    sink: Option<Box<dyn FnMut(VmMessage) + Send>>,
     /// Off while the host globals and the prelude run (trusted, bounded code).
     polling: bool,
     /// While the prelude runs the clock reads 0 in UTC.
@@ -193,6 +195,25 @@ impl VmSession {
         data: &VmStart,
         interrupt: Arc<AtomicBool>,
     ) -> Result<(VmSession, Vec<VmMessage>), String> {
+        Self::start_with(data, interrupt, None)
+    }
+
+    /// As [`VmSession::start`], with every message passed to `sink` as it
+    /// happens instead of returned: output a script writes before it spins
+    /// reaches the host, as upstream's worker posts each message at once.
+    pub fn start_streaming(
+        data: &VmStart,
+        interrupt: Arc<AtomicBool>,
+        sink: Box<dyn FnMut(VmMessage) + Send>,
+    ) -> Result<VmSession, String> {
+        Self::start_with(data, interrupt, Some(sink)).map(|(session, _)| session)
+    }
+
+    fn start_with(
+        data: &VmStart,
+        interrupt: Arc<AtomicBool>,
+        sink: Option<Box<dyn FnMut(VmMessage) + Send>>,
+    ) -> Result<(VmSession, Vec<VmMessage>), String> {
         let mut options = VmOptions {
             random_seed: entropy(),
             ..VmOptions::default()
@@ -206,6 +227,7 @@ impl VmSession {
             prepared: None,
             interrupt,
             outbox: Vec::new(),
+            sink,
             polling: true,
             fixed_clock: false,
             ended: false,
@@ -245,7 +267,10 @@ impl VmSession {
         ) {
             self.ended = true;
         }
-        self.outbox.push(message);
+        match &mut self.sink {
+            Some(sink) => sink(message),
+            None => self.outbox.push(message),
+        }
     }
 
     fn begin(&mut self, data: &VmStart) -> Result<(), Crash> {
