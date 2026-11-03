@@ -20,6 +20,7 @@ libc = "=0.2.186"
 nix.workspace = true
 noel-ai = { path = "../noel-ai" }
 noel-chord = { path = "../noel-chord" }
+noel-client = { path = "../noel-client" }
 noel-config = { path = "../noel-config" }
 noel-core = { path = "../noel-core" }
 noel-env = { path = "../noel-env" }

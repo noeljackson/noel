@@ -16,7 +16,7 @@ import {
  * session's worker, and follows its `view`.
  *
  * The consumer declares only the view, with an open schema; noel's contract
- * (`crates/noel-cli/src/server/contracts/noel.chat.json`) covers it, so the
+ * (`crates/noel-client/contracts/noel.chat.json`) covers it, so the
  * hold binds by coverage. Prints `{"subscribed": ...}` once the snapshot came,
  * then waits for `noel client send` (run by scripts/chord-interop.sh) to add
  * two entries, which must arrive as ops. Exits 0 when both hold.
