@@ -30,7 +30,7 @@ ENV_DAEMONS_SCRIPT := scripts/build-env-daemons.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord-interop env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord-interop chord2-interop env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -68,6 +68,7 @@ help:
 		'  ts-parity-pi-env    Regenerate only the pi-env daemon goldens inside Docker' \
 		'  ts-parity-pi-env-ssh Regenerate only the pi-env SSH deployment goldens inside Docker' \
 		'  chord-interop       Run noel-chord against upstream Chord over WebSockets' \
+		'  chord2-interop      Run noel against upstream Chord v2 (Bun, CHORD2_REFERENCE_DIR)' \
 		'  env-interop         Run upstream pi-env client tests against noel-env serve, and the noel-env client tests against upstream pi-env' \
 		'  ts-parity-update    Refresh fixtures from moving TS reference inside Docker' \
 		'  ts-parity-drift     Check moving TS reference for fixture drift' \
@@ -250,6 +251,9 @@ ts-parity-update:
 
 # Upstream's client and server hosts (in the ts-parity image) against
 # noel-chord's examples, over WebSockets on Unix sockets.
+chord2-interop:
+	CARGO="$(CARGO)" CHORD2_REFERENCE_DIR="$(CHORD2_REFERENCE_DIR)" scripts/chord2-interop.sh
+
 chord-interop: ts-parity-build
 	CARGO="$(CARGO)" DOCKER="$(DOCKER)" TS_PARITY_IMAGE="$(TS_PARITY_IMAGE)" scripts/chord-interop.sh
 
