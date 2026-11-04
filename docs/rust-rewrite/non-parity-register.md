@@ -730,8 +730,12 @@ upstream's, byte for byte (`docs/codemode-port.md`). These parts differ:
   parallel; extension v2 calls share one host lock, so they run one at a
   time. A nested call resolves to its text output: `bash` and `read` have no
   structured results, and `read` of an image gives its text, not an image
-  block. Nested calls are not reported as tool events (no live rows) and the
-  result carries no `nestedCalls`.
+  block. Nested calls are reported as they change (`TurnEvent::NestedToolCalls`):
+  the TUI lists them as upstream's renderer does, above the result once the
+  call ends, and RPC sends upstream's `tool_execution_update` with
+  `details.calls`. They have no `tool_execution_*` events of their own, the
+  result message carries no `nestedCalls`, and the server's view shows them
+  only through the tool's result (no `nestedTools`).
 - **Result.** The text items are joined into the tool result's text and
   images are attached after it, not interleaved. Spill and image files are
   `noel-codemode-<random>.<ext>` in the temp directory.

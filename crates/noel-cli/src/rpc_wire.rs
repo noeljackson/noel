@@ -1019,10 +1019,13 @@ pub(crate) enum AssistantEvent<'a> {
     },
 }
 
-/// A tool's result, or what it has printed so far: its output as text.
+/// A tool's result, or what it has printed so far: its output as text,
+/// and for a running `codemode` call its nested calls (`details.calls`).
 #[derive(Serialize)]
 pub(crate) struct ExecutionResult<'a> {
     content: &'a [Content],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
 
 /// Where records go, in order.
@@ -1211,6 +1214,18 @@ impl Recorder {
                     args: parse_arguments(&call.arguments),
                     partial_result: ExecutionResult {
                         content: content.as_slice(),
+                        details: None,
+                    },
+                });
+            }
+            TurnEvent::NestedToolCalls { call, calls } => {
+                sink(Event::ToolExecutionUpdate {
+                    tool_call_id: &call.id,
+                    tool_name: &call.name,
+                    args: parse_arguments(&call.arguments),
+                    partial_result: ExecutionResult {
+                        content: &[],
+                        details: Some(serde_json::json!({ "calls": calls })),
                     },
                 });
             }
@@ -1478,7 +1493,10 @@ impl Recorder {
         sink(Event::ToolExecutionEnd {
             tool_call_id: &call.id,
             tool_name: &call.name,
-            result: ExecutionResult { content: &content },
+            result: ExecutionResult {
+                content: &content,
+                details: None,
+            },
             is_error,
             duration_ms,
         });

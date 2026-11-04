@@ -386,9 +386,10 @@ impl View {
                 }
                 true
             }
-            TurnEvent::Provider(_) | TurnEvent::ToolUpdate { .. } | TurnEvent::TodosUpdated(_) => {
-                false
-            }
+            TurnEvent::Provider(_)
+            | TurnEvent::ToolUpdate { .. }
+            | TurnEvent::NestedToolCalls { .. }
+            | TurnEvent::TodosUpdated(_) => false,
             TurnEvent::RetryStarted(notice) => {
                 self.live.generation = Some(Generation {
                     attempt: notice.attempt + 1,

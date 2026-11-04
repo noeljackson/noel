@@ -11,9 +11,9 @@ use serde_json::json;
 
 use crate::{
     active_tool_definitions, available_tool_names, bash_timeout_ms, execute_model_tool_call,
-    extension_tools_from_resources, prompt_tools, provider_messages, runtime_system_prompt,
-    ChatToolCall, ConversationMessage, ExtensionTool, MessageRole, ReloadableSystems, ResourceFile,
-    Runtime, SessionState,
+    execute_model_tool_call_with, extension_tools_from_resources, prompt_tools, provider_messages,
+    runtime_system_prompt, ChatToolCall, ConversationMessage, ExtensionTool, MessageRole,
+    NestedCallStatus, NestedToolCall, ReloadableSystems, ResourceFile, Runtime, SessionState,
 };
 
 /// A session in a new directory with one extension, `ext-tool`, whose
@@ -713,4 +713,60 @@ async fn sessions_in_a_workspace_run_their_tools_only_there() {
     assert_eq!((output.as_str(), is_error), ("from here\n", false));
     assert_eq!(opened.lock().unwrap().len(), opens);
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn codemode_reports_its_nested_calls_as_they_change() {
+    let (mut runtime, cwd) = runtime_with_codemode("nested", &["read", "codemode"]);
+    fs::write(cwd.join("a.txt"), "alpha").expect("write a");
+    let call = ChatToolCall {
+        id: "cm1".to_string(),
+        name: "codemode".to_string(),
+        arguments: json!({ "code": "await tools.read({ path: 'a.txt' });\nawait tools.read({ path: 'missing.txt' }).catch(() => {});" }).to_string(),
+    };
+    let mut snapshots: Vec<Vec<NestedToolCall>> = Vec::new();
+    execute_model_tool_call_with(&mut runtime, &call, &mut |_| {}, &mut |calls| {
+        snapshots.push(calls)
+    })
+    .await
+    .expect("run codemode");
+    // First the script as running, then each call starting and ending.
+    assert!(snapshots[0].is_empty());
+    let last = snapshots.last().expect("a final snapshot");
+    let rows: Vec<_> = last
+        .iter()
+        .map(|row| {
+            (
+                row.id.as_str(),
+                row.name.as_str(),
+                row.status,
+                row.args.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "cm1/1",
+                "read",
+                NestedCallStatus::Ok,
+                "{\"path\":\"a.txt\"}"
+            ),
+            (
+                "cm1/2",
+                "read",
+                NestedCallStatus::Error,
+                "{\"path\":\"missing.txt\"}"
+            ),
+        ]
+    );
+    assert!(last[1].error.is_some());
+    assert!(snapshots.iter().any(|rows| rows
+        .first()
+        .is_some_and(|row| row.status == NestedCallStatus::Running)));
+    // Upstream's `details.calls` shape.
+    let row = serde_json::to_value(&last[0]).unwrap();
+    assert_eq!(row["status"], "ok");
+    assert!(row["durationMs"].is_u64());
 }
