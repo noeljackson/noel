@@ -9,7 +9,8 @@
 //! - [`part`]: limits per part, compression and opening parts.
 //! - [`channel`]: a host's end of a link (handshake, checks, heartbeat).
 //! - [`link`]: byte links; [`object`]: what a provider serves; [`host`]:
-//!   hosts with both sides of each link and remote references.
+//!   hosts with both sides of each link and remote references;
+//!   [`transport`]: WebSocket and framed byte-stream links.
 
 pub mod binary;
 pub mod channel;
@@ -21,6 +22,7 @@ pub mod link;
 pub mod message;
 pub mod object;
 pub mod part;
+pub mod transport;
 
 pub use channel::{BinaryCodec, Channel, ChannelOptions, Codec, ProtocolError, Received, Tick};
 pub use contract::{hash64, Contract, ContractError, Declaration, HostKind};

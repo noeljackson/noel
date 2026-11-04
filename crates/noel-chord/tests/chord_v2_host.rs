@@ -588,3 +588,40 @@ async fn revocation_ends_a_principals_objects_and_links() {
         "{gone:?}"
     );
 }
+
+/// Hosts over a WebSocket (binary frames), and over a framed byte stream.
+#[tokio::test]
+async fn hosts_talk_over_websockets_and_framed_streams() {
+    let cell = Cell::new(json!({"type": "integer"}), json!(1)).unwrap();
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let server = server(&cell, &disposed);
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let accepted = tokio::spawn(tokio_tungstenite::accept_async(server_io));
+    let (socket, _) = tokio_tungstenite::client_async("ws://localhost/chord", client_io)
+        .await
+        .unwrap();
+    let accepted = accepted.await.unwrap().unwrap();
+    server.accept(
+        noel_chord::v2::transport::websocket(accepted),
+        LinkOptions::new(json!({"kind": "device"})),
+    );
+    let ws_client = client();
+    ws_client.connect(
+        noel_chord::v2::transport::websocket(socket),
+        LinkOptions::new(json!({"kind": "server"})),
+    );
+    let held = ws_client.get(Arc::new(counter()), json!({"session": "s1"}));
+    assert_eq!(held.call("add", json!({"by": 2})).await.unwrap(), json!(3));
+
+    let (a_read, b_write) = tokio::io::duplex(1 << 16);
+    let (b_read, a_write) = tokio::io::duplex(1 << 16);
+    let (down, _) = noel_chord::v2::transport::framed(a_read, a_write, None);
+    let (up, _) = noel_chord::v2::transport::framed(b_read, b_write, None);
+    server.accept(down, LinkOptions::new(json!({"kind": "worker"})));
+    let other = client();
+    other.connect(up, LinkOptions::new(json!({"kind": "server"})));
+    let held = other.get(Arc::new(counter()), json!({"session": "s1"}));
+    let mut count = held.subscribe("count");
+    assert_eq!(next(&mut count).await, StateUpdate::Snapshot(json!(3)));
+}
