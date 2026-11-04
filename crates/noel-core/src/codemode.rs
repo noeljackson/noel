@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use noel_ai::{ChatToolCall, ToolDefinition as AiToolDefinition};
-use noel_codemode::execution::{execute, CallFuture, DeclaredTool, ExecuteOptions, Executor};
+use noel_codemode::execution::{
+    execute, AbortSignal, CallFuture, DeclaredTool, ExecuteOptions, Executor,
+};
 use noel_codemode::format::{format_result, Block, CallSummary, OutputFiles};
 use noel_codemode::vm::CallTarget;
 use noel_codemode::{parse_codemode_source, to_codemode_identifier};
@@ -85,6 +87,10 @@ fn admission_failure(deadline_ms: Option<u64>, max: usize, waited_seconds: f64) 
     )
 }
 
+/// The reason an aborted script names: the message of the `AbortError` an
+/// `AbortController.abort()` without a reason gives in Node.
+const ABORT_REASON: &str = "This operation was aborted";
+
 /// Upstream's `DESCRIPTION_INTRO`, word for word.
 const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.
 - `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. A tool whose declaration returns an object resolves on failure too when it returned that object; check its fields. Calls still running when the script ends are cancelled.
@@ -114,8 +120,9 @@ pub(crate) fn definition(callable: &[AiToolDefinition]) -> AiToolDefinition {
         for tool in callable {
             let summary = tool.description.lines().next().unwrap_or_default();
             description.push_str(&format!(
-                "\n- `tools.{}(args)`: {summary}",
-                to_codemode_identifier(&tool.name)
+                "\n- `tools.{}(args)`: {summary}{}",
+                to_codemode_identifier(&tool.name),
+                resolves_to(&tool.name)
             ));
         }
     }
@@ -129,6 +136,16 @@ pub(crate) fn definition(callable: &[AiToolDefinition]) -> AiToolDefinition {
             },
             "required": ["code"]
         }),
+    }
+}
+
+/// What a nested call resolves to, for the tools whose value is not their
+/// text (upstream's `outputSchema`s of `bash` and `read`).
+fn resolves_to(name: &str) -> &'static str {
+    match name {
+        "bash" => " Resolves to `{ output, truncated, full_output_path?, exit_code, wall_time_seconds }`, also for a non-zero exit code.",
+        "read" => " Resolves to the text, or `{ type: \"image\", data, mimeType, note }` for an image.",
+        _ => "",
     }
 }
 
@@ -206,7 +223,15 @@ impl Nested {
                 Ok(result) => (result.output, result.is_error),
                 Err(error) => (error.to_string(), true),
             },
-            None => self.builtin(&call).await,
+            None => {
+                let (output, is_error, value) = self.builtin(&call).await;
+                // A tool with a structured result resolves to it, on a
+                // failure too (upstream `toScriptValue`).
+                if let Some(value) = value {
+                    return Ok(Some(value));
+                }
+                (output, is_error)
+            }
         };
         if is_error {
             Err(if output.is_empty() {
@@ -219,17 +244,21 @@ impl Nested {
         }
     }
 
-    async fn builtin(&self, call: &ChatToolCall) -> (String, bool) {
+    /// A built-in tool's text, error flag, and the value a script gets
+    /// instead of the text when the tool has one: `bash`'s structured
+    /// output, or `read` of an image as an image block.
+    async fn builtin(&self, call: &ChatToolCall) -> (String, bool, Option<Value>) {
         let requests = match model_tool_requests(call) {
             Ok(requests) => requests,
-            Err(error) => return (error.to_string(), true),
+            Err(error) => return (error.to_string(), true, None),
         };
         let env = match &self.env {
             Ok(env) => env.clone(),
-            Err(message) => return (message.clone(), true),
+            Err(message) => return (message.clone(), true, None),
         };
         let mut outputs = Vec::new();
         let mut is_error = false;
+        let mut value = None;
         for request in requests {
             let edited = match &request {
                 ToolRequest::Edit { path, .. } | ToolRequest::Write { path, .. } => {
@@ -245,6 +274,16 @@ impl Nested {
                     if let (Some(path), false) = (edited, result.is_error) {
                         self.state().edited.push(path);
                     }
+                    if let Some(structured) = result.structured {
+                        value = Some(structured);
+                    } else if let Some(image) = result.images.first() {
+                        value = Some(json!({
+                            "type": "image",
+                            "data": image.data_base64,
+                            "mimeType": image.mime_type,
+                            "note": result.output,
+                        }));
+                    }
                     outputs.push(result.output);
                 }
                 Err(error) => {
@@ -253,7 +292,7 @@ impl Nested {
                 }
             }
         }
-        (outputs.join("\n"), is_error)
+        (outputs.join("\n"), is_error, value)
     }
 }
 
@@ -418,6 +457,7 @@ pub(crate) async fn run(
     tool_call: &ChatToolCall,
     callable: &[AiToolDefinition],
     on_nested: &mut (dyn FnMut(Vec<NestedToolCall>) + Send),
+    cancellation: Option<&noel_agent::CancellationToken>,
 ) -> Result<CodemodeOutput, AgentError> {
     let started = Instant::now();
     let failed = |message: String| CodemodeOutput {
@@ -494,13 +534,27 @@ pub(crate) async fn run(
         memory_limit_bytes: Some(MEMORY_LIMIT_BYTES),
         store: runtime.session.codemode_store.clone(),
     };
+    // The run's abort ends the script, which then reports `Script aborted`.
+    let abort = AbortSignal::default();
     let result = {
-        let execution = execute(&source.code, &tools, &[], &recording, options, None);
+        let execution = execute(&source.code, &tools, &[], &recording, options, Some(&abort));
         tokio::pin!(execution);
+        let cancelled = async {
+            match cancellation {
+                Some(cancellation) => cancellation.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(cancelled);
+        let mut watching = true;
         loop {
             tokio::select! {
                 result = &mut execution => break result,
                 Some(rows) = snapshots.recv() => on_nested(rows),
+                () = &mut cancelled, if watching => {
+                    watching = false;
+                    abort.abort(ABORT_REASON);
+                }
             }
         }
     };

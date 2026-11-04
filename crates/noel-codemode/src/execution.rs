@@ -140,6 +140,9 @@ pub struct CodemodeResult {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Completed {
     pub value: Option<Value>,
+    /// The value's JSON as the script serialized it, keys in its order
+    /// (a `Value` sorts them).
+    pub value_json: Option<String>,
     pub store_writes: StoreWrites,
 }
 
@@ -466,12 +469,13 @@ pub async fn execute(
                             });
                         }
                         VmMessage::Done { value, writes } => {
+                            let value_json = value.clone();
                             let value = match value.as_deref().map(|value| parse_bridge_json(value, "return value")).transpose() {
                                 Ok(value) => value,
                                 Err(BridgeError(message)) => break 'run Err(bridge_broken(&message)),
                             };
                             match parse_store_writes(&writes) {
-                                Ok(store_writes) => break 'run Ok(Completed { value, store_writes }),
+                                Ok(store_writes) => break 'run Ok(Completed { value, value_json, store_writes }),
                                 Err(BridgeError(message)) => break 'run Err(bridge_broken(&message)),
                             }
                         }

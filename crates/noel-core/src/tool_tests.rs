@@ -725,9 +725,13 @@ async fn codemode_reports_its_nested_calls_as_they_change() {
         arguments: json!({ "code": "await tools.read({ path: 'a.txt' });\nawait tools.read({ path: 'missing.txt' }).catch(() => {});" }).to_string(),
     };
     let mut snapshots: Vec<Vec<NestedToolCall>> = Vec::new();
-    execute_model_tool_call_with(&mut runtime, &call, &mut |_| {}, &mut |calls| {
-        snapshots.push(calls)
-    })
+    execute_model_tool_call_with(
+        &mut runtime,
+        &call,
+        &mut |_| {},
+        &mut |calls| snapshots.push(calls),
+        None,
+    )
     .await
     .expect("run codemode");
     // First the script as running, then each call starting and ending.
@@ -769,4 +773,71 @@ async fn codemode_reports_its_nested_calls_as_they_change() {
     let row = serde_json::to_value(&last[0]).unwrap();
     assert_eq!(row["status"], "ok");
     assert!(row["durationMs"].is_u64());
+}
+
+#[tokio::test]
+async fn an_aborted_codemode_script_reports_it_as_upstream_does() {
+    let (mut runtime, _) = runtime_with_codemode("abort", &["bash", "codemode"]);
+    let call = ChatToolCall {
+        id: "cm-abort".to_string(),
+        name: "codemode".to_string(),
+        arguments: json!({ "code": "text('before');\nawait tools.bash({ command: 'sleep 30' });\ntext('after');" })
+            .to_string(),
+    };
+    let cancellation = crate::CancellationToken::default();
+    let cancel = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        cancel.cancel();
+    });
+    let mut last = Vec::new();
+    let started = std::time::Instant::now();
+    execute_model_tool_call_with(
+        &mut runtime,
+        &call,
+        &mut |_| {},
+        &mut |calls| last = calls,
+        Some(&cancellation),
+    )
+    .await
+    .expect("run codemode");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let event = runtime.session.tool_history.last().expect("a result");
+    assert!(event.is_error);
+    assert!(
+        event.result.starts_with("Script failed\n"),
+        "{}",
+        event.result
+    );
+    assert!(
+        event.result.ends_with(
+            "Output:\nbefore\nScript error:\nScript aborted: This operation was aborted\n\nTool calls made before the failure (they are not undone): bash (cancelled)"
+        ),
+        "{}",
+        event.result
+    );
+    assert_eq!(last[0].status, NestedCallStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn a_codemode_bash_call_resolves_to_its_structured_output() {
+    let (mut runtime, _) = runtime_with_codemode("bash-structured", &["bash", "codemode"]);
+    let code = "const r = await tools.bash({ command: 'echo hi; exit 3' });\n\
+                return { output: r.output, exit: r.exit_code, truncated: r.truncated, timed: typeof r.wall_time_seconds };";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(!is_error, "{output}");
+    assert!(
+        output.ends_with(
+            "Output:\n{\"output\":\"hi\\n\",\"exit\":3,\"truncated\":false,\"timed\":\"number\"}"
+        ),
+        "{output}"
+    );
+    let definitions = active_tool_definitions(&runtime);
+    let codemode = definitions
+        .iter()
+        .find(|tool| tool.name == "codemode")
+        .unwrap();
+    assert!(codemode
+        .description
+        .contains("exit_code, wall_time_seconds"));
 }
