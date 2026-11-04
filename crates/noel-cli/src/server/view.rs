@@ -11,11 +11,15 @@
 //!   the entry just before the window; `noel.chat`'s `entries` method pages
 //!   back from it.
 //! - `docs["pi.agent"]`: `{model?, thinkingLevel, cwd}`.
-//! - `docs["pi.live"]`: `{}` while idle; while a run is active, `run`
-//!   (`{runId, requestId?, inputs}`), `generation` (`{attempt, message?,
-//!   retry?}`, where `message` is the reply's committed partial), `tools`
-//!   (the round's calls, `{callId, name, status, output?, truncated?}`, with
-//!   their committed output) and `compaction` while one runs.
+//! - `docs["pi.live"]`: a subset of Durable's `pi.live` v3. While a run is
+//!   active, `run` (`{runId, requestId?, inputs, turns}`), `generation`
+//!   (`{attempt, message?, retry?}`, where `message` is the reply's
+//!   committed partial) and `tools` (the round's calls, `{callId, name,
+//!   status, output?, truncated?, entry?}`, with their committed output and,
+//!   once saved, their result's entry); `compactions` (`[{trigger}]`) while
+//!   one runs and `compactionFailure` (`{trigger, error}`) after one failed;
+//!   `runFailure` (`{reason, detail?, inputs}`) after a run that ended
+//!   without an answer, until the next starts. Otherwise `{}`.
 //! - `docs["pi.inbox"]`: `{items: [{id, mode, content, requestId?}]}`.
 //! - `docs["pi.usage"]`: `{total: {input, output, requests}}`.
 //! - `lastRun`: `get_state.lastRun`.
@@ -99,13 +103,23 @@ struct Live {
     run: Option<RunDoc>,
     generation: Option<Generation>,
     tools: Vec<ToolSlot>,
+    /// The running compaction's trigger: `manual`, `threshold` or
+    /// `overflow` (Durable's `CompactionStatus.trigger`).
     compaction: Option<&'static str>,
+    /// The last compaction failed: its trigger and error.
+    compaction_failure: Option<(&'static str, String)>,
+    /// The reply ran out of context: the next compaction is an overflow's.
+    overflowed: bool,
+    /// Why the last run ended without an answer; kept until a run starts.
+    run_failure: Option<Value>,
 }
 
 struct RunDoc {
     run_id: String,
     request_id: Option<String>,
     inputs: Vec<String>,
+    /// The run's tool rounds so far.
+    turns: u64,
 }
 
 #[derive(Default)]
@@ -122,6 +136,8 @@ struct ToolSlot {
     status: &'static str,
     output: String,
     truncated: bool,
+    /// The history entry of the call's result, once saved.
+    entry: Option<u64>,
 }
 
 impl View {
@@ -219,6 +235,7 @@ impl View {
             }
             Event::CompactionStarted => {
                 self.live.compaction = Some("manual");
+                self.live.compaction_failure = None;
                 true
             }
             Event::CompactionEnded { .. } => {
@@ -227,8 +244,24 @@ impl View {
             }
             Event::SaveFailed { .. } => false,
             Event::RunSettled { run_id, outcome } => {
-                let request_id = self.live.run.take().and_then(|run| run.request_id);
+                let run = self.live.run.take();
+                let inputs = run
+                    .as_ref()
+                    .map(|run| run.inputs.clone())
+                    .unwrap_or_default();
+                let request_id = run.and_then(|run| run.request_id);
                 self.live = Live::default();
+                // Why the run ended without an answer (Durable's
+                // `runFailure`), until another run starts.
+                self.live.run_failure = match outcome {
+                    Outcome::Completed => None,
+                    Outcome::Aborted => Some(json!({"reason": "aborted", "inputs": inputs})),
+                    Outcome::Failed(error) => Some(json!({
+                        "reason": "model_error",
+                        "detail": error,
+                        "inputs": inputs,
+                    })),
+                };
                 self.resuming.clear();
                 let mut last = json!({"runId": run_id, "status": to_json(&outcome.status())});
                 if let Some(request_id) = request_id {
@@ -288,6 +321,17 @@ impl View {
                     .push(record, |message, failed| render(message, failed, empty))
                     .map(|entry| entry.to_json());
                 if let Some(entry) = added {
+                    // A call's result names its entry in the call's slot.
+                    let call_id = entry["model"][0]["toolCallId"].as_str().map(str::to_owned);
+                    let id = entry["id"].as_u64();
+                    if let Some(slot) = call_id.and_then(|call_id| {
+                        self.live
+                            .tools
+                            .iter_mut()
+                            .find(|slot| slot.call_id == call_id)
+                    }) {
+                        slot.entry = id;
+                    }
                     self.push_entry(entry);
                 }
             }
@@ -322,6 +366,7 @@ impl View {
                 run_id: run_id.to_owned(),
                 request_id,
                 inputs: vec![run_id.to_owned()],
+                turns: 0,
             }),
             ..Live::default()
         };
@@ -363,6 +408,7 @@ impl View {
                 },
                 output: saved.map(|saved| saved.output.clone()).unwrap_or_default(),
                 truncated: saved.is_some_and(|saved| saved.truncated),
+                entry: None,
             });
         }
     }
@@ -413,6 +459,7 @@ impl View {
                             status: "pending",
                             output: String::new(),
                             truncated: false,
+                            entry: None,
                         })
                         .collect();
                 }
@@ -440,6 +487,7 @@ impl View {
                 true
             }
             TurnEvent::Overflowed { .. } => {
+                self.live.overflowed = true;
                 if let Some(generation) = &mut self.live.generation {
                     generation.text.clear();
                     generation.thinking.clear();
@@ -460,14 +508,31 @@ impl View {
                 true
             }
             TurnEvent::CompactionStarted => {
-                self.live.compaction = Some("auto");
+                let trigger = if std::mem::take(&mut self.live.overflowed) {
+                    "overflow"
+                } else {
+                    "threshold"
+                };
+                self.live.compaction = Some(trigger);
+                self.live.compaction_failure = None;
                 true
             }
-            TurnEvent::CompactionFinished(_) | TurnEvent::CompactionFailed(_) => {
+            TurnEvent::CompactionFinished(_) => {
                 self.live.compaction = None;
                 true
             }
+            TurnEvent::CompactionFailed(error) => {
+                if let Some(trigger) = self.live.compaction.take() {
+                    self.live.compaction_failure = Some((trigger, error.clone()));
+                }
+                true
+            }
             TurnEvent::RoundFinished => {
+                if !self.live.tools.is_empty() {
+                    if let Some(run) = &mut self.live.run {
+                        run.turns += 1;
+                    }
+                }
                 self.live.generation = None;
                 self.live.tools.clear();
                 true
@@ -490,6 +555,7 @@ impl View {
                     status: "running",
                     output: String::new(),
                     truncated: false,
+                    entry: None,
                 });
                 self.live.tools.len() - 1
             }
@@ -526,7 +592,7 @@ impl View {
     fn live_json(&self) -> Value {
         let mut live = Map::new();
         if let Some(run) = &self.live.run {
-            let mut doc = json!({"runId": run.run_id, "inputs": run.inputs});
+            let mut doc = json!({"runId": run.run_id, "inputs": run.inputs, "turns": run.turns});
             if let Some(request_id) = &run.request_id {
                 doc["requestId"] = json!(request_id);
             }
@@ -563,13 +629,25 @@ impl View {
                     if slot.truncated {
                         doc["truncated"] = json!(true);
                     }
+                    if let Some(entry) = slot.entry {
+                        doc["entry"] = json!(entry);
+                    }
                     doc
                 })
                 .collect::<Vec<_>>();
             live.insert("tools".into(), Value::Array(tools));
         }
-        if let Some(reason) = self.live.compaction {
-            live.insert("compaction".into(), json!({"reason": reason}));
+        if let Some(trigger) = self.live.compaction {
+            live.insert("compactions".into(), json!([{"trigger": trigger}]));
+        }
+        if let Some((trigger, error)) = &self.live.compaction_failure {
+            live.insert(
+                "compactionFailure".into(),
+                json!({"trigger": trigger, "error": error}),
+            );
+        }
+        if let Some(failure) = &self.live.run_failure {
+            live.insert("runFailure".into(), failure.clone());
         }
         Value::Object(live)
     }
@@ -842,7 +920,10 @@ mod tests {
             append: true,
         });
         let live = view.value()["docs"]["pi.live"].clone();
-        assert_eq!(live["run"], json!({"runId": "r1", "inputs": ["r1"]}));
+        assert_eq!(
+            live["run"],
+            json!({"runId": "r1", "inputs": ["r1"], "turns": 0})
+        );
         assert_eq!(
             live["generation"]["message"],
             json!({"role": "assistant", "content": [{"type": "text", "text": "Hello"}]})
@@ -986,5 +1067,66 @@ mod tests {
         assert_eq!(page_ids, (92..=121).collect::<Vec<_>>());
         assert_eq!(page["before"], 91);
         assert!(view.page(1, 30).get("before").is_none());
+    }
+
+    #[test]
+    fn live_shows_turns_compactions_and_why_a_run_ended() {
+        let session = SessionState::new("s1".to_owned(), PathBuf::from("/w"));
+        let runtime = Runtime::new(session.clone(), ReloadableSystems::default());
+        let mut view = View::new(&session, &[]);
+        view.refresh(&runtime, json!({}), &[]);
+        let (snapshot, from) = (view.value(), view.applied.len());
+        let queue = noel_core::controller::Queue::default();
+        let report = |view: &mut View, event: TurnEvent| {
+            view.event(&Event::Turn {
+                event: &event,
+                queue: &queue,
+            })
+        };
+        let live = |view: &View| view.value()["docs"]["pi.live"].clone();
+        view.event(&Event::RunStarted {
+            run_id: "r1",
+            runtime: &runtime,
+        });
+        // A round with a tool call is a turn; its result names its entry.
+        report(&mut view, TurnEvent::RoundStarted);
+        let mut reply = message(MessageRole::Assistant, "");
+        reply.tool_calls.push(noel_ai::ChatToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        });
+        report(&mut view, TurnEvent::MessageAdded(reply));
+        let mut result = message(MessageRole::Tool, "ok");
+        result.tool_call_id = Some("c1".into());
+        view.saved(&saved(result));
+        assert_eq!(live(&view)["tools"][0]["entry"], 1);
+        report(&mut view, TurnEvent::RoundFinished);
+        assert_eq!(live(&view)["run"]["turns"], 1);
+        // An overflow's compaction, which fails.
+        report(&mut view, TurnEvent::Overflowed { error: None });
+        report(&mut view, TurnEvent::CompactionStarted);
+        assert_eq!(live(&view)["compactions"], json!([{"trigger": "overflow"}]));
+        report(&mut view, TurnEvent::CompactionFailed("too big".into()));
+        assert!(live(&view).get("compactions").is_none());
+        assert_eq!(
+            live(&view)["compactionFailure"],
+            json!({"trigger": "overflow", "error": "too big"})
+        );
+        // The run fails; the failure stays until the next run.
+        view.event(&Event::RunSettled {
+            run_id: "r1",
+            outcome: &Outcome::Failed("provider down".into()),
+        });
+        assert_eq!(
+            live(&view),
+            json!({"runFailure": {"reason": "model_error", "detail": "provider down", "inputs": ["r1"]}})
+        );
+        assert_eq!(replay(&view, snapshot, from), view.value());
+        view.event(&Event::RunStarted {
+            run_id: "r2",
+            runtime: &runtime,
+        });
+        assert!(live(&view).get("runFailure").is_none());
     }
 }
