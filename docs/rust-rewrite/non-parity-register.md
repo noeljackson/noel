@@ -1390,7 +1390,10 @@ private), so the objects and processes are noel's, and these parts differ:
     `pi.compaction` (`data: {reason, summary, omittedMessages,
     retainedMessages}`) and `pi.reset` (`data: {messages}`, an undo), each
     with `head` at itself; a window can start at any entry, and the window
-    is not chosen by the subscriber (no `ConversationWindow` argument);
+    is not chosen by the subscriber (no `ConversationWindow` argument).
+    `noel-client`'s `Transcript` merges windows and pages; it loads what is
+    before the window when a client attaches, not gaps a long disconnect
+    leaves later;
   - `docs["pi.agent"]` is `{model, thinkingLevel, cwd}`; Durable's stores
     the chosen extensions, tools and instructions;
   - `docs["pi.live"]` has `run` (`runId`, `requestId`, `inputs`, where
