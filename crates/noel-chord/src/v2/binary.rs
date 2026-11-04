@@ -504,9 +504,10 @@ fn decode_fields(
             revocation: reader.json()?,
         },
         "ack" => Message::Ack { origin },
-        "closed" => match origin {
-            Some(origin) if origin > 0 => Message::Closed { origin },
-            _ => return fail("`closed` without an origin"),
+        // Its origin is the kind byte's; 0 without one, which the message
+        // check refuses (as upstream).
+        "closed" => Message::Closed {
+            origin: origin.unwrap_or(0),
         },
         "ping" => Message::Ping,
         "pong" => Message::Pong,

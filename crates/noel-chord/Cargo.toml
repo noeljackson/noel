@@ -8,6 +8,7 @@ description = "Chord link protocol 2 for noel: frames, links (memory, WebSocket,
 [dependencies]
 base64.workspace = true
 flate2 = "=1.1.9"
+getrandom.workspace = true
 futures-util = { version = "=0.3.32", default-features = false, features = ["sink", "std"] }
 tokio = { workspace = true, features = ["rt", "sync", "time", "io-util"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }

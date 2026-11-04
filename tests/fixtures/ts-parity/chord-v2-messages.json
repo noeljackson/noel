@@ -358,5 +358,512 @@
       },
       "hex": "0a045f7b226572726f72223a7b22636f6465223a22756e617661696c61626c65222c226d657373616765223a22776f726b6572207374617274696e67222c22726561736f6e223a227374617274696e67227d2c226b696e64223a2263686f7264227d"
     }
+  ],
+  "checks": [
+    {
+      "message": {
+        "kind": "hello",
+        "protocol": 1,
+        "incarnation": "0190f5a1-2b3c-7d4e-8f00-112233445566",
+        "calls": 1
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "hello",
+        "protocol": 1,
+        "incarnation": "0190f5a1-2b3c-7d4e-8f00-112233445566",
+        "calls": 0
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hello",
+        "protocol": 9,
+        "incarnation": "0190f5a1-2b3c-7d4e-8f00-112233445566",
+        "calls": 1
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "ack",
+        "origin": 0
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "ack",
+        "origin": 1
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "closed",
+        "origin": 0
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "retry",
+        "hold": 0,
+        "hops": 0
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "retry",
+        "hold": 0,
+        "hops": 1
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "retry",
+        "hold": 0,
+        "hops": 17
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 0,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "principal": {
+          "via": "device"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "principal": {
+          "kind": 1
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "principal": {
+          "kind": "owner"
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "chain": [
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566"
+        ]
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "chain": [
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566"
+        ]
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "code": "c",
+          "kind": "plugin",
+          "message": "m"
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "code": "c",
+          "details": [
+            1
+          ],
+          "kind": "plugin",
+          "message": "m"
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "code": "c",
+          "kind": "plugin"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "code": "c",
+          "kind": "plugin",
+          "message": "m",
+          "stack": "s"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "error": 1,
+          "kind": "chord"
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "error": {},
+          "kind": "chord",
+          "x": 1
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "kind": "other"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "gone",
+        "hold": 0,
+        "error": {
+          "kind": "chord"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "failed",
+        "hold": 0,
+        "cause": {
+          "kind": "broken",
+          "error": {
+            "kind": "plugin",
+            "code": 1,
+            "message": "m"
+          }
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "bound",
+        "holds": [
+          {
+            "hold": 0,
+            "variant": 0,
+            "members": [],
+            "failed": [
+              {
+                "member": 0,
+                "error": {
+                  "kind": "x"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "state",
+        "holds": [
+          {
+            "hold": 0,
+            "members": [],
+            "failed": [
+              {
+                "member": 0,
+                "error": {
+                  "kind": "x"
+                }
+              }
+            ],
+            "retired": []
+          }
+        ]
+      },
+      "ok": false
+    }
+  ],
+  "envelopes": [
+    {
+      "input": {
+        "code": "gone",
+        "message": "m"
+      },
+      "json": {
+        "code": "gone",
+        "message": "m"
+      }
+    },
+    {
+      "input": {
+        "code": "invalid",
+        "reason": "args",
+        "message": "m",
+        "details": {
+          "at": [
+            "x"
+          ]
+        }
+      },
+      "json": {
+        "code": "invalid",
+        "reason": "args",
+        "message": "m",
+        "details": {
+          "at": [
+            "x"
+          ]
+        }
+      }
+    },
+    {
+      "input": {
+        "code": "too_large",
+        "reason": "part",
+        "message": "m"
+      },
+      "json": {
+        "code": "too_large",
+        "reason": "part",
+        "message": "m"
+      }
+    },
+    {
+      "input": {
+        "code": "released",
+        "reason": "settled",
+        "message": "m"
+      },
+      "json": {
+        "code": "released",
+        "reason": "settled",
+        "message": "m"
+      }
+    },
+    {
+      "input": {
+        "code": "invalid",
+        "message": "m"
+      },
+      "error": "Invalid ChordError JSON: reason not allowed for invalid"
+    },
+    {
+      "input": {
+        "code": "gone",
+        "reason": "x",
+        "message": "m"
+      },
+      "error": "Invalid ChordError JSON: reason not allowed for gone"
+    },
+    {
+      "input": {
+        "code": "busy",
+        "message": "m"
+      },
+      "error": "Invalid ChordError JSON: unknown code"
+    },
+    {
+      "input": {
+        "code": "gone"
+      },
+      "error": "Invalid ChordError JSON: message is not a string"
+    },
+    {
+      "input": {
+        "code": "gone",
+        "message": "m",
+        "stack": "s"
+      },
+      "error": "Invalid ChordError JSON: unknown key \"stack\""
+    },
+    {
+      "input": [],
+      "error": "Invalid ChordError JSON: not an object"
+    },
+    {
+      "input": "gone",
+      "error": "Invalid ChordError JSON: not an object"
+    }
   ]
 }
