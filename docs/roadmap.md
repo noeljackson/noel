@@ -75,8 +75,10 @@ v1 pin `@earendil-works/chord@1.5.0`).
   table and wire errors; part limits and inflate; the channel (handshake,
   checks, heartbeat); a host with provider and consumer sides (holds, the
   window, calls and the call window, refused holds, re-holds after a drop),
-  tested over memory links. Goldens against upstream where upstream has a
-  verdict. Next: relay and routes, principals and revocation, transports.
+  tested over memory links; placement by address, routes and relayed holds
+  with per-origin acks and `closed`. Goldens against upstream where
+  upstream has a verdict. Next: revocation, transports, then the
+  noel-cli and noel-client cut-over.
 
 ### 5. View parity (Client side done, #120)
 - Done: the session history (`noel-core/src/history.rs`, ids that survive

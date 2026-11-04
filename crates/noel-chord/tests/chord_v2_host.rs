@@ -11,7 +11,7 @@ use noel_chord::delta::Op;
 use noel_chord::v2::channel::{BinaryCodec, Channel, ChannelOptions, Received};
 use noel_chord::v2::check::uuidv7;
 use noel_chord::v2::host::{HostOptions, LinkOptions, RefStatus, StateUpdate, WINDOW};
-use noel_chord::v2::message::{CauseKind, Message, Part};
+use noel_chord::v2::message::{Address, CauseKind, Message, Part};
 use noel_chord::v2::object::Cell;
 use noel_chord::v2::{
     ChordError, Code, Contract, Host, Implementation, Link, PluginError, WireError,
@@ -51,7 +51,7 @@ fn counter() -> Contract {
 
 /// A server serving the counter, with the cell and how many objects ended.
 fn server(cell: &Cell, disposed: &Arc<AtomicUsize>) -> Host {
-    let host = Host::new(HostOptions::default());
+    let host = session_host("s1");
     serve(&host, cell, disposed);
     host
 }
@@ -92,6 +92,17 @@ fn serve(host: &Host, cell: &Cell, disposed: &Arc<AtomicUsize>) {
                 disposed.fetch_add(1, Ordering::SeqCst);
             }))
     });
+}
+
+/// A host at the address of session `id`.
+fn session_host(id: &str) -> Host {
+    Host::new(HostOptions {
+        address: Some(Address {
+            kind: "session".to_owned(),
+            params: json!({"id": id}),
+        }),
+        ..HostOptions::default()
+    })
 }
 
 fn client() -> Host {
@@ -190,7 +201,7 @@ async fn a_client_reads_state_and_calls_methods() {
 async fn holds_wait_for_their_type_and_fail_on_another_contract() {
     let cell = Cell::new(json!({"type": "integer"}), json!(5)).unwrap();
     let disposed = Arc::new(AtomicUsize::new(0));
-    let server = Host::new(HostOptions::default());
+    let server = session_host("s1");
     let client = client();
     connect(&server, &client);
 
@@ -223,7 +234,8 @@ async fn holds_wait_for_their_type_and_fail_on_another_contract() {
         })
     ));
 
-    let invalid = client.get(Arc::new(counter()), json!({"session": 1}));
+    // The same address, params the contract refuses.
+    let invalid = client.get(Arc::new(counter()), json!({"session": "s1", "extra": 1}));
     let failed = status(&invalid, |s| matches!(s, RefStatus::Failed { .. })).await;
     assert!(matches!(
         failed,
@@ -373,4 +385,128 @@ async fn the_window_holds_state_until_acknowledged() {
     };
     let ops: Value = serde_json::from_slice(ops).unwrap();
     assert_eq!(ops, json!([["r", 5]]));
+}
+
+/// A route to one worker per session: each `resolve` makes a fresh memory
+/// link to the worker of that session, if there is one.
+struct Workers {
+    workers: std::sync::Mutex<std::collections::HashMap<String, Host>>,
+    resolves: AtomicUsize,
+}
+
+struct WorkerRoute(Arc<Workers>);
+
+impl noel_chord::v2::host::Route for WorkerRoute {
+    fn resolve(
+        &self,
+        address: Address,
+    ) -> noel_chord::v2::object::BoxFuture<Result<noel_chord::v2::host::Resolved, ChordError>> {
+        self.0.resolves.fetch_add(1, Ordering::SeqCst);
+        let id = address.params["id"].as_str().unwrap_or_default().to_owned();
+        let worker = self.0.workers.lock().unwrap().get(&id).cloned();
+        Box::pin(async move {
+            let Some(worker) = worker else {
+                return Err(ChordError::new(
+                    Code::Unavailable,
+                    format!("no worker for {id}"),
+                ));
+            };
+            let (route, parent) = Link::memory_pair();
+            worker.connect(parent, LinkOptions::new(json!({"kind": "server"})));
+            Ok(noel_chord::v2::host::Resolved {
+                link: route,
+                options: LinkOptions {
+                    trusted: true,
+                    ..LinkOptions::new(json!({"kind": "worker", "session": id}))
+                },
+            })
+        })
+    }
+}
+
+/// A client holds a session's object through a relay that routes it to the
+/// session's worker: snapshot, ops and calls cross both links; when the
+/// worker's link drops, the client goes loading and binds again over the
+/// route's next link.
+#[tokio::test]
+async fn a_relay_routes_holds_to_workers() {
+    let cell = Cell::new(json!({"type": "integer"}), json!(1)).unwrap();
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let worker = server(&cell, &disposed);
+    let workers = Arc::new(Workers {
+        workers: std::sync::Mutex::new([("s1".to_owned(), worker.clone())].into()),
+        resolves: AtomicUsize::new(0),
+    });
+    let relay = Host::new(HostOptions {
+        address: Some(Address {
+            kind: "server".to_owned(),
+            params: json!({}),
+        }),
+        ..HostOptions::default()
+    });
+    relay.route("session", WorkerRoute(workers.clone()));
+    let client = client();
+    connect(&relay, &client);
+
+    let held = client.get(Arc::new(counter()), json!({"session": "s1"}));
+    assert_eq!(held.ready().await.unwrap(), "owner");
+    let mut count = held.subscribe("count");
+    assert_eq!(next(&mut count).await, StateUpdate::Snapshot(json!(1)));
+    assert_eq!(held.call("add", json!({"by": 4})).await.unwrap(), json!(5));
+    assert!(matches!(next(&mut count).await, StateUpdate::Ops { value, .. } if value == json!(5)));
+    // More changes than the window: the relay forwards the acks upstream.
+    for value in 6..12 {
+        cell.replace(json!(value)).unwrap();
+    }
+    loop {
+        if let StateUpdate::Ops { value, .. } = next(&mut count).await {
+            if value == json!(11) {
+                break;
+            }
+        }
+    }
+    let error = held.call("fail", Value::Null).await.unwrap_err();
+    assert!(matches!(&error, WireError::Plugin(PluginError { code, .. }) if code == "nope"));
+
+    // The worker's side of the route closes: the route resolves again.
+    worker.close().await;
+    status(&held, |s| !matches!(s, RefStatus::Live { .. })).await;
+    let fresh = server(&cell, &disposed);
+    workers
+        .workers
+        .lock()
+        .unwrap()
+        .insert("s1".to_owned(), fresh);
+    // The first re-resolve may have raced the new worker: retry until live.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(held.status(), RefStatus::Live { .. }) {
+                break;
+            }
+            if matches!(held.status(), RefStatus::Failed { .. }) {
+                held.retry();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("live again");
+    assert!(workers.resolves.load(Ordering::SeqCst) >= 2);
+    assert_eq!(held.call("add", json!({"by": 1})).await.unwrap(), json!(12));
+
+    // A session without a worker: the hold fails waiting with the route's
+    // error.
+    let other = client.get(Arc::new(counter()), json!({"session": "s2"}));
+    let failed = status(&other, |s| matches!(s, RefStatus::Failed { .. })).await;
+    assert!(matches!(
+        failed,
+        RefStatus::Failed {
+            cause: CauseKind::Waiting,
+            error: WireError::Chord(ChordError {
+                code: Code::Unavailable,
+                ..
+            }),
+            ..
+        }
+    ));
 }

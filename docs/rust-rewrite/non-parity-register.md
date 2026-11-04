@@ -1400,9 +1400,19 @@ on a link yet. Where it differs:
   message with others made at the same time.
 - **No byte segments.** noel's contracts have no `bytes()` leaves; results
   and arguments carry none.
-- **References** are held over the parent link only; routes, relaying and
-  revocation are later steps of the port. A call on a loading reference
-  waits until it is live.
+- **References** go over the route of their address's kind or the parent
+  link; a reference to this host's own address is refused (noel has no
+  in-host references). A call on a loading reference waits until it is
+  live.
+- **Routes** resolve an address again at once when its link drops while it
+  has holders, with no backoff; there is no `suspend` or route `retry`
+  handle. A reference's `retry` on a route failure asks the provider, as
+  for any failed hold.
+- **Relayed calls** are not counted against the downstream call window, and
+  their arguments are not checked against the part limit before they are
+  forwarded (the provider that parses them checks them).
+- **Revocation** (`revoke`, `forbidden/revoked`) is a later step of the
+  port.
 
 ### Mode 2 Server, Worker and Client
 

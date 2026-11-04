@@ -17,8 +17,11 @@
 //!
 //! One task owns everything: link bytes, cell changes, API requests and
 //! method completions arrive as messages, and the ops of one drained batch
-//! go out as one `state` message per (link, origin). Relaying, routes and
-//! revocation are later steps of the port (`docs/chord-v2-port.md`).
+//! go out as one `state` message per (link, origin). Paths, routes and
+//! relaying are in [`relay`]; revocation is a later step of the port
+//! (`docs/chord-v2-port.md`).
+
+mod relay;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,11 +36,13 @@ use super::contract::Contract;
 use super::error::{ChordError, Code, WireError};
 use super::link::Link;
 use super::message::{Address, BoundEntry, CauseKind, FailedMember, Message, Part, StateEntry};
-use super::object::{CallContext, Cell, Factory, Implementation, MethodFn, Signal};
+use super::object::{BoxFuture, CallContext, Cell, Factory, Implementation, MethodFn, Signal};
 use super::part::{open_part, origin_part, oversized, Limits, OpenError, PartLimits};
 use crate::delta::{apply_owned, Decoder, Encoder, Op};
 use crate::object::CellChange;
 use crate::schema::canonical_json;
+use relay::{Holder, PathKey, PathState, Placed, RelayedHold};
+pub use relay::{Resolved, Route};
 
 /// At most this many of this host's own `bound` and `state` messages
 /// unacknowledged per (link, origin).
@@ -47,17 +52,22 @@ pub const WINDOW: usize = 2;
 pub const MAX_PENDING_OPS: usize = 10_000;
 
 /// How a link was made: `Parent` by [`Host::connect`] (holds arriving on
-/// it may name whom they act for), `Child` by [`Host::accept`].
+/// it may name whom they act for), `Child` by [`Host::accept`], `Route` by a
+/// route's `resolve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Parent,
     Child,
+    Route,
 }
 
 #[derive(Debug, Clone)]
 pub struct HostOptions {
     /// This host's incarnation; a new uuidv7 when `None`.
     pub incarnation: Option<String>,
+    /// This host's address: holds naming it are served here, others are
+    /// routed or relayed to the parent.
+    pub address: Option<Address>,
     /// Deflate parts this host originates above the threshold (never up a
     /// parent link).
     pub compress: bool,
@@ -72,6 +82,7 @@ impl Default for HostOptions {
     fn default() -> Self {
         HostOptions {
             incarnation: None,
+            address: None,
             compress: false,
             ping_ms: super::channel::PING_AFTER_MS,
             close_ms: super::channel::CLOSE_AFTER_MS,
@@ -209,6 +220,14 @@ enum Msg {
     Release {
         reference: u64,
     },
+    Route {
+        kind: String,
+        route: Arc<dyn Route>,
+    },
+    Resolved {
+        key: PathKey,
+        result: Result<Resolved, ChordError>,
+    },
     Observe(Observer),
     Tick,
     Close(oneshot::Sender<()>),
@@ -243,6 +262,10 @@ impl Host {
             objects: HashMap::new(),
             links: HashMap::new(),
             parent: None,
+            paths: HashMap::new(),
+            routes: HashMap::new(),
+            relays: HashMap::new(),
+            next_relay: 0,
             refs: HashMap::new(),
             subs: HashMap::new(),
             running: HashMap::new(),
@@ -294,7 +317,16 @@ impl Host {
         });
     }
 
-    /// Holds the object of `contract` with `params` over the parent link.
+    /// Routes holds for addresses of `kind` over the links `route` resolves.
+    pub fn route(&self, kind: impl Into<String>, route: impl Route) {
+        let _ = self.tx.send(Msg::Route {
+            kind: kind.into(),
+            route: Arc::new(route),
+        });
+    }
+
+    /// Holds the object of `contract` with `params`: over the route of its
+    /// address's kind, or the parent link.
     pub fn get(&self, contract: Arc<Contract>, params: Value) -> RemoteRef {
         let id = self.next();
         let (status, receiver) = watch::channel(RefStatus::Loading);
@@ -563,6 +595,15 @@ struct RunningCall {
 struct Provider {
     holds: HashMap<u64, ServedHold>,
     calls: HashMap<u64, RunningCall>,
+    /// Holds relayed upstream, and their calls in flight (call to hold).
+    relayed: HashMap<u64, RelayedHold>,
+    relayed_calls: HashMap<u64, u64>,
+    /// The sender of each `bound` and `state` message in flight, in order:
+    /// this host (`None`) or the upstream link it was relayed from.
+    sent: VecDeque<Option<u64>>,
+    /// This origin's number on upstream links, and the links it relays to.
+    relay: Option<u64>,
+    relay_links: Vec<u64>,
     in_flight: usize,
     /// Holds waiting for a slot to send their first binding, in order.
     binding: Vec<u64>,
@@ -623,6 +664,8 @@ struct RefEntry {
     contract: Arc<Contract>,
     params: Value,
     status: watch::Sender<RefStatus>,
+    /// Where it is held.
+    path: Option<PathKey>,
     /// (link, hold) while held.
     held: Option<(u64, u64)>,
     variant: Option<String>,
@@ -655,6 +698,7 @@ struct HostLink {
     channel: Channel,
     role: Role,
     principal: Value,
+    trusted: bool,
     limits: Limits,
     providers: HashMap<u64, Provider>,
     consumer: Consumer,
@@ -669,6 +713,11 @@ struct Actor {
     objects: HashMap<ObjectKey, Object>,
     links: HashMap<u64, HostLink>,
     parent: Option<u64>,
+    paths: HashMap<PathKey, PathState>,
+    routes: HashMap<String, Arc<dyn Route>>,
+    /// This host's relay origins: to (downstream link, origin).
+    relays: HashMap<u64, (u64, u64)>,
+    next_relay: u64,
     refs: HashMap<u64, RefEntry>,
     /// Subscription id to (link, origin, hold).
     subs: HashMap<u64, (u64, u64, u64)>,
@@ -757,6 +806,7 @@ impl Actor {
                         contract,
                         params,
                         status,
+                        path: None,
                         held: None,
                         variant: None,
                         methods: Vec::new(),
@@ -766,12 +816,23 @@ impl Actor {
                         queued: Vec::new(),
                     },
                 );
-                if let Some(parent) = self.parent {
-                    if self.links[&parent].channel.is_open() {
-                        self.hold_on(id, parent);
+                let entry = &self.refs[&id];
+                let address = entry.contract.address(&entry.params);
+                match self.place_reference(&address) {
+                    Ok(key) => {
+                        self.refs.get_mut(&id).expect("the reference").path = Some(key.clone());
+                        self.path_attach(&key, Holder::Ref(id));
+                    }
+                    Err(error) => {
+                        let entry = self.refs.remove(&id).expect("the reference");
+                        entry.set_status(RefStatus::Gone(error.into()));
                     }
                 }
             }
+            Msg::Route { kind, route } => {
+                self.routes.insert(kind, route);
+            }
+            Msg::Resolved { key, result } => self.resolved(key, result),
             Msg::Call {
                 reference,
                 token,
@@ -875,6 +936,7 @@ impl Actor {
                 channel,
                 role,
                 principal: options.principal,
+                trusted: options.trusted,
                 limits: Limits::of_link(options.trusted, options.limits),
                 providers: HashMap::new(),
                 consumer: Consumer::default(),
@@ -902,6 +964,9 @@ impl Actor {
             }
             let _ = tx.send(Msg::Ended { link: id });
         });
+        if role == Role::Parent {
+            self.path_connected(&PathKey::Parent, id);
+        }
     }
 
     fn receive(&mut self, id: u64, bytes: &[u8]) {
@@ -915,17 +980,6 @@ impl Actor {
                 let peer = link.channel.peer().to_owned();
                 link.consumer.limit = link.channel.peer_calls();
                 self.emit(HostEvent::Opened { link: id, peer });
-                if self.parent == Some(id) {
-                    let waiting: Vec<u64> = self
-                        .refs
-                        .iter()
-                        .filter(|(_, entry)| entry.held.is_none())
-                        .map(|(id, _)| *id)
-                        .collect();
-                    for reference in waiting {
-                        self.hold_on(reference, id);
-                    }
-                }
                 self.drain_calls(id);
             }
             Ok(Received::Message(message)) => {
@@ -961,13 +1015,20 @@ impl Actor {
         if self.parent == Some(id) {
             self.parent = None;
         }
-        for (origin, provider) in link.providers.drain() {
+        for (origin, mut provider) in link.providers.drain() {
             for call in provider.calls.values() {
                 call.signal.abort(link_closed());
                 self.running.remove(&call.token);
             }
-            for (hold_id, hold) in provider.holds {
+            for (hold_id, hold) in std::mem::take(&mut provider.holds) {
                 self.drop_hold(id, origin, hold_id, hold);
+            }
+            self.relay_closed(id, origin, &mut provider);
+        }
+        // Upstream of relayed holds: nothing more goes to it.
+        for link in self.links.values_mut() {
+            for provider in link.providers.values_mut() {
+                provider.relay_links.retain(|up| *up != id);
             }
         }
         let tokens: Vec<u64> = self
@@ -988,6 +1049,7 @@ impl Actor {
                 entry.set_status(RefStatus::Loading);
             }
         }
+        self.path_disconnected(id);
         self.emit(HostEvent::Closed { link: id });
     }
 
@@ -1009,6 +1071,24 @@ impl Actor {
         let role = self.links[&link].role;
         if role == Role::Child && message.origin().is_some() {
             return Err(format!("{}: an origin on a child link", message.kind()));
+        }
+        if let Message::Call { origin, call, .. } = &message {
+            let in_use = self
+                .provider(link, origin.unwrap_or(0))
+                .is_some_and(|p| p.calls.contains_key(call) || p.relayed_calls.contains_key(call));
+            if in_use {
+                return Err(format!("call {call}: the id is in use"));
+            }
+        }
+        if matches!(
+            message,
+            Message::Release { .. }
+                | Message::Call { .. }
+                | Message::Abort { .. }
+                | Message::Retry { .. }
+        ) && self.relayed_message(link, &message)
+        {
+            return Ok(());
         }
         match message {
             Message::Hold { .. } => self.hold(link, message),
@@ -1050,10 +1130,19 @@ impl Actor {
             }
             Message::Ack { origin } => {
                 let origin = origin.unwrap_or(0);
-                if let Some(provider) = self.provider(link, origin) {
-                    if provider.in_flight > 0 {
+                let Some(provider) = self.provider(link, origin) else {
+                    return Ok(());
+                };
+                match provider.sent.pop_front() {
+                    // An ack crossing nothing in flight is ignored.
+                    None => {}
+                    Some(None) => {
                         provider.in_flight -= 1;
                         self.slot_freed(link, origin);
+                    }
+                    Some(Some(up)) => {
+                        let relay = provider.relay;
+                        self.send(up, &Message::Ack { origin: relay });
                     }
                 }
                 Ok(())
@@ -1068,9 +1157,10 @@ impl Actor {
                         call.signal.abort(link_closed());
                         self.running.remove(&call.token);
                     }
-                    for (hold_id, hold) in provider.holds.drain() {
+                    for (hold_id, hold) in std::mem::take(&mut provider.holds) {
                         self.drop_hold(link, origin, hold_id, hold);
                     }
+                    self.relay_closed(link, origin, &mut provider);
                 }
                 Ok(())
             }
@@ -1130,19 +1220,24 @@ impl Actor {
                     self.forget_reference(reference, error.clone());
                     if let Some(entry) = self.refs.get_mut(&reference) {
                         entry.set_status(RefStatus::Gone(error));
+                        if let Some(path) = entry.path.take() {
+                            self.path_detach(&path, Holder::Ref(reference));
+                        }
                     }
                 }
                 Ok(())
             }
-            // Replies for relayed holds: relaying is not ported yet, so no
-            // origin of this host's is known.
+            // With an origin: for a hold this host relays.
             Message::Bound { .. }
             | Message::State { .. }
             | Message::Failed { .. }
             | Message::Loading { .. }
             | Message::Result { .. }
             | Message::Error { .. }
-            | Message::Gone { .. } => Ok(()),
+            | Message::Gone { .. } => {
+                self.forward(link, message);
+                Ok(())
+            }
             // Only the parent revokes; revocation is not ported yet.
             Message::Revoke { .. } => Ok(()),
             Message::Hello { .. } | Message::Ping | Message::Pong => Ok(()),
@@ -1170,8 +1265,9 @@ impl Actor {
             params,
             address,
             principal,
+            incarnation,
+            chain,
             limit,
-            ..
         } = message
         else {
             unreachable!("a hold");
@@ -1179,29 +1275,62 @@ impl Actor {
         let origin = origin.unwrap_or(0);
         let host_link = &self.links[&link];
         let provider = host_link.providers.get(&origin);
-        if provider.is_some_and(|provider| provider.holds.contains_key(&hold)) {
+        if provider.is_some_and(|p| p.holds.contains_key(&hold) || p.relayed.contains_key(&hold)) {
             return Err(format!("hold {hold}: the id is in use"));
         }
         if matches!(params, Part::Deflated(_)) {
             return Err(format!("hold {hold}: compressed params"));
         }
         let parent = host_link.role == Role::Parent;
-        let principal = match (parent, principal) {
-            (true, Some(principal)) => principal,
-            _ => host_link.principal.clone(),
+        let peer = host_link.channel.peer().to_owned();
+        let (principal, incarnation) = match (parent, principal) {
+            (true, Some(principal)) => (principal, incarnation.unwrap_or(peer)),
+            _ => (host_link.principal.clone(), peer),
         };
+        let chain = chain.filter(|_| host_link.trusted);
         let mut limits = host_link.limits;
         if let (true, Some(limit)) = (parent, limit) {
             limits.decoded = limits.decoded.min(limit);
         }
+        let wire_limit = host_link.limits.part;
+        let request = Request {
+            type_name,
+            version,
+            fingerprint,
+            params,
+            address,
+        };
+        // Placed by its address, its params within the link's part limit
+        // first; one placed elsewhere is relayed.
+        let placed = match oversized(&request.params, wire_limit) {
+            Some(error) => Err(error),
+            None => self.place_hold(link, &request.type_name, &request.address, &principal),
+        };
+        let refusal = match placed {
+            Ok(Placed::Path(path)) => {
+                let relayed = RelayedHold {
+                    request,
+                    principal,
+                    incarnation,
+                    chain,
+                    limit: (limits.decoded != u64::MAX).then_some(limits.decoded),
+                    path,
+                    upstream: None,
+                };
+                self.links
+                    .get_mut(&link)
+                    .expect("the link")
+                    .providers
+                    .entry(origin)
+                    .or_default();
+                self.relay_hold(link, origin, hold, relayed);
+                return Ok(());
+            }
+            Ok(Placed::Here) => None,
+            Err(error) => Some(error),
+        };
         let served = ServedHold {
-            request: Request {
-                type_name,
-                version,
-                fingerprint,
-                params,
-                address,
-            },
+            request,
             principal,
             limits,
             object: None,
@@ -1215,6 +1344,10 @@ impl Actor {
             .or_default()
             .holds
             .insert(hold, served);
+        if let Some(error) = refusal {
+            self.refuse(link, origin, hold, CauseKind::Broken, error.into());
+            return Ok(());
+        }
         self.start_hold(link, origin, hold)
     }
 
@@ -1270,20 +1403,24 @@ impl Actor {
                 ChordError::invalid("params", error).into(),
             );
         }
+        // The provider's own check: the params put the object on this host.
         let address = contract.address(&params);
-        if address != request.address {
+        if !self.is_here(&address) {
             let error = ChordError::invalid(
                 "host_address",
                 format!(
-                    "{}: the address is {}, not {}",
+                    "{}: placed on {}, this host is {}",
                     request.type_name,
                     canonical_json(&json!({"kind": address.kind, "params": address.params})),
-                    canonical_json(
-                        &json!({"kind": request.address.kind, "params": request.address.params})
-                    ),
+                    self.options
+                        .address
+                        .as_ref()
+                        .map_or("unaddressed".to_owned(), |own| {
+                            canonical_json(&json!({"kind": own.kind, "params": own.params}))
+                        }),
                 ),
             );
-            return refuse(self, CauseKind::Broken, error.into());
+            return refuse(self, CauseKind::Waiting, error.into());
         }
         let key: ObjectKey = (
             request.type_name.clone(),
@@ -1481,6 +1618,7 @@ impl Actor {
     fn send_own(&mut self, link: u64, origin: u64, message: Message) {
         if let Some(provider) = self.provider(link, origin) {
             provider.in_flight += 1;
+            provider.sent.push_back(None);
         }
         self.send_origin(link, origin, message);
     }
@@ -2118,6 +2256,9 @@ impl Actor {
         }
         self.forget_reference(reference, released().into());
         if let Some(entry) = self.refs.remove(&reference) {
+            if let Some(path) = &entry.path {
+                self.path_detach(path, Holder::Ref(reference));
+            }
             entry.set_status(RefStatus::Released);
         }
     }
