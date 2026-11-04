@@ -20,6 +20,7 @@ async function main() {
 	const { binaryCodec } = await import(join(reference, "packages/chord/src/link/binary.ts"));
 	const { checkMessage } = await import(join(reference, "packages/chord/src/link/message.ts"));
 	const { DeflatedPart } = await import(join(reference, "packages/chord/src/link/part.ts"));
+	const { chordErrorFromJson } = await import(join(reference, "packages/chord/src/data/internal.ts"));
 	const { BACKGROUND_CONTEXT } = await import(join(reference, "packages/chord/src/context/index.ts"));
 	const commit = execFileSync("git", ["-C", reference, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 
@@ -117,6 +118,71 @@ async function main() {
 		return { message: toJson(message), hex: hexOf(bytes) };
 	});
 
+	// The message check on what the binary codec decodes: messages it encodes, valid or not, with the verdict.
+	const hold = messages[1]!;
+	const checked: Record<string, unknown>[] = [
+		{ kind: "hello", protocol: 1, incarnation, calls: 1 },
+		{ kind: "hello", protocol: 1, incarnation, calls: 0 },
+		{ kind: "hello", protocol: 9, incarnation, calls: 1 },
+		{ kind: "ack", origin: 0 },
+		{ kind: "ack", origin: 1 },
+		{ kind: "closed", origin: 0 },
+		{ kind: "retry", hold: 0, hops: 0 },
+		{ kind: "retry", hold: 0, hops: 1 },
+		{ kind: "retry", hold: 0, hops: 17 },
+		{ ...hold, version: 0 },
+		{ ...hold, principal: { via: "device" } },
+		{ ...hold, principal: { kind: 1 } },
+		{ ...hold, principal: { kind: "owner" } },
+		{ ...hold, chain: Array.from({ length: 32 }, () => incarnation) },
+		{ ...hold, chain: Array.from({ length: 33 }, () => incarnation) },
+		{ kind: "error", call: 0, error: { code: "c", kind: "plugin", message: "m" } },
+		{ kind: "error", call: 0, error: { code: "c", details: [1], kind: "plugin", message: "m" } },
+		{ kind: "error", call: 0, error: { code: "c", kind: "plugin" } },
+		{ kind: "error", call: 0, error: { code: "c", kind: "plugin", message: "m", stack: "s" } },
+		{ kind: "error", call: 0, error: { error: 1, kind: "chord" } },
+		{ kind: "error", call: 0, error: { error: {}, kind: "chord", x: 1 } },
+		{ kind: "error", call: 0, error: { kind: "other" } },
+		{ kind: "gone", hold: 0, error: { kind: "chord" } },
+		{ kind: "failed", hold: 0, cause: { kind: "broken", error: { kind: "plugin", code: 1, message: "m" } } },
+		{ kind: "bound", holds: [{ hold: 0, variant: 0, members: [], failed: [{ member: 0, error: { kind: "x" } }] }] },
+		{
+			kind: "state",
+			holds: [{ hold: 0, members: [], failed: [{ member: 0, error: { kind: "x" } }], retired: [] }],
+		},
+	];
+	const checks = checked.map((message) => {
+		const decoded = binaryCodec.decode(binaryCodec.encode(message));
+		let ok = true;
+		try {
+			checkMessage(decoded, BACKGROUND_CONTEXT);
+		} catch {
+			ok = false;
+		}
+		return { message: toJson(message), ok };
+	});
+
+	// ChordError envelopes as a consumer rebuilds them: the error's JSON again, or why it is refused.
+	const envelopes = [
+		{ code: "gone", message: "m" },
+		{ code: "invalid", reason: "args", message: "m", details: { at: ["x"] } },
+		{ code: "too_large", reason: "part", message: "m" },
+		{ code: "released", reason: "settled", message: "m" },
+		{ code: "invalid", message: "m" },
+		{ code: "gone", reason: "x", message: "m" },
+		{ code: "busy", message: "m" },
+		{ code: "gone" },
+		{ code: "gone", message: "m", stack: "s" },
+		[],
+		"gone",
+	].map((input) => {
+		try {
+			return { input, json: chordErrorFromJson(input).toJSON() };
+		} catch (error) {
+			return { input, error: (error as Error).message };
+		}
+	});
+
 	await mkdir(outputDir, { recursive: true });
 	await writeFile(
 		join(outputDir, "chord-v2-messages.json"),
@@ -130,6 +196,8 @@ async function main() {
 					script: `/ts-parity/${fileURLToPath(import.meta.url).split("/").pop()}`,
 				},
 				messages: cases,
+				checks,
+				envelopes,
 			},
 			null,
 			2,

@@ -70,6 +70,11 @@ v1 pin `@earendil-works/chord@1.5.0`).
   channel, provider/consumer, relay, transports, then a `chord2-interop`
   target; noel generates its own goldens (upstream has none).
 - Done: interop passes both ways; `mode2` tests pass on v2.
+- Progress (`noel_chord::v2`, nothing on a link yet): contracts and
+  fingerprints; messages, the binary codec and the message check; the error
+  table and wire errors; part limits and inflate; the channel (handshake,
+  checks, heartbeat). All against upstream goldens where upstream has a
+  verdict. Next: provider and consumer sides.
 
 ### 5. View parity (Client side done, #120)
 - Done: the session history (`noel-core/src/history.rs`, ids that survive

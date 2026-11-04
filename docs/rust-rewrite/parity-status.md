@@ -58,7 +58,10 @@ The committed TypeScript parity fixtures are:
 - `chord-v2-messages.json`: every Chord v2 message kind in upstream's JSON
   form and binary encoding at `CHORD2_REFERENCE_REF`, plus decode errors.
   `noel-chord`'s `v2::message` and `v2::binary` round-trip each message
-  byte for byte (`crates/noel-chord/tests/chord_v2_messages.rs`).
+  byte for byte (`crates/noel-chord/tests/chord_v2_messages.rs`). Its
+  `checks` hold upstream's `checkMessage` verdicts on decoded messages, and
+  its `envelopes` what `chordErrorFromJson` makes of ChordError envelopes;
+  `v2::check` and `v2::error` give the same.
 - `cli-contract.json`: upstream CLI option and command contract.
 - `cloudflare-ai-gateway-kimi.json`: Cloudflare AI Gateway OpenAI-compatible
   request shape.

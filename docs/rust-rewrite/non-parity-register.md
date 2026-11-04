@@ -1367,6 +1367,24 @@ Reason: noel needs Chord's protocol, not its runtime: one code version, no
 plugins, and objects whose state it owns directly. The rest are a native
 JSON library and scheduler standing in for JavaScript's.
 
+
+### Chord v2 (in progress)
+
+`noel_chord::v2` is ported from upstream at `CHORD2_REFERENCE_REF` and is not
+on a link yet. Where it differs:
+
+- **Synchronous inflate.** A deflated part is inflated with flate2 when its
+  owner opens it. Upstream hosts without a synchronous compressor inflate
+  ahead of the owner and hold later messages meanwhile; noel's channel has
+  nothing to hold.
+- **Sans-IO channel.** `v2::Channel` takes received bytes and the time and
+  gives the bytes to send; its owner moves them and runs the timer. Upstream's
+  `Channel` owns its link's listeners.
+- **No text codec yet.** Only the binary codec, upstream's default. The text
+  codec is for debugging and both ends must agree on it.
+- **Error messages of protocol errors** carry the decode error after the
+  handshake message; protocol errors are only reported, never sent.
+
 ### Mode 2 Server, Worker and Client
 
 `noel server`, `noel worker` and `noel client` (`crates/noel-cli/src/server`,
