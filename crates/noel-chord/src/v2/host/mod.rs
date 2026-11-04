@@ -18,10 +18,10 @@
 //! One task owns everything: link bytes, cell changes, API requests and
 //! method completions arrive as messages, and the ops of one drained batch
 //! go out as one `state` message per (link, origin). Paths, routes and
-//! relaying are in [`relay`]; revocation is a later step of the port
-//! (`docs/chord-v2-port.md`).
+//! relaying are in [`relay`]; revocation in `revoke`.
 
 mod relay;
+mod revoke;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,6 +163,10 @@ pub enum StateUpdate {
 
 type Observer = Arc<dyn Fn(&HostEvent) + Send + Sync>;
 
+/// What revokes a principal: the revocations that end its objects and
+/// links (compared as canonical JSON). The same function on every host.
+pub type RevokedBy = Arc<dyn Fn(&Value) -> Vec<Value> + Send + Sync>;
+
 enum Msg {
     Serve {
         contract: Arc<Contract>,
@@ -229,6 +233,8 @@ enum Msg {
         result: Result<Resolved, ChordError>,
     },
     Observe(Observer),
+    RevokedBy(RevokedBy),
+    Revoke(Value),
     Tick,
     Close(oneshot::Sender<()>),
 }
@@ -272,6 +278,7 @@ impl Host {
             outgoing: HashMap::new(),
             dirty: Vec::new(),
             observers: Vec::new(),
+            revoked_by: None,
             next: 1,
         };
         tokio::spawn(actor.run(rx));
@@ -342,6 +349,19 @@ impl Host {
             status: receiver,
             contract,
         }
+    }
+
+    /// Sets what revokes a principal (upstream `revokedBy`).
+    pub fn revoked_by(&self, revoked_by: impl Fn(&Value) -> Vec<Value> + Send + Sync + 'static) {
+        let _ = self.tx.send(Msg::RevokedBy(Arc::new(revoked_by)));
+    }
+
+    /// Revokes `revocation`: every object whose principal it revokes ends
+    /// (`gone forbidden/revoked`), so do unbound holds acting for one; route
+    /// links are sent `revoke`; child links of such principals close.
+    /// Nothing is replayed to links made later.
+    pub fn revoke(&self, revocation: Value) {
+        let _ = self.tx.send(Msg::Revoke(revocation));
     }
 
     /// Calls `observer` with each event from now on.
@@ -516,6 +536,8 @@ struct Object {
     methods: BTreeMap<String, MethodFn>,
     on_dispose: Option<Box<dyn FnOnce() + Send>>,
     holds: usize,
+    /// Whom it was made for.
+    principal: Value,
 }
 
 /// (type, params, principal), each as canonical JSON.
@@ -728,6 +750,7 @@ struct Actor {
     /// (link, origin) sides the current batch touched.
     dirty: Vec<(u64, u64)>,
     observers: Vec<Observer>,
+    revoked_by: Option<RevokedBy>,
     next: u64,
 }
 
@@ -878,6 +901,8 @@ impl Actor {
             }
             Msg::Release { reference } => self.release(reference),
             Msg::Observe(observer) => self.observers.push(observer),
+            Msg::RevokedBy(revoked_by) => self.revoked_by = Some(revoked_by),
+            Msg::Revoke(revocation) => self.revoke(&revocation),
             Msg::Tick => {
                 let now = self.now();
                 let (ping, close) = (self.options.ping_ms, self.options.close_ms);
@@ -1238,8 +1263,13 @@ impl Actor {
                 self.forward(link, message);
                 Ok(())
             }
-            // Only the parent revokes; revocation is not ported yet.
-            Message::Revoke { .. } => Ok(()),
+            // Only the parent revokes.
+            Message::Revoke { revocation } => {
+                if role == Role::Parent {
+                    self.revoke(&revocation);
+                }
+                Ok(())
+            }
             Message::Hello { .. } | Message::Ping | Message::Pong => Ok(()),
         }
     }
@@ -1455,6 +1485,7 @@ impl Actor {
                     methods: implementation.methods,
                     on_dispose: implementation.on_dispose,
                     holds: 0,
+                    principal: principal.clone(),
                 },
             );
         }

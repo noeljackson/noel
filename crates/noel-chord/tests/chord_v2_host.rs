@@ -510,3 +510,81 @@ async fn a_relay_routes_holds_to_workers() {
         }
     ));
 }
+
+/// Revoking a device ends the objects made for it (`gone
+/// forbidden/revoked`) and closes its link; other devices keep theirs.
+/// Through a relay, the revocation goes down the route and the worker ends
+/// the device's object there too.
+#[tokio::test]
+async fn revocation_ends_a_principals_objects_and_links() {
+    let revoked_by = |principal: &Value| match principal.get("device") {
+        Some(device) => vec![json!({"device": device})],
+        None => Vec::new(),
+    };
+    let cell = Cell::new(json!({"type": "integer"}), json!(1)).unwrap();
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let server = server(&cell, &disposed);
+    server.revoked_by(revoked_by);
+    let device = |server: &Host, id: &str| {
+        let client = client();
+        let (up, down) = Link::memory_pair();
+        server.accept(
+            down,
+            LinkOptions::new(json!({"kind": "device", "device": id})),
+        );
+        client.connect(up.clone(), LinkOptions::new(json!({"kind": "server"})));
+        (client, up)
+    };
+    let (one, one_link) = device(&server, "d1");
+    let (two, _) = device(&server, "d2");
+    let held_one = one.get(Arc::new(counter()), json!({"session": "s1"}));
+    let held_two = two.get(Arc::new(counter()), json!({"session": "s1"}));
+    held_one.ready().await.unwrap();
+    held_two.ready().await.unwrap();
+
+    server.revoke(json!({"device": "d1"}));
+    let gone = status(&held_one, |s| matches!(s, RefStatus::Gone(_))).await;
+    assert_eq!(
+        gone,
+        RefStatus::Gone(WireError::Chord(ChordError::with_reason(
+            Code::Forbidden,
+            "revoked",
+            "test.counter: revoked"
+        )))
+    );
+    tokio::time::timeout(Duration::from_secs(5), one_link.closed())
+        .await
+        .expect("the revoked device's link closes");
+    assert!(matches!(held_two.status(), RefStatus::Live { .. }));
+    assert_eq!(
+        held_two.call("add", json!({"by": 1})).await.unwrap(),
+        json!(2)
+    );
+
+    // Through a relay: the worker applies the revocation it is sent.
+    let worker = session_host("s2");
+    serve(&worker, &cell, &disposed);
+    worker.revoked_by(revoked_by);
+    let workers = Arc::new(Workers {
+        workers: std::sync::Mutex::new([("s2".to_owned(), worker)].into()),
+        resolves: AtomicUsize::new(0),
+    });
+    let relay = Host::new(HostOptions::default());
+    relay.route("session", WorkerRoute(workers));
+    relay.revoked_by(revoked_by);
+    let (three, _) = device(&relay, "d3");
+    let held_three = three.get(Arc::new(counter()), json!({"session": "s2"}));
+    held_three.ready().await.unwrap();
+    relay.revoke(json!({"device": "d3"}));
+    let gone = status(&held_three, |s| !matches!(s, RefStatus::Live { .. })).await;
+    assert!(
+        matches!(
+            &gone,
+            RefStatus::Gone(WireError::Chord(ChordError {
+                reason: Some("revoked"),
+                ..
+            })) | RefStatus::Loading
+        ),
+        "{gone:?}"
+    );
+}
