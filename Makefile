@@ -202,6 +202,8 @@ parity-check:
 chord2-fixtures:
 	bun --conditions=source scripts/ts-parity/chord-v2-contracts-fixture.ts \
 		"$(CHORD2_REFERENCE_DIR)" crates/noel-client/contracts/v2 $(TS_PARITY_FIXTURES_DIR)
+	bun --conditions=source scripts/ts-parity/chord-v2-messages-fixture.ts \
+		"$(CHORD2_REFERENCE_DIR)" $(TS_PARITY_FIXTURES_DIR)
 
 ts-parity-build:
 	$(DOCKER) build -f Dockerfile.ts-parity \

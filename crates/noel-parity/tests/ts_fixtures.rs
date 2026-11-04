@@ -17,6 +17,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "chord-delta.json",
     "chord-link.json",
     "chord-v2-contracts.json",
+    "chord-v2-messages.json",
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
     "error-classification.json",
@@ -56,6 +57,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "chord-delta-fixture.ts",
     "chord-link-fixture.ts",
     "chord-v2-contracts-fixture.ts",
+    "chord-v2-messages-fixture.ts",
     "cli-contract-fixture.ts",
     "cloudflare-fixture.ts",
     "codex-oauth-fixture.ts",
@@ -164,6 +166,10 @@ fn every_script_output_is_committed() {
         (
             "chord-v2-contracts-fixture.ts",
             fixture_set(&["chord-v2-contracts.json"]),
+        ),
+        (
+            "chord-v2-messages-fixture.ts",
+            fixture_set(&["chord-v2-messages.json"]),
         ),
         (
             "cli-contract-fixture.ts",
@@ -347,6 +353,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         (
             "chord-v2-contracts.json",
             "crates/noel-chord/tests/chord_v2_contracts.rs",
+        ),
+        (
+            "chord-v2-messages.json",
+            "crates/noel-chord/tests/chord_v2_messages.rs",
         ),
         ("cli-contract.json", "crates/noel-cli/src/main.rs"),
         (
