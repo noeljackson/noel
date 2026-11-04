@@ -71,11 +71,17 @@ v1 pin `@earendil-works/chord@1.5.0`).
   target; noel generates its own goldens (upstream has none).
 - Done: interop passes both ways; `mode2` tests pass on v2.
 
-### 5. View parity (Planned, #120)
-- Journal entries get ids and timestamps; the view is a window (newest 50, at
-  most 100, `before`), `pi.live` v3 (`run.turns`, `runFailure`, nested tools,
-  compaction states), rendering from state only.
-- Done: goldens against Durable 1.5's view; TUI attach renders from it.
+### 5. View parity (Client side done, #120)
+- Done: the session history (`noel-core/src/history.rs`, ids that survive
+  restarts and compaction, markers for compaction and undo), the windowed
+  `noel.chat` view in Durable's entry shape with `before` and an `entries`
+  paging method, `noel-client`'s `Transcript`, the attached TUI showing the
+  whole history, and `pi.live` v3's `turns`, `compactions`,
+  `compactionFailure`, `runFailure` and slot `entry`.
+- Open (engine behavior, needs an owner decision against spec section 4.1):
+  Durable's run-end rules: an interrupted request charged to retry and
+  ending `interrupted` instead of being resent, `restart_limit`, the
+  `continue` submission, `whenIdle: "reject"`, `turn_limit`.
 
 ### 6. Storage trait (Planned, #121)
 - The JSONL journal behind a storage trait; SQLite as a second backend later.
