@@ -745,8 +745,14 @@ upstream's, byte for byte (`docs/codemode-port.md`). These parts differ:
 - **Abort and deadline.** No deadline unless `timeout_ms` is given, as
   upstream. An abort ends the call like other tools: the result is the
   aborted-output text, not `Script failed ... Script aborted: <reason>`.
-- **Not present:** worker admission limits, `models.*`, MCP exposure,
-  durable replay, grammar-constrained input.
+- **Slots.** At most 2 scripts run at once in the process
+  (`NOEL_CODEMODE_MAX_WORKERS` or `PI_CODEMODE_MAX_WORKERS`), with upstream's
+  60-second wait and failure texts; the number is read once per process,
+  where upstream reads it per call. Starts restore a VM image taken after
+  the prelude when the tools, store and limits are the same, as djs's
+  adapter does.
+- **Not present:** `models.*`, MCP exposure, durable replay,
+  grammar-constrained input.
 
 ### Built-in Tools Run In-Process
 
