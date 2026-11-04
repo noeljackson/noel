@@ -80,7 +80,8 @@ v1 pin `@earendil-works/chord@1.5.0`).
   upstream has a verdict; revocation; WebSocket (binary) and framed
   byte-stream transports; noel-cli and noel-client cut over (server,
   workers, line-mode client and the attached TUI speak v2; mode2 passes).
-  Next: `chord2-interop` against upstream, then deleting v1.
+  `make chord2-interop` passes both ways against upstream (Bun, Unix
+  sockets). Next: deleting v1.
 
 ### 5. View parity (Client side done, #120)
 - Done: the session history (`noel-core/src/history.rs`, ids that survive

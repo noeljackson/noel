@@ -167,7 +167,7 @@ reply stays in the transcript.
 - **hosts:** placement by address (here, a route of the address's kind, or the parent link); holds bound with a snapshot of each state member, then `state` ops through a window of 2 unacknowledged messages per origin, pending ops replaced by a value past 10,000; calls within 256 per side and the peer's window, `abort`; holds refused `failed {waiting}` (not served, another contract) or `failed {broken}` (params, address, factory), `loading` and `retry`; routes resolving one link per address, again when it drops; relayed holds keeping their ids under a relay origin, with acks returned to the link that sent each message and `closed` when the origin goes; revocation (`revoked_by`, `revoke`, `gone forbidden/revoked`);
 - **transports:** WebSocket binary messages (a text message ends the link), also over a Unix socket; framed byte streams for server and worker (§5); an in-memory pair.
 
-The v1 implementation (link protocol 4) stays in `noel-chord` for `make chord-interop` until `chord2-interop` replaces it. Where v2 differs from upstream is listed in `docs/rust-rewrite/non-parity-register.md` ("Chord v2").
+`make chord2-interop` (`scripts/chord2-interop.sh`, Bun against a checkout at the pin) runs both directions against upstream: upstream's client host holds `noel.chat` on `noel server` (relayed to the worker), submits, follows the run and holds again after a drop; noel's `chord2-client` holds an upstream server host's object, calls it, follows a burst of commits past the window and holds again after a drop. Where v2 differs from upstream is listed in `docs/rust-rewrite/non-parity-register.md` ("Chord v2").
 
 ### 7.2 Objects
 
