@@ -15,14 +15,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use noel_ai::{ChatToolCall, ToolDefinition as AiToolDefinition};
-use noel_codemode::execution::{
-    execute, CallFuture, CallStatus, DeclaredTool, ExecuteOptions, Executor,
-};
+use noel_codemode::execution::{execute, CallFuture, DeclaredTool, ExecuteOptions, Executor};
 use noel_codemode::format::{format_result, Block, CallSummary, OutputFiles};
 use noel_codemode::vm::CallTarget;
 use noel_codemode::{parse_codemode_source, to_codemode_identifier};
 use noel_env::ExecutionEnv;
 use noel_tools::{execute_tool_streaming_in, ToolImage, ToolRequest, ToolRuntimeOptions};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::{
@@ -91,13 +90,11 @@ struct Nested {
     hosts: Arc<tokio::sync::Mutex<extensions::ExtensionHosts>>,
     cwd: PathBuf,
     extension_tools: BTreeMap<String, ExtensionTool>,
-    parent_id: String,
     state: Mutex<NestedState>,
 }
 
 #[derive(Default)]
 struct NestedState {
-    next: usize,
     edited: Vec<String>,
     registrations: Vec<extensions::ExtensionRegistrationSet>,
 }
@@ -109,13 +106,13 @@ impl Nested {
 
     /// One nested call: the gate, then the tool. A string result, or the
     /// tool's error text as the script's `Error`.
-    async fn run(&self, name: &str, args: Option<Value>) -> Result<Option<Value>, String> {
+    async fn run(
+        &self,
+        id: String,
+        name: &str,
+        args: Option<Value>,
+    ) -> Result<Option<Value>, String> {
         let arguments = args.unwrap_or_else(|| json!({})).to_string();
-        let id = {
-            let mut state = self.state();
-            state.next += 1;
-            format!("{}/{}", self.parent_id, state.next)
-        };
         let call = ChatToolCall {
             id,
             name: name.to_owned(),
@@ -210,10 +207,77 @@ impl Nested {
     }
 }
 
-/// Records each nested call's name and status for the failure summary.
+/// Characters of a nested call's arguments and error kept for display
+/// (upstream `ARGS_PREVIEW_CHARS`, `ERROR_PREVIEW_CHARS`).
+const ARGS_PREVIEW_CHARS: usize = 200;
+const ERROR_PREVIEW_CHARS: usize = 500;
+
+/// `text` cut to `max` characters (UTF-16 units, as upstream counts) with
+/// `...` at the end.
+fn truncate_text(text: &str, max: usize) -> String {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    if units.len() <= max {
+        return text.to_owned();
+    }
+    format!("{}...", String::from_utf16_lossy(&units[..max - 3]))
+}
+
+/// What a nested call is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NestedCallStatus {
+    Running,
+    Ok,
+    Error,
+    Cancelled,
+}
+
+impl NestedCallStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NestedCallStatus::Running => "running",
+            NestedCallStatus::Ok => "ok",
+            NestedCallStatus::Error => "error",
+            NestedCallStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A tool call a codemode script made (upstream `CodemodeNestedCall`, the
+/// rows of the tool's `details.calls`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedToolCall {
+    /// `<codemode call id>/<n>`.
+    pub id: String,
+    pub name: String,
+    /// Compact JSON of the arguments, cut for display.
+    pub args: String,
+    pub status: NestedCallStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Error text, cut for display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Keeps the rows of the script's nested calls and sends a snapshot on
+/// every change.
 struct Recording<'a> {
     nested: &'a Nested,
-    calls: Mutex<Vec<CallSummary>>,
+    parent_id: String,
+    calls: Mutex<Vec<NestedToolCall>>,
+    updates: tokio::sync::mpsc::UnboundedSender<Vec<NestedToolCall>>,
+}
+
+impl Recording<'_> {
+    fn rows(&self) -> std::sync::MutexGuard<'_, Vec<NestedToolCall>> {
+        self.calls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn publish(&self, rows: &[NestedToolCall]) {
+        let _ = self.updates.send(rows.to_vec());
+    }
 }
 
 impl Executor for Recording<'_> {
@@ -227,18 +291,38 @@ impl Executor for Recording<'_> {
             if target == CallTarget::Global {
                 return Err(format!("Unknown global \"{name}\""));
             }
-            let index = {
-                let mut calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
-                calls.push(CallSummary {
+            let preview = args
+                .as_ref()
+                .map(|args| truncate_text(&args.to_string(), ARGS_PREVIEW_CHARS))
+                .unwrap_or_default();
+            let (index, id) = {
+                let mut rows = self.rows();
+                let id = format!("{}/{}", self.parent_id, rows.len() + 1);
+                rows.push(NestedToolCall {
+                    id: id.clone(),
                     name: name.to_owned(),
-                    status: "cancelled".to_owned(),
+                    args: preview,
+                    status: NestedCallStatus::Running,
+                    duration_ms: None,
+                    error: None,
                 });
-                calls.len() - 1
+                self.publish(&rows);
+                (rows.len() - 1, id)
             };
-            let result = self.nested.run(name, args).await;
-            let status = if result.is_ok() { "ok" } else { "error" };
-            self.calls.lock().unwrap_or_else(PoisonError::into_inner)[index].status =
-                status.to_owned();
+            let started = Instant::now();
+            let result = self.nested.run(id, name, args).await;
+            let mut rows = self.rows();
+            let row = &mut rows[index];
+            row.duration_ms = Some(started.elapsed().as_millis() as u64);
+            match &result {
+                Ok(_) => row.status = NestedCallStatus::Ok,
+                Err(error) => {
+                    row.status = NestedCallStatus::Error;
+                    row.error = Some(truncate_text(error, ERROR_PREVIEW_CHARS));
+                }
+            }
+            self.publish(&rows);
+            drop(rows);
             result
         })
     }
@@ -283,6 +367,7 @@ pub(crate) async fn run(
     runtime: &mut Runtime,
     tool_call: &ChatToolCall,
     callable: &[AiToolDefinition],
+    on_nested: &mut (dyn FnMut(Vec<NestedToolCall>) + Send),
 ) -> Result<CodemodeOutput, AgentError> {
     let started = Instant::now();
     let failed = |message: String| CodemodeOutput {
@@ -315,7 +400,6 @@ pub(crate) async fn run(
         hosts: runtime.extension_hosts(),
         cwd: runtime.session.cwd.clone(),
         extension_tools: runtime.systems.extension_tools.clone(),
-        parent_id: tool_call.id.clone(),
         state: Mutex::default(),
     };
     let tools: Vec<DeclaredTool> = callable
@@ -326,10 +410,15 @@ pub(crate) async fn run(
             description: tool.description.clone(),
         })
         .collect();
+    let (updates, mut snapshots) = tokio::sync::mpsc::unbounded_channel();
     let recording = Recording {
         nested: &nested,
+        parent_id: tool_call.id.clone(),
         calls: Mutex::default(),
+        updates,
     };
+    // Shows the script as running before its first nested call.
+    on_nested(Vec::new());
     let options = ExecuteOptions {
         timeout: source
             .options
@@ -338,7 +427,28 @@ pub(crate) async fn run(
         memory_limit_bytes: Some(MEMORY_LIMIT_BYTES),
         store: runtime.session.codemode_store.clone(),
     };
-    let result = execute(&source.code, &tools, &[], &recording, options, None).await;
+    let result = {
+        let execution = execute(&source.code, &tools, &[], &recording, options, None);
+        tokio::pin!(execution);
+        loop {
+            tokio::select! {
+                result = &mut execution => break result,
+                Some(rows) = snapshots.recv() => on_nested(rows),
+            }
+        }
+    };
+    // Calls still running were cut off by the script ending, a timeout or
+    // an abort.
+    let rows = {
+        let mut rows = recording.rows();
+        for row in rows.iter_mut() {
+            if row.status == NestedCallStatus::Running {
+                row.status = NestedCallStatus::Cancelled;
+            }
+        }
+        rows.clone()
+    };
+    on_nested(rows.clone());
 
     let NestedState {
         edited,
@@ -364,16 +474,13 @@ pub(crate) async fn run(
             runtime.set_codemode_store(store)?;
         }
     }
-    let mut calls = recording
-        .calls
-        .into_inner()
-        .unwrap_or_else(PoisonError::into_inner);
-    // A call the sandbox cancelled stays `cancelled` in the summary.
-    for (summary, record) in calls.iter_mut().zip(&result.calls) {
-        if record.status == CallStatus::Cancelled {
-            summary.status = "cancelled".to_owned();
-        }
-    }
+    let calls: Vec<CallSummary> = rows
+        .iter()
+        .map(|row| CallSummary {
+            name: row.name.clone(),
+            status: row.status.as_str().to_owned(),
+        })
+        .collect();
     let formatted = format_result(
         &result,
         &calls,

@@ -1,4 +1,5 @@
 mod codemode;
+pub use codemode::{NestedCallStatus, NestedToolCall};
 mod compaction;
 pub mod controller;
 #[cfg(test)]
@@ -3657,6 +3658,13 @@ pub enum TurnEvent {
         name: String,
         is_error: bool,
     },
+    /// The tool calls a running `codemode` script has made so far, each
+    /// with its status: sent when the script starts and on every change
+    /// (upstream's `details.calls`). Nested calls are not saved as results.
+    NestedToolCalls {
+        call: ChatToolCall,
+        calls: Vec<NestedToolCall>,
+    },
     /// A tool call's result as saved, and how long the tool ran (`None` for
     /// a call of a reply cut off at the output limit, which is not run).
     /// `images` are the attachments of the result (`read` of an image).
@@ -4235,8 +4243,10 @@ async fn run_tool_call(
             runtime.systems.progress.output_interval,
         ));
         let put_off = tokio::sync::Notify::new();
+        // Both callbacks report events while the call runs.
+        let events = Mutex::new(&mut *on_event);
         let mut on_output = |output: OutputSoFar<'_>| {
-            on_event(&TurnEvent::ToolUpdate {
+            (lock(&events))(&TurnEvent::ToolUpdate {
                 call: tool_call.clone(),
                 output: output.text.to_owned(),
             });
@@ -4244,7 +4254,14 @@ async fn run_tool_call(
                 put_off.notify_one();
             }
         };
-        let execution = execute_model_tool_call(runtime, &tool_call, &mut on_output);
+        let mut on_nested = |calls: Vec<NestedToolCall>| {
+            (lock(&events))(&TurnEvent::NestedToolCalls {
+                call: tool_call.clone(),
+                calls,
+            });
+        };
+        let execution =
+            execute_model_tool_call_with(runtime, &tool_call, &mut on_output, &mut on_nested);
         let execution = async {
             tokio::pin!(execution);
             loop {
@@ -5115,10 +5132,22 @@ fn fail_truncated_tool_call(
 
 /// Runs a tool call of the model and saves its result. `on_output` gets a
 /// running `bash` command's output so far.
+#[cfg(test)]
 async fn execute_model_tool_call(
     runtime: &mut Runtime,
     tool_call: &ChatToolCall,
     on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
+) -> Result<(), AgentError> {
+    execute_model_tool_call_with(runtime, tool_call, on_output, &mut |_| {}).await
+}
+
+/// [`execute_model_tool_call`], with a `codemode` call's nested calls
+/// reported to `on_nested` as they change.
+async fn execute_model_tool_call_with(
+    runtime: &mut Runtime,
+    tool_call: &ChatToolCall,
+    on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
+    on_nested: &mut (dyn FnMut(Vec<NestedToolCall>) + Send),
 ) -> Result<(), AgentError> {
     let extension_tool = runtime
         .systems
@@ -5179,7 +5208,7 @@ async fn execute_model_tool_call(
     } else if tool_call.name == codemode::CODEMODE {
         if model_tool_enabled(runtime, codemode::CODEMODE) {
             let callable = codemode::callable(&active_tool_definitions(runtime));
-            let result = codemode::run(runtime, tool_call, &callable).await?;
+            let result = codemode::run(runtime, tool_call, &callable, on_nested).await?;
             is_error = result.is_error;
             images = result.images;
             vec![result.output]
@@ -10105,6 +10134,15 @@ mod tests {
                     format!("tool {} {} {}", call.id, call.name, call.arguments)
                 }
                 TurnEvent::ToolUpdate { call, output } => format!("update {} {output:?}", call.id),
+                TurnEvent::NestedToolCalls { call, calls } => format!(
+                    "nested {} [{}]",
+                    call.id,
+                    calls
+                        .iter()
+                        .map(|nested| format!("{} {}", nested.name, nested.status.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
                 TurnEvent::ToolOutput {
                     call,
                     output,
