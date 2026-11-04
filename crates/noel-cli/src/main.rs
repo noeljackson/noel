@@ -7919,6 +7919,10 @@ async fn handle_tui_submission(
             app.replace_entry(checking, usage::format_account_status(&rows, now));
         }
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
+        "/app" => app.push(
+            TuiEntryKind::System,
+            open_desktop_app(&runtime.session().session_id),
+        ),
         "/changelog" => app.push(TuiEntryKind::System, format_changelog()),
         "/settings" => open_tui_selector(app, config, runtime, "settings", "")?,
         "/settings show" => app.push(TuiEntryKind::System, format_settings(config, runtime)),
@@ -10055,6 +10059,24 @@ fn keybinding_map(config: &LoadedConfig) -> KeybindingMap {
             })
             .collect(),
     )
+}
+
+/// `/app`: the desktop app (`noel app`, spec §14) on this session, started
+/// apart from the terminal. A session this process holds opens there once
+/// it lets the session go (one writer at a time).
+pub(crate) fn open_desktop_app(session: &str) -> String {
+    let started = std::env::current_exe().and_then(|noel| {
+        std::process::Command::new(noel)
+            .args(["app", "--session", session])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    });
+    match started {
+        Ok(_) => format!("opening session {session} in the desktop app"),
+        Err(error) => format!("could not start the desktop app: {error}"),
+    }
 }
 
 fn format_session(runtime: &Runtime) -> String {

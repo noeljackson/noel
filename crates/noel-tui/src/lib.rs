@@ -211,6 +211,10 @@ pub const COMMAND_HELP: &[CommandHelp] = &[
         description: "show session info",
     },
     CommandHelp {
+        command: "/app",
+        description: "open this session in the desktop app",
+    },
+    CommandHelp {
         command: "/changelog",
         description: "show changelog entries",
     },

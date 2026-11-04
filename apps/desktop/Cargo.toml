@@ -1,0 +1,25 @@
+[package]
+name = "noel-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "noel's desktop app (roadmap phase 9): a GPUI window on noel server, through noel-client"
+publish = false
+
+[[bin]]
+name = "noel-app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+futures = "0.3"
+gpui = { package = "gpui-ce", version = "=0.3.0" }
+gpui_platform = { package = "gpui_ce_platform", version = "=0.3.0" }
+gpui_elements = { package = "gpui_ce_elements", version = "=0.3.0" }
+noel-chord = { path = "../../crates/noel-chord" }
+noel-client = { path = "../../crates/noel-client" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+
+# Its own workspace: the GPUI dependencies stay out of `make check`.
+[workspace]

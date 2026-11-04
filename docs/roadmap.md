@@ -116,10 +116,15 @@ v1 pin `@earendil-works/chord@1.5.0`).
   plugin (`state.json`) across restarts (plugins belong to the server, not
   a session). Spec §13; tested by `tests/plugins.rs`.
 
-### 9. Desktop app, GPUI (Planned, #124)
-- `noel app`: sessions sidebar, transcript, composer, palette, diffs, plugin
-  panels; local or ssh server. `/app` in the TUI opens the current session.
-- Done: usable against local and remote servers; plain `noel` unchanged.
+### 9. Desktop app, GPUI (Done, #124)
+- `noel app` / `noel-app` (`apps/desktop`, gpui-ce): sessions sidebar,
+  transcript with diff coloring, composer, command palette, plugin
+  commands and panels; local server through `noel bridge`, remote through
+  `ssh … noel bridge`. `/app` in the TUI opens the current session. Its own
+  workspace (`make app`, `make app-check`), so plain `noel` and `make check`
+  are unchanged. Spec §14.
+- Done: `scripts/app-smoke.sh` runs it against a real server locally,
+  through `noel app` and through ssh, and draws the window under Xvfb.
 
 ### 10. `noel-ffi` and iOS (Planned, #125)
 - UniFFI over `noel-client` and the view types; SwiftUI app over an ssh

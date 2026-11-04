@@ -153,7 +153,11 @@ impl Contract {
             "variants": variants,
         });
         let fingerprint = hash64(
-            &json!({ "normalFormVersion": NORMAL_FORM_VERSION, "value": normal }).to_string(),
+            // Canonical JSON: the keys sorted whatever order a `Map` keeps
+            // (serde_json's `preserve_order` may be on in a build).
+            &crate::schema::canonical_json(
+                &json!({ "normalFormVersion": NORMAL_FORM_VERSION, "value": normal }),
+            ),
         );
         Ok(Contract {
             declaration,
@@ -370,7 +374,7 @@ fn snapshot(schema: &Value, path: &str, objects: Objects) -> Result<Value, Contr
                     .as_array()
                     .cloned()
                     .ok_or_else(|| error(format!("{at}: expected an array")))?;
-                values.sort_by_key(|value| value.to_string());
+                values.sort_by_key(crate::schema::canonical_json);
                 Value::Array(values)
             }
             Keyword::Data => value.clone(),
