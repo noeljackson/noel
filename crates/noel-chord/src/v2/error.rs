@@ -271,6 +271,43 @@ impl WireError {
     }
 }
 
+/// `code/reason: message` for a Chord error, `code: message` for a
+/// plugin's, as noel's front ends print them.
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WireError::Chord(error) => match error.reason {
+                Some(reason) => write!(f, "{}/{}: {}", error.code, reason, error.message),
+                None => write!(f, "{}: {}", error.code, error.message),
+            },
+            WireError::Plugin(error) => write!(f, "{}: {}", error.code, error.message),
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
+impl WireError {
+    /// A plugin error with `code` and `message`.
+    pub fn plugin(code: impl Into<String>, message: impl Into<String>) -> WireError {
+        WireError::Plugin(PluginError {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        })
+    }
+
+    /// Whether it is a Chord error with `code`.
+    pub fn is(&self, code: Code) -> bool {
+        matches!(self, WireError::Chord(error) if error.code == code)
+    }
+
+    /// Whether it is a plugin error with `code`.
+    pub fn is_plugin(&self, code: &str) -> bool {
+        matches!(self, WireError::Plugin(error) if error.code == code)
+    }
+}
+
 impl From<ChordError> for WireError {
     fn from(error: ChordError) -> WireError {
         WireError::Chord(error)

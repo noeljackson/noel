@@ -236,6 +236,10 @@ impl Actor {
         match result {
             Ok(Resolved { link, options }) => {
                 let id = link.id();
+                // The path has this link already (adopted meanwhile).
+                if path.link == Some(id) {
+                    return;
+                }
                 self.attach(link, Role::Route, options);
                 if self.links.contains_key(&id) {
                     self.path_connected(&key, id);
@@ -247,6 +251,24 @@ impl Actor {
                     self.holder_unreachable(holder, error.clone());
                 }
             }
+        }
+    }
+
+    /// A link given for `address` before anything resolved it.
+    pub(super) fn route_link(&mut self, address: Address, resolved: Resolved) {
+        let key = PathKey::Route {
+            kind: address.kind.clone(),
+            params: canonical_json(&address.params),
+        };
+        let path = self.paths.entry(key.clone()).or_default();
+        path.address = Some(address);
+        let id = resolved.link.id();
+        if path.link == Some(id) {
+            return;
+        }
+        self.attach(resolved.link, Role::Route, resolved.options);
+        if self.links.contains_key(&id) {
+            self.path_connected(&key, id);
         }
     }
 

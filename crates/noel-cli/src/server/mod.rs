@@ -4,10 +4,10 @@
 //!
 //! - **The server** ([`serve`]) is the user's one host, `server`, on an
 //!   owner-only Unix socket in the runtime directory. It serves
-//!   `noel.sessions` and `noel.models`, routes `session:<id>` to its workers,
+//!   `noel.sessions` and `noel.models`, routes `Session({id})` addresses to its workers,
 //!   spawns, watches and adopts them, and resumes a run a worker crash
 //!   interrupted.
-//! - **A worker** ([`worker`]) is the host `session:<id>`: the session's only
+//! - **A worker** ([`worker`]) is the host at `Session({id})`: the session's only
 //!   writer, holding its journal lock. It serves `noel.chat` with the view
 //!   of the conversation ([`view`]) and drives runs with the session
 //!   controller. It outlives its server and waits to be adopted.
@@ -33,7 +33,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use noel_chord::Description;
+use std::sync::Arc;
+
+use noel_chord::v2::Contract;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
@@ -49,8 +51,9 @@ pub(crate) const ENV_RUNTIME_DIR: &str = "NOEL_RUNTIME_DIR";
 /// on the socket is the device's.
 pub(crate) const VIA_HEADER: &str = "Noel-Via";
 
-/// The worker's `ready` and `fatal` lines, and the control lines on a
-/// server–worker link, are `{"chord2control": message}`.
+/// The worker's `ready` and `fatal` lines on stdout, and its `ready` line
+/// on a new socket connection before the framed link, are
+/// `{"chord2control": message}`.
 pub(crate) const CONTROL_KEY: &str = "chord2control";
 
 /// Default for `server.idleExitMs`.
@@ -59,15 +62,15 @@ pub(crate) const DEFAULT_SERVER_IDLE_MS: u64 = 10 * 60 * 1000;
 pub(crate) const DEFAULT_WORKER_IDLE_MS: u64 = 60 * 1000;
 
 // The contracts live in noel-client, which every front end shares.
-pub(crate) fn chat_contract() -> Description {
+pub(crate) fn chat_contract() -> Arc<Contract> {
     noel_client::contracts::chat()
 }
 
-pub(crate) fn sessions_contract() -> Description {
+pub(crate) fn sessions_contract() -> Arc<Contract> {
     noel_client::contracts::sessions()
 }
 
-pub(crate) fn models_contract() -> Description {
+pub(crate) fn models_contract() -> Arc<Contract> {
     noel_client::contracts::models()
 }
 
@@ -376,23 +379,54 @@ pub(crate) fn chat_variant(principal: &Value, session: &str) -> Option<&'static 
     }
 }
 
-/// Keys objects by principal (spec §6): `owner@<via>`,
-/// `guest:<id>:r<revision>`, `worker:<session>:<generation>`.
-pub(crate) fn principal_key(principal: &Value) -> String {
-    let text = |key: &str| {
-        principal
-            .get(key)
-            .map(|value| match value {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            })
-            .unwrap_or_default()
-    };
-    match principal.get("kind").and_then(Value::as_str) {
-        Some("owner") => format!("owner@{}", text("via")),
-        Some("guest") => format!("guest:{}:r{}", text("id"), text("revision")),
-        Some("worker") => format!("worker:{}:{}", text("session"), text("generation")),
-        _ => noel_chord::canonical_json(principal),
+/// Errors as the server and its workers give them (Chord v2): Chord's own
+/// codes for what Chord means, plugin codes for noel's refusals (`busy`,
+/// `session`, `cwd`, ...), which v2's closed reason table cannot carry.
+pub(crate) mod errors {
+    use noel_chord::v2::{ChordError, Code, WireError};
+    use serde_json::json;
+
+    pub(crate) fn unavailable(message: impl Into<String>) -> ChordError {
+        ChordError::new(Code::Unavailable, message)
+    }
+
+    /// `unavailable` with `reason` when v2 allows it (`locked`, `busy`,
+    /// ...), else with the reason in its details.
+    pub(crate) fn unavailable_because(reason: &str, message: impl Into<String>) -> ChordError {
+        if Code::Unavailable.reasons().contains(&reason) {
+            ChordError::with_reason(Code::Unavailable, reason, message)
+        } else {
+            unavailable(message).details(json!({ "reason": reason }))
+        }
+    }
+
+    pub(crate) fn forbidden(message: impl Into<String>) -> WireError {
+        ChordError::new(Code::Forbidden, message).into()
+    }
+
+    /// A refusal of noel's: the plugin error `code`.
+    pub(crate) fn refused(code: &str, message: impl Into<String>) -> WireError {
+        WireError::plugin(code, message)
+    }
+
+    /// A session the server has no journal for: `unavailable` with
+    /// `details.missing: "session"` (a route's failure is a Chord error).
+    pub(crate) fn no_session(id: &str) -> ChordError {
+        unavailable(format!("no session {id}")).details(json!({ "missing": "session" }))
+    }
+
+    /// Whether `error` says a session does not exist.
+    pub(crate) fn is_no_session(error: &WireError) -> bool {
+        match error {
+            WireError::Chord(error) => {
+                error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("missing"))
+                    == Some(&json!("session"))
+            }
+            WireError::Plugin(error) => error.code == "session",
+        }
     }
 }
 
@@ -514,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn principals_get_their_variant_and_key() {
+    fn principals_get_their_variant() {
         assert_eq!(chat_variant(&owner("device"), "s1"), Some("participant"));
         assert_eq!(chat_variant(&owner("tunnel"), "s1"), Some("participant"));
         let guest = |session: &str, mode: &str| json!({"kind": "guest", "id": "g", "name": "G", "session": session, "mode": mode, "revision": 2});
@@ -526,20 +560,20 @@ mod tests {
         assert_eq!(chat_variant(&guest("s2", "full"), "s1"), None);
         assert_eq!(chat_variant(&worker_principal("s1", 1), "s1"), None);
         assert_eq!(chat_variant(&json!({"host": "server"}), "s1"), None);
-        assert_eq!(principal_key(&owner("device")), "owner@device");
-        assert_eq!(principal_key(&owner("tunnel")), "owner@tunnel");
-        assert_eq!(principal_key(&guest("s1", "view")), "guest:g:r2");
-        assert_eq!(principal_key(&worker_principal("s1", 3)), "worker:s1:3");
     }
 
     #[test]
     fn the_contracts_parse_and_have_their_variants() {
         let chat = chat_contract();
-        assert_eq!((chat.name.as_str(), chat.version), ("noel.chat", 1));
-        assert!(chat.variants.get("viewer").is_some());
-        assert!(chat.variants.get("participant").is_some());
-        assert_eq!(sessions_contract().name, "noel.sessions");
-        assert_eq!(models_contract().name, "noel.models");
+        let declaration = &chat.declaration;
+        assert_eq!(
+            (declaration.name.as_str(), declaration.version),
+            ("noel.chat", 1)
+        );
+        assert!(declaration.variants.contains_key("viewer"));
+        assert!(declaration.variants.contains_key("participant"));
+        assert_eq!(sessions_contract().declaration.name, "noel.sessions");
+        assert_eq!(models_contract().declaration.name, "noel.models");
     }
 
     #[test]

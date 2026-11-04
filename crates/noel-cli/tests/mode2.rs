@@ -336,7 +336,16 @@ fn a_client_creates_a_session_sends_and_a_late_watcher_sees_the_partial_then_del
     // A watcher that joins now gets the view with the committed partial.
     let mut watch = mode2.watch(&session);
     let view = watch.snapshot("the snapshot");
-    assert_eq!(partial(&view), "Hello there, ");
+    // The journal is written a moment before the view: the snapshot has the
+    // partial, at most one delta behind.
+    assert!(
+        "Hello there, ".starts_with(&partial(&view)) && !partial(&view).is_empty(),
+        "{}",
+        partial(&view)
+    );
+    let view = watch.settle("the committed partial", |view| {
+        partial(view) == "Hello there, "
+    });
     assert_eq!(view["docs"]["pi.live"]["run"]["runId"], json!(run_id));
     assert_eq!(entries(&view).len(), 1);
     assert_eq!(text_of(&entries(&view)[0]), "hi");
@@ -421,7 +430,8 @@ fn an_abort_withdraws_the_queue_and_the_next_prompt_starts_without_it() {
     // A prompt while busy is refused, not queued.
     let busy = mode2.noel(&["client", "send", &session, "too soon"]);
     assert!(!busy.status.success());
-    assert!(String::from_utf8_lossy(&busy.stderr).contains("invalid/busy"));
+    let stderr = String::from_utf8_lossy(&busy.stderr);
+    assert!(stderr.contains("busy: "), "{stderr}");
 
     let aborted = mode2.client(&["abort", &session]);
     assert!(aborted.starts_with("aborted run "), "{aborted}");
