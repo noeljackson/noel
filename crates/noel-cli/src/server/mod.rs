@@ -100,6 +100,7 @@ pub(crate) async fn try_run(args: &[String]) -> Option<i32> {
             Ok(parsed) => bridge::run(parsed).await,
             Err(error) => usage(error),
         },
+        "app" => app(&args[2..]),
         _ => return None,
     })
 }
@@ -443,6 +444,35 @@ pub(crate) fn control_line(message: &Value) -> String {
 pub(crate) fn parse_control(line: &str) -> Option<Value> {
     let mut value: Value = serde_json::from_str(line.trim()).ok()?;
     value.as_object_mut()?.remove(CONTROL_KEY)
+}
+
+/// `noel app [--remote <dest>] [--session <id>]`: runs the desktop app
+/// (`noel-app`, apps/desktop), beside this program or on the PATH, on this
+/// program's server.
+fn app(args: &[String]) -> i32 {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("noel-app")))
+        .filter(|path| path.is_file());
+    let program = beside.unwrap_or_else(|| PathBuf::from("noel-app"));
+    let mut command = std::process::Command::new(&program);
+    // This program's resolved path: `/proc/self/exe` would name the app in
+    // the app's own process.
+    if !args.iter().any(|arg| arg == "--remote" || arg == "--noel") {
+        if let Ok(noel) = std::env::current_exe() {
+            command.arg("--noel").arg(noel);
+        }
+    }
+    match command.args(args).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(error) => {
+            eprintln!(
+                "noel app: {}: {error} (build it with `make app`)",
+                program.display()
+            );
+            127
+        }
+    }
 }
 
 /// A random id for a `requestId`.

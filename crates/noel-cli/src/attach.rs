@@ -657,6 +657,10 @@ impl Remote {
             ),
             "/status" => app.push(TuiEntryKind::System, format!("status\t{}", app.status)),
             "/session" => app.push(TuiEntryKind::System, self.describe()),
+            "/app" => app.push(
+                TuiEntryKind::System,
+                crate::open_desktop_app(&self.session),
+            ),
             "/copy" if app.transcript_view.borrow().has_selection() => {
                 app.transcript_view.get_mut().request_copy();
             }
