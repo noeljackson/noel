@@ -16,6 +16,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "bedrock-tools.json",
     "chord-delta.json",
     "chord-link.json",
+    "chord-v2-contracts.json",
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
     "error-classification.json",
@@ -54,6 +55,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "bedrock-fixture.ts",
     "chord-delta-fixture.ts",
     "chord-link-fixture.ts",
+    "chord-v2-contracts-fixture.ts",
     "cli-contract-fixture.ts",
     "cloudflare-fixture.ts",
     "codex-oauth-fixture.ts",
@@ -160,6 +162,10 @@ fn every_script_output_is_committed() {
         ("chord-delta-fixture.ts", fixture_set(&["chord-delta.json"])),
         ("chord-link-fixture.ts", fixture_set(&["chord-link.json"])),
         (
+            "chord-v2-contracts-fixture.ts",
+            fixture_set(&["chord-v2-contracts.json"]),
+        ),
+        (
             "cli-contract-fixture.ts",
             fixture_set(&["cli-contract.json"]),
         ),
@@ -260,6 +266,16 @@ fn every_script_output_is_committed() {
 /// `LocalEnv`'s and pi-env's (daemon and SSH deployment), which are pinned to
 /// `CHORD_REFERENCE_REF` in the Makefile.
 fn expected_ref(fixture_name: &str) -> String {
+    // Chord v2's fixtures follow its own pin, while v1 still runs.
+    if fixture_name.starts_with("chord-v2-") {
+        let makefile = fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
+        return makefile
+            .lines()
+            .find_map(|line| line.strip_prefix("CHORD2_REFERENCE_REF ?= "))
+            .expect("the Makefile pins Chord v2")
+            .trim()
+            .to_string();
+    }
     if !matches!(
         fixture_name,
         "chord-delta.json"
@@ -327,6 +343,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         (
             "chord-link.json",
             "crates/noel-chord/tests/chord_link_parity.rs",
+        ),
+        (
+            "chord-v2-contracts.json",
+            "crates/noel-chord/tests/chord_v2_contracts.rs",
         ),
         ("cli-contract.json", "crates/noel-cli/src/main.rs"),
         (

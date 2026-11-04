@@ -24,6 +24,7 @@ mod js;
 pub mod link;
 pub mod object;
 pub mod schema;
+pub mod v2;
 pub mod validate;
 pub mod wire;
 

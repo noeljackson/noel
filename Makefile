@@ -13,6 +13,9 @@ TS_PARITY_TRACKING_REF ?= main
 # (packages/env) on the tracking ref that came after it; move the pin here and
 # regenerate.
 CHORD_REFERENCE_REF ?= b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb
+# Chord v2 (docs/chord-v2-port.md), ported beside v1 until the cut-over:
+# chord-v2-*.json come from upstream at this commit.
+CHORD2_REFERENCE_REF ?= 3551ec07eb87afebac20191958163ae58976f1d0
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -27,7 +30,7 @@ ENV_DAEMONS_SCRIPT := scripts/build-env-daemons.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord-interop env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord-interop env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -192,6 +195,13 @@ parity-check:
 	$(CARGO) test -p noel-env
 	$(CARGO) test -p noel-env-daemon
 	$(MAKE) ts-parity-drift
+
+# Chord v2 fixtures, from a checkout of upstream at CHORD2_REFERENCE_REF
+# (CHORD2_REFERENCE_DIR) with node_modules/@earendil-works/pi-schema and
+# pi-telemetry linked to its packages: Bun runs its TypeScript sources.
+chord2-fixtures:
+	bun --conditions=source scripts/ts-parity/chord-v2-contracts-fixture.ts \
+		"$(CHORD2_REFERENCE_DIR)" crates/noel-client/contracts/v2 $(TS_PARITY_FIXTURES_DIR)
 
 ts-parity-build:
 	$(DOCKER) build -f Dockerfile.ts-parity \
