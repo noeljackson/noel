@@ -4260,8 +4260,16 @@ async fn run_tool_call(
                 calls,
             });
         };
-        let execution =
-            execute_model_tool_call_with(runtime, &tool_call, &mut on_output, &mut on_nested);
+        // A codemode script ends itself on an abort, with upstream's
+        // `Script aborted` result: it is not dropped.
+        let ends_itself = tool_call.name == codemode::CODEMODE;
+        let execution = execute_model_tool_call_with(
+            runtime,
+            &tool_call,
+            &mut on_output,
+            &mut on_nested,
+            Some(&run.cancellation),
+        );
         let execution = async {
             tokio::pin!(execution);
             loop {
@@ -4274,7 +4282,11 @@ async fn run_tool_call(
                 }
             }
         };
-        let result = run.until_cancelled(execution).await;
+        let result = if ends_itself {
+            Ok(execution.await)
+        } else {
+            run.until_cancelled(execution).await
+        };
         let mut progress = progress
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner);
@@ -4328,10 +4340,15 @@ async fn run_tool_call(
     if tool_call.name == "todo" {
         on_event(&TurnEvent::TodosUpdated(runtime.session.todos.clone()));
     }
+    // An aborted codemode call saved its own result; the turn still ends.
+    let aborted = tool_call.name == codemode::CODEMODE && run.cancellation.is_cancelled();
     on_event(&TurnEvent::ToolFinished {
         name: tool_call.name,
         is_error,
     });
+    if aborted {
+        return Err(AgentError::Cancelled);
+    }
     result
 }
 
@@ -5138,7 +5155,7 @@ async fn execute_model_tool_call(
     tool_call: &ChatToolCall,
     on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
 ) -> Result<(), AgentError> {
-    execute_model_tool_call_with(runtime, tool_call, on_output, &mut |_| {}).await
+    execute_model_tool_call_with(runtime, tool_call, on_output, &mut |_| {}, None).await
 }
 
 /// [`execute_model_tool_call`], with a `codemode` call's nested calls
@@ -5148,6 +5165,7 @@ async fn execute_model_tool_call_with(
     tool_call: &ChatToolCall,
     on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
     on_nested: &mut (dyn FnMut(Vec<NestedToolCall>) + Send),
+    cancellation: Option<&CancellationToken>,
 ) -> Result<(), AgentError> {
     let extension_tool = runtime
         .systems
@@ -5208,7 +5226,8 @@ async fn execute_model_tool_call_with(
     } else if tool_call.name == codemode::CODEMODE {
         if model_tool_enabled(runtime, codemode::CODEMODE) {
             let callable = codemode::callable(&active_tool_definitions(runtime));
-            let result = codemode::run(runtime, tool_call, &callable, on_nested).await?;
+            let result =
+                codemode::run(runtime, tool_call, &callable, on_nested, cancellation).await?;
             is_error = result.is_error;
             images = result.images;
             vec![result.output]

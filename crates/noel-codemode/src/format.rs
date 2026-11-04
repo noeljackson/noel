@@ -276,8 +276,13 @@ pub fn format_result(
     if let Ok(completed) = &result.outcome {
         // pi's extension: a returned value is appended like `text()`.
         if let Some(value) = &completed.value {
+            // Compact JSON in the script's key order, when it is known.
+            let text = match (value, &completed.value_json) {
+                (Value::String(_), _) | (_, None) => value_text(value),
+                (_, Some(json)) => json.clone(),
+            };
             output.push(OutputItem::Text {
-                text: value_text(value),
+                text,
                 console: false,
             });
         }

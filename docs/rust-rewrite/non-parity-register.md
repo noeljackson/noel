@@ -728,9 +728,11 @@ upstream's, byte for byte (`docs/codemode-port.md`). These parts differ:
   except `todo` (it changes the session; model-only here) and codemode
   itself. Every call goes through the extension `toolCall` gate and runs in
   parallel; extension v2 calls share one host lock, so they run one at a
-  time. A nested call resolves to its text output: `bash` and `read` have no
-  structured results, and `read` of an image gives its text, not an image
-  block. Nested calls are reported as they change (`TurnEvent::NestedToolCalls`):
+  time. A nested call resolves to its text output, except as upstream:
+  `bash` resolves to `{output, truncated, full_output_path?, exit_code,
+  wall_time_seconds}` (also on a non-zero exit) and `read` of an image to
+  `{type: "image", data, mimeType, note}`. The description's nested-tool
+  list says so in one sentence each, not as upstream's declarations. Nested calls are reported as they change (`TurnEvent::NestedToolCalls`):
   the TUI lists them as upstream's renderer does, above the result once the
   call ends, and RPC sends upstream's `tool_execution_update` with
   `details.calls`. They have no `tool_execution_*` events of their own, the
@@ -743,8 +745,10 @@ upstream's, byte for byte (`docs/codemode-port.md`). These parts differ:
   store after each script that wrote to it, not as upstream's `codemode-store`
   custom entries per branch.
 - **Abort and deadline.** No deadline unless `timeout_ms` is given, as
-  upstream. An abort ends the call like other tools: the result is the
-  aborted-output text, not `Script failed ... Script aborted: <reason>`.
+  upstream. An abort ends the script, which saves upstream's `Script failed
+  ... Script aborted: <reason>` result with the calls it made, and then the
+  turn ends. The reason is "This operation was aborted" (Node's default
+  `AbortError` message; unverified against a pi abort).
 - **Slots.** At most 2 scripts run at once in the process
   (`NOEL_CODEMODE_MAX_WORKERS` or `PI_CODEMODE_MAX_WORKERS`), with upstream's
   60-second wait and failure texts; the number is read once per process,
