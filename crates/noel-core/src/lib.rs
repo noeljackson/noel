@@ -11,6 +11,7 @@ mod progress;
 #[cfg(test)]
 mod recovery_tests;
 mod session_lock;
+pub mod storage;
 mod system_prompt;
 #[cfg(test)]
 mod tool_parity_tests;
@@ -21,6 +22,7 @@ pub use compaction::RuntimeCompactionSettings;
 pub use input::expand_input;
 pub use progress::{interrupted_output, RuntimeProgressSettings};
 use progress::{ReplyProgress, ToolProgress};
+#[cfg(test)]
 use session_lock::SessionLock;
 pub use system_prompt::PRODUCT_NAME;
 use system_prompt::{PromptTool, SystemPromptInput};
@@ -1298,14 +1300,15 @@ impl std::fmt::Debug for ObserverSlot {
     }
 }
 
-/// A session journal opened for writing. Every constructor takes the session
-/// lock (see [`SessionError::Locked`]) and repairs a torn tail before the
-/// first append; clones share the lock and serialize their writes. Read-only
+/// A session journal opened for writing, over a [`storage::JournalStorage`]:
+/// the journal file by default, whose constructors take the session lock
+/// (see [`SessionError::Locked`]) and repair a torn tail before the first
+/// append; clones share the storage and serialize their writes. Read-only
 /// access goes through [`SessionStore::read`], which never locks or repairs.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     path: PathBuf,
-    lock: Arc<SessionLock>,
+    storage: storage::Storage,
     /// Hears the progress this store and its clones save.
     progress: Option<ObserverSlot>,
 }
@@ -1468,17 +1471,7 @@ impl SessionStore {
     /// fork and clone sources, and import sources. A torn final segment left
     /// by an interrupted append is ignored; a bad line before it is an error.
     pub fn read(path: &Path) -> Result<SessionState, SessionError> {
-        let content = read_journal_bytes(path)?;
-        if jsonl_is_ts_session_export(&content) {
-            let export = read_ts_jsonl_export(path, &content)?;
-            let session_id = if export.session_id.trim().is_empty() {
-                "recovered".to_string()
-            } else {
-                export.session_id.clone()
-            };
-            return Ok(session_state_from_export(export, session_id));
-        }
-        read_rust_journal(path, &content)
+        session_state_from_bytes(path, &read_journal_bytes(path)?)
     }
 
     /// Deletes a session journal. Refuses with [`SessionError::Locked`] while
@@ -1494,16 +1487,47 @@ impl SessionStore {
     }
 
     fn writer(path: PathBuf) -> Result<Self, SessionError> {
-        let store = Self {
-            lock: session_lock::acquire(&path)?,
-            path,
+        Ok(Self::on(Arc::new(storage::JsonlFile::open(path)?)))
+    }
+
+    fn on(storage: storage::Storage) -> Self {
+        Self {
+            path: storage.path().to_path_buf(),
+            storage,
             progress: None,
-        };
-        {
-            let _writer = store.lock.writer();
-            noel_session::repair_jsonl_tail(&store.path)?;
         }
-        Ok(store)
+    }
+
+    /// Opens the session a storage holds (another backend than the journal
+    /// file): its state, with a reply a stop cut off recovered as for
+    /// [`SessionStore::open`].
+    pub fn open_storage(storage: storage::Storage) -> Result<(Self, SessionState), SessionError> {
+        let store = Self::on(storage);
+        let mut state = store.load()?;
+        store.recover_partial(&mut state)?;
+        Ok((store, state))
+    }
+
+    /// Starts a new session in an empty storage.
+    pub fn create_in_storage(
+        storage: storage::Storage,
+        cwd: PathBuf,
+        session_id: impl Into<String>,
+    ) -> Result<(Self, SessionState), SessionError> {
+        let store = Self::on(storage);
+        let session_id = session_id.into();
+        let state = SessionState::new(session_id.clone(), cwd.clone());
+        store.append(&SessionRecord::Started { session_id, cwd })?;
+        Ok((store, state))
+    }
+
+    #[cfg(test)]
+    fn lock(&self) -> &Arc<SessionLock> {
+        self.storage
+            .as_any()
+            .downcast_ref::<storage::JsonlFile>()
+            .expect("a journal file")
+            .lock()
     }
 
     /// This store, and the clones made of it from now on, tell `observer`
@@ -1683,26 +1707,19 @@ impl SessionStore {
                     source,
                 },
             )?;
-        // No append from another handle may land between the read and the
-        // rename, or the rewrite would drop it.
-        let _writer = self.lock.writer();
-        let mut journal = fs::read(&self.path).map_err(|source| SessionError::Read {
-            path: self.path.clone(),
-            source,
+        // No append from another handle lands between the read and the
+        // replacement, and a failure leaves the old journal and active
+        // context unchanged, with no partial checkpoint. A torn final
+        // segment is dropped, never patched into a corrupt interior line.
+        self.storage.rewrite(&mut |journal| {
+            // The rewrite drops what the checkpoint and the rest of the
+            // journal supersede of what replies and tool calls saved as they
+            // ran.
+            let mut journal = progress::drop_superseded(&journal, &pending);
+            journal.extend_from_slice(&checkpoint);
+            journal.push(b'\n');
+            Ok(journal)
         })?;
-        // A torn final segment is dropped, never patched with a newline into
-        // a corrupt interior line; a complete record that only lost its
-        // newline is terminated.
-        noel_session::repair_jsonl_tail_bytes(&mut journal);
-        // The rewrite drops what the checkpoint and the rest of the journal
-        // supersede of what replies and tool calls saved as they ran.
-        let mut journal = progress::drop_superseded(&journal, &pending);
-        journal.extend(checkpoint);
-        journal.push(b'\n');
-        // Rename a synced temporary file: a failed write leaves the old
-        // journal and active context unchanged, with no partial checkpoint.
-        // The session lock lives in a separate file, so the rename keeps it.
-        noel_config::write_file_atomic(&self.path, &journal)?;
         self.observe_history(&marker);
         Ok(())
     }
@@ -1840,7 +1857,7 @@ impl SessionStore {
     }
 
     fn load(&self) -> Result<SessionState, SessionError> {
-        Self::read(&self.path)
+        session_state_from_bytes(&self.path, &self.storage.read()?)
     }
 
     /// Replaces the journal with the full state in one atomic rename, so a
@@ -1924,16 +1941,15 @@ impl SessionStore {
             })?;
             journal.push(b'\n');
         }
-        let _writer = self.lock.writer();
-        noel_config::write_file_atomic(&self.path, &journal)?;
-        Ok(())
+        self.storage.rewrite(&mut |_| Ok(journal.clone()))
     }
 
     fn append(&self, record: &SessionRecord) -> Result<(), SessionError> {
-        {
-            let _writer = self.lock.writer();
-            noel_session::append_jsonl_record(&self.path, record)?;
-        }
+        let line = serde_json::to_vec(record).map_err(|source| SessionError::Parse {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.storage.append(&line)?;
         self.observe_history(record);
         Ok(())
     }
@@ -2024,6 +2040,20 @@ fn queue_items_record(items: &[QueueItem], withdrawn: &[QueueItemId]) -> Session
             .cloned()
             .collect(),
     }
+}
+
+/// A session from its journal's bytes: noel's records, or pi's export.
+fn session_state_from_bytes(path: &Path, content: &[u8]) -> Result<SessionState, SessionError> {
+    if jsonl_is_ts_session_export(content) {
+        let export = read_ts_jsonl_export(path, content)?;
+        let session_id = if export.session_id.trim().is_empty() {
+            "recovered".to_string()
+        } else {
+            export.session_id.clone()
+        };
+        return Ok(session_state_from_export(export, session_id));
+    }
+    read_rust_journal(path, content)
 }
 
 fn read_journal_bytes(path: &Path) -> Result<Vec<u8>, SessionError> {
@@ -7350,15 +7380,15 @@ mod tests {
         let base = durable_test_dir("same-process");
         let (store, state) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
         let (again, _) = SessionStore::open(store.path().to_path_buf()).unwrap();
-        assert!(Arc::ptr_eq(&store.lock, &again.lock));
+        assert!(Arc::ptr_eq(store.lock(), again.lock()));
         let spelled = base.join(".").join(store.path().file_name().unwrap());
         let (spelled, _) = SessionStore::open(spelled).unwrap();
-        assert!(Arc::ptr_eq(&store.lock, &spelled.lock));
+        assert!(Arc::ptr_eq(store.lock(), spelled.lock()));
         // Importing onto the id this process holds rewrites it in place.
         let (imported, _) = SessionStore::import(&base, SessionExport::from(&state)).unwrap();
-        assert!(Arc::ptr_eq(&store.lock, &imported.lock));
+        assert!(Arc::ptr_eq(store.lock(), imported.lock()));
 
-        let lock_path = store.lock.lock_path().to_path_buf();
+        let lock_path = store.lock().lock_path().to_path_buf();
         assert!(lock_path.exists());
         drop((store, again, spelled));
         assert!(lock_path.exists(), "a live handle keeps the lock");
@@ -7458,7 +7488,7 @@ mod tests {
         #[cfg(unix)]
         assert_ne!(inode(), before, "the checkpoint replaces the journal");
 
-        let probe = File::open(store.lock.lock_path()).unwrap();
+        let probe = File::open(store.lock().lock_path()).unwrap();
         assert!(matches!(
             probe.try_lock(),
             Err(std::fs::TryLockError::WouldBlock)
@@ -7543,7 +7573,7 @@ mod tests {
         let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
         // A second description of the same lock inode, to observe the OS lock
         // after the store unlinks the path on drop.
-        let probe = File::open(store.lock.lock_path()).unwrap();
+        let probe = File::open(store.lock().lock_path()).unwrap();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .stdin(std::process::Stdio::null())
@@ -7582,7 +7612,7 @@ mod tests {
 
         let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
         let path = store.path().to_path_buf();
-        let lock_path = store.lock.lock_path().to_path_buf();
+        let lock_path = store.lock().lock_path().to_path_buf();
         drop(store);
         SessionStore::delete(&path).unwrap();
         assert!(!path.exists());
@@ -7591,7 +7621,7 @@ mod tests {
         // The session this process holds can be deleted; its lock file goes
         // away with the last handle.
         let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
-        let lock_path = store.lock.lock_path().to_path_buf();
+        let lock_path = store.lock().lock_path().to_path_buf();
         SessionStore::delete(store.path()).unwrap();
         assert!(!store.path().exists());
         assert!(lock_path.exists());

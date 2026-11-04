@@ -1294,11 +1294,9 @@ mod tests {
         }
         // A directory cannot be replaced by the checkpoint file.
         let mut runtime = self::runtime();
-        runtime.set_store(SessionStore {
-            lock: crate::session_lock::acquire(&base).unwrap(),
-            path: base.clone(),
-            progress: None,
-        });
+        runtime.set_store(SessionStore::on(std::sync::Arc::new(
+            crate::storage::JsonlFile::unrepaired(base.clone()).unwrap(),
+        )));
         let before = runtime.session.clone();
         assert!(runtime
             .compact_messages(
