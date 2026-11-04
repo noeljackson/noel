@@ -175,10 +175,18 @@ impl JsonlJournal {
 /// the new record always starts on its own line. Callers serialize appends to
 /// one journal.
 pub fn append_jsonl_record<T: Serialize>(path: &Path, record: &T) -> Result<(), JournalError> {
-    let mut line = serde_json::to_vec(record).map_err(|source| JournalError::Serialize {
+    let line = serde_json::to_vec(record).map_err(|source| JournalError::Serialize {
         path: path.to_path_buf(),
         source,
     })?;
+    append_jsonl_line(path, &line)
+}
+
+/// Appends one record already serialized (its JSON without the newline), as
+/// [`append_jsonl_record`] does.
+pub fn append_jsonl_line(path: &Path, record: &[u8]) -> Result<(), JournalError> {
+    let mut line = Vec::with_capacity(record.len() + 1);
+    line.extend_from_slice(record);
     line.push(b'\n');
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| JournalError::CreateDir {

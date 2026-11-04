@@ -85,9 +85,14 @@ v1 pin `@earendil-works/chord@1.5.0`).
   ending `interrupted` instead of being resent, `restart_limit`, the
   `continue` submission, `whenIdle: "reject"`, `turn_limit`.
 
-### 6. Storage trait (Planned, #121)
-- The JSONL journal behind a storage trait; SQLite as a second backend later.
-- Done: existing recovery and journal tests pass through the trait.
+### 6. Storage trait (Done, #121)
+- `noel_core::storage::JournalStorage`: append a record, read the journal,
+  rewrite it atomically. `SessionStore` keeps the records' meaning
+  (recovery, checkpoints, history) over any storage: `JsonlFile` (the
+  journal file under the session lock, the default) and `MemoryJournal`.
+  Every recovery and journal test passes through the trait; the recovery
+  paths (compaction checkpoint, partial recovery, torn tail) also run on
+  `MemoryJournal`. SQLite can be added as another `JournalStorage`.
 
 ### 7. Plugin host (Planned, #122)
 - Plugins as Chord v2 hosts with a manifest; contributions through v2-style
