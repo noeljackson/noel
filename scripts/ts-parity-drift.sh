@@ -26,7 +26,7 @@ mkdir -p "${fresh_fixtures_dir}" "${fixtures_dir}"
   git -C /ts-reference rev-parse HEAD > "${out_dir}/reference-sha"
 reference_sha="$(cat "${out_dir}/reference-sha")"
 
-# chord-delta.json, chord-link.json, local-env.json, pi-env.json and
+# chord-delta.json, local-env.json, pi-env.json and
 # pi-env-ssh.json are pinned (CHORD_REFERENCE_REF in the Makefile) rather than
 # made from the tracking ref, so their drift is the commits on the tracking ref
 # after the pin: to packages/chord, to Durable's env and its conformance cases,
@@ -87,11 +87,11 @@ if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord_file_actionable}" ] || [ -s "$
       if [ ! -s "${chord_file_actionable}" ]; then
         printf 'The pin is at the newest commit at which `packages/chord` builds; the commits below do not build yet. They are recorded for the next pass.\n\n'
       fi
-      printf '`chord-delta.json` and `chord-link.json` are pinned to `%s` (`CHORD_REFERENCE_REF` in the Makefile). `packages/chord` changed after it on the tracked reference:\n\n' "${chord_pin}"
+      printf '`chord-delta.json` is pinned to `%s` (`CHORD_REFERENCE_REF` in the Makefile). `packages/chord` changed after it on the tracked reference:\n\n' "${chord_pin}"
       printf '```text\n'
       cat "${chord_file}"
       printf '```\n\n'
-      printf 'Move the pin to the newest of these commits at which `packages/chord` builds (the image build checks), regenerate with `make ts-parity-chord`, bring `crates/noel-chord` level with the new fixtures, and run `make chord-interop`.\n\n'
+      printf 'Move the pin to the newest of these commits at which `packages/chord` builds (the image build checks), regenerate with `make ts-parity-chord`, and bring `crates/noel-chord`'"'"'s Delta codec level with the new fixture. Chord v2 has its own pin, `CHORD2_REFERENCE_REF`: regenerate with `make chord2-fixtures` and run `make chord2-interop`.\n\n'
     fi
     if [ -s "${env_file}" ] && [ -s "${env_file_actionable}" ]; then
       printf '## Durable env pin\n\n'

@@ -15,7 +15,6 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "bedrock-claude-opus-4.6.json",
     "bedrock-tools.json",
     "chord-delta.json",
-    "chord-link.json",
     "chord-v2-contracts.json",
     "chord-v2-messages.json",
     "cli-contract.json",
@@ -55,7 +54,6 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "auth-discovery-fixture.ts",
     "bedrock-fixture.ts",
     "chord-delta-fixture.ts",
-    "chord-link-fixture.ts",
     "chord-v2-contracts-fixture.ts",
     "chord-v2-messages-fixture.ts",
     "cli-contract-fixture.ts",
@@ -162,7 +160,6 @@ fn every_script_output_is_committed() {
             fixture_set(&["bedrock-claude-opus-4.6.json", "bedrock-tools.json"]),
         ),
         ("chord-delta-fixture.ts", fixture_set(&["chord-delta.json"])),
-        ("chord-link-fixture.ts", fixture_set(&["chord-link.json"])),
         (
             "chord-v2-contracts-fixture.ts",
             fixture_set(&["chord-v2-contracts.json"]),
@@ -284,11 +281,7 @@ fn expected_ref(fixture_name: &str) -> String {
     }
     if !matches!(
         fixture_name,
-        "chord-delta.json"
-            | "chord-link.json"
-            | "local-env.json"
-            | "pi-env.json"
-            | "pi-env-ssh.json"
+        "chord-delta.json" | "local-env.json" | "pi-env.json" | "pi-env-ssh.json"
     ) {
         return "main".to_string();
     }
@@ -345,10 +338,6 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
         (
             "chord-delta.json",
             "crates/noel-chord/tests/chord_delta_parity.rs",
-        ),
-        (
-            "chord-link.json",
-            "crates/noel-chord/tests/chord_link_parity.rs",
         ),
         (
             "chord-v2-contracts.json",

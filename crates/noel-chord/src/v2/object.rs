@@ -15,7 +15,119 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use super::error::{ChordError, WireError};
-pub use crate::object::{BoxFuture, Cell};
+use std::pin::Pin;
+use std::sync::Mutex;
+
+use crate::delta::{apply_owned, diff, Op};
+use crate::validate;
+
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+/// Why a cell refused a value: it does not fit the cell's schema, or ops do
+/// not apply to it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct CellError(pub String);
+
+/// A change of a cell: its ops and the value after them.
+#[derive(Clone, Debug)]
+pub(crate) struct CellChange {
+    pub ops: Arc<Vec<Op>>,
+}
+
+type Listener = Arc<dyn Fn(&CellChange) + Send + Sync>;
+
+struct CellState {
+    value: Arc<Value>,
+    listeners: Vec<(u64, Listener)>,
+    next: u64,
+}
+
+struct CellInner {
+    schema: Value,
+    state: Mutex<CellState>,
+}
+
+/// A state member's value with its schema; each change is checked against
+/// the schema and published as ops to the holds that follow it.
+#[derive(Clone)]
+pub struct Cell {
+    inner: Arc<CellInner>,
+}
+
+impl Cell {
+    pub fn new(schema: Value, initial: Value) -> Result<Cell, CellError> {
+        validate::check(&schema, &initial)
+            .map_err(|problem| CellError(format!("initial state: {problem}")))?;
+        Ok(Cell {
+            inner: Arc::new(CellInner {
+                schema,
+                state: Mutex::new(CellState {
+                    value: Arc::new(initial),
+                    listeners: Vec::new(),
+                    next: 0,
+                }),
+            }),
+        })
+    }
+
+    pub fn schema(&self) -> &Value {
+        &self.inner.schema
+    }
+
+    pub fn value(&self) -> Arc<Value> {
+        self.inner.state.lock().expect("cell").value.clone()
+    }
+
+    pub fn apply(&self, ops: Vec<Op>) -> Result<(), CellError> {
+        self.change(|_| ops).map(|_| ())
+    }
+
+    /// Applies the ops `ops` gives for the current value, atomically.
+    pub fn change(&self, ops: impl FnOnce(&Value) -> Vec<Op>) -> Result<Arc<Value>, CellError> {
+        let mut state = self.inner.state.lock().expect("cell");
+        let ops = ops(&state.value);
+        if ops.is_empty() {
+            return Ok(state.value.clone());
+        }
+        let next = apply_owned((*state.value).clone(), &ops)
+            .map_err(|error| CellError(format!("state: {error}")))?;
+        validate::check(&self.inner.schema, &next)
+            .map_err(|problem| CellError(format!("state: {problem}")))?;
+        state.value = Arc::new(next);
+        let change = CellChange { ops: Arc::new(ops) };
+        for (_, listener) in &state.listeners {
+            listener(&change);
+        }
+        Ok(state.value.clone())
+    }
+
+    /// Replaces the whole value: followers get one `r` op.
+    pub fn replace(&self, value: Value) -> Result<(), CellError> {
+        self.apply(vec![Op::Replace(value)])
+    }
+
+    /// Moves to `value`, publishing the structural difference.
+    pub fn update(&self, value: Value) -> Result<(), CellError> {
+        let ops = diff(&self.value(), &value);
+        self.apply(ops)
+    }
+
+    /// Registers a listener and returns the value it starts from, atomically
+    /// with respect to changes.
+    pub(crate) fn listen(&self, listener: Listener) -> (u64, Arc<Value>) {
+        let mut state = self.inner.state.lock().expect("cell");
+        let id = state.next;
+        state.next += 1;
+        state.listeners.push((id, listener));
+        (id, state.value.clone())
+    }
+
+    pub(crate) fn unlisten(&self, id: u64) {
+        let mut state = self.inner.state.lock().expect("cell");
+        state.listeners.retain(|(listener, _)| *listener != id);
+    }
+}
 
 /// A method: its arguments (`null` when it takes none) and the call's
 /// context, giving its result (`null` for none) or an error.

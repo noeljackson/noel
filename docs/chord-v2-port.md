@@ -1,5 +1,10 @@
 # Chord v2: audit and port plan for noel
 
+**Status (2026-11-04): done.** noel speaks Chord v2; `make chord2-interop`
+passes both ways against upstream and the v1 implementation is deleted.
+The audit below is kept as written; the notes about v1 describe the code
+as it was.
+
 Audit of upstream Chord v2 for porting `crates/noel-chord` (Chord v1, link
 protocol 4, pinned at `b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb`) and the Mode 2
 server, worker and client built on it.
