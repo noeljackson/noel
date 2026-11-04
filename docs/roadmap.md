@@ -137,9 +137,15 @@ v1 pin `@earendil-works/chord@1.5.0`).
 - Open: the Swift side has not been compiled here (no macOS; the Swift
   toolchain download is blocked); the macOS workflow is its first build.
 
-### 11. Pairing and remote access (Planned, #126)
-- Owner links or device pairing over TLS, following Chord v2's HTTP auth;
-  guests later. Security review before default-on.
+### 11. Pairing and remote access (Done, off by default, #126)
+- `server.listen` adds a TLS listener (self-signed, fingerprint pinned);
+  devices pair with `noel client pair` (upstream's `/_chord/pair` and
+  `/_chord/pair/poll`), the owner approves with `noel client devices
+  approve`, and devices connect with `noel client --server` (Bearer token,
+  stamped `{kind: "owner", via: "remote", device}`); `devices revoke` uses
+  v2 revocation. Spec §16; tested by `tests/remote.rs`.
+- Open: guests, and the security review before it is on by default
+  (the owner's).
 
 ## Decisions pending
 

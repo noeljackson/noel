@@ -73,6 +73,12 @@ pub mod contracts {
         declared(&CELL, include_str!("../contracts/v2/noel.plugins.json"))
     }
 
+    /// `noel.devices`, served by `Server()`: paired devices (spec §16).
+    pub fn devices() -> Arc<Contract> {
+        static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
+        declared(&CELL, include_str!("../contracts/v2/noel.devices.json"))
+    }
+
     /// `noel.models`, served by `Server()`.
     pub fn models() -> Arc<Contract> {
         static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
@@ -250,6 +256,22 @@ impl Client {
         let plugins = self.plugins();
         let outcome = call(&plugins, method, args).await;
         plugins.release();
+        outcome
+    }
+
+    /// The server's paired devices as they are now (`noel.devices`).
+    pub async fn device_directory(&self) -> Result<Value> {
+        let devices = self.host.get(contracts::devices(), json!({}));
+        let value = current(&devices, "devices").await;
+        devices.release();
+        value
+    }
+
+    /// Calls a `noel.devices` method (`approve`, `revoke`).
+    pub async fn devices_call(&self, method: &str, args: Value) -> Result<Value> {
+        let devices = self.host.get(contracts::devices(), json!({}));
+        let outcome = call(&devices, method, args).await;
+        devices.release();
         outcome
     }
 

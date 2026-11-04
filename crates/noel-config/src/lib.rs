@@ -877,6 +877,9 @@ pub struct ServerSettings {
     /// queued; one that lost its server waits this long to be adopted.
     /// Default 60000.
     pub worker_idle_exit_ms: Option<u64>,
+    /// Where the server also listens for paired devices over TLS
+    /// (`host:port`); unset, it does not (spec §16).
+    pub listen: Option<String>,
 }
 
 impl MergeSettings for ServerSettings {
@@ -884,6 +887,7 @@ impl MergeSettings for ServerSettings {
         Self {
             idle_exit_ms: overrides.idle_exit_ms.or(self.idle_exit_ms),
             worker_idle_exit_ms: overrides.worker_idle_exit_ms.or(self.worker_idle_exit_ms),
+            listen: overrides.listen.or(self.listen),
         }
     }
 }

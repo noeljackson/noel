@@ -63,6 +63,7 @@ pub(crate) async fn run(
     let place = match &endpoint {
         Endpoint::Local => "noel server".to_owned(),
         Endpoint::Ssh { destination, .. } => format!("noel server on {destination}"),
+        Endpoint::Paired(paired) => format!("noel server on {}:{}", paired.host, paired.port),
     };
     let client = connect(
         endpoint,
