@@ -1380,6 +1380,9 @@ on a link yet. Where it differs:
 - **Sans-IO channel.** `v2::Channel` takes received bytes and the time and
   gives the bytes to send; its owner moves them and runs the timer. Upstream's
   `Channel` owns its link's listeners.
+- **Process links** are noel's framed byte streams (`[u32 BE length][tag]
+  [payload]`, tag 0 a Chord message, tag 1 a JSON control message), not
+  Node IPC.
 - **No text codec yet.** Only the binary codec, upstream's default. The text
   codec is for debugging and both ends must agree on it.
 - **Error messages of protocol errors** carry the decode error after the
