@@ -304,6 +304,13 @@ async fn foreground() -> Result<i32> {
     serve_sessions(&host, sessions.clone());
     serve_models(&host, &config, offline)?;
     let plugins = super::plugins::Plugins::start(&host, &dir, &config.paths.agent_dir)?;
+    let listen = config
+        .settings
+        .server
+        .as_ref()
+        .and_then(|server| server.listen.clone());
+    let _remote =
+        super::remote::Remote::start(&host, &config.paths.agent_dir, listen.as_deref()).await?;
     host.route("session", SessionRoute(workers.clone()));
 
     workers.adopt_all().await;

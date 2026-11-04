@@ -64,6 +64,10 @@ pub(crate) struct ClientArgs {
     /// PATH; a leading ~/ is its home).
     #[arg(long, value_name = "PATH", requires = "remote", global = true)]
     remote_noel: Option<String>,
+    /// Use a server this device paired with (`noel client pair`), over TLS
+    /// (spec §16).
+    #[arg(long, value_name = "URL", global = true, conflicts_with = "remote")]
+    server: Option<String>,
     #[command(subcommand)]
     command: ClientCommand,
 }
@@ -153,6 +157,20 @@ enum ClientCommand {
         /// The command's arguments, as one string.
         args: Vec<String>,
     },
+    /// Pair this device with a server that listens for devices
+    /// (`server.listen`): show a code to approve there, then keep the token.
+    Pair {
+        url: String,
+        /// How the server lists this device.
+        #[arg(long, default_value = "device")]
+        label: String,
+    },
+    /// The devices paired with this machine's server: list, `approve
+    /// <code>`, `revoke <id>`.
+    Devices {
+        action: Option<String>,
+        argument: Option<String>,
+    },
     /// Send a plugin panel an action (a button's).
     Panel {
         plugin: String,
@@ -163,7 +181,28 @@ enum ClientCommand {
 }
 
 pub(crate) async fn run(args: ClientArgs) -> i32 {
-    let endpoint = match Endpoint::new(args.remote, args.remote_noel) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let agent_dir = match noel_config::ConfigPaths::discover(cwd, None) {
+        Ok((paths, _)) => paths.agent_dir,
+        Err(error) => {
+            eprintln!("noel client: {error}");
+            return 2;
+        }
+    };
+    if let ClientCommand::Pair { url, label } = &args.command {
+        return match super::remote::pair(&agent_dir, url, label).await {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("noel client: pair: {error:#}");
+                1
+            }
+        };
+    }
+    let endpoint = match &args.server {
+        Some(url) => super::remote::paired(&agent_dir, url).map(Endpoint::Paired),
+        None => Endpoint::new(args.remote, args.remote_noel),
+    };
+    let endpoint = match endpoint {
         Ok(endpoint) => endpoint,
         Err(error) => {
             eprintln!("noel client: {error:#}");
@@ -296,6 +335,60 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
             let args = json!({"submissionId": submission_id});
             let result = client.chat_call(&session, "withdraw", args, false).await?;
             println!("{}", result["outcome"].as_str().unwrap_or_default());
+            Ok(0)
+        }
+        ClientCommand::Pair { .. } => unreachable!("handled before connecting"),
+        ClientCommand::Devices { action, argument } => {
+            let call = |method: &'static str, key: &'static str| {
+                let client = client.clone();
+                let argument = argument.clone();
+                async move {
+                    let value =
+                        argument.ok_or_else(|| anyhow!("devices {method} needs its {key}"))?;
+                    client.devices_call(method, json!({ key: value })).await
+                }
+            };
+            match action.as_deref() {
+                None | Some("ls") => {
+                    let devices = client.device_directory().await?;
+                    println!(
+                        "certificate: {}",
+                        devices["fingerprint"].as_str().unwrap_or_default()
+                    );
+                    match devices["listening"].as_str() {
+                        Some(address) => println!("listening: {address}"),
+                        None => println!("listening: no (set server.listen)"),
+                    }
+                    for device in devices["devices"].as_array().into_iter().flatten() {
+                        println!(
+                            "device {} {}",
+                            device["id"].as_str().unwrap_or_default(),
+                            device["label"].as_str().unwrap_or_default()
+                        );
+                    }
+                    for pending in devices["pending"].as_array().into_iter().flatten() {
+                        println!(
+                            "pending {} {}",
+                            pending["code"].as_str().unwrap_or_default(),
+                            pending["label"].as_str().unwrap_or_default()
+                        );
+                    }
+                }
+                Some("approve") => {
+                    let approved = call("approve", "code").await?;
+                    println!(
+                        "approved: device {}",
+                        approved["id"].as_str().unwrap_or_default()
+                    );
+                }
+                Some("revoke") => {
+                    call("revoke", "id").await?;
+                    println!("revoked");
+                }
+                Some(other) => {
+                    return Err(anyhow!("devices: no action {other} (ls, approve, revoke)"))
+                }
+            }
             Ok(0)
         }
         ClientCommand::Plugins { json } => {
@@ -447,6 +540,8 @@ pub(crate) enum Endpoint {
         destination: String,
         program: String,
     },
+    /// A server this device paired with, over TLS.
+    Paired(super::remote::Paired),
 }
 
 impl Endpoint {
@@ -533,6 +628,7 @@ async fn open(
     report: &Report,
 ) -> Result<noel_chord::v2::Link> {
     match endpoint {
+        Endpoint::Paired(paired) => super::remote::connect(paired).await,
         Endpoint::Local => websocket_link(dial(true, report).await?).await,
         Endpoint::Ssh {
             destination,
