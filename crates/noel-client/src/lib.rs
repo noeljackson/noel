@@ -30,6 +30,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
 
+pub mod app;
+
 pub mod contracts {
     //! The contracts `noel server` serves, and its workers (Chord v2).
 

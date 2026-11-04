@@ -126,9 +126,16 @@ v1 pin `@earendil-works/chord@1.5.0`).
 - Done: `scripts/app-smoke.sh` runs it against a real server locally,
   through `noel app` and through ssh, and draws the window under Xvfb.
 
-### 10. `noel-ffi` and iOS (Planned, #125)
-- UniFFI over `noel-client` and the view types; SwiftUI app over an ssh
-  channel to `noel bridge`. Built on macOS.
+### 10. `noel-ffi` and iOS (Rust side done; app needs macOS, #125)
+- `crates/noel-ffi`: noel-client's app link through UniFFI, over a byte
+  channel the app opens (SSH to `noel bridge`), events as records; tested
+  over a channel (`tests/channel.rs`); static libraries for
+  `aarch64-apple-ios` and `aarch64-apple-ios-sim` build on Linux
+  (`make ios-libs`). `noel-client::app` is shared with the desktop app.
+- `apps/ios`: NoelKit and the SwiftUI app (sessions, chat, plugin panels),
+  `make ios` and `.github/workflows/ios.yml` (macOS runner). Spec §15.
+- Open: the Swift side has not been compiled here (no macOS; the Swift
+  toolchain download is blocked); the macOS workflow is its first build.
 
 ### 11. Pairing and remote access (Planned, #126)
 - Owner links or device pairing over TLS, following Chord v2's HTTP auth;
