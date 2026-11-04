@@ -1,0 +1,189 @@
+{
+  "name": "noel.plugin",
+  "version": 1,
+  "host": "plugin",
+  "params": [
+    [
+      "plugin",
+      {
+        "type": "string"
+      }
+    ]
+  ],
+  "variants": {
+    "host": {
+      "state": {
+        "contributions": {
+          "type": "object",
+          "required": [
+            "tools",
+            "commands",
+            "panels"
+          ],
+          "properties": {
+            "tools": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "description",
+                  "parameters"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "parameters": {
+                    "type": "object"
+                  },
+                  "replaySafe": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "commands": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "description"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "panels": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "title",
+                  "view"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "view": {
+                    "type": "object",
+                    "required": [
+                      "type"
+                    ],
+                    "properties": {
+                      "type": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "methods": {
+        "callTool": {
+          "args": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "args": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "args"
+            ],
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "properties": {
+              "output": {
+                "type": "string"
+              },
+              "isError": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "output",
+              "isError"
+            ]
+          }
+        },
+        "runCommand": {
+          "args": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "args": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "properties": {
+              "output": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "output"
+            ]
+          }
+        },
+        "panelAction": {
+          "args": {
+            "type": "object",
+            "properties": {
+              "panel": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "panel",
+              "action"
+            ],
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  }
+}

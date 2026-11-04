@@ -94,12 +94,19 @@ v1 pin `@earendil-works/chord@1.5.0`).
   paths (compaction checkpoint, partial recovery, torn tail) also run on
   `MemoryJournal`. SQLite can be added as another `JournalStorage`.
 
-### 7. Plugin host (Planned, #122)
-- Plugins as Chord v2 hosts with a manifest; contributions through v2-style
-  registries: tools, commands, hooks, panels. Permissions checked per
-  principal. Rust SDK first, then Bun.
-- Done: a sample plugin adds a tool, a command and a panel; a crash restarts
-  it; a denied permission is refused.
+### 7. Plugin host (Done, #122)
+- Plugins are Chord v2 hosts at `Plugin({name})` that `noel server` starts
+  from manifests and restarts when they exit; they contribute tools,
+  commands and panels (`noel.plugin`), which the server publishes in
+  `noel.plugins` limited to the permissions `plugins.json` grants; each
+  object checks the plugin principal. Workers offer plugin tools to their
+  model; `noel client plugins|run|panel` lists, runs and acts on panels.
+  Rust SDK: `crates/noel-plugin`. Spec §13.
+- Done: `crates/noel-cli/tests/plugins.rs` runs the sample plugin: its tool
+  called by a session's model, its command and panel, a refused
+  `sessions` permission, and a restart after a crash.
+- Follow-up: a Bun SDK (pi extensions keep working through the extension
+  host meanwhile); panels in the attached TUI and the desktop app (phase 9).
 
 ### 8. djs plugin tier (Planned, #123)
 - In-process plugins on the codemode host layer; same contributions as phase 7.

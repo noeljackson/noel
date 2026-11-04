@@ -12,7 +12,9 @@
 //! - `watch <id>`: the view, its snapshot then each change, as text (or
 //!   JSON lines with `--json`). It holds again when the worker is lost, and
 //!   reconnects (starting a server) when the server is;
-//! - `abort <id>`, `resume <id> [<runId>]`, `withdraw <id> <submissionId>`.
+//! - `abort <id>`, `resume <id> [<runId>]`, `withdraw <id> <submissionId>`;
+//! - `plugins`, `run <plugin> <command> [args]`, `panel <plugin> <panel>
+//!   <action> [value]`: `noel.plugins` (spec §13).
 //!
 //! With `--remote <ssh-destination>`, the server is another machine's: the
 //! client runs `ssh -T <destination> noel bridge` ([`super::bridge`]) and
@@ -137,6 +139,26 @@ enum ClientCommand {
     Withdraw {
         session: String,
         submission_id: String,
+    },
+    /// List the plugins: their permissions, contributions and panels.
+    Plugins {
+        /// Print the directory as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a plugin's command and print its output.
+    Run {
+        plugin: String,
+        command: String,
+        /// The command's arguments, as one string.
+        args: Vec<String>,
+    },
+    /// Send a plugin panel an action (a button's).
+    Panel {
+        plugin: String,
+        panel: String,
+        action: String,
+        value: Option<String>,
     },
 }
 
@@ -276,6 +298,126 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
             println!("{}", result["outcome"].as_str().unwrap_or_default());
             Ok(0)
         }
+        ClientCommand::Plugins { json } => {
+            let directory = client.plugin_directory().await?;
+            if json {
+                println!("{directory}");
+            } else {
+                for line in render_plugins(&directory) {
+                    println!("{line}");
+                }
+            }
+            Ok(0)
+        }
+        ClientCommand::Run {
+            plugin,
+            command,
+            args,
+        } => {
+            let args = json!({"plugin": plugin, "name": command, "args": args.join(" ")});
+            let result = client.plugins_call("runCommand", args).await?;
+            println!("{}", result["output"].as_str().unwrap_or_default());
+            Ok(0)
+        }
+        ClientCommand::Panel {
+            plugin,
+            panel,
+            action,
+            value,
+        } => {
+            let mut args = json!({"plugin": plugin, "panel": panel, "action": action});
+            if let Some(value) = value {
+                args["value"] = json!(value);
+            }
+            client.plugins_call("panelAction", args).await?;
+            Ok(0)
+        }
+    }
+}
+
+/// The plugin directory as text: each plugin, its permissions, tools,
+/// commands and panels, rendered.
+fn render_plugins(directory: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let plugins = directory["plugins"].as_array().cloned().unwrap_or_default();
+    if plugins.is_empty() {
+        lines.push("no plugins".to_owned());
+    }
+    let names = |list: &Value| {
+        list.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["name"].as_str().or(entry.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for plugin in plugins {
+        let state = if plugin["running"] == json!(true) {
+            "running".to_owned()
+        } else {
+            format!(
+                "stopped{}",
+                plugin["error"]
+                    .as_str()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            )
+        };
+        lines.push(format!(
+            "{} {} restarts {}",
+            plugin["name"].as_str().unwrap_or_default(),
+            state,
+            plugin["restarts"]
+        ));
+        lines.push(format!(
+            "  permissions: {} of {}",
+            names(&plugin["granted"]),
+            names(&plugin["requested"])
+        ));
+        let contributions = &plugin["contributions"];
+        lines.push(format!("  tools: {}", names(&contributions["tools"])));
+        lines.push(format!("  commands: {}", names(&contributions["commands"])));
+        for panel in contributions["panels"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  panel {} ({}):",
+                panel["id"].as_str().unwrap_or_default(),
+                panel["title"].as_str().unwrap_or_default()
+            ));
+            render_panel(&panel["view"], 2, &mut lines);
+        }
+    }
+    lines
+}
+
+/// A panel's view (spec §13's widget vocabulary) as indented text.
+fn render_panel(view: &Value, depth: usize, lines: &mut Vec<String>) {
+    let indent = "  ".repeat(depth);
+    match view["type"].as_str() {
+        Some("text") => lines.push(format!(
+            "{indent}{}",
+            view["text"].as_str().unwrap_or_default()
+        )),
+        Some("button") => lines.push(format!(
+            "{indent}[{}] ({})",
+            view["label"].as_str().unwrap_or_default(),
+            view["action"].as_str().unwrap_or_default()
+        )),
+        Some("list") => {
+            for item in view["items"].as_array().into_iter().flatten() {
+                let mut nested = Vec::new();
+                render_panel(item, 0, &mut nested);
+                for (index, line) in nested.into_iter().enumerate() {
+                    let mark = if index == 0 { "- " } else { "  " };
+                    lines.push(format!("{indent}{mark}{line}"));
+                }
+            }
+        }
+        Some("stack") => {
+            for child in view["children"].as_array().into_iter().flatten() {
+                render_panel(child, depth, lines);
+            }
+        }
+        _ => lines.push(format!("{indent}{view}")),
     }
 }
 

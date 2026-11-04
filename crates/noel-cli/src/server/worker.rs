@@ -31,7 +31,7 @@ use std::time::Duration;
 use base64::Engine;
 use clap::Parser;
 use noel_ai::{MediaInput, ModelRef};
-use noel_chord::v2::host::{Host, HostEvent, HostOptions, LinkOptions};
+use noel_chord::v2::host::{Host, HostEvent, HostOptions, LinkOptions, RemoteRef, StateUpdate};
 use noel_chord::v2::object::{BoxFuture, CallContext, Cell, Implementation};
 use noel_chord::v2::transport::{framed, ControlSender};
 use noel_chord::v2::{ChordError, WireError};
@@ -41,6 +41,7 @@ use noel_core::controller::{
     AbortPolicy, Busy, Enqueued, Event, Host as ControllerHost, Image, Repeat, SessionController,
     Start, Submission, SubmissionState, SubmitError, Submitted, WhenBusy, Withdrawal,
 };
+use noel_core::plugins::{PluginTool, PluginToolHost, PluginToolOutput};
 use noel_core::{
     expand_input, ReloadableSystems, RunStatus, Runtime, SessionError, SessionStore, SubmissionKind,
 };
@@ -214,14 +215,18 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     let status = Arc::new(StatusBoard::default());
     let host = chat_host(&session_id, status.clone());
     let (commands, inbox) = mpsc::unbounded_channel::<Command>();
-    serve_chat(&host, &session_id, view.clone(), commands);
+    serve_chat(&host, &session_id, view.clone(), commands.clone());
 
+    let plugins = Arc::new(host.get(noel_client::contracts::plugins(), json!({})));
+    follow_plugin_tools(plugins.clone(), commands.clone());
     let worker = WorkerHost {
         config,
         offline,
         view,
         status: status.clone(),
         aborts: Vec::new(),
+        plugin_host: Arc::new(ServerPluginTools(plugins)),
+        pending_plugin_tools: None,
     };
     let mut controller = SessionController::new(runtime, worker, AbortPolicy::WithdrawQueue);
     refresh(&mut controller);
@@ -375,6 +380,8 @@ enum Command {
     Compact(Value, Reply),
     Configure(Value, Reply),
     Resume(Value, Reply),
+    /// The plugin tools the server's directory offers now.
+    PluginTools(Vec<PluginTool>),
 }
 
 fn serve_chat(
@@ -621,6 +628,10 @@ struct WorkerHost {
     /// Aborts to answer once the run settles, with how many queued
     /// submissions they withdrew.
     aborts: Vec<(Reply, usize)>,
+    /// Runs plugin tools through the server's `noel.plugins`.
+    plugin_host: Arc<dyn PluginToolHost>,
+    /// Plugin tools that changed during a run, set once it settles.
+    pending_plugin_tools: Option<Vec<PluginTool>>,
 }
 
 impl ControllerHost for WorkerHost {
@@ -694,6 +705,10 @@ fn refresh(controller: &mut SessionController<WorkerHost>) {
 
 /// Handles commands; a run they start is driven here, and what arrives
 /// meanwhile is handled through [`Busy`].
+/// How long a new worker waits for the server's plugin tools before it
+/// handles its first command.
+const PLUGIN_TOOLS_WAIT: Duration = Duration::from_secs(3);
+
 async fn drive(
     mut controller: SessionController<WorkerHost>,
     mut inbox: mpsc::UnboundedReceiver<Command>,
@@ -710,7 +725,25 @@ async fn drive(
             Err(error) => eprintln!("noel worker: run {run_id} not resumed: {error}"),
         }
     }
-    while let Some(command) = inbox.recv().await {
+    // The server's plugin tools come first, so a run started at once
+    // offers them; what arrives meanwhile waits its turn.
+    let mut early = std::collections::VecDeque::new();
+    let deadline = tokio::time::Instant::now() + PLUGIN_TOOLS_WAIT;
+    while let Ok(Some(command)) = tokio::time::timeout_at(deadline, inbox.recv()).await {
+        if let Command::PluginTools(tools) = command {
+            set_plugin_tools(&mut controller, tools);
+            break;
+        }
+        early.push_back(command);
+    }
+    loop {
+        let command = match early.pop_front() {
+            Some(command) => command,
+            None => match inbox.recv().await {
+                Some(command) => command,
+                None => break,
+            },
+        };
         controller
             .host()
             .status
@@ -735,8 +768,89 @@ async fn run_session(
     inbox: &mut mpsc::UnboundedReceiver<Command>,
 ) -> bool {
     let finished = controller.run(start, inbox, busy_command).await;
+    if let Some(tools) = controller.host().pending_plugin_tools.take() {
+        set_plugin_tools(controller, tools);
+    }
     refresh(controller);
     finished
+}
+
+fn set_plugin_tools(controller: &mut SessionController<WorkerHost>, tools: Vec<PluginTool>) {
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    eprintln!("noel worker: plugin tools: {}", names.join(", "));
+    controller.configure(|runtime, host| {
+        runtime.set_plugin_tools(host.plugin_host.clone(), tools);
+    });
+}
+
+/// Follows the server's plugin directory: its tools, as the worker's
+/// runtime offers them.
+fn follow_plugin_tools(plugins: Arc<RemoteRef>, commands: mpsc::UnboundedSender<Command>) {
+    let mut updates = plugins.subscribe("directory");
+    tokio::spawn(async move {
+        let _keep = plugins;
+        while let Some(update) = updates.next().await {
+            let directory = match update {
+                StateUpdate::Snapshot(value) | StateUpdate::Ops { value, .. } => value,
+                StateUpdate::Failed(_) => continue,
+            };
+            let tools = directory["plugins"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|plugin| plugin["running"] == json!(true))
+                .flat_map(|plugin| {
+                    let name = plugin["name"].as_str().unwrap_or_default().to_owned();
+                    plugin["contributions"]["tools"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |tool| PluginTool {
+                            plugin: name.clone(),
+                            name: tool["name"].as_str().unwrap_or_default().to_owned(),
+                            description: tool["description"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                            parameters: tool["parameters"].clone(),
+                            replay_safe: tool["replaySafe"] == json!(true),
+                        })
+                })
+                .collect();
+            if commands.send(Command::PluginTools(tools)).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Plugin tools run through the server, which forwards each call to the
+/// plugin when it is granted `tools`.
+struct ServerPluginTools(Arc<RemoteRef>);
+
+impl PluginToolHost for ServerPluginTools {
+    fn call(
+        &self,
+        plugin: &str,
+        tool: &str,
+        args: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginToolOutput> + Send>> {
+        let plugins = self.0.clone();
+        let args = json!({"plugin": plugin, "name": tool, "args": args.to_string()});
+        Box::pin(async move {
+            match plugins.call("callTool", args).await {
+                Ok(result) => PluginToolOutput {
+                    output: result["output"].as_str().unwrap_or_default().to_owned(),
+                    is_error: result["isError"] == json!(true),
+                },
+                Err(error) => PluginToolOutput {
+                    output: error.to_string(),
+                    is_error: true,
+                },
+            }
+        })
+    }
 }
 
 /// A command while no run is active; a run it starts is returned.
@@ -809,6 +923,7 @@ async fn idle_command(
                 }
             }
         }
+        Command::PluginTools(tools) => set_plugin_tools(controller, tools),
     }
     None
 }
@@ -851,6 +966,7 @@ fn busy_command(command: Command, busy: &mut Busy<'_, WorkerHost>) {
                 "a run is active; wait for it to settle",
             )));
         }
+        Command::PluginTools(tools) => busy.host().pending_plugin_tools = Some(tools),
     }
 }
 

@@ -13,7 +13,7 @@ type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 interface Declaration {
 	name: string;
 	version: number;
-	host: "server" | "session";
+	host: "server" | "session" | "plugin";
 	params: [string, Json][];
 	variants: Record<string, { state?: Record<string, Json>; methods?: Record<string, { args: Json; result: Json }> }>;
 }
@@ -41,6 +41,7 @@ async function main() {
 	const { BACKGROUND_CONTEXT: context } = await import(join(src, "context/index.ts"));
 	const Server = chord.hostKind("server");
 	const Session = chord.hostKind("session", { id: chord.str() });
+	const Plugin = chord.hostKind("plugin", { name: chord.str() });
 	const declare = (declaration: Declaration) =>
 		chord.remote(declaration.name, {
 			version: declaration.version,
@@ -48,7 +49,9 @@ async function main() {
 			hostAddress:
 				declaration.host === "server"
 					? () => Server()
-					: (params: { session: string }) => Session({ id: params.session }),
+					: declaration.host === "plugin"
+						? (params: { plugin: string }) => Plugin({ name: params.plugin })
+						: (params: { session: string }) => Session({ id: params.session }),
 			variants: Object.fromEntries(
 				Object.entries(declaration.variants).map(([variant, members]) => [
 					variant,

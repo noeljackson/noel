@@ -22,6 +22,7 @@
 
 pub(crate) mod bridge;
 pub(crate) mod client;
+pub(crate) mod plugins;
 pub(crate) mod serve;
 mod view;
 pub(crate) mod worker;

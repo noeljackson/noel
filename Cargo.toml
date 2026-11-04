@@ -11,6 +11,7 @@ members = [
     "crates/noel-env",
     "crates/noel-env-daemon",
     "crates/noel-parity",
+    "crates/noel-plugin",
     "crates/noel-providers",
     "crates/noel-session",
     "crates/noel-tools",
