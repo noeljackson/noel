@@ -41,12 +41,13 @@ fn error(message: impl Into<String>) -> ContractError {
 }
 
 /// The kind of host a contract's objects live on (upstream `hostKind`):
-/// noel's server, or a session's worker.
+/// noel's server, a session's worker, or a plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HostKind {
     Server,
     Session,
+    Plugin,
 }
 
 /// A method's arguments and result schemas.
@@ -198,7 +199,7 @@ impl Contract {
 
     /// The address of the object with `params` (upstream `hostAddress`):
     /// `Server()` for server contracts, `Session({id: params.session})` for
-    /// session contracts.
+    /// session contracts, `Plugin({name: params.plugin})` for plugin ones.
     pub fn address(&self, params: &Value) -> Address {
         match self.declaration.host {
             HostKind::Server => Address {
@@ -208,6 +209,10 @@ impl Contract {
             HostKind::Session => Address {
                 kind: "session".to_owned(),
                 params: json!({"id": params.get("session").cloned().unwrap_or(Value::Null)}),
+            },
+            HostKind::Plugin => Address {
+                kind: "plugin".to_owned(),
+                params: json!({"name": params.get("plugin").cloned().unwrap_or(Value::Null)}),
             },
         }
     }

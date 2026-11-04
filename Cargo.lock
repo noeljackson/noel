@@ -1689,6 +1689,7 @@ dependencies = [
  "noel-config",
  "noel-core",
  "noel-env",
+ "noel-plugin",
  "noel-tui",
  "ratatui",
  "reqwest",
@@ -1795,6 +1796,16 @@ name = "noel-parity"
 version = "0.3.0"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "noel-plugin"
+version = "0.3.0"
+dependencies = [
+ "noel-chord",
+ "noel-client",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

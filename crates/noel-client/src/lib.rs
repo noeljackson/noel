@@ -58,6 +58,19 @@ pub mod contracts {
         declared(&CELL, SESSIONS)
     }
 
+    /// `noel.plugin`, served by each plugin at `Plugin({name})`.
+    pub fn plugin() -> Arc<Contract> {
+        static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
+        declared(&CELL, include_str!("../contracts/v2/noel.plugin.json"))
+    }
+
+    /// `noel.plugins`, served by `Server()`: the plugins and their
+    /// contributions.
+    pub fn plugins() -> Arc<Contract> {
+        static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
+        declared(&CELL, include_str!("../contracts/v2/noel.plugins.json"))
+    }
+
     /// `noel.models`, served by `Server()`.
     pub fn models() -> Arc<Contract> {
         static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
@@ -70,6 +83,14 @@ pub fn server_address() -> Address {
     Address {
         kind: "server".to_owned(),
         params: json!({}),
+    }
+}
+
+/// A plugin's host address, `Plugin({name})`.
+pub fn plugin_address(name: &str) -> Address {
+    Address {
+        kind: "plugin".to_owned(),
+        params: json!({ "name": name }),
     }
 }
 
@@ -207,6 +228,27 @@ impl Client {
     pub fn chat(&self, session: &str) -> RemoteRef {
         self.host
             .get(contracts::chat(), json!({ "session": session }))
+    }
+
+    /// A reference on the server's `noel.plugins`.
+    pub fn plugins(&self) -> RemoteRef {
+        self.host.get(contracts::plugins(), json!({}))
+    }
+
+    /// The server's plugins as they are now.
+    pub async fn plugin_directory(&self) -> Result<Value> {
+        let plugins = self.plugins();
+        let value = current(&plugins, "directory").await;
+        plugins.release();
+        value
+    }
+
+    /// Calls a `noel.plugins` method (`runCommand`, `panelAction`).
+    pub async fn plugins_call(&self, method: &str, args: Value) -> Result<Value> {
+        let plugins = self.plugins();
+        let outcome = call(&plugins, method, args).await;
+        plugins.release();
+        outcome
     }
 
     /// Calls a `noel.sessions` method (`create`, `fork`).

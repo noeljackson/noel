@@ -7,6 +7,7 @@ pub mod controller;
 mod controller_tests;
 pub mod extensions;
 mod input;
+pub mod plugins;
 mod progress;
 #[cfg(test)]
 mod recovery_tests;
@@ -722,6 +723,9 @@ pub struct ReloadableSystems {
     pub available_accounts: BTreeMap<String, Vec<String>>,
     pub available_tool_names: BTreeSet<String>,
     pub tool_scope_configured: bool,
+    /// The settings' `enabledTools` and `excludedTools`, which choose the
+    /// tools plugins add as they choose extension tools.
+    pub tool_selection: (Option<Vec<String>>, Vec<String>),
     pub extension_tools: BTreeMap<String, ExtensionTool>,
     /// The loaded extension files, for the v2 persistent hosts: which
     /// extensions exist this generation and where their programs are.
@@ -759,6 +763,7 @@ impl Default for ReloadableSystems {
             available_accounts: BTreeMap::new(),
             available_tool_names: BTreeSet::new(),
             tool_scope_configured: false,
+            tool_selection: (None, Vec::new()),
             extension_tools: BTreeMap::new(),
             extension_files: Vec::new(),
             keybinding_generation: 0,
@@ -960,6 +965,10 @@ impl ReloadableSystems {
             available_accounts,
             available_tool_names,
             tool_scope_configured: true,
+            tool_selection: (
+                config.settings.enabled_tools.clone(),
+                config.settings.excluded_tools.clone(),
+            ),
             extension_tools,
             extension_files: config.extensions.clone(),
             keybinding_generation: generation,
@@ -2922,6 +2931,10 @@ pub struct Runtime {
     /// registrations. Durable session state stays plain data; the hosts
     /// are processes, owned here and dropped with the runtime.
     extension_hosts: Arc<tokio::sync::Mutex<extensions::ExtensionHosts>>,
+    /// Plugin tools (roadmap phase 7) and what runs them: offered with the
+    /// extension tools, and kept across reloads.
+    plugin_tools: Vec<plugins::PluginTool>,
+    plugin_host: Option<Arc<dyn plugins::PluginToolHost>>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -2945,7 +2958,21 @@ impl Runtime {
             workspace_context: None,
             workspace_context_enabled: true,
             extension_hosts: Arc::new(tokio::sync::Mutex::new(extensions::ExtensionHosts::new())),
+            plugin_tools: Vec::new(),
+            plugin_host: None,
         }
+    }
+
+    /// The plugin tools the run offers from now on, run by `host`; they
+    /// replace the ones set before.
+    pub fn set_plugin_tools(
+        &mut self,
+        host: Arc<dyn plugins::PluginToolHost>,
+        tools: Vec<plugins::PluginTool>,
+    ) {
+        self.plugin_host = Some(host);
+        self.plugin_tools = tools;
+        overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
     }
 
     pub fn with_store(
@@ -3080,6 +3107,7 @@ impl Runtime {
         // Overlay the live registrations on the manifest tools the run
         // presents to the model and the prompt.
         overlay_live_registrations(&mut self.systems, &hosts);
+        overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
         diagnostics
     }
 
@@ -3088,6 +3116,7 @@ impl Runtime {
     pub async fn refresh_extension_registrations(&mut self) {
         let hosts = self.extension_hosts.lock().await;
         overlay_live_registrations(&mut self.systems, &hosts);
+        overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
     }
 
     /// Adopt a registration change a host response carried: the host
@@ -3467,6 +3496,7 @@ impl Runtime {
         let mut next = next;
         next.offline |= self.systems.offline;
         self.systems = next;
+        overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
         // A reload reads context files again, a workspace's at the next run.
         self.workspace_context = None;
         Ok(ReloadReport {
@@ -5137,6 +5167,54 @@ fn overlay_live_registrations(systems: &mut ReloadableSystems, hosts: &extension
     }
 }
 
+/// Offers the plugin tools as extension tools of the protocol `plugin`,
+/// replacing the plugin tools offered before. A tool named like a built-in
+/// or an extension's is left out. They are available as extension tools
+/// are: when `enabledTools` names them (or is unset), and `excludedTools`
+/// does not.
+fn overlay_plugin_tools(systems: &mut ReloadableSystems, tools: &[plugins::PluginTool]) {
+    let previous: Vec<String> = systems
+        .extension_tools
+        .iter()
+        .filter(|(_, tool)| tool.protocol == "plugin")
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in previous {
+        systems.extension_tools.remove(&name);
+        systems.available_tool_names.remove(&name);
+    }
+    let builtin: BTreeSet<String> = builtin_tool_definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    for tool in tools {
+        if builtin.contains(&tool.name) || systems.extension_tools.contains_key(&tool.name) {
+            continue;
+        }
+        systems.extension_tools.insert(
+            tool.name.clone(),
+            ExtensionTool {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+                extension_name: tool.plugin.clone(),
+                extension_path: PathBuf::new(),
+                protocol: "plugin".to_string(),
+                replay_safe: tool.replay_safe,
+                prompt_snippet: None,
+                prompt_guidelines: Vec::new(),
+            },
+        );
+        let (enabled, excluded) = &systems.tool_selection;
+        let selected = enabled
+            .as_ref()
+            .is_none_or(|enabled| noel_config::tool_name_matches(enabled, &tool.name));
+        if selected && !noel_config::tool_name_matches(excluded, &tool.name) {
+            systems.available_tool_names.insert(tool.name.clone());
+        }
+    }
+}
+
 fn extension_tools_from_resources(extensions: &[ResourceFile]) -> BTreeMap<String, ExtensionTool> {
     let mut tools = BTreeMap::new();
     for extension in extensions {
@@ -5293,8 +5371,30 @@ async fn execute_model_tool_call_with(
     {
         // A persistent v2 host serves its tools over one process; v1 runs
         // one process per call. Both are started lazily, on the call that
-        // needs them.
-        if extension_tool.protocol == "2" {
+        // needs them. A plugin's tool runs through the plugin host.
+        if extension_tool.protocol == "plugin" {
+            match runtime.plugin_host.clone() {
+                Some(host) => {
+                    let outcome = host
+                        .call(
+                            &extension_tool.extension_name,
+                            &extension_tool.name,
+                            serde_json::from_str(&tool_call.arguments)
+                                .unwrap_or(Value::Object(Default::default())),
+                        )
+                        .await;
+                    is_error = outcome.is_error;
+                    vec![outcome.output]
+                }
+                None => {
+                    is_error = true;
+                    vec![format!(
+                        "plugin {} is not reachable",
+                        extension_tool.extension_name
+                    )]
+                }
+            }
+        } else if extension_tool.protocol == "2" {
             let extension_name = extension_tool.extension_name.clone();
             let tool_name = extension_tool.name.clone();
             let call = tool_call.clone();
@@ -9171,6 +9271,60 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn plugin_tools_run_through_their_host_and_survive_a_reload() {
+        struct Echo;
+        impl plugins::PluginToolHost for Echo {
+            fn call(
+                &self,
+                plugin: &str,
+                tool: &str,
+                args: Value,
+            ) -> std::pin::Pin<Box<dyn Future<Output = plugins::PluginToolOutput> + Send>>
+            {
+                let output = format!("{plugin}/{tool}: {}", args["text"].as_str().unwrap_or(""));
+                Box::pin(async move {
+                    plugins::PluginToolOutput {
+                        output,
+                        is_error: false,
+                    }
+                })
+            }
+        }
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        runtime.set_plugin_tools(
+            Arc::new(Echo),
+            vec![plugins::PluginTool {
+                plugin: "sample".into(),
+                name: "shout".into(),
+                description: "Shouts.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                replay_safe: false,
+            }],
+        );
+        let call = ChatToolCall {
+            id: "call_plugin_1".to_string(),
+            name: "shout".to_string(),
+            arguments: serde_json::json!({"text": "hi"}).to_string(),
+        };
+        execute_model_tool_call(&mut runtime, &call, &mut |_| {})
+            .await
+            .expect("the plugin tool runs");
+        let event = runtime.session().tool_history.last().expect("tool event");
+        assert_eq!(event.result, "sample/shout: hi");
+        // A reload keeps the plugin's tools offered.
+        runtime
+            .reload(ReloadableSystems {
+                config_generation: 1,
+                ..ReloadableSystems::default()
+            })
+            .unwrap();
+        assert_eq!(runtime.systems.extension_tools["shout"].protocol, "plugin");
     }
 
     #[tokio::test]

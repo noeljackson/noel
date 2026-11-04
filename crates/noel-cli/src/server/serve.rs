@@ -303,6 +303,7 @@ async fn foreground() -> Result<i32> {
     });
     serve_sessions(&host, sessions.clone());
     serve_models(&host, &config, offline)?;
+    let plugins = super::plugins::Plugins::start(&host, &dir, &config.paths.agent_dir)?;
     host.route("session", SessionRoute(workers.clone()));
 
     workers.adopt_all().await;
@@ -329,6 +330,7 @@ async fn foreground() -> Result<i32> {
     };
     // Workers are left running: a new server adopts them.
     workers.closing.store(true, Ordering::SeqCst);
+    plugins.close();
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_file(dir.server_record());
     host.close().await;
@@ -960,7 +962,12 @@ fn directory_schema() -> Value {
 
 fn serve_sessions(host: &Host, sessions: Arc<Sessions>) {
     host.serve(sessions_contract(), move |_input, principal| {
-        if principal.get("kind").and_then(Value::as_str) != Some("owner") {
+        // The owner, and a plugin granted `sessions`.
+        let allowed = match super::plugins::plugin_permissions(principal) {
+            Some(permissions) => permissions.contains(&"sessions"),
+            None => principal.get("kind").and_then(Value::as_str) == Some("owner"),
+        };
+        if !allowed {
             return Err(forbidden("noel.sessions is the owner's"));
         }
         let (create, fork) = (sessions.clone(), sessions.clone());

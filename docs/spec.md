@@ -345,3 +345,17 @@ The attached TUI added "The TUI Attached to a Server Session": where it
 differs from the TUI on a local session. Remote workspaces added "Remote
 Workspaces": noel's selection and trust, and where tools there differ from
 local ones.
+
+## 13. Plugins
+
+**Built (2026-11-04, roadmap phase 7).** A plugin is a process `noel server` starts and keeps running, a Chord v2 host at `Plugin({name})` serving `noel.plugin`. The Rust SDK is `crates/noel-plugin`; `noel-sample-plugin` is its example and the tests' plugin.
+
+- **Manifests:** `<agent dir>/plugins/<dir>/plugin.json`: `{name, version?, description?, command: [program, args...], permissions: [...]}`, the program relative to the manifest's directory when it is there. Names are `[a-z0-9-]`.
+- **Grants:** `<agent dir>/plugins.json`: `{"<name>": {"permissions": [...]}}`. A plugin gets the permissions it requests that are granted there: `tools`, `commands` and `panels` for its contributions to count, `sessions` to hold `noel.sessions`. The server stamps its link `{kind: "plugin", name, permissions}`, and each object checks that principal (`forbidden` otherwise).
+- **Supervision:** the plugin's stdin and stdout are its framed link to the server (§5's framing), the `plugin` route's link for its address; its stderr goes to `plugins/<name>.log` in the runtime directory. One that exits is started again after a backoff (0.5 s doubling to 30 s, back to 0.5 s after a minute up). Only the server's own references reach a plugin.
+- **`noel.plugin`** (params `{plugin}`, variant `host`): state `contributions` `{tools: [{name, description, parameters, replaySafe?}], commands: [{name, description}], panels: [{id, title, view}]}`; `callTool({name, args})` (`args` as JSON text) `-> {output, isError}`, `runCommand({name, args?}) -> {output}`, `panelAction({panel, action, value?})`.
+- **`noel.plugins`** (at `Server()`): state `directory` `{plugins: [{name, version?, description?, running, restarts, requested, granted, contributions, error?}]}`, each plugin's contributions limited to the kinds it was granted. The owner gets `runCommand` and `panelAction` (`{plugin, ...}`), a worker gets `callTool`; the server forwards each to the plugin when its kind is granted.
+- **Tools:** each worker follows the directory and offers the plugins' tools to its model as extension tools (protocol `plugin`), selected by `enabledTools` and `excludedTools` as extension tools are, and kept across reloads; a new worker waits up to 3 s for the first directory before it handles a command. Calls go through the server's `callTool`.
+- **Commands and panels:** `noel client plugins [--json]` lists the plugins with their panels rendered as text, `noel client run <plugin> <command> [args]` runs a command, and `noel client panel <plugin> <panel> <action> [value]` sends a panel action.
+- **Panels** are views in a declarative vocabulary each client renders natively: `{type: "text", text}`, `{type: "stack", children}`, `{type: "list", items}` and `{type: "button", label, action}`.
+- **Not built yet:** a Bun SDK; pi's extensions keep working through the extension host (unchanged).
