@@ -327,7 +327,7 @@ Where remote workspaces differ from upstream and from a local workspace is liste
 
 **Decided:** compatibility is proved by goldens recorded from upstream, as the RPC goldens are.
 - **No server or client to record.** Upstream publishes no `pi server` or `pi client`, so the Chord goldens drive upstream's public `packages/chord` with noel's contracts, covering delta and canonical-JSON vectors and the link frames.
-- **Interop:** a test in Docker connects an upstream Chord client to a noel server, and the reverse (`make chord-interop`). **Built**, including upstream's client holding `noel.chat` on `noel server` through its relay to a worker, following the view's snapshot and ops.
+- **Interop:** `make chord2-interop` connects an upstream Chord v2 client host to `noel server`, and noel's client to an upstream server host (§7.1). **Built**, including upstream's client holding `noel.chat` on `noel server` through its relay to a worker, following a run and holding again after a drop.
 - **pi-env goldens** come from upstream's `RemoteExecutionEnv` talking to its own daemon (`pi-env.json`), and from upstream's SSH deployment through a stand-in for `ssh` (`pi-env-ssh.json`). **Built** for the daemon and the client, with interop both ways (`make env-interop`): upstream's client against `noel-env serve`, and noel's client against upstream's `pi-env`.
 - **`LocalEnv`** is checked against the conformance results of upstream's `NodeExecutionEnv` (**Built**: `local-env.json`).
 

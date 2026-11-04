@@ -36,7 +36,7 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use noel_chord::delta::{Op, Seg};
 use noel_chord::v2::host::StateUpdate;
-use noel_chord::BoxFuture;
+use noel_chord::v2::object::BoxFuture;
 use noel_client::{websocket_link, Connector};
 pub(crate) use noel_client::{Client, Followed, Report};
 use serde_json::{json, Value};

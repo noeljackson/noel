@@ -63,25 +63,15 @@ v1 pin `@earendil-works/chord@1.5.0`).
   upstream's `packages/codemode` tests, the declarations catalog and the
   discovery globals (with `tool_search`).
 
-### 4. Chord v2 port (Planned, #119)
-- `noel-chord` speaks v2's link protocol; server, worker and client move to v2
-  hosts and contracts; `noel-client` keeps its API so clients do not change.
-- Plan in `docs/chord-v2-port.md`: contracts and fingerprints, codecs,
-  channel, provider/consumer, relay, transports, then a `chord2-interop`
-  target; noel generates its own goldens (upstream has none).
-- Done: interop passes both ways; `mode2` tests pass on v2.
-- Progress (`noel_chord::v2`, nothing on a link yet): contracts and
-  fingerprints; messages, the binary codec and the message check; the error
-  table and wire errors; part limits and inflate; the channel (handshake,
-  checks, heartbeat); a host with provider and consumer sides (holds, the
-  window, calls and the call window, refused holds, re-holds after a drop),
-  tested over memory links; placement by address, routes and relayed holds
-  with per-origin acks and `closed`. Goldens against upstream where
-  upstream has a verdict; revocation; WebSocket (binary) and framed
-  byte-stream transports; noel-cli and noel-client cut over (server,
-  workers, line-mode client and the attached TUI speak v2; mode2 passes).
-  `make chord2-interop` passes both ways against upstream (Bun, Unix
-  sockets). Next: deleting v1.
+### 4. Chord v2 port (Done, #119)
+- noel's server, workers and clients speak Chord v2 (`noel_chord::v2`):
+  contracts and fingerprints, messages and the binary codec with the message
+  check, the error table, part limits, the channel, hosts with routes,
+  relays and revocation, WebSocket and framed transports. Goldens from
+  upstream at `CHORD2_REFERENCE_REF`; `make chord2-interop` passes both ways;
+  `mode2` passes on v2. The v1 implementation is deleted. Differences are in
+  the non-parity register ("Chord v2"); noel's refusals are plugin error
+  codes since v2's table is closed.
 
 ### 5. View parity (Client side done, #120)
 - Done: the session history (`noel-core/src/history.rs`, ids that survive

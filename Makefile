@@ -6,15 +6,15 @@ RUST_CI_IMAGE ?= noel-rust-ci:1.99.0
 TS_REFERENCE_REPO ?= https://github.com/earendil-works/pi.git
 TS_REFERENCE_REF ?= main
 TS_PARITY_TRACKING_REF ?= main
-# chord-delta.json, chord-link.json, local-env.json, pi-env.json and
-# pi-env-ssh.json are pinned to this upstream commit, whatever TS_REFERENCE_REF
+# chord-delta.json, local-env.json, pi-env.json and pi-env-ssh.json are
+# pinned to this upstream commit, whatever TS_REFERENCE_REF
 # is. ts-parity-drift reports commits to packages/chord, to Durable's env
 # (packages/durable/src/env and its conformance cases) and to pi-env
 # (packages/env) on the tracking ref that came after it; move the pin here and
 # regenerate.
 CHORD_REFERENCE_REF ?= b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb
-# Chord v2 (docs/chord-v2-port.md), ported beside v1 until the cut-over:
-# chord-v2-*.json come from upstream at this commit.
+# Chord v2 (docs/chord-v2-port.md), what noel speaks: chord-v2-*.json come
+# from upstream at this commit, and `make chord2-interop` runs against it.
 CHORD2_REFERENCE_REF ?= 3551ec07eb87afebac20191958163ae58976f1d0
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
@@ -30,7 +30,7 @@ ENV_DAEMONS_SCRIPT := scripts/build-env-daemons.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord-interop chord2-interop env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord2-interop env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -67,7 +67,6 @@ help:
 		'  ts-parity-env       Regenerate only the LocalEnv goldens inside Docker' \
 		'  ts-parity-pi-env    Regenerate only the pi-env daemon goldens inside Docker' \
 		'  ts-parity-pi-env-ssh Regenerate only the pi-env SSH deployment goldens inside Docker' \
-		'  chord-interop       Run noel-chord against upstream Chord over WebSockets' \
 		'  chord2-interop      Run noel against upstream Chord v2 (Bun, CHORD2_REFERENCE_DIR)' \
 		'  env-interop         Run upstream pi-env client tests against noel-env serve, and the noel-env client tests against upstream pi-env' \
 		'  ts-parity-update    Refresh fixtures from moving TS reference inside Docker' \
@@ -253,9 +252,6 @@ ts-parity-update:
 # noel-chord's examples, over WebSockets on Unix sockets.
 chord2-interop:
 	CARGO="$(CARGO)" CHORD2_REFERENCE_DIR="$(CHORD2_REFERENCE_DIR)" scripts/chord2-interop.sh
-
-chord-interop: ts-parity-build
-	CARGO="$(CARGO)" DOCKER="$(DOCKER)" TS_PARITY_IMAGE="$(TS_PARITY_IMAGE)" scripts/chord-interop.sh
 
 # Upstream pi-env's client tests (in the ts-parity image) against noel-env
 # serve, which they start directly; upstream's daemon runs them first. Then

@@ -3,10 +3,9 @@ name = "noel-chord"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Chord link protocol 2 for noel: frames, links (memory, WebSocket, NDJSON), hosts with relay and principals, delta ops and their wire codec, canonical JSON, hash64 and contract descriptions"
+description = "Chord v2 for noel: contracts, messages and the binary codec, channels, hosts with routes and relays, transports, the Delta op codec and canonical JSON"
 
 [dependencies]
-base64.workspace = true
 flate2 = "=1.1.9"
 getrandom.workspace = true
 futures-util = { version = "=0.3.32", default-features = false, features = ["sink", "std"] }

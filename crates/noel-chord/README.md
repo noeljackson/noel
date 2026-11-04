@@ -1,101 +1,53 @@
 # noel-chord
 
-Chord link protocol 4 for noel, ported from upstream pi's `packages/chord`:
+Chord for noel: the Chord v2 link protocol that `noel server`, its workers
+and its clients speak, ported from upstream's `packages/chord` at
+`CHORD2_REFERENCE_REF` (Makefile), and the Delta op codec its parts carry.
 
-- `delta`: the ops `r`, `s`, `d`, `a`, `t`, `p` and `m` over
-  `serde_json::Value`, applied without changing the base
-  (`apply_immutable`, `apply_immutable_batches`, `apply_owned`); the wire
-  `Encoder` and `Decoder`; and `diff`. `t` and `a` count UTF-16 code units.
-- `schema`: `canonical_json`, `hash64` and `fits`.
-- `contract`: `Description`, its `fingerprint`, and `coverage`.
-- `wire`: every protocol 4 frame (`Frame`), checked on receipt as upstream's
-  frame schema checks it.
-- `link`: links and their transports: `Link::memory_pair` (tests),
-  `websocket` (one JSON text message per frame; packed binary frames are
-  decoded when accepted and never sent) and `ndjson` (`{"chord2": frame}`
-  lines, unwindowed, with `{"chord2control": message}` lines for control).
-  `Link::new` builds a link over any other medium.
-- `host`: a `Host` serves object types (a contract and a factory that picks a
-  variant per principal), accepts links from clients and child hosts,
-  connects to a parent, relays holds through routes (`authorize` before and
-  after `resolve`), stamps principals, holds remote objects (`Host::get`,
-  `RemoteRef`), and revokes principals (`invalidate_principal`). Each
-  connection runs `hello`, holds, calls with cancellation and `maxCalls`,
-  state subscriptions through one delta encoder each, pings, and
-  acknowledgements with the flow-control window.
-- `object`: what a factory returns (`Implementation`: a variant, state
-  `Cell`s and methods) and what a method gets (`CallContext`).
-- `validate`: values against contract schemas, and input normalization.
+## Modules
 
-There is no hot reload and there are no plugins: a host runs one code
-version and answers reload control with `unavailable`.
+- `v2::contract`: contracts as noel declares them
+  (`crates/noel-client/contracts/v2/*.json`), their schema normal form and
+  fingerprints (`hash64` over UTF-8), variant and member order, params and
+  host addresses.
+- `v2::message`, `v2::binary`, `v2::check`, `v2::error`: the 18 message
+  kinds, the binary codec, the message schema check, the closed error table
+  and wire errors.
+- `v2::part`: limits per part, deflate at an origin, inflate within limits.
+- `v2::channel`: one end of a link, without I/O: handshake, checks,
+  heartbeat.
+- `v2::host`: a host actor with both sides of each link (holds, the state
+  window, calls and call windows, refused holds, `loading`, `retry`), routes
+  and relayed holds, revocation, and remote references with state streams.
+- `v2::object`: what a provider serves: cells and methods per variant.
+- `v2::link`, `v2::transport`: byte links (in memory, WebSocket binary
+  messages, framed byte streams with control frames).
+- `delta`: the Delta op codec, immutable applier and `diff`.
+- `schema::canonical_json`, `validate::check`: canonical JSON and the JSON
+  Schema subset contracts use.
 
-```rust
-let server = Host::new(HostOptions::host("server"));
-server.serve(contract, |input, principal| {
-    let count = Cell::new(schema, json!({"n": 0}))?;
-    Ok(Implementation::new("owner").state("count", &count).method("add", ...))
-});
-server.accept(link, AcceptOptions::client(json!({"kind": "owner", "via": "device"})));
+## Checks
 
-let client = Host::new(HostOptions::client("client"));
-client.connect(peer_link, LinkOptions::default());
-let counter = client.get(contract, json!({"name": "a"}), "server");
-let mut count = counter.subscribe("count"); // Snapshot, then Ops
-counter.call("add", Some(json!(1))).await?;
+```bash
+cargo test -p noel-chord      # unit tests, v2 goldens, hosts over memory links
+make chord2-fixtures CHORD2_REFERENCE_DIR=<pi checkout at the pin>
+make chord2-interop  CHORD2_REFERENCE_DIR=<pi checkout at the pin>
 ```
 
-## Examples
+- `tests/chord_v2_contracts.rs` and `tests/chord_v2_messages.rs` match
+  `tests/fixtures/ts-parity/chord-v2-*.json`, written from upstream by
+  `scripts/ts-parity/chord-v2-*-fixture.ts`: fingerprints, every message
+  kind byte for byte, upstream's message-check verdicts and ChordError
+  envelopes.
+- `tests/chord_v2_host.rs` runs hosts over memory links, WebSockets and
+  framed streams: state and calls, refused holds, the window against a
+  consumer that does not acknowledge, drops and re-holds, relays to
+  workers, revocation.
+- `tests/chord_delta_parity.rs` matches `chord-delta.json`
+  (`CHORD_REFERENCE_REF`).
+- `make chord2-interop` (`scripts/chord2-interop.sh`) runs both directions
+  against upstream with Bun over Unix sockets; `examples/chord2-client.rs`
+  is noel's side.
 
-```sh
-# A server on an owner-only Unix socket (WebSocket upgrade on /chord). It
-# checks each peer's uid before reading a byte and logs holds and releases.
-cargo run -p noel-chord --example device-server -- --socket /run/user/$UID/dev.sock
-
-# Hold the counter there: snapshot, then ops.
-cargo run -p noel-chord --example chord-client -- --socket /run/user/$UID/dev.sock
-
-# Decode the delta fixture's batches and compare them with upstream's values.
-cargo run -p noel-chord --example replay
-```
-
-## Parity
-
-Each piece matches upstream at one pinned commit, `CHORD_REFERENCE_REF` in
-the repository's Makefile, independent of the `TS_REFERENCE_REF` the other
-goldens use. Two fixtures run upstream's code in the ts-parity Docker image:
-
-- `scripts/ts-parity/chord-delta-fixture.ts` writes
-  `tests/fixtures/ts-parity/chord-delta.json`, and
-  `tests/chord_delta_parity.rs` checks the codec, canonical JSON, `hash64` and
-  contracts against every vector in it;
-- `scripts/ts-parity/chord-link-fixture.ts` runs upstream's hosts in fifteen
-  scenarios (hello; holds and `gone`; subscriptions; calls and errors;
-  cancel, `maxCalls` and release; relay; refused routes and forged
-  principals; `invalidatePrincipal`; pings and the ping timeout; window
-  coalescing and the four-window reset; version mismatches; protocol
-  violations), recording every frame on every link, and writes
-  `tests/fixtures/ts-parity/chord-link.json`. `tests/chord_link_parity.rs`
-  runs the same scenarios on noel's hosts and compares the frames of each
-  link and direction in order, ids included.
-
-`make chord-interop` (`scripts/chord-interop.sh`) then runs upstream's
-client host against `device-server` over a real WebSocket on a Unix socket,
-kills a client that holds the counter to see its hold released, and runs
-`chord-client` against upstream's server host.
-
-```sh
-make ts-parity-chord      # regenerate both chord goldens in Docker
-make chord-interop        # interop with upstream, in Docker
-cargo test -p noel-chord
-```
-
-`make ts-parity-drift` lists the `packages/chord` commits upstream made after
-the pin. To move the pin, change `CHORD_REFERENCE_REF` (the image build fails
-if `packages/chord` does not build there), regenerate, and bring this crate
-level with the new goldens.
-
-Error messages are upstream's where noel makes the same error, and
-`DeltaError::upstream_name` names the error upstream throws. Where noel
-differs, see `docs/rust-rewrite/non-parity-register.md`, "Chord Delta,
-Canonical JSON and Contracts" and "Chord Link and Hosts".
+Where noel differs from upstream is listed in
+`docs/rust-rewrite/non-parity-register.md` ("Chord v2").

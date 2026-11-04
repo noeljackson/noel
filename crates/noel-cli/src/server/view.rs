@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use noel_chord::delta::{diff, Op, Seg};
-use noel_chord::Cell;
+use noel_chord::v2::object::Cell;
 use noel_core::controller::{CallInput, Event, Outcome};
 use noel_core::history::{History, HistoryRecord};
 use noel_core::{
