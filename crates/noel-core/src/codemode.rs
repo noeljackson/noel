@@ -35,6 +35,56 @@ pub(crate) const CODEMODE: &str = "codemode";
 /// script (upstream `CODEMODE_MEMORY_LIMIT_BYTES`).
 const MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Scripts that may run at once in this process, unless
+/// `NOEL_CODEMODE_MAX_WORKERS` (or upstream's `PI_CODEMODE_MAX_WORKERS`)
+/// names another positive number (upstream `DEFAULT_MAX_CODEMODE_WORKERS`).
+const DEFAULT_MAX_WORKERS: usize = 2;
+/// How long a script waits for a free slot (upstream
+/// `CODEMODE_WORKER_WAIT_MS`).
+const WORKER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn max_workers() -> usize {
+    ["NOEL_CODEMODE_MAX_WORKERS", "PI_CODEMODE_MAX_WORKERS"]
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()?
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+        })
+        .unwrap_or(DEFAULT_MAX_WORKERS)
+}
+
+/// The slots, sized when the first script asks for one.
+fn workers() -> &'static (Arc<tokio::sync::Semaphore>, usize) {
+    static WORKERS: std::sync::OnceLock<(Arc<tokio::sync::Semaphore>, usize)> =
+        std::sync::OnceLock::new();
+    WORKERS.get_or_init(|| {
+        let max = max_workers();
+        (Arc::new(tokio::sync::Semaphore::new(max)), max)
+    })
+}
+
+/// Why a script did not start: no slot became free in time (upstream's
+/// texts).
+fn admission_failure(deadline_ms: Option<u64>, max: usize, waited_seconds: f64) -> String {
+    let error = match deadline_ms {
+        Some(deadline) if deadline <= WORKER_WAIT.as_millis() as u64 => format!(
+            "Script timed out: Execution timed out after {deadline} ms while waiting for a free codemode worker"
+        ),
+        _ => format!(
+            "No codemode worker became free within {} seconds. All {max} workers, shared by every session in this process, are held by other scripts. Retry after they finish.",
+            WORKER_WAIT.as_secs()
+        ),
+    };
+    format!(
+        "Script failed\nWall time {} seconds\nOutput:\nScript error:\n{error}\n\nThe script did not start.",
+        noel_codemode::format::to_fixed_1(waited_seconds)
+    )
+}
+
 /// Upstream's `DESCRIPTION_INTRO`, word for word.
 const DESCRIPTION_INTRO: &str = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.
 - `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. A tool whose declaration returns an object resolves on failure too when it returned that object; check its fields. Calls still running when the script ends are cancelled.
@@ -394,6 +444,22 @@ pub(crate) async fn run(
         Ok(source) => source,
         Err(error) => return Ok(failed(error.0)),
     };
+    // A slot first: the wait counts toward the script's deadline.
+    let (slots, max) = workers();
+    let wait = source.options.timeout_ms.map_or(WORKER_WAIT, |ms| {
+        WORKER_WAIT.min(std::time::Duration::from_millis(ms))
+    });
+    let _slot = match tokio::time::timeout(wait, slots.clone().acquire_owned()).await {
+        Ok(Ok(slot)) => slot,
+        _ => {
+            return Ok(failed(admission_failure(
+                source.options.timeout_ms,
+                *max,
+                started.elapsed().as_secs_f64(),
+            )))
+        }
+    };
+    let waited = started.elapsed();
     let nested = Nested {
         env: runtime.tool_env(),
         options: super::tool_runtime_options(runtime, super::bash_session_env(runtime)),
@@ -420,10 +486,11 @@ pub(crate) async fn run(
     // Shows the script as running before its first nested call.
     on_nested(Vec::new());
     let options = ExecuteOptions {
-        timeout: source
-            .options
-            .timeout_ms
-            .map(std::time::Duration::from_millis),
+        timeout: source.options.timeout_ms.map(|ms| {
+            std::time::Duration::from_millis(ms)
+                .saturating_sub(waited)
+                .max(std::time::Duration::from_millis(1))
+        }),
         memory_limit_bytes: Some(MEMORY_LIMIT_BYTES),
         store: runtime.session.codemode_store.clone(),
     };
@@ -510,4 +577,26 @@ pub(crate) async fn run(
 /// never on by default).
 pub(crate) fn selected(available: &BTreeSet<String>, disabled: &BTreeSet<String>) -> bool {
     available.contains(CODEMODE) && !disabled.contains(CODEMODE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_script_that_finds_no_free_slot_says_why_as_upstream_does() {
+        assert_eq!(
+            admission_failure(Some(5000), 2, 5.04),
+            "Script failed\nWall time 5.0 seconds\nOutput:\nScript error:\nScript timed out: Execution timed out after 5000 ms while waiting for a free codemode worker\n\nThe script did not start."
+        );
+        assert!(admission_failure(None, 3, 60.0).contains(
+            "No codemode worker became free within 60 seconds. All 3 workers, shared by every session in this process, are held by other scripts. Retry after they finish."
+        ));
+    }
+
+    #[test]
+    fn previews_are_cut_with_dots() {
+        assert_eq!(truncate_text("abcdef", 10), "abcdef");
+        assert_eq!(truncate_text("abcdefghijkl", 10), "abcdefg...");
+    }
 }

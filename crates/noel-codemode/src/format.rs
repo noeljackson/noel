@@ -214,7 +214,7 @@ fn image_extension(mime_type: &str) -> Option<&'static str> {
 }
 
 /// `value.toFixed(1)`: halves round up, as JavaScript rounds them.
-fn to_fixed_1(value: f64) -> String {
+pub fn to_fixed_1(value: f64) -> String {
     format!("{:.1}", (value * 10.0).round() / 10.0)
 }
 

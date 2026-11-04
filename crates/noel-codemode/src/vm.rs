@@ -164,7 +164,9 @@ enum Arg<'a> {
 #[derive(Debug)]
 struct Crash(String);
 
-/// Handles to what the prelude set up; valid across collections.
+/// Handles to what the prelude set up; valid across collections and in
+/// images of the VM.
+#[derive(Clone, Copy)]
 struct Prepared {
     api: Handle,
     settle: Handle,
@@ -221,7 +223,18 @@ impl VmSession {
         if let Some(limit) = data.memory_limit_bytes {
             options.memory_limit = limit;
         }
-        let vm = djs_prelude::new_vm(options).map_err(|error| format!("{error:?}"))?;
+        let key = prelude_key(data);
+        let cached = key.as_deref().and_then(cached_prelude);
+        let (vm, prepared) = match cached {
+            Some((image, prepared)) => (
+                Vm::from_bytes(image.to_vec(), options).map_err(|error| format!("{error:?}"))?,
+                Some(prepared),
+            ),
+            None => (
+                djs_prelude::new_vm(options).map_err(|error| format!("{error:?}"))?,
+                None,
+            ),
+        };
         let mut session = VmSession {
             vm,
             prepared: None,
@@ -232,7 +245,7 @@ impl VmSession {
             fixed_clock: false,
             ended: false,
         };
-        if let Err(Crash(message)) = session.begin(data) {
+        if let Err(Crash(message)) = session.begin(data, prepared, key) {
             session.post(VmMessage::Crash { message });
         }
         let messages = session.take();
@@ -273,16 +286,32 @@ impl VmSession {
         }
     }
 
-    fn begin(&mut self, data: &VmStart) -> Result<(), Crash> {
-        self.polling = false;
-        self.fixed_clock = true;
-        let prepared = self.prepare(data);
-        self.polling = true;
-        self.fixed_clock = false;
-        let prepared = prepared?;
-        self.vm
-            .seal()
-            .map_err(|error| Crash(format!("seal: {error:?}")))?;
+    /// Runs the prelude (or starts from an image taken after it, with its
+    /// handles in `cached`), then the script until it waits or ends.
+    fn begin(
+        &mut self,
+        data: &VmStart,
+        cached: Option<Prepared>,
+        key: Option<String>,
+    ) -> Result<(), Crash> {
+        let prepared = match cached {
+            Some(prepared) => prepared,
+            None => {
+                self.polling = false;
+                self.fixed_clock = true;
+                let prepared = self.prepare(data);
+                self.polling = true;
+                self.fixed_clock = false;
+                let prepared = prepared?;
+                self.vm
+                    .seal()
+                    .map_err(|error| Crash(format!("seal: {error:?}")))?;
+                if let Some(key) = key {
+                    cache_prelude(key, Arc::new(self.vm.image().to_vec()), prepared);
+                }
+                prepared
+            }
+        };
         self.vm.set_math_random_seed(entropy());
         self.call(prepared.set_origin, &[Arg::Value(Value::number(now_ms()))])?;
         let run = prepared.run;
@@ -587,6 +616,55 @@ impl VmSession {
     }
 }
 
+/// VM images taken right after the prelude, by everything the prelude
+/// depends on: a start with the same inputs restores the image instead of
+/// running the prelude's lockdown again (djs `vm.ts` `imageCache`).
+type PreludeImage = (String, Arc<Vec<u8>>, Prepared);
+
+static PRELUDE_IMAGES: std::sync::Mutex<std::collections::VecDeque<PreludeImage>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const IMAGE_CACHE_ENTRIES: usize = 16;
+const MAX_CACHE_KEY: usize = 64 * 1024;
+
+/// What the prelude image depends on, or `None` when it is too large to key.
+fn prelude_key(data: &VmStart) -> Option<String> {
+    let tools: Vec<_> = data
+        .tools
+        .iter()
+        .map(|tool| json!([tool.name, tool.js_name, tool.description]))
+        .collect();
+    let globals: Vec<_> = data
+        .globals
+        .iter()
+        .map(|global| json!([global.name, global.spread]))
+        .collect();
+    let key = json!([tools, globals, data.store, data.memory_limit_bytes]).to_string();
+    (key.len() <= MAX_CACHE_KEY).then_some(key)
+}
+
+fn cached_prelude(key: &str) -> Option<(Arc<Vec<u8>>, Prepared)> {
+    let images = PRELUDE_IMAGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    images
+        .iter()
+        .find(|(entry, _, _)| entry == key)
+        .map(|(_, image, prepared)| (image.clone(), *prepared))
+}
+
+fn cache_prelude(key: String, image: Arc<Vec<u8>>, prepared: Prepared) {
+    let mut images = PRELUDE_IMAGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if images.iter().any(|(entry, _, _)| *entry == key) {
+        return;
+    }
+    if images.len() >= IMAGE_CACHE_ENTRIES {
+        images.pop_front();
+    }
+    images.push_back((key, image, prepared));
+}
+
 fn heap_crash(error: djs_core::heap::HeapError) -> Crash {
     Crash(format!("{error:?}"))
 }
@@ -872,6 +950,36 @@ mod tests {
             run.end,
             Some(VmMessage::Done {
                 value: Some("\"TypeError\"".to_owned()),
+                writes: "[]".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_start_from_the_prelude_image_behaves_the_same_and_shares_nothing() {
+        // A store makes the key unique to this test.
+        let mut store = BTreeMap::new();
+        store.insert("image-test".to_owned(), "1".to_owned());
+        let code = "const seen = globalThis.leak; globalThis.leak = 1; \
+                    return { seen: seen ?? null, n: load('image-test'), r: typeof Math.random() };";
+        let first = run_with(code, store.clone(), Arc::default());
+        let key = prelude_key(&VmStart {
+            code: String::new(),
+            tools: tools(),
+            store: store.clone(),
+            ..VmStart::default()
+        })
+        .expect("a key");
+        assert!(
+            cached_prelude(&key).is_some(),
+            "the first start saved an image"
+        );
+        let second = run_with(code, store, Arc::default());
+        assert_eq!(first.end, second.end);
+        assert_eq!(
+            second.end,
+            Some(VmMessage::Done {
+                value: Some("{\"seen\":null,\"n\":1,\"r\":\"number\"}".to_owned()),
                 writes: "[]".to_owned()
             })
         );
