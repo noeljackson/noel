@@ -952,7 +952,10 @@ fn last_run(view: &Value) -> Option<(String, String)> {
 
 /// What the active run is doing, for the footer's spinner.
 fn activity(live: &Value) -> Activity {
-    if live.get("compaction").is_some() {
+    if live["compactions"]
+        .as_array()
+        .is_some_and(|running| !running.is_empty())
+    {
         return Activity::Compacting;
     }
     if let Some(tool) = live["tools"]

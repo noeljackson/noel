@@ -1396,12 +1396,15 @@ private), so the objects and processes are noel's, and these parts differ:
     leaves later;
   - `docs["pi.agent"]` is `{model, thinkingLevel, cwd}`; Durable's stores
     the chosen extensions, tools and instructions;
-  - `docs["pi.live"]` has `run` (`runId`, `requestId`, `inputs`, where
-    Durable names a task), `generation` (`attempt`, `message`, `retry`; no
-    deferred polls), `tools` (`callId`, `name`, `status`, `output`,
-    `truncated`; no task ids, details, diagnostics or dropped counts) and
-    `compaction` (`reason`), and no nested tools or compaction failure. A
-    tool slot can also be `interrupted`: a resumed run's call that gets its
+  - `docs["pi.live"]` is a subset of Durable's v3: `run` (`runId`,
+    `requestId`, `inputs`, `turns`, where Durable names a task), `generation`
+    (`attempt`, `message`, `retry`; no deferred polls), `tools` (`callId`,
+    `name`, `status`, `output`, `truncated`, `entry`; no task ids, details,
+    diagnostics or dropped counts), `compactions` (`[{trigger}]`, one at a
+    time; no task ids, blocking, attempt or retry), `compactionFailure`
+    (`{trigger, error}`) and `runFailure` (`{reason, detail?, inputs}`, with
+    reasons `model_error` and `aborted` only), and no nested tools. A tool
+    slot can also be `interrupted`: a resumed run's call that gets its
     interrupted result. The partial `message` is `{role, content}` only;
   - `docs["pi.inbox"]` items are `{id, mode, content, requestId?}` with the
     text as `content`; there are no writes;

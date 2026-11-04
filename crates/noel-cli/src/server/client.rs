@@ -700,10 +700,27 @@ fn render_view(view: &Value) -> Vec<String> {
             }
         ));
     }
-    if let Some(compaction) = live.get("compaction") {
+    for compaction in live["compactions"].as_array().into_iter().flatten() {
         lines.push(format!(
             "live: compacting ({})",
-            compaction["reason"].as_str().unwrap_or_default()
+            compaction["trigger"].as_str().unwrap_or_default()
+        ));
+    }
+    if let Some(failure) = live.get("compactionFailure") {
+        lines.push(format!(
+            "live: compaction failed ({}): {}",
+            failure["trigger"].as_str().unwrap_or_default(),
+            failure["error"].as_str().unwrap_or_default()
+        ));
+    }
+    if let Some(failure) = live.get("runFailure") {
+        lines.push(format!(
+            "live: last run ended without an answer ({}){}",
+            failure["reason"].as_str().unwrap_or_default(),
+            failure["detail"]
+                .as_str()
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
         ));
     }
     for item in view["docs"]["pi.inbox"]["items"]
