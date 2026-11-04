@@ -605,6 +605,7 @@ mod tests {
                 crate::SavedProgress::ToolOutput { call_id, .. } => {
                     state.tool_outputs.contains_key(call_id)
                 }
+                crate::SavedProgress::History(_) => true,
             };
             sink.lock().unwrap().push((saved.clone(), committed));
         }));
@@ -628,11 +629,17 @@ mod tests {
             },
             start,
         );
-        // Other records are not progress.
+        // A saved message is heard as history, not progress; other records
+        // are not heard.
         store
             .record_message(message(MessageRole::Assistant, "Hello"))
             .unwrap();
-        let heard = heard.lock().unwrap().clone();
+        store.record_active_model(None).unwrap();
+        let mut heard = heard.lock().unwrap().clone();
+        assert!(matches!(
+            heard.pop(),
+            Some((crate::SavedProgress::History(_), true))
+        ));
         assert_eq!(
             heard,
             [

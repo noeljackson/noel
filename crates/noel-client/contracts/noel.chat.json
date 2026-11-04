@@ -4,8 +4,14 @@
   "version": 1,
   "input": {
     "type": "object",
-    "required": ["session"],
-    "properties": {"session": {"type": "string"}}
+    "required": [
+      "session"
+    ],
+    "properties": {
+      "session": {
+        "type": "string"
+      }
+    }
   },
   "variants": {
     "viewer": {
@@ -13,16 +19,75 @@
         "kind": "state",
         "schema": {
           "type": "object",
-          "required": ["conversation", "entries", "docs"],
+          "required": [
+            "conversation",
+            "entries",
+            "docs"
+          ],
           "properties": {
             "conversation": {
               "type": "object",
-              "required": ["id", "cwd"],
-              "properties": {"id": {"type": "string"}, "cwd": {"type": "string"}, "name": {"type": "string"}}
+              "required": [
+                "id",
+                "cwd"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "cwd": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
             },
-            "entries": {"type": "array"},
-            "docs": {"type": "object"},
-            "lastRun": {"type": "object"}
+            "entries": {
+              "type": "array"
+            },
+            "docs": {
+              "type": "object"
+            },
+            "lastRun": {
+              "type": "object"
+            },
+            "before": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "entries": {
+        "kind": "method",
+        "args": {
+          "type": "object",
+          "required": [
+            "before"
+          ],
+          "properties": {
+            "before": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "entries"
+          ],
+          "properties": {
+            "entries": {
+              "type": "array"
+            },
+            "before": {
+              "type": "integer"
+            }
           }
         }
       }
@@ -32,16 +97,42 @@
         "kind": "state",
         "schema": {
           "type": "object",
-          "required": ["conversation", "entries", "docs"],
+          "required": [
+            "conversation",
+            "entries",
+            "docs"
+          ],
           "properties": {
             "conversation": {
               "type": "object",
-              "required": ["id", "cwd"],
-              "properties": {"id": {"type": "string"}, "cwd": {"type": "string"}, "name": {"type": "string"}}
+              "required": [
+                "id",
+                "cwd"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "cwd": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
             },
-            "entries": {"type": "array"},
-            "docs": {"type": "object"},
-            "lastRun": {"type": "object"}
+            "entries": {
+              "type": "array"
+            },
+            "docs": {
+              "type": "object"
+            },
+            "lastRun": {
+              "type": "object"
+            },
+            "before": {
+              "type": "integer"
+            }
           }
         }
       },
@@ -49,29 +140,76 @@
         "kind": "method",
         "args": {
           "type": "object",
-          "required": ["requestId", "text"],
+          "required": [
+            "requestId",
+            "text"
+          ],
           "properties": {
-            "requestId": {"type": "string", "minLength": 1},
-            "text": {"type": "string"},
+            "requestId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "text": {
+              "type": "string"
+            },
             "images": {
               "type": "array",
               "items": {
                 "type": "object",
-                "required": ["data", "mimeType"],
-                "properties": {"data": {"type": "string"}, "mimeType": {"type": "string"}}
+                "required": [
+                  "data",
+                  "mimeType"
+                ],
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "mimeType": {
+                    "type": "string"
+                  }
+                }
               }
             },
-            "whenBusy": {"enum": ["reject", "steer", "followUp"]}
+            "whenBusy": {
+              "enum": [
+                "reject",
+                "steer",
+                "followUp"
+              ]
+            }
           }
         },
         "result": {
           "type": "object",
-          "required": ["submissionId", "disposition"],
+          "required": [
+            "submissionId",
+            "disposition"
+          ],
           "properties": {
-            "submissionId": {"type": "string"},
-            "runId": {"type": "string"},
-            "disposition": {"enum": ["started", "queued", "repeated"]},
-            "status": {"enum": ["queued", "running", "interrupted", "completed", "failed", "aborted", "withdrawn"]}
+            "submissionId": {
+              "type": "string"
+            },
+            "runId": {
+              "type": "string"
+            },
+            "disposition": {
+              "enum": [
+                "started",
+                "queued",
+                "repeated"
+              ]
+            },
+            "status": {
+              "enum": [
+                "queued",
+                "running",
+                "interrupted",
+                "completed",
+                "failed",
+                "aborted",
+                "withdrawn"
+              ]
+            }
           }
         }
       },
@@ -79,32 +217,76 @@
         "kind": "method",
         "args": {
           "type": "object",
-          "required": ["submissionId"],
-          "properties": {"submissionId": {"type": "string"}}
+          "required": [
+            "submissionId"
+          ],
+          "properties": {
+            "submissionId": {
+              "type": "string"
+            }
+          }
         },
         "result": {
           "type": "object",
-          "required": ["outcome"],
-          "properties": {"outcome": {"enum": ["withdrawn", "already_placed", "settled"]}}
+          "required": [
+            "outcome"
+          ],
+          "properties": {
+            "outcome": {
+              "enum": [
+                "withdrawn",
+                "already_placed",
+                "settled"
+              ]
+            }
+          }
         }
       },
       "abort": {
         "kind": "method",
-        "args": {"type": "object", "properties": {"expectedRunId": {"type": "string"}}},
+        "args": {
+          "type": "object",
+          "properties": {
+            "expectedRunId": {
+              "type": "string"
+            }
+          }
+        },
         "result": {
           "type": "object",
-          "properties": {"runId": {"type": "string"}, "withdrawn": {"type": "integer"}}
+          "properties": {
+            "runId": {
+              "type": "string"
+            },
+            "withdrawn": {
+              "type": "integer"
+            }
+          }
         }
       },
       "compact": {
         "kind": "method",
-        "args": {"type": "object", "properties": {"instructions": {"type": "string"}}},
+        "args": {
+          "type": "object",
+          "properties": {
+            "instructions": {
+              "type": "string"
+            }
+          }
+        },
         "result": {
           "type": "object",
-          "required": ["omittedMessages", "retainedMessages"],
+          "required": [
+            "omittedMessages",
+            "retainedMessages"
+          ],
           "properties": {
-            "omittedMessages": {"type": "integer"},
-            "retainedMessages": {"type": "integer"}
+            "omittedMessages": {
+              "type": "integer"
+            },
+            "retainedMessages": {
+              "type": "integer"
+            }
           }
         }
       },
@@ -112,25 +294,86 @@
         "kind": "method",
         "args": {
           "type": "object",
-          "properties": {"model": {"type": "string"}, "thinkingLevel": {"type": "string"}}
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "thinkingLevel": {
+              "type": "string"
+            }
+          }
         },
         "result": {
           "type": "object",
-          "required": ["thinkingLevel"],
-          "properties": {"model": {"type": "string"}, "thinkingLevel": {"type": "string"}}
+          "required": [
+            "thinkingLevel"
+          ],
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "thinkingLevel": {
+              "type": "string"
+            }
+          }
         }
       },
       "resume": {
         "kind": "method",
         "args": {
           "type": "object",
-          "required": ["expectedRunId"],
-          "properties": {"expectedRunId": {"type": "string"}}
+          "required": [
+            "expectedRunId"
+          ],
+          "properties": {
+            "expectedRunId": {
+              "type": "string"
+            }
+          }
         },
         "result": {
           "type": "object",
-          "required": ["runId"],
-          "properties": {"runId": {"type": "string"}}
+          "required": [
+            "runId"
+          ],
+          "properties": {
+            "runId": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "entries": {
+        "kind": "method",
+        "args": {
+          "type": "object",
+          "required": [
+            "before"
+          ],
+          "properties": {
+            "before": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "result": {
+          "type": "object",
+          "required": [
+            "entries"
+          ],
+          "properties": {
+            "entries": {
+              "type": "array"
+            },
+            "before": {
+              "type": "integer"
+            }
+          }
         }
       }
     }

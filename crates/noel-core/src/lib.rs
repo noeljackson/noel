@@ -1,4 +1,5 @@
 mod codemode;
+pub mod history;
 pub use codemode::{NestedCallStatus, NestedToolCall};
 mod compaction;
 pub mod controller;
@@ -1116,6 +1117,10 @@ enum SessionRecord {
         /// never saved without its prompt. Older versions ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run: Option<RunStart>,
+        /// When it was saved, in milliseconds since the epoch: the history
+        /// entry's timestamp. Older versions ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ts: Option<u64>,
         /// The queued submissions this message places into the run, which
         /// leave the queue with it: one record, so a submission is never
         /// both placed and still queued. Older versions ignore it.
@@ -1254,6 +1259,30 @@ pub enum SavedProgress {
         truncated: bool,
         append: bool,
     },
+    /// A record that adds to the session's history (see [`history`]).
+    History(history::HistoryRecord),
+}
+
+/// What `record` adds to the session's history, if anything.
+fn history_record(record: &SessionRecord) -> Option<history::HistoryRecord> {
+    Some(match record {
+        SessionRecord::Message { message, ts, .. } => history::HistoryRecord::Message {
+            message: message.clone(),
+            timestamp: *ts,
+        },
+        SessionRecord::MessagesSnapshot { messages } => history::HistoryRecord::Reset {
+            messages: messages.len(),
+        },
+        SessionRecord::CompactionCheckpoint { record, .. }
+        | SessionRecord::Compaction { record } => {
+            history::HistoryRecord::Compaction(record.clone())
+        }
+        SessionRecord::Tool { event } => history::HistoryRecord::ToolEvent {
+            call_id: event.id.clone(),
+            is_error: event.is_error,
+        },
+        _ => return None,
+    })
 }
 
 /// Hears each [`SavedProgress`] once it is in the journal, on the task that
@@ -1504,6 +1533,7 @@ impl SessionStore {
         self.append(&SessionRecord::Message {
             message,
             run: None,
+            ts: Some(history::now_ms()),
             placed,
         })
     }
@@ -1643,6 +1673,9 @@ impl SessionStore {
         let pending: BTreeSet<String> = pending_tool_calls(&messages)
             .map(|(_, calls)| calls.into_iter().map(|call| call.id.clone()).collect())
             .unwrap_or_default();
+        let marker = SessionRecord::Compaction {
+            record: record.clone(),
+        };
         let checkpoint =
             serde_json::to_vec(&SessionRecord::CompactionCheckpoint { record, messages }).map_err(
                 |source| SessionError::Parse {
@@ -1670,6 +1703,7 @@ impl SessionStore {
         // journal and active context unchanged, with no partial checkpoint.
         // The session lock lives in a separate file, so the rename keeps it.
         noel_config::write_file_atomic(&self.path, &journal)?;
+        self.observe_history(&marker);
         Ok(())
     }
 
@@ -1853,6 +1887,7 @@ impl SessionStore {
                 .map(|message| SessionRecord::Message {
                     message,
                     run: None,
+                    ts: None,
                     placed: Vec::new(),
                 }),
         );
@@ -1895,9 +1930,56 @@ impl SessionStore {
     }
 
     fn append(&self, record: &SessionRecord) -> Result<(), SessionError> {
-        let _writer = self.lock.writer();
-        noel_session::append_jsonl_record(&self.path, record)?;
+        {
+            let _writer = self.lock.writer();
+            noel_session::append_jsonl_record(&self.path, record)?;
+        }
+        self.observe_history(record);
         Ok(())
+    }
+
+    /// Tells the observer what `record`, now saved, adds to the history.
+    fn observe_history(&self, record: &SessionRecord) {
+        if let (Some(ObserverSlot(observer)), Some(added)) =
+            (&self.progress, history_record(record))
+        {
+            observer(&SavedProgress::History(added));
+        }
+    }
+
+    /// The session's history as its journal holds it, oldest first (see
+    /// [`history`]). A session imported from pi's format is its messages.
+    pub fn read_history(path: &Path) -> Result<Vec<history::HistoryRecord>, SessionError> {
+        let content = read_journal_bytes(path)?;
+        if jsonl_is_ts_session_export(&content) {
+            let state = Self::read(path)?;
+            return Ok(state
+                .messages
+                .into_iter()
+                .map(|message| history::HistoryRecord::Message {
+                    message,
+                    timestamp: None,
+                })
+                .collect());
+        }
+        let (records, tail) = noel_session::split_jsonl_tail(&content);
+        let mut history = Vec::new();
+        let lines = String::from_utf8_lossy(records);
+        let tail = (!is_blank_line(tail)).then(|| String::from_utf8_lossy(tail).into_owned());
+        for line in lines.lines().map(str::to_owned).chain(tail) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // What the session does not read (a torn tail) is no history.
+            if let Some(added) = serde_json::from_str::<SessionRecord>(&line)
+                .ok()
+                .as_ref()
+                .and_then(history_record)
+            {
+                history.push(added);
+            }
+        }
+        Ok(history)
     }
 }
 
@@ -2018,6 +2100,7 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             message,
             run,
             placed,
+            ..
         } => {
             state.supersede_progress(&message);
             state.messages.push(message);
@@ -3217,6 +3300,7 @@ impl Runtime {
             store.append(&SessionRecord::Message {
                 message: message.clone(),
                 run: Some(start.clone()),
+                ts: Some(history::now_ms()),
                 placed: Vec::new(),
             })?;
         }
@@ -7281,6 +7365,72 @@ mod tests {
         drop(imported);
         assert!(!lock_path.exists(), "the last handle removes the lock file");
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn the_history_heard_live_is_the_history_read_back() {
+        let base = durable_test_dir("history");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        let store = store.observe_progress(Arc::new(move |saved| {
+            if let SavedProgress::History(record) = saved {
+                lock(&sink).push(record.clone());
+            }
+        }));
+        store
+            .record_message(test_message(MessageRole::User, "one"))
+            .unwrap();
+        store
+            .record_message(test_message(MessageRole::Assistant, "two"))
+            .unwrap();
+        store
+            .record_compaction_checkpoint(
+                CompactionRecord {
+                    kind: CompactionKind::Automatic,
+                    omitted_messages: 2,
+                    retained_messages: 0,
+                    summary: "summary".into(),
+                },
+                vec![test_message(MessageRole::User, "summary")],
+            )
+            .unwrap();
+        store
+            .record_message(test_message(MessageRole::User, "three"))
+            .unwrap();
+        // An undo: the context is cut back to one message.
+        store
+            .record_messages_snapshot(vec![test_message(MessageRole::User, "summary")])
+            .unwrap();
+
+        let read = SessionStore::read_history(store.path()).unwrap();
+        assert_eq!(*lock(&heard), read);
+        let mut history = history::History::default();
+        for record in &read {
+            history.push(record, |message, _| json!(message.content));
+        }
+        let kinds: Vec<(u64, String)> = history
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.to_json()["kind"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        // The checkpoint rewrote the journal, and every message stayed.
+        assert_eq!(
+            kinds,
+            [
+                (1, "pi.user".to_owned()),
+                (2, "pi.assistant".to_owned()),
+                (3, "pi.compaction".to_owned()),
+                (4, "pi.user".to_owned()),
+                (5, "pi.reset".to_owned()),
+            ]
+        );
+        assert!(history.entries()[0].timestamp.is_some());
     }
 
     #[test]

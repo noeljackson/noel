@@ -3,8 +3,13 @@
 //! §9.3) with the documents noel has data for.
 //!
 //! - `conversation`: `{id, cwd, name?}`.
-//! - `entries`: the transcript as upstream pi's `Message` JSON, as RPC
-//!   mode's `get_messages` reports it.
+//! - `entries`: a window over the session's history
+//!   ([`noel_core::history`]): Durable's entry records `{id, kind, model?,
+//!   data?, head?, timestamp?}`, each message as upstream pi's `Message`
+//!   JSON. A view starts with the newest 50 entries; new ones are appended,
+//!   and past 100 the oldest leave in one splice down to 50. `before` names
+//!   the entry just before the window; `noel.chat`'s `entries` method pages
+//!   back from it.
 //! - `docs["pi.agent"]`: `{model?, thinkingLevel, cwd}`.
 //! - `docs["pi.live"]`: `{}` while idle; while a run is active, `run`
 //!   (`{runId, requestId?, inputs}`), `generation` (`{attempt, message?,
@@ -28,6 +33,7 @@ use std::path::PathBuf;
 use noel_chord::delta::{diff, Op, Seg};
 use noel_chord::Cell;
 use noel_core::controller::{CallInput, Event, Outcome};
+use noel_core::history::{History, HistoryRecord};
 use noel_core::{
     interrupted_output, MessageRole, QueueItem, QueueMode, Runtime, SavedProgress, SessionState,
     TurnEvent,
@@ -50,11 +56,23 @@ pub(crate) fn schema() -> Value {
     }
 }
 
+/// Entries a view starts with, and the most it holds before the oldest
+/// leave (Durable's `ConversationWindow` defaults).
+pub(crate) const WINDOW_MIN: usize = 50;
+pub(crate) const WINDOW_MAX: usize = 2 * WINDOW_MIN;
+
 /// The view of one session and what of it the cell holds.
 pub(crate) struct View {
     cell: Cell,
     conversation: Value,
+    history: History,
+    /// The window's entries, as the cell holds them once published.
     entries: Vec<Value>,
+    /// The entry just before the window.
+    before: Option<u64>,
+    published_before: Option<u64>,
+    /// Entries that left the front of the window since the last publish.
+    trimmed: usize,
     agent: Value,
     usage: Value,
     inbox: Value,
@@ -67,8 +85,6 @@ pub(crate) struct View {
     published_conversation: Value,
     published_docs: BTreeMap<&'static str, Value>,
     published_last_run: Option<Value>,
-    /// The saved prompt the run's first engine call reports again.
-    skip_prompt: Option<Value>,
     /// The calls an interrupted run owes results for, as it continues:
     /// `(call, replay-safe, interrupted result)`.
     resuming: Vec<(noel_ai::ChatToolCall, bool, String)>,
@@ -109,8 +125,16 @@ struct ToolSlot {
 }
 
 impl View {
-    /// An empty view of `session`; [`View::refresh`] fills it.
-    pub fn new(session: &SessionState) -> Self {
+    /// A view of `session` with its saved history (from
+    /// `SessionStore::read_history`); [`View::refresh`] publishes it.
+    pub fn new(session: &SessionState, saved: &[HistoryRecord]) -> Self {
+        let mut history = History::default();
+        let empty = SessionState::new(String::new(), PathBuf::new());
+        for record in saved {
+            history.push(record, |message, failed| render(message, failed, &empty));
+        }
+        let (window, before) = history.window(None, WINDOW_MIN, WINDOW_MAX);
+        let entries = window.iter().map(|entry| entry.to_json()).collect();
         let conversation = conversation(session);
         let initial = json!({"conversation": conversation, "entries": [], "docs": {}});
         let cell = Cell::new(schema(), initial).expect("the empty view fits its schema");
@@ -118,19 +142,22 @@ impl View {
             cell,
             published_conversation: conversation.clone(),
             conversation,
-            entries: Vec::new(),
+            history,
+            entries,
+            before,
+            published_before: None,
+            trimmed: 0,
             agent: json!({}),
             usage: json!({}),
             inbox: json!({"items": []}),
             live: Live::default(),
             last_run: None,
-            dirty_from: None,
+            dirty_from: Some(0),
             published_entries: 0,
             published_docs: BTreeMap::new(),
             published_last_run: None,
-            skip_prompt: None,
             resuming: Vec::new(),
-            empty: SessionState::new(String::new(), PathBuf::new()),
+            empty,
             #[cfg(test)]
             applied: Vec::new(),
         }
@@ -151,7 +178,6 @@ impl View {
     pub fn refresh(&mut self, runtime: &Runtime, agent: Value, queue: &[QueueItem]) {
         let session = runtime.session();
         self.conversation = conversation(session);
-        self.set_entries(session);
         self.agent = agent;
         self.usage = usage(session);
         self.inbox = inbox(queue);
@@ -175,7 +201,6 @@ impl View {
             Event::CallStarted { input } => self.call_started(*input),
             Event::Turn { event, .. } => self.turn(event),
             Event::CallReturned { session, queue, .. } => {
-                self.set_entries(session);
                 self.usage = usage(session);
                 self.inbox = inbox(&queue.items());
                 true
@@ -205,7 +230,6 @@ impl View {
                 let request_id = self.live.run.take().and_then(|run| run.request_id);
                 self.live = Live::default();
                 self.resuming.clear();
-                self.skip_prompt = None;
                 let mut last = json!({"runId": run_id, "status": to_json(&outcome.status())});
                 if let Some(request_id) = request_id {
                     last["requestId"] = json!(request_id);
@@ -257,14 +281,35 @@ impl View {
                 }
                 slot.truncated = *truncated;
             }
+            SavedProgress::History(record) => {
+                let empty = &self.empty;
+                let added = self
+                    .history
+                    .push(record, |message, failed| render(message, failed, empty))
+                    .map(|entry| entry.to_json());
+                if let Some(entry) = added {
+                    self.push_entry(entry);
+                }
+            }
         }
         self.publish();
+    }
+
+    /// Up to `limit` entries just before the entry `before`, oldest first,
+    /// and the entry before them: `noel.chat`'s `entries`.
+    pub fn page(&self, before: u64, limit: usize) -> Value {
+        let (entries, earlier) = self.history.page(before, limit);
+        let mut page =
+            json!({"entries": entries.iter().map(|entry| entry.to_json()).collect::<Vec<_>>()});
+        if let Some(earlier) = earlier {
+            page["before"] = json!(earlier);
+        }
+        page
     }
 
     fn run_started(&mut self, run_id: &str, runtime: &Runtime) {
         let session = runtime.session();
         self.conversation = conversation(session);
-        self.set_entries(session);
         self.usage = usage(session);
         let request_id = session
             .runs
@@ -324,22 +369,15 @@ impl View {
 
     fn call_started(&mut self, input: CallInput) -> bool {
         match input {
-            CallInput::Prompt => {
-                // The run's prompt is saved with its start, and the engine
-                // reports it again as its first round opens.
-                self.skip_prompt = self.entries.last().cloned();
-                false
-            }
+            CallInput::Prompt => false,
             CallInput::Resume => {
                 // The calls that do not run again get their interrupted
-                // result first thing; show it now.
+                // result first thing (saved, it is an entry).
                 let resuming = std::mem::take(&mut self.resuming);
-                for (call, replay_safe, result) in resuming {
-                    if replay_safe {
-                        continue;
+                for (call, replay_safe, _) in resuming {
+                    if !replay_safe {
+                        self.live.tools.retain(|slot| slot.call_id != call.id);
                     }
-                    self.live.tools.retain(|slot| slot.call_id != call.id);
-                    self.push_entry(to_json(&Message::tool_result(&call, &result, &[], true)));
                 }
                 true
             }
@@ -358,14 +396,8 @@ impl View {
                 true
             }
             TurnEvent::RoundResumed(_) => false,
+            // Saved messages are entries through the history.
             TurnEvent::MessageAdded(message) => {
-                let entry = to_json(&Message::saved(message, &self.empty));
-                if self.skip_prompt.take().as_ref() == Some(&entry)
-                    && message.role == MessageRole::User
-                {
-                    return false;
-                }
-                self.push_entry(entry);
                 if message.role == MessageRole::Assistant {
                     // The reply supersedes its partial; its calls are next.
                     if let Some(generation) = &mut self.live.generation {
@@ -420,16 +452,7 @@ impl View {
                 true
             }
             TurnEvent::ToolFinished { .. } => false,
-            TurnEvent::ToolOutput {
-                call,
-                output,
-                images,
-                is_error,
-                ..
-            } => {
-                self.push_entry(to_json(&Message::tool_result(
-                    call, output, images, *is_error,
-                )));
+            TurnEvent::ToolOutput { call, .. } => {
                 let slot = self.slot(&call.id, Some(&call.name));
                 slot.status = "done";
                 slot.output.clear();
@@ -478,29 +501,26 @@ impl View {
         slot
     }
 
+    /// Appends a new entry to the window; past [`WINDOW_MAX`] the oldest
+    /// leave, down to [`WINDOW_MIN`].
     fn push_entry(&mut self, entry: Value) {
         let index = self.entries.len();
         self.dirty_from = Some(self.dirty_from.map_or(index, |from| from.min(index)));
         self.entries.push(entry);
-    }
-
-    /// Makes the session's messages the entries, marking where they differ.
-    fn set_entries(&mut self, session: &SessionState) {
-        let entries: Vec<Value> = session
-            .messages
-            .iter()
-            .map(|message| to_json(&Message::saved(message, session)))
-            .collect();
-        let same = self
-            .entries
-            .iter()
-            .zip(&entries)
-            .take_while(|(old, new)| old == new)
-            .count();
-        if same < self.entries.len() || same < entries.len() {
-            self.dirty_from = Some(self.dirty_from.map_or(same, |from| from.min(same)));
+        if self.entries.len() > WINDOW_MAX {
+            let leave = self.entries.len() - WINDOW_MIN;
+            self.entries.drain(..leave);
+            self.before = self.entries[0]["id"]
+                .as_u64()
+                .map(|id| id - 1)
+                .filter(|id| *id > 0);
+            // What the cell holds of the leaving entries goes in one splice;
+            // the rest of the pending change moves with the window.
+            let published_leaving = leave.min(self.published_entries);
+            self.trimmed += published_leaving;
+            self.published_entries -= published_leaving;
+            self.dirty_from = self.dirty_from.map(|from| from.saturating_sub(leave));
         }
-        self.entries = entries;
     }
 
     fn live_json(&self) -> Value {
@@ -564,6 +584,21 @@ impl View {
             ));
             self.published_conversation = self.conversation.clone();
         }
+        if self.trimmed > 0 {
+            ops.push(Op::Splice(
+                vec![key("entries")],
+                0,
+                std::mem::take(&mut self.trimmed) as u64,
+                Vec::new(),
+            ));
+        }
+        if self.before != self.published_before {
+            match self.before {
+                Some(before) => ops.push(Op::Set(vec![key("before")], json!(before))),
+                None => ops.push(Op::Delete(vec![key("before")])),
+            }
+            self.published_before = self.before;
+        }
         if let Some(from) = self.dirty_from.take() {
             let from = from.min(self.published_entries);
             let removed = self.published_entries - from;
@@ -622,8 +657,20 @@ impl View {
         if let Some(last) = &self.last_run {
             view["lastRun"] = last.clone();
         }
+        if let Some(before) = self.published_before {
+            view["before"] = json!(before);
+        }
         view
     }
+}
+
+/// A saved message as clients see it: upstream pi's `Message` JSON.
+fn render(message: &noel_core::ConversationMessage, failed: bool, empty: &SessionState) -> Value {
+    let mut json = to_json(&Message::saved(message, empty));
+    if message.role == MessageRole::Tool {
+        json["isError"] = json!(failed);
+    }
+    json
 }
 
 fn key(name: &str) -> Seg {
@@ -723,6 +770,14 @@ mod tests {
         }
     }
 
+    /// A saved message, as the store reports it.
+    fn saved(message: ConversationMessage) -> SavedProgress {
+        SavedProgress::History(HistoryRecord::Message {
+            message,
+            timestamp: Some(5),
+        })
+    }
+
     /// What a subscriber that took the snapshot at `from` (a count of
     /// batches applied) would hold after the ops since.
     fn replay(view: &View, snapshot: Value, from: usize) -> Value {
@@ -736,10 +791,18 @@ mod tests {
         let mut session = SessionState::new("s1".to_owned(), PathBuf::from("/w"));
         session.messages.push(message(MessageRole::User, "hello"));
         let runtime = Runtime::new(session.clone(), ReloadableSystems::default());
-        let mut view = View::new(&session);
+        let history = [HistoryRecord::Message {
+            message: message(MessageRole::User, "hello"),
+            timestamp: Some(1),
+        }];
+        let mut view = View::new(&session, &history);
         view.refresh(&runtime, json!({"thinkingLevel": "off", "cwd": "/w"}), &[]);
         let (snapshot, from) = (view.value(), view.applied.len());
-        assert_eq!(view.value()["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            view.value()["entries"],
+            json!([{"id": 1, "kind": "pi.user", "timestamp": 1,
+                    "model": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]}])
+        );
         assert_eq!(view.value()["docs"]["pi.live"], json!({}));
 
         view.event(&Event::RunStarted {
@@ -758,7 +821,7 @@ mod tests {
             })
         };
         report(&mut view, turn(TurnEvent::RoundStarted));
-        // The prompt reported again is not a second entry.
+        // Entries come from what is saved, not from what the engine reports.
         report(
             &mut view,
             TurnEvent::MessageAdded(message(MessageRole::User, "hello")),
@@ -790,6 +853,7 @@ mod tests {
             matches!(last.as_slice(), [Op::Append(path, text)] if text == "lo" && path.len() == 7),
             "{last:?}"
         );
+        view.saved(&saved(message(MessageRole::Assistant, "Hello")));
         report(
             &mut view,
             TurnEvent::MessageAdded(message(MessageRole::Assistant, "Hello")),
@@ -801,7 +865,9 @@ mod tests {
         });
         let value = view.value();
         assert_eq!(value["entries"].as_array().unwrap().len(), 2);
-        assert_eq!(value["entries"][1]["role"], "assistant");
+        assert_eq!(value["entries"][1]["id"], 2);
+        assert_eq!(value["entries"][1]["kind"], "pi.assistant");
+        assert_eq!(value["entries"][1]["model"][0]["role"], "assistant");
         assert_eq!(value["docs"]["pi.live"], json!({}));
         assert_eq!(
             value["lastRun"],
@@ -831,7 +897,15 @@ mod tests {
             },
         );
         let runtime = Runtime::new(session.clone(), ReloadableSystems::default());
-        let mut view = View::new(&session);
+        let history: Vec<_> = session
+            .messages
+            .iter()
+            .map(|message| HistoryRecord::Message {
+                message: message.clone(),
+                timestamp: None,
+            })
+            .collect();
+        let mut view = View::new(&session, &history);
         view.refresh(&runtime, json!({}), &[]);
         let (snapshot, from) = (view.value(), view.applied.len());
         view.event(&Event::RunStarted {
@@ -846,8 +920,19 @@ mod tests {
         view.event(&Event::CallStarted {
             input: CallInput::Resume,
         });
+        // The engine saves the interrupted result: its outcome, then it.
+        let output = interrupted_output("bash", session.tool_outputs.get("c1"));
+        view.saved(&SavedProgress::History(HistoryRecord::ToolEvent {
+            call_id: "c1".into(),
+            is_error: true,
+        }));
+        let mut result = message(MessageRole::Tool, &output);
+        result.tool_call_id = Some("c1".into());
+        result.tool_name = Some("bash".into());
+        view.saved(&saved(result));
         let value = view.value();
-        let result = &value["entries"][2];
+        assert_eq!(value["entries"][2]["kind"], "pi.tool-result");
+        let result = &value["entries"][2]["model"][0];
         assert_eq!(result["role"], "toolResult");
         assert_eq!(result["isError"], true);
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -855,5 +940,51 @@ mod tests {
         assert!(text.contains("[error] Tool bash was interrupted"), "{text}");
         assert!(value["docs"]["pi.live"].get("tools").is_none());
         assert_eq!(replay(&view, snapshot, from), value);
+    }
+
+    #[test]
+    fn the_window_keeps_the_newest_entries_and_pages_back() {
+        let session = SessionState::new("s1".to_owned(), PathBuf::from("/w"));
+        let runtime = Runtime::new(session.clone(), ReloadableSystems::default());
+        let history: Vec<_> = (0..120)
+            .map(|index| HistoryRecord::Message {
+                message: message(MessageRole::User, &index.to_string()),
+                timestamp: None,
+            })
+            .collect();
+        let mut view = View::new(&session, &history);
+        view.refresh(&runtime, json!({}), &[]);
+        let ids = |value: &Value| -> Vec<u64> {
+            value["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["id"].as_u64().unwrap())
+                .collect()
+        };
+        let value = view.value();
+        assert_eq!(ids(&value), (71..=120).collect::<Vec<_>>());
+        assert_eq!(value["before"], 70);
+        let (snapshot, from) = (view.value(), view.applied.len());
+        // Fifty more fill the window to 100; the next makes the oldest leave
+        // down to 50, in one splice.
+        for index in 0..51 {
+            view.saved(&saved(message(MessageRole::User, &format!("new {index}"))));
+        }
+        let value = view.value();
+        assert_eq!(ids(&value), (122..=171).collect::<Vec<_>>());
+        assert_eq!(value["before"], 121);
+        assert_eq!(replay(&view, snapshot, from), value);
+        // Paging back from the window's first entry.
+        let page = view.page(122, 30);
+        let page_ids: Vec<u64> = page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(page_ids, (92..=121).collect::<Vec<_>>());
+        assert_eq!(page["before"], 91);
+        assert!(view.page(1, 30).get("before").is_none());
     }
 }

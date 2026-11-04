@@ -654,8 +654,11 @@ fn render_view(view: &Value) -> Vec<String> {
         agent["model"].as_str().unwrap_or("-"),
         agent["thinkingLevel"].as_str().unwrap_or("-"),
     ));
-    for (index, entry) in view["entries"].as_array().into_iter().flatten().enumerate() {
-        lines.push(format!("[{}] {}", index + 1, render_entry(entry)));
+    if let Some(before) = view["before"].as_u64() {
+        lines.push(format!("(entries 1-{before} not shown)"));
+    }
+    for entry in view["entries"].as_array().into_iter().flatten() {
+        lines.push(format!("[{}] {}", entry["id"], render_entry(entry)));
     }
     let live = &view["docs"]["pi.live"];
     if let Some(run) = live.get("run") {
@@ -725,7 +728,26 @@ fn render_view(view: &Value) -> Vec<String> {
     lines
 }
 
-fn render_entry(entry: &Value) -> String {
+/// A history entry as a line: its message, or what a marker did.
+fn render_entry(record: &Value) -> String {
+    match record["kind"].as_str() {
+        Some("pi.compaction") => {
+            let data = &record["data"];
+            return format!(
+                "compaction ({}): {} messages summarized, {} kept: {}",
+                data["reason"].as_str().unwrap_or_default(),
+                data["omittedMessages"],
+                data["retainedMessages"],
+                one_line(data["summary"].as_str().unwrap_or_default(), 120)
+            );
+        }
+        Some("pi.reset") => return format!("reset to {} messages", record["data"]["messages"]),
+        _ => {}
+    }
+    let entry = record
+        .get("model")
+        .and_then(|model| model.get(0))
+        .unwrap_or(record);
     let role = entry["role"].as_str().unwrap_or_default();
     match role {
         "toolResult" => format!(
@@ -865,9 +887,11 @@ mod tests {
     fn a_view_renders_its_entries_partial_tools_and_queue() {
         let view = json!({
             "conversation": {"id": "s1", "cwd": "/w"},
+            "before": 3,
             "entries": [
-                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-                {"role": "assistant", "content": [{"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "ls"}}], "stopReason": "toolUse"},
+                {"id": 4, "kind": "pi.user", "model": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]},
+                {"id": 5, "kind": "pi.assistant", "model": [{"role": "assistant", "content": [{"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "ls"}}], "stopReason": "toolUse"}]},
+                {"id": 6, "kind": "pi.compaction", "head": 6, "data": {"reason": "threshold", "summary": "did things", "omittedMessages": 2, "retainedMessages": 1}},
             ],
             "docs": {
                 "pi.agent": {"model": "faux/script", "thinkingLevel": "off", "cwd": "/w"},
@@ -885,8 +909,10 @@ mod tests {
             lines,
             [
                 "session s1 in /w (model faux/script, thinking off)",
-                "[1] user: hi",
-                "[2] assistant:  -> bash({\"command\":\"ls\"})",
+                "(entries 1-3 not shown)",
+                "[4] user: hi",
+                "[5] assistant:  -> bash({\"command\":\"ls\"})",
+                "[6] compaction (threshold): 2 messages summarized, 1 kept: did things",
                 "live: run r1 (inputs 1)",
                 "live: reply attempt 1: partial \"Hel\"",
                 "live: tool bash c1 running: output \"a\\\\nb\"",

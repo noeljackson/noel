@@ -268,8 +268,14 @@ impl Watch {
     }
 }
 
+/// The messages of the view's entries (each entry's `model[0]`).
 fn entries(view: &Value) -> Vec<Value> {
-    view["entries"].as_array().cloned().unwrap_or_default()
+    view["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["model"].get(0).cloned())
+        .collect()
 }
 
 fn text_of(entry: &Value) -> String {

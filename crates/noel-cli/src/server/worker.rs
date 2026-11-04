@@ -170,7 +170,8 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     );
 
     // The view hears each partial and tool output once it is saved.
-    let view = Arc::new(Mutex::new(View::new(&state)));
+    let saved = SessionStore::read_history(store.path())?;
+    let view = Arc::new(Mutex::new(View::new(&state, &saved)));
     let heard = view.clone();
     let store = store.observe_progress(Arc::new(move |saved| lock(&heard).saved(saved)));
     let mut runtime = Runtime::with_store(state, systems, store);
@@ -212,7 +213,7 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     let status = Arc::new(StatusBoard::default());
     let host = chat_host(&session_id, status.clone());
     let (commands, inbox) = mpsc::unbounded_channel::<Command>();
-    serve_chat(&host, &session_id, lock(&view).cell().clone(), commands);
+    serve_chat(&host, &session_id, view.clone(), commands);
 
     let worker = WorkerHost {
         config,
@@ -376,8 +377,14 @@ enum Command {
     Resume(Value, Reply),
 }
 
-fn serve_chat(host: &Host, session_id: &str, cell: Cell, commands: mpsc::UnboundedSender<Command>) {
+fn serve_chat(
+    host: &Host,
+    session_id: &str,
+    view: Arc<Mutex<View>>,
+    commands: mpsc::UnboundedSender<Command>,
+) {
     let session_id = session_id.to_owned();
+    let cell = lock(&view).cell().clone();
     host.serve(chat_contract(), move |input, principal| {
         if input.get("session").and_then(Value::as_str) != Some(session_id.as_str()) {
             return Err(ChordError::invalid(
@@ -386,13 +393,42 @@ fn serve_chat(host: &Host, session_id: &str, cell: Cell, commands: mpsc::Unbound
             ));
         }
         match chat_variant(principal, &session_id) {
-            Some("participant") => Ok(participant(&cell, &commands)),
-            Some(_) => Ok(Implementation::new("viewer").state("view", &cell)),
+            Some("participant") => {
+                Ok(participant(&cell, &commands).method("entries", entries_method(&view)))
+            }
+            Some(_) => Ok(Implementation::new("viewer")
+                .state("view", &cell)
+                .method("entries", entries_method(&view))),
             None => Err(ChordError::forbidden(format!(
                 "session {session_id} is not for this principal"
             ))),
         }
     });
+}
+
+/// Entries before the view's window, for scrolling back: `entries({before,
+/// limit?})` gives up to `limit` (default and at most 100) entries just
+/// before entry `before`, and the entry before those.
+fn entries_method(
+    view: &Arc<Mutex<View>>,
+) -> impl Fn(Option<Value>, CallContext) -> BoxFuture<Result<Value, ChordError>> + Send + Sync + 'static
+{
+    let view = view.clone();
+    move |args, _ctx| {
+        let args = args.unwrap_or_else(|| json!({}));
+        let page = match args.get("before").and_then(Value::as_u64) {
+            Some(before) => {
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map_or(super::view::WINDOW_MAX, |limit| limit as usize)
+                    .clamp(1, super::view::WINDOW_MAX);
+                Ok(lock(&view).page(before, limit))
+            }
+            None => Err(ChordError::invalid("args", "`before` must be an entry id")),
+        };
+        Box::pin(async move { page })
+    }
 }
 
 fn participant(cell: &Cell, commands: &mpsc::UnboundedSender<Command>) -> Implementation {

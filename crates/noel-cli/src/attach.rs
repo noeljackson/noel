@@ -904,6 +904,14 @@ fn entries(view: &Value) -> &[Value] {
     view["entries"].as_array().map_or(&[], Vec::as_slice)
 }
 
+/// The message of a history entry (`model[0]`), or the entry itself.
+fn message_of(entry: &Value) -> &Value {
+    match entry.get("model").and_then(|model| model.get(0)) {
+        Some(message) => message,
+        None => entry,
+    }
+}
+
 /// `pi.inbox`'s items: `(id, mode, content)`.
 fn inbox(view: &Value) -> Vec<(String, String, String)> {
     view["docs"]["pi.inbox"]["items"]
@@ -1027,8 +1035,35 @@ fn add(rows: &mut Vec<Row>, kind: TuiEntryKind, text: String, source: Source) {
 /// a reply's thinking, then its text, then `aborted` if it was; a prompt
 /// and its images; a tool's result with its call.
 fn entry_rows(entries: &[Value], index: usize) -> Vec<Row> {
-    let entry = &entries[index];
+    let record = &entries[index];
     let mut rows = Vec::new();
+    // Markers of the history: where the model's context was cut or reset.
+    match record["kind"].as_str() {
+        Some("pi.compaction") => {
+            let data = &record["data"];
+            add(
+                &mut rows,
+                TuiEntryKind::System,
+                format!(
+                    "compacted: {} messages summarized, {} kept",
+                    data["omittedMessages"], data["retainedMessages"]
+                ),
+                Source::Entry,
+            );
+            return rows;
+        }
+        Some("pi.reset") => {
+            add(
+                &mut rows,
+                TuiEntryKind::System,
+                format!("context reset to {} messages", record["data"]["messages"]),
+                Source::Entry,
+            );
+            return rows;
+        }
+        _ => {}
+    }
+    let entry = message_of(record);
     match entry["role"].as_str().unwrap_or_default() {
         "assistant" => {
             add(
@@ -1166,6 +1201,7 @@ fn call_detail(entries: &[Value], id: Option<&str>) -> String {
     entries
         .iter()
         .rev()
+        .map(message_of)
         .filter(|entry| entry["role"] == "assistant")
         .flat_map(|entry| entry["content"].as_array().into_iter().flatten())
         .find(|block| block["type"] == "toolCall" && block["id"] == id)
