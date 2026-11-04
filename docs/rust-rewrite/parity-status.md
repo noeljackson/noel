@@ -50,6 +50,11 @@ The committed TypeScript parity fixtures are:
   with re-stamping and closing; pings and the ping timeout; window
   coalescing and the four-window reset; version mismatches both ways; and
   protocol violations. Each frame has its link and the side that sent it.
+- `chord-v2-contracts.json`: Chord v2's `hash64` and the fingerprints of
+  contracts as upstream's `remote()` declares them at `CHORD2_REFERENCE_REF`
+  (noel's three v2 contracts, upstream's pinned `notes`, normal-form edge
+  cases). `noel-chord`'s `v2::contract` matches every fingerprint
+  (`crates/noel-chord/tests/chord_v2_contracts.rs`).
 - `cli-contract.json`: upstream CLI option and command contract.
 - `cloudflare-ai-gateway-kimi.json`: Cloudflare AI Gateway OpenAI-compatible
   request shape.
