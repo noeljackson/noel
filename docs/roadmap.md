@@ -73,8 +73,10 @@ v1 pin `@earendil-works/chord@1.5.0`).
 - Progress (`noel_chord::v2`, nothing on a link yet): contracts and
   fingerprints; messages, the binary codec and the message check; the error
   table and wire errors; part limits and inflate; the channel (handshake,
-  checks, heartbeat). All against upstream goldens where upstream has a
-  verdict. Next: provider and consumer sides.
+  checks, heartbeat); a host with provider and consumer sides (holds, the
+  window, calls and the call window, refused holds, re-holds after a drop),
+  tested over memory links. Goldens against upstream where upstream has a
+  verdict. Next: relay and routes, principals and revocation, transports.
 
 ### 5. View parity (Client side done, #120)
 - Done: the session history (`noel-core/src/history.rs`, ids that survive

@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use super::message::Address;
+
 /// Version of the normal form (upstream `NORMAL_FORM_VERSION`).
 pub const NORMAL_FORM_VERSION: u64 = 2;
 
@@ -164,6 +166,72 @@ impl Contract {
         let declaration: Declaration =
             serde_json::from_str(text).map_err(|parse| error(format!("contract: {parse}")))?;
         Contract::declare(declaration)
+    }
+
+    /// The variants in the order links index them: sorted.
+    pub fn variant_order(&self) -> Vec<&str> {
+        self.declaration
+            .variants
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// A variant's state members and methods in the order links index them:
+    /// each sorted.
+    pub fn variant_names(&self, variant: &str) -> Option<(Vec<&str>, Vec<&str>)> {
+        let variant = self.declaration.variants.get(variant)?;
+        Some((
+            variant.state.keys().map(String::as_str).collect(),
+            variant.methods.keys().map(String::as_str).collect(),
+        ))
+    }
+
+    /// The method `name` of any variant (a method has one signature across
+    /// variants).
+    pub fn method(&self, name: &str) -> Option<&MethodDeclaration> {
+        self.declaration
+            .variants
+            .values()
+            .find_map(|variant| variant.methods.get(name))
+    }
+
+    /// The address of the object with `params` (upstream `hostAddress`):
+    /// `Server()` for server contracts, `Session({id: params.session})` for
+    /// session contracts.
+    pub fn address(&self, params: &Value) -> Address {
+        match self.declaration.host {
+            HostKind::Server => Address {
+                kind: "server".to_owned(),
+                params: json!({}),
+            },
+            HostKind::Session => Address {
+                kind: "session".to_owned(),
+                params: json!({"id": params.get("session").cloned().unwrap_or(Value::Null)}),
+            },
+        }
+    }
+
+    /// Checks `params` against the declared fields: an object with exactly
+    /// those fields, each valid.
+    pub fn check_params(&self, params: &Value) -> Result<(), String> {
+        let Value::Object(fields) = params else {
+            return Err("params: not an object".to_owned());
+        };
+        if let Some(extra) = fields
+            .keys()
+            .find(|key| !self.declaration.params.iter().any(|(name, _)| name == *key))
+        {
+            return Err(format!("params: an unknown field {extra:?}"));
+        }
+        for (name, schema) in &self.declaration.params {
+            let value = fields
+                .get(name)
+                .ok_or_else(|| format!("params: {name:?} is missing"))?;
+            crate::validate::check(schema, value)
+                .map_err(|error| format!("params.{name}: {error}"))?;
+        }
+        Ok(())
     }
 }
 

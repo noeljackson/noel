@@ -1384,6 +1384,25 @@ on a link yet. Where it differs:
   codec is for debugging and both ends must agree on it.
 - **Error messages of protocol errors** carry the decode error after the
   handshake message; protocol errors are only reported, never sent.
+- **Objects are cells and methods.** A factory returns a variant, its state
+  members as cells and its methods; the object is live at once and shared by
+  the holds of the same type, params and principal. There are no documents,
+  derives, resources, routines, reload, `accepts` adapters or older contract
+  versions, so a live object never fails, unbinds or swaps: `failed` is sent
+  only for refused holds (not served, another contract, invalid params, a
+  wrong address, a factory error) and `retry` only restarts those.
+- **Pending ops are concatenated**, not folded: a batch that starts with a
+  replacement drops what was pending, and more than 10,000 ops are replaced
+  by the member's value (subscribed afresh). The consumer's value is the
+  same; the ops on the wire can be more.
+- **A batch** is what the host's task drained at once, not a commit of
+  upstream's batch: a cell change made in one step may share a `state`
+  message with others made at the same time.
+- **No byte segments.** noel's contracts have no `bytes()` leaves; results
+  and arguments carry none.
+- **References** are held over the parent link only; routes, relaying and
+  revocation are later steps of the port. A call on a loading reference
+  waits until it is live.
 
 ### Mode 2 Server, Worker and Client
 
