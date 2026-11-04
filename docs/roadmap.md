@@ -78,8 +78,9 @@ v1 pin `@earendil-works/chord@1.5.0`).
   tested over memory links; placement by address, routes and relayed holds
   with per-origin acks and `closed`. Goldens against upstream where
   upstream has a verdict; revocation; WebSocket (binary) and framed
-  byte-stream transports. Next: the noel-cli and noel-client cut-over, then
-  `chord2-interop`.
+  byte-stream transports; noel-cli and noel-client cut over (server,
+  workers, line-mode client and the attached TUI speak v2; mode2 passes).
+  Next: `chord2-interop` against upstream, then deleting v1.
 
 ### 5. View parity (Client side done, #120)
 - Done: the session history (`noel-core/src/history.rs`, ids that survive

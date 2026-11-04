@@ -114,13 +114,35 @@ impl LinkOptions {
 /// What a host reports.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostEvent {
+    /// The host runs a new link (before its handshake).
+    Linked {
+        link: u64,
+        role: Role,
+        principal: Value,
+    },
     /// A link's peer said `hello`.
     Opened {
         link: u64,
         peer: String,
+        role: Role,
+        principal: Value,
     },
     Closed {
         link: u64,
+    },
+    /// A hold served here bound its object.
+    Held {
+        link: u64,
+        hold: u64,
+        type_name: String,
+        params: Value,
+        principal: Value,
+    },
+    /// A hold served here ended.
+    Released {
+        link: u64,
+        hold: u64,
+        type_name: String,
     },
     /// The link closed for it.
     ProtocolError {
@@ -232,6 +254,10 @@ enum Msg {
         key: PathKey,
         result: Result<Resolved, ChordError>,
     },
+    RouteLink {
+        address: Address,
+        resolved: Resolved,
+    },
     Observe(Observer),
     RevokedBy(RevokedBy),
     Revoke(Value),
@@ -295,12 +321,12 @@ impl Host {
 
     /// Serves `contract`'s objects, made by `factory` from their params and
     /// the principal of the hold that made them.
-    pub fn serve<F>(&self, contract: Contract, factory: F)
+    pub fn serve<F>(&self, contract: impl Into<Arc<Contract>>, factory: F)
     where
         F: Fn(&Value, &Value) -> Result<Implementation, WireError> + Send + Sync + 'static,
     {
         let _ = self.tx.send(Msg::Serve {
-            contract: Arc::new(contract),
+            contract: contract.into(),
             factory: Arc::new(factory),
         });
     }
@@ -329,6 +355,16 @@ impl Host {
         let _ = self.tx.send(Msg::Route {
             kind: kind.into(),
             route: Arc::new(route),
+        });
+    }
+
+    /// Runs `link` now as the link of `address` on its kind's route, as if
+    /// the route had resolved it (a worker this host adopts); its route
+    /// resolves the address again when it drops.
+    pub fn route_link(&self, address: Address, link: Link, options: LinkOptions) {
+        let _ = self.tx.send(Msg::RouteLink {
+            address,
+            resolved: Resolved { link, options },
         });
     }
 
@@ -856,6 +892,7 @@ impl Actor {
                 self.routes.insert(kind, route);
             }
             Msg::Resolved { key, result } => self.resolved(key, result),
+            Msg::RouteLink { address, resolved } => self.route_link(address, resolved),
             Msg::Call {
                 reference,
                 token,
@@ -967,6 +1004,11 @@ impl Actor {
                 consumer: Consumer::default(),
             },
         );
+        self.emit(HostEvent::Linked {
+            link: id,
+            role,
+            principal: self.links[&id].principal.clone(),
+        });
         if role == Role::Parent {
             if let Some(previous) = self.parent.replace(id) {
                 self.close_link(previous);
@@ -1004,7 +1046,13 @@ impl Actor {
             Ok(Received::Opened) => {
                 let peer = link.channel.peer().to_owned();
                 link.consumer.limit = link.channel.peer_calls();
-                self.emit(HostEvent::Opened { link: id, peer });
+                let (role, principal) = (link.role, link.principal.clone());
+                self.emit(HostEvent::Opened {
+                    link: id,
+                    peer,
+                    role,
+                    principal,
+                });
                 self.drain_calls(id);
             }
             Ok(Received::Message(message)) => {
@@ -1245,6 +1293,8 @@ impl Actor {
                     self.forget_reference(reference, error.clone());
                     if let Some(entry) = self.refs.get_mut(&reference) {
                         entry.set_status(RefStatus::Gone(error));
+                        // Its subscriptions end.
+                        entry.subscribers.clear();
                         if let Some(path) = entry.path.take() {
                             self.path_detach(&path, Holder::Ref(reference));
                         }
@@ -1490,6 +1540,13 @@ impl Actor {
             );
         }
         self.objects.get_mut(&key).expect("the object").holds += 1;
+        self.emit(HostEvent::Held {
+            link,
+            hold,
+            type_name: request.type_name.clone(),
+            params: params.clone(),
+            principal: principal.clone(),
+        });
         let provider = self.provider(link, origin).expect("the provider");
         let served = provider.holds.get_mut(&hold).expect("the hold");
         served.object = Some(key);
@@ -1869,6 +1926,11 @@ impl Actor {
             provider.touched.retain(|id| *id != hold);
         }
         if let Some(key) = served.object {
+            self.emit(HostEvent::Released {
+                link,
+                hold,
+                type_name: served.request.type_name.clone(),
+            });
             if let Some(object) = self.objects.get_mut(&key) {
                 object.holds -= 1;
                 if object.holds == 0 {

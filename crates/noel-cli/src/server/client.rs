@@ -35,7 +35,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use noel_chord::delta::{Op, Seg};
-use noel_chord::host::StateUpdate;
+use noel_chord::v2::host::StateUpdate;
 use noel_chord::BoxFuture;
 use noel_client::{websocket_link, Connector};
 pub(crate) use noel_client::{Client, Followed, Report};
@@ -337,7 +337,7 @@ impl Endpoint {
 }
 
 impl Connector for Endpoint {
-    fn open(&self, interactive: bool, report: Report) -> BoxFuture<Result<noel_chord::Link>> {
+    fn open(&self, interactive: bool, report: Report) -> BoxFuture<Result<noel_chord::v2::Link>> {
         let endpoint = self.clone();
         Box::pin(async move { open(&endpoint, interactive, &report).await })
     }
@@ -385,7 +385,11 @@ async fn watch(client: &Client, session: &str, json: bool) -> Result<i32> {
 
 /// A link to the server at `endpoint`. ssh asks on the terminal (a password,
 /// an unknown host key) only when `interactive`.
-async fn open(endpoint: &Endpoint, interactive: bool, report: &Report) -> Result<noel_chord::Link> {
+async fn open(
+    endpoint: &Endpoint,
+    interactive: bool,
+    report: &Report,
+) -> Result<noel_chord::v2::Link> {
     match endpoint {
         Endpoint::Local => websocket_link(dial(true, report).await?).await,
         Endpoint::Ssh {
@@ -436,7 +440,7 @@ async fn open_ssh(
     program: &str,
     interactive: bool,
     report: &Report,
-) -> Result<noel_chord::Link> {
+) -> Result<noel_chord::v2::Link> {
     let mut command = tokio::process::Command::new("ssh");
     command.args(["-T", "-e", "none"]);
     if !interactive {
@@ -609,35 +613,29 @@ fn print_update(update: &StateUpdate, json: bool) {
     if json {
         let line = match update {
             StateUpdate::Snapshot(value) => json!({ "snapshot": value }),
-            StateUpdate::Reset(value) => json!({ "reset": value }),
             StateUpdate::Ops { ops, value } => json!({
                 "ops": ops.iter().map(Op::to_json).collect::<Vec<_>>(),
                 "value": value,
             }),
-            StateUpdate::Error(error) => json!({ "error": error.to_string() }),
+            StateUpdate::Failed(error) => json!({ "error": error.to_string() }),
         };
         println!("{line}");
         return;
     }
     match update {
-        StateUpdate::Snapshot(value) | StateUpdate::Reset(value) => {
-            let kind = if matches!(update, StateUpdate::Snapshot(_)) {
-                "snapshot"
-            } else {
-                "reset"
-            };
-            println!("== {kind}");
+        StateUpdate::Snapshot(value) => {
+            println!("== snapshot");
             for line in render_view(value) {
                 println!("{line}");
             }
-            println!("== end of {kind}");
+            println!("== end of snapshot");
         }
         StateUpdate::Ops { ops, .. } => {
             for op in ops {
                 println!("{}", render_op(op));
             }
         }
-        StateUpdate::Error(error) => println!("== error: {error}"),
+        StateUpdate::Failed(error) => println!("== error: {error}"),
     }
 }
 

@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use noel_chord::host::StateUpdate;
-use noel_chord::{ChordError, ErrorCode};
+use noel_chord::v2::host::StateUpdate;
+use noel_chord::v2::WireError;
 use noel_config::LoadedConfig;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -89,10 +89,10 @@ pub(crate) async fn run(
         loop {
             tokio::select! {
                 message = incoming.recv() => match message {
-                    Some(Incoming::Followed(Followed::Update(
-                        StateUpdate::Snapshot(view) | StateUpdate::Reset(view),
-                    ))) => return Ok(view),
-                    Some(Incoming::Followed(Followed::Update(StateUpdate::Error(error)))) => {
+                    Some(Incoming::Followed(Followed::Update(StateUpdate::Snapshot(view)))) => {
+                        return Ok(view)
+                    }
+                    Some(Incoming::Followed(Followed::Update(StateUpdate::Failed(error)))) => {
                         return Err(attach_error(session, error.into()))
                     }
                     Some(other) => early.push(other),
@@ -172,10 +172,8 @@ pub(crate) async fn run(
 
 /// An attach's error, naming an unknown session plainly.
 fn attach_error(session: &str, error: anyhow::Error) -> anyhow::Error {
-    match error.downcast_ref::<ChordError>() {
-        Some(chord)
-            if chord.code == ErrorCode::Invalid && chord.reason.as_deref() == Some("session") =>
-        {
+    match error.downcast_ref::<WireError>() {
+        Some(chord) if crate::server::errors::is_no_session(chord) => {
             anyhow!("no session {session} on noel server (`noel client ls` lists its sessions)")
         }
         _ => anyhow!("could not attach to session {session}: {error}"),
@@ -302,7 +300,7 @@ impl Remote {
 
     fn update(&mut self, app: &mut TuiApp, update: StateUpdate) {
         let mut view = match update {
-            StateUpdate::Snapshot(view) | StateUpdate::Reset(view) => {
+            StateUpdate::Snapshot(view) => {
                 if self.waiting.take().is_some() {
                     app.push(
                         TuiEntryKind::System,
@@ -312,7 +310,7 @@ impl Remote {
                 view
             }
             StateUpdate::Ops { value, .. } => value,
-            StateUpdate::Error(error) => {
+            StateUpdate::Failed(error) => {
                 app.push(TuiEntryKind::Error, format!("the session's view: {error}"));
                 return;
             }
@@ -877,15 +875,13 @@ impl Remote {
     }
 }
 
-/// A refusal because a run is active: `invalid/busy`.
+/// A refusal because a run is active: the plugin error `busy`.
 fn refused_busy(result: &Result<Value>) -> bool {
     result
         .as_ref()
         .err()
-        .and_then(|error| error.downcast_ref::<ChordError>())
-        .is_some_and(|error| {
-            error.code == ErrorCode::Invalid && error.reason.as_deref() == Some("busy")
-        })
+        .and_then(|error| error.downcast_ref::<WireError>())
+        .is_some_and(|error| error.is_plugin("busy"))
 }
 
 /// Whether a slash command goes to the session as a prompt: a tool command

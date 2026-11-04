@@ -170,6 +170,15 @@ where
     )
 }
 
+/// Writes one control frame on a stream a framed link has not taken over
+/// (a server refusing to adopt a worker tells it `shutdown` this way).
+pub async fn write_control<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &Value,
+) -> std::io::Result<()> {
+    write_frame(writer, CONTROL, message.to_string().as_bytes()).await
+}
+
 async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     tag: u8,

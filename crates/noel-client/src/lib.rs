@@ -20,44 +20,65 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use noel_chord::host::{Host, HostEvent, HostOptions, LinkOptions, RemoteRef, StateUpdate};
-use noel_chord::link::{websocket, WebSocketOptions};
-use noel_chord::{BoxFuture, ChordError, ErrorCode, Link, RefStatus, StateStream};
+use noel_chord::v2::host::{
+    Host, HostEvent, HostOptions, LinkOptions, RefStatus, RemoteRef, StateStream, StateUpdate,
+};
+use noel_chord::v2::message::Address;
+use noel_chord::v2::object::BoxFuture;
+use noel_chord::v2::{Code, Link, WireError};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
 
 pub mod contracts {
-    //! The contracts `noel server` serves, and its workers.
+    //! The contracts `noel server` serves, and its workers (Chord v2).
 
-    use noel_chord::Description;
+    use std::sync::{Arc, OnceLock};
 
-    const CHAT: &str = include_str!("../contracts/noel.chat.json");
-    const SESSIONS: &str = include_str!("../contracts/noel.sessions.json");
-    const MODELS: &str = include_str!("../contracts/noel.models.json");
+    use noel_chord::v2::Contract;
 
-    /// `noel.chat`, served by the worker `session:<id>`.
-    pub fn chat() -> Description {
-        serde_json::from_str(CHAT).expect("noel.chat's contract parses")
+    const CHAT: &str = include_str!("../contracts/v2/noel.chat.json");
+    const SESSIONS: &str = include_str!("../contracts/v2/noel.sessions.json");
+    const MODELS: &str = include_str!("../contracts/v2/noel.models.json");
+
+    fn declared(cell: &'static OnceLock<Arc<Contract>>, text: &str) -> Arc<Contract> {
+        cell.get_or_init(|| Arc::new(Contract::from_json(text).expect("the contract declares")))
+            .clone()
     }
 
-    /// `noel.sessions`, served by `server`.
-    pub fn sessions() -> Description {
-        serde_json::from_str(SESSIONS).expect("noel.sessions' contract parses")
+    /// `noel.chat`, served by the worker at `Session({id})`.
+    pub fn chat() -> Arc<Contract> {
+        static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
+        declared(&CELL, CHAT)
     }
 
-    /// `noel.models`, served by `server`.
-    pub fn models() -> Description {
-        serde_json::from_str(MODELS).expect("noel.models' contract parses")
+    /// `noel.sessions`, served by `Server()`.
+    pub fn sessions() -> Arc<Contract> {
+        static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
+        declared(&CELL, SESSIONS)
+    }
+
+    /// `noel.models`, served by `Server()`.
+    pub fn models() -> Arc<Contract> {
+        static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
+        declared(&CELL, MODELS)
     }
 }
 
-/// The host name of the server.
-pub const SERVER_HOST: &str = "server";
+/// The server's host address, `Server()`.
+pub fn server_address() -> Address {
+    Address {
+        kind: "server".to_owned(),
+        params: json!({}),
+    }
+}
 
-/// The host name of a session's worker.
-pub fn session_host(session: &str) -> String {
-    format!("session:{session}")
+/// A session's worker's host address, `Session({id})`.
+pub fn session_address(session: &str) -> Address {
+    Address {
+        kind: "session".to_owned(),
+        params: json!({ "id": session }),
+    }
 }
 
 /// A random id (a version 4 UUID) for a `requestId`.
@@ -103,7 +124,7 @@ where
     let (socket, _) = tokio_tungstenite::client_async("ws://localhost/chord", stream)
         .await
         .map_err(|error| anyhow!("websocket upgrade: {error}"))?;
-    Ok(websocket(socket, WebSocketOptions::default()))
+    Ok(noel_chord::v2::transport::websocket(socket))
 }
 
 /// What following a session's view ([`Client::follow`]) yields.
@@ -132,23 +153,17 @@ impl Client {
     pub async fn connect(connector: Arc<dyn Connector>, report: Report) -> Result<Self> {
         let lost = Arc::new(Notify::new());
         let signal = lost.clone();
-        let host = Host::new(HostOptions {
-            on_error: Some(Arc::new(|error| {
-                if std::env::var_os("NOEL_CLIENT_DEBUG").is_some() {
-                    eprintln!("noel client: chord: {error}");
-                }
-            })),
-            observer: Some(Arc::new(move |event| {
-                if matches!(event, HostEvent::LinkClosed { .. }) {
-                    signal.notify_one();
-                }
-            })),
-            ..HostOptions::client("client")
+        let host = Host::new(HostOptions::default());
+        host.observe(move |event| match event {
+            HostEvent::Closed { .. } => signal.notify_one(),
+            HostEvent::ProtocolError { error, .. }
+                if std::env::var_os("NOEL_CLIENT_DEBUG").is_some() =>
+            {
+                eprintln!("noel client: chord: {error}")
+            }
+            _ => {}
         });
-        host.connect(
-            connector.open(true, report.clone()).await?,
-            LinkOptions::default(),
-        );
+        host.connect(connector.open(true, report.clone()).await?, server_link());
         Ok(Self {
             host,
             connector,
@@ -168,7 +183,7 @@ impl Client {
         loop {
             match self.connector.open(false, self.report.clone()).await {
                 Ok(link) => {
-                    self.host.connect(link, LinkOptions::default());
+                    self.host.connect(link, server_link());
                     return;
                 }
                 Err(error) => (self.report)(format!("reconnect: {error:#}")),
@@ -180,21 +195,18 @@ impl Client {
 
     /// A reference on the server's `noel.sessions`.
     pub fn sessions(&self) -> RemoteRef {
-        self.host.get(contracts::sessions(), json!({}), SERVER_HOST)
+        self.host.get(contracts::sessions(), json!({}))
     }
 
     /// A reference on the server's `noel.models`.
     pub fn models(&self) -> RemoteRef {
-        self.host.get(contracts::models(), json!({}), SERVER_HOST)
+        self.host.get(contracts::models(), json!({}))
     }
 
     /// A reference on a session's `noel.chat`.
     pub fn chat(&self, session: &str) -> RemoteRef {
-        self.host.get(
-            contracts::chat(),
-            json!({ "session": session }),
-            &session_host(session),
-        )
+        self.host
+            .get(contracts::chat(), json!({ "session": session }))
     }
 
     /// Calls a `noel.sessions` method (`create`, `fork`).
@@ -225,8 +237,8 @@ impl Client {
                     if retry
                         && attempt < 10
                         && error
-                            .downcast_ref::<ChordError>()
-                            .is_some_and(|error| error.code == ErrorCode::Unavailable) =>
+                            .downcast_ref::<WireError>()
+                            .is_some_and(|error| error.is(Code::Unavailable)) =>
                 {
                     (self.report)(format!("{method}: {error}; sending again ({attempt})"));
                     attempt += 1;
@@ -265,7 +277,7 @@ impl Client {
             let mut updates = chat.subscribe("view");
             match chat.ready().await {
                 Ok(_) => {}
-                Err(error) if error.code == ErrorCode::Unavailable && !first => {
+                Err(error) if error.is(Code::Unavailable) && !first => {
                     (self.report)(format!("watch: {error}; holding again"));
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     continue;
@@ -273,12 +285,34 @@ impl Client {
                 Err(error) => return error.into(),
             }
             first = false;
+            let mut statuses = chat.statuses();
+            let mut live = true;
             loop {
                 tokio::select! {
                     update = updates.next() => match update {
                         Some(update) => sink(Followed::Update(update)),
                         None => break,
                     },
+                    // The hold left its binding (its worker was lost): a
+                    // snapshot follows once it binds again.
+                    changed = statuses.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let status = statuses.borrow_and_update().clone();
+                        match status {
+                            RefStatus::Live { .. } => live = true,
+                            RefStatus::Loading | RefStatus::Failed { .. } if live => {
+                                live = false;
+                                let why = match status {
+                                    RefStatus::Failed { error, .. } => error.to_string(),
+                                    _ => "its worker was lost".to_owned(),
+                                };
+                                sink(Followed::ViewEnded(why));
+                            }
+                            _ => {}
+                        }
+                    }
                     () = self.lost.notified() => {
                         sink(Followed::ServerLost);
                         self.reconnect().await;
@@ -355,11 +389,15 @@ impl Transcript {
     }
 }
 
+/// The parent link to the server, as this client stamps it.
+fn server_link() -> LinkOptions {
+    LinkOptions::new(json!({ "kind": "server" }))
+}
+
 /// Calls `method` on `reference` once it is ready.
 pub async fn call(reference: &RemoteRef, method: &str, args: Value) -> Result<Value> {
     reference.ready().await?;
-    let result = reference.call(method, Some(args)).await?;
-    Ok(result.unwrap_or(Value::Null))
+    Ok(reference.call(method, args).await?)
 }
 
 /// The first value of the state member `member`: its snapshot.
@@ -368,8 +406,8 @@ async fn current(reference: &RemoteRef, member: &str) -> Result<Value> {
     reference.ready().await?;
     loop {
         match tokio::time::timeout(Duration::from_secs(30), updates.next()).await {
-            Ok(Some(StateUpdate::Snapshot(value) | StateUpdate::Reset(value))) => return Ok(value),
-            Ok(Some(StateUpdate::Error(error))) => return Err(error.into()),
+            Ok(Some(StateUpdate::Snapshot(value))) => return Ok(value),
+            Ok(Some(StateUpdate::Failed(error))) => return Err(error.into()),
             Ok(Some(StateUpdate::Ops { .. })) => {}
             Ok(None) => return Err(anyhow!("{member} ended")),
             Err(_) => return Err(anyhow!("no {member} within 30 s")),
@@ -380,14 +418,15 @@ async fn current(reference: &RemoteRef, member: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noel_chord::{AcceptOptions, Cell, Implementation};
+    use noel_chord::v2::object::{Cell, Implementation};
+    use noel_chord::v2::{ChordError, Contract};
     use std::sync::Mutex;
 
     #[test]
     fn contracts_parse_with_their_names() {
-        assert_eq!(contracts::chat().name, "noel.chat");
-        assert_eq!(contracts::sessions().name, "noel.sessions");
-        assert_eq!(contracts::models().name, "noel.models");
+        assert_eq!(contracts::chat().declaration.name, "noel.chat");
+        assert_eq!(contracts::sessions().declaration.name, "noel.sessions");
+        assert_eq!(contracts::models().declaration.name, "noel.models");
     }
 
     #[test]
@@ -419,7 +458,7 @@ mod tests {
             let (ours, theirs) = Link::memory_pair();
             self.server.accept(
                 theirs,
-                AcceptOptions::client(json!({"kind": "owner", "via": "device"})),
+                LinkOptions::new(json!({"kind": "owner", "via": "device"})),
             );
             self.opens.lock().unwrap().push((interactive, ours.clone()));
             Box::pin(async move { Ok(ours) })
@@ -437,20 +476,20 @@ mod tests {
         Arc::new(|_| {})
     }
 
-    fn state_schema(contract: &noel_chord::Description, variant: &str, member: &str) -> Value {
-        match contract
-            .variants
-            .get(variant)
-            .and_then(|members| members.get(member))
-        {
-            Some(noel_chord::MemberDescription::State { schema }) => schema.clone(),
-            _ => panic!("{variant}.{member} is no state"),
-        }
+    fn state_schema(contract: &Contract, variant: &str, member: &str) -> Value {
+        contract.declaration.variants[variant].state[member].clone()
+    }
+
+    fn host_at(address: Address) -> Host {
+        Host::new(HostOptions {
+            address: Some(address),
+            ..HostOptions::default()
+        })
     }
 
     #[tokio::test]
     async fn a_client_reads_the_directory_and_creates_sessions() {
-        let server = Host::new(HostOptions::host(SERVER_HOST));
+        let server = host_at(server_address());
         let directory = Cell::new(
             state_schema(&contracts::sessions(), "owner", "directory"),
             json!({"sessions": []}),
@@ -463,18 +502,18 @@ mod tests {
                 .method("create", move |args, _ctx| {
                     let cell = cell.clone();
                     async move {
-                        let args = args.unwrap_or_default();
                         let id = args["requestId"].clone();
                         cell.replace(json!({"sessions": [{
                             "sessionId": id, "cwd": args["cwd"], "modified": 1,
                             "messageCount": 0,
                             "live": {"worker": false, "busy": false, "viewers": 0},
-                        }]}))?;
+                        }]}))
+                        .map_err(|error| WireError::internal(error.to_string()))?;
                         Ok(json!({"sessionId": id, "created": true}))
                     }
                 })
                 .method("fork", |_args, _ctx| async {
-                    Err(ChordError::unavailable("no forks"))
+                    Err(ChordError::new(Code::Unavailable, "no forks").into())
                 }))
         });
         let client = Client::connect(Memory::new(&server), quiet())
@@ -497,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn following_a_view_survives_a_lost_link() {
-        let server = Host::new(HostOptions::host(session_host("s1")));
+        let server = host_at(session_address("s1"));
         let view = Cell::new(
             state_schema(&contracts::chat(), "viewer", "view"),
             json!({"conversation": {"id": "s1", "cwd": "/w"}, "entries": [], "docs": {}}),
@@ -538,9 +577,13 @@ mod tests {
         };
         assert_eq!(next(&mut seen).await, "snapshot 0");
 
-        memory.opens.lock().unwrap()[0].1.close("gone");
-        assert_eq!(next(&mut seen).await, "lost");
-        assert_eq!(next(&mut seen).await, "reconnected");
+        memory.opens.lock().unwrap()[0].1.close();
+        // Lost and reconnected, with the hold leaving its binding meanwhile.
+        let mut events = Vec::new();
+        while events.last().map(String::as_str) != Some("reconnected") {
+            events.push(next(&mut seen).await);
+        }
+        assert!(events.contains(&"lost".to_owned()), "{events:?}");
         // The hold goes again over the new link; a reconnect never asks.
         let mut after = next(&mut seen).await;
         while after != "snapshot 0" {

@@ -48,16 +48,7 @@ use crate::rpc_wire::{LastRun, Message};
 
 /// The view's schema, as `noel.chat` declares it.
 pub(crate) fn schema() -> Value {
-    let contract = super::chat_contract();
-    let member = contract
-        .variants
-        .get("participant")
-        .and_then(|members| members.get("view"))
-        .expect("noel.chat has a view");
-    match member {
-        noel_chord::MemberDescription::State { schema } => schema.clone(),
-        _ => unreachable!("view is state"),
-    }
+    super::chat_contract().declaration.variants["participant"].state["view"].clone()
 }
 
 /// Entries a view starts with, and the most it holds before the oldest

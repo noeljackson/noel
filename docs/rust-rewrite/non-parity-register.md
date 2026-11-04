@@ -1368,10 +1368,11 @@ plugins, and objects whose state it owns directly. The rest are a native
 JSON library and scheduler standing in for JavaScript's.
 
 
-### Chord v2 (in progress)
+### Chord v2
 
-`noel_chord::v2` is ported from upstream at `CHORD2_REFERENCE_REF` and is not
-on a link yet. Where it differs:
+`noel_chord::v2` is ported from upstream at `CHORD2_REFERENCE_REF`; noel's
+server, workers and clients speak it (the v1 section above describes the
+v1 implementation `make chord-interop` still runs). Where it differs:
 
 - **Synchronous inflate.** A deflated part is inflated with flate2 when its
   owner opens it. Upstream hosts without a synchronous compressor inflate
@@ -1414,6 +1415,12 @@ on a link yet. Where it differs:
 - **Relayed calls** are not counted against the downstream call window, and
   their arguments are not checked against the part limit before they are
   forwarded (the provider that parses them checks them).
+- **noel's refusals are plugin errors** whose code is the old reason
+  (`busy`, `session`, `cwd`, ...): v2's error table is closed. A session
+  without a journal fails a route's resolve as `unavailable` with
+  `details.missing: "session"`.
+- **Objects are keyed by canonical principal JSON**, not by a principal key
+  that ignores fields such as a guest's name.
 - **Revocation** follows upstream's `host.revoke` with a `revoked_by`
   function, except that noel has no host principal of its own to exempt and
   no references of its own acting for a principal.
