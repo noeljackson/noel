@@ -29,6 +29,7 @@ noel-chord = { path = "../noel-chord" }
 noel-client = { path = "../noel-client" }
 noel-plugin = { path = "../noel-plugin" }
 noel-config = { path = "../noel-config" }
+noel-codemode = { path = "../noel-codemode" }
 noel-core = { path = "../noel-core" }
 noel-env = { path = "../noel-env" }
 noel-tui = { path = "../noel-tui" }

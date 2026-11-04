@@ -55,7 +55,14 @@ pub(crate) struct Manifest {
     pub version: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// The program and its arguments, for a process plugin.
+    #[serde(default)]
     pub command: Vec<String>,
+    /// The script, for a djs plugin run in process (phase 8).
+    #[serde(default)]
+    pub script: Option<String>,
+    #[serde(default)]
+    pub limits: super::djs_plugins::Limits,
     #[serde(default)]
     pub permissions: Vec<String>,
     #[serde(skip)]
@@ -75,12 +82,15 @@ pub(crate) fn manifests(agent_dir: &Path) -> Vec<Manifest> {
             continue;
         };
         match serde_json::from_str::<Manifest>(&text) {
-            Ok(mut manifest) if valid_name(&manifest.name) && !manifest.command.is_empty() => {
+            Ok(mut manifest)
+                if valid_name(&manifest.name)
+                    && (manifest.command.is_empty() != manifest.script.is_none()) =>
+            {
                 manifest.dir = entry.path();
                 found.insert(manifest.name.clone(), manifest);
             }
             Ok(_) => eprintln!(
-                "noel server: plugin {}: needs a name of [a-z0-9-] and a command",
+                "noel server: plugin {}: needs a name of [a-z0-9-] and a command or a script",
                 path.display()
             ),
             Err(error) => eprintln!("noel server: plugin {}: {error}", path.display()),
@@ -232,17 +242,14 @@ impl Plugins {
             }
             let started = tokio::time::Instant::now();
             match self.spawn(&name) {
-                Ok(mut child) => {
-                    let status = child.wait().await;
+                Ok(running) => {
+                    let stopped = running.await;
                     let mut state = lock(&self.state);
                     if let Some(plugin) = state.get_mut(&name) {
                         plugin.running = false;
                         plugin.link = None;
                         plugin.restarts += 1;
-                        plugin.error = Some(match status {
-                            Ok(status) => format!("exited: {status}"),
-                            Err(error) => format!("lost: {error}"),
-                        });
+                        plugin.error = Some(stopped);
                     }
                     drop(state);
                     eprintln!("noel server: plugin {name} stopped; starting it again");
@@ -263,13 +270,32 @@ impl Plugins {
         }
     }
 
-    /// Starts the plugin's process and runs its link.
-    fn spawn(self: &Arc<Self>, name: &str) -> Result<tokio::process::Child, String> {
+    /// Starts the plugin and runs its link; the future resolves, with why,
+    /// when it stops.
+    fn spawn(self: &Arc<Self>, name: &str) -> Result<BoxFuture<String>, String> {
         let (manifest, granted) = {
             let state = lock(&self.state);
             let plugin = state.get(name).ok_or("no such plugin")?;
             (plugin.manifest.clone(), plugin.granted.clone())
         };
+        if let Some(script) = &manifest.script {
+            let script = Arc::new(super::djs_plugins::Script::load(
+                &manifest.dir,
+                script,
+                manifest.limits.clone(),
+            )?);
+            let (outer, inner) = Link::memory_pair();
+            let serving = tokio::spawn(super::djs_plugins::serve(name.to_owned(), script, inner));
+            self.linked(name, outer, granted);
+            eprintln!("noel server: started script plugin {name}");
+            return Ok(Box::pin(async move {
+                match serving.await {
+                    Ok(Ok(())) => "its link closed".to_owned(),
+                    Ok(Err(error)) => error,
+                    Err(error) => format!("lost: {error}"),
+                }
+            }));
+        }
         let program = {
             let local = manifest.dir.join(&manifest.command[0]);
             if local.is_file() {
@@ -298,6 +324,19 @@ impl Plugins {
         let stdout = child.stdout.take().expect("piped");
         let stdin = child.stdin.take().expect("piped");
         let (link, _) = framed(stdout, stdin, None);
+        self.linked(name, link, granted);
+        eprintln!("noel server: started plugin {name} (pid {:?})", child.id());
+        Ok(Box::pin(async move {
+            match child.wait().await {
+                Ok(status) => format!("exited: {status}"),
+                Err(error) => format!("lost: {error}"),
+            }
+        }))
+    }
+
+    /// Runs `link` as the plugin's: the `plugin` route's link for its
+    /// address, stamped with its granted permissions.
+    fn linked(self: &Arc<Self>, name: &str, link: Link, granted: Vec<String>) {
         let principal = json!({"kind": "plugin", "name": name, "permissions": granted});
         self.host.route_link(
             plugin_address(name),
@@ -313,11 +352,9 @@ impl Plugins {
             plugin.reference.is_none()
         };
         self.linked.notify_waiters();
-        eprintln!("noel server: started plugin {name} (pid {:?})", child.id());
         if first {
             self.follow(name);
         }
-        Ok(child)
     }
 
     /// Holds the plugin's `noel.plugin` and follows its contributions.

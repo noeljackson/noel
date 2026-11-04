@@ -18,8 +18,8 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new() -> Scratch {
-        let root = std::env::temp_dir().join(format!("npl-{}", std::process::id()));
+    fn new(name: &str) -> Scratch {
+        let root = std::env::temp_dir().join(format!("npl{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for dir in ["home", "agent/plugins/sample", "cwd"] {
             fs::create_dir_all(root.join(dir)).unwrap();
@@ -153,7 +153,7 @@ fn panel_text(plugin: &Value) -> String {
 
 #[test]
 fn a_plugin_adds_a_tool_a_command_and_a_panel_and_restarts_after_a_crash() {
-    let scratch = Scratch::new();
+    let scratch = Scratch::new("p");
     let plugin = scratch.plugin_until("the plugin running", |plugin| {
         plugin["running"] == json!(true)
             && plugin["contributions"]["tools"][0]["name"] == json!("sample_reverse")
@@ -218,4 +218,105 @@ fn a_plugin_adds_a_tool_a_command_and_a_panel_and_restarts_after_a_crash() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+const SCRIPT_PLUGIN: &str = r#"
+const view = (state) => ({ type: "stack", children: [
+  { type: "text", text: `count ${state?.count ?? 0}` },
+  { type: "button", label: "Reset", action: "reset" },
+] });
+const plugin = {
+  tools: {
+    shout: {
+      description: "Says the text louder.",
+      parameters: { type: "object", required: ["text"], properties: { text: { type: "string" } } },
+      run: async (args) => args.text.toUpperCase(),
+    },
+  },
+  commands: {
+    count: {
+      description: "Counts one more.",
+      run: async (_, ctx) => {
+        const count = (ctx.state?.count ?? 0) + 1;
+        ctx.save({ count });
+        return `count ${count}`;
+      },
+    },
+    spin: { description: "Never ends.", run: async () => { for (;;) {} } },
+  },
+  panels: {
+    counter: { title: "Counter", view, action: async (action, _, ctx) => { if (action === "reset") ctx.save({ count: 0 }); } },
+  },
+};
+"#;
+
+/// A djs plugin (phase 8): its contributions, its state across a server
+/// restart, and a runaway call stopped by its time limit.
+#[test]
+fn a_script_plugin_runs_in_process_with_state_and_limits() {
+    let scratch = Scratch::new("s");
+    // Only the script plugin.
+    fs::remove_dir_all(scratch.root.join("agent/plugins/sample")).unwrap();
+    let dir = scratch.root.join("agent/plugins/script");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("main.js"), SCRIPT_PLUGIN).unwrap();
+    let manifest = json!({
+        "name": "script",
+        "script": "main.js",
+        "limits": {"timeoutMs": 500},
+        "permissions": ["tools", "commands", "panels"],
+    });
+    fs::write(dir.join("plugin.json"), manifest.to_string()).unwrap();
+    let grants = json!({"script": {"permissions": ["tools", "commands", "panels"]}});
+    fs::write(scratch.root.join("agent/plugins.json"), grants.to_string()).unwrap();
+
+    let plugin = scratch.plugin_until("the script plugin running", |plugin| {
+        plugin["running"] == json!(true)
+            && plugin["contributions"]["tools"][0]["name"] == json!("shout")
+    });
+    assert_eq!(panel_text(&plugin), "count 0");
+    assert_eq!(
+        scratch.client(&["run", "script", "count"]).trim(),
+        "count 1"
+    );
+    scratch.plugin_until("the panel at 1", |plugin| panel_text(plugin) == "count 1");
+
+    // A runaway command ends at its time limit; the plugin goes on.
+    let spun = scratch.noel(&["client", "run", "script", "spin"]);
+    assert!(!spun.status.success());
+    assert!(
+        String::from_utf8_lossy(&spun.stderr).contains("timeout"),
+        "{}",
+        String::from_utf8_lossy(&spun.stderr)
+    );
+    assert_eq!(
+        scratch.client(&["run", "script", "count"]).trim(),
+        "count 2"
+    );
+
+    // The state survives the server: kill it, and the next client starts a
+    // new one.
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(scratch.root.join("run/server.json")).unwrap())
+            .unwrap();
+    let pid = record["pid"].as_u64().unwrap().to_string();
+    assert!(Command::new("kill")
+        .args(["-9", &pid])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + TIMEOUT;
+    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(Instant::now() < deadline, "the server did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    scratch.plugin_until("the script plugin running again", |plugin| {
+        plugin["running"] == json!(true) && panel_text(plugin) == "count 2"
+    });
+    assert_eq!(
+        scratch.client(&["run", "script", "count"]).trim(),
+        "count 3"
+    );
+    scratch.client(&["panel", "script", "counter", "reset"]);
+    scratch.plugin_until("the panel reset", |plugin| panel_text(plugin) == "count 0");
 }

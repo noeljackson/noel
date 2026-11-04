@@ -1686,6 +1686,7 @@ dependencies = [
  "noel-ai",
  "noel-chord",
  "noel-client",
+ "noel-codemode",
  "noel-config",
  "noel-core",
  "noel-env",
