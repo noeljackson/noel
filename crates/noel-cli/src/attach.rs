@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use noel_chord::delta::{Op, Seg};
 use noel_chord::host::StateUpdate;
 use noel_chord::{ChordError, ErrorCode};
 use noel_config::LoadedConfig;
@@ -143,6 +142,18 @@ pub(crate) async fn run(
     for message in early {
         remote.receive(&mut app, message);
     }
+    // The whole history before the view's window, as reopening a session
+    // shows all of it.
+    if let Err(error) = remote
+        .history
+        .load_earlier(&remote.client, session, &first)
+        .await
+    {
+        app.push(
+            TuiEntryKind::Error,
+            format!("could not load the earlier history: {error:#}"),
+        );
+    }
     remote.first(&mut app, first);
     let result = remote
         .drive(
@@ -210,8 +221,11 @@ struct Remote {
     session: String,
     client: Client,
     sender: mpsc::UnboundedSender<Incoming>,
-    /// The view as of the last update.
+    /// The view as of the last update, its entries every entry the
+    /// session's history holds here (not only the view's window).
     view: Value,
+    /// The session's history: the windows seen and the pages loaded.
+    history: noel_client::Transcript,
     transcript: Transcript,
     /// The active run and when this TUI first saw it.
     run: Option<(String, Instant)>,
@@ -234,6 +248,7 @@ impl Remote {
             client,
             sender,
             view: Value::Null,
+            history: noel_client::Transcript::default(),
             transcript: Transcript::default(),
             run: None,
             saw_tools: false,
@@ -247,7 +262,7 @@ impl Remote {
     /// The first view: the transcript, and its prompts as the editor's
     /// history, as reopening a session restores them.
     fn first(&mut self, app: &mut TuiApp, view: Value) {
-        for entry in entries(&view) {
+        for entry in self.history.merge(&view).iter().map(message_of) {
             if entry["role"] == "user" {
                 app.editor_state.record_history(blocks(entry, "text"));
             }
@@ -286,7 +301,7 @@ impl Remote {
     }
 
     fn update(&mut self, app: &mut TuiApp, update: StateUpdate) {
-        let (view, dirty) = match update {
+        let mut view = match update {
             StateUpdate::Snapshot(view) | StateUpdate::Reset(view) => {
                 if self.waiting.take().is_some() {
                     app.push(
@@ -294,15 +309,17 @@ impl Remote {
                         "holding the session again: redrawn from its snapshot",
                     );
                 }
-                let dirty = first_difference(&self.view, &view);
-                (view, dirty)
+                view
             }
-            StateUpdate::Ops { ops, value } => (value, entries_changed_from(&ops)),
+            StateUpdate::Ops { value, .. } => value,
             StateUpdate::Error(error) => {
                 app.push(TuiEntryKind::Error, format!("the session's view: {error}"));
                 return;
             }
         };
+        // The view holds a window of the history; the TUI shows all of it.
+        view["entries"] = Value::Array(self.history.merge(&view));
+        let dirty = first_difference(&self.view, &view);
         self.view = view;
         self.transcript.sync(app, &self.view, dirty);
         self.note_last_run(app);
@@ -331,7 +348,7 @@ impl Remote {
             "aborted"
                 if entries(&self.view)
                     .last()
-                    .is_none_or(|entry| entry["stopReason"] != "aborted") =>
+                    .is_none_or(|entry| message_of(entry)["stopReason"] != "aborted") =>
             {
                 app.push(TuiEntryKind::System, "aborted")
             }
@@ -965,29 +982,6 @@ fn first_difference(old: &Value, new: &Value) -> usize {
         .count()
 }
 
-/// The first entry `ops` may have changed; none when they leave the entries
-/// alone.
-fn entries_changed_from(ops: &[Op]) -> usize {
-    ops.iter()
-        .filter_map(|op| {
-            let Some(path) = op.path() else {
-                return Some(0);
-            };
-            match path.first() {
-                Some(Seg::Key(key)) if key == "entries" => {}
-                Some(_) => return None,
-                None => return Some(0),
-            }
-            Some(match (path.get(1), op) {
-                (None, Op::Splice(_, index, _, _)) => *index as usize,
-                (Some(Seg::Index(index)), _) => *index as usize,
-                _ => 0,
-            })
-        })
-        .min()
-        .unwrap_or(usize::MAX)
-}
-
 /// The text of a message's content blocks of type `kind` (`text` or
 /// `thinking`); a string content is its text.
 fn blocks(message: &Value, kind: &str) -> String {
@@ -1481,21 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn ops_name_the_first_entry_they_change() {
-        let entries = |index| vec![Seg::Key("entries".into()), Seg::Index(index)];
-        let live = vec![Seg::Key("docs".into()), Seg::Key("pi.live".into())];
-        assert_eq!(
-            entries_changed_from(&[Op::Append(live.clone(), "x".into())]),
-            usize::MAX
-        );
-        assert_eq!(
-            entries_changed_from(&[
-                Op::Splice(vec![Seg::Key("entries".into())], 4, 0, vec![]),
-                Op::Set(entries(2), json!({})),
-            ]),
-            2
-        );
-        assert_eq!(entries_changed_from(&[Op::Replace(json!({}))]), 0);
+    fn views_differ_from_their_first_changed_entry() {
         assert_eq!(
             first_difference(
                 &json!({"entries": [1, 2, 3]}),

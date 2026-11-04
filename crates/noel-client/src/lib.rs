@@ -15,6 +15,7 @@
 //! It depends on no Unix sockets, processes or terminal, so it builds for
 //! targets such as iOS.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -295,6 +296,65 @@ impl Client {
     }
 }
 
+/// A session's history as a client holds it (Durable's
+/// `ConversationTranscript`): every entry it has seen in a view's window or
+/// loaded with `noel.chat`'s `entries`, by id. The view holds only the
+/// newest entries; [`Transcript::load_earlier`] pages back from its window.
+#[derive(Debug, Clone, Default)]
+pub struct Transcript {
+    entries: BTreeMap<u64, Value>,
+}
+
+impl Transcript {
+    /// Takes the entries of `view`'s window and returns every entry held,
+    /// oldest first.
+    pub fn merge(&mut self, view: &Value) -> Vec<Value> {
+        self.add(&view["entries"]);
+        self.entries.values().cloned().collect()
+    }
+
+    fn add(&mut self, entries: &Value) {
+        for entry in entries.as_array().into_iter().flatten() {
+            if let Some(id) = entry["id"].as_u64() {
+                self.entries.insert(id, entry.clone());
+            }
+        }
+    }
+
+    /// Loads the entries before `view`'s window that this transcript lacks,
+    /// paging back until it meets an entry it holds or the first one.
+    pub async fn load_earlier(
+        &mut self,
+        client: &Client,
+        session: &str,
+        view: &Value,
+    ) -> Result<()> {
+        let mut next = view["entries"]
+            .get(0)
+            .and_then(|entry| entry["id"].as_u64());
+        while let Some(before) = next {
+            if before <= 1 || self.entries.contains_key(&(before - 1)) {
+                break;
+            }
+            let page = client
+                .chat_call(session, "entries", json!({ "before": before }), false)
+                .await?;
+            let ids: Vec<u64> = page["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry["id"].as_u64())
+                .collect();
+            self.add(&page["entries"]);
+            next = match (ids.first(), page["before"].as_u64()) {
+                (Some(first), Some(_)) => Some(*first),
+                _ => None,
+            };
+        }
+        Ok(())
+    }
+}
+
 /// Calls `method` on `reference` once it is ready.
 pub async fn call(reference: &RemoteRef, method: &str, args: Value) -> Result<Value> {
     reference.ready().await?;
@@ -501,5 +561,23 @@ mod tests {
         follower.abort();
         client.close().await;
         server.close().await;
+    }
+
+    #[test]
+    fn a_transcript_keeps_every_entry_it_saw_in_order() {
+        let entry = |id: u64| json!({"id": id, "kind": "pi.user"});
+        let mut transcript = Transcript::default();
+        let merged = transcript.merge(&json!({"entries": [entry(3), entry(4)]}));
+        assert_eq!(merged, [entry(3), entry(4)]);
+        // The window moved on: what left it stays, what is new is added.
+        let merged = transcript.merge(&json!({"entries": [entry(5), entry(6)]}));
+        assert_eq!(merged, [entry(3), entry(4), entry(5), entry(6)]);
+        transcript.add(&json!([entry(1), entry(2)]));
+        let ids: Vec<u64> = transcript
+            .merge(&json!({"entries": []}))
+            .iter()
+            .map(|entry| entry["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, [1, 2, 3, 4, 5, 6]);
     }
 }
