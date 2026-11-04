@@ -108,8 +108,13 @@ v1 pin `@earendil-works/chord@1.5.0`).
 - Follow-up: a Bun SDK (pi extensions keep working through the extension
   host meanwhile); panels in the attached TUI and the desktop app (phase 9).
 
-### 8. djs plugin tier (Planned, #123)
-- In-process plugins on the codemode host layer; same contributions as phase 7.
+### 8. djs plugin tier (Done, #123)
+- Script plugins (`script` in the manifest) run in the server's process on
+  the codemode VM: sandboxed, time and memory limited, no JIT; same
+  contributions, grants and `noel.plugins` as phase 7, through the same
+  `noel-plugin` host over a memory link. Their state is kept with the
+  plugin (`state.json`) across restarts (plugins belong to the server, not
+  a session). Spec §13; tested by `tests/plugins.rs`.
 
 ### 9. Desktop app, GPUI (Planned, #124)
 - `noel app`: sessions sidebar, transcript, composer, palette, diffs, plugin
