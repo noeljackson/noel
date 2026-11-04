@@ -1381,9 +1381,16 @@ private), so the objects and processes are noel's, and these parts differ:
   `Sessions` at `server` only as examples.
 - **The view** has Durable's shape `{conversation, entries, docs}`
   (`durable/docs/spec.md` §9.3) with what noel's journal holds:
-  - `entries` are upstream pi's `Message` JSON, as RPC mode's `get_messages`
-    reports them (no entry ids, timestamps or usage), not Durable's entry
-    records;
+  - `entries` are a window over the session's history in Durable's
+    `EntryRecord` shape (`{id, kind, model?, data?, head?, timestamp?}`,
+    newest 50, at most 100, `before`, paged back with `noel.chat`'s
+    `entries` method). Ids are numbers counting the session's entries, not
+    Durable's minted ids; each `model` is upstream pi's `Message` JSON, as
+    RPC mode's `get_messages` reports it (no usage). Markers are
+    `pi.compaction` (`data: {reason, summary, omittedMessages,
+    retainedMessages}`) and `pi.reset` (`data: {messages}`, an undo), each
+    with `head` at itself; a window can start at any entry, and the window
+    is not chosen by the subscriber (no `ConversationWindow` argument);
   - `docs["pi.agent"]` is `{model, thinkingLevel, cwd}`; Durable's stores
     the chosen extensions, tools and instructions;
   - `docs["pi.live"]` has `run` (`runId`, `requestId`, `inputs`, where
@@ -1398,15 +1405,15 @@ private), so the objects and processes are noel's, and these parts differ:
   - `docs["pi.usage"]` is `{total: {input, output, requests}}`: noel counts
     a session's usage, not per model or tool. There is no `pi.provider`;
   - `lastRun` is added: RPC mode's `get_state.lastRun`.
-- **Only committed progress, nearly.** A partial reply and a tool's output
-  come from the journal's own records once saved, as Durable's view shows
-  only committed state. Two things are shown as the run engine reports them,
-  just before it saves them: a message it adds, and, as a resumed run
-  starts, the interrupted results of calls that do not run again.
+- **Only committed progress.** A partial reply, a tool's output and the
+  history's entries come from the journal's own records once saved, as
+  Durable's view shows only committed state.
 - **Ops.** The worker makes ops per change: a splice at the end of
-  `entries`, appends to a streaming text, and diffs of the documents. Durable
-  derives view ops from document ops, and bounds a watch to 100 pending
-  frames; noel relies on Chord's four-window reset.
+  `entries` (and one at the start when the window moves), appends to a
+  streaming text, and diffs of the documents. Durable derives view ops from
+  document ops, folds a watch's pending commits into one call and replaces
+  the value past 10,000 pending operations; noel relies on Chord's
+  four-window reset.
 - **Submissions.** `submit`'s `whenBusy` names the submission's kind
   (`reject` a prompt, `steer`, `followUp`). A refusal is `invalid` with a
   reason (`busy`, Durable's `ConversationBusy`; `request_id_reused`;

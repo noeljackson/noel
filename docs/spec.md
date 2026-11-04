@@ -227,7 +227,7 @@ the input names this worker's session.
 
 **Built** (`crates/noel-cli/src/server/view.rs`): the view follows Durable's shape `{conversation, entries, docs}` (`durable/docs/spec.md:4542-4558`), plus `lastRun`:
 - **`conversation`:** `{id, cwd, name?}`;
-- **`entries`:** messages in upstream pi's `Message` JSON, as RPC mode's `get_messages`;
+- **`entries`:** a window over the session's history (`crates/noel-core/src/history.rs`): every message the session saved, with markers where compaction or an undo cut the model's context, as Durable's entry records `{id, kind, model?, data?, head?, timestamp?}`. Ids count entries in journal order, so they survive restarts and compaction checkpoints. The view starts with the newest 50; past 100 the oldest leave in one splice down to 50, and `before` names the entry before the window. `noel.chat`'s `entries({before, limit?})` pages back;
 - **`docs["pi.agent"]`:** `{model?, thinkingLevel, cwd}`;
 - **`docs["pi.live"]`:** `{}` while idle; during a run `run` (`{runId, requestId?, inputs}`), `generation` (`{attempt, message?, retry?}`, where `message` is the committed partial, §4.2), `tools` (`{callId, name, status, output?, truncated?}` with the committed output; `status` is `pending`, `running`, `done`, or `interrupted` for a resumed run's call that does not run again) and `compaction` (`{reason}`);
 - **`docs["pi.inbox"]`:** `{items: [{id, mode, content, requestId?}]}`;

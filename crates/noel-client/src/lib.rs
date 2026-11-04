@@ -445,7 +445,11 @@ mod tests {
         .unwrap();
         let served = view.clone();
         server.serve(contracts::chat(), move |_input, _principal| {
-            Ok(Implementation::new("viewer").state("view", &served))
+            Ok(Implementation::new("viewer")
+                .state("view", &served)
+                .method("entries", |_args, _ctx| async {
+                    Ok(json!({"entries": []}))
+                }))
         });
         let memory = Memory::new(&server);
         let client = Client::connect(memory.clone(), quiet()).await.unwrap();
