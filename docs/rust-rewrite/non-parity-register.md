@@ -1411,8 +1411,9 @@ on a link yet. Where it differs:
 - **Relayed calls** are not counted against the downstream call window, and
   their arguments are not checked against the part limit before they are
   forwarded (the provider that parses them checks them).
-- **Revocation** (`revoke`, `forbidden/revoked`) is a later step of the
-  port.
+- **Revocation** follows upstream's `host.revoke` with a `revoked_by`
+  function, except that noel has no host principal of its own to exempt and
+  no references of its own acting for a principal.
 
 ### Mode 2 Server, Worker and Client
 
