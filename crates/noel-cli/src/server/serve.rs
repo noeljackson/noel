@@ -567,17 +567,27 @@ impl Workers {
         })
     }
 
+    /// The session's journal: in the session directory, unless a client
+    /// registered one kept elsewhere.
+    fn journal(&self, id: &str) -> PathBuf {
+        std::fs::read_to_string(self.dir.worker_journal(id))
+            .ok()
+            .map(|text| PathBuf::from(text.trim_end_matches('\n')))
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| self.session_dir.join(format!("{id}.jsonl")))
+    }
+
     /// Starts a worker for the session, resuming its interrupted last run
     /// while that run's resumes last (spec §8.3), and attaches it.
     async fn spawn(self: &Arc<Self>, id: &str) -> Result<Link, ChordError> {
         if self.closing.load(Ordering::SeqCst) {
             return Err(unavailable("the server is exiting"));
         }
-        let journal = self.session_dir.join(format!("{id}.jsonl"));
+        let journal = self.journal(id);
         if !journal.is_file() {
             return Err(no_session(id));
         }
-        let resume = self.resume_for(id, journal).await;
+        let resume = self.resume_for(id, journal.clone()).await;
         let generation = {
             let mut state = lock(&self.state);
             let recorded = recorded_generation(&self.dir, id);
@@ -597,6 +607,9 @@ impl Workers {
             .arg0("noel")
             .args(["worker", "--session", id, "--generation"])
             .arg(generation.to_string());
+        if journal != self.session_dir.join(format!("{id}.jsonl")) {
+            command.arg("--journal").arg(&journal);
+        }
         if let Some(run_id) = &resume {
             command.args(["--resume", run_id]);
         }
@@ -822,7 +835,7 @@ impl Workers {
         }
         // Started again now only when it left a run to resume; otherwise
         // the next hold starts it.
-        let journal = self.session_dir.join(format!("{id}.jsonl"));
+        let journal = self.journal(&id);
         let interrupted = tokio::task::spawn_blocking(move || {
             SessionStore::read(&journal).ok().and_then(|state| {
                 state

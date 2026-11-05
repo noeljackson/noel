@@ -121,17 +121,46 @@ pub(crate) struct RuntimeDir {
     root: PathBuf,
 }
 
-/// `-<hash>` of NOEL_DIR and NOEL_SESSION_DIR when either is set, so each
-/// pair has its own server; empty for the defaults.
+/// This user's home directory as the password database names it.
+fn passwd_home() -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: getpwuid_r writes only into `entry` and `buffer`, whose
+    // lengths it is given; `found` points at `entry` or is null.
+    unsafe {
+        let mut entry: libc::passwd = std::mem::zeroed();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let status = libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        );
+        if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr(entry.pw_dir);
+        Some(std::ffi::OsStr::from_bytes(dir.to_bytes()).to_os_string())
+    }
+}
+
+/// `-<hash>` of NOEL_DIR, NOEL_SESSION_DIR and a HOME other than the
+/// user's own (which moves the default agent and session dirs) when any is
+/// set, so each has its own server; empty for the defaults.
 fn scope_suffix() -> String {
     use sha2::{Digest, Sha256};
     let dir = std::env::var_os("NOEL_DIR").filter(|dir| !dir.is_empty());
     let sessions = std::env::var_os(noel_config::ENV_SESSION_DIR).filter(|dir| !dir.is_empty());
-    if dir.is_none() && sessions.is_none() {
+    let own_home = passwd_home();
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .filter(|home| Some(home) != own_home.as_ref());
+    if dir.is_none() && sessions.is_none() && home.is_none() {
         return String::new();
     }
     let mut hasher = Sha256::new();
-    for part in [dir, sessions] {
+    for part in [dir, sessions, home] {
         hasher.update(part.unwrap_or_default().as_encoded_bytes());
         hasher.update([0]);
     }
@@ -245,6 +274,12 @@ impl RuntimeDir {
     /// worker (docs/client-tui-plan.md).
     pub fn worker_args(&self, session: &str) -> PathBuf {
         self.workers().join(format!("{session}.args.json"))
+    }
+
+    /// The journal of a session kept outside the session directory
+    /// (`noel --session <path>`): its path, one line.
+    pub fn worker_journal(&self, session: &str) -> PathBuf {
+        self.workers().join(format!("{session}.journal"))
     }
 
     /// The flags the session's running worker started with.

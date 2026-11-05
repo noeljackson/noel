@@ -196,15 +196,19 @@ quit_noel() {
 
 # The main test process unsets NO_COLOR inherited from a shared tmux server.
 # Exercise real SGR transitions, including removal of fixed light/dark colors.
+# A reply may still be on its way (noel as a client of a local server), so
+# the pane is read until the color shows, for up to 5 s.
 require_live_color() {
   local expected="$1"
   local output="$2"
-  tmux capture-pane -t "${session_name}" -p -e > "${work_dir}/${output}.txt"
-  if ! grep -Fq "${expected}" "${work_dir}/${output}.txt"; then
-    cat "${work_dir}/${output}.txt" >&2
-    echo "missing terminal color ${expected}" >&2
-    exit 1
-  fi
+  for _ in $(seq 1 50); do
+    tmux capture-pane -t "${session_name}" -p -e > "${work_dir}/${output}.txt"
+    if grep -Fq "${expected}" "${work_dir}/${output}.txt"; then return; fi
+    sleep 0.1
+  done
+  cat "${work_dir}/${output}.txt" >&2
+  echo "missing terminal color ${expected}" >&2
+  exit 1
 }
 
 send_line "/theme light"

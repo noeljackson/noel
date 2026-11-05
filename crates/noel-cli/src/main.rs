@@ -798,7 +798,7 @@ fn login_http_client() -> reqwest::Client {
 /// flow on the plain terminal (the CLI command's own flow, opened browser
 /// included), then reloads the config so the new account is selectable at
 /// once. Returns the line to show in the transcript.
-async fn run_tui_login(
+pub(crate) async fn run_tui_login(
     surface: &mut TuiSurface<'_>,
     app: &mut TuiApp,
     config: &mut LoadedConfig,
@@ -1698,7 +1698,13 @@ async fn run() -> Result<()> {
             return Err(anyhow!("--attach opens the TUI and needs a terminal"));
         }
         let endpoint = server::client::Endpoint::new(cli.remote.clone(), cli.remote_noel.clone())?;
-        return attach::run(session, endpoint, config, cli.owned_screen(), false).await;
+        if attach::run(session, endpoint, config, cli.owned_screen(), false)
+            .await?
+            .is_some()
+        {
+            restart_current_process(None)?;
+        }
+        return Ok(());
     }
     let offline = offline_enabled(cli.offline);
     apply_cached_claude_code_version(&config);
@@ -1735,9 +1741,49 @@ async fn run() -> Result<()> {
     let selection = resolve_cli_selection(&cli, &mut config, offline)?;
     let mut systems = ReloadableSystems::from_config(&config, 1);
     systems.offline = offline;
-    let mut runtime =
-        create_runtime_when_unlocked(&cli, &cwd, &config, systems, requested_workspace.as_ref())
-            .await?;
+    // Interactive `noel` as a client: a session its worker already holds
+    // (a client gone without quitting) is attached to, not waited for.
+    let mut opened = None;
+    if client_tui_enabled()
+        && io::stdin().is_terminal()
+        && !cli.print
+        && cli.messages.is_empty()
+        && !matches!(cli.mode, OutputMode::Rpc)
+    {
+        // The server reads the same sessions: a --session-dir is its too
+        // (and names its runtime directory).
+        if cli.session_dir.is_some() {
+            std::env::set_var(ENV_SESSION_DIR, &config.paths.session_dir);
+        }
+        match create_runtime(
+            &cli,
+            &cwd,
+            &config,
+            systems.clone(),
+            requested_workspace.as_ref(),
+        ) {
+            Ok(runtime) => opened = Some(runtime),
+            Err(error) => {
+                if let Some(SessionError::Locked {
+                    path,
+                    pid: Some(pid),
+                }) = error.downcast_ref::<SessionError>()
+                {
+                    if let Some(session) = held_by_worker(path, *pid) {
+                        offer_bun_install(&config).await?;
+                        return run_client_tui(session, Some(path.clone()), config, &cli).await;
+                    }
+                }
+            }
+        }
+    }
+    let mut runtime = match opened {
+        Some(runtime) => runtime,
+        None => {
+            create_runtime_when_unlocked(&cli, &cwd, &config, systems, requested_workspace.as_ref())
+                .await?
+        }
+    };
     workspace::check_saved(runtime.session(), &config.paths.agent_dir)?;
     workspace::install(&mut runtime, &config.paths.agent_dir, !cli.no_context_files);
     select_initial_model(&mut runtime, &config, &selection, offline)?;
@@ -1789,7 +1835,26 @@ async fn run() -> Result<()> {
     offer_bun_install(&config).await?;
 
     if client_tui_enabled() {
-        return run_client_tui(runtime, config, &cli).await;
+        // --no-session: the worker still needs a journal; this one is kept
+        // in the runtime directory only while this `noel` runs.
+        let ephemeral = runtime.store().is_none();
+        let (session, journal) = match runtime.store() {
+            Some(store) => (
+                runtime.session().session_id.clone(),
+                store.path().to_path_buf(),
+            ),
+            None => ephemeral_journal(&runtime)?,
+        };
+        // The worker opens the journal: this process lets go of it first.
+        drop(runtime);
+        let result = run_client_tui(session.clone(), Some(journal.clone()), config, &cli).await;
+        if ephemeral {
+            let _ = fs::remove_file(&journal);
+            if let Ok(dir) = server::RuntimeDir::check(server::RuntimeDir::locate()) {
+                let _ = fs::remove_file(dir.worker_journal(&session));
+            }
+        }
+        return result;
     }
     run_interactive(runtime, config, offline, cli.owned_screen(), cli.no_splash).await
 }
@@ -1803,24 +1868,61 @@ fn client_tui_enabled() -> bool {
 /// Interactive `noel` as a client: the session chosen and prepared as for
 /// the in-process TUI, then left to its worker under the local server, and
 /// the TUI attached to it.
-async fn run_client_tui(runtime: Runtime, config: LoadedConfig, cli: &Cli) -> Result<()> {
-    let session = runtime.session().session_id.clone();
-    // The server reads the same sessions: a --session-dir is its too.
-    if cli.session_dir.is_some() {
-        std::env::set_var(ENV_SESSION_DIR, &config.paths.session_dir);
+async fn run_client_tui(
+    session: String,
+    journal: Option<PathBuf>,
+    config: LoadedConfig,
+    cli: &Cli,
+) -> Result<()> {
+    let dir = server::RuntimeDir::ensure(server::RuntimeDir::locate())?;
+    dir.ensure_workers()?;
+    // A journal outside the session directory (--session <path>) is
+    // registered with the server, which otherwise looks there.
+    let registered = dir.worker_journal(&session);
+    match journal.and_then(|path| fs::canonicalize(path).ok()) {
+        Some(path)
+            if fs::canonicalize(config.paths.session_dir.join(format!("{session}.jsonl")))
+                .ok()
+                .as_ref()
+                != Some(&path) =>
+        {
+            fs::write(&registered, format!("{}\n", path.display()))?;
+        }
+        _ => {
+            let _ = fs::remove_file(&registered);
+        }
     }
-    // The worker opens the journal: this process lets go of it first.
-    drop(runtime);
-    // This run's flags are the worker's when it starts now; a running one
-    // keeps its own (docs/client-tui-plan.md).
+    let notice = hand_over_flags(&session, false)?;
+    if let Some(notice) = notice {
+        eprintln!("noel: {notice}");
+    }
+    let endpoint = server::client::Endpoint::new(None, None)?;
+    let session_dir = config.paths.session_dir.clone();
+    if let Some(session) = attach::run(&session, endpoint, config, cli.owned_screen(), true).await?
+    {
+        // The new image reopens the session shown last, by its journal.
+        let journal = fs::read_to_string(dir.worker_journal(&session))
+            .ok()
+            .map(|text| PathBuf::from(text.trim_end()))
+            .unwrap_or_else(|| session_dir.join(format!("{session}.jsonl")));
+        restart_current_process(Some(&journal))?;
+    }
+    Ok(())
+}
+
+/// Leaves this run's flags and environment for `session`'s worker when it
+/// starts now; a running one keeps its own, and the notice says so
+/// (docs/client-tui-plan.md). A session `switched` to (not the one this
+/// run opened) keeps its own model and thinking level, as `/resume` does.
+pub(crate) fn hand_over_flags(session: &str, switched: bool) -> Result<Option<String>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = server::RuntimeDir::ensure(server::RuntimeDir::locate())?;
     dir.ensure_workers()?;
-    let running = fs::read_to_string(dir.worker_applied_args(&session))
+    let running = fs::read_to_string(dir.worker_applied_args(session))
         .ok()
-        .filter(|_| dir.worker_socket(&session).exists())
+        .filter(|_| dir.worker_socket(session).exists())
         .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok());
-    let notice = match running {
+    Ok(match running {
         Some(running) if running != args => Some(format!(
             "this session's worker runs with other flags ({}); quit every client to start it with yours",
             if running.is_empty() { "none".to_owned() } else { running.join(" ") }
@@ -1832,8 +1934,10 @@ async fn run_client_tui(runtime: Runtime, config: LoadedConfig, cli: &Cli) -> Re
             let env: serde_json::Map<String, serde_json::Value> = std::env::vars()
                 .map(|(key, value)| (key, serde_json::Value::String(value)))
                 .collect();
-            let path = dir.worker_args(&session);
-            let launch = serde_json::json!({"args": args, "env": env});
+            let path = dir.worker_args(session);
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let launch =
+                serde_json::json!({"args": args, "env": env, "cwd": cwd, "switched": switched});
             let mut file = {
                 use std::os::unix::fs::OpenOptionsExt;
                 fs::OpenOptions::new()
@@ -1846,12 +1950,38 @@ async fn run_client_tui(runtime: Runtime, config: LoadedConfig, cli: &Cli) -> Re
             file.write_all(launch.to_string().as_bytes())?;
             None
         }
-    };
-    if let Some(notice) = notice {
-        eprintln!("noel: {notice}");
+    })
+}
+
+/// A journal for a `--no-session` run in client mode, in the runtime
+/// directory: a new session with `runtime`'s cwd, workspace and model.
+fn ephemeral_journal(runtime: &Runtime) -> Result<(String, PathBuf)> {
+    let dir = server::RuntimeDir::ensure(server::RuntimeDir::locate())?;
+    let base = dir.root().join("ephemeral");
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&base)?;
     }
-    let endpoint = server::client::Endpoint::new(None, None)?;
-    attach::run(&session, endpoint, config, cli.owned_screen(), true).await
+    let session = runtime.session();
+    let (store, state) =
+        SessionStore::create_with_workspace(&base, session.cwd.clone(), session.workspace.clone())?;
+    store.record_active_model(session.active_model.clone())?;
+    store.record_active_thinking_level(session.active_thinking_level.clone())?;
+    store.record_active_account(session.active_account.clone())?;
+    Ok((state.session_id, store.path().to_path_buf()))
+}
+
+/// The session whose journal at `path` its running worker holds, if one
+/// does: the lock's holder `pid` is the worker in the session's record.
+pub(crate) fn held_by_worker(path: &Path, pid: u32) -> Option<String> {
+    let session = SessionStore::read(path).ok()?.session_id;
+    let dir = server::RuntimeDir::check(server::RuntimeDir::locate()).ok()?;
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.worker_record(&session)).ok()?).ok()?;
+    (record["pid"].as_u64() == Some(u64::from(pid))).then_some(session)
 }
 
 /// Before the TUI opens (the terminal is still plain), offer to install
@@ -3470,7 +3600,7 @@ fn resume_hint(runtime: &Runtime) -> Option<String> {
     }
 }
 
-struct AutoRestart {
+pub(crate) struct AutoRestart {
     executable: PathBuf,
     modified: Option<SystemTime>,
     pending: Option<(SystemTime, Instant)>,
@@ -3482,7 +3612,7 @@ struct AutoRestart {
 const RESTART_DEBOUNCE: Duration = Duration::from_secs(2);
 
 impl AutoRestart {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         let enabled = std::env::var("NOEL_DOGFOOD_AUTO_RESTART").ok().as_deref() == Some("1");
         if !enabled {
             return Self {
@@ -3506,7 +3636,7 @@ impl AutoRestart {
         }
     }
 
-    fn should_restart(&mut self) -> Result<bool> {
+    pub(crate) fn should_restart(&mut self) -> Result<bool> {
         let Some(modified) = self.modified else {
             return Ok(false);
         };
@@ -4914,9 +5044,9 @@ fn transcript_overflow(
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-struct TuiSurface<'a> {
-    terminal: &'a mut TuiTerminal,
-    viewport_height: &'a mut u16,
+pub(crate) struct TuiSurface<'a> {
+    pub(crate) terminal: &'a mut TuiTerminal,
+    pub(crate) viewport_height: &'a mut u16,
 }
 
 fn new_tui_terminal(height: u16, owned_screen: bool) -> Result<TuiTerminal> {

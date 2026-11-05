@@ -67,6 +67,38 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
    (§7.4, §9), the non-parity register (upstream pi's TUI is in process) and
    the parity status.
 
+## Status
+
+- Slices 1, 2, 4 and 5 are built; slice 6 runs behind `NOEL_CLIENT_TUI=1`,
+  under which every `make e2e` suite passes.
+- How a local `noel` hands its session over:
+  - The client prepares the session as before (`--session`, `--continue`,
+    `--fork`, a new one), lets go of the journal and attaches.
+  - Its flags, environment and cwd go to the session's worker in
+    `workers/<id>.args.json` when the worker starts. A running worker keeps
+    its own, and the client says so.
+  - A session reached by a switch (`/resume`, a pick) keeps its model.
+  - A journal outside the session directory (`--session <path>`) is named
+    in `workers/<id>.journal`, and the server opens it from there.
+  - `--no-session` uses a journal in the runtime directory, deleted on exit.
+  - A session its worker already holds is attached to without waiting for
+    the lock.
+- The rules that keep `noel`'s behaviour:
+  - Opening a session whose context ends mid-turn resumes it once: `resume`
+    without a run named answers first, then the queue.
+  - Ctrl+C, `/interrupt` and quitting abort with `keepQueue`.
+  - `/quit` ends the worker once no client holds the session.
+  - A signal that ends a local `noel` that is the only client stops the
+    worker too, so its tools end with it.
+  - Submissions and commands keep the order typed.
+  - A queued slash-tool command is placed alone.
+  - Retries and failover switches are notes in the transcript.
+  - A rebuilt binary restarts the client (dogfood).
+- Left:
+  - Slice 3's login relay and extension UI over the link.
+  - Making client mode the default, and measuring its latency.
+  - Slice 7.
+
 ## Risks
 
 - `main.rs` is large and the TUI is the most tested surface (`make e2e`); the

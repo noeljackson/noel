@@ -18,6 +18,17 @@ fn tui_terminal() -> MutexGuard<'static, Option<bool>> {
     TUI_TERMINAL.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What a fatal signal does first, besides the process's own tool groups:
+/// plain `noel` as a client stops the session's worker when it is the only
+/// client, so the session's tools end with it.
+type ExitHook = Box<dyn Fn() + Send>;
+static EXIT_HOOK: Mutex<Option<ExitHook>> = Mutex::new(None);
+
+/// Sets (or, with `None`, clears) what a fatal signal runs before exiting.
+pub(crate) fn set_exit_hook(hook: Option<ExitHook>) {
+    *EXIT_HOOK.lock().unwrap_or_else(PoisonError::into_inner) = hook;
+}
+
 /// Records that the TUI is taking the terminal; called before it enables raw
 /// mode, so a signal never finds raw mode on without a claim.
 pub(crate) fn claim_tui_terminal(owned_screen: bool) {
@@ -62,6 +73,9 @@ pub(crate) fn install() {
 
 #[cfg(unix)]
 fn exit_for_signal(signal: i32) -> ! {
+    if let Some(hook) = &*EXIT_HOOK.lock().unwrap_or_else(PoisonError::into_inner) {
+        hook();
+    }
     noel_core::kill_running_tool_groups();
     let mut terminal = tui_terminal();
     // Both locks stay held until exit: a concurrent normal restore waits, and

@@ -1118,3 +1118,115 @@ async fn a_continue_is_refused_while_a_run_is_active() {
         .await;
     assert_eq!(*refusal.lock().unwrap(), Some(SubmitError::Busy));
 }
+
+/// A context ending in the prompt, as a run whose request failed leaves it.
+fn unanswered(name: &str) -> Fixture {
+    let fixture = Fixture::new(name, AbortPolicy::KeepQueue);
+    let path = fixture.path.clone();
+    drop(fixture);
+    let (store, state) = SessionStore::open(path.clone()).unwrap();
+    let mut runtime = Runtime::with_store(state, systems(), store);
+    let start = RunStart {
+        id: "run-1".into(),
+        request_id: None,
+        kind: SubmissionKind::Prompt,
+    };
+    runtime.start_run(start, "work".into(), Vec::new()).unwrap();
+    runtime
+        .end_run(
+            "run-1",
+            RunStatus::Failed,
+            Some(RunFailure {
+                reason: FailureReason::ModelError,
+                detail: "provider down".into(),
+            }),
+        )
+        .unwrap();
+    drop(runtime);
+    Fixture::reopen(&path, AbortPolicy::KeepQueue)
+}
+
+#[tokio::test]
+async fn resuming_an_unfinished_turn_answers_it_before_the_queue() {
+    let mut fixture = unanswered("resume-unfinished");
+    queued(
+        fixture
+            .controller
+            .enqueue(QueueMode::FollowUp, follow_up("and then?", "f-1")),
+    );
+    fixture.take_events();
+    fixture.script([says("answered"), says("then this")]);
+    let Ok(start) = fixture.controller.resume_unfinished().await else {
+        panic!("an unfinished turn resumes while idle");
+    };
+    let (_sender, mut inbox) = mpsc::unbounded_channel::<Action>();
+    assert!(fixture.controller.run(start, &mut inbox, |a, b| a(b)).await);
+    assert_eq!(
+        fixture.take_events(),
+        [
+            "run started",
+            "assistant answered",
+            "placed f-1",
+            "user and then?",
+            "assistant then this",
+            "settled Completed",
+        ]
+    );
+    // Nothing is unfinished now.
+    assert!(fixture.controller.resume_unfinished().await.is_err());
+}
+
+#[tokio::test]
+async fn a_queued_slash_tool_command_is_placed_alone() {
+    let mut fixture = Fixture::new("tool-follow-ups", AbortPolicy::KeepQueue);
+    let gate = Arc::new(Notify::new());
+    fixture.script([after(&gate, "first"), says("prose")]);
+    let release_gate = gate.clone();
+    fixture
+        .start(
+            "work",
+            "r-1",
+            vec![
+                act(|busy| {
+                    queued(busy.submit(follow_up("one", "f-1"), WhenBusy::FollowUp));
+                    queued(busy.submit(follow_up("two", "f-2"), WhenBusy::FollowUp));
+                    queued(busy.submit(
+                        follow_up("/read missing-tool-fixture.txt", "f-3"),
+                        WhenBusy::FollowUp,
+                    ));
+                    queued(busy.submit(follow_up("three", "f-4"), WhenBusy::FollowUp));
+                }),
+                release(&release_gate),
+            ],
+        )
+        .await;
+    let events = fixture.take_events();
+    let placed = events
+        .iter()
+        .filter(|event| event.starts_with("placed") || event.starts_with("user"))
+        .cloned()
+        .collect::<Vec<_>>();
+    // Prose up to the command is one message; the command is placed alone
+    // and fails (the file is missing), so `three` is still queued.
+    assert_eq!(
+        placed,
+        [
+            "user work",
+            "placed f-1,f-2",
+            "user one\n---\ntwo",
+            "placed f-3",
+        ],
+        "{events:?}"
+    );
+    assert!(
+        events.last().unwrap().starts_with("settled Failed"),
+        "{events:?}"
+    );
+    let left = fixture.controller.queue().items();
+    assert_eq!(
+        left.iter()
+            .map(|item| item.content.as_str())
+            .collect::<Vec<_>>(),
+        ["three"]
+    );
+}
