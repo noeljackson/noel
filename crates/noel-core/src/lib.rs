@@ -740,6 +740,8 @@ pub struct ReloadableSystems {
     pub retry: RuntimeRetrySettings,
     pub offline: bool,
     pub compaction: RuntimeCompactionSettings,
+    /// How codemode presents the tools (`codemode` settings).
+    pub codemode: codemode::Presentation,
     /// How often a run saves what it has produced so far (spec §4.2).
     pub progress: RuntimeProgressSettings,
     pub model_context_windows: BTreeMap<String, u64>,
@@ -774,6 +776,7 @@ impl Default for ReloadableSystems {
             retry: RuntimeRetrySettings::default(),
             offline: false,
             compaction: RuntimeCompactionSettings::default(),
+            codemode: codemode::Presentation::default(),
             progress: RuntimeProgressSettings::default(),
             model_context_windows: BTreeMap::new(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
@@ -943,6 +946,7 @@ impl ReloadableSystems {
                     )
                 })
                 .collect(),
+            codemode: codemode::Presentation::from_settings(config.settings.codemode.as_ref()),
             compaction: {
                 let settings = config.settings.compaction.clone().unwrap_or_default();
                 RuntimeCompactionSettings {
@@ -4822,6 +4826,27 @@ fn tool_result_media(images: Vec<noel_tools::ToolImage>) -> Vec<MediaInput> {
 /// name replaces it: the model is sent one definition per name, the one
 /// that runs.
 fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
+    let definitions = enabled_tool_definitions(runtime);
+    if !model_tool_enabled(runtime, codemode::CODEMODE) {
+        return definitions;
+    }
+    codemode::present(
+        definitions,
+        &tool_guidelines(runtime),
+        runtime.systems.codemode,
+    )
+}
+
+/// The prompt guidelines of each active tool, by name.
+fn tool_guidelines(runtime: &Runtime) -> BTreeMap<String, Vec<String>> {
+    prompt_tools(runtime)
+        .into_iter()
+        .map(|tool| (tool.name, tool.guidelines))
+        .collect()
+}
+
+/// The enabled tools as they are, before codemode's presentation.
+fn enabled_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
     let mut definitions = builtin_tool_definitions()
         .into_iter()
         .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
@@ -4840,10 +4865,6 @@ fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
                 parameters: tool.parameters.clone(),
             }),
     );
-    if model_tool_enabled(runtime, codemode::CODEMODE) {
-        let callable = codemode::callable(&definitions);
-        definitions.push(codemode::definition(&callable));
-    }
     definitions
 }
 
@@ -5439,9 +5460,17 @@ async fn execute_model_tool_call_with(
         }
     } else if tool_call.name == codemode::CODEMODE {
         if model_tool_enabled(runtime, codemode::CODEMODE) {
-            let callable = codemode::callable(&active_tool_definitions(runtime));
-            let result =
-                codemode::run(runtime, tool_call, &callable, on_nested, cancellation).await?;
+            let callable = codemode::callable(&enabled_tool_definitions(runtime));
+            let guidelines = tool_guidelines(runtime);
+            let result = codemode::run(
+                runtime,
+                tool_call,
+                &callable,
+                &guidelines,
+                on_nested,
+                cancellation,
+            )
+            .await?;
             is_error = result.is_error;
             images = result.images;
             vec![result.output]

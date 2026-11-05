@@ -19,6 +19,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "chord-v2-messages.json",
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
+    "codemode-declarations.json",
     "error-classification.json",
     "github-copilot-gpt-6.1-sol.json",
     "google-gemini-2.5-pro.json",
@@ -45,6 +46,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "slash-commands.json",
     "system-prompt.json",
     "tool-behavior.json",
+    "tool-search.json",
     "tui-transcripts.json",
 ];
 
@@ -58,6 +60,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "chord-v2-messages-fixture.ts",
     "cli-contract-fixture.ts",
     "cloudflare-fixture.ts",
+    "codemode-declarations-fixture.ts",
     "codex-oauth-fixture.ts",
     "copilot-fixture.ts",
     "error-classification-fixture.ts",
@@ -79,6 +82,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "slash-command-fixture.ts",
     "system-prompt-fixture.ts",
     "tool-behavior-fixture.ts",
+    "tool-search-fixture.ts",
     "tui-transcript-fixture.ts",
 ];
 
@@ -177,6 +181,10 @@ fn every_script_output_is_committed() {
             fixture_set(&["cloudflare-ai-gateway-kimi.json"]),
         ),
         (
+            "codemode-declarations-fixture.ts",
+            fixture_set(&["codemode-declarations.json"]),
+        ),
+        (
             "codex-oauth-fixture.ts",
             fixture_set(&["openai-codex-chatgpt-oauth.json"]),
         ),
@@ -253,6 +261,7 @@ fn every_script_output_is_committed() {
             "tool-behavior-fixture.ts",
             fixture_set(&["tool-behavior.json"]),
         ),
+        ("tool-search-fixture.ts", fixture_set(&["tool-search.json"])),
         (
             "tui-transcript-fixture.ts",
             fixture_set(&["tui-transcripts.json"]),
@@ -352,6 +361,10 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "cloudflare-ai-gateway-kimi.json",
             "crates/noel-ai/src/lib.rs",
         ),
+        (
+            "codemode-declarations.json",
+            "crates/noel-codemode/src/declarations.rs",
+        ),
         ("error-classification.json", "crates/noel-ai/src/lib.rs"),
         (
             "github-copilot-gpt-6.1-sol.json",
@@ -405,6 +418,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "tool-behavior.json",
             "crates/noel-core/src/tool_parity_tests.rs",
         ),
+        ("tool-search.json", "crates/noel-codemode/src/search.rs"),
         ("tui-transcripts.json", "crates/noel-tui/src/lib.rs"),
     ]
     .into_iter()

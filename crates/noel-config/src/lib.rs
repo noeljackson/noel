@@ -467,6 +467,9 @@ pub struct Settings {
     pub markdown: Option<MarkdownSettings>,
     #[serde(default)]
     pub warnings: Option<WarningSettings>,
+    /// How codemode presents tools (upstream `codemode`).
+    #[serde(default)]
+    pub codemode: Option<CodemodeSettings>,
     #[serde(default)]
     pub model_refresh: Option<ModelRefreshSettings>,
     /// Failover-only multi-account rotation. Disabled by default.
@@ -563,6 +566,7 @@ impl Settings {
             show_hardware_cursor: overrides.show_hardware_cursor.or(self.show_hardware_cursor),
             markdown: merge_optional_settings(self.markdown, overrides.markdown),
             warnings: merge_optional_settings(self.warnings, overrides.warnings),
+            codemode: merge_optional_settings(self.codemode, overrides.codemode),
             model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
             failover: merge_optional_settings(self.failover, overrides.failover),
             server: merge_optional_settings(self.server, overrides.server),
@@ -1005,6 +1009,27 @@ impl MergeSettings for MarkdownSettings {
     fn merge(self, overrides: Self) -> Self {
         Self {
             code_block_indent: overrides.code_block_indent.or(self.code_block_indent),
+        }
+    }
+}
+
+/// Upstream's `codemode` settings: `mode` is `"on"` (the default: tools stay
+/// declared and their descriptions say how scripts call them) or `"only"`
+/// (codemode lists every script-callable tool and the others are not
+/// declared); `inlineBudget` is the estimated tokens codemode's description
+/// may spend on tool declarations (default 3000).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodemodeSettings {
+    pub mode: Option<String>,
+    pub inline_budget: Option<serde_json::Number>,
+}
+
+impl MergeSettings for CodemodeSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            mode: overrides.mode.or(self.mode),
+            inline_budget: overrides.inline_budget.or(self.inline_budget),
         }
     }
 }

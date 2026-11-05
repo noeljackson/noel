@@ -255,6 +255,12 @@ The description is `DESCRIPTION_INTRO` (`tool.ts:118-120`) followed by `Globals:
   - `on` lists only non-direct callable tools, and appends `Codemode: \`tools.<id>(args)\`
     resolves to <...>.` to each declared callable tool (`:301-329`).
   - `only` lists every callable tool and hides the active direct tools' declarations.
+- **noel:** `noel_codemode::declarations` ports `cm/src/declarations.ts` (goldens:
+  `tests/fixtures/ts-parity/codemode-declarations.json`, every call of
+  `cm/test/declarations.test.ts`); `crates/noel-core/src/codemode.rs` ports the catalog, modes
+  and `describeScriptCall`. The discovery globals (`execute.ts:671-735`) use
+  `noel_codemode::search`, upstream's BM25 ranker (`ca/src/extensions/tool-search/tool.ts`;
+  goldens `tool-search.json`).
 - **Durable** adds "The script survives a restart..." and moves the catalog into a system-prompt
   section (`du/src/codemode/describe.ts:29-48,118-157`).
 

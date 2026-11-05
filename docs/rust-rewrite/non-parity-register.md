@@ -692,7 +692,7 @@ upstream merges them (`settings.json` fixture). These parts differ:
   (`--tools`, `enabledTools`, or `defaultTools: ["+codemode"]`), as
   upstream registers it inactive; a pattern such as `*` never selects it
   (see Codemode). Upstream's other `defaultActive: false` tool,
-  `tool_search`, and its MCP rules for `--tools` do not exist in Rust; every
+  `tool_search` (it loads `deferred` tools, which noel does not have), and its MCP rules for `--tools` do not exist in Rust; every
   extension tool is on unless an allowlist or `--exclude-tools` leaves it out.
 - Tool flags are not saved with the session. Earlier Rust versions saved them
   as the session's disabled tools; a saved list is cleared when the session is
@@ -717,13 +717,25 @@ upstream's, byte for byte (`docs/codemode-port.md`). These parts differ:
 - **Engine.** djs is always strict and `eval` is always indirect; one
   upstream sandbox test depends on sloppy mode. Interrupts are polled every
   10,000 units of fuel. Scripts are JavaScript only, as upstream's.
-- **Description.** Upstream's introduction and globals lines, without the
-  discovery globals (`searchTools`, `describeTool`, `describeNamespace`) and
-  `models`, which noel does not have; the nested tools are a plain list of
-  `tools.<id>(args)` with each tool's first description line, not upstream's
-  declarations, budgeted catalog or `codemode.mode`. The tool proxy's error
-  for an unknown tool still mentions `searchTools`, as upstream's prelude
-  words it.
+- **Description.** Upstream's `createCodemodeDescription`,
+  `describeScriptCall` and `codemode.mode`/`codemode.inlineBudget`, on
+  upstream's declarations (`noel_codemode::declarations`, matched byte for
+  byte against every call of upstream's `declarations.test.ts`). Every noel
+  tool has `direct` exposure, so with `mode: "on"` codemode lists no tools
+  and each callable tool's description ends with upstream's `Codemode:`
+  line; with `"only"` codemode lists them all (budgeted, cheapest first) and
+  they are not declared, but the system prompt still lists them. There are
+  no namespaces or deferred tools, and no `models` line. In declarations,
+  object values of `const`, `enum` and `@default` render with sorted keys,
+  where upstream keeps insertion order. `bash` and `read` have upstream's
+  output schemas; other tools resolve to a string.
+- **Discovery globals.** `searchTools()`, `describeTool()`,
+  `describeNamespace()` and `ALL_TOOLS` samples as upstream's. Without
+  namespaces, a `namespace` filter matches nothing and `describeNamespace()`
+  returns `undefined`. The ranker (`noel_codemode::search`) matches
+  upstream's tokens, documents and BM25 scores on its tests, except that
+  text in Chinese, Japanese and Thai is split by Unicode word boundaries
+  (one word per ideograph, one per Thai run), not by ICU's dictionaries.
 - **Nested tools.** Scripts call the active built-in and extension tools
   except `todo` (it changes the session; model-only here) and codemode
   itself. Every call goes through the extension `toolCall` gate and runs in
@@ -731,8 +743,7 @@ upstream's, byte for byte (`docs/codemode-port.md`). These parts differ:
   time. A nested call resolves to its text output, except as upstream:
   `bash` resolves to `{output, truncated, full_output_path?, exit_code,
   wall_time_seconds}` (also on a non-zero exit) and `read` of an image to
-  `{type: "image", data, mimeType, note}`. The description's nested-tool
-  list says so in one sentence each, not as upstream's declarations. Nested calls are reported as they change (`TurnEvent::NestedToolCalls`):
+  `{type: "image", data, mimeType, note}`. These are their output schemas. Nested calls are reported as they change (`TurnEvent::NestedToolCalls`):
   the TUI lists them as upstream's renderer does, above the result once the
   call ends, and RPC sends upstream's `tool_execution_update` with
   `details.calls`. They have no `tool_execution_*` events of their own, the
