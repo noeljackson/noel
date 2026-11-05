@@ -121,14 +121,37 @@ pub(crate) struct RuntimeDir {
     root: PathBuf,
 }
 
+/// `-<hash>` of NOEL_DIR and NOEL_SESSION_DIR when either is set, so each
+/// pair has its own server; empty for the defaults.
+fn scope_suffix() -> String {
+    use sha2::{Digest, Sha256};
+    let dir = std::env::var_os("NOEL_DIR").filter(|dir| !dir.is_empty());
+    let sessions = std::env::var_os(noel_config::ENV_SESSION_DIR).filter(|dir| !dir.is_empty());
+    if dir.is_none() && sessions.is_none() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    for part in [dir, sessions] {
+        hasher.update(part.unwrap_or_default().as_encoded_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let hex = digest[..8].iter().map(|byte| format!("{byte:02x}"));
+    format!("-{}", hex.collect::<String>())
+}
+
 impl RuntimeDir {
     pub fn locate() -> PathBuf {
         if let Some(dir) = std::env::var_os(ENV_RUNTIME_DIR).filter(|dir| !dir.is_empty()) {
             return PathBuf::from(dir);
         }
+        // A server serves one agent dir and one session dir: a `noel` with
+        // other ones (NOEL_DIR, NOEL_SESSION_DIR) has its own server, in a
+        // directory named after them next to the default one.
+        let scope = scope_suffix();
         match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
-            Some(dir) => PathBuf::from(dir).join("noel"),
-            None => PathBuf::from(format!("/tmp/noel-{}", own_uid())),
+            Some(dir) => PathBuf::from(dir).join(format!("noel{scope}")),
+            None => PathBuf::from(format!("/tmp/noel-{}{scope}", own_uid())),
         }
     }
 
@@ -216,6 +239,17 @@ impl RuntimeDir {
 
     pub fn worker_record(&self, session: &str) -> PathBuf {
         self.workers().join(format!("{session}.json"))
+    }
+
+    /// The flags of the `noel` that opened the session, for its next
+    /// worker (docs/client-tui-plan.md).
+    pub fn worker_args(&self, session: &str) -> PathBuf {
+        self.workers().join(format!("{session}.args.json"))
+    }
+
+    /// The flags the session's running worker started with.
+    pub fn worker_applied_args(&self, session: &str) -> PathBuf {
+        self.workers().join(format!("{session}.applied.json"))
     }
 
     pub fn worker_log(&self, session: &str) -> PathBuf {

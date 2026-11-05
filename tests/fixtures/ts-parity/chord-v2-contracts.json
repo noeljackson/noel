@@ -478,7 +478,8 @@
                             "selector",
                             "session",
                             "login",
-                            "draft"
+                            "draft",
+                            "diff"
                           ]
                         }
                       }
@@ -490,7 +491,7 @@
           }
         }
       },
-      "fingerprint": "ae318bc69debbc73"
+      "fingerprint": "dfcf02e964078fb2"
     },
     {
       "declaration": {

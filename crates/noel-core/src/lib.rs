@@ -1392,9 +1392,18 @@ pub enum SavedProgress {
 /// What `record` adds to the session's history, if anything.
 fn history_record(record: &SessionRecord) -> Option<history::HistoryRecord> {
     Some(match record {
-        SessionRecord::Message { message, ts, .. } => history::HistoryRecord::Message {
+        SessionRecord::Message {
+            message,
+            ts,
+            placed,
+            ..
+        } => history::HistoryRecord::Message {
             message: message.clone(),
             timestamp: *ts,
+            queued: placed.first().map(|id| match id.mode {
+                QueueMode::Steer => "steer",
+                QueueMode::FollowUp => "followUp",
+            }),
         },
         SessionRecord::MessagesSnapshot { messages } => history::HistoryRecord::Reset {
             messages: messages.len(),
@@ -2126,6 +2135,7 @@ impl SessionStore {
                 .map(|message| history::HistoryRecord::Message {
                     message,
                     timestamp: None,
+                    queued: None,
                 })
                 .collect());
         }

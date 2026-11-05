@@ -70,6 +70,9 @@ pub(crate) struct View {
     trimmed: usize,
     agent: Value,
     usage: Value,
+    /// `docs["noel.todos"]`: the session's todo list, as the TUI's panel
+    /// shows it.
+    todos: Value,
     inbox: Value,
     live: Live,
     last_run: Option<Value>,
@@ -156,6 +159,7 @@ impl View {
             trimmed: 0,
             agent: json!({}),
             usage: json!({}),
+            todos: json!({"items": session.todos}),
             inbox: json!({"items": []}),
             live: Live::default(),
             last_run: None,
@@ -187,8 +191,15 @@ impl View {
         self.conversation = conversation(session);
         self.agent = agent;
         self.usage = usage(session);
+        self.todos = json!({"items": session.todos});
         self.inbox = inbox(queue);
         self.last_run = LastRun::of(runtime).map(|last| to_json(&last));
+        // A failed run keeps its error, which the journal saved with it.
+        if let (Some(last), Some(run)) = (self.last_run.as_mut(), session.runs.last()) {
+            if let Some(failure) = run.failure.as_ref().filter(|f| !f.detail.is_empty()) {
+                last["error"] = json!(failure.detail);
+            }
+        }
         self.publish();
     }
 
@@ -209,6 +220,7 @@ impl View {
             Event::Turn { event, .. } => self.turn(event),
             Event::CallReturned { session, queue, .. } => {
                 self.usage = usage(session);
+                self.todos = json!({"items": session.todos});
                 self.inbox = inbox(&queue.items());
                 true
             }
@@ -685,11 +697,12 @@ impl View {
             }
             self.published_entries = self.entries.len();
         }
-        let docs: [(&'static str, Value); 4] = [
+        let docs: [(&'static str, Value); 5] = [
             ("pi.agent", self.agent.clone()),
             ("pi.live", self.live_json()),
             ("pi.inbox", self.inbox.clone()),
             ("pi.usage", self.usage.clone()),
+            ("noel.todos", self.todos.clone()),
         ];
         for (name, doc) in docs {
             let path = vec![key("docs"), key(name)];
@@ -847,6 +860,7 @@ mod tests {
         SavedProgress::History(HistoryRecord::Message {
             message,
             timestamp: Some(5),
+            queued: None,
         })
     }
 
@@ -866,6 +880,7 @@ mod tests {
         let history = [HistoryRecord::Message {
             message: message(MessageRole::User, "hello"),
             timestamp: Some(1),
+            queued: None,
         }];
         let mut view = View::new(&session, &history);
         view.refresh(&runtime, json!({"thinkingLevel": "off", "cwd": "/w"}), &[]);
@@ -978,6 +993,7 @@ mod tests {
             .map(|message| HistoryRecord::Message {
                 message: message.clone(),
                 timestamp: None,
+                queued: None,
             })
             .collect();
         let mut view = View::new(&session, &history);
@@ -1025,6 +1041,7 @@ mod tests {
             .map(|index| HistoryRecord::Message {
                 message: message(MessageRole::User, &index.to_string()),
                 timestamp: None,
+                queued: None,
             })
             .collect();
         let mut view = View::new(&session, &history);

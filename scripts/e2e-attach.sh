@@ -160,9 +160,9 @@ grep -Fq "no session no-such-session on noel server" "${work_dir}/${second}.txt"
 
 # A fork is another session: the TUI attaches to it.
 send_line "${first}" "/fork"
-wait_for "${first}" "attached to session"
+wait_for "${first}" "parent: e2e-attach"
 capture "${first}"
-grep -q "attached to session [0-9]" "${work_dir}/${first}.txt" || fail "${first}" "the fork was not attached"
+grep -q "session: [0-9]" "${work_dir}/${first}.txt" || fail "${first}" "the fork was not attached"
 
 quit "${first}"
 echo "attach e2e passed (artifacts: ${work_dir})"
