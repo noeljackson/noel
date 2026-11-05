@@ -20,6 +20,7 @@
 //! peer uid (`via: "device"`), and through the bridge, as the user ssh let
 //! in (`via: "tunnel"`). There is no relay, pairing or guest yet.
 
+pub(crate) mod accounts;
 pub(crate) mod bridge;
 pub(crate) mod client;
 mod djs_plugins;

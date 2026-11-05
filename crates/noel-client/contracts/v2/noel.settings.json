@@ -1,0 +1,56 @@
+{
+  "name": "noel.settings",
+  "version": 1,
+  "host": "server",
+  "params": [],
+  "variants": {
+    "owner": {
+      "state": {
+        "settings": {
+          "type": "object",
+          "required": [
+            "path",
+            "values"
+          ],
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "values": {
+              "type": "object"
+            }
+          }
+        }
+      },
+      "methods": {
+        "set": {
+          "args": {
+            "type": "object",
+            "required": [
+              "key"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "value": {}
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "values"
+            ],
+            "properties": {
+              "values": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

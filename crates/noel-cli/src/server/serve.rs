@@ -300,11 +300,17 @@ async fn foreground() -> Result<i32> {
         session_dir: config.paths.session_dir.clone(),
         directory: Cell::new(directory_schema(), json!({"sessions": []}))?,
         creating: Mutex::new(()),
+        imported: Mutex::default(),
         cache: Mutex::default(),
         changed: changed.clone(),
     });
     serve_sessions(&host, sessions.clone());
     serve_models(&host, &config, offline)?;
+    super::accounts::serve_accounts(
+        &host,
+        super::accounts::Accounts::new(&config, super::accounts::Endpoints::default())?,
+    );
+    super::accounts::serve_settings(&host, super::accounts::Settings::new(&config)?);
     let plugins = super::plugins::Plugins::start(&host, &dir, &config.paths.agent_dir)?;
     let listen = config
         .settings
@@ -972,8 +978,11 @@ struct Sessions {
     offline: bool,
     session_dir: PathBuf,
     directory: Cell,
-    /// One `create` or `fork` at a time, so a repeat finds the first.
+    /// One `create`, `fork` or `import` at a time, so a repeat finds the
+    /// first.
     creating: Mutex<()>,
+    /// The sessions `import` made, by `requestId`.
+    imported: Mutex<HashMap<String, String>>,
     /// Directory entries by journal, with the size and time they were read
     /// at.
     cache: Mutex<HashMap<PathBuf, (u64, SystemTime, Value)>>,
@@ -994,17 +1003,20 @@ fn serve_sessions(host: &Host, sessions: Arc<Sessions>) {
         if !allowed {
             return Err(forbidden("noel.sessions is the owner's"));
         }
-        let (create, fork) = (sessions.clone(), sessions.clone());
+        let blocking_method = |method: fn(&Sessions, &Value) -> Result<Value, WireError>| {
+            let sessions = sessions.clone();
+            move |args: Value, _ctx| {
+                let sessions = sessions.clone();
+                async move { blocking(move || method(&sessions, &args)).await }
+            }
+        };
         Ok(Implementation::new("owner")
             .state("directory", &sessions.directory)
-            .method("create", move |args, _ctx| {
-                let sessions = create.clone();
-                async move { blocking(move || sessions.create(&args)).await }
-            })
-            .method("fork", move |args, _ctx| {
-                let sessions = fork.clone();
-                async move { blocking(move || sessions.fork(&args)).await }
-            }))
+            .method("create", blocking_method(Sessions::create))
+            .method("fork", blocking_method(Sessions::fork))
+            .method("rename", blocking_method(Sessions::rename))
+            .method("delete", blocking_method(Sessions::delete))
+            .method("import", blocking_method(Sessions::import)))
     });
 }
 
@@ -1094,13 +1106,108 @@ impl Sessions {
         let source_path = self.session_dir.join(format!("{source_id}.jsonl"));
         let source = SessionStore::read(&source_path)
             .map_err(|_| refused("session", format!("no session {source_id}")))?;
+        // A clone copies the session whole, keeping its parent.
+        let clone = args.get("clone").and_then(Value::as_bool) == Some(true);
         let _creating = lock(&self.creating);
-        let id = derived_session_id("fork", text("requestId"));
+        let id = derived_session_id(if clone { "clone" } else { "fork" }, text("requestId"));
         if self.session_dir.join(format!("{id}.jsonl")).exists() {
             return Ok(json!({"sessionId": id, "created": false}));
         }
-        SessionStore::fork_with_id(&self.session_dir, &source, false, &id)
+        SessionStore::fork_with_id(&self.session_dir, &source, clone, &id)
             .map_err(|error| WireError::from(unavailable(error.to_string())))?;
+        self.listed(&id);
+        Ok(json!({"sessionId": id, "created": true}))
+    }
+
+    /// The journal of a session in the directory, if it has one.
+    fn journal(&self, id: &str) -> Result<PathBuf, WireError> {
+        let path = self.session_dir.join(format!("{id}.jsonl"));
+        if valid_session_id(id) && path.is_file() {
+            Ok(path)
+        } else {
+            Err(refused("session", format!("no session {id}")))
+        }
+    }
+
+    /// `rename({sessionId, name})`: an empty name clears it. A session its
+    /// worker holds is renamed there (`/name`), not here.
+    fn rename(&self, args: &Value) -> Result<Value, WireError> {
+        let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
+        let id = text("sessionId");
+        let path = self.journal(id)?;
+        let (store, state) = SessionStore::open(path).map_err(|error| match error {
+            noel_core::SessionError::Locked { .. } => refused(
+                "busy",
+                format!("session {id} is open; rename it there with /name"),
+            ),
+            error => WireError::from(unavailable(error.to_string())),
+        })?;
+        let mut runtime = Runtime::with_store(
+            state,
+            ReloadableSystems::from_config(&self.config, 1),
+            store,
+        );
+        let name = text("name").trim();
+        runtime
+            .rename_session((!name.is_empty()).then(|| name.to_owned()))
+            .map_err(|error| WireError::from(unavailable(error.to_string())))?;
+        drop(runtime);
+        self.listed(id);
+        Ok(json!({ "sessionId": id }))
+    }
+
+    /// `delete({sessionId})`: refused while a worker holds the session.
+    fn delete(&self, args: &Value) -> Result<Value, WireError> {
+        let id = args
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = self.journal(id)?;
+        SessionStore::delete(&path).map_err(|error| match error {
+            noel_core::SessionError::Locked { .. } => {
+                refused("busy", format!("session {id} is open; quit it first"))
+            }
+            error => WireError::from(unavailable(error.to_string())),
+        })?;
+        let _ = self.directory.change(|directory| {
+            let sessions = directory["sessions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let next: Vec<Value> = sessions
+                .into_iter()
+                .filter(|session| session["sessionId"] != json!(id))
+                .collect();
+            vec![noel_chord::delta::Op::Set(
+                vec![noel_chord::delta::Seg::Key("sessions".into())],
+                Value::Array(next),
+            )]
+        });
+        self.changed.notify_one();
+        Ok(json!({ "sessionId": id }))
+    }
+
+    /// `import({requestId, path})`: a session from an exported file (or a
+    /// journal, which is only read) on the server's machine. A repeated
+    /// `requestId` names the session the first made.
+    fn import(&self, args: &Value) -> Result<Value, WireError> {
+        let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
+        let request = text("requestId").to_owned();
+        let path = PathBuf::from(text("path"));
+        if !path.is_absolute() || !path.is_file() {
+            return Err(refused(
+                "path",
+                format!("{} is not an absolute path to a file", path.display()),
+            ));
+        }
+        let _creating = lock(&self.creating);
+        if let Some(id) = lock(&self.imported).get(&request) {
+            return Ok(json!({"sessionId": id, "created": false}));
+        }
+        let (_store, state) = SessionStore::import_path(&self.session_dir, &path)
+            .map_err(|error| refused("path", error.to_string()))?;
+        let id = state.session_id;
+        lock(&self.imported).insert(request, id.clone());
         self.listed(&id);
         Ok(json!({"sessionId": id, "created": true}))
     }
@@ -1206,6 +1313,9 @@ fn directory_entry(state: &SessionState, modified: SystemTime) -> Value {
     if let Some(workspace) = &state.workspace {
         entry["workspace"] = json!(crate::workspace::describe(workspace));
     }
+    if !state.labels.is_empty() {
+        entry["labels"] = json!(state.labels);
+    }
     if let Some(prompt) = state
         .messages
         .iter()
@@ -1246,7 +1356,19 @@ async fn refresh_directory(sessions: Arc<Sessions>, workers: Arc<Workers>) {
 
 fn serve_models(host: &Host, config: &LoadedConfig, offline: bool) -> Result<()> {
     let schema = models_contract().declaration.variants["owner"].state["catalog"].clone();
-    let models = crate::model_select::selectable_models(config, offline)
+    // The models a session can use (with auth, or local), and the scoped
+    // ones (`enabledModels`, `--models`) whether usable or not, each saying
+    // which it is: a picker shows the scope when there is one.
+    let available = crate::model_select::available_models(config, offline);
+    let mut listed = available.clone();
+    for scoped in &config.model_scope {
+        if let Some(model) = crate::model_select::configured_model(config, &scoped.model) {
+            if !listed.iter().any(|listed| std::ptr::eq(*listed, model)) {
+                listed.push(model);
+            }
+        }
+    }
+    let models = listed
         .into_iter()
         .map(|model| {
             let reasoning = model.reasoning();
@@ -1259,13 +1381,22 @@ fn serve_models(host: &Host, config: &LoadedConfig, offline: bool) -> Result<()>
             } else {
                 vec!["off"]
             };
-            json!({
+            let scoped = config.model_scope.iter().find(|scoped| {
+                scoped.model.provider == model.provider && scoped.model.id == model.id
+            });
+            let mut entry = json!({
                 "provider": model.provider,
                 "modelId": model.id,
                 "name": model.name.clone().unwrap_or_else(|| model.id.clone()),
                 "reasoning": reasoning,
                 "thinkingLevels": levels,
-            })
+                "available": available.iter().any(|usable| std::ptr::eq(*usable, model)),
+                "scoped": scoped.is_some(),
+            });
+            if let Some(level) = scoped.and_then(|scoped| scoped.thinking_level.as_ref()) {
+                entry["thinkingLevel"] = json!(level);
+            }
+            entry
         })
         .collect::<Vec<_>>();
     let catalog = Cell::new(schema, json!({ "models": models }))?;

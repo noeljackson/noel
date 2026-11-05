@@ -69,10 +69,34 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
 
 ## Status
 
-- Done. Interactive `noel` is always a client; the in-process TUI is
-  removed (slice 7), and every `make e2e` suite passes. The spec (§7.4, §9)
-  and the non-parity register ("The TUI Is a Client of a Local Server")
-  describe it.
+- Every slice is built, and `make check` and `make e2e` pass. Interactive
+  `noel` is always a client; the in-process TUI is removed (slice 7). The
+  spec (§7.2, §7.4, §9) and the non-parity register ("The TUI Is a Client
+  of a Local Server") describe it.
+- Slice 3:
+  - `noel.sessions` gains `rename`, `delete`, `import` and `fork`'s `clone`,
+    and its directory lists `labels`.
+  - `noel.models` says which models are `available` and which `scoped`.
+  - `noel.accounts` lists the accounts and relays logins (device code,
+    pasted code, API key) and logouts.
+  - `noel.settings` reads and writes the settings.
+  - `noel client rename|delete|fork|import|models|accounts|login|logout|settings`
+    use them.
+  - `/login` through `--attach` to another machine runs there, relayed.
+  - Tests: the mode2 test
+    `the_server_manages_sessions_accounts_and_settings_for_a_client`, and
+    `server::accounts` unit tests of the relayed code and device logins
+    against stub endpoints.
+  - The TUI's own session commands keep running on the worker through
+    `command`, which runs where the server's sessions are.
+- Slice 4's comparison test (`scripts/e2e-render.sh`, in `make e2e`): with
+  the in-process TUI gone, the two ways are the TUI rendering a run live
+  from the view and the TUI rebuilding the same session when reopened
+  (plain `noel`, then `--attach`). The transcripts it writes on exit must
+  match. Before slice 7, every e2e suite passed both in process and as a
+  client.
+- Extension UI needs no relay: extension hosts have no UI in process either
+  (`hasUI` is false).
 - Latency (debug build, faux provider, a fresh server each start, three
   runs): to the first prompt box, about 70 ms in process and 185 ms as a
   client, which starts the server and the worker; from Enter to the reply
@@ -100,10 +124,6 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
   - A queued slash-tool command is placed alone.
   - Retries and failover switches are notes in the transcript.
   - A rebuilt binary restarts the client (dogfood).
-- Slice 3, as built: the session operations a client needs run on the
-  worker through `command`; a local login runs in the client, then the
-  worker reloads. Extension UI needs no relay: extension hosts have no UI
-  in process either (`hasUI` is false).
 
 ## Risks
 

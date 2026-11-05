@@ -1417,7 +1417,8 @@ Where it differs:
 publishes no server or client to match (its application on Chord is
 private), so the objects and processes are noel's, and these parts differ:
 
-- **Objects.** `noel.sessions`, `noel.chat` and `noel.models` are noel's
+- **Objects.** `noel.sessions`, `noel.chat`, `noel.models`, `noel.accounts`
+  and `noel.settings` are noel's
   contracts (version 1, `crates/noel-cli/src/server/contracts/`). Upstream's
   guide shows a `Chat` with `viewer` and `participant` variants and a
   `Sessions` at `server` only as examples.
@@ -1544,8 +1545,9 @@ keys, commands and transcript, and differs here:
   session. `--attach` only detaches.
 - **A run interrupted by a crash** is resumed by the server at once (spec
   §8.3), not when `noel` next opens the session.
-- **`--attach` to another machine** cannot run a login. The TUI names the
-  command to run there.
+- **A login through `--attach` to another machine** runs there
+  (`noel.accounts`): the TUI shows the device code or the sign-in URL, and
+  no browser opens on either machine.
 
 Reason: one code path for a session on this machine and on another, which
 only the connection tells apart (owner's decision, 2026-11-05).
