@@ -69,8 +69,13 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
 
 ## Status
 
-- Slices 1, 2, 4 and 5 are built; slice 6 runs behind `NOEL_CLIENT_TUI=1`,
-  under which every `make e2e` suite passes.
+- Slices 1, 2, 4 and 5 are built. Slice 6 is done: interactive `noel` is
+  a client by default; `NOEL_CLIENT_TUI=0` keeps the in-process TUI until
+  slice 7. Every `make e2e` suite passes both ways.
+- Latency (debug build, faux provider, a fresh server each start, three
+  runs): to the first prompt box, about 70 ms in process and 185 ms as a
+  client, which starts the server and the worker; from Enter to the reply
+  shown, 20-36 ms both ways.
 - How a local `noel` hands its session over:
   - The client prepares the session as before (`--session`, `--continue`,
     `--fork`, a new one), lets go of the journal and attaches.
@@ -96,7 +101,6 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
   - A rebuilt binary restarts the client (dogfood).
 - Left:
   - Slice 3's login relay and extension UI over the link.
-  - Making client mode the default, and measuring its latency.
   - Slice 7.
 
 ## Risks

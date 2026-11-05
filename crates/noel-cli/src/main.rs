@@ -1860,9 +1860,10 @@ async fn run() -> Result<()> {
 }
 
 /// Whether interactive `noel` is a client of a local server
-/// (docs/client-tui-plan.md); `NOEL_CLIENT_TUI=1` until it is the only way.
+/// (docs/client-tui-plan.md): the default; `NOEL_CLIENT_TUI=0` keeps the
+/// in-process TUI until it is removed.
 fn client_tui_enabled() -> bool {
-    std::env::var("NOEL_CLIENT_TUI").is_ok_and(|value| value == "1")
+    std::env::var("NOEL_CLIENT_TUI").map_or(true, |value| value != "0")
 }
 
 /// Interactive `noel` as a client: the session chosen and prepared as for
