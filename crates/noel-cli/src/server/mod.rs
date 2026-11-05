@@ -441,7 +441,9 @@ pub(crate) fn worker_principal(session: &str, generation: u64) -> Value {
 /// else gets nothing (spec §6, §7.2).
 pub(crate) fn chat_variant(principal: &Value, session: &str) -> Option<&'static str> {
     match principal.get("kind").and_then(Value::as_str) {
-        Some("owner") => Some("participant"),
+        // The server itself (the worker's parent link), which renames and
+        // deletes a session it holds through it (`noel.sessions`).
+        Some("owner") | Some("server") => Some("participant"),
         Some("guest") if principal.get("session").and_then(Value::as_str) == Some(session) => {
             match principal.get("mode").and_then(Value::as_str) {
                 Some("full") => Some("participant"),

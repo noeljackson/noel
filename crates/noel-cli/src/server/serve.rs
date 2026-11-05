@@ -295,6 +295,7 @@ async fn foreground() -> Result<i32> {
         closing: AtomicBool::new(false),
     });
     let sessions = Arc::new(Sessions {
+        host: host.clone(),
         config: config.clone(),
         offline,
         session_dir: config.paths.session_dir.clone(),
@@ -942,10 +943,13 @@ fn session_of(address: &Address) -> Option<&str> {
 }
 
 impl Route for SessionRoute {
-    /// The owner reaches any session, a guest only its own.
+    /// The owner reaches any session, a guest only its own. The server's
+    /// own references (a null principal: `noel.sessions` renaming or
+    /// deleting an open session) reach any.
     fn authorize(&self, principal: &Value, address: &Address) -> bool {
         session_of(address).is_some_and(|id| match principal.get("kind").and_then(Value::as_str) {
             Some("owner") => true,
+            None if principal.is_null() => true,
             Some("guest") => principal.get("session").and_then(Value::as_str) == Some(id),
             _ => false,
         })
@@ -974,6 +978,9 @@ impl Route for SessionRoute {
 // ─── noel.sessions and noel.models ──────────────────────────────────────────
 
 struct Sessions {
+    /// The server's host: a session a worker holds is renamed or deleted
+    /// through that worker (`noel.chat`).
+    host: Host,
     config: LoadedConfig,
     offline: bool,
     session_dir: PathBuf,
@@ -1014,10 +1021,27 @@ fn serve_sessions(host: &Host, sessions: Arc<Sessions>) {
             .state("directory", &sessions.directory)
             .method("create", blocking_method(Sessions::create))
             .method("fork", blocking_method(Sessions::fork))
-            .method("rename", blocking_method(Sessions::rename))
-            .method("delete", blocking_method(Sessions::delete))
+            .method("rename", {
+                let sessions = sessions.clone();
+                move |args: Value, _ctx| {
+                    let sessions = sessions.clone();
+                    async move { sessions.rename_open_or_not(args).await }
+                }
+            })
+            .method("delete", {
+                let sessions = sessions.clone();
+                move |args: Value, _ctx| {
+                    let sessions = sessions.clone();
+                    async move { sessions.delete_open_or_not(args).await }
+                }
+            })
             .method("import", blocking_method(Sessions::import)))
     });
+}
+
+/// A refusal because a worker holds the session.
+fn is_open(error: &WireError) -> bool {
+    error.to_string().contains("is open")
 }
 
 async fn blocking(
@@ -1129,17 +1153,94 @@ impl Sessions {
         }
     }
 
+    /// `rename`, here or, for a session a worker holds, through it.
+    async fn rename_open_or_not(self: Arc<Self>, args: Value) -> Result<Value, WireError> {
+        let this = self.clone();
+        let here = args.clone();
+        match blocking(move || this.rename(&here)).await {
+            Err(error) if is_open(&error) => {
+                let id = args["sessionId"].as_str().unwrap_or_default().to_owned();
+                let name = args["name"].as_str().unwrap_or_default().trim().to_owned();
+                if name.is_empty() {
+                    return Err(refused(
+                        "busy",
+                        format!("session {id} is open; a name can be cleared only while it is not"),
+                    ));
+                }
+                self.through_worker(&id, &format!("/name {name}")).await?;
+                self.listed(&id);
+                Ok(json!({ "sessionId": id }))
+            }
+            outcome => outcome,
+        }
+    }
+
+    /// `delete`, here or, for a session a worker holds and no client, after
+    /// that worker ends (`/quit`, which it refuses during a run or while a
+    /// client holds the session).
+    async fn delete_open_or_not(self: Arc<Self>, args: Value) -> Result<Value, WireError> {
+        let this = self.clone();
+        let here = args.clone();
+        match blocking(move || this.delete(&here)).await {
+            Err(error) if is_open(&error) => {
+                let id = args["sessionId"].as_str().unwrap_or_default().to_owned();
+                let answer = self.through_worker(&id, "/quit").await?;
+                if answer["leaving"] != true {
+                    return Err(refused(
+                        "busy",
+                        format!("session {id} is open in a client or running; quit it first"),
+                    ));
+                }
+                // The worker exits once this hold is let go; then its lock is.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let this = self.clone();
+                    let here = args.clone();
+                    match blocking(move || this.delete(&here)).await {
+                        Err(error) if is_open(&error) && tokio::time::Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        outcome => return outcome,
+                    }
+                }
+            }
+            outcome => outcome,
+        }
+    }
+
+    /// Runs `line` on the worker holding session `id`, as a TUI would.
+    async fn through_worker(&self, id: &str, line: &str) -> Result<Value, WireError> {
+        let chat = self
+            .host
+            .get(noel_client::contracts::chat(), json!({ "session": id }));
+        let args = json!({"line": line, "requestId": super::new_request_id()});
+        let answer = noel_client::call(&chat, "command", args).await;
+        chat.release();
+        let answer = answer.map_err(|error| WireError::from(unavailable(format!("{error:#}"))))?;
+        if let Some(error) = answer["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["kind"] == "error")
+        {
+            return Err(refused(
+                "session",
+                error["text"].as_str().unwrap_or_default(),
+            ));
+        }
+        Ok(answer)
+    }
+
     /// `rename({sessionId, name})`: an empty name clears it. A session its
-    /// worker holds is renamed there (`/name`), not here.
+    /// worker holds is renamed through it (`rename_open_or_not`).
     fn rename(&self, args: &Value) -> Result<Value, WireError> {
         let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
         let id = text("sessionId");
         let path = self.journal(id)?;
         let (store, state) = SessionStore::open(path).map_err(|error| match error {
-            noel_core::SessionError::Locked { .. } => refused(
-                "busy",
-                format!("session {id} is open; rename it there with /name"),
-            ),
+            noel_core::SessionError::Locked { .. } => {
+                refused("busy", format!("session {id} is open"))
+            }
             error => WireError::from(unavailable(error.to_string())),
         })?;
         let mut runtime = Runtime::with_store(
@@ -1165,7 +1266,7 @@ impl Sessions {
         let path = self.journal(id)?;
         SessionStore::delete(&path).map_err(|error| match error {
             noel_core::SessionError::Locked { .. } => {
-                refused("busy", format!("session {id} is open; quit it first"))
+                refused("busy", format!("session {id} is open"))
             }
             error => WireError::from(unavailable(error.to_string())),
         })?;
