@@ -60,6 +60,7 @@ pub(crate) async fn run(
     mut config: LoadedConfig,
     owned_screen: bool,
     quit_ends: bool,
+    no_splash: bool,
 ) -> Result<Option<String>> {
     if !valid_session_id(session) {
         return Err(anyhow!("--attach: {session:?} is not a session id"));
@@ -94,13 +95,24 @@ pub(crate) async fn run(
         status: "Ready".to_owned(),
         ..TuiApp::default()
     };
-    app.push(
-        TuiEntryKind::System,
+    // A local `noel` greets as it always has; an attach says where it is.
+    let greeting = if quit_ends {
+        let renderer = crate::terminal_renderer(&config);
+        format!(
+            "{}\ntype /help for commands, /reload to reload config, /quit to exit",
+            if no_splash {
+                renderer.banner()
+            } else {
+                renderer.splash()
+            }
+        )
+    } else {
         format!(
             "{}\nattached to session {session} on {place} · /help for commands, /quit to detach",
             crate::terminal_renderer(&config).banner()
-        ),
-    );
+        )
+    };
+    app.push(TuiEntryKind::System, greeting);
     if let Err(error) = crate::terminal_theme(&config) {
         app.push(TuiEntryKind::Error, format!("{error}; using system theme"));
     }
@@ -1214,6 +1226,18 @@ impl Remote {
                 TuiEntryKind::System,
                 format!("{line} is not available while a turn is running"),
             ),
+            // `/bug` takes the error rows shown here into its report.
+            _ if line.split_whitespace().next() == Some("/bug") => {
+                let errors = app
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind == TuiEntryKind::Error)
+                    .map(|entry| entry.text.clone())
+                    .collect::<Vec<_>>();
+                self.submitting += 1;
+                let args = json!({"line": line, "requestId": new_request_id(), "errors": errors});
+                self.call(Call::Command(line.to_owned()), args);
+            }
             _ => self.run_command(line.to_owned()),
         }
         Action::None

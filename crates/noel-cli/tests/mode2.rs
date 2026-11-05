@@ -757,3 +757,39 @@ fn slash_commands_run_on_the_worker_as_the_tui_types_them() {
     let unknown = mode2.noel(&["client", "command", &session, "/model nope/nothing"]);
     assert!(unknown.status.success());
 }
+
+/// The worker expands typed input with the session's configuration, as the
+/// TUI's prompts were expanded in process: a prompt template, whether it
+/// starts a run or is queued during one.
+#[test]
+fn the_worker_expands_templates_in_prompts_and_queued_follow_ups() {
+    let mode2 = Mode2::new(
+        "expand",
+        json!([
+            [{"text": "first, "}, {"wait_for_file": "release"}, {"text": "done."}],
+            [{"text": "second."}],
+        ]),
+        json!({}),
+    );
+    fs::create_dir_all(mode2.root.join("agent/prompts")).unwrap();
+    fs::write(mode2.root.join("agent/prompts/fix.md"), "Fix issue $1.\n").unwrap();
+    let session = mode2.new_session("expand");
+    let started = mode2.client(&["send", &session, "/fix 1"]);
+    assert!(started.starts_with("started run "), "{started}");
+    wait_until("the first partial saved", || {
+        mode2.journal(&session).contains("\"type\":\"partial\"")
+    });
+    let queued = mode2.client(&["send", &session, "/fix 2", "--follow-up"]);
+    assert!(queued.contains("queued"), "{queued}");
+    mode2.release("release");
+    wait_until("both turns answered", || {
+        mode2.journal(&session).contains("second.")
+    });
+    let journal = mode2.journal(&session);
+    for prompt in ["Fix issue 1.", "Fix issue 2."] {
+        assert!(
+            journal.contains(&format!("\"role\":\"user\",\"content\":\"{prompt}\\n\"")),
+            "{prompt} in {journal}"
+        );
+    }
+}

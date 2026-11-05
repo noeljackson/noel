@@ -1209,6 +1209,21 @@ async fn run_command(
         }
         return (json!({"entries": entries}), None);
     }
+    // `/bug`: the report goes into the session's directory, with the error
+    // rows the client shows (`errors`).
+    if line.split_whitespace().next() == Some("/bug") {
+        let errors: Vec<String> =
+            serde_json::from_value(args["errors"].clone()).unwrap_or_default();
+        let errors = errors.iter().map(String::as_str).collect::<Vec<_>>();
+        let (runtime, host) = controller.parts();
+        let dir = std::env::current_dir().unwrap_or_else(|_| runtime.session().cwd.clone());
+        let entry =
+            match crate::bug_report::report_into(runtime, &host.config, &line, &errors, &dir) {
+                Ok(text) => json!({"kind": "system", "text": text}),
+                Err(text) => json!({"kind": "error", "text": text}),
+            };
+        return (json!({"entries": [entry]}), None);
+    }
     if line == "/undo" {
         // The prompt goes back to the client's draft.
         let undone = controller.configure(|runtime, _| runtime.undo_last_turn());
@@ -1329,7 +1344,7 @@ fn open_elsewhere(
     config: &noel_config::LoadedConfig,
     switch: SessionSwitch,
 ) -> anyhow::Result<String> {
-    let SessionSwitch::Open { path, .. } = &switch else {
+    let SessionSwitch::Open { path } = &switch else {
         return session_commands::switch_elsewhere(runtime, config, switch);
     };
     let session = SessionStore::read(path)?.session_id;
@@ -1368,15 +1383,8 @@ fn selected_session(
     }
     let (runtime, host) = controller.parts();
     Some(
-        crate::resolve_session_reference(&host.config.paths.session_dir, value.trim()).and_then(
-            |path| {
-                open_elsewhere(
-                    runtime,
-                    &host.config,
-                    SessionSwitch::Open { path, resume: true },
-                )
-            },
-        ),
+        crate::resolve_session_reference(&host.config.paths.session_dir, value.trim())
+            .and_then(|path| open_elsewhere(runtime, &host.config, SessionSwitch::Open { path })),
     )
 }
 

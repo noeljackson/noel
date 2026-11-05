@@ -30,10 +30,10 @@ pub(crate) trait CommandUi {
 
 /// Another session a command moves to.
 pub(crate) enum SessionSwitch {
-    /// An existing session; `resume` continues its unfinished turn.
+    /// An existing session; the client opening it continues its
+    /// unfinished turn.
     Open {
         path: PathBuf,
-        resume: bool,
     },
     /// A fork (or, with `clone`, a full copy) of `source`.
     Fork {
@@ -45,42 +45,6 @@ pub(crate) enum SessionSwitch {
     New,
 }
 
-/// Opens `switch` in `runtime`, the in-process TUI's way.
-pub(crate) fn switch_in_place(
-    ui: &mut impl CommandUi,
-    runtime: &mut Runtime,
-    config: &LoadedConfig,
-    switch: SessionSwitch,
-) -> Result<CommandOutcome> {
-    let (store, state, resume) = match switch {
-        SessionSwitch::Open { path, resume } => {
-            let (store, state) = SessionStore::open(path)?;
-            (store, state, resume)
-        }
-        SessionSwitch::Fork { source, clone } => {
-            let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, clone)?;
-            (store, state, false)
-        }
-        SessionSwitch::Import(path) => {
-            let (store, state) = SessionStore::import_path(&config.paths.session_dir, &path)?;
-            (store, state, false)
-        }
-        SessionSwitch::New => {
-            let (store, state) = new_session_like(runtime, config)?;
-            (store, state, false)
-        }
-    };
-    runtime.replace_session(state, Some(store));
-    if resume {
-        ui.set_resume_pending(runtime.session().has_unfinished_turn());
-        if let Some(hint) = resume_hint(runtime) {
-            ui.push(TuiEntryKind::System, hint);
-        }
-    }
-    ui.push(TuiEntryKind::System, format_session(runtime));
-    Ok(CommandOutcome::Handled)
-}
-
 /// Writes `switch`'s session without opening it here, for a client to
 /// attach to: its id.
 pub(crate) fn switch_elsewhere(
@@ -89,7 +53,7 @@ pub(crate) fn switch_elsewhere(
     switch: SessionSwitch,
 ) -> Result<String> {
     Ok(match switch {
-        SessionSwitch::Open { path, .. } => SessionStore::read(&path)?.session_id,
+        SessionSwitch::Open { path } => SessionStore::read(&path)?.session_id,
         SessionSwitch::Fork { source, clone } => {
             SessionStore::fork(&config.paths.session_dir, &source, clone)?
                 .1
@@ -574,11 +538,7 @@ pub(crate) async fn run(
                 return open_selector(ui, config, runtime, "session", "");
             } else {
                 let path = resolve_session_reference(&config.paths.session_dir, reference)?;
-                return ui.switch_session(
-                    runtime,
-                    config,
-                    SessionSwitch::Open { path, resume: true },
-                );
+                return ui.switch_session(runtime, config, SessionSwitch::Open { path });
             }
         }
         _ if line.starts_with("/fork") => {
