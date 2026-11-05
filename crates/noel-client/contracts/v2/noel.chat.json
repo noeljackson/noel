@@ -420,7 +420,8 @@
                     "kind": {
                       "enum": [
                         "system",
-                        "error"
+                        "error",
+                        "tool"
                       ]
                     },
                     "text": {

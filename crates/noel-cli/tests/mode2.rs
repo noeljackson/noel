@@ -723,6 +723,10 @@ fn slash_commands_run_on_the_worker_as_the_tui_types_them() {
         mode2.client(&["command", &session, "/queue"]),
         "queue: empty\n"
     );
+    // A ! command runs in the session's cwd, on the worker.
+    let shell = mode2.client(&["command", &session, "!echo from-the-worker && pwd"]);
+    assert!(shell.contains("from-the-worker"), "{shell}");
+    assert!(shell.contains("/cwd"), "{shell}");
 
     // A prompt starts a run.
     let started = mode2.client(&["command", &session, "say hello"]);

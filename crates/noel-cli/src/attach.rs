@@ -599,10 +599,7 @@ impl Remote {
         }
         app.quit_armed_since = None;
         if bound("paste-image") {
-            app.push(
-                TuiEntryKind::System,
-                "images are not available when attached",
-            );
+            crate::paste_clipboard_image(app, config).await;
             return Action::None;
         }
         if bound("expand") {
@@ -662,7 +659,15 @@ impl Remote {
     /// submission is a follow-up, or with the steer key a steer.
     fn enter(&mut self, app: &mut TuiApp, config: &LoadedConfig, steer: bool) -> Action {
         let line = app.input.trim().to_owned();
+        let media = std::mem::take(&mut app.input_media);
         app.clear_input();
+        app.input_media = media;
+        // As locally: an image alone has a default prompt.
+        let line = if line.is_empty() && !app.input_media.is_empty() {
+            "Describe this image.".to_owned()
+        } else {
+            line
+        };
         if line.is_empty() {
             return Action::None;
         }
@@ -680,7 +685,11 @@ impl Remote {
             (true, true) => "steer",
             (true, false) => "followUp",
         };
-        self.submit(text, when_busy);
+        let images = std::mem::take(&mut app.input_media)
+            .into_iter()
+            .map(|media| json!({"data": media.data_base64, "mimeType": media.mime_type}))
+            .collect();
+        self.submit(text, images, when_busy);
     }
 
     /// A slash command. What has a meaning for the session is a call; what
@@ -722,10 +731,41 @@ impl Remote {
                 }
             }
             "/interrupt" if app.turn_running => self.call(Call::Abort, json!({})),
-            _ if name.starts_with('!') => app.push(
-                TuiEntryKind::System,
-                "! commands are not available when attached yet",
-            ),
+            "!!" if app.last_shell_command.is_none() => {
+                app.push(TuiEntryKind::System, "no previous shell command")
+            }
+            "!" if line == "!" => app.push(TuiEntryKind::System, "usage: ! <command>"),
+            _ if name.starts_with('!') => {
+                match crate::resolve_bang_command(line, &app.last_shell_command) {
+                    Some(command) if !app.turn_running => {
+                        app.last_shell_command = Some(command.clone());
+                        self.run_command(format!("!{command}"));
+                    }
+                    Some(_) => app.push(
+                        TuiEntryKind::System,
+                        "! commands wait for the run to settle",
+                    ),
+                    None => self.prompt(app, line.to_owned(), steer),
+                }
+            }
+            "/image" if line == "/image" => {
+                app.push(TuiEntryKind::System, "usage: /image <path> [prompt]")
+            }
+            "/image" => {
+                let rest = line.trim_start_matches("/image").trim();
+                let (path, prompt) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                let cwd = std::env::current_dir().unwrap_or_default();
+                match crate::load_media_input(&cwd, std::path::Path::new(path), config) {
+                    Ok(media) => {
+                        app.push(TuiEntryKind::System, crate::format_media_fallback(&media));
+                        app.input_media.push(media);
+                        if !prompt.trim().is_empty() {
+                            self.prompt(app, prompt.trim().to_owned(), steer);
+                        }
+                    }
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+            }
             _ if is_prompt_command(line, name) => self.prompt(app, line.to_owned(), steer),
             _ if app.turn_running => app.push(
                 TuiEntryKind::System,
@@ -793,7 +833,7 @@ impl Remote {
     /// Submits `text` with a new `requestId`, sent again with that id while
     /// it fails `unavailable`. A prompt that meets a run another client
     /// started meanwhile is queued after it, as Enter queues during a run.
-    fn submit(&self, text: String, when_busy: &'static str) {
+    fn submit(&self, text: String, images: Vec<Value>, when_busy: &'static str) {
         let (client, session, sender) = (
             self.client.clone(),
             self.session.clone(),
@@ -801,8 +841,11 @@ impl Remote {
         );
         tokio::spawn(async move {
             let send = |when_busy: &str| {
-                let args =
+                let mut args =
                     json!({"requestId": new_request_id(), "text": text, "whenBusy": when_busy});
+                if !images.is_empty() {
+                    args["images"] = json!(images);
+                }
                 client.chat_call(&session, "submit", args, true)
             };
             let mut result = send(when_busy).await;
@@ -914,10 +957,10 @@ impl Remote {
     /// What the worker made of a command: its rows, then what to do next.
     fn command_answer(&mut self, app: &mut TuiApp, value: &Value) {
         for entry in value["entries"].as_array().into_iter().flatten() {
-            let kind = if entry["kind"] == "error" {
-                TuiEntryKind::Error
-            } else {
-                TuiEntryKind::System
+            let kind = match entry["kind"].as_str() {
+                Some("error") => TuiEntryKind::Error,
+                Some("tool") => TuiEntryKind::Tool,
+                _ => TuiEntryKind::System,
             };
             app.push(kind, entry["text"].as_str().unwrap_or_default());
         }
