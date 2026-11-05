@@ -55,5 +55,5 @@ xcodebuild -create-xcframework \
 cd "${ios}"
 xcodegen generate
 xcodebuild -project Noel.xcodeproj -scheme Noel \
-  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO ARCHS=arm64 build
 echo "ios-build: the app builds for the simulator"
