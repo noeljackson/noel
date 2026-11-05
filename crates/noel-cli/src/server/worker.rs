@@ -144,7 +144,27 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     };
 
     // The session's configuration, as `noel` started in its directory
-    // builds it with no flags.
+    // builds it: with the flags of the `noel` that opened it, when one left
+    // them (they hold while this worker runs), else with none.
+    // The environment comes with them, as `noel` would have run in it (a
+    // key exported in that shell, a provider setting).
+    let launched = fs::read_to_string(dir.worker_args(&session_id))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_default();
+    let _ = fs::remove_file(dir.worker_args(&session_id));
+    for (key, value) in launched["env"].as_object().into_iter().flatten() {
+        if let Some(value) = value.as_str() {
+            std::env::set_var(key, value);
+        }
+    }
+    let launch: Vec<String> = serde_json::from_value(launched["args"].clone()).unwrap_or_default();
+    let cli = crate::Cli::try_parse_from(std::iter::once("noel".to_owned()).chain(launch.clone()))
+        .unwrap_or_else(|_| crate::Cli::parse_from(["noel"]));
+    let _ = fs::write(
+        dir.worker_applied_args(&session_id),
+        serde_json::to_string(&launch).unwrap_or_default(),
+    );
     let cwd = state.cwd.clone();
     if let Err(error) = std::env::set_current_dir(&cwd) {
         eprintln!(
@@ -153,12 +173,17 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
         );
     }
     let paths = crate::config_paths(cwd.clone(), Some(session_dir))?;
-    let trusted = project_is_trusted(&paths.agent_dir, &cwd).unwrap_or(false);
-    let cli = crate::Cli::parse_from(["noel"]);
+    let trusted = if cli.approve {
+        true
+    } else if cli.no_approve {
+        false
+    } else {
+        project_is_trusted(&paths.agent_dir, &cwd).unwrap_or(false)
+    };
     let resources = crate::resource_commands::resource_options(&cli);
     let mut config = load_config_with_resources(paths, trusted, &resources)?;
     crate::apply_cli_overrides(&cli, &cwd, &mut config)?;
-    let offline = crate::offline_enabled(false);
+    let offline = crate::offline_enabled(cli.offline);
     crate::apply_cached_claude_code_version(&config);
     let selection = crate::resolve_cli_selection(&cli, &mut config, offline)?;
     let mut systems = ReloadableSystems::from_config(&config, 1);
@@ -293,6 +318,8 @@ struct Status {
     queued: usize,
     /// A command that runs no run (a compaction, a configure) is in hand.
     working: bool,
+    /// The last client quit, as a local `noel` quits: exit once idle.
+    leaving: bool,
 }
 
 impl Status {
@@ -598,6 +625,8 @@ async fn supervise(supervision: Supervision) {
         let idle_since = status.idle_since();
         let done = if draining.load(Ordering::SeqCst) && now.running.is_none() && !now.working {
             Some("shut down by the server")
+        } else if now.leaving && now.running.is_none() && !now.working {
+            Some("its last client quit")
         } else if idle_since.is_some_and(|since| since.elapsed() >= idle_limit) {
             Some("idle")
         } else {
@@ -1022,13 +1051,42 @@ async fn run_command(
     let mut next = Value::Null;
     let mut start = None;
     // The queue is the controller's; the session's own fields are not.
+    if let Some(text) = line
+        .strip_prefix("/queue ")
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        let content = controller.parts().1.expand(text);
+        let submission = Submission {
+            kind: SubmissionKind::FollowUp,
+            request_id: args
+                .get("requestId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            content,
+            images: Vec::new(),
+            expected_run_id: None,
+        };
+        let answer = match controller.enqueue(noel_core::QueueMode::FollowUp, submission) {
+            Ok(_) => format!("queued: {}", controller.queue().pending()),
+            Err(error) => error.to_string(),
+        };
+        refresh(controller);
+        return (
+            json!({"entries": [{"kind": "system", "text": answer}]}),
+            None,
+        );
+    }
     let queued = match line.as_str() {
         "/queue" => Some(Ok(queue_text(&controller.queue().items()))),
-        "/queue-clear" | "/interrupt" => Some(
-            controller
-                .clear_queue()
-                .map(|items| format!("cleared {} queued message(s)", items.len())),
-        ),
+        "/queue-clear" | "/interrupt" => Some(controller.clear_queue().map(|items| {
+            let cleared = format!("cleared {} queued message(s)", items.len());
+            if line == "/interrupt" {
+                format!("interrupted; {cleared}")
+            } else {
+                cleared
+            }
+        })),
         _ => None,
     };
     if let Some(result) = queued {
@@ -1064,13 +1122,65 @@ async fn run_command(
         };
         return (json!({"entries": [entry]}), None);
     }
+    // The diff panel: the edited files and each one's diff, read here.
+    if line == "/diff" {
+        let session = controller.runtime().session();
+        let files = crate::collect_diff_file_entries(&session.cwd, &session.edited_files);
+        let files = files.iter().map(|entry| {
+            let detail = crate::build_diff_detail(&session.cwd, entry);
+            json!({
+                "path": entry.path,
+                "added": entry.added,
+                "removed": entry.removed,
+                "untracked": entry.untracked,
+                "lines": detail.lines,
+            })
+        });
+        let files = files.collect::<Vec<_>>();
+        return (
+            json!({"entries": [], "next": {"type": "diff", "files": files}}),
+            None,
+        );
+    }
+    // A local `noel` quitting (docs/client-tui-plan.md): with no other
+    // client and no run, the session ends as the in-process TUI's does,
+    // its extensions told so; otherwise the client only detaches.
+    if matches!(line.as_str(), "/quit" | "/exit" | "/q") {
+        let (runtime, host) = controller.parts_mut();
+        let alone = host.status.get().holds <= 1;
+        let mut entries = Vec::new();
+        if alone
+            && runtime
+                .session()
+                .runs
+                .last()
+                .is_none_or(|run| run.status.is_finished())
+        {
+            let cwd = runtime.session().cwd.clone();
+            let mut diagnostics =
+                crate::notify_extension_lifecycle(&host.config.extensions, "shutdown", &cwd);
+            {
+                let hosts = runtime.extension_hosts();
+                let mut hosts = hosts.lock().await;
+                diagnostics.extend(hosts.notify("shutdown", &cwd).await);
+                hosts.shutdown(&cwd).await;
+            }
+            entries.extend(
+                diagnostics
+                    .into_iter()
+                    .map(|text| json!({"kind": "error", "text": text})),
+            );
+            host.status.update(|status| status.leaving = true);
+        }
+        return (json!({"entries": entries}), None);
+    }
     if line == "/undo" {
         // The prompt goes back to the client's draft.
         let undone = controller.configure(|runtime, _| runtime.undo_last_turn());
         let answer = match undone {
             Ok(Some(prompt)) => json!({
                 "entries": [{"kind": "system", "text": "undid the last turn"}],
-                "next": {"type": "draft", "text": prompt.content},
+                "next": {"type": "draft", "text": prompt.content, "media": prompt.media},
             }),
             Ok(None) => json!({"entries": [{"kind": "system", "text": "nothing to undo"}]}),
             Err(error) => json!({"entries": [{"kind": "error", "text": error.to_string()}]}),
@@ -1138,7 +1248,14 @@ async fn run_command(
             next = json!({"type": "login", "provider": provider, "account": account});
         }
         Ok(CommandOutcome::Selector(state)) => {
-            next = json!({"type": "selector", "selector": state.to_json()});
+            let mut selector = state.to_json();
+            // The model picker's provider layer carries each provider's
+            // models, so the client opens them at once, in key order.
+            if state.kind == "provider" {
+                let (runtime, host) = controller.parts();
+                selector["layers"] = crate::provider_model_layers(&host.config, runtime);
+            }
+            next = json!({"type": "selector", "selector": selector});
         }
         Ok(CommandOutcome::Session(session)) => {
             next = json!({"type": "session", "session": session});
@@ -1156,16 +1273,16 @@ async fn run_command(
     (answer, start)
 }
 
-/// The queue as `/queue` lists it.
+/// The queue as `/queue` lists it, as the in-process TUI does.
 fn queue_text(items: &[noel_core::QueueItem]) -> String {
     if items.is_empty() {
-        return "queue: empty".to_owned();
+        return "queue is empty".to_owned();
     }
     let lines = items
         .iter()
         .enumerate()
-        .map(|(index, item)| format!("{}. {}", index + 1, item.content));
-    format!("queue:\n{}", lines.collect::<Vec<_>>().join("\n"))
+        .map(|(index, item)| format!("{}.\t{}", index + 1, item.content));
+    lines.collect::<Vec<_>>().join("\n")
 }
 
 /// A pick of the session or branch selector names another session here:

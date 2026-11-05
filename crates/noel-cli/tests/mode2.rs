@@ -721,7 +721,7 @@ fn slash_commands_run_on_the_worker_as_the_tui_types_them() {
     assert!(shown.contains(&session), "{shown}");
     assert_eq!(
         mode2.client(&["command", &session, "/queue"]),
-        "queue: empty\n"
+        "queue is empty\n"
     );
     // A ! command runs in the session's cwd, on the worker.
     let shell = mode2.client(&["command", &session, "!echo from-the-worker && pwd"]);

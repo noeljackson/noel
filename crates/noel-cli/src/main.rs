@@ -1698,7 +1698,7 @@ async fn run() -> Result<()> {
             return Err(anyhow!("--attach opens the TUI and needs a terminal"));
         }
         let endpoint = server::client::Endpoint::new(cli.remote.clone(), cli.remote_noel.clone())?;
-        return attach::run(session, endpoint, config, cli.owned_screen()).await;
+        return attach::run(session, endpoint, config, cli.owned_screen(), false).await;
     }
     let offline = offline_enabled(cli.offline);
     apply_cached_claude_code_version(&config);
@@ -1788,7 +1788,70 @@ async fn run() -> Result<()> {
 
     offer_bun_install(&config).await?;
 
+    if client_tui_enabled() {
+        return run_client_tui(runtime, config, &cli).await;
+    }
     run_interactive(runtime, config, offline, cli.owned_screen(), cli.no_splash).await
+}
+
+/// Whether interactive `noel` is a client of a local server
+/// (docs/client-tui-plan.md); `NOEL_CLIENT_TUI=1` until it is the only way.
+fn client_tui_enabled() -> bool {
+    std::env::var("NOEL_CLIENT_TUI").is_ok_and(|value| value == "1")
+}
+
+/// Interactive `noel` as a client: the session chosen and prepared as for
+/// the in-process TUI, then left to its worker under the local server, and
+/// the TUI attached to it.
+async fn run_client_tui(runtime: Runtime, config: LoadedConfig, cli: &Cli) -> Result<()> {
+    let session = runtime.session().session_id.clone();
+    // The server reads the same sessions: a --session-dir is its too.
+    if cli.session_dir.is_some() {
+        std::env::set_var(ENV_SESSION_DIR, &config.paths.session_dir);
+    }
+    // The worker opens the journal: this process lets go of it first.
+    drop(runtime);
+    // This run's flags are the worker's when it starts now; a running one
+    // keeps its own (docs/client-tui-plan.md).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let dir = server::RuntimeDir::ensure(server::RuntimeDir::locate())?;
+    dir.ensure_workers()?;
+    let running = fs::read_to_string(dir.worker_applied_args(&session))
+        .ok()
+        .filter(|_| dir.worker_socket(&session).exists())
+        .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok());
+    let notice = match running {
+        Some(running) if running != args => Some(format!(
+            "this session's worker runs with other flags ({}); quit every client to start it with yours",
+            if running.is_empty() { "none".to_owned() } else { running.join(" ") }
+        )),
+        Some(_) => None,
+        None => {
+            // With this process's environment, which the worker takes on;
+            // the file is the user's alone, as the directory is.
+            let env: serde_json::Map<String, serde_json::Value> = std::env::vars()
+                .map(|(key, value)| (key, serde_json::Value::String(value)))
+                .collect();
+            let path = dir.worker_args(&session);
+            let launch = serde_json::json!({"args": args, "env": env});
+            let mut file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&path)?
+            };
+            file.write_all(launch.to_string().as_bytes())?;
+            None
+        }
+    };
+    if let Some(notice) = notice {
+        eprintln!("noel: {notice}");
+    }
+    let endpoint = server::client::Endpoint::new(None, None)?;
+    attach::run(&session, endpoint, config, cli.owned_screen(), true).await
 }
 
 /// Before the TUI opens (the terminal is still plain), offer to install
@@ -6561,6 +6624,39 @@ fn key_event_name(key: &KeyEvent) -> Option<String> {
 }
 
 fn handle_diff_panel_key(key: &KeyEvent, app: &mut TuiApp, runtime: &Runtime) -> bool {
+    let cwd = runtime.session().cwd.clone();
+    diff_panel_key(key, app, |entry| build_diff_detail(&cwd, entry))
+}
+
+/// The model picker's second layer for every provider: `{provider:
+/// [{label, value, active}]}`, as the provider pick shows it.
+fn provider_model_layers(config: &LoadedConfig, runtime: &Runtime) -> serde_json::Value {
+    let mut layers = serde_json::Map::new();
+    for model in picker_models(config) {
+        let value = format!("{}/{}", model.provider, model.id);
+        let active = runtime
+            .session()
+            .active_model
+            .as_ref()
+            .is_some_and(|active| active.provider == model.provider && active.id == model.id);
+        let entry = serde_json::json!({"label": value, "value": value, "active": active});
+        match layers
+            .entry(model.provider.clone())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        {
+            serde_json::Value::Array(items) => items.push(entry),
+            _ => unreachable!("layers hold arrays"),
+        }
+    }
+    serde_json::Value::Object(layers)
+}
+
+/// A key on the diff panel, with `detail` for the file opened.
+fn diff_panel_key(
+    key: &KeyEvent,
+    app: &mut TuiApp,
+    detail: impl Fn(&DiffFileEntry) -> DiffDetail,
+) -> bool {
     let Some(panel) = app.diff_panel.as_mut() else {
         return false;
     };
@@ -6585,10 +6681,7 @@ fn handle_diff_panel_key(key: &KeyEvent, app: &mut TuiApp, runtime: &Runtime) ->
             panel.selected = (panel.selected + 1).min(panel.files.len().saturating_sub(1));
         }
         KeyCode::Enter if key.modifiers.is_empty() && app.input.trim().is_empty() => {
-            let detail = panel
-                .files
-                .get(panel.selected)
-                .map(|entry| build_diff_detail(&runtime.session().cwd, entry));
+            let detail = panel.files.get(panel.selected).map(&detail);
             if let Some(detail) = detail {
                 panel.detail = Some(detail);
             }

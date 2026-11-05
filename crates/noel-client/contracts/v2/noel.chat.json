@@ -446,7 +446,8 @@
                       "selector",
                       "session",
                       "login",
-                      "draft"
+                      "draft",
+                      "diff"
                     ]
                   }
                 }

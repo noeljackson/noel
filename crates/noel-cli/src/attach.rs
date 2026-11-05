@@ -49,11 +49,15 @@ use crate::{
 /// How long the first view may take: starting a server and a worker.
 const FIRST_VIEW: Duration = Duration::from_secs(30);
 
+/// `quit_ends`: quitting ends the session's run and, with no other client,
+/// the session, as a local `noel` quits (plain `noel` as a client);
+/// otherwise quitting detaches (`--attach`).
 pub(crate) async fn run(
     session: &str,
     endpoint: Endpoint,
-    config: LoadedConfig,
+    mut config: LoadedConfig,
     owned_screen: bool,
+    quit_ends: bool,
 ) -> Result<()> {
     if !valid_session_id(session) {
         return Err(anyhow!("--attach: {session:?} is not a session id"));
@@ -100,8 +104,12 @@ pub(crate) async fn run(
     let mut session = session.to_owned();
     let mut first = first;
     let mut early = early;
+    let mut switched = false;
     let result = loop {
         let mut remote = Remote::new(&session, client.clone(), sender.clone());
+        if std::mem::take(&mut switched) {
+            remote.run_command("/session".to_owned());
+        }
         // What came before the view: starting a server, sending again.
         for message in std::mem::take(&mut early) {
             remote.receive(&mut app, message);
@@ -124,13 +132,25 @@ pub(crate) async fn run(
                 &mut app,
                 &mut terminal,
                 &mut viewport_height,
-                &config,
+                &mut config,
                 &mut incoming,
             )
             .await;
         follower.abort();
         let next = match ended {
             Ok(Some(next)) => next,
+            Ok(None) if quit_ends => {
+                // As a local quit: the run is aborted, then the session ends
+                // unless another client holds it.
+                if remote.run.is_some() {
+                    let _ = client.chat_call(&session, "abort", json!({}), false).await;
+                }
+                let args = json!({"line": "/quit", "requestId": new_request_id()});
+                if let Ok(answer) = client.chat_call(&session, "command", args, false).await {
+                    remote.command_answer(&mut app, "/quit", &answer);
+                }
+                break Ok(());
+            }
             other => break other.map(|_| ()),
         };
         // Another session a command named (a fork, a pick): its view, or
@@ -150,11 +170,9 @@ pub(crate) async fn run(
                 follower = next_follower;
                 first = next_first;
                 early = next_early;
-                app.clear_visible();
-                app.push(
-                    TuiEntryKind::System,
-                    format!("attached to session {session} on {place}"),
-                );
+                // What was shown stays, as a local switch keeps it; the
+                // session's details follow, as a local switch prints them.
+                switched = true;
             }
             Err(error) => break Err(error),
         }
@@ -280,6 +298,8 @@ struct Remote {
     saw_tools: bool,
     /// The run an abort was sent for.
     aborting: Option<String>,
+    /// The run this TUI interrupted, noted as locally once it ends.
+    interrupted: Option<String>,
     /// Queued submissions a withdrawal was sent for.
     withdrawing: Vec<String>,
     /// The last run as last shown: `(runId, status)`.
@@ -288,6 +308,16 @@ struct Remote {
     waiting: Option<&'static str>,
     /// A session a command named, to attach to next.
     switch_to: Option<String>,
+    /// The model picker's provider layer: each provider's models.
+    provider_layers: std::collections::HashMap<String, Value>,
+    /// Prompts sent to start a run, not answered yet.
+    submitting: usize,
+    /// A run a prompt started that the view has not shown yet.
+    starting: Option<String>,
+    /// The row of the `!` command running on the worker.
+    shell_row: Option<usize>,
+    /// The diff panel's files' diffs, by path, as the worker read them.
+    diff_lines: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Remote {
@@ -302,10 +332,16 @@ impl Remote {
             run: None,
             saw_tools: false,
             aborting: None,
+            interrupted: None,
             withdrawing: Vec::new(),
             last_run: None,
             waiting: None,
             switch_to: None,
+            diff_lines: std::collections::HashMap::new(),
+            shell_row: None,
+            submitting: 0,
+            starting: None,
+            provider_layers: std::collections::HashMap::new(),
         }
     }
 
@@ -383,7 +419,12 @@ impl Remote {
             return;
         }
         self.last_run.clone_from(&now);
-        let Some((_, status)) = now else { return };
+        let Some((run_id, status)) = now else { return };
+        if status == "aborted" && self.interrupted.as_deref() == Some(run_id.as_str()) {
+            self.interrupted = None;
+            app.push(TuiEntryKind::System, "interrupted");
+            return;
+        }
         match status.as_str() {
             "failed" => app.push(
                 TuiEntryKind::Error,
@@ -409,7 +450,9 @@ impl Remote {
     /// The footer and the panels: the queue from `pi.inbox`, the run and
     /// what it does from `pi.live`, the model from `pi.agent`.
     fn refresh_chrome(&mut self, app: &mut TuiApp, config: &LoadedConfig) {
+        app.show_hardware_cursor = config.settings.show_hardware_cursor.unwrap_or(true);
         let docs = &self.view["docs"];
+        app.todos = serde_json::from_value(docs["noel.todos"]["items"].clone()).unwrap_or_default();
         let live = &docs["pi.live"];
         app.queued_messages = docs["pi.inbox"]["items"]
             .as_array()
@@ -432,11 +475,22 @@ impl Remote {
                 self.aborting = None;
             }
         }
+        let seen = |id: &str| {
+            self.run.as_ref().is_some_and(|(run, _)| run == id)
+                || self.last_run.as_ref().is_some_and(|(run, _)| run == id)
+        };
+        if self.starting.as_deref().is_some_and(seen) {
+            self.starting = None;
+        }
         app.turn_running = self.run.is_some();
         app.turn_saw_tools = self.saw_tools;
         let queued = app.queued_messages.len();
         app.status = if let Some(why) = self.waiting {
             format!("{why}… · /quit to detach")
+        } else if self.run.is_none() && (self.submitting > 0 || self.starting.is_some()) {
+            // Sent, and not shown running yet: as the in-process TUI shows a
+            // prompt it is about to run.
+            "Working...".to_owned()
         } else if let Some((_, started)) = &self.run {
             let status = crate::activity_status(*started, &activity(live), queued);
             if self.aborting.is_some() {
@@ -485,7 +539,7 @@ impl Remote {
         app: &mut TuiApp,
         terminal: &mut TuiTerminal,
         viewport_height: &mut u16,
-        config: &LoadedConfig,
+        config: &mut LoadedConfig,
         incoming: &mut mpsc::UnboundedReceiver<Incoming>,
     ) -> Result<Option<String>> {
         let mut tick = tokio::time::interval(Duration::from_millis(STREAM_RENDER_INTERVAL_MS * 2));
@@ -522,11 +576,17 @@ impl Remote {
                                 crate::handle_transcript_mouse(mouse, app);
                             }
                             Event::Paste(text) => app.paste_text(&text),
-                            Event::Resize(_, _) => crate::resize_tui_viewport(
-                                terminal,
-                                viewport_height,
-                                app.owned_screen,
-                            )?,
+                            Event::Resize(_, _) => {
+                                crate::resize_tui_viewport(
+                                    terminal,
+                                    viewport_height,
+                                    app.owned_screen,
+                                )?;
+                                // As the in-process loop: drawn once at the
+                                // new size, then again below, which places
+                                // the cursor.
+                                crate::redraw_tui(terminal, app, config)?;
+                            }
                             _ => {}
                         }
                     }
@@ -558,7 +618,7 @@ impl Remote {
 
     // ─── keys ───────────────────────────────────────────────────────────────
 
-    async fn key(&mut self, key: KeyEvent, app: &mut TuiApp, config: &LoadedConfig) -> Action {
+    async fn key(&mut self, key: KeyEvent, app: &mut TuiApp, config: &mut LoadedConfig) -> Action {
         let bindings = crate::keybinding_map(config);
         let name = crate::key_event_name(&key);
         let bound = |action: &str| {
@@ -566,8 +626,19 @@ impl Remote {
                 .is_some_and(|name| bindings.matches(action, name))
         };
         if app.selector.is_some() {
-            self.selector_key(key, app);
+            self.selector_key(key, app, config);
             return Action::None;
+        }
+        if app.diff_panel.is_some() {
+            let lines = &self.diff_lines;
+            let handled = crate::diff_panel_key(&key, app, |entry| crate::DiffDetail {
+                path: entry.path.clone(),
+                lines: lines.get(&entry.path).cloned().unwrap_or_default(),
+                scroll: 0,
+            });
+            if handled {
+                return Action::None;
+            }
         }
         if bound("newline") {
             app.insert_input_newline();
@@ -631,7 +702,7 @@ impl Remote {
             return Action::None;
         }
         if bound("steer") {
-            return self.enter(app, config, true);
+            return self.enter(app, config, true).await;
         }
         match key.code {
             KeyCode::Esc if app.turn_running => self.abort(),
@@ -646,7 +717,7 @@ impl Remote {
             }
             KeyCode::Up => app.history_previous(),
             KeyCode::Down => app.history_next(),
-            KeyCode::Enter => return self.enter(app, config, false),
+            KeyCode::Enter => return self.enter(app, config, false).await,
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.push_input_char(ch)
             }
@@ -657,7 +728,12 @@ impl Remote {
 
     /// Sends the draft: a command, or a submission. While a run is active a
     /// submission is a follow-up, or with the steer key a steer.
-    fn enter(&mut self, app: &mut TuiApp, config: &LoadedConfig, steer: bool) -> Action {
+    async fn enter(&mut self, app: &mut TuiApp, config: &mut LoadedConfig, steer: bool) -> Action {
+        // As locally: a draft with images waits while a run is active (they
+        // are not queued), and is sent once idle.
+        if app.turn_running && !app.input_media.is_empty() {
+            return Action::None;
+        }
         let line = app.input.trim().to_owned();
         let media = std::mem::take(&mut app.input_media);
         app.clear_input();
@@ -671,8 +747,18 @@ impl Remote {
         if line.is_empty() {
             return Action::None;
         }
+        if let Some(lines) = app.multiline.as_mut() {
+            if line == "." {
+                let prompt = lines.join("\n");
+                app.multiline = None;
+                self.prompt(app, prompt, steer);
+            } else {
+                lines.push(line);
+            }
+            return Action::None;
+        }
         if line.starts_with('/') || line.starts_with('!') {
-            return self.command(&line, app, config, steer);
+            return self.command(&line, app, config, steer).await;
         }
         self.prompt(app, line, steer);
         Action::None
@@ -696,11 +782,11 @@ impl Remote {
     /// acts on this process's own session is not available; anything else
     /// is a prompt, which the worker expands as `noel` would (a skill, a
     /// template, a tool command such as `/bash`).
-    fn command(
+    async fn command(
         &mut self,
         line: &str,
         app: &mut TuiApp,
-        config: &LoadedConfig,
+        config: &mut LoadedConfig,
         steer: bool,
     ) -> Action {
         let name = line.split_whitespace().next().unwrap_or(line);
@@ -722,13 +808,112 @@ impl Remote {
             ),
             "/status" => app.push(TuiEntryKind::System, format!("status\t{}", app.status)),
             "/app" => app.push(TuiEntryKind::System, crate::open_desktop_app(&self.session)),
+            // The theme is this terminal's.
+            "/theme" if line != "/theme" => {
+                let name = line.trim_start_matches("/theme").trim();
+                match crate::persist_theme(config, name) {
+                    Ok(name) => app.push(TuiEntryKind::System, format!("theme: {name}")),
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+            }
+            "/accent" if line != "/accent" => {
+                let color = line.trim_start_matches("/accent").trim();
+                match crate::persist_accent(config, color) {
+                    Ok(()) => app.push(TuiEntryKind::System, format!("accent: {color}")),
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+            }
+            "/diff" if app.diff_panel.is_some() => app.diff_panel = None,
+            "/changelog" => app.push(TuiEntryKind::System, crate::format_changelog()),
+            "/themes" => app.push(TuiEntryKind::System, crate::format_themes(config)),
+            "/theme" => {
+                let items = crate::theme_names(config).into_iter().map(|name| {
+                    let active = config.settings.theme.as_deref().unwrap_or("system") == name
+                        || (name == "system"
+                            && config.settings.theme.as_deref() == Some("default"));
+                    json!({"label": name, "value": name, "active": active})
+                });
+                let selector = json!({
+                    "kind": "theme",
+                    "title": "theme",
+                    "items": items.collect::<Vec<_>>(),
+                });
+                if let Some(selector) = crate::TuiSelectorState::from_json(&selector) {
+                    app.push(TuiEntryKind::System, format!("{} selector", selector.title));
+                    app.selector = Some(selector);
+                }
+            }
             "/copy" if app.transcript_view.borrow().has_selection() => {
                 app.transcript_view.get_mut().request_copy();
             }
+            "/copy" => {
+                let last = entries(&self.view)
+                    .iter()
+                    .rev()
+                    .map(message_of)
+                    .find(|message| message["role"] == "assistant")
+                    .map(|message| blocks(message, "text"));
+                match last {
+                    None => app.push(TuiEntryKind::System, "no assistant message"),
+                    Some(text) => {
+                        let copied = crate::clipboard::copy_text(&text).await;
+                        match copied {
+                            Ok(status) => {
+                                app.push(TuiEntryKind::System, format!("{text}\n{status}"))
+                            }
+                            Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                        }
+                    }
+                }
+            }
+            // The external editor is this terminal's.
+            "/editor" => {
+                let initial = line.trim_start_matches("/editor").trim();
+                match crate::read_external_editor_prompt(initial) {
+                    Ok(prompt) if !prompt.trim().is_empty() => self.prompt(app, prompt, steer),
+                    Ok(_) => app.push(TuiEntryKind::System, "editor returned an empty prompt"),
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+            }
+            "/multiline" => {
+                app.multiline = Some(Vec::new());
+                app.push(
+                    TuiEntryKind::System,
+                    "enter multiline prompt; submit . on its own line",
+                );
+            }
+            // While a run is active, as the in-process TUI does mid-turn.
+            "/queue" if app.turn_running && line == "/queue" => {
+                let pending = inbox(&self.view);
+                if pending.is_empty() {
+                    app.push(TuiEntryKind::System, "no pending follow-ups");
+                } else {
+                    let list = pending
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (_, _, text))| format!("{}. {text}", index + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    app.push(TuiEntryKind::System, format!("pending follow-ups:\n{list}"));
+                }
+            }
+            "/queue" if app.turn_running => {
+                let text = line.trim_start_matches("/queue").trim();
+                if !text.is_empty() {
+                    self.submit(text.to_owned(), Vec::new(), "followUp");
+                }
+            }
+            "/todos" if app.turn_running => app.todos_expanded = !app.todos_expanded,
             "/queue-clear" if app.turn_running => {
-                for (id, _, text) in inbox(&self.view) {
+                let pending = inbox(&self.view);
+                let cleared = pending.len();
+                for (id, _, text) in pending {
                     self.withdraw(id, text, false);
                 }
+                app.push(
+                    TuiEntryKind::System,
+                    format!("cleared {cleared} pending follow-up(s)"),
+                );
             }
             "/interrupt" if app.turn_running => self.call(Call::Abort, json!({})),
             "!!" if app.last_shell_command.is_none() => {
@@ -737,8 +922,13 @@ impl Remote {
             "!" if line == "!" => app.push(TuiEntryKind::System, "usage: ! <command>"),
             _ if name.starts_with('!') => {
                 match crate::resolve_bang_command(line, &app.last_shell_command) {
-                    Some(command) if !app.turn_running => {
+                    Some(command) if !app.turn_running && self.shell_row.is_none() => {
                         app.last_shell_command = Some(command.clone());
+                        app.previews_expanded = false;
+                        self.shell_row = Some(app.push_placeholder(
+                            TuiEntryKind::Tool,
+                            crate::format_bash_running(&command),
+                        ));
                         self.run_command(format!("!{command}"));
                     }
                     Some(_) => app.push(
@@ -766,18 +956,25 @@ impl Remote {
                     Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
                 }
             }
-            _ if is_prompt_command(line, name) => self.prompt(app, line.to_owned(), steer),
+            // While a run is active a prompt-like command queues as a
+            // prompt; otherwise the worker runs it as `noel` would (an
+            // extension's command, a skill, a template, a tool command).
+            _ if app.turn_running && is_prompt_command(line, name) => {
+                self.prompt(app, line.to_owned(), steer)
+            }
             _ if app.turn_running => app.push(
                 TuiEntryKind::System,
-                format!("{name}: wait for the run to settle, or abort it"),
+                format!("{line} is not available while a turn is running"),
             ),
             _ => self.run_command(line.to_owned()),
         }
         Action::None
     }
 
-    /// Runs `line` on the session's worker.
-    fn run_command(&self, line: String) {
+    /// Runs `line` on the session's worker; the TUI shows it working until
+    /// the answer, as the in-process TUI blocks on a command.
+    fn run_command(&mut self, line: String) {
+        self.submitting += 1;
         let args = json!({"line": line, "requestId": new_request_id()});
         self.call(Call::Command(line), args);
     }
@@ -785,7 +982,7 @@ impl Remote {
     /// A key while a selector is open: moving and filtering here, a pick on
     /// the worker (`/select <kind> <value>`). The model picker's provider
     /// layer opens that provider's models.
-    fn selector_key(&mut self, key: KeyEvent, app: &mut TuiApp) {
+    fn selector_key(&mut self, key: KeyEvent, app: &mut TuiApp, config: &mut LoadedConfig) {
         match key.code {
             KeyCode::Esc => {
                 let mut selector = app.selector.take().expect("selector");
@@ -812,11 +1009,42 @@ impl Remote {
                 let selector = app.selector.take().expect("selector");
                 let Some(item) = selector.selected_item().cloned() else {
                     app.push(TuiEntryKind::System, "no selector match");
-                    app.selector = Some(selector);
+                    // As locally: only the settings list stays open.
+                    if selector.kind == "settings" {
+                        app.selector = Some(selector);
+                    }
                     return;
                 };
+                // A settings pick keeps the list open; the worker's answer
+                // redraws it, unless it was closed meanwhile.
+                if selector.kind == "settings" {
+                    self.run_command(format!("/select settings {}", item.value));
+                    app.selector = Some(selector);
+                    return;
+                }
                 if selector.kind == "provider" {
-                    self.run_command(format!("/models {}", item.value));
+                    let models = self.provider_layers.get(&item.value).and_then(|items| {
+                        crate::TuiSelectorState::from_json(&json!({
+                            "kind": "model",
+                            "title": format!("model · {}", item.value),
+                            "items": items,
+                        }))
+                    });
+                    match models {
+                        Some(mut models) if !models.items.is_empty() => {
+                            models.parent = Some(Box::new(selector));
+                            app.selector = Some(models);
+                        }
+                        _ => app.push(
+                            TuiEntryKind::System,
+                            format!("no models for {}", item.value),
+                        ),
+                    }
+                } else if matches!(selector.kind.as_str(), "theme" | "themes") {
+                    match crate::persist_theme(config, &item.value) {
+                        Ok(name) => app.push(TuiEntryKind::System, format!("theme: {name}")),
+                        Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                    }
                 } else {
                     self.run_command(format!("/select {} {}", selector.kind, item.value));
                 }
@@ -833,7 +1061,10 @@ impl Remote {
     /// Submits `text` with a new `requestId`, sent again with that id while
     /// it fails `unavailable`. A prompt that meets a run another client
     /// started meanwhile is queued after it, as Enter queues during a run.
-    fn submit(&self, text: String, images: Vec<Value>, when_busy: &'static str) {
+    fn submit(&mut self, text: String, images: Vec<Value>, when_busy: &'static str) {
+        if when_busy == "reject" {
+            self.submitting += 1;
+        }
         let (client, session, sender) = (
             self.client.clone(),
             self.session.clone(),
@@ -881,6 +1112,7 @@ impl Remote {
             return;
         }
         self.aborting = Some(run_id.clone());
+        self.interrupted = Some(run_id.clone());
         self.call(Call::Abort, json!({"expectedRunId": run_id}));
     }
 
@@ -905,6 +1137,17 @@ impl Remote {
     }
 
     fn answer(&mut self, app: &mut TuiApp, call: Call, result: Result<Value>) {
+        if matches!(&call, Call::Submit(_) | Call::Command(_)) {
+            self.submitting = self.submitting.saturating_sub(1);
+            let started = result.as_ref().ok().and_then(|value| {
+                let next = &value["next"];
+                let from_command = (next["type"] == "run").then(|| next["runId"].as_str());
+                value["runId"].as_str().or(from_command.flatten())
+            });
+            if let Some(run_id) = started {
+                self.starting = Some(run_id.to_owned());
+            }
+        }
         if let Call::Withdraw { id, .. } = &call {
             self.withdrawing.retain(|withdrawing| withdrawing != id);
         }
@@ -920,7 +1163,14 @@ impl Remote {
                     Call::Withdraw { text, .. } => {
                         format!("withdraw {}: {error}", one_line(text))
                     }
-                    Call::Command(line) => format!("{}: {error}", one_line(line)),
+                    Call::Command(line) => {
+                        if let Some(row) = self.shell_row.take() {
+                            app.replace_entry(row, format!("failed bash\n{error}"));
+                            app.finish_live_entry();
+                            return;
+                        }
+                        format!("{}: {error}", one_line(line))
+                    }
                 };
                 app.push(TuiEntryKind::Error, message);
                 return;
@@ -928,7 +1178,7 @@ impl Remote {
         };
         match call {
             Call::Submit(_) => {}
-            Call::Command(_) => self.command_answer(app, &value),
+            Call::Command(line) => self.command_answer(app, &line, &value),
             Call::Withdraw { text, recall, .. } => match value["outcome"].as_str() {
                 Some("withdrawn") if recall && app.input.is_empty() => {
                     crate::recall_queued_message(app, text)
@@ -955,8 +1205,20 @@ impl Remote {
 
 impl Remote {
     /// What the worker made of a command: its rows, then what to do next.
-    fn command_answer(&mut self, app: &mut TuiApp, value: &Value) {
-        for entry in value["entries"].as_array().into_iter().flatten() {
+    fn command_answer(&mut self, app: &mut TuiApp, line: &str, value: &Value) {
+        let mut entries = value["entries"].as_array().cloned().unwrap_or_default();
+        // A `!` command's result fills the row that showed it running.
+        if let Some(row) = self.shell_row.take() {
+            let text = if entries.is_empty() {
+                String::new()
+            } else {
+                let first = entries.remove(0);
+                first["text"].as_str().unwrap_or_default().to_owned()
+            };
+            app.replace_entry(row, text);
+            app.finish_live_entry();
+        }
+        for entry in &entries {
             let kind = match entry["kind"].as_str() {
                 Some("error") => TuiEntryKind::Error,
                 Some("tool") => TuiEntryKind::Tool,
@@ -968,22 +1230,65 @@ impl Remote {
         match next["type"].as_str() {
             Some("session") => {
                 if let Some(session) = next["session"].as_str() {
-                    if session != self.session {
+                    if session == self.session {
+                        // The session open here: its details, as locally.
+                        self.run_command("/session".to_owned());
+                    } else {
                         self.switch_to = Some(session.to_owned());
                     }
                 }
             }
             Some("selector") => match crate::TuiSelectorState::from_json(&next["selector"]) {
-                Some(selector) => app.selector = Some(selector),
+                // A settings pick's list again, after the list was closed.
+                Some(_)
+                    if line.starts_with("/select settings ")
+                        && app
+                            .selector
+                            .as_ref()
+                            .is_none_or(|open| open.kind != "settings") => {}
+                Some(selector) => {
+                    if let Some(layers) = next["selector"]["layers"].as_object() {
+                        self.provider_layers = layers
+                            .iter()
+                            .map(|(provider, items)| (provider.clone(), items.clone()))
+                            .collect();
+                    }
+                    app.selector = Some(selector);
+                }
                 None => app.push(
                     TuiEntryKind::Error,
                     "the worker sent an unreadable selector",
                 ),
             },
-            Some("draft") if app.input.is_empty() => crate::recall_queued_message(
-                app,
-                next["text"].as_str().unwrap_or_default().to_owned(),
-            ),
+            Some("diff") => {
+                let mut files = Vec::new();
+                self.diff_lines.clear();
+                for file in next["files"].as_array().into_iter().flatten() {
+                    let path = file["path"].as_str().unwrap_or_default().to_owned();
+                    let lines = file["lines"].as_array().into_iter().flatten();
+                    let lines = lines.filter_map(Value::as_str).map(str::to_owned).collect();
+                    self.diff_lines.insert(path.clone(), lines);
+                    files.push(crate::DiffFileEntry {
+                        path,
+                        added: file["added"].as_u64(),
+                        removed: file["removed"].as_u64(),
+                        untracked: file["untracked"] == true,
+                    });
+                }
+                app.diff_panel = Some(crate::DiffPanelState {
+                    files,
+                    selected: 0,
+                    detail: None,
+                });
+            }
+            Some("draft") if app.input.is_empty() => {
+                crate::recall_queued_message(
+                    app,
+                    next["text"].as_str().unwrap_or_default().to_owned(),
+                );
+                // Its images come back to the draft too, as locally.
+                app.input_media = serde_json::from_value(next["media"].clone()).unwrap_or_default();
+            }
             Some("login") => app.push(
                 TuiEntryKind::System,
                 format!(
@@ -1198,6 +1503,24 @@ fn entry_rows(entries: &[Value], index: usize) -> Vec<Row> {
                     &mut rows,
                     TuiEntryKind::System,
                     "aborted".into(),
+                    Source::Entry,
+                );
+            }
+        }
+        // Placed from the queue: each queued text as the in-process TUI
+        // shows it.
+        "user" if record["data"]["queued"].is_string() => {
+            // As locally: steering is a system row, a follow-up a prompt.
+            let (prefix, kind) = if record["data"]["queued"] == "steer" {
+                ("steering>", TuiEntryKind::System)
+            } else {
+                ("queued>", TuiEntryKind::User)
+            };
+            for text in blocks(entry, "text").split(noel_core::STEERING_JOIN) {
+                add(
+                    &mut rows,
+                    kind.clone(),
+                    format!("{prefix} {text}"),
                     Source::Entry,
                 );
             }
