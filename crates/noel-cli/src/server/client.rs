@@ -195,6 +195,47 @@ enum ClientCommand {
         action: Option<String>,
         argument: Option<String>,
     },
+    /// Rename a session (an empty name clears it).
+    Rename { session: String, name: String },
+    /// Delete a session that no worker holds.
+    Delete { session: String },
+    /// Fork a session into a new one (with --clone, a whole copy).
+    Fork {
+        session: String,
+        #[arg(long)]
+        clone: bool,
+    },
+    /// Import an exported session (a file on the server's machine).
+    Import { path: String },
+    /// The models the server's sessions can use, and the scoped ones.
+    Models {
+        #[arg(long)]
+        json: bool,
+    },
+    /// The server machine's provider accounts.
+    Accounts {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Log in to a provider on the server's machine: a device code or a
+    /// browser sign-in shown here, or an API key read from stdin.
+    Login {
+        provider: String,
+        #[arg(long, default_value = noel_config::DEFAULT_ACCOUNT_NAME)]
+        account: String,
+    },
+    /// Remove a provider account from the server's machine.
+    Logout {
+        provider: String,
+        #[arg(long, default_value = noel_config::DEFAULT_ACCOUNT_NAME)]
+        account: String,
+    },
+    /// The server machine's settings; with a key and a JSON value, set it
+    /// (`null` removes it).
+    Settings {
+        key: Option<String>,
+        value: Option<String>,
+    },
     /// Send a plugin panel an action (a button's).
     Panel {
         plugin: String,
@@ -473,6 +514,128 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
             }
             Ok(0)
         }
+        ClientCommand::Rename { session, name } => {
+            let args = json!({"sessionId": session, "name": name});
+            client.sessions_call("rename", args).await?;
+            println!("renamed {session}");
+            Ok(0)
+        }
+        ClientCommand::Delete { session } => {
+            client
+                .sessions_call("delete", json!({"sessionId": session}))
+                .await?;
+            println!("deleted {session}");
+            Ok(0)
+        }
+        ClientCommand::Fork { session, clone } => {
+            let args = json!({"requestId": new_request_id(), "sessionId": session, "clone": clone});
+            let made = client.sessions_call("fork", args).await?;
+            println!("{}", made["sessionId"].as_str().unwrap_or_default());
+            Ok(0)
+        }
+        ClientCommand::Import { path } => {
+            let path = std::path::absolute(&path).unwrap_or_else(|_| path.into());
+            let args = json!({"requestId": new_request_id(), "path": path});
+            let made = client.sessions_call("import", args).await?;
+            println!("{}", made["sessionId"].as_str().unwrap_or_default());
+            Ok(0)
+        }
+        ClientCommand::Models { json } => {
+            let catalog = client
+                .server_state(noel_client::contracts::models(), "catalog")
+                .await?;
+            if json {
+                println!("{catalog}");
+            } else {
+                for model in catalog["models"].as_array().into_iter().flatten() {
+                    let mut notes = Vec::new();
+                    if model["scoped"] == true {
+                        notes.push("scoped");
+                    }
+                    if model["available"] != true {
+                        notes.push("no auth");
+                    }
+                    println!(
+                        "{}/{}{}",
+                        model["provider"].as_str().unwrap_or_default(),
+                        model["modelId"].as_str().unwrap_or_default(),
+                        if notes.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", notes.join(", "))
+                        }
+                    );
+                }
+            }
+            Ok(0)
+        }
+        ClientCommand::Accounts { json } => {
+            let accounts = client
+                .server_state(noel_client::contracts::accounts(), "accounts")
+                .await?;
+            if json {
+                println!("{accounts}");
+            } else {
+                for line in render_accounts(&accounts) {
+                    println!("{line}");
+                }
+            }
+            Ok(0)
+        }
+        ClientCommand::Login { provider, account } => {
+            let line = relay_login(&client, &provider, &account, |kind| {
+                use std::io::BufRead;
+                match kind {
+                    "key" => eprintln!("paste the {provider} API key:"),
+                    _ => eprintln!("after signing in, paste the full code shown (code#state):"),
+                }
+                let mut input = String::new();
+                std::io::stdin().lock().read_line(&mut input)?;
+                Ok(input.trim().to_owned())
+            })
+            .await?;
+            println!("{line}");
+            Ok(0)
+        }
+        ClientCommand::Logout { provider, account } => {
+            let args = json!({"provider": provider, "account": account});
+            let removed = client
+                .server_call(noel_client::contracts::accounts(), "logout", args)
+                .await?;
+            if removed["removed"] == true {
+                println!("logged out {provider} account {account}");
+            } else {
+                println!("no account {account} of {provider}");
+            }
+            Ok(0)
+        }
+        ClientCommand::Settings { key, value } => {
+            let contract = noel_client::contracts::settings;
+            match (key, value) {
+                (Some(key), Some(value)) => {
+                    let value: Value = serde_json::from_str(&value)
+                        .map_err(|error| anyhow!("{value} is not JSON: {error}"))?;
+                    let set = client
+                        .server_call(contract(), "set", json!({"key": key, "value": value}))
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&set["values"])?);
+                }
+                (Some(key), None) => {
+                    let settings = client.server_state(contract(), "settings").await?;
+                    let mut value = &settings["values"];
+                    for part in key.split('.') {
+                        value = &value[part];
+                    }
+                    println!("{value}");
+                }
+                (None, _) => {
+                    let settings = client.server_state(contract(), "settings").await?;
+                    println!("{}", settings["path"].as_str().unwrap_or_default());
+                    println!("{}", serde_json::to_string_pretty(&settings["values"])?);
+                }
+            }
+            Ok(0)
+        }
         ClientCommand::Plugins { json } => {
             let directory = client.plugin_directory().await?;
             if json {
@@ -666,6 +829,79 @@ impl Connector for Endpoint {
 /// listens.
 pub(crate) async fn connect(endpoint: Endpoint, report: Report) -> Result<Client> {
     Client::connect(Arc::new(endpoint), report).await
+}
+
+/// The accounts, one line each: `provider account kind`, with failover's
+/// current account and a rate limit noted.
+fn render_accounts(accounts: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for provider in accounts["providers"].as_array().into_iter().flatten() {
+        let name = provider["provider"].as_str().unwrap_or_default();
+        for account in provider["accounts"].as_array().into_iter().flatten() {
+            let account_name = account["name"].as_str().unwrap_or_default();
+            let mut line = format!(
+                "{name} {account_name} {}",
+                account["kind"].as_str().unwrap_or_default()
+            );
+            if provider["current"].as_str() == Some(account_name) {
+                line.push_str(" (current)");
+            }
+            if let Some(until) = account["limitedUntil"].as_i64() {
+                line.push_str(&format!(" (rate limited until {until})"));
+            }
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        lines.push("no accounts".to_owned());
+    }
+    lines
+}
+
+/// Runs a login on the server's machine, relaying it: a device code or a
+/// sign-in URL is shown (on stderr), and `read` gives the pasted code or
+/// the API key. Returns the line to show when it is done.
+pub(crate) async fn relay_login(
+    client: &Client,
+    provider: &str,
+    account: &str,
+    read: impl FnOnce(&str) -> Result<String>,
+) -> Result<String> {
+    let contract = noel_client::contracts::accounts;
+    let args = json!({"provider": provider, "account": account});
+    let started = client.server_call(contract(), "login", args).await?;
+    let login_id = started["loginId"].as_str().unwrap_or_default().to_owned();
+    let kind = started["kind"].as_str().unwrap_or_default();
+    let mut finish = json!({ "loginId": login_id });
+    match kind {
+        "device" => {
+            eprintln!(
+                "open {} and enter code {}",
+                started["url"].as_str().unwrap_or_default(),
+                started["userCode"].as_str().unwrap_or_default()
+            );
+            eprintln!("waiting for authorization (the code expires in 15 minutes)...");
+        }
+        "code" => {
+            eprintln!(
+                "open this URL and sign in:\n{}",
+                started["url"].as_str().unwrap_or_default()
+            );
+            finish["code"] = json!(read("code")?);
+        }
+        _ => finish["key"] = json!(read("key")?),
+    }
+    let done = client
+        .server_call(contract(), "finishLogin", finish)
+        .await?;
+    Ok(format!(
+        "logged in {provider} as account {account}{}",
+        if done["replaced"] == true {
+            " (replaced existing login)"
+        } else {
+            ""
+        }
+    ))
 }
 
 async fn ls(client: &Client, json: bool) -> Result<i32> {

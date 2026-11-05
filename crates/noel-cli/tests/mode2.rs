@@ -91,6 +91,33 @@ impl Mode2 {
         String::from_utf8(output.stdout).unwrap()
     }
 
+    /// `noel client <args>` with `input` on its stdin, which must succeed.
+    fn client_with_input(&self, args: &[&str], input: &str) -> String {
+        use std::io::Write as _;
+        let mut child = self
+            .command(&[&["client"], args].concat())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        eprintln!(
+            "$ noel client {} -> {}\n{}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "noel client {args:?} failed");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
     fn new_session(&self, request_id: &str) -> String {
         self.client(&["new", "--model", "faux/script", "--request-id", request_id])
             .trim()
@@ -792,4 +819,93 @@ fn the_worker_expands_templates_in_prompts_and_queued_follow_ups() {
             "{prompt} in {journal}"
         );
     }
+}
+
+/// The server's objects for what is not a session's (spec §7.2): session
+/// management, the models, accounts with a relayed login, and settings.
+#[test]
+fn the_server_manages_sessions_accounts_and_settings_for_a_client() {
+    let mode2 = Mode2::new("objects", json!([[{"text": "Hello."}]]), json!({}));
+    // noel.sessions: rename, a clone, a fork, delete, import.
+    let session = mode2.new_session("objects");
+    mode2.client(&["rename", &session, "release notes"]);
+    wait_until("the name listed", || {
+        mode2.client(&["ls"]).contains("release notes")
+    });
+    let clone = mode2
+        .client(&["fork", &session, "--clone"])
+        .trim()
+        .to_owned();
+    let fork = mode2.client(&["fork", &session]).trim().to_owned();
+    assert_ne!(clone, fork);
+    assert!(mode2.journal(&fork).contains(&session));
+    mode2.client(&["delete", &clone]);
+    wait_until("the clone gone", || !mode2.client(&["ls"]).contains(&clone));
+    assert!(!mode2
+        .root
+        .join(format!("agent/sessions/{clone}.jsonl"))
+        .exists());
+    // A journal from elsewhere on the server's machine (only read).
+    let export = mode2.root.join("elsewhere.jsonl");
+    fs::write(
+        &export,
+        format!(
+            "{{\"type\":\"started\",\"session_id\":\"from-elsewhere\",\"cwd\":\"{}\"}}\n\
+             {{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"imported prompt\",\"tool_calls\":[],\"media\":[]}}}}\n",
+            mode2.root.join("cwd").display()
+        ),
+    )
+    .unwrap();
+    let imported = mode2
+        .client(&["import", export.to_str().unwrap()])
+        .trim()
+        .to_owned();
+    assert_ne!(imported, session);
+    wait_until("the import listed", || {
+        mode2.client(&["ls"]).contains("imported prompt")
+    });
+    assert!(mode2.journal(&imported).contains("imported prompt"));
+
+    // noel.models: what a session can use, each saying whether it can.
+    let models: Value = serde_json::from_str(&mode2.client(&["models", "--json"])).unwrap();
+    let script = models["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["provider"] == "faux" && model["modelId"] == "script")
+        .unwrap_or_else(|| panic!("{models}"));
+    assert_eq!(script["available"], true);
+    assert_eq!(script["scoped"], false);
+
+    // noel.accounts: an API-key login relayed from the client, which only
+    // hands over the key; the auth file is the server's.
+    assert_eq!(mode2.client(&["accounts"]), "no accounts\n");
+    let login = mode2.client_with_input(
+        &["login", "openai", "--account", "work"],
+        "sk-relayed-key\n",
+    );
+    assert_eq!(login, "logged in openai as account work\n");
+    assert_eq!(mode2.client(&["accounts"]), "openai work api_key\n");
+    let auth = fs::read_to_string(mode2.root.join("agent/auth.json")).unwrap();
+    assert!(auth.contains("sk-relayed-key"), "{auth}");
+    let listed = mode2.client(&["accounts", "--json"]);
+    assert!(!listed.contains("sk-relayed-key"), "{listed}");
+    assert_eq!(
+        mode2.client(&["logout", "openai", "--account", "work"]),
+        "logged out openai account work\n"
+    );
+    assert_eq!(mode2.client(&["accounts"]), "no accounts\n");
+
+    // noel.settings: read and write the server machine's settings.
+    mode2.client(&["settings", "theme", "\"dark\""]);
+    assert_eq!(mode2.client(&["settings", "theme"]), "\"dark\"\n");
+    let settings = fs::read_to_string(mode2.root.join("agent/settings.json")).unwrap();
+    assert!(settings.contains("\"theme\": \"dark\""), "{settings}");
+    mode2.client(&["settings", "theme", "null"]);
+    assert_eq!(mode2.client(&["settings", "theme"]), "null\n");
+    let settings = fs::read_to_string(mode2.root.join("agent/settings.json")).unwrap();
+    assert!(
+        settings.contains("modelRefresh") && !settings.contains("theme"),
+        "{settings}"
+    );
 }

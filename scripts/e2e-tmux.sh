@@ -1166,6 +1166,7 @@ tmux send-keys -t "${modern_session}" "/quit" Enter
 sleep 0.3
 
 "${repo_root}/scripts/e2e-scrollback.sh"
+"${repo_root}/scripts/e2e-render.sh"
 "${repo_root}/scripts/e2e-transcript.sh"
 "${repo_root}/scripts/e2e-selection.sh"
 "${repo_root}/scripts/e2e-tool-output.sh"

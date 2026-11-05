@@ -419,7 +419,8 @@ enum Action {
 /// The session as the server shows it, and the calls into it.
 struct Remote {
     /// The server runs on this machine: a login runs here, in the terminal,
-    /// writing the auth file the worker reads.
+    /// writing the auth file the worker reads; otherwise it runs on the
+    /// server's machine, relayed (`noel.accounts`).
     local_machine: bool,
     /// A login the worker asked for, run once the loop has the terminal.
     login: Option<(String, String)>,
@@ -837,7 +838,31 @@ impl Remote {
                     terminal,
                     viewport_height,
                 };
-                match crate::run_tui_login(&mut surface, app, config, &provider, &account).await {
+                let login = if self.local_machine {
+                    crate::run_tui_login(&mut surface, app, config, &provider, &account).await
+                } else {
+                    let client = self.client.clone();
+                    let flow = async {
+                        crate::server::client::relay_login(&client, &provider, &account, |kind| {
+                            use std::io::{BufRead, Write};
+                            match kind {
+                                "key" => println!("paste the {provider} API key:"),
+                                _ => println!(
+                                    "after signing in, paste the full code shown (code#state):"
+                                ),
+                            }
+                            let _ = std::io::stdout().flush();
+                            let mut input = String::new();
+                            std::io::stdin().lock().read_line(&mut input)?;
+                            Ok(input.trim().to_owned())
+                        })
+                        .await
+                    };
+                    crate::with_suspended_tui(&mut surface, app, config, flow)
+                        .await
+                        .and_then(|outcome| outcome)
+                };
+                match login {
                     Ok(line) => {
                         app.push(TuiEntryKind::System, line);
                         self.run_command("/reload".to_owned());
@@ -1602,20 +1627,14 @@ impl Remote {
                 // Its images come back to the draft too, as locally.
                 app.input_media = serde_json::from_value(next["media"].clone()).unwrap_or_default();
             }
-            Some("login") if self.local_machine => {
+            // Run once the loop has the terminal: here on this machine, or
+            // relayed from the server's (`noel.accounts`).
+            Some("login") => {
                 self.login = Some((
                     next["provider"].as_str().unwrap_or_default().to_owned(),
                     next["account"].as_str().unwrap_or("default").to_owned(),
                 ));
             }
-            Some("login") => app.push(
-                TuiEntryKind::System,
-                format!(
-                    "log in to {} on the server's machine: noel auth login {}",
-                    next["provider"].as_str().unwrap_or_default(),
-                    next["provider"].as_str().unwrap_or_default()
-                ),
-            ),
             _ => {}
         }
     }

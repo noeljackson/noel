@@ -782,7 +782,7 @@ fn open_browser(url: &str) {
         });
 }
 
-fn login_http_client() -> reqwest::Client {
+pub(crate) fn login_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
@@ -3396,7 +3396,7 @@ fn open_tui_terminal(owned_screen: bool) -> Result<(TerminalRestore, TuiTerminal
 /// the TUI shows afterwards. The same claim/release lock the signal path
 /// uses covers the gap, so a fatal signal during the flow still restores
 /// the terminal.
-async fn with_suspended_tui<R>(
+pub(crate) async fn with_suspended_tui<R>(
     surface: &mut TuiSurface<'_>,
     app: &mut TuiApp,
     config: &LoadedConfig,
@@ -3435,7 +3435,7 @@ async fn with_suspended_tui<R>(
 }
 
 /// Gives the terminal back, then prints the transcript for the e2e suites
-/// when `NOEL_TUI_E2E_DUMP=1`.
+/// when `NOEL_TUI_E2E_DUMP=1`, or writes it to `NOEL_TUI_E2E_DUMP_FILE`.
 fn close_tui_terminal(
     mut terminal: TuiTerminal,
     restore: TerminalRestore,
@@ -3450,6 +3450,9 @@ fn close_tui_terminal(
     if dump_transcript {
         println!();
         println!("{}", app.transcript_text());
+    }
+    if let Some(path) = std::env::var_os("NOEL_TUI_E2E_DUMP_FILE").filter(|path| !path.is_empty()) {
+        fs::write(path, format!("{}\n", app.transcript_text()))?;
     }
     Ok(())
 }
