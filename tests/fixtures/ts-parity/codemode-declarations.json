@@ -1,0 +1,1330 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "commit": "7dc38ff0e9490483b368c2b14531c9199c4cbee1",
+    "script": "/ts-parity/codemode-declarations-fixture.ts",
+    "files": [
+      "packages/codemode/src/declarations.ts",
+      "packages/codemode/test/declarations.test.ts"
+    ]
+  },
+  "defaultInputSchemaMaxChars": 16000,
+  "calls": [
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "string"
+        }
+      ],
+      "result": "string"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "integer"
+        }
+      ],
+      "result": "number"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      ],
+      "result": "string | null"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "const": "a"
+        }
+      ],
+      "result": "\"a\""
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "enum": [
+            "a",
+            1,
+            null
+          ]
+        }
+      ],
+      "result": "\"a\" | 1 | null"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "result": "string | number"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {}
+          ]
+        }
+      ],
+      "result": "unknown"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "allOf": [
+            {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "number"
+                }
+              ]
+            },
+            {
+              "const": 1
+            }
+          ]
+        }
+      ],
+      "result": "(string | number) & 1"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "$ref": "#/defs/x"
+        }
+      ],
+      "result": "unknown"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        true
+      ],
+      "result": "unknown"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        false
+      ],
+      "result": "never"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "max-lines": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "result": "{ city: string; \"max-lines\"?: number; }"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          }
+        }
+      ],
+      "result": "{ [key: string]: number; }"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object"
+        }
+      ],
+      "result": "{ [key: string]: unknown; }"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      ],
+      "result": "{}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "weather": {
+              "type": "array",
+              "description": "look up weather for a given list of locations",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          },
+          "required": [
+            "weather"
+          ]
+        }
+      ],
+      "result": "{\n  // look up weather for a given list of locations\n  weather: Array<{ location: string; }>;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "outer": {
+              "type": "object",
+              "description": "Outer",
+              "properties": {
+                "inner": {
+                  "type": "string",
+                  "description": "Inner"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "result": "{\n  // Outer\n  outer?: {\n    // Inner\n    inner?: string;\n  };\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000,
+              "default": 0,
+              "description": "Wait in milliseconds."
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^[a-z]+$",
+              "maxLength": 8
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 5,
+              "uniqueItems": true,
+              "deprecated": true
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ]
+        }
+      ],
+      "result": "{\n  // @maxLength 8 @pattern ^[a-z]+$\n  id: string;\n  name?: string;\n  // @maxItems 5 @uniqueItems @deprecated\n  tags?: Array<string>;\n  // Wait in milliseconds.\n  // @integer @minimum 0 @maximum 30000 @default 0\n  timeoutMs?: number;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 100
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Limit"
+            }
+          }
+        }
+      ],
+      "result": "{\n  // @integer @minimum 1 @maximum 100\n  limit?: number | null;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "n": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 10,
+                  "maximum": 50,
+                  "format": "int32"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "minimum": 0,
+              "maximum": 20,
+              "format": "port"
+            }
+          }
+        }
+      ],
+      "result": "{\n  // @integer @minimum 10 @maximum 20 @format port @format int32\n  n?: number | null;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "n": {
+              "type": "integer",
+              "minimum": 0,
+              "exclusiveMinimum": true,
+              "maximum": 10,
+              "exclusiveMaximum": false
+            },
+            "m": {
+              "anyOf": [
+                {
+                  "type": "number",
+                  "maximum": 5,
+                  "exclusiveMaximum": true
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "maximum": 8
+            }
+          }
+        }
+      ],
+      "result": "{\n  // @maximum 8 @exclusiveMaximum 5\n  m?: number | null;\n  // @integer @exclusiveMinimum 0 @maximum 10\n  n?: number;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "config": {
+              "type": "object",
+              "default": {
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            }
+          }
+        }
+      ],
+      "result": "{ config?: { [key: string]: unknown; }; }"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "sep": {
+              "type": "string",
+              "pattern": "^[\r\n  ]$",
+              "default": " ",
+              "description": "a b"
+            }
+          }
+        }
+      ],
+      "result": "{\n  // a\n  // b\n  // @pattern ^[\\u000d\\u000a\\u2028\\u2029]$ @default \"\\u2028\"\n  sep?: string;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "n": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      ],
+      "result": "{\n  // @integer @minimum 1\n  n?: number;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "n": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        {
+          "maxChars": 20
+        }
+      ],
+      "result": "{ n?: number; }"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "n": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        {
+          "maxChars": 10
+        }
+      ],
+      "result": "unknown"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/Item"
+            },
+            "legacy": {
+              "$ref": "#/definitions/Legacy"
+            },
+            "remote": {
+              "$ref": "https://example.com/schema.json"
+            }
+          },
+          "required": [
+            "item"
+          ],
+          "$defs": {
+            "Item": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "parent": {
+                  "$ref": "#/$defs/Item"
+                }
+              },
+              "required": [
+                "id"
+              ]
+            }
+          },
+          "definitions": {
+            "Legacy": {
+              "enum": [
+                "a",
+                "b"
+              ]
+            }
+          }
+        }
+      ],
+      "result": "{ item: { id: string; parent?: unknown; }; legacy?: \"a\" | \"b\"; remote?: unknown; }"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": "Array<string>"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "result": "[string, number]"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "array"
+        }
+      ],
+      "result": "unknown[]"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "field0": {
+              "type": "string"
+            },
+            "field1": {
+              "type": "string"
+            },
+            "field2": {
+              "type": "string"
+            },
+            "field3": {
+              "type": "string"
+            },
+            "field4": {
+              "type": "string"
+            },
+            "field5": {
+              "type": "string"
+            },
+            "field6": {
+              "type": "string"
+            },
+            "field7": {
+              "type": "string"
+            },
+            "field8": {
+              "type": "string"
+            },
+            "field9": {
+              "type": "string"
+            },
+            "field10": {
+              "type": "string"
+            },
+            "field11": {
+              "type": "string"
+            },
+            "field12": {
+              "type": "string"
+            },
+            "field13": {
+              "type": "string"
+            },
+            "field14": {
+              "type": "string"
+            },
+            "field15": {
+              "type": "string"
+            },
+            "field16": {
+              "type": "string"
+            },
+            "field17": {
+              "type": "string"
+            },
+            "field18": {
+              "type": "string"
+            },
+            "field19": {
+              "type": "string"
+            },
+            "field20": {
+              "type": "string"
+            },
+            "field21": {
+              "type": "string"
+            },
+            "field22": {
+              "type": "string"
+            },
+            "field23": {
+              "type": "string"
+            },
+            "field24": {
+              "type": "string"
+            },
+            "field25": {
+              "type": "string"
+            },
+            "field26": {
+              "type": "string"
+            },
+            "field27": {
+              "type": "string"
+            },
+            "field28": {
+              "type": "string"
+            },
+            "field29": {
+              "type": "string"
+            },
+            "field30": {
+              "type": "string"
+            },
+            "field31": {
+              "type": "string"
+            },
+            "field32": {
+              "type": "string"
+            },
+            "field33": {
+              "type": "string"
+            },
+            "field34": {
+              "type": "string"
+            },
+            "field35": {
+              "type": "string"
+            },
+            "field36": {
+              "type": "string"
+            },
+            "field37": {
+              "type": "string"
+            },
+            "field38": {
+              "type": "string"
+            },
+            "field39": {
+              "type": "string"
+            },
+            "field40": {
+              "type": "string"
+            },
+            "field41": {
+              "type": "string"
+            },
+            "field42": {
+              "type": "string"
+            },
+            "field43": {
+              "type": "string"
+            },
+            "field44": {
+              "type": "string"
+            },
+            "field45": {
+              "type": "string"
+            },
+            "field46": {
+              "type": "string"
+            },
+            "field47": {
+              "type": "string"
+            },
+            "field48": {
+              "type": "string"
+            },
+            "field49": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "maxChars": 100
+        }
+      ],
+      "result": "unknown"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "field0": {
+              "type": "string"
+            },
+            "field1": {
+              "type": "string"
+            },
+            "field2": {
+              "type": "string"
+            },
+            "field3": {
+              "type": "string"
+            },
+            "field4": {
+              "type": "string"
+            },
+            "field5": {
+              "type": "string"
+            },
+            "field6": {
+              "type": "string"
+            },
+            "field7": {
+              "type": "string"
+            },
+            "field8": {
+              "type": "string"
+            },
+            "field9": {
+              "type": "string"
+            },
+            "field10": {
+              "type": "string"
+            },
+            "field11": {
+              "type": "string"
+            },
+            "field12": {
+              "type": "string"
+            },
+            "field13": {
+              "type": "string"
+            },
+            "field14": {
+              "type": "string"
+            },
+            "field15": {
+              "type": "string"
+            },
+            "field16": {
+              "type": "string"
+            },
+            "field17": {
+              "type": "string"
+            },
+            "field18": {
+              "type": "string"
+            },
+            "field19": {
+              "type": "string"
+            },
+            "field20": {
+              "type": "string"
+            },
+            "field21": {
+              "type": "string"
+            },
+            "field22": {
+              "type": "string"
+            },
+            "field23": {
+              "type": "string"
+            },
+            "field24": {
+              "type": "string"
+            },
+            "field25": {
+              "type": "string"
+            },
+            "field26": {
+              "type": "string"
+            },
+            "field27": {
+              "type": "string"
+            },
+            "field28": {
+              "type": "string"
+            },
+            "field29": {
+              "type": "string"
+            },
+            "field30": {
+              "type": "string"
+            },
+            "field31": {
+              "type": "string"
+            },
+            "field32": {
+              "type": "string"
+            },
+            "field33": {
+              "type": "string"
+            },
+            "field34": {
+              "type": "string"
+            },
+            "field35": {
+              "type": "string"
+            },
+            "field36": {
+              "type": "string"
+            },
+            "field37": {
+              "type": "string"
+            },
+            "field38": {
+              "type": "string"
+            },
+            "field39": {
+              "type": "string"
+            },
+            "field40": {
+              "type": "string"
+            },
+            "field41": {
+              "type": "string"
+            },
+            "field42": {
+              "type": "string"
+            },
+            "field43": {
+              "type": "string"
+            },
+            "field44": {
+              "type": "string"
+            },
+            "field45": {
+              "type": "string"
+            },
+            "field46": {
+              "type": "string"
+            },
+            "field47": {
+              "type": "string"
+            },
+            "field48": {
+              "type": "string"
+            },
+            "field49": {
+              "type": "string"
+            }
+          }
+        }
+      ],
+      "result": "{ field0?: string; field1?: string; field10?: string; field11?: string; field12?: string; field13?: string; field14?: string; field15?: string; field16?: string; field17?: string; field18?: string; field19?: string; field2?: string; field20?: string; field21?: string; field22?: string; field23?: string; field24?: string; field25?: string; field26?: string; field27?: string; field28?: string; field29?: string; field3?: string; field30?: string; field31?: string; field32?: string; field33?: string; field34?: string; field35?: string; field36?: string; field37?: string; field38?: string; field39?: string; field4?: string; field40?: string; field41?: string; field42?: string; field43?: string; field44?: string; field45?: string; field46?: string; field47?: string; field48?: string; field49?: string; field5?: string; field6?: string; field7?: string; field8?: string; field9?: string; }"
+    },
+    {
+      "fn": "renderToolSignature",
+      "args": [
+        {
+          "name": "hidden-dynamic-tool",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "additionalProperties": false
+          },
+          "outputSchema": {
+            "type": "object",
+            "properties": {
+              "ok": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "ok"
+            ]
+          }
+        }
+      ],
+      "result": "hidden_dynamic_tool(args: { city: string; }): Promise<{ ok: boolean; }>;"
+    },
+    {
+      "fn": "renderToolSignature",
+      "args": [
+        {
+          "name": "free"
+        }
+      ],
+      "result": "free(args: unknown): Promise<unknown>;"
+    },
+    {
+      "fn": "renderToolSignature",
+      "args": [
+        {
+          "name": "plain",
+          "inputSchema": {
+            "type": "object",
+            "properties": {}
+          },
+          "outputSchema": {
+            "type": "object",
+            "properties": {
+              "content": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              },
+              "isError": {
+                "type": "boolean"
+              },
+              "_meta": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "content"
+            ]
+          }
+        }
+      ],
+      "result": "plain(args: { [key: string]: unknown; }): Promise<{ _meta?: { [key: string]: unknown; }; content: Array<{ [key: string]: unknown; }>; isError?: boolean; }>;"
+    },
+    {
+      "fn": "renderToolSample",
+      "args": [
+        {
+          "name": "foo",
+          "description": "bar",
+          "inputSchema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": "bar\n\ncodemode tool declaration:\n```ts\ndeclare const tools: { foo(args: string): Promise<unknown>; };\n```"
+    },
+    {
+      "fn": "renderDeclarations",
+      "args": [
+        {
+          "tools": [
+            {
+              "name": "read",
+              "description": "Read a file.\nSecond line.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              },
+              "outputSchema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "remote-api"
+            }
+          ],
+          "globals": [
+            {
+              "name": "attach",
+              "description": "Attach it.",
+              "inputSchema": {
+                "type": "string"
+              }
+            }
+          ]
+        }
+      ],
+      "result": "declare const tools: {\n  /**\n   * Read a file.\n   * Second line.\n   */\n  read(args: { path: string; }): Promise<string>;\n  remote_api(args: unknown): Promise<unknown>;\n};\n\n/** Attach it. */\ndeclare function attach(args: string): Promise<unknown>;"
+    },
+    {
+      "fn": "renderDeclarations",
+      "args": [
+        {
+          "globals": [
+            {
+              "name": "models.list",
+              "description": "List models.",
+              "signature": "(type: string): Promise<string[]>"
+            },
+            {
+              "name": "models.get",
+              "inputSchema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "plain",
+              "signature": "(): void"
+            }
+          ]
+        }
+      ],
+      "result": "declare function plain(): void;\n\ndeclare const models: {\n  /** List models. */\n  list(type: string): Promise<string[]>;\n  get(args: string): Promise<unknown>;\n};"
+    },
+    {
+      "fn": "renderDeclarations",
+      "args": [
+        {
+          "tools": [
+            {
+              "name": "x",
+              "description": "a */ b"
+            }
+          ]
+        }
+      ],
+      "result": "declare const tools: {\n  /** a *\\/ b */\n  x(args: unknown): Promise<unknown>;\n};"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "😀": {
+              "type": "string"
+            },
+            "": {
+              "type": "number"
+            }
+          }
+        }
+      ],
+      "result": "{ \"😀\"?: string; \"\"?: number; }"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "n": {
+              "type": "number",
+              "minimum": 0.5,
+              "maximum": 1000
+            }
+          }
+        }
+      ],
+      "result": "{\n  // @minimum 0.5 @maximum 1000\n  n?: number;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "s": {
+              "type": "string",
+              "default": "a b",
+              "description": " x   y "
+            }
+          }
+        }
+      ],
+      "result": "{\n  // x\n  // y\n  // @default \"a\\u2028b\"\n  s?: string;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "$ref": "#",
+          "properties": {
+            "a": {
+              "$ref": "#/properties/b"
+            },
+            "b": {
+              "type": "string"
+            }
+          }
+        }
+      ],
+      "result": "unknown"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "$ref": "#/$defs/a~1b",
+          "$defs": {
+            "a/b": {
+              "type": "boolean"
+            }
+          }
+        }
+      ],
+      "result": "boolean"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "items": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": "Array<string>"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "result": "[string, number]"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "array"
+        }
+      ],
+      "result": "unknown[]"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "required": [
+            "a"
+          ]
+        }
+      ],
+      "result": "{ [key: string]: unknown; }"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "result": "string"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "allOf": [
+            {},
+            true
+          ]
+        }
+      ],
+      "result": "unknown"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "a": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        }
+      ],
+      "result": "{ a?: string; [key: string]: unknown; }"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "a": {
+              "type": "integer",
+              "multipleOf": 2,
+              "uniqueItems": true,
+              "deprecated": true
+            }
+          }
+        }
+      ],
+      "result": "{\n  // @integer @multipleOf 2 @uniqueItems @deprecated\n  a?: number;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "a": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "minLength": 2
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "minLength": 1
+            }
+          }
+        }
+      ],
+      "result": "{\n  // @minLength 2\n  a?: string | null;\n}"
+    },
+    {
+      "fn": "schemaToType",
+      "args": [
+        {
+          "type": "object",
+          "properties": {
+            "a": {
+              "type": "object",
+              "description": "line one\nline two",
+              "properties": {
+                "b": {
+                  "type": "string",
+                  "description": "B"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "result": "{\n  // line one\n  // line two\n  a?: {\n    // B\n    b?: string;\n  };\n}"
+    },
+    {
+      "fn": "renderDeclarations",
+      "args": [
+        {
+          "tools": [
+            {
+              "name": "multi",
+              "description": "First.\n\nSecond.\r\nThird."
+            }
+          ]
+        }
+      ],
+      "result": "declare const tools: {\n  /**\n   * First.\n   *\n   * Second.\n   * Third.\n   */\n  multi(args: unknown): Promise<unknown>;\n};"
+    },
+    {
+      "fn": "renderDeclarations",
+      "args": [
+        {
+          "globals": [
+            {
+              "name": "a.b.c",
+              "description": "Nested."
+            },
+            {
+              "name": "solo"
+            },
+            {
+              "name": "a.d"
+            }
+          ]
+        }
+      ],
+      "result": "declare function solo(args: unknown): Promise<unknown>;\n\ndeclare const a: {\n  /** Nested. */\n  b.c(args: unknown): Promise<unknown>;\n  d(args: unknown): Promise<unknown>;\n};"
+    },
+    {
+      "fn": "renderDeclarations",
+      "args": [
+        {}
+      ],
+      "result": ""
+    },
+    {
+      "fn": "renderToolSignature",
+      "args": [
+        {
+          "name": "big",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "string",
+                "description": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            }
+          }
+        },
+        {
+          "inputMaxChars": 30
+        }
+      ],
+      "result": "big(args: unknown): Promise<unknown>;"
+    },
+    {
+      "fn": "renderToolSample",
+      "args": [
+        {
+          "name": "bare"
+        }
+      ],
+      "result": "\n\ncodemode tool declaration:\n```ts\ndeclare const tools: { bare(args: unknown): Promise<unknown>; };\n```"
+    }
+  ]
+}

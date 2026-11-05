@@ -51,17 +51,22 @@ v1 pin `@earendil-works/chord@1.5.0`).
 - Done when the owner approves both and the non-parity register and spec
   citations are updated.
 
-### 3. Codemode (First version done, #118)
+### 3. Codemode (Done, #118)
 - Done: `crates/noel-codemode` runs upstream's prelude on djs (pinned by
   commit; type-checks for iOS), with upstream's source options, execution
   layer and result format. The built-in `codemode` tool is off unless
   selected by name; nested calls go through the gate and run in parallel;
   the store is saved in the journal. Spec: `docs/codemode-port.md`;
   differences: the register's Codemode section.
-- Next: nested-call events and TUI rows, structured `bash`/`read` results,
-  upstream's `Script aborted` result on abort, goldens recorded from
-  upstream's `packages/codemode` tests, the declarations catalog and the
-  discovery globals (with `tool_search`).
+- Also done: nested-call events and TUI rows, structured `bash`/`read`
+  results, the `Script aborted` result; upstream's declarations
+  (`noel_codemode::declarations`) and BM25 tool search
+  (`noel_codemode::search`) with goldens recorded from upstream's own tests
+  (`scripts/ts-parity/codemode-declarations-fixture.ts`,
+  `tool-search-fixture.ts`); the description catalog with
+  `codemode.mode`/`inlineBudget`; the discovery globals.
+- Not ported: the `tool_search` tool, which loads `deferred` tools; noel
+  has no tool exposures (register: Tools).
 
 ### 4. Chord v2 port (Done, #119)
 - noel's server, workers and clients speak Chord v2 (`noel_chord::v2`):

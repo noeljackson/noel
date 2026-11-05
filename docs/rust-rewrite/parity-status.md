@@ -42,6 +42,15 @@ The committed TypeScript parity fixtures are:
   UTF-16 and v1 contract descriptions with `coverage` and `fits`, are no
   longer checked: noel speaks Chord v2, whose contracts
   `chord-v2-contracts.json` covers.)
+- `codemode-declarations.json`: every call upstream's
+  `packages/codemode/test/declarations.test.ts` makes to `schemaToType`,
+  `renderToolSignature`, `renderToolSample` and `renderDeclarations`, plus
+  noel's own cases. `noel-codemode`'s `declarations` matches each byte for
+  byte (`crates/noel-codemode/src/declarations.rs`).
+- `tool-search.json`: upstream's tool-search `tokenize`, search documents
+  and BM25 rankings on the cases of its `tool-search.test.ts`.
+  `noel-codemode`'s `search` matches them, except dictionary-segmented
+  scripts (`crates/noel-codemode/src/search.rs`).
 - `chord-v2-contracts.json`: Chord v2's `hash64` and the fingerprints of
   contracts as upstream's `remote()` declares them at `CHORD2_REFERENCE_REF`
   (noel's three v2 contracts, upstream's pinned `notes`, normal-form edge

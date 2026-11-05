@@ -30,7 +30,7 @@ ENV_DAEMONS_SCRIPT := scripts/build-env-daemons.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord2-interop app app-check ios ios-libs env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures codemode-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord2-interop app app-check ios ios-libs env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -208,6 +208,13 @@ chord2-fixtures:
 		"$(CHORD2_REFERENCE_DIR)" crates/noel-client/contracts/v2 $(TS_PARITY_FIXTURES_DIR)
 	bun --conditions=source scripts/ts-parity/chord-v2-messages-fixture.ts \
 		"$(CHORD2_REFERENCE_DIR)" $(TS_PARITY_FIXTURES_DIR)
+
+# Codemode's declaration and tool-search goldens, recorded with Bun from a pi
+# checkout at the TS reference (CODEMODE_REFERENCE_DIR).
+CODEMODE_REFERENCE_DIR ?= ../earendil-works/pi
+codemode-fixtures:
+	bun scripts/ts-parity/codemode-declarations-fixture.ts "$(CODEMODE_REFERENCE_DIR)" $(TS_PARITY_FIXTURES_DIR)
+	bun scripts/ts-parity/tool-search-fixture.ts "$(CODEMODE_REFERENCE_DIR)" $(TS_PARITY_FIXTURES_DIR)
 
 ts-parity-build:
 	$(DOCKER) build -f Dockerfile.ts-parity \

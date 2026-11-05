@@ -345,12 +345,30 @@ async fn codemode_is_declared_only_when_selected_and_lists_its_nested_tools() {
     assert!(codemode
         .description
         .starts_with("Run JavaScript that calls other tools."));
-    assert!(codemode.description.contains("- `tools.read(args)`"));
-    assert!(codemode.description.contains("- `tools.write(args)`"));
+    // `codemode.mode: "on"`: the tools stay declared and say how scripts
+    // call them; codemode lists none (they all have direct exposure).
+    assert!(!codemode.description.contains("Nested tools:"));
+    let described = |name: &str| {
+        definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .map(|definition| definition.description.clone())
+            .unwrap_or_default()
+    };
+    assert!(described("read").contains("\n\nCodemode: `tools.read(args)` resolves to"));
+    assert!(described("write").ends_with("Codemode: `tools.write(args)` resolves to a string."));
     // Model-only tools are not callable from scripts.
-    assert!(!codemode.description.contains("tools.todo("));
-    assert!(!codemode.description.contains("tools.codemode("));
+    assert!(!described("todo").contains("Codemode:"));
     assert_eq!(codemode.parameters["required"], json!(["code"]));
+
+    // `"only"`: codemode lists the callable tools, which are not declared.
+    let (mut runtime, _) = runtime_with_codemode("only", &["read", "write", "todo", "codemode"]);
+    runtime.systems.codemode.only = true;
+    let definitions = active_tool_definitions(&runtime);
+    let names: Vec<&str> = definitions.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, ["todo", "codemode"]);
+    assert!(definitions[1].description.contains("### `read`"));
+    assert!(definitions[1].description.contains("### `write`"));
 
     let (runtime, _) = runtime_with_codemode("not-selected", &["read", "write"]);
     assert!(!active_tool_definitions(&runtime)
@@ -837,7 +855,42 @@ async fn a_codemode_bash_call_resolves_to_its_structured_output() {
         .iter()
         .find(|tool| tool.name == "codemode")
         .unwrap();
-    assert!(codemode
-        .description
-        .contains("exit_code, wall_time_seconds"));
+    assert!(!codemode.description.contains("Nested tools:"));
+    let bash = definitions.iter().find(|tool| tool.name == "bash").unwrap();
+    assert!(bash.description.contains(
+        "Codemode: `tools.bash(args)` resolves to `{ output, truncated, full_output_path?, exit_code, wall_time_seconds }`."
+    ));
+}
+
+#[tokio::test]
+async fn codemode_scripts_find_tools_with_the_discovery_globals() {
+    let (mut runtime, _) =
+        runtime_with_codemode("discovery", &["read", "write", "bash", "todo", "codemode"]);
+    let code = "const found = await searchTools('write file', { limit: 1 });\n\
+                const sample = await describeTool('read');\n\
+                const entry = ALL_TOOLS.find((tool) => tool.name === 'bash');\n\
+                return {\n\
+                  found: found.map((tool) => tool.name),\n\
+                  sample: sample.includes('codemode tool declaration:'),\n\
+                  all: entry.description.includes('declare const tools: { bash('),\n\
+                  missing: await describeTool('todo'),\n\
+                  namespace: await describeNamespace('mcp__x'),\n\
+                };";
+    let (output, is_error) = call_tool(&mut runtime, "codemode", json!({ "code": code })).await;
+    assert!(!is_error, "{output}");
+    assert!(
+        output.ends_with("Output:\n{\"found\":[\"write\"],\"sample\":true,\"all\":true}"),
+        "{output}"
+    );
+    let (output, is_error) = call_tool(
+        &mut runtime,
+        "codemode",
+        json!({ "code": "await searchTools(1)" }),
+    )
+    .await;
+    assert!(is_error);
+    assert!(
+        output.contains("searchTools() expects a query string"),
+        "{output}"
+    );
 }
