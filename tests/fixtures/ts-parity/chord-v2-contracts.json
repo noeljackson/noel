@@ -289,6 +289,9 @@
                   "properties": {
                     "expectedRunId": {
                       "type": "string"
+                    },
+                    "keepQueue": {
+                      "type": "boolean"
                     }
                   },
                   "additionalProperties": false
@@ -362,9 +365,6 @@
               "resume": {
                 "args": {
                   "type": "object",
-                  "required": [
-                    "expectedRunId"
-                  ],
                   "properties": {
                     "expectedRunId": {
                       "type": "string"
@@ -491,7 +491,7 @@
           }
         }
       },
-      "fingerprint": "dfcf02e964078fb2"
+      "fingerprint": "178a361886443d23"
     },
     {
       "declaration": {

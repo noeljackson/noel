@@ -28,6 +28,7 @@
 //!   watch` does.
 //! - An unknown session is an error before the terminal is taken.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,19 +52,21 @@ const FIRST_VIEW: Duration = Duration::from_secs(30);
 
 /// `quit_ends`: quitting ends the session's run and, with no other client,
 /// the session, as a local `noel` quits (plain `noel` as a client);
-/// otherwise quitting detaches (`--attach`).
+/// otherwise quitting detaches (`--attach`). Returns the session shown last
+/// when the TUI should restart (a rebuilt binary, dogfood).
 pub(crate) async fn run(
     session: &str,
     endpoint: Endpoint,
     mut config: LoadedConfig,
     owned_screen: bool,
     quit_ends: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if !valid_session_id(session) {
         return Err(anyhow!("--attach: {session:?} is not a session id"));
     }
     let (sender, mut incoming) = mpsc::unbounded_channel();
     let reports = sender.clone();
+    let local_machine = matches!(endpoint, Endpoint::Local);
     let place = match &endpoint {
         Endpoint::Local => "noel server".to_owned(),
         Endpoint::Ssh { destination, .. } => format!("noel server on {destination}"),
@@ -105,8 +108,26 @@ pub(crate) async fn run(
     let mut first = first;
     let mut early = early;
     let mut switched = false;
+    let mut auto_restart = crate::AutoRestart::from_env();
+    // A local `noel` that a signal ends takes its session's worker with it
+    // when no other client holds the session, as its tools would end with
+    // it in process.
+    let local = Arc::new(LocalHolds::default());
+    if quit_ends {
+        let local = local.clone();
+        crate::signals::set_exit_hook(Some(Box::new(move || {
+            if let Some(session) = local.alone() {
+                stop_local_worker(&session);
+            }
+        })));
+    }
     let result = loop {
         let mut remote = Remote::new(&session, client.clone(), sender.clone());
+        remote.local_machine = local_machine;
+        if let Ok(mut held) = local.session.lock() {
+            held.clone_from(&session);
+        }
+        remote.local = local.clone();
         if std::mem::take(&mut switched) {
             remote.run_command("/session".to_owned());
         }
@@ -134,6 +155,7 @@ pub(crate) async fn run(
                 &mut viewport_height,
                 &mut config,
                 &mut incoming,
+                &mut auto_restart,
             )
             .await;
         follower.abort();
@@ -143,18 +165,36 @@ pub(crate) async fn run(
                 // As a local quit: the run is aborted, then the session ends
                 // unless another client holds it.
                 if remote.run.is_some() {
-                    let _ = client.chat_call(&session, "abort", json!({}), false).await;
+                    let _ = client
+                        .chat_call(&session, "abort", json!({"keepQueue": true}), false)
+                        .await;
                 }
                 let args = json!({"line": "/quit", "requestId": new_request_id()});
                 if let Ok(answer) = client.chat_call(&session, "command", args, false).await {
                     remote.command_answer(&mut app, "/quit", &answer);
+                    // The session ends with its worker, which lets go of the
+                    // journal: the next `noel` opens it as this one quit it.
+                    // Released first: a hold left would start it again.
+                    if answer["leaving"] == true {
+                        client.close().await;
+                        wait_for_worker_exit(&session).await;
+                    }
                 }
-                break Ok(());
+                break Ok(remote.restart.then(|| session.clone()));
             }
-            other => break other.map(|_| ()),
+            Ok(None) => break Ok(remote.restart.then(|| session.clone())),
+            Err(error) => break Err(error),
         };
         // Another session a command named (a fork, a pick): its view, or
-        // back to this one if it cannot be held.
+        // back to this one if it cannot be held. A local `noel`'s flags go
+        // with it, as with the session it opened.
+        if quit_ends {
+            match crate::hand_over_flags(&next, true) {
+                Ok(Some(notice)) => app.push(TuiEntryKind::System, notice),
+                Ok(None) => {}
+                Err(error) => app.push(TuiEntryKind::Error, format!("{error:#}")),
+            }
+        }
         let attached = match first_view(&client, &next, &sender, &mut incoming).await {
             Ok(attached) => {
                 session = next;
@@ -177,9 +217,76 @@ pub(crate) async fn run(
             Err(error) => break Err(error),
         }
     };
+    crate::signals::set_exit_hook(None);
     crate::close_tui_terminal(terminal, restore, &app)?;
     client.close().await;
     result
+}
+
+/// What the signal hook knows of the session's holds.
+#[derive(Default)]
+struct LocalHolds {
+    session: std::sync::Mutex<String>,
+    /// The holds the view last reported (`noel.clients`).
+    holds: AtomicU64,
+    /// This client's calls in flight, each a hold of its own.
+    calls: Arc<AtomicUsize>,
+}
+
+impl LocalHolds {
+    /// The session, when no other client holds it.
+    fn alone(&self) -> Option<String> {
+        let holds = self.holds.load(Ordering::SeqCst);
+        let ours = 1 + self.calls.load(Ordering::SeqCst) as u64;
+        let session = self.session.lock().ok()?.clone();
+        (holds > 0 && holds <= ours && !session.is_empty()).then_some(session)
+    }
+
+    /// Counts a call until the guard drops.
+    fn calling(&self) -> Calling {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Calling(self.calls.clone())
+    }
+}
+
+struct Calling(Arc<AtomicUsize>);
+
+impl Drop for Calling {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Ends the local worker of `session` (SIGTERM: it kills its tools' groups
+/// and exits).
+fn stop_local_worker(session: &str) {
+    let Ok(dir) = crate::server::RuntimeDir::check(crate::server::RuntimeDir::locate()) else {
+        return;
+    };
+    let record = std::fs::read_to_string(dir.worker_record(session))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    if let Some(pid) = record.and_then(|record| record["pid"].as_i64()) {
+        if let Ok(pid) = i32::try_from(pid) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+    }
+}
+
+/// Waits, briefly, for the local worker of `session` to exit: its socket
+/// goes when it does.
+async fn wait_for_worker_exit(session: &str) {
+    let Ok(dir) = crate::server::RuntimeDir::check(crate::server::RuntimeDir::locate()) else {
+        return;
+    };
+    let socket = dir.worker_socket(session);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while socket.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Follows `session` and waits for its first view, keeping what came
@@ -247,6 +354,20 @@ fn attach_error(session: &str, error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// What opening a session says of its saved work, as `noel` says it.
+fn resume_hint(unfinished: bool, queued: usize) -> Option<String> {
+    match (unfinished, queued) {
+        (false, 0) => None,
+        (true, 0) => Some("resumed mid-turn; continuing automatically from saved context".to_owned()),
+        (false, n) => Some(format!(
+            "{n} queued message(s) pending; they run after your next prompt (/queue to list, /queue-clear to clear)"
+        )),
+        (true, n) => Some(format!(
+            "resumed mid-turn; continuing automatically from saved context, then {n} queued message(s)"
+        )),
+    }
+}
+
 /// What reaches the TUI from the server.
 enum Incoming {
     /// The view, and what happened to the link or the hold.
@@ -271,6 +392,8 @@ enum Call {
         recall: bool,
     },
     Abort,
+    /// A resume of the turn the saved context left unfinished.
+    Resume,
 }
 
 /// What a key or a command asks of the loop.
@@ -283,6 +406,17 @@ enum Action {
 
 /// The session as the server shows it, and the calls into it.
 struct Remote {
+    /// The server runs on this machine: a login runs here, in the terminal,
+    /// writing the auth file the worker reads.
+    local_machine: bool,
+    /// A login the worker asked for, run once the loop has the terminal.
+    login: Option<(String, String)>,
+    /// How many holds the session has and how many are this client's
+    /// calls, for the signal hook.
+    local: Arc<LocalHolds>,
+    /// The last submission sent: the next waits for its answer, so the
+    /// worker queues them in the order typed.
+    last_submit: Option<tokio::task::JoinHandle<()>>,
     session: String,
     client: Client,
     sender: mpsc::UnboundedSender<Incoming>,
@@ -300,6 +434,13 @@ struct Remote {
     aborting: Option<String>,
     /// The run this TUI interrupted, noted as locally once it ends.
     interrupted: Option<String>,
+    /// The binary was rebuilt: the TUI restarts (dogfood).
+    restart: bool,
+    /// The retry last noted (its `at`).
+    retry_noted: Option<u64>,
+    /// The worker's notes shown, by id; `None` until the first view, whose
+    /// notes are old.
+    notices_seen: Option<u64>,
     /// Queued submissions a withdrawal was sent for.
     withdrawing: Vec<String>,
     /// The last run as last shown: `(runId, status)`.
@@ -333,6 +474,9 @@ impl Remote {
             saw_tools: false,
             aborting: None,
             interrupted: None,
+            restart: false,
+            retry_noted: None,
+            notices_seen: None,
             withdrawing: Vec::new(),
             last_run: None,
             waiting: None,
@@ -342,6 +486,10 @@ impl Remote {
             submitting: 0,
             starting: None,
             provider_layers: std::collections::HashMap::new(),
+            last_submit: None,
+            local: Arc::default(),
+            local_machine: false,
+            login: None,
         }
     }
 
@@ -354,7 +502,20 @@ impl Remote {
             }
         }
         self.last_run = last_run(&view);
+        // As `noel` opening a session: a turn its saved context left
+        // unfinished continues once, then what is queued after it.
+        let docs = &view["docs"];
+        let unfinished =
+            docs["noel.turn"]["unfinished"] == true && docs["pi.live"]["run"].is_null();
+        let queued = docs["pi.inbox"]["items"].as_array().map_or(0, Vec::len);
+        let hint = resume_hint(unfinished, queued);
         self.update(app, StateUpdate::Snapshot(view));
+        if let Some(hint) = hint {
+            app.push(TuiEntryKind::System, hint);
+        }
+        if unfinished {
+            self.continue_turn();
+        }
     }
 
     fn receive(&mut self, app: &mut TuiApp, message: Incoming) {
@@ -408,7 +569,65 @@ impl Remote {
         let dirty = first_difference(&self.view, &view);
         self.view = view;
         self.transcript.sync(app, &self.view, dirty);
+        if let Some(count) = self.view["docs"]["noel.clients"]["count"].as_u64() {
+            self.local.holds.store(count, Ordering::SeqCst);
+        }
+        self.note_retry(app);
+        self.note_notices(app);
         self.note_last_run(app);
+    }
+
+    /// Shows the worker's new notes (an account failover's switch).
+    fn note_notices(&mut self, app: &mut TuiApp) {
+        let items = self.view["docs"]["noel.notices"]["items"].as_array();
+        let newest = items
+            .and_then(|items| items.last())
+            .and_then(|item| item["id"].as_u64())
+            .unwrap_or(0);
+        let Some(seen) = self
+            .notices_seen
+            .replace(newest.max(self.notices_seen.unwrap_or(0)))
+        else {
+            return;
+        };
+        for item in items.into_iter().flatten() {
+            if item["id"].as_u64().is_some_and(|id| id > seen) {
+                if let Some(text) = item["text"].as_str() {
+                    app.push(TuiEntryKind::System, text.to_owned());
+                }
+            }
+        }
+    }
+
+    /// Notes each retry the run waits out once, as the in-process TUI
+    /// does: the attempt that failed, the backoff and why.
+    fn note_retry(&mut self, app: &mut TuiApp) {
+        let generation = &self.view["docs"]["pi.live"]["generation"];
+        let retry = &generation["retry"];
+        let Some(error) = retry["error"].as_str() else {
+            return;
+        };
+        let at = retry["at"].as_u64();
+        if at.is_none() || at == self.retry_noted {
+            return;
+        }
+        self.retry_noted = at;
+        let attempt = generation["attempt"]
+            .as_u64()
+            .unwrap_or(2)
+            .saturating_sub(1);
+        let text = match (retry["delayMs"].as_u64(), retry["maxAttempts"].as_u64()) {
+            (Some(delay), Some(most)) => {
+                let delay = if delay >= 1000 {
+                    format!("{}s", delay / 1000)
+                } else {
+                    format!("{delay}ms")
+                };
+                format!("retrying in {delay} (attempt {attempt} of {most}): {error}")
+            }
+            _ => format!("retrying (attempt {attempt}): {error}"),
+        };
+        app.push(TuiEntryKind::System, text);
     }
 
     /// Notes a run that another client's abort or a failure ended; a
@@ -541,6 +760,7 @@ impl Remote {
         viewport_height: &mut u16,
         config: &mut LoadedConfig,
         incoming: &mut mpsc::UnboundedReceiver<Incoming>,
+        auto_restart: &mut crate::AutoRestart,
     ) -> Result<Option<String>> {
         let mut tick = tokio::time::interval(Duration::from_millis(STREAM_RENDER_INTERVAL_MS * 2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -597,6 +817,34 @@ impl Remote {
             }
             if let Some(next) = self.switch_to.take() {
                 return Ok(Some(next));
+            }
+            // A login runs on the plain terminal, as locally; the worker then
+            // reloads, so the new account is selectable at once.
+            if let Some((provider, account)) = self.login.take() {
+                let mut surface = crate::TuiSurface {
+                    terminal,
+                    viewport_height,
+                };
+                match crate::run_tui_login(&mut surface, app, config, &provider, &account).await {
+                    Ok(line) => {
+                        app.push(TuiEntryKind::System, line);
+                        self.run_command("/reload".to_owned());
+                    }
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+                changed = true;
+            }
+            // A rebuilt `noel` (dogfood) restarts between turns, as the
+            // in-process TUI does: never mid-run or mid-turn.
+            if self.run.is_none()
+                && !app.turn_running
+                && self.view["docs"]["noel.turn"]["unfinished"] != true
+                && auto_restart.should_restart()?
+            {
+                app.push(TuiEntryKind::System, "rebuilt; restarting");
+                crate::redraw_tui(terminal, app, config)?;
+                self.restart = true;
+                return Ok(None);
             }
             if changed {
                 self.refresh_chrome(app, config);
@@ -915,7 +1163,7 @@ impl Remote {
                     format!("cleared {cleared} pending follow-up(s)"),
                 );
             }
-            "/interrupt" if app.turn_running => self.call(Call::Abort, json!({})),
+            "/interrupt" if app.turn_running => self.call(Call::Abort, json!({"keepQueue": true})),
             "!!" if app.last_shell_command.is_none() => {
                 app.push(TuiEntryKind::System, "no previous shell command")
             }
@@ -1070,7 +1318,13 @@ impl Remote {
             self.session.clone(),
             self.sender.clone(),
         );
-        tokio::spawn(async move {
+        let previous = self.last_submit.take();
+        let calling = self.local.calling();
+        self.last_submit = Some(tokio::spawn(async move {
+            let _calling = calling;
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
             let send = |when_busy: &str| {
                 let mut args =
                     json!({"requestId": new_request_id(), "text": text, "whenBusy": when_busy});
@@ -1084,25 +1338,47 @@ impl Remote {
                 result = send("followUp").await;
             }
             let _ = sender.send(Incoming::Answer(Call::Submit(text), result));
-        });
+        }));
     }
 
-    fn call(&self, call: Call, args: Value) {
+    /// Continues the turn the saved context left unfinished: `resume`
+    /// without a run named.
+    fn continue_turn(&mut self) {
+        self.call(Call::Resume, json!({}));
+    }
+
+    fn call(&mut self, call: Call, args: Value) {
         let method = match &call {
             Call::Submit(_) => "submit",
             Call::Command(_) => "command",
             Call::Withdraw { .. } => "withdraw",
             Call::Abort => "abort",
+            Call::Resume => "resume",
         };
         let (client, session, sender) = (
             self.client.clone(),
             self.session.clone(),
             self.sender.clone(),
         );
-        tokio::spawn(async move {
+        // Commands keep their order with submissions (`/queue x`, then a
+        // prompt); the rest go at once.
+        let previous = match &call {
+            Call::Command(_) => self.last_submit.take(),
+            _ => None,
+        };
+        let ordered = matches!(&call, Call::Command(_));
+        let calling = self.local.calling();
+        let task = tokio::spawn(async move {
+            let _calling = calling;
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
             let result = client.chat_call(&session, method, args, false).await;
             let _ = sender.send(Incoming::Answer(call, result));
         });
+        if ordered {
+            self.last_submit = Some(task);
+        }
     }
 
     /// Aborts the active run, once.
@@ -1113,7 +1389,10 @@ impl Remote {
         }
         self.aborting = Some(run_id.clone());
         self.interrupted = Some(run_id.clone());
-        self.call(Call::Abort, json!({"expectedRunId": run_id}));
+        self.call(
+            Call::Abort,
+            json!({"expectedRunId": run_id, "keepQueue": true}),
+        );
     }
 
     /// Withdraws the last queued submission, to edit it.
@@ -1137,6 +1416,15 @@ impl Remote {
     }
 
     fn answer(&mut self, app: &mut TuiApp, call: Call, result: Result<Value>) {
+        if matches!(&call, Call::Resume) {
+            if let Some(run_id) = result
+                .as_ref()
+                .ok()
+                .and_then(|value| value["runId"].as_str())
+            {
+                self.starting = Some(run_id.to_owned());
+            }
+        }
         if matches!(&call, Call::Submit(_) | Call::Command(_)) {
             self.submitting = self.submitting.saturating_sub(1);
             let started = result.as_ref().ok().and_then(|value| {
@@ -1160,6 +1448,7 @@ impl Remote {
                         self.aborting = None;
                         format!("abort: {error}")
                     }
+                    Call::Resume => format!("resume: {error}"),
                     Call::Withdraw { text, .. } => {
                         format!("withdraw {}: {error}", one_line(text))
                     }
@@ -1177,7 +1466,7 @@ impl Remote {
             }
         };
         match call {
-            Call::Submit(_) => {}
+            Call::Submit(_) | Call::Resume => {}
             Call::Command(line) => self.command_answer(app, &line, &value),
             Call::Withdraw { text, recall, .. } => match value["outcome"].as_str() {
                 Some("withdrawn") if recall && app.input.is_empty() => {
@@ -1288,6 +1577,12 @@ impl Remote {
                 );
                 // Its images come back to the draft too, as locally.
                 app.input_media = serde_json::from_value(next["media"].clone()).unwrap_or_default();
+            }
+            Some("login") if self.local_machine => {
+                self.login = Some((
+                    next["provider"].as_str().unwrap_or_default().to_owned(),
+                    next["account"].as_str().unwrap_or("default").to_owned(),
+                ));
             }
             Some("login") => app.push(
                 TuiEntryKind::System,
@@ -1599,14 +1894,6 @@ fn live_rows(live: &Value, entries: &[Value]) -> Vec<Row> {
         blocks(message, "text"),
         Source::Text,
     );
-    if let Some(error) = generation["retry"]["error"].as_str() {
-        add(
-            &mut rows,
-            TuiEntryKind::System,
-            format!("retrying (attempt {}): {error}", generation["attempt"]),
-            Source::Tool,
-        );
-    }
     for tool in live["tools"].as_array().into_iter().flatten() {
         let verb = match tool["status"].as_str() {
             Some("running") => "running",
@@ -1813,6 +2100,7 @@ mod tests {
 
     #[test]
     fn live_rows_show_the_partial_and_running_tools() {
+        // A retry is a note (`note_retry`), not a live row.
         let entries = [json!({"role": "assistant", "content": [
             {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "make"}},
             {"type": "toolCall", "id": "c2", "name": "read", "arguments": {"path": "x"}},
@@ -1836,11 +2124,6 @@ mod tests {
             [
                 (TuiEntryKind::Thinking, "hmm".to_owned(), Source::Thinking),
                 (TuiEntryKind::Assistant, "Hel".to_owned(), Source::Text),
-                (
-                    TuiEntryKind::System,
-                    "retrying (attempt 2): overloaded".to_owned(),
-                    Source::Tool
-                ),
                 (
                     TuiEntryKind::Tool,
                     "running bash\n$ make\nbuilt".to_owned(),

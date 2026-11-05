@@ -70,6 +70,9 @@ pub(crate) struct WorkerArgs {
     /// Which start of this session's worker this is, from 1.
     #[arg(long)]
     generation: u64,
+    /// The session's journal when it is kept outside the session directory.
+    #[arg(long, value_name = "PATH")]
+    journal: Option<std::path::PathBuf>,
     /// Continue this interrupted run once ready.
     #[arg(long, value_name = "RUN_ID")]
     resume: Option<String>,
@@ -127,11 +130,14 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     // The server names its session directory in NOEL_SESSION_DIR.
     let here = std::env::current_dir().unwrap_or_else(|_| "/".into());
     let session_dir = crate::config_paths(here, None)?.session_dir;
-    let journal = session_dir.join(format!("{session_id}.jsonl"));
+    let journal = args
+        .journal
+        .clone()
+        .unwrap_or_else(|| session_dir.join(format!("{session_id}.jsonl")));
     if !journal.exists() {
         return Err(Fatal::new(format!("no session {session_id}")));
     }
-    let (store, state) = match SessionStore::open(journal) {
+    let (store, mut state) = match SessionStore::open(journal) {
         Ok(opened) => opened,
         Err(error @ SessionError::Locked { .. }) => {
             return Err(Fatal {
@@ -165,6 +171,12 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
         dir.worker_applied_args(&session_id),
         serde_json::to_string(&launch).unwrap_or_default(),
     );
+    // A relative directory is the opening `noel`'s, as there.
+    if state.cwd.is_relative() {
+        if let Some(base) = launched["cwd"].as_str() {
+            state.cwd = std::path::Path::new(base).join(&state.cwd);
+        }
+    }
     let cwd = state.cwd.clone();
     if let Err(error) = std::env::set_current_dir(&cwd) {
         eprintln!(
@@ -185,7 +197,12 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     crate::apply_cli_overrides(&cli, &cwd, &mut config)?;
     let offline = crate::offline_enabled(cli.offline);
     crate::apply_cached_claude_code_version(&config);
-    let selection = crate::resolve_cli_selection(&cli, &mut config, offline)?;
+    let mut selection = crate::resolve_cli_selection(&cli, &mut config, offline)?;
+    // A session the client switched to keeps its model, as `/resume` does.
+    if launched["switched"] == true {
+        selection.model = None;
+        selection.thinking = None;
+    }
     let mut systems = ReloadableSystems::from_config(&config, 1);
     systems.offline = offline;
     let idle_limit = Duration::from_millis(
@@ -242,6 +259,7 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     let host = chat_host(&session_id, status.clone());
     let (commands, inbox) = mpsc::unbounded_channel::<Command>();
     serve_chat(&host, &session_id, view.clone(), commands.clone());
+    let clients = view.clone();
 
     let plugins = Arc::new(host.get(noel_client::contracts::plugins(), json!({})));
     follow_plugin_tools(plugins.clone(), commands.clone());
@@ -280,6 +298,7 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
         idle_limit,
         host,
         files: Files { socket, record },
+        view: clients,
     }));
     drive(controller, inbox, args.resume).await;
     // The controller only stops when every command sender is gone, which
@@ -580,6 +599,7 @@ struct Supervision {
     idle_limit: Duration,
     host: Host,
     files: Files,
+    view: Arc<Mutex<View>>,
 }
 
 /// Reports status to the parent, and ends the worker: idle for the limit,
@@ -593,6 +613,7 @@ async fn supervise(supervision: Supervision) {
         idle_limit,
         host,
         files,
+        view,
     } = supervision;
     let mut terminate = signal(SignalKind::terminate()).ok();
     let mut interrupt = signal(SignalKind::interrupt()).ok();
@@ -615,6 +636,7 @@ async fn supervise(supervision: Supervision) {
             std::process::exit(128 + signal);
         }
         let now = status.get();
+        lock(&view).set_clients(now.holds);
         let report = now.control();
         if sent.as_ref() != Some(&report) {
             if let Some(parent) = &*lock(&parent) {
@@ -625,7 +647,9 @@ async fn supervise(supervision: Supervision) {
         let idle_since = status.idle_since();
         let done = if draining.load(Ordering::SeqCst) && now.running.is_none() && !now.working {
             Some("shut down by the server")
-        } else if now.leaving && now.running.is_none() && !now.working {
+        } else if now.leaving && now.holds == 0 && now.running.is_none() && !now.working {
+            // Once the quitting client let go: a hold left would bind the
+            // session's next worker.
             Some("its last client quit")
         } else if idle_since.is_some_and(|since| since.elapsed() >= idle_limit) {
             Some("idle")
@@ -698,6 +722,7 @@ impl ControllerHost for WorkerHost {
     fn event(&mut self, event: Event<'_>) {
         for notice in crate::account_failover::drain_notices() {
             eprintln!("noel worker: {notice}");
+            lock(&self.view).notice(notice);
         }
         match &event {
             Event::RunStarted { run_id, .. } => {
@@ -939,9 +964,13 @@ async fn idle_command(
         }
         Command::Abort(args, reply) => {
             let expected = args.get("expectedRunId").and_then(Value::as_str);
-            let queued = controller.queue().pending();
+            let policy = abort_policy(&args);
+            let queued = match policy {
+                AbortPolicy::WithdrawQueue => controller.queue().pending(),
+                AbortPolicy::KeepQueue => 0,
+            };
             let result = controller
-                .abort(expected)
+                .abort_with(expected, policy)
                 .map(|()| json!({"withdrawn": queued}));
             let _ = reply.send(result.map_err(|error| refused("abort", error)));
         }
@@ -960,8 +989,13 @@ async fn idle_command(
             let _ = reply.send(result);
         }
         Command::Resume(args, reply) => {
-            let expected = text(&args, "expectedRunId");
-            match controller.resume(&expected).await {
+            // Without a run named, the turn the saved context left
+            // unfinished (a client opening the session).
+            let resumed = match args.get("expectedRunId").and_then(Value::as_str) {
+                Some(expected) => controller.resume(expected).await,
+                None => controller.resume_unfinished().await,
+            };
+            match resumed {
                 Ok(start) => {
                     let _ = reply.send(Ok(json!({"runId": start.run_id()})));
                     return Some(start);
@@ -1033,7 +1067,7 @@ impl CommandUi for CommandOutput {
         switch: SessionSwitch,
     ) -> anyhow::Result<CommandOutcome> {
         // This worker serves one session: the client attaches to the other.
-        session_commands::switch_elsewhere(runtime, config, switch).map(CommandOutcome::Session)
+        open_elsewhere(runtime, config, switch).map(CommandOutcome::Session)
     }
 }
 
@@ -1171,6 +1205,7 @@ async fn run_command(
                     .map(|text| json!({"kind": "error", "text": text})),
             );
             host.status.update(|status| status.leaving = true);
+            return (json!({"entries": entries, "leaving": true}), None);
         }
         return (json!({"entries": entries}), None);
     }
@@ -1285,6 +1320,38 @@ fn queue_text(items: &[noel_core::QueueItem]) -> String {
     lines.collect::<Vec<_>>().join("\n")
 }
 
+/// The session `switch` names, for the client to attach to. A journal
+/// another process holds is refused, as `noel` refuses it (its own worker
+/// holding it is no refusal); one outside the session directory is
+/// registered with the server, which looks there.
+fn open_elsewhere(
+    runtime: &Runtime,
+    config: &noel_config::LoadedConfig,
+    switch: SessionSwitch,
+) -> anyhow::Result<String> {
+    let SessionSwitch::Open { path, .. } = &switch else {
+        return session_commands::switch_elsewhere(runtime, config, switch);
+    };
+    let session = SessionStore::read(path)?.session_id;
+    match SessionStore::open(path.clone()) {
+        Ok(opened) => drop(opened),
+        Err(SessionError::Locked { pid: Some(pid), .. })
+            if crate::held_by_worker(path, pid).as_deref() == Some(session.as_str()) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let dir = RuntimeDir::check(RuntimeDir::locate())?;
+    let registered = dir.worker_journal(&session);
+    let canonical = fs::canonicalize(path)?;
+    if fs::canonicalize(config.paths.session_dir.join(format!("{session}.jsonl"))).ok()
+        == Some(canonical.clone())
+    {
+        let _ = fs::remove_file(registered);
+    } else {
+        fs::write(registered, format!("{}\n", canonical.display()))?;
+    }
+    Ok(session)
+}
+
 /// A pick of the session or branch selector names another session here:
 /// the client attaches to it.
 fn selected_session(
@@ -1303,7 +1370,7 @@ fn selected_session(
     Some(
         crate::resolve_session_reference(&host.config.paths.session_dir, value.trim()).and_then(
             |path| {
-                session_commands::switch_elsewhere(
+                open_elsewhere(
                     runtime,
                     &host.config,
                     SessionSwitch::Open { path, resume: true },
@@ -1336,8 +1403,12 @@ fn busy_command(command: Command, busy: &mut Busy<'_, WorkerHost>) {
         }
         Command::Abort(args, reply) => {
             let expected = args.get("expectedRunId").and_then(Value::as_str);
-            let queued = busy.queue().pending();
-            match busy.abort(expected) {
+            let policy = abort_policy(&args);
+            let queued = match policy {
+                AbortPolicy::WithdrawQueue => busy.queue().pending(),
+                AbortPolicy::KeepQueue => 0,
+            };
+            match busy.abort_with(expected, policy) {
                 // Answered once the run settles.
                 Ok(()) => busy.host().aborts.push((reply, queued)),
                 Err(error) => {
@@ -1366,6 +1437,16 @@ fn text(args: &Value, key: &str) -> String {
 }
 
 /// `submit`'s arguments as a submission: `whenBusy` names its kind, as
+/// What an abort does to the queue: Durable's rule, everything queued is
+/// withdrawn, unless `keepQueue` (`noel`'s interrupt, which keeps it).
+fn abort_policy(args: &Value) -> AbortPolicy {
+    if args.get("keepQueue").and_then(Value::as_bool) == Some(true) {
+        AbortPolicy::KeepQueue
+    } else {
+        AbortPolicy::WithdrawQueue
+    }
+}
+
 /// `prompt`, `steer` and `follow_up` do over RPC; `type: "continue"` is
 /// Durable's continue. The flag is `whenIdle: "reject"`.
 fn submission(args: &Value) -> Result<(Submission, WhenBusy, bool), WireError> {

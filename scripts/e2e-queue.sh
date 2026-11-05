@@ -29,8 +29,11 @@ wait_record() {
 }
 send() { tmux send-keys -t "${session}" -l "$1"; tmux send-keys -t "${session}" Enter; }
 # Fixtures are plain ASCII, allowing exact journal checks without new tools.
+# Only `messages` is compared: a session's worker also saves each item's
+# submission ids (`items`).
 snapshot_is() {
   grep -F '"type":"queued_messages_snapshot"' "${journal}" | tail -n 1 | \
+    sed 's/,"items":.*}$/}/' | \
     grep -Fxq "{\"type\":\"queued_messages_snapshot\",\"messages\":$1}"
 }
 not_sent() {

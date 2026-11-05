@@ -566,6 +566,16 @@ impl<H: Host> SessionController<H> {
     /// aborted, so it is never resumed. `expected_run_id`, when given,
     /// must name that run.
     pub fn abort(&mut self, expected_run_id: Option<&str>) -> Result<(), String> {
+        let policy = self.live().policy;
+        self.abort_with(expected_run_id, policy)
+    }
+
+    /// [`Self::abort`] with `policy` in place of the controller's.
+    pub fn abort_with(
+        &mut self,
+        expected_run_id: Option<&str>,
+        policy: AbortPolicy,
+    ) -> Result<(), String> {
         let interrupted = self
             .runtime
             .session()
@@ -585,9 +595,8 @@ impl<H: Host> SessionController<H> {
                 .map_err(|error| error.to_string())?,
             (None, _) => fence(expected_run_id, None)?,
         }
-        let live = self.live();
-        if live.policy == AbortPolicy::WithdrawQueue {
-            live.clear_queue()?;
+        if policy == AbortPolicy::WithdrawQueue {
+            self.live().clear_queue()?;
         }
         Ok(())
     }
@@ -692,6 +701,34 @@ impl<H: Host> SessionController<H> {
             provider,
             call: Call::Continue,
         }))
+    }
+
+    /// While no run is active, continues the turn the saved context left
+    /// unfinished, as `noel` opening the session does: the model answers
+    /// first, then follow-ups queued meanwhile are placed (unlike
+    /// [`Self::continue_run`], which places them first). Refused when no
+    /// turn is unfinished.
+    pub async fn resume_unfinished(&mut self) -> Result<Start, String> {
+        if !self.runtime.session().has_unfinished_turn() {
+            return Err("no turn is unfinished".to_owned());
+        }
+        let Self { runtime, live } = self;
+        let live = live.get_mut().expect("controller state");
+        let provider = live.host.provider(runtime).await?;
+        let run = RunStart {
+            id: new_id(),
+            request_id: None,
+            kind: SubmissionKind::Continue,
+        };
+        let run_id = run.id.clone();
+        runtime
+            .start_bare_run(run)
+            .map_err(|error| error.to_string())?;
+        Ok(Start {
+            run_id,
+            provider,
+            call: Call::Resume { charged: None },
+        })
     }
 
     /// Compacts the session now.
@@ -931,8 +968,18 @@ impl<H: Host> Busy<'_, H> {
     /// when given, must name it. The policy decides what happens to the
     /// queue.
     pub fn abort(&mut self, expected_run_id: Option<&str>) -> Result<(), String> {
+        let policy = self.live.policy;
+        self.abort_with(expected_run_id, policy)
+    }
+
+    /// [`Self::abort`] with `policy` in place of the controller's.
+    pub fn abort_with(
+        &mut self,
+        expected_run_id: Option<&str>,
+        policy: AbortPolicy,
+    ) -> Result<(), String> {
         fence(expected_run_id, Some(self.run_id()))?;
-        if self.live.policy == AbortPolicy::WithdrawQueue {
+        if policy == AbortPolicy::WithdrawQueue {
             if let Err(error) = self.live.clear_queue_saving() {
                 self.live.host.event(Event::SaveFailed { error: &error });
             }
@@ -1267,7 +1314,19 @@ impl<H: Host> Live<H> {
         if self.queue.follow_ups.is_empty() {
             return None;
         }
-        let items = std::mem::take(&mut self.queue.follow_ups);
+        // A slash-tool command is placed alone, in its turn; prose up to the
+        // next one is placed as one message (as the TUI drains its queue).
+        let tool = |item: &QueueItem| crate::is_tool_command(&item.content);
+        let count = if tool(&self.queue.follow_ups[0]) {
+            1
+        } else {
+            self.queue
+                .follow_ups
+                .iter()
+                .take_while(|item| !tool(item))
+                .count()
+        };
+        let items = self.queue.follow_ups.drain(..count).collect::<Vec<_>>();
         let texts = items.iter().map(|item| item.content.as_str());
         let text = texts.collect::<Vec<_>>().join(STEERING_JOIN);
         let placed = items.into_iter().map(|item| item.id).collect::<Vec<_>>();

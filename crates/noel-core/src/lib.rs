@@ -6228,6 +6228,12 @@ struct ParsedToolCommand {
     request: ToolRequest,
 }
 
+/// Whether `prompt` is a slash-tool command (`/read path`, ...), which runs
+/// the tool directly instead of asking the model; a malformed one counts.
+pub fn is_tool_command(prompt: &str) -> bool {
+    !matches!(parse_tool_command(prompt), Ok(None))
+}
+
 fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentError> {
     let trimmed = prompt.trim();
     if !trimmed.starts_with('/') {

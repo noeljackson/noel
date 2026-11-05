@@ -257,6 +257,9 @@
             "properties": {
               "expectedRunId": {
                 "type": "string"
+              },
+              "keepQueue": {
+                "type": "boolean"
               }
             },
             "additionalProperties": false
@@ -330,9 +333,6 @@
         "resume": {
           "args": {
             "type": "object",
-            "required": [
-              "expectedRunId"
-            ],
             "properties": {
               "expectedRunId": {
                 "type": "string"
