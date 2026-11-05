@@ -384,6 +384,73 @@
               }
             }
           }
+        },
+        "command": {
+          "args": {
+            "type": "object",
+            "required": [
+              "line"
+            ],
+            "properties": {
+              "line": {
+                "type": "string"
+              },
+              "requestId": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "entries"
+            ],
+            "properties": {
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "text"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "system",
+                        "error"
+                      ]
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "resumePending": {
+                "type": "boolean"
+              },
+              "next": {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "enum": [
+                      "run",
+                      "repeated",
+                      "selector",
+                      "session",
+                      "login"
+                    ]
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }

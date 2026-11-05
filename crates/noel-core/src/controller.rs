@@ -468,6 +468,14 @@ impl<H: Host> SessionController<H> {
     }
 
     /// The runtime and the host together, to read both.
+    /// The runtime and the host, both mutable, for a change that awaits
+    /// while no run is active (a command); queued submissions stay the
+    /// controller's.
+    pub fn parts_mut(&mut self) -> (&mut Runtime, &mut H) {
+        let host = &mut self.live.get_mut().expect("controller state").host;
+        (&mut self.runtime, host)
+    }
+
     pub fn parts(&mut self) -> (&Runtime, &mut H) {
         let host = &mut self.live.get_mut().expect("controller state").host;
         (&self.runtime, host)

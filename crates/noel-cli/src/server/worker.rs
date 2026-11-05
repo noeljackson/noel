@@ -56,6 +56,7 @@ use super::{
     build_id, chat_contract, chat_variant, control_line, peer_check, remove_stale_socket, set_mode,
     valid_session_id, write_record, RuntimeDir, DEFAULT_WORKER_IDLE_MS, EXIT_LOCKED,
 };
+use crate::session_commands::{self, CommandOutcome, CommandUi, SessionSwitch};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -305,6 +306,7 @@ impl Status {
             "viewers": self.holds,
             "running": self.running.is_some(),
             "queued": self.queued,
+            "working": self.working,
         });
         if let Some(run_id) = &self.running {
             message["runId"] = json!(run_id);
@@ -380,6 +382,8 @@ enum Command {
     Compact(Value, Reply),
     Configure(Value, Reply),
     Resume(Value, Reply),
+    /// A slash command or prompt, as the TUI types it.
+    Run(Value, Reply),
     /// The plugin tools the server's directory offers now.
     PluginTools(Vec<PluginTool>),
 }
@@ -462,6 +466,7 @@ fn participant(cell: &Cell, commands: &mpsc::UnboundedSender<Command>) -> Implem
         .method("compact", method(commands, Command::Compact))
         .method("configure", method(commands, Command::Configure))
         .method("resume", method(commands, Command::Resume))
+        .method("command", method(commands, Command::Run))
 }
 
 /// Takes each connection to the worker's socket as its parent.
@@ -937,9 +942,218 @@ async fn idle_command(
                 }
             }
         }
+        Command::Run(args, reply) => {
+            // Working while it runs; the status change it ends with also
+            // has the server read its directory again (a fork, a new
+            // session).
+            let status = controller.parts().1.status.clone();
+            status.update(|status| status.working = true);
+            let (answer, start) = run_command(controller, &args).await;
+            status.update(|status| status.working = false);
+            let _ = reply.send(Ok(answer));
+            if start.is_some() {
+                return start;
+            }
+        }
         Command::PluginTools(tools) => set_plugin_tools(controller, tools),
     }
     None
+}
+
+/// A command's output, as the worker answers `command`.
+#[derive(Default)]
+struct CommandOutput {
+    entries: Vec<Value>,
+    resume_pending: bool,
+}
+
+impl CommandUi for CommandOutput {
+    fn push(&mut self, kind: crate::TuiEntryKind, text: impl Into<String>) {
+        let kind = match kind {
+            crate::TuiEntryKind::Error => "error",
+            _ => "system",
+        };
+        self.entries
+            .push(json!({"kind": kind, "text": text.into()}));
+    }
+
+    fn placeholder(&mut self, kind: crate::TuiEntryKind, text: impl Into<String>) -> usize {
+        self.push(kind, text);
+        self.entries.len() - 1
+    }
+
+    fn replace(&mut self, index: usize, text: impl Into<String>) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry["text"] = json!(text.into());
+        }
+    }
+
+    fn redraw(&mut self, _config: &noel_config::LoadedConfig) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn set_resume_pending(&mut self, pending: bool) {
+        self.resume_pending = pending;
+    }
+
+    fn switch_session(
+        &mut self,
+        runtime: &mut Runtime,
+        config: &noel_config::LoadedConfig,
+        switch: SessionSwitch,
+    ) -> anyhow::Result<CommandOutcome> {
+        // This worker serves one session: the client attaches to the other.
+        session_commands::switch_elsewhere(runtime, config, switch).map(CommandOutcome::Session)
+    }
+}
+
+/// `command({line, requestId?})`: runs `line` as the TUI would, on this
+/// session (docs/client-tui-plan.md). The answer is `{entries, next?}`:
+/// the rows to show, then what the client does next (`run` it started,
+/// `selector` to open, `session` to attach to, `login` to run). A prompt
+/// starts a run, returned to be driven.
+async fn run_command(
+    controller: &mut SessionController<WorkerHost>,
+    args: &Value,
+) -> (Value, Option<Start>) {
+    let line = text(args, "line");
+    let mut output = CommandOutput::default();
+    let mut next = Value::Null;
+    let mut start = None;
+    // The queue is the controller's; the session's own fields are not.
+    let queued = match line.as_str() {
+        "/queue" => Some(Ok(queue_text(&controller.queue().items()))),
+        "/queue-clear" | "/interrupt" => Some(
+            controller
+                .clear_queue()
+                .map(|items| format!("cleared {} queued message(s)", items.len())),
+        ),
+        _ => None,
+    };
+    if let Some(result) = queued {
+        match result {
+            Ok(text) => output.push(crate::TuiEntryKind::System, text),
+            Err(error) => output.push(crate::TuiEntryKind::Error, error),
+        }
+        refresh(controller);
+        return (json!({"entries": output.entries}), None);
+    }
+    if let Some(switch) = selected_session(controller, &line) {
+        match switch {
+            Ok(session) => next = json!({"type": "session", "session": session}),
+            Err(error) => output.push(crate::TuiEntryKind::Error, format!("{error:#}")),
+        }
+        return (json!({"entries": output.entries, "next": next}), None);
+    }
+    let outcome = {
+        let (runtime, host) = controller.parts_mut();
+        let offline = host.offline;
+        session_commands::run(&mut output, runtime, &mut host.config, offline, line).await
+    };
+    match outcome {
+        Ok(CommandOutcome::Handled) => {}
+        Ok(CommandOutcome::Submit { prompt, media }) => {
+            if !media.is_empty() {
+                output.push(
+                    crate::TuiEntryKind::Error,
+                    "images are sent with the prompt",
+                );
+            } else {
+                let submission = Submission {
+                    kind: SubmissionKind::Prompt,
+                    request_id: args
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    content: prompt.prompt,
+                    images: Vec::new(),
+                    expected_run_id: None,
+                };
+                match controller.submit(submission).await {
+                    Ok(Submitted::Started(started)) => {
+                        next = json!({"type": "run", "runId": started.run_id()});
+                        start = Some(started);
+                    }
+                    Ok(Submitted::Repeated(repeat)) => {
+                        next = json!({"type": "repeated", "result": repeated(&repeat, None)});
+                    }
+                    Err(error) => output.push(crate::TuiEntryKind::Error, error.to_string()),
+                }
+            }
+        }
+        Ok(CommandOutcome::Compact { focus }) => {
+            let focus = Some(focus.as_str()).filter(|focus| !focus.is_empty());
+            match controller.compact(focus).await {
+                Ok(record) => output.push(
+                    crate::TuiEntryKind::System,
+                    format!(
+                        "compacted: {} messages summarized, {} kept",
+                        record.omitted_messages, record.retained_messages
+                    ),
+                ),
+                Err(error) => output.push(crate::TuiEntryKind::Error, error),
+            }
+        }
+        Ok(CommandOutcome::Login { provider, account }) => {
+            next = json!({"type": "login", "provider": provider, "account": account});
+        }
+        Ok(CommandOutcome::Selector(state)) => {
+            next = json!({"type": "selector", "selector": state.to_json()});
+        }
+        Ok(CommandOutcome::Session(session)) => {
+            next = json!({"type": "session", "session": session});
+        }
+        Err(error) => output.push(crate::TuiEntryKind::Error, format!("{error:#}")),
+    }
+    refresh(controller);
+    let mut answer = json!({"entries": output.entries});
+    if output.resume_pending {
+        answer["resumePending"] = json!(true);
+    }
+    if !next.is_null() {
+        answer["next"] = next;
+    }
+    (answer, start)
+}
+
+/// The queue as `/queue` lists it.
+fn queue_text(items: &[noel_core::QueueItem]) -> String {
+    if items.is_empty() {
+        return "queue: empty".to_owned();
+    }
+    let lines = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| format!("{}. {}", index + 1, item.content));
+    format!("queue:\n{}", lines.collect::<Vec<_>>().join("\n"))
+}
+
+/// A pick of the session or branch selector names another session here:
+/// the client attaches to it.
+fn selected_session(
+    controller: &mut SessionController<WorkerHost>,
+    line: &str,
+) -> Option<anyhow::Result<String>> {
+    let rest = line.strip_prefix("/select ")?.trim();
+    let (kind, value) = rest.split_once(char::is_whitespace)?;
+    if !matches!(
+        kind,
+        "session" | "sessions" | "resume" | "tree" | "branches"
+    ) {
+        return None;
+    }
+    let (runtime, host) = controller.parts();
+    Some(
+        crate::resolve_session_reference(&host.config.paths.session_dir, value.trim()).and_then(
+            |path| {
+                session_commands::switch_elsewhere(
+                    runtime,
+                    &host.config,
+                    SessionSwitch::Open { path, resume: true },
+                )
+            },
+        ),
+    )
 }
 
 /// A command while a run is active.
@@ -974,7 +1188,10 @@ fn busy_command(command: Command, busy: &mut Busy<'_, WorkerHost>) {
                 }
             }
         }
-        Command::Compact(_, reply) | Command::Configure(_, reply) | Command::Resume(_, reply) => {
+        Command::Compact(_, reply)
+        | Command::Configure(_, reply)
+        | Command::Resume(_, reply)
+        | Command::Run(_, reply) => {
             let _ = reply.send(Err(refused(
                 "busy",
                 "a run is active; wait for it to settle",

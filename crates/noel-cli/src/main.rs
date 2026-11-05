@@ -3118,18 +3118,7 @@ fn create_runtime(
 /// Start fresh conversation state without changing the current selections.
 /// Persist them before replacing the runtime so reopen/resume agrees with the UI.
 fn start_new_session(runtime: &mut Runtime, config: &LoadedConfig) -> Result<()> {
-    // The new session keeps the workspace, as it keeps the model.
-    let (store, mut state) = SessionStore::create_with_workspace(
-        &config.paths.session_dir,
-        runtime.session().cwd.clone(),
-        runtime.session().workspace.clone(),
-    )?;
-    state.active_model = runtime.session().active_model.clone();
-    state.active_thinking_level = runtime.session().active_thinking_level.clone();
-    state.active_account = runtime.session().active_account.clone();
-    store.record_active_model(state.active_model.clone())?;
-    store.record_active_thinking_level(state.active_thinking_level.clone())?;
-    store.record_active_account(state.active_account.clone())?;
+    let (store, state) = session_commands::new_session_like(runtime, config)?;
     runtime.replace_session(state, Some(store));
     Ok(())
 }
@@ -3653,6 +3642,22 @@ struct TuiSelectorState {
     parent: Option<Box<TuiSelectorState>>,
     /// Provider filter for the model layer (e.g. "zai-coding").
     provider_filter: Option<String>,
+}
+
+impl TuiSelectorState {
+    /// The selector as a worker sends it to a client: its kind, title,
+    /// query and rows; a pick comes back as `/select <kind> <value>`.
+    fn to_json(&self) -> serde_json::Value {
+        let items = self.items.iter().map(|item| {
+            serde_json::json!({"label": item.label, "value": item.value, "active": item.active})
+        });
+        serde_json::json!({
+            "kind": self.kind,
+            "title": self.title,
+            "query": self.query,
+            "items": items.collect::<Vec<_>>(),
+        })
+    }
 }
 
 impl TuiSelectorState {
@@ -8012,6 +8017,8 @@ async fn handle_tui_submission(
                     }
                 }
                 CommandOutcome::Selector(state) => app.selector = Some(state),
+                // In process a switch happens in place.
+                CommandOutcome::Session(_) => {}
             }
         }
     }
@@ -8136,6 +8143,15 @@ impl CommandUi for TuiCommandUi<'_> {
 
     fn set_resume_pending(&mut self, pending: bool) {
         self.app.resume_pending = pending;
+    }
+
+    fn switch_session(
+        &mut self,
+        runtime: &mut Runtime,
+        config: &LoadedConfig,
+        switch: session_commands::SessionSwitch,
+    ) -> Result<CommandOutcome> {
+        session_commands::switch_in_place(self, runtime, config, switch)
     }
 }
 

@@ -703,3 +703,53 @@ fn a_continue_answers_after_a_failed_run_and_when_idle_reject_never_starts_one()
     assert_eq!(last_run_status(&view).as_deref(), Some("failed"));
     assert_eq!(mode2.requests().len(), 2);
 }
+
+#[test]
+fn slash_commands_run_on_the_worker_as_the_tui_types_them() {
+    let mut mode2 = Mode2::new("commands", json!([[{"text": "Hello there"}]]), json!({}));
+    let session = mode2.new_session("commands");
+    let mut watch = mode2.watch(&session);
+    watch.snapshot("the snapshot");
+
+    // A command that changes the session shows in its view.
+    let named = mode2.client(&["command", &session, "/name release notes"]);
+    assert!(named.contains("release notes"), "{named}");
+    watch.settle("the name", |view| {
+        view["conversation"]["name"] == "release notes"
+    });
+    let shown = mode2.client(&["command", &session, "/session"]);
+    assert!(shown.contains(&session), "{shown}");
+    assert_eq!(
+        mode2.client(&["command", &session, "/queue"]),
+        "queue: empty\n"
+    );
+
+    // A prompt starts a run.
+    let started = mode2.client(&["command", &session, "say hello"]);
+    assert!(started.starts_with("started run "), "{started}");
+    watch.settle("the answer", |view| {
+        last_run_status(view).as_deref() == Some("completed")
+    });
+
+    // A fork is another session, for the client to attach to.
+    let forked = mode2.client(&["command", &session, "/fork"]);
+    let fork_id = forked
+        .lines()
+        .find_map(|line| line.strip_prefix("session "))
+        .unwrap_or_else(|| panic!("{forked}"))
+        .to_owned();
+    assert_ne!(fork_id, session);
+    // The directory reads the new journal soon after; attaching to it by id
+    // does not wait for that.
+    wait_until("the fork listed", || {
+        mode2.client(&["ls"]).contains(&fork_id)
+    });
+    let forked_view = mode2.client(&["command", &fork_id, "/session"]);
+    assert!(forked_view.contains(&fork_id), "{forked_view}");
+
+    // A selector comes back as data; an unknown command is an error.
+    let selector = mode2.client(&["command", &session, "/selector settings"]);
+    assert!(selector.lines().count() > 1, "{selector}");
+    let unknown = mode2.noel(&["client", "command", &session, "/model nope/nothing"]);
+    assert!(unknown.status.success());
+}
