@@ -59,19 +59,21 @@ public final class SSHChannelOpener: ChannelOpener, @unchecked Sendable {
                     reconnect: .never
                 )
                 let command = "'\(endpoint.program)' bridge"
-                let stream = try await client.executeCommandPair(command)
-                let (inbound, outbound) = (stream.stdout, stream.stdin)
-                channel = ExecChannel(
-                    writer: { data in
-                        Task { try? await outbound.write(ByteBuffer(bytes: data)) }
-                    },
-                    closer: {
-                        Task { try? await client.close() }
+                try await client.withExec(command) { inbound, outbound in
+                    channel = ExecChannel(
+                        writer: { data in
+                            Task { try? await outbound.write(ByteBuffer(data: data)) }
+                        },
+                        closer: {
+                            Task { try? await client.close() }
+                        }
+                    )
+                    opened.signal()
+                    for try await output in inbound {
+                        if case let .stdout(chunk) = output {
+                            delivery.receive(bytes: Data(buffer: chunk))
+                        }
                     }
-                )
-                opened.signal()
-                for try await chunk in inbound {
-                    delivery.receive(bytes: Data(buffer: chunk))
                 }
                 delivery.closed()
             } catch {
