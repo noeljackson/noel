@@ -87,8 +87,10 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
     `the_server_manages_sessions_accounts_and_settings_for_a_client`, and
     `server::accounts` unit tests of the relayed code and device logins
     against stub endpoints.
-  - The TUI's own session commands keep running on the worker through
-    `command`, which runs where the server's sessions are.
+  - The TUI manages sessions through `noel.sessions`: `/fork`, `/clone`,
+    `/import` and `/delete` of another session. Deleting the session shown,
+    and importing the export of a session a worker holds, stay with the
+    worker, which holds that journal.
 - Slice 4's comparison test is `make e2e-render-inprocess`. It runs one
   faux script both ways and compares the rendered transcripts. The script
   has thinking, a tool call with output, markdown and a second turn.
