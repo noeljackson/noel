@@ -1260,10 +1260,7 @@ impl Recorder {
     /// agent_settled.
     pub fn finish(mut self, outcome: &Outcome, sink: Sink) {
         let aborted = matches!(outcome, Outcome::Aborted);
-        let error = match outcome {
-            Outcome::Failed(error) => Some(error.as_str()),
-            Outcome::Completed | Outcome::Aborted => None,
-        };
+        let error = outcome.error();
         if self.ended {
             // Only the compaction that was to recover the dropped reply can
             // still be open.

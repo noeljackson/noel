@@ -170,13 +170,18 @@
                 "args": {
                   "type": "object",
                   "required": [
-                    "requestId",
-                    "text"
+                    "requestId"
                   ],
                   "properties": {
                     "requestId": {
                       "type": "string",
                       "minLength": 1
+                    },
+                    "type": {
+                      "enum": [
+                        "input",
+                        "continue"
+                      ]
                     },
                     "text": {
                       "type": "string"
@@ -205,6 +210,11 @@
                         "reject",
                         "steer",
                         "followUp"
+                      ]
+                    },
+                    "whenIdle": {
+                      "enum": [
+                        "reject"
                       ]
                     }
                   },
@@ -411,7 +421,7 @@
           }
         }
       },
-      "fingerprint": "2a6091124251ff09"
+      "fingerprint": "5a15a5b7885ce1be"
     },
     {
       "declaration": {

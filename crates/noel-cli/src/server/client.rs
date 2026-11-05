@@ -116,6 +116,21 @@ enum ClientCommand {
         /// The submission's id; a repeat reports the first submission.
         #[arg(long)]
         request_id: Option<String>,
+        /// `reject`: refuse it while no run is active, so it never starts
+        /// a run (Durable's `whenIdle`).
+        #[arg(long, value_name = "reject")]
+        when_idle: Option<String>,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start a run on the session's context as it is, without a prompt
+    /// (Durable's continue): after a run that ended without an answer.
+    Continue {
+        session: String,
+        /// The submission's id; a repeat reports the first submission.
+        #[arg(long)]
+        request_id: Option<String>,
         /// Print the result as JSON.
         #[arg(long)]
         json: bool,
@@ -273,6 +288,7 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
             steer,
             follow_up,
             request_id,
+            when_idle,
             json,
         } => {
             let when_busy = if steer {
@@ -283,7 +299,25 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
                 "reject"
             };
             let request_id = request_id.unwrap_or_else(new_request_id);
-            let args = json!({"requestId": request_id, "text": text, "whenBusy": when_busy});
+            let mut args = json!({"requestId": request_id, "text": text, "whenBusy": when_busy});
+            if let Some(when_idle) = when_idle {
+                args["whenIdle"] = json!(when_idle);
+            }
+            let result = client.chat_call(&session, "submit", args, true).await?;
+            if json {
+                println!("{}", json!({"requestId": request_id, "result": result}));
+            } else {
+                println!("{}", describe_submit(&result, &request_id));
+            }
+            Ok(0)
+        }
+        ClientCommand::Continue {
+            session,
+            request_id,
+            json,
+        } => {
+            let request_id = request_id.unwrap_or_else(new_request_id);
+            let args = json!({"requestId": request_id, "type": "continue"});
             let result = client.chat_call(&session, "submit", args, true).await?;
             if json {
                 println!("{}", json!({"requestId": request_id, "result": result}));

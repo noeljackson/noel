@@ -175,6 +175,74 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "SubmissionKind::is_prompt")]
     pub kind: SubmissionKind,
     pub status: RunStatus,
+    /// Why a failed run ended without an answer (Durable's `runFailure`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<RunFailure>,
+    /// Crash restarts since the run last made progress (Durable's task
+    /// `restarts`): a resume after a stop that was not a close counts one,
+    /// and a message the run saves clears them.
+    #[serde(default, skip_serializing_if = "no_restarts")]
+    pub restarts: u32,
+    /// A close stopped the run (not a crash): its resume is not counted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
+}
+
+fn no_restarts(value: &u32) -> bool {
+    *value == 0
+}
+
+impl Run {
+    fn started(start: RunStart, status: RunStatus) -> Self {
+        Self {
+            id: start.id,
+            request_id: start.request_id,
+            kind: start.kind,
+            status,
+            failure: None,
+            restarts: 0,
+            closed: false,
+        }
+    }
+}
+
+/// Why a run ended without an answer, as Durable's `pi.live.runFailure`
+/// names it. An aborted run is [`RunStatus::Aborted`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    /// The model request failed, retries included.
+    ModelError,
+    /// The host died while the model was answering, and the retry policy
+    /// allowed no other attempt.
+    Interrupted,
+    /// The run was restarted `restartLimit` times in a row without
+    /// progress.
+    RestartLimit,
+    /// A continue found nothing to answer.
+    NothingToAnswer,
+    /// The run's tool rounds reached `agent.maxToolRounds`.
+    TurnLimit,
+}
+
+impl FailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelError => "model_error",
+            Self::Interrupted => "interrupted",
+            Self::RestartLimit => "restart_limit",
+            Self::NothingToAnswer => "nothing_to_answer",
+            Self::TurnLimit => "turn_limit",
+        }
+    }
+}
+
+/// A failed run's reason and detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFailure {
+    pub reason: FailureReason,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
 }
 
 /// What a client called a submission (spec §3.1): a prompt, a steer or a
@@ -186,6 +254,8 @@ pub enum SubmissionKind {
     Prompt,
     Steer,
     FollowUp,
+    /// Durable's `{type: "continue"}`: a run on the context as it is.
+    Continue,
 }
 
 impl SubmissionKind {
@@ -198,6 +268,7 @@ impl SubmissionKind {
             Self::Prompt => "prompt",
             Self::Steer => "steer",
             Self::FollowUp => "followUp",
+            Self::Continue => "continue",
         }
     }
 }
@@ -461,9 +532,13 @@ impl SessionState {
     }
 
     fn set_run_status(&mut self, run_id: &str, status: RunStatus) {
-        if let Some(run) = self.runs.iter_mut().rev().find(|run| run.id == run_id) {
+        if let Some(run) = self.run_mut(run_id) {
             run.status = status;
         }
+    }
+
+    fn run_mut(&mut self, run_id: &str) -> Option<&mut Run> {
+        self.runs.iter_mut().rev().find(|run| run.id == run_id)
     }
 
     /// The tool calls of the last reply that have no saved result, with
@@ -749,6 +824,9 @@ pub struct ReloadableSystems {
     /// `Default` keeps the compiled cap; a derived zero would stop every
     /// turn after zero rounds.
     pub max_tool_rounds: usize,
+    /// Crash restarts in a row after which a run ends `restart_limit`
+    /// (Durable's `settings.restartLimit`, default 5).
+    pub restart_limit: u32,
 }
 
 impl Default for ReloadableSystems {
@@ -780,6 +858,7 @@ impl Default for ReloadableSystems {
             progress: RuntimeProgressSettings::default(),
             model_context_windows: BTreeMap::new(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+            restart_limit: DEFAULT_RESTART_LIMIT,
         }
     }
 }
@@ -1015,6 +1094,10 @@ impl ReloadableSystems {
                 .and_then(|agent| agent.max_tool_rounds)
                 .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
                 .max(1),
+            restart_limit: config
+                .settings
+                .restart_limit
+                .unwrap_or(DEFAULT_RESTART_LIMIT),
         }
     }
 }
@@ -1082,6 +1165,10 @@ fn lock_holder(pid: &Option<u32>) -> String {
 pub enum AgentError {
     #[error("compaction failed: {0}")]
     Compaction(String),
+    /// The host died while the model was answering, and the retry policy
+    /// allows no other attempt (Durable's `interrupted` run failure).
+    #[error("{0}")]
+    Interrupted(String),
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error(transparent)]
@@ -1207,6 +1294,30 @@ enum SessionRecord {
     RunFinished {
         run_id: String,
         status: RunStatus,
+        /// A failed run's reason; older versions leave it out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<RunFailure>,
+    },
+    /// A run that saves no message to start it: a continue.
+    RunStarted {
+        run: RunStart,
+    },
+    /// A close stopped the run, which a later resume continues without
+    /// counting a restart.
+    RunClosed {
+        run_id: String,
+    },
+    /// The run resumed after a stop that was not a close (a crash).
+    RunRestarted {
+        run_id: String,
+    },
+    /// A reply's request failed and the turn waits out a retry's backoff
+    /// before attempt `attempt + 1`, or (`attempt` 0) compacts after an
+    /// overflow: a crash now cut off no request.
+    RetryWait {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        attempt: u64,
     },
     /// What a streaming reply has produced so far (spec §4.2), saved at
     /// most every `progress.partialIntervalMs`. A reply's first record
@@ -1324,6 +1435,25 @@ pub struct SessionStore {
     storage: storage::Storage,
     /// Hears the progress this store and its clones save.
     progress: Option<ObserverSlot>,
+    /// What opening the journal found about how its last run stopped.
+    hint: Arc<Mutex<ResumeHint>>,
+}
+
+/// How the journal's last run stopped, as opening it found: for a resume
+/// to charge a model request a crash cut off (Durable section 8.3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeHint {
+    /// The attempt of the reply a stop cut off, recovered as an aborted
+    /// reply.
+    pub attempt: Option<u64>,
+    /// The run was waiting out a retry's backoff (its last record is a
+    /// `retry_wait`): no request was in flight.
+    pub waiting: bool,
+}
+
+fn lock_hint(hint: &Mutex<ResumeHint>) -> std::sync::MutexGuard<'_, ResumeHint> {
+    hint.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl SessionStore {
@@ -1461,6 +1591,7 @@ impl SessionStore {
         })?;
         let store = Self::writer(path)?;
         let mut state = store.load()?;
+        lock_hint(&store.hint).waiting = waiting_retry(&store.path);
         store.recover_partial(&mut state)?;
         Ok((store, state))
     }
@@ -1473,6 +1604,7 @@ impl SessionStore {
         let Some(partial) = state.partial.take() else {
             return Ok(());
         };
+        lock_hint(&self.hint).attempt = Some(partial.attempt);
         if let Some(message) = partial.aborted_message() {
             self.record_message(message.clone())?;
             state.messages.push(message);
@@ -1508,7 +1640,13 @@ impl SessionStore {
             path: storage.path().to_path_buf(),
             storage,
             progress: None,
+            hint: Arc::default(),
         }
+    }
+
+    /// How the journal's last run stopped, as opening it found.
+    pub fn resume_hint(&self) -> ResumeHint {
+        *lock_hint(&self.hint)
     }
 
     /// Opens the session a storage holds (another backend than the journal
@@ -2069,6 +2207,43 @@ fn session_state_from_bytes(path: &Path, content: &[u8]) -> Result<SessionState,
     read_rust_journal(path, content)
 }
 
+/// Whether the journal's last record about its last reply is a
+/// `retry_wait`: the run stopped during a retry's backoff.
+fn waiting_retry(path: &Path) -> bool {
+    let Ok(content) = fs::read(path) else {
+        return false;
+    };
+    for line in content.split(|byte| *byte == b'\n').rev() {
+        let Ok(record) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        match record.get("type").and_then(Value::as_str) {
+            Some("retry_wait") => return true,
+            Some("partial") => {
+                let streamed = ["text", "thinking"].iter().any(|key| {
+                    record
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                });
+                if streamed {
+                    return false;
+                }
+            }
+            Some(
+                "message"
+                | "messages_snapshot"
+                | "compaction_checkpoint"
+                | "run_finished"
+                | "run_started"
+                | "run_restarted",
+            ) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn read_journal_bytes(path: &Path) -> Result<Vec<u8>, SessionError> {
     let mut file = File::open(path).map_err(|source| SessionError::Open {
         path: path.to_path_buf(),
@@ -2147,14 +2322,19 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         } => {
             state.supersede_progress(&message);
             state.messages.push(message);
+            // A message is progress: the active run's restarts start again.
+            if let Some(active) = state
+                .runs
+                .last_mut()
+                .filter(|run| !run.status.is_finished())
+            {
+                active.restarts = 0;
+            }
             // Whatever started a run, a load did not: it was interrupted
             // unless a `run_finished` record follows.
-            state.runs.extend(run.map(|run| Run {
-                id: run.id,
-                request_id: run.request_id,
-                kind: run.kind,
-                status: RunStatus::Interrupted,
-            }));
+            state
+                .runs
+                .extend(run.map(|run| Run::started(run, RunStatus::Interrupted)));
             // Submissions are placed only while a run is active: the last.
             let run_id = state.runs.last().map(|run| run.id.clone());
             state.place_queued(placed, run_id.as_deref());
@@ -2206,8 +2386,30 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         }
         SessionRecord::BranchSummary { summary } => state.branch_summaries.push(summary),
         SessionRecord::Usage { usage } => state.usage = usage,
-        SessionRecord::RunFinished { run_id, status } => {
+        SessionRecord::RetryWait { .. } => {}
+        SessionRecord::RunStarted { run } => {
+            state.runs.push(Run::started(run, RunStatus::Interrupted));
+        }
+        SessionRecord::RunClosed { run_id } => {
+            if let Some(run) = state.run_mut(&run_id) {
+                run.closed = true;
+            }
+        }
+        SessionRecord::RunRestarted { run_id } => {
+            if let Some(run) = state.run_mut(&run_id) {
+                run.closed = false;
+                run.restarts += 1;
+            }
+        }
+        SessionRecord::RunFinished {
+            run_id,
+            status,
+            failure,
+        } => {
             state.set_run_status(&run_id, status);
+            if let Some(run) = state.run_mut(&run_id) {
+                run.failure = failure;
+            }
             // The run settled what it left running.
             state.partial = None;
             state.tool_outputs.clear();
@@ -3368,12 +3570,9 @@ impl Runtime {
             })?;
         }
         self.session.messages.push(message.clone());
-        self.session.runs.push(Run {
-            id: start.id,
-            request_id: start.request_id,
-            kind: start.kind,
-            status: RunStatus::Running,
-        });
+        self.session
+            .runs
+            .push(Run::started(start, RunStatus::Running));
         Ok(message)
     }
 
@@ -3401,16 +3600,82 @@ impl Runtime {
     /// Records how run `run_id` ended. The status changes even if saving
     /// it fails, since this process is no longer running the run.
     pub fn finish_run(&mut self, run_id: &str, status: RunStatus) -> Result<(), SessionError> {
+        self.end_run(run_id, status, None)
+    }
+
+    /// Records how run `run_id` ended, with a failed run's reason.
+    pub fn end_run(
+        &mut self,
+        run_id: &str,
+        status: RunStatus,
+        failure: Option<RunFailure>,
+    ) -> Result<(), SessionError> {
         self.session.set_run_status(run_id, status);
+        if let Some(run) = self.session.run_mut(run_id) {
+            run.failure = failure.clone();
+        }
         self.session.partial = None;
         self.session.tool_outputs.clear();
         if let Some(store) = &self.store {
             store.append(&SessionRecord::RunFinished {
                 run_id: run_id.to_owned(),
                 status,
+                failure,
             })?;
         }
         Ok(())
+    }
+
+    /// Starts a run that saves no message of its own (a continue), ending
+    /// an interrupted last run first, as a prompt's start does.
+    pub fn start_bare_run(&mut self, start: RunStart) -> Result<(), SessionError> {
+        let interrupted = self
+            .session
+            .runs
+            .last()
+            .filter(|run| run.status == RunStatus::Interrupted)
+            .map(|run| run.id.clone());
+        if let Some(run_id) = interrupted {
+            self.finish_run(&run_id, RunStatus::Aborted)?;
+        }
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::RunStarted { run: start.clone() })?;
+        }
+        self.session
+            .runs
+            .push(Run::started(start, RunStatus::Running));
+        Ok(())
+    }
+
+    /// A close stops run `run_id`: its next resume is not a restart.
+    pub fn close_run(&mut self, run_id: &str) -> Result<(), SessionError> {
+        if let Some(run) = self.session.run_mut(run_id) {
+            run.closed = true;
+        }
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::RunClosed {
+                run_id: run_id.to_owned(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Counts a crash restart of run `run_id`, and returns its restarts.
+    pub fn count_restart(&mut self, run_id: &str) -> Result<u32, SessionError> {
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::RunRestarted {
+                run_id: run_id.to_owned(),
+            })?;
+        }
+        Ok(self
+            .session
+            .run_mut(run_id)
+            .map(|run| {
+                run.closed = false;
+                run.restarts += 1;
+                run.restarts
+            })
+            .unwrap_or(0))
     }
 
     /// Turns automatic retries on or off for this runtime's turns; the
@@ -3516,6 +3781,9 @@ impl Runtime {
 /// (read, edit, run tests, iterate) still needs far more than a handful of
 /// rounds, so keep this generous while still bounding a runaway tool loop.
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 200;
+
+/// Durable's default `settings.restartLimit`.
+pub const DEFAULT_RESTART_LIMIT: u32 = 5;
 
 /// Resolves the effective per-run round cap from `agent.maxToolRounds`.
 pub fn effective_max_tool_rounds(configured: Option<usize>) -> usize {
@@ -3669,6 +3937,10 @@ pub struct RunControl {
     /// The run the turn belongs to, which names what it saves as it goes
     /// (spec §4.2); a mode without runs has none.
     pub run_id: Option<String>,
+    /// A continued turn whose model request was in flight when the host
+    /// died, on this attempt: the attempt failed, and is charged to the
+    /// retry policy before the request is sent again (Durable).
+    pub interrupted_attempt: Option<u64>,
 }
 
 /// Ends the backoff a turn is waiting out before a retry (upstream
@@ -3939,7 +4211,7 @@ pub async fn run_saved_prompt_streaming_events(
         return Ok(result.output);
     }
 
-    run_model_turn_streaming_events(runtime, provider, run, Some(message), on_event).await
+    run_model_turn(runtime, provider, run, Some(message), 0, on_event).await
 }
 
 /// Continues an unfinished turn from its saved context, without adding a
@@ -3962,8 +4234,51 @@ pub async fn continue_turn_streaming_events(
     if !runtime.session().has_unfinished_turn() {
         return Ok(String::new());
     }
+    let retries = match run.interrupted_attempt {
+        Some(attempt) => charge_interrupted_request(runtime, run, attempt, &mut on_event).await?,
+        None => 0,
+    };
     settle_pending_calls(runtime, run, &mut on_event).await?;
-    run_model_turn_streaming_events(runtime, provider, run, None, on_event).await
+    run_model_turn(runtime, provider, run, None, retries, on_event).await
+}
+
+/// The text of a model request the host's death cut off (Durable).
+pub fn interrupted_request_text(attempt: u64) -> String {
+    format!("The host stopped while the model was answering, on attempt {attempt}")
+}
+
+/// Charges a request the host's death cut off to the retry policy, as
+/// Durable does: when another attempt is allowed the turn waits out its
+/// backoff (reported as a retry) and returns the retries so far; otherwise
+/// the turn ends `interrupted`.
+async fn charge_interrupted_request(
+    runtime: &Runtime,
+    run: &RunControl,
+    attempt: u64,
+    on_event: &mut (impl FnMut(&TurnEvent) + Send),
+) -> Result<u64, AgentError> {
+    let message = interrupted_request_text(attempt);
+    let policy = retry_policy(&runtime.systems.retry);
+    let used = attempt.saturating_sub(1);
+    if used >= policy.max_retries {
+        return Err(AgentError::Interrupted(message));
+    }
+    let delay = noel_agent::retry_delay_ms(&policy, used);
+    on_event(&TurnEvent::RetryStarted(RetryNotice {
+        attempt,
+        max_attempts: policy.max_retries,
+        delay_ms: delay,
+        error_message: message.clone(),
+    }));
+    let backoff = run.retry.backoff(Duration::from_millis(delay));
+    if run.until_cancelled(backoff).await? {
+        return Ok(attempt);
+    }
+    on_event(&TurnEvent::RetryFinished {
+        attempt,
+        error: Some(RETRY_CANCELLED.into()),
+    });
+    Err(AgentError::Interrupted(message))
 }
 
 /// Settles the calls the last reply still owes results for, in order:
@@ -4002,11 +4317,13 @@ async fn settle_pending_calls(
 
 /// Runs provider rounds until a reply calls no tools. `prompt` is the user
 /// message the caller just saved; it is reported as the first round's.
-async fn run_model_turn_streaming_events(
+/// `retries` are those the reply asked for has had already.
+async fn run_model_turn(
     runtime: &mut Runtime,
     provider: &dyn Provider,
     run: &RunControl,
     mut prompt: Option<ConversationMessage>,
+    retries: u64,
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     runtime.load_workspace_context(run).await?;
@@ -4027,7 +4344,10 @@ async fn run_model_turn_streaming_events(
     let mut round_open = false;
     // Replies kept so far. A round whose reply is dropped is not counted.
     let mut rounds = 0;
-    let mut recovery = Recovery::default();
+    let mut recovery = Recovery {
+        retries,
+        ..Recovery::default()
+    };
     // What the reply being asked for has streamed, saved as it goes.
     let mut progress = Mutex::new(ReplyProgress::new(
         runtime.store.clone(),
@@ -4246,6 +4566,12 @@ impl Recovery {
                 });
                 self.finish_retries(Some(&error), on_event);
                 progress.dropped()?;
+                if let Some(store) = &runtime.store {
+                    store.append(&SessionRecord::RetryWait {
+                        run_id: run.run_id.clone(),
+                        attempt: 0,
+                    })?;
+                }
                 if self.compact(runtime, provider, run, on_event).await? {
                     return Ok(());
                 }
@@ -4256,6 +4582,14 @@ impl Recovery {
             if self.retries < policy.max_retries {
                 let delay = noel_agent::retry_delay_ms(&policy, self.retries);
                 self.retries += 1;
+                // Saved before the retry is reported, so a crash the report
+                // races is never taken for one during a request.
+                if let Some(store) = &runtime.store {
+                    store.append(&SessionRecord::RetryWait {
+                        run_id: run.run_id.clone(),
+                        attempt: self.retries,
+                    })?;
+                }
                 on_event(&TurnEvent::RetryStarted(RetryNotice {
                     attempt: self.retries,
                     max_attempts: policy.max_retries,
@@ -10288,6 +10622,9 @@ mod tests {
             request_id: Some(request_id.into()),
             kind: SubmissionKind::Prompt,
             status,
+            failure: None,
+            restarts: 0,
+            closed: false,
         };
         let runs = || SessionStore::read(&path).unwrap().runs;
 
