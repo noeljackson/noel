@@ -37,7 +37,7 @@ final class ExecChannel: ByteChannel, @unchecked Sendable {
     func close() { closer() }
 }
 
-/// noel-ffi calls `open` from a background thread and waits for it.
+/// noel-ffi calls `openChannel` from a background thread and waits for it.
 public final class SSHChannelOpener: ChannelOpener, @unchecked Sendable {
     private let endpoint: SSHEndpoint
 
@@ -45,7 +45,7 @@ public final class SSHChannelOpener: ChannelOpener, @unchecked Sendable {
         self.endpoint = endpoint
     }
 
-    public func open(delivery: Delivery) -> ByteChannel? {
+    public func openChannel(delivery: Delivery) -> ByteChannel? {
         let opened = DispatchSemaphore(value: 0)
         var channel: ByteChannel?
         let endpoint = endpoint

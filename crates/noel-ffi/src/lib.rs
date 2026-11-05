@@ -99,7 +99,7 @@ pub trait ByteChannel: Send + Sync {
 /// what arrives to `delivery`; `None` when it cannot now.
 #[uniffi::export(with_foreign)]
 pub trait ChannelOpener: Send + Sync {
-    fn open(&self, delivery: Arc<Delivery>) -> Option<Arc<dyn ByteChannel>>;
+    fn open_channel(&self, delivery: Arc<Delivery>) -> Option<Arc<dyn ByteChannel>>;
 }
 
 /// Where the app hands what arrives on one channel.
@@ -136,7 +136,7 @@ impl Connector for Channels {
             let delivery = Arc::new(Delivery {
                 inbound: Mutex::new(Some(inbound)),
             });
-            let channel = tokio::task::spawn_blocking(move || opener.open(delivery))
+            let channel = tokio::task::spawn_blocking(move || opener.open_channel(delivery))
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("the channel could not be opened"))?;
             let (ours, theirs) = tokio::io::duplex(1 << 16);
