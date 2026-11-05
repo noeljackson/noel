@@ -281,6 +281,7 @@ Partials and tool output reach the view from the journal's records as each is sa
   - Up on an empty draft withdraws the session's last queued submission into the draft.
 - **Commands:**
   - The session's commands run on its worker through `command({line})` (§7.2), whose answer gives the rows to show and what to do next: a run, a selector, another session to attach to, a draft, the diff panel, a login.
+  - Managing sessions is the server's (`noel.sessions`, §7.2): `/fork` and `/clone` (of this session, or one named by id, id prefix or name), `/import <path>` and `/delete` of another session, after which the TUI attaches to the session made. Deleting the session shown, and importing the export of a session a worker holds, run on the worker.
   - The terminal's own commands run in the TUI: themes, accent, editor, multiline, clipboard, images, `/changelog`, the selectors' movement. `!` commands run on the worker.
   - `/bug` writes its report in the session's directory, with the error rows the TUI shows.
 - **The footer** comes from `pi.live` during a run: what the run does (compacting, a running tool, writing, thinking or waiting) and how many submissions are queued. Otherwise it shows the model and thinking level from `pi.agent`, the queue, and the last run when it was aborted, failed or interrupted (`lastRun`). A run that failed is noted with its error. An abort another client made is noted when no aborted reply shows it.

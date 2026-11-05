@@ -366,6 +366,82 @@ fn attach_error(session: &str, error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Runs a session command on `noel.sessions` for the TUI showing `session`
+/// (in `cwd`): the session made or deleted, or null when the worker runs it
+/// (deleting `session` itself, importing into a session a worker holds).
+async fn sessions_request(client: &Client, session: &str, cwd: &str, line: &str) -> Result<Value> {
+    let (command, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let rest = rest.trim();
+    let named = |reference: &str| {
+        let reference = reference.to_owned();
+        async move { resolve_listed(client, &reference).await }
+    };
+    match command {
+        "/fork" | "/clone" => {
+            let source = if rest.is_empty() {
+                session.to_owned()
+            } else {
+                named(rest).await?
+            };
+            let args = json!({
+                "requestId": new_request_id(),
+                "sessionId": source,
+                "clone": command == "/clone",
+            });
+            client.sessions_call("fork", args).await
+        }
+        "/import" => {
+            let path = std::path::Path::new(cwd).join(rest);
+            let args = json!({"requestId": new_request_id(), "path": path});
+            match client.sessions_call("import", args).await {
+                // The export of a session a worker holds (this one) goes
+                // in through that worker.
+                Err(error) if format!("{error:#}").contains("in use by another noel process") => {
+                    Ok(Value::Null)
+                }
+                imported => imported,
+            }
+        }
+        _ => {
+            let target = named(rest).await?;
+            if target == session {
+                return Ok(Value::Null);
+            }
+            client
+                .sessions_call("delete", json!({ "sessionId": target }))
+                .await
+        }
+    }
+}
+
+/// The session the server lists under `reference`: its id, the one id it
+/// begins, or its name.
+async fn resolve_listed(client: &Client, reference: &str) -> Result<String> {
+    let directory = client.directory().await?;
+    let sessions = directory["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let id = |session: &Value| session["sessionId"].as_str().unwrap_or_default().to_owned();
+    if let Some(exact) = sessions
+        .iter()
+        .find(|session| session["sessionId"] == reference)
+    {
+        return Ok(id(exact));
+    }
+    let matching = sessions
+        .iter()
+        .filter(|session| {
+            id(session).starts_with(reference) || session["name"].as_str() == Some(reference)
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [one] => Ok(id(one)),
+        [] => Err(anyhow!("no session {reference}")),
+        _ => Err(anyhow!("{reference} names {} sessions", matching.len())),
+    }
+}
+
 /// What opening a session says of its saved work, as `noel` says it.
 fn resume_hint(unfinished: bool, queued: usize) -> Option<String> {
     match (unfinished, queued) {
@@ -406,6 +482,9 @@ enum Call {
     Abort,
     /// A resume of the turn the saved context left unfinished.
     Resume,
+    /// A session command `noel.sessions` answers, with its line: the session
+    /// it made, the one it deleted, or `None` to leave it to the worker.
+    Sessions(String),
 }
 
 /// What a key or a command asks of the loop.
@@ -1251,6 +1330,14 @@ impl Remote {
                 TuiEntryKind::System,
                 format!("{line} is not available while a turn is running"),
             ),
+            // Managing sessions is the server's (`noel.sessions`): a fork, a
+            // clone, an import, deleting another session. Deleting the
+            // session shown stays the worker's, which opens a new one.
+            _ if matches!(name, "/fork" | "/clone")
+                || (matches!(name, "/import" | "/delete") && line.trim() != name) =>
+            {
+                self.sessions_command(line.to_owned());
+            }
             // `/bug` takes the error rows shown here into its report.
             _ if line.split_whitespace().next() == Some("/bug") => {
                 let errors = app
@@ -1390,6 +1477,26 @@ impl Remote {
         }));
     }
 
+    /// `/fork [session]`, `/clone [session]`, `/import <path>` or
+    /// `/delete <session>` through `noel.sessions`. A session is named as the
+    /// picker names it: its id, a prefix of it, or its name.
+    fn sessions_command(&mut self, line: String) {
+        self.submitting += 1;
+        let (client, session, sender) = (
+            self.client.clone(),
+            self.session.clone(),
+            self.sender.clone(),
+        );
+        let cwd = self.view["conversation"]["cwd"]
+            .as_str()
+            .unwrap_or("/")
+            .to_owned();
+        tokio::spawn(async move {
+            let result = sessions_request(&client, &session, &cwd, &line).await;
+            let _ = sender.send(Incoming::Answer(Call::Sessions(line), result));
+        });
+    }
+
     /// Continues the turn the saved context left unfinished: `resume`
     /// without a run named.
     fn continue_turn(&mut self) {
@@ -1403,6 +1510,7 @@ impl Remote {
             Call::Withdraw { .. } => "withdraw",
             Call::Abort => "abort",
             Call::Resume => "resume",
+            Call::Sessions(_) => unreachable!("sent by sessions_command"),
         };
         let (client, session, sender) = (
             self.client.clone(),
@@ -1474,7 +1582,10 @@ impl Remote {
                 self.starting = Some(run_id.to_owned());
             }
         }
-        if matches!(&call, Call::Submit(_) | Call::Command(_)) {
+        if matches!(
+            &call,
+            Call::Submit(_) | Call::Command(_) | Call::Sessions(_)
+        ) {
             self.submitting = self.submitting.saturating_sub(1);
             let started = result.as_ref().ok().and_then(|value| {
                 let next = &value["next"];
@@ -1498,6 +1609,7 @@ impl Remote {
                         format!("abort: {error}")
                     }
                     Call::Resume => format!("resume: {error}"),
+                    Call::Sessions(line) => format!("{}: {error:#}", one_line(line)),
                     Call::Withdraw { text, .. } => {
                         format!("withdraw {}: {error}", one_line(text))
                     }
@@ -1516,6 +1628,18 @@ impl Remote {
         };
         match call {
             Call::Submit(_) | Call::Resume => {}
+            // The worker's: deleting the session shown.
+            Call::Sessions(line) if value.is_null() => self.run_command(line),
+            Call::Sessions(line) if line.starts_with("/delete") => app.push(
+                TuiEntryKind::System,
+                format!(
+                    "deleted {}",
+                    value["sessionId"].as_str().unwrap_or_default()
+                ),
+            ),
+            Call::Sessions(_) => {
+                self.switch_to = value["sessionId"].as_str().map(str::to_owned);
+            }
             Call::Command(line) => self.command_answer(app, &line, &value),
             Call::Withdraw { text, recall, .. } => match value["outcome"].as_str() {
                 Some("withdrawn") if recall && app.input.is_empty() => {

@@ -162,7 +162,7 @@ grep -Fq "no session no-such-session on noel server" "${work_dir}/${second}.txt"
 send_line "${first}" "/fork"
 wait_for "${first}" "parent: e2e-attach"
 capture "${first}"
-grep -q "session: [0-9]" "${work_dir}/${first}.txt" || fail "${first}" "the fork was not attached"
+grep -Eq "session: (s-[0-9a-f]+|[0-9])" "${work_dir}/${first}.txt" || fail "${first}" "the fork was not attached"
 
 quit "${first}"
 echo "attach e2e passed (artifacts: ${work_dir})"
