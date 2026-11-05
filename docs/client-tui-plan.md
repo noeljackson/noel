@@ -89,12 +89,20 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
     against stub endpoints.
   - The TUI's own session commands keep running on the worker through
     `command`, which runs where the server's sessions are.
-- Slice 4's comparison test (`scripts/e2e-render.sh`, in `make e2e`): with
-  the in-process TUI gone, the two ways are the TUI rendering a run live
-  from the view and the TUI rebuilding the same session when reopened
-  (plain `noel`, then `--attach`). The transcripts it writes on exit must
-  match. Before slice 7, every e2e suite passed both in process and as a
-  client.
+- Slice 4's comparison test is `make e2e-render-inprocess`. It runs one
+  faux script both ways and compares the rendered transcripts. The script
+  has thinking, a tool call with output, markdown and a second turn.
+  - The two ways are in process, with `scripts/build-inprocess-reference.sh`'s
+    build of 7850c69 (the last commit with the in-process TUI), and as a
+    client.
+  - It then also compares the session reopened, with plain `noel` and with
+    `--attach`.
+  - The only difference it found is an empty thinking row the in-process
+    TUI kept for a reply that did not think, which neither TUI draws, so
+    the comparison drops it.
+  - `make e2e` runs the same suite (`scripts/e2e-render.sh`) without the
+    reference build. Before slice 7, every e2e suite also passed both in
+    process and as a client.
 - Extension UI needs no relay: extension hosts have no UI in process either
   (`hasUI` is false).
 - Latency (debug build, faux provider, a fresh server each start, three
