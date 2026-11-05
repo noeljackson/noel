@@ -5,10 +5,12 @@ import PackageDescription
 
 let package = Package(
     name: "NoelKit",
-    platforms: [.iOS(.v17), .macOS(.v14)],
+    platforms: [.iOS(.v17), .macOS(.v15)],
     products: [.library(name: "NoelKit", targets: ["NoelKit"])],
     dependencies: [
-        .package(url: "https://github.com/orlandos-nl/Citadel.git", from: "0.9.0"),
+        // withExec (stdin and stdout of one exec channel) is not in a tagged
+        // release yet (0.9.2 has none), so Citadel is pinned by commit.
+        .package(url: "https://github.com/orlandos-nl/Citadel.git", revision: "ae8562f895de06ccb86fdb1cbb65fd99c8976e12"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
     ],
     targets: [
