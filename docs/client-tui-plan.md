@@ -69,14 +69,15 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
 
 ## Status
 
-- Done: accepted by the owner (2026-11-05), with slice 4's comparison
-  against the recorded in-process transcript. Two choices stay open, with
-  the current behaviour kept until the owner picks:
-  - `/name` and deleting the session shown run on its worker; the server
-    could instead forward them to the worker holding the session.
-  - A second `noel` with other flags on a running worker gets a notice; the
-    worker could instead restart when idle, or the second `noel` could be
-    refused.
+- Done: accepted by the owner (2026-11-05), with these decisions:
+  - Slice 4 compares against the recorded in-process transcript.
+  - `noel.sessions` forwards `rename` and `delete` of a session a worker
+    holds to that worker: a rename at once, a delete once no client holds
+    the session and no run is active (mode2 test
+    `an_open_session_is_renamed_and_deleted_through_its_worker`). The TUI's
+    `/name` and deleting the session shown still run on its own worker.
+  - A second `noel` with other flags on a running worker keeps that
+    worker's flags and gets a notice.
 - Every slice is built, and `make check` and `make e2e` pass. Interactive
   `noel` is always a client; the in-process TUI is removed (slice 7). The
   spec (§7.2, §7.4, §9) and the non-parity register ("The TUI Is a Client

@@ -909,3 +909,43 @@ fn the_server_manages_sessions_accounts_and_settings_for_a_client() {
         "{settings}"
     );
 }
+
+/// A session its worker holds is renamed and deleted through that worker:
+/// a rename at once, a delete once no client holds it and it runs nothing.
+#[test]
+fn an_open_session_is_renamed_and_deleted_through_its_worker() {
+    let mut mode2 = Mode2::new("open", json!([[{"text": "Hello."}]]), json!({}));
+    let session = mode2.new_session("open");
+    let mut watch = mode2.watch(&session);
+    watch.snapshot("the snapshot");
+    let worker = mode2.worker_pid(&session);
+    mode2.client(&["rename", &session, "renamed while open"]);
+    watch.settle("the name", |view| {
+        view["conversation"]["name"] == "renamed while open"
+    });
+    // A client holds it: not deleted.
+    let refused = mode2.noel(&["client", "delete", &session]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("open in a client"),
+        "{refused:?}"
+    );
+    assert!(mode2
+        .root
+        .join(format!("agent/sessions/{session}.jsonl"))
+        .exists());
+    // With the client gone, the worker (still running) ends and it goes.
+    let mut child = mode2.watches.pop().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(alive(worker));
+    mode2.client(&["delete", &session]);
+    assert!(!mode2
+        .root
+        .join(format!("agent/sessions/{session}.jsonl"))
+        .exists());
+    wait_until("the worker gone", || !alive(worker));
+    wait_until("the session unlisted", || {
+        !mode2.client(&["ls"]).contains(&session)
+    });
+}
