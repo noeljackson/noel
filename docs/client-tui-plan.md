@@ -69,9 +69,10 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
 
 ## Status
 
-- Slices 1, 2, 4 and 5 are built. Slice 6 is done: interactive `noel` is
-  a client by default; `NOEL_CLIENT_TUI=0` keeps the in-process TUI until
-  slice 7. Every `make e2e` suite passes both ways.
+- Done. Interactive `noel` is always a client; the in-process TUI is
+  removed (slice 7), and every `make e2e` suite passes. The spec (§7.4, §9)
+  and the non-parity register ("The TUI Is a Client of a Local Server")
+  describe it.
 - Latency (debug build, faux provider, a fresh server each start, three
   runs): to the first prompt box, about 70 ms in process and 185 ms as a
   client, which starts the server and the worker; from Enter to the reply
@@ -99,9 +100,10 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
   - A queued slash-tool command is placed alone.
   - Retries and failover switches are notes in the transcript.
   - A rebuilt binary restarts the client (dogfood).
-- Left:
-  - Slice 3's login relay and extension UI over the link.
-  - Slice 7.
+- Slice 3, as built: the session operations a client needs run on the
+  worker through `command`; a local login runs in the client, then the
+  worker reloads. Extension UI needs no relay: extension hosts have no UI
+  in process either (`hasUI` is false).
 
 ## Risks
 

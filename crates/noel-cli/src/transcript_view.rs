@@ -152,35 +152,6 @@ impl TranscriptView {
         }
     }
 
-    pub(super) fn insert(&mut self, index: usize) {
-        if let Some(selection) = &mut self.selection {
-            for point in [
-                &mut selection.origin.start,
-                &mut selection.origin.end,
-                &mut selection.focus.start,
-                &mut selection.focus.end,
-            ] {
-                if index <= point.anchor.entry {
-                    point.anchor.entry += 1;
-                }
-            }
-        }
-        if let Some((snapshot_index, _)) = &mut self.thinking_snapshot {
-            if index <= *snapshot_index {
-                *snapshot_index += 1;
-            }
-        }
-        if index < self.layouts.len() {
-            self.layouts.insert(index, None);
-        }
-        if let Some(anchor) = &mut self.anchor {
-            if index <= anchor.entry {
-                anchor.entry += 1;
-            }
-        }
-        self.invalidate(index);
-    }
-
     pub(super) fn remove(&mut self, index: usize) {
         if let Some(selection) = &mut self.selection {
             let low = selection
@@ -726,9 +697,8 @@ mod tests {
     use super::*;
     use crate::tests::{line_text, minimal_test_config};
     use crate::{
-        handle_streaming_tui_key, handle_transcript_key, handle_transcript_mouse, redraw_tui,
-        DiffDetail, DiffPanelState, FollowUpQueue, KeyCode, KeyEvent, KeyModifiers, MouseButton,
-        MouseEvent, MouseEventKind, Position, SteeringMailbox, StreamingKeyOutcome, TuiApp,
+        handle_transcript_mouse, redraw_tui, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        Position, TuiApp,
     };
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -980,109 +950,6 @@ mod tests {
     }
 
     #[test]
-    fn dragging_scrolls_edges_and_selection_survives_streaming_insert_and_resize() {
-        let (mut app, mut terminal) = app_and_terminal();
-        paint(&mut app, &mut terminal);
-        let area = app.transcript_view.get_mut().area;
-        app.transcript_view
-            .get_mut()
-            .begin_selection(Position::new(2, area.y));
-        let before = app.transcript_view.get_mut().anchor;
-        app.append_entry(0, "\nnew output");
-        paint(&mut app, &mut terminal);
-        assert_eq!(app.transcript_view.get_mut().anchor, before);
-        let view = app.transcript_view.get_mut();
-        view.drag_selection(Position::new(8, area.bottom()));
-        view.finish_selection();
-        let selected = view.selected_text().unwrap();
-        assert!(selected.contains("row-"));
-        assert!(!selected.contains("new output"));
-        app.insert_entry(0, TuiEntryKind::System, "unrelated");
-        paint(&mut app, &mut terminal);
-        assert_eq!(
-            app.transcript_view.get_mut().selected_text().unwrap(),
-            selected
-        );
-        app.remove_entry(0);
-        paint(&mut app, &mut terminal);
-        assert_eq!(
-            app.transcript_view.get_mut().selected_text().unwrap(),
-            selected
-        );
-        app.remove_entry(0);
-        paint(&mut app, &mut terminal);
-        assert!(!app.transcript_view.get_mut().has_selection());
-    }
-
-    #[test]
-    fn ctrl_c_and_copy_command_copy_selection_without_interrupting_or_clearing_draft() {
-        let (mut app, mut terminal) = app_and_terminal();
-        app.turn_running = true;
-        app.set_input("keep draft");
-        paint(&mut app, &mut terminal);
-        let area = app.transcript_view.get_mut().area;
-        let mouse = |kind, x| MouseEvent {
-            kind,
-            column: x,
-            row: area.y,
-            modifiers: KeyModifiers::NONE,
-        };
-        assert!(handle_transcript_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 2),
-            &mut app
-        ));
-        assert!(handle_transcript_mouse(
-            mouse(MouseEventKind::Drag(MouseButton::Left), 8),
-            &mut app
-        ));
-        assert!(handle_transcript_mouse(
-            mouse(MouseEventKind::Up(MouseButton::Left), 8),
-            &mut app
-        ));
-        let selected = app.transcript_view.get_mut().take_pending_copy().unwrap();
-        let followups = FollowUpQueue::default();
-        let steering = SteeringMailbox::default();
-        let config = minimal_test_config();
-        assert_eq!(
-            handle_streaming_tui_key(
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                &mut app,
-                &followups,
-                &steering,
-                &config
-            ),
-            StreamingKeyOutcome::Changed
-        );
-        assert_eq!(
-            app.transcript_view.get_mut().take_pending_copy().unwrap(),
-            selected
-        );
-        assert_eq!(app.input, "keep draft");
-        assert!(app.turn_running);
-        crate::handle_streaming_command("copy", &mut app, &followups, &config);
-        assert_eq!(
-            app.transcript_view.get_mut().take_pending_copy().unwrap(),
-            selected
-        );
-        assert!(handle_transcript_key(
-            &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &mut app
-        ));
-        assert!(!app.transcript_view.get_mut().has_selection());
-        assert_eq!(app.input, "keep draft");
-        assert_eq!(
-            handle_streaming_tui_key(
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                &mut app,
-                &followups,
-                &steering,
-                &config
-            ),
-            StreamingKeyOutcome::Interrupt
-        );
-    }
-
-    #[test]
     fn resumed_history_remains_navigable_without_native_scrollback() {
         let (mut app, mut terminal) = app_and_terminal();
         app.set_input("draft");
@@ -1103,44 +970,6 @@ mod tests {
         }
         assert!(!app.transcript_view.get_mut().is_reading());
         assert_eq!(app.input, "draft");
-    }
-
-    #[test]
-    fn anchored_reading_survives_output_reflow_height_and_entry_edits() {
-        let (mut app, mut terminal) = app_and_terminal();
-        paint(&mut app, &mut terminal);
-        app.transcript_view.get_mut().scroll(-50);
-        let anchor = app.transcript_view.get_mut().anchor;
-        let first = app.transcript_view.get_mut().visible_lines()[0].clone();
-        app.append_entry(0, "\nnew line\n".repeat(100).as_str());
-        paint(&mut app, &mut terminal);
-        assert_eq!(app.transcript_view.get_mut().visible_lines()[0], first);
-        assert!(app.transcript_view.get_mut().hint().contains("new output"));
-        for (w, h) in [(18, 12), (80, 30), (40, 20)] {
-            terminal.backend_mut().resize(w, h);
-            terminal.resize(Rect::new(0, 0, w, h)).unwrap();
-            paint(&mut app, &mut terminal);
-            assert_eq!(app.transcript_view.get_mut().anchor, anchor);
-            assert_eq!(app.transcript_view.get_mut().visible_lines()[0], first);
-        }
-        app.insert_entry(0, TuiEntryKind::Tool, "completed read\nfile\ncontents");
-        paint(&mut app, &mut terminal);
-        assert_eq!(app.transcript_view.get_mut().anchor.unwrap().entry, 1);
-        assert_eq!(app.transcript_view.get_mut().visible_lines()[0], first);
-        app.remove_entry(0);
-        paint(&mut app, &mut terminal);
-        assert_eq!(app.transcript_view.get_mut().anchor, anchor);
-        app.diff_panel = Some(DiffPanelState {
-            files: vec![],
-            selected: 0,
-            detail: None,
-        });
-        app.previews_expanded = true;
-        paint(&mut app, &mut terminal);
-        assert_eq!(app.transcript_view.get_mut().anchor, anchor);
-        app.remove_entry(0);
-        paint(&mut app, &mut terminal);
-        assert!(!app.transcript_view.get_mut().is_reading());
     }
 
     #[test]
@@ -1165,105 +994,6 @@ mod tests {
             line_text(&app.transcript_view.get_mut().visible_lines()[0]),
             first
         );
-    }
-
-    #[test]
-    fn esc_returns_to_latest_without_touching_draft_or_interrupting_stream() {
-        let (mut app, mut terminal) = app_and_terminal();
-        app.turn_running = true;
-        app.set_input("draft");
-        app.paste_text("pasted\ntext");
-        app.input_media.push(crate::MediaInput {
-            mime_type: "image/png".into(),
-            data_base64: "AAAA".into(),
-            path: None,
-            width: None,
-            height: None,
-        });
-        paint(&mut app, &mut terminal);
-        let draft = app.input.clone();
-        let cursor = app.input_cursor;
-        let pastes = app.input_pastes.len();
-        let followups = FollowUpQueue::default();
-        let steering = SteeringMailbox::default();
-        let config = minimal_test_config();
-        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        app.transcript_view.get_mut().page(false);
-        assert!(matches!(
-            handle_streaming_tui_key(esc, &mut app, &followups, &steering, &config),
-            StreamingKeyOutcome::Changed
-        ));
-        assert!(!app.transcript_view.get_mut().is_reading());
-        assert_eq!(app.input, draft);
-        assert_eq!(app.input_cursor, cursor);
-        assert_eq!(app.input_pastes.len(), pastes);
-        assert_eq!(app.input_media.len(), 1);
-        assert!(app.turn_running);
-        assert!(matches!(
-            handle_streaming_tui_key(esc, &mut app, &followups, &steering, &config),
-            StreamingKeyOutcome::Interrupt
-        ));
-    }
-
-    #[test]
-    fn modal_esc_precedes_reading_and_mouse_does_not_capture_editor() {
-        let (mut app, mut terminal) = app_and_terminal();
-        paint(&mut app, &mut terminal);
-        let position = app.transcript_view.get_mut().area.as_position();
-        let mouse = MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: position.x,
-            row: position.y,
-            modifiers: KeyModifiers::NONE,
-        };
-        assert!(handle_transcript_mouse(mouse, &mut app));
-        let anchor = app.transcript_view.get_mut().anchor;
-        app.diff_panel = Some(DiffPanelState {
-            files: vec![],
-            selected: 0,
-            detail: Some(DiffDetail {
-                path: "file".into(),
-                lines: vec![],
-                scroll: 0,
-            }),
-        });
-        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(matches!(
-            handle_streaming_tui_key(
-                esc,
-                &mut app,
-                &FollowUpQueue::default(),
-                &SteeringMailbox::default(),
-                &minimal_test_config()
-            ),
-            StreamingKeyOutcome::Changed
-        ));
-        assert_eq!(app.transcript_view.get_mut().anchor, anchor);
-        assert!(app.diff_panel.as_ref().unwrap().detail.is_none());
-        let hint = app.transcript_view.get_mut().hint_area.as_position();
-        let click = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: hint.x,
-            row: hint.y,
-            ..mouse
-        };
-        assert!(handle_transcript_mouse(click, &mut app));
-        assert!(!app.transcript_view.get_mut().is_reading());
-        let editor = Position::new(0, 19);
-        assert!(!handle_transcript_mouse(
-            MouseEvent {
-                column: editor.x,
-                row: editor.y,
-                ..mouse
-            },
-            &mut app
-        ));
-        app.owned_screen = false;
-        assert!(!handle_transcript_mouse(mouse, &mut app));
-        assert!(!handle_transcript_key(
-            &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-            &mut app
-        ));
     }
 
     #[test]

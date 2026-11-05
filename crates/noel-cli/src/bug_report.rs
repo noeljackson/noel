@@ -18,7 +18,7 @@ use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::{format_diagnostics, thinking_label, TuiApp, TuiEntryKind};
+use crate::{format_diagnostics, thinking_label};
 
 /// Where this port's bugs are filed.
 const ISSUES_URL: &str = "https://github.com/noeljackson/noel/issues";
@@ -28,33 +28,21 @@ const MAX_REPORTED_ERRORS: usize = 20;
 const MAX_ERROR_CHARS: usize = 2_000;
 const MAX_TITLE_CHARS: usize = 120;
 
-/// Handles `/bug [description]` in the TUI; the report lands in the current
-/// directory, like upstream's zip export.
-pub(crate) fn run_tui_command(
-    app: &mut TuiApp,
+/// `/bug [description]`: writes the report into `dir`, with `errors` (the
+/// error rows the TUI shows) in it. Returns the line to show, or why it
+/// failed.
+pub(crate) fn report_into(
     runtime: &Runtime,
     config: &LoadedConfig,
     line: &str,
-) {
-    let dir = std::env::current_dir().unwrap_or_else(|_| runtime.session().cwd.clone());
-    report_into(app, runtime, config, line, &dir);
-}
-
-fn report_into(app: &mut TuiApp, runtime: &Runtime, config: &LoadedConfig, line: &str, dir: &Path) {
+    errors: &[&str],
+    dir: &Path,
+) -> Result<String, String> {
     let description = line.strip_prefix("/bug").unwrap_or_default().trim();
-    let errors = app
-        .entries
-        .iter()
-        .filter(|entry| entry.kind == TuiEntryKind::Error)
-        .map(|entry| entry.text.as_str())
-        .collect::<Vec<_>>();
-    let report = BugReport::collect(description, runtime, config, &errors, SystemTime::now());
+    let report = BugReport::collect(description, runtime, config, errors, SystemTime::now());
     match report.write(dir) {
-        Ok(path) => app.push(TuiEntryKind::System, report.status_message(&path)),
-        Err(error) => app.push(
-            TuiEntryKind::Error,
-            format!("failed to write bug report: {error}"),
-        ),
+        Ok(path) => Ok(report.status_message(&path)),
+        Err(error) => Err(format!("failed to write bug report: {error}")),
     }
 }
 
@@ -898,25 +886,22 @@ mod tests {
             id: "echo".to_string(),
         });
         let runtime = Runtime::new(session, ReloadableSystems::default());
-        let mut app = TuiApp::default();
-        app.push(TuiEntryKind::User, "private prompt text");
-        app.push(TuiEntryKind::Error, "provider returned 529: overloaded");
-        app.push(
-            TuiEntryKind::Error,
+        // The TUI's error rows; its other rows ("private prompt text") are
+        // never sent.
+        let errors = [
+            "provider returned 529: overloaded",
             "GET https://faux.test/v1?token=url-secret-1 failed; sent Bearer sk-ant-oat01-headersecret2",
-        );
+        ];
 
-        report_into(
-            &mut app,
+        let status = report_into(
             &runtime,
             &config,
             "/bug model switch lost my draft",
+            &errors,
             &dir,
-        );
-
-        let status = app.entries.last().expect("status entry");
-        assert_eq!(status.kind, TuiEntryKind::System, "{}", status.text);
-        assert!(status.text.contains(
+        )
+        .expect("the report is written");
+        assert!(status.contains(
             "https://github.com/noeljackson/noel/issues/new?title=model+switch+lost+my+draft"
         ));
         let reports = fs::read_dir(&dir)
@@ -931,7 +916,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(reports.len(), 1, "{reports:?}");
-        assert!(status.text.contains(&reports[0].display().to_string()));
+        assert!(status.contains(&reports[0].display().to_string()));
         let report = fs::read_to_string(&reports[0]).expect("read report");
         for expected in [
             "# noel bug report",
@@ -961,9 +946,8 @@ mod tests {
             assert!(!report.contains(leaked), "report leaked {leaked:?}");
         }
 
-        report_into(&mut app, &runtime, &config, "/bug", &dir);
-        let status = app.entries.last().expect("status entry");
-        assert!(status.text.contains(
+        let status = report_into(&runtime, &config, "/bug", &errors, &dir).unwrap();
+        assert!(status.contains(
             "attach it to a new issue: https://github.com/noeljackson/noel/issues/new\n"
         ));
 

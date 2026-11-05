@@ -424,6 +424,12 @@
                     "line"
                   ],
                   "properties": {
+                    "errors": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
                     "line": {
                       "type": "string"
                     },
@@ -491,7 +497,7 @@
           }
         }
       },
-      "fingerprint": "178a361886443d23"
+      "fingerprint": "495c954f26d44c88"
     },
     {
       "declaration": {

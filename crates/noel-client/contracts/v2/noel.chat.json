@@ -392,6 +392,12 @@
               "line"
             ],
             "properties": {
+              "errors": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
               "line": {
                 "type": "string"
               },
