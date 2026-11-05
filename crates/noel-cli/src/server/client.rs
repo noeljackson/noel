@@ -135,6 +135,15 @@ enum ClientCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Run a slash command (or a prompt) on the session as the TUI would,
+    /// and print its output.
+    Command {
+        session: String,
+        line: String,
+        /// Print the answer as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the session's view, then its changes, until interrupted.
     Watch {
         session: String,
@@ -325,6 +334,45 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
                 println!("{}", describe_submit(&result, &request_id));
             }
             Ok(0)
+        }
+        ClientCommand::Command {
+            session,
+            line,
+            json,
+        } => {
+            let args = json!({"line": line, "requestId": new_request_id()});
+            let result = client.chat_call(&session, "command", args, true).await?;
+            if json {
+                println!("{result}");
+                return Ok(0);
+            }
+            let mut failed = false;
+            for entry in result["entries"].as_array().into_iter().flatten() {
+                let text = entry["text"].as_str().unwrap_or_default();
+                if entry["kind"] == "error" {
+                    failed = true;
+                    eprintln!("{text}");
+                } else {
+                    println!("{text}");
+                }
+            }
+            match result["next"]["type"].as_str() {
+                Some("run") => println!(
+                    "started run {}",
+                    result["next"]["runId"].as_str().unwrap_or("")
+                ),
+                Some("session") => println!(
+                    "session {}",
+                    result["next"]["session"].as_str().unwrap_or("")
+                ),
+                Some("selector") => println!("{}", describe_selector(&result["next"]["selector"])),
+                Some("login") => println!(
+                    "login {} needs a terminal on the server's machine",
+                    result["next"]["provider"].as_str().unwrap_or("")
+                ),
+                _ => {}
+            }
+            Ok(if failed { 1 } else { 0 })
         }
         ClientCommand::Watch { session, json } => watch(&client, &session, json).await,
         ClientCommand::Abort {
@@ -1141,6 +1189,20 @@ fn one_line(text: &str, limit: usize) -> String {
     }
     let kept: String = flat.chars().take(limit).collect();
     format!("{kept}…")
+}
+
+/// A selector a command opened, as `noel client command` prints it.
+fn describe_selector(selector: &Value) -> String {
+    let mut lines = vec![selector["title"].as_str().unwrap_or("selector").to_owned()];
+    for item in selector["items"].as_array().into_iter().flatten() {
+        let marker = if item["active"] == true { "*" } else { " " };
+        lines.push(format!(
+            "{marker} {}\t{}",
+            item["value"].as_str().unwrap_or_default(),
+            item["label"].as_str().unwrap_or_default()
+        ));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]

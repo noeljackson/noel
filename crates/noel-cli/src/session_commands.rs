@@ -18,6 +18,111 @@ pub(crate) trait CommandUi {
     /// The session changed: whether its last turn is unfinished, so the
     /// client resumes it.
     fn set_resume_pending(&mut self, pending: bool);
+    /// Moves to another session: in place for the in-process TUI
+    /// ([`switch_in_place`]), or by telling the client which one.
+    fn switch_session(
+        &mut self,
+        runtime: &mut Runtime,
+        config: &LoadedConfig,
+        switch: SessionSwitch,
+    ) -> Result<CommandOutcome>;
+}
+
+/// Another session a command moves to.
+pub(crate) enum SessionSwitch {
+    /// An existing session; `resume` continues its unfinished turn.
+    Open {
+        path: PathBuf,
+        resume: bool,
+    },
+    /// A fork (or, with `clone`, a full copy) of `source`.
+    Fork {
+        source: Box<SessionState>,
+        clone: bool,
+    },
+    Import(PathBuf),
+    /// A new session in the same cwd and workspace, with the same model.
+    New,
+}
+
+/// Opens `switch` in `runtime`, the in-process TUI's way.
+pub(crate) fn switch_in_place(
+    ui: &mut impl CommandUi,
+    runtime: &mut Runtime,
+    config: &LoadedConfig,
+    switch: SessionSwitch,
+) -> Result<CommandOutcome> {
+    let (store, state, resume) = match switch {
+        SessionSwitch::Open { path, resume } => {
+            let (store, state) = SessionStore::open(path)?;
+            (store, state, resume)
+        }
+        SessionSwitch::Fork { source, clone } => {
+            let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, clone)?;
+            (store, state, false)
+        }
+        SessionSwitch::Import(path) => {
+            let (store, state) = SessionStore::import_path(&config.paths.session_dir, &path)?;
+            (store, state, false)
+        }
+        SessionSwitch::New => {
+            let (store, state) = new_session_like(runtime, config)?;
+            (store, state, false)
+        }
+    };
+    runtime.replace_session(state, Some(store));
+    if resume {
+        ui.set_resume_pending(runtime.session().has_unfinished_turn());
+        if let Some(hint) = resume_hint(runtime) {
+            ui.push(TuiEntryKind::System, hint);
+        }
+    }
+    ui.push(TuiEntryKind::System, format_session(runtime));
+    Ok(CommandOutcome::Handled)
+}
+
+/// Writes `switch`'s session without opening it here, for a client to
+/// attach to: its id.
+pub(crate) fn switch_elsewhere(
+    runtime: &Runtime,
+    config: &LoadedConfig,
+    switch: SessionSwitch,
+) -> Result<String> {
+    Ok(match switch {
+        SessionSwitch::Open { path, .. } => SessionStore::read(&path)?.session_id,
+        SessionSwitch::Fork { source, clone } => {
+            SessionStore::fork(&config.paths.session_dir, &source, clone)?
+                .1
+                .session_id
+        }
+        SessionSwitch::Import(path) => {
+            SessionStore::import_path(&config.paths.session_dir, &path)?
+                .1
+                .session_id
+        }
+        SessionSwitch::New => new_session_like(runtime, config)?.1.session_id,
+    })
+}
+
+/// A new session in `runtime`'s cwd and workspace, with its model,
+/// thinking level and account (the new session keeps the workspace, as it
+/// keeps the model).
+pub(crate) fn new_session_like(
+    runtime: &Runtime,
+    config: &LoadedConfig,
+) -> Result<(SessionStore, SessionState)> {
+    let (store, mut state) = SessionStore::create_with_workspace(
+        &config.paths.session_dir,
+        runtime.session().cwd.clone(),
+        runtime.session().workspace.clone(),
+    )?;
+    state.active_model = runtime.session().active_model.clone();
+    state.active_thinking_level = runtime.session().active_thinking_level.clone();
+    state.active_account = runtime.session().active_account.clone();
+    store.record_active_model(state.active_model.clone())?;
+    store.record_active_thinking_level(state.active_thinking_level.clone())?;
+    store.record_active_account(state.active_account.clone())?;
+    Ok((store, state))
 }
 
 /// What a command leaves for the client to do.
@@ -39,6 +144,8 @@ pub(crate) enum CommandOutcome {
     },
     /// Open this selector.
     Selector(TuiSelectorState),
+    /// Attach to this session instead (a worker's answer to a switch).
+    Session(String),
 }
 
 /// Opens selector `kind`, filtered by `query`: an empty one is a note.
@@ -441,8 +548,7 @@ pub(crate) async fn run(
             });
         }
         _ if line.starts_with("/new") => {
-            start_new_session(runtime, config)?;
-            ui.push(TuiEntryKind::System, format_session(runtime));
+            return ui.switch_session(runtime, config, SessionSwitch::New);
         }
         _ if line.starts_with("/resume") => {
             let reference = line.trim_start_matches("/resume").trim();
@@ -452,28 +558,36 @@ pub(crate) async fn run(
                 return open_selector(ui, config, runtime, "session", "");
             } else {
                 let path = resolve_session_reference(&config.paths.session_dir, reference)?;
-                let (store, state) = SessionStore::open(path)?;
-                runtime.replace_session(state, Some(store));
-                ui.set_resume_pending(runtime.session().has_unfinished_turn());
-                if let Some(hint) = resume_hint(runtime) {
-                    ui.push(TuiEntryKind::System, hint);
-                }
-                ui.push(TuiEntryKind::System, format_session(runtime));
+                return ui.switch_session(
+                    runtime,
+                    config,
+                    SessionSwitch::Open { path, resume: true },
+                );
             }
         }
         _ if line.starts_with("/fork") => {
             let source =
                 resolve_source_session(&config.paths.session_dir, runtime, &line, "/fork")?;
-            let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, false)?;
-            runtime.replace_session(state, Some(store));
-            ui.push(TuiEntryKind::System, format_session(runtime));
+            return ui.switch_session(
+                runtime,
+                config,
+                SessionSwitch::Fork {
+                    source: Box::new(source),
+                    clone: false,
+                },
+            );
         }
         _ if line.starts_with("/clone") => {
             let source =
                 resolve_source_session(&config.paths.session_dir, runtime, &line, "/clone")?;
-            let (store, state) = SessionStore::fork(&config.paths.session_dir, &source, true)?;
-            runtime.replace_session(state, Some(store));
-            ui.push(TuiEntryKind::System, format_session(runtime));
+            return ui.switch_session(
+                runtime,
+                config,
+                SessionSwitch::Fork {
+                    source: Box::new(source),
+                    clone: true,
+                },
+            );
         }
         _ if line.starts_with("/delete") => {
             ui.push(
@@ -524,9 +638,7 @@ pub(crate) async fn run(
         "/import" => ui.push(TuiEntryKind::System, "usage: /import <path.jsonl>"),
         _ if line.starts_with("/import ") => {
             let path = PathBuf::from(line.trim_start_matches("/import ").trim());
-            let (store, state) = SessionStore::import_path(&config.paths.session_dir, &path)?;
-            runtime.replace_session(state, Some(store));
-            ui.push(TuiEntryKind::System, format_session(runtime));
+            return ui.switch_session(runtime, config, SessionSwitch::Import(path));
         }
         _ if line.starts_with("/account ") => {
             let account = line.trim_start_matches("/account ").trim();
