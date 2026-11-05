@@ -30,7 +30,7 @@ ENV_DAEMONS_SCRIPT := scripts/build-env-daemons.sh
 RUN_ARGS ?=
 DOGFOOD_ARGS ?= --continue --model faux/echo
 
-.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures codemode-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord2-interop app app-check ios ios-libs env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
+.PHONY: help build release install install-system run dogfood dogfood-release fmt lint test check check-ci ci e2e e2e-render-inprocess dogfood-long dogfood-real dogfood-real-print test-smoke docker-build docker-e2e parity-check ts-parity-build ts-parity-fixtures chord2-fixtures codemode-fixtures ts-parity-chord ts-parity-env ts-parity-pi-env ts-parity-pi-env-ssh ts-parity-update ts-parity-drift ts-parity-agent chord2-interop app app-check ios ios-libs env-interop env-daemon env-daemons noel-static workspace-journey bridge-journey smoke-real smoke-real-openai smoke-real-anthropic smoke-real-gemini smoke-real-mistral smoke-real-openrouter smoke-real-profiles smoke-claude-opus-oauth clean
 
 help:
 	@printf '%s\n' \
@@ -161,6 +161,12 @@ ci: check e2e
 
 e2e:
 	scripts/e2e-tmux.sh
+
+# One faux script rendered in process (a build of the last commit with the
+# in-process TUI) and as a client, compared (docs/client-tui-plan.md).
+e2e-render-inprocess:
+	cargo build -p noel-cli
+	NOEL_INPROCESS_BIN="$$(scripts/build-inprocess-reference.sh)" scripts/e2e-render.sh
 
 dogfood-release: release
 	scripts/dogfood-release.sh
