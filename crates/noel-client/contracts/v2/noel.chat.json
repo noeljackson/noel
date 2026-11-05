@@ -138,13 +138,18 @@
           "args": {
             "type": "object",
             "required": [
-              "requestId",
-              "text"
+              "requestId"
             ],
             "properties": {
               "requestId": {
                 "type": "string",
                 "minLength": 1
+              },
+              "type": {
+                "enum": [
+                  "input",
+                  "continue"
+                ]
               },
               "text": {
                 "type": "string"
@@ -173,6 +178,11 @@
                   "reject",
                   "steer",
                   "followUp"
+                ]
+              },
+              "whenIdle": {
+                "enum": [
+                  "reject"
                 ]
               }
             },

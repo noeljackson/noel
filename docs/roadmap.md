@@ -38,7 +38,7 @@ v1 pin `@earendil-works/chord@1.5.0`).
 - Chord client, contracts, reconnect, follow; transports through `Connector`.
   Type-checks for `aarch64-apple-ios`.
 
-### 2. Upstream audits (Written, awaiting owner review; #116, #117)
+### 2. Upstream audits (Done, approved by the owner 2026-11-05; #116, #117)
 - **Durable 1.5.0:** `docs/durable-1.5-audit.md`. Top ports: entry ids and
   raw history kept across compaction (L, blocks phase 5); codemode on djs
   with nested calls; `pi.live` v3 subset, `runFailure` and run-end rules;
@@ -48,8 +48,8 @@ v1 pin `@earendil-works/chord@1.5.0`).
   18 message kinds, typed host addresses, new fingerprints), wire marked
   unstable upstream; only the delta op encoding carries over. Proposed pin
   `3551ec07`; about 8-11k lines, replacing most of `noel-chord`'s host.
-- Done when the owner approves both and the non-parity register and spec
-  citations are updated.
+- Approved by the owner on 2026-11-05. The spec citations and the
+  non-parity register were updated with phases 3-5.
 
 ### 3. Codemode (Done, #118)
 - Done: `crates/noel-codemode` runs upstream's prelude on djs (pinned by
@@ -78,17 +78,19 @@ v1 pin `@earendil-works/chord@1.5.0`).
   the non-parity register ("Chord v2"); noel's refusals are plugin error
   codes since v2's table is closed.
 
-### 5. View parity (Client side done, #120)
+### 5. View parity (Done, #120)
 - Done: the session history (`noel-core/src/history.rs`, ids that survive
   restarts and compaction, markers for compaction and undo), the windowed
   `noel.chat` view in Durable's entry shape with `before` and an `entries`
   paging method, `noel-client`'s `Transcript`, the attached TUI showing the
   whole history, and `pi.live` v3's `turns`, `compactions`,
   `compactionFailure`, `runFailure` and slot `entry`.
-- Open (engine behavior, needs an owner decision against spec section 4.1):
-  Durable's run-end rules: an interrupted request charged to retry and
-  ending `interrupted` instead of being resent, `restart_limit`, the
-  `continue` submission, `whenIdle: "reject"`, `turn_limit`.
+- Durable's run-end rules, adopted by the owner (2026-11-05): `runFailure`
+  reasons saved with each run's end, a crash-interrupted request charged to
+  `retry` (else `interrupted`), `restartLimit` (default 5, counted in the
+  journal), `continue` (`noel client continue`), `whenIdle: "reject"`, and
+  `turn_limit` at `agent.maxToolRounds`. Spec §3.1, §4.1, §8.3; differences
+  in the register ("Run-End Rules").
 
 ### 6. Storage trait (Done, #121)
 - `noel_core::storage::JournalStorage`: append a record, read the journal,

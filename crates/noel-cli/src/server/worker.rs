@@ -860,14 +860,28 @@ async fn idle_command(
 ) -> Option<Start> {
     match command {
         Command::Submit(args, reply) => {
-            let (submission, _) = match submission(&args) {
+            let (submission, _, reject_when_idle) = match submission(&args) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     let _ = reply.send(Err(error));
                     return None;
                 }
             };
-            match controller.submit(submission).await {
+            // Durable's whenIdle: "reject": an idle session refuses the
+            // input and writes nothing, so it never starts a run.
+            if reject_when_idle && submission.kind != SubmissionKind::Continue {
+                let _ = reply.send(Err(refused(
+                    "idle",
+                    "no run is active; the input was not admitted (whenIdle reject)",
+                )));
+                return None;
+            }
+            let submitted = if submission.kind == SubmissionKind::Continue {
+                controller.continue_run(submission.request_id).await
+            } else {
+                controller.submit(submission).await
+            };
+            match submitted {
                 Ok(Submitted::Started(start)) => {
                     let run_id = start.run_id().to_owned();
                     let _ = reply.send(Ok(json!({
@@ -932,7 +946,7 @@ async fn idle_command(
 fn busy_command(command: Command, busy: &mut Busy<'_, WorkerHost>) {
     match command {
         Command::Submit(args, reply) => {
-            let result = submission(&args).and_then(|(submission, when_busy)| {
+            let result = submission(&args).and_then(|(submission, when_busy, _)| {
                 let active = busy.run_id().to_owned();
                 match busy.submit(submission, when_busy) {
                     Ok(Enqueued::Queued(id)) => Ok(json!({
@@ -978,8 +992,45 @@ fn text(args: &Value, key: &str) -> String {
 }
 
 /// `submit`'s arguments as a submission: `whenBusy` names its kind, as
-/// `prompt`, `steer` and `follow_up` do over RPC.
-fn submission(args: &Value) -> Result<(Submission, WhenBusy), WireError> {
+/// `prompt`, `steer` and `follow_up` do over RPC; `type: "continue"` is
+/// Durable's continue. The flag is `whenIdle: "reject"`.
+fn submission(args: &Value) -> Result<(Submission, WhenBusy, bool), WireError> {
+    let reject_when_idle = match args.get("whenIdle").and_then(Value::as_str) {
+        None => false,
+        Some("reject") => true,
+        Some(other) => {
+            return Err(
+                ChordError::invalid("args", format!("whenIdle {other:?} is not reject")).into(),
+            )
+        }
+    };
+    let continuing = match args.get("type").and_then(Value::as_str) {
+        None | Some("input") => false,
+        Some("continue") => true,
+        Some(other) => {
+            return Err(ChordError::invalid(
+                "args",
+                format!("type {other:?} is not input or continue"),
+            )
+            .into())
+        }
+    };
+    if continuing {
+        return Ok((
+            Submission {
+                kind: SubmissionKind::Continue,
+                request_id: Some(text(args, "requestId")),
+                content: String::new(),
+                images: Vec::new(),
+                expected_run_id: None,
+            },
+            WhenBusy::Reject,
+            reject_when_idle,
+        ));
+    }
+    if !args.get("text").is_some_and(Value::is_string) {
+        return Err(ChordError::invalid("args", "an input needs its text").into());
+    }
     let (kind, when_busy) = match args.get("whenBusy").and_then(Value::as_str) {
         None | Some("reject") => (SubmissionKind::Prompt, WhenBusy::Reject),
         Some("steer") => (SubmissionKind::Steer, WhenBusy::Steer),
@@ -1014,6 +1065,7 @@ fn submission(args: &Value) -> Result<(Submission, WhenBusy), WireError> {
             expected_run_id: None,
         },
         when_busy,
+        reject_when_idle,
     ))
 }
 
@@ -1145,7 +1197,7 @@ mod tests {
             if !when.is_null() {
                 args["whenBusy"] = when;
             }
-            submission(&args).map(|(submission, when_busy)| (submission.kind, when_busy))
+            submission(&args).map(|(submission, when_busy, _)| (submission.kind, when_busy))
         };
         assert_eq!(
             parse(Value::Null).unwrap(),
@@ -1160,6 +1212,19 @@ mod tests {
             (SubmissionKind::FollowUp, WhenBusy::FollowUp)
         );
         assert!(parse(json!("later")).is_err());
+    }
+
+    #[test]
+    fn a_continue_and_when_idle_are_read_from_submit() {
+        let (continuing, _, reject) =
+            submission(&json!({"requestId": "r", "type": "continue"})).unwrap();
+        assert_eq!((continuing.kind, reject), (SubmissionKind::Continue, false));
+        let (_, _, reject) =
+            submission(&json!({"requestId": "r", "text": "hi", "whenIdle": "reject"})).unwrap();
+        assert!(reject);
+        assert!(submission(&json!({"requestId": "r"})).is_err());
+        assert!(submission(&json!({"requestId": "r", "type": "later"})).is_err());
+        assert!(submission(&json!({"requestId": "r", "text": "x", "whenIdle": "start"})).is_err());
     }
 
     #[test]

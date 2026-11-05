@@ -467,6 +467,10 @@ pub struct Settings {
     pub markdown: Option<MarkdownSettings>,
     #[serde(default)]
     pub warnings: Option<WarningSettings>,
+    /// Crash restarts in a row after which a Mode 2 run ends
+    /// `restart_limit` (Durable's `settings.restartLimit`, default 5).
+    #[serde(default)]
+    pub restart_limit: Option<u32>,
     /// How codemode presents tools (upstream `codemode`).
     #[serde(default)]
     pub codemode: Option<CodemodeSettings>,
@@ -567,6 +571,7 @@ impl Settings {
             markdown: merge_optional_settings(self.markdown, overrides.markdown),
             warnings: merge_optional_settings(self.warnings, overrides.warnings),
             codemode: merge_optional_settings(self.codemode, overrides.codemode),
+            restart_limit: overrides.restart_limit.or(self.restart_limit),
             model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
             failover: merge_optional_settings(self.failover, overrides.failover),
             server: merge_optional_settings(self.server, overrides.server),

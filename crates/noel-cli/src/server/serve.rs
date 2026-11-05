@@ -72,8 +72,10 @@ pub(crate) struct ServerArgs {
     foreground: bool,
 }
 
-/// How many times the server resumes one run by itself.
-const RESUME_LIMIT: u32 = 3;
+/// How many times one server resumes a run by itself. The run's own
+/// count (Durable's `restartLimit`, in its journal) ends it first; this
+/// only stops a worker that crashes before it counts a restart.
+const RESUME_LIMIT: u32 = 20;
 /// How long a starting worker has to report `ready`.
 const WORKER_START: Duration = Duration::from_secs(30);
 
@@ -671,7 +673,9 @@ impl Workers {
     }
 
     /// The journal's interrupted last run, if the server may resume it once
-    /// more. The resume counts once a worker started with it is ready.
+    /// more. The resume counts once a worker started with it is ready; the
+    /// worker counts the run's restart in its journal and ends the run at
+    /// `restartLimit` (spec §8.3).
     async fn resume_for(&self, id: &str, journal: PathBuf) -> Option<String> {
         let state = tokio::task::spawn_blocking(move || SessionStore::read(&journal))
             .await

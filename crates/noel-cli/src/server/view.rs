@@ -247,18 +247,21 @@ impl View {
                 self.live.run_failure = match outcome {
                     Outcome::Completed => None,
                     Outcome::Aborted => Some(json!({"reason": "aborted", "inputs": inputs})),
-                    Outcome::Failed(error) => Some(json!({
-                        "reason": "model_error",
-                        "detail": error,
-                        "inputs": inputs,
-                    })),
+                    failed => failed.failure().map(|failure| {
+                        let mut value =
+                            json!({"reason": failure.reason.as_str(), "inputs": inputs});
+                        if !failure.detail.is_empty() {
+                            value["detail"] = json!(failure.detail);
+                        }
+                        value
+                    }),
                 };
                 self.resuming.clear();
                 let mut last = json!({"runId": run_id, "status": to_json(&outcome.status())});
                 if let Some(request_id) = request_id {
                     last["requestId"] = json!(request_id);
                 }
-                if let Outcome::Failed(error) = outcome {
+                if let Some(error) = outcome.error() {
                     last["error"] = json!(error);
                 }
                 self.last_run = Some(last);

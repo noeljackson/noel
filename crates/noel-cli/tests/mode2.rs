@@ -648,3 +648,58 @@ fn a_session_is_created_in_a_workspace_only_on_a_trusted_host() {
     assert_eq!(listed["sessions"][0]["workspace"], url);
     assert!(mode2.client(&["ls"]).contains(url));
 }
+
+#[test]
+fn a_continue_answers_after_a_failed_run_and_when_idle_reject_never_starts_one() {
+    let mut mode2 = Mode2::new(
+        "continue",
+        json!([[{"error": "provider down"}], [{"text": "Recovered"}]]),
+        json!({}),
+    );
+    let session = mode2.new_session("continue");
+    let mut watch = mode2.watch(&session);
+    watch.snapshot("the snapshot");
+    // Idle, an input with whenIdle reject is refused and writes nothing.
+    let idle = mode2.noel(&[
+        "client",
+        "send",
+        &session,
+        "only if busy",
+        "--when-idle",
+        "reject",
+    ]);
+    assert!(!idle.status.success());
+    let stderr = String::from_utf8_lossy(&idle.stderr);
+    assert!(stderr.contains("idle: "), "{stderr}");
+    assert!(!mode2.journal(&session).contains("only if busy"));
+
+    mode2.client(&["send", &session, "work"]);
+    let view = watch.settle("the run failed", |view| {
+        last_run_status(view).as_deref() == Some("failed")
+    });
+    let failure = &view["docs"]["pi.live"]["runFailure"];
+    assert_eq!(failure["reason"], "model_error", "{failure}");
+
+    // A continue runs on the context as it is: the prompt is asked again.
+    let continued = mode2.client(&["continue", &session, "--request-id", "c1"]);
+    assert!(continued.starts_with("started run "), "{continued}");
+    let view = watch.settle("the continue answered", |view| {
+        last_run_status(view).as_deref() == Some("completed")
+    });
+    assert!(view["docs"]["pi.live"].get("runFailure").is_none());
+    assert_eq!(
+        text_of(&entries(&view).last().cloned().unwrap()),
+        "Recovered"
+    );
+    let requests = mode2.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+
+    // Now the context ends in an answer: a continue has nothing to answer.
+    mode2.client(&["continue", &session]);
+    let view = watch.settle("nothing to answer", |view| {
+        view["docs"]["pi.live"]["runFailure"]["reason"] == "nothing_to_answer"
+    });
+    assert_eq!(last_run_status(&view).as_deref(), Some("failed"));
+    assert_eq!(mode2.requests().len(), 2);
+}

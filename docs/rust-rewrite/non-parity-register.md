@@ -452,7 +452,10 @@ edits stay untouched.
 The per-run provider round cap (`agent.maxToolRounds`, default 200, including
 steering rounds) is configurable in settings and reports a dedicated
 round-limit error that names the cap and the setting instead of masquerading
-as an invalid tool call.
+as an invalid tool call. A run that reaches it ends failed with Durable's
+reason `turn_limit` (`maxTurns`), saved with its end and shown as
+`pi.live.runFailure`; a continue goes on from there. Durable's `run.turns`
+is not in the view.
 
 Reason: the default is a runaway-loop bound, not a usage quota; long working
 sessions legitimately exceed it and the recovery path (continue or raise the
@@ -959,6 +962,35 @@ refreshed tokens back to their files, so an early refresh from `noel auth` would
 sign the user out of Claude Code or Codex. After noel refreshes such a login it
 keeps its own `claude-import`/`codex-import` account, which refreshes early
 like any stored account.
+
+### Run-End Rules (Durable 1.5)
+
+Durable's run-end rules, adopted by the owner on 2026-11-05 (spec §3.1, §4.1,
+§8.3): the `runFailure` reasons, the restart limit, a crash-interrupted
+request charged to retry, `continue` and `whenIdle: "reject"`. These parts
+differ:
+
+- **Unit.** Durable counts restarts per task (each tool call, compaction and
+  generation). noel has no tasks: it counts per run, and at the limit ends
+  the run, never a single tool call with a `restart_limit` result. The
+  count is cleared by any message the run saves, where Durable clears it on
+  a new checkpoint, wait or outcome.
+- **Close.** A close is a stop whose driver's inbox ended (a worker told to
+  shut down, RPC mode exiting with its run active); it saves `run_closed`.
+  Durable joins the invocations and writes the tasks back as `pending`.
+  Journals from before this change hold no close record, so their
+  interrupted runs count as crashed.
+- **Charging.** A crash counts as one during a request unless the journal's
+  last record about the reply is a `retry_wait` (a retry's backoff, or a
+  compaction after an overflow), saved before the retry is reported; Durable
+  knows the generation's phase. A crash after a tool round's results were
+  saved and before the request left is charged too. The attempt is the
+  cut-off partial's, or 1. RPC reports the charged attempt as upstream pi
+  reports a retry, so a resumed run may have more than one `agent_start`.
+- **Not ported:** `afterFailedRun` (noel keeps the queue: `keep`),
+  `Conversation.submit(tx, draft)`, `no_model`, `reset`, `faulted`,
+  `orphaned`; `continue` and `whenIdle` exist on `noel.chat` only, not in
+  RPC mode.
 
 ### Run Recovery
 

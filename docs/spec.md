@@ -56,6 +56,9 @@ reply stays in the transcript.
   - `followUp` queues it for when the run would answer.
 - **Each queued submission has its own id.** A submission that starts a run is named by the run's id. A submission ends either *done*, when the run it was placed into completed, or *unanswered*: withdrawn, or placed into a run that failed or was aborted.
 - **While no run is active,** a prompt starts one, and what is still queued joins it: steering in its first round, follow-ups after it would answer.
+- **`whenIdle: "reject"`** (Durable `spec.md:2924-2932`): while no run is active the input is refused (`idle`) and nothing is written, so it never starts a run of its own; with `whenBusy: "steer"` it steers the current run or is refused, in one step.
+- **A continue** (`type: "continue"`, Durable `spec.md:2958-2977`) starts a run on the context as it is, without a user message, for example after a run that ended without an answer. Only an idle session admits it; a busy one refuses it `busy` before any write. Queued follow-ups are placed into its run first. A context that does not end in a user message or tool results (system messages aside) ends the run without a request, failed with reason `nothing_to_answer`; a reply whose tool calls never ran is continued, its calls settled as on a resume. Its start is saved as a `run_started` record (no message), and its `requestId` deduplicates as a prompt's does.
+- **How a run ends without an answer** is saved with its end (`run_finished.failure`: Durable's `runFailure` reason and detail) and shown in the view's `pi.live.runFailure` until another run starts: `model_error` (the request failed, retries included), `interrupted`, `restart_limit`, `nothing_to_answer`, `turn_limit` (its tool rounds reached `agent.maxToolRounds`; a continue goes on). An aborted run is `aborted`.
 
 **RPC mode** keeps its wire: only a `prompt`'s `requestId` is read (a repeat replies `started` or `handled` with the run's id, as before), a queued `prompt` cannot carry one, and replies carry no submission ids.
 
@@ -80,8 +83,10 @@ reply stays in the transcript.
 **Built.**
 - A supervisor decides when an interrupted run resumes: the Mode 1 driver, or the Mode 2 server (§8.3). noel never resumes in RPC mode on its own.
 - The TUI continues an unfinished session when you reopen it.
+- **Close and crash** (Durable `spec.md:2525-2560`): a stop that closes a run (its driver's inbox ends: the worker shutting down, RPC mode exiting) saves `run_closed`; a resume after any other stop is a crash restart, saved as `run_restarted`. A message the run saves is progress and clears its restarts. At `restartLimit` (setting, default 5) restarts in a row the run ends at its resume instead of running again, failed with reason `restart_limit`.
 - **What runs again on resume:**
-  - a model request that a crash cut off is sent again, after what its reply had streamed is saved as an aborted reply (§4.2);
+  - a model request a close stopped is sent again, after what its reply had streamed is saved as an aborted reply (§4.2);
+  - a model request a crash cut off is a failed attempt (Durable `spec.md:4884-4901`): when the retry policy (`retry`) allows another attempt the run waits out its backoff, reported as a retry with the text "The host stopped while the model was answering, on attempt N", and sends it again; otherwise the run ends failed with reason `interrupted` and that text. A crash while the turn waited out a retry's backoff or compacted after an overflow (a `retry_wait` record is its last) cut off no request and is not charged;
   - replay-safe tools (`read`, `grep`, `find`, `ls`) run again;
   - any other interrupted tool call gets an "interrupted" result holding the output it had saved (§4.2), and never runs again.
 
@@ -255,8 +260,8 @@ Where the attached TUI differs from the local one is in the non-parity register 
 ### 8.3 Worker
 - **A worker crash:** the kernel releases its lock, and the run is interrupted.
 - **Restart:** the server starts it again with the next generation. The new worker repairs a torn tail, applies §4.2, and resumes the run.
-- **Resume limit:** the server resumes a run by itself at most 3 times. After that the run stays interrupted until a client resumes or aborts it.
-- **When:** a worker lost with its run interrupted is started again at once. Any worker the server starts resumes the journal's interrupted last run while its resumes last, so after a machine stopped the first hold resumes it. The count is the server's: a new server counts again.
+- **Restart limit:** the worker counts each crash restart of a run in its journal and ends the run `restart_limit` at `restartLimit` (§4.1), so the count holds across servers. One server also stops resuming a run by itself after 20 resumes, for a worker that crashes before it counts one.
+- **When:** a worker lost with its run interrupted is started again at once. Any worker the server starts resumes the journal's interrupted last run, so after a machine stopped the first hold resumes it.
 - **Clients:** they see `gone`, hold the object again, and get a snapshot.
 
 ## 9. Mode 1 relationship
