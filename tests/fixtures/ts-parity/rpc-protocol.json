@@ -10000,7 +10000,7 @@
             "stopReason": "error",
             "timestamp": "<timestamp>",
             "responseId": "chatcmpl-stub-1",
-            "errorMessage": "terminated",
+            "errorMessage": "terminated: other side closed (UND_ERR_SOCKET)",
             "durationMs": "<duration-ms>",
             "thinkingLevel": "off"
           }
@@ -10035,7 +10035,7 @@
             "stopReason": "error",
             "timestamp": "<timestamp>",
             "responseId": "chatcmpl-stub-1",
-            "errorMessage": "terminated",
+            "errorMessage": "terminated: other side closed (UND_ERR_SOCKET)",
             "durationMs": "<duration-ms>",
             "thinkingLevel": "off"
           },
@@ -10132,7 +10132,7 @@
               "stopReason": "error",
               "timestamp": "<timestamp>",
               "responseId": "chatcmpl-stub-1",
-              "errorMessage": "terminated",
+              "errorMessage": "terminated: other side closed (UND_ERR_SOCKET)",
               "durationMs": "<duration-ms>",
               "thinkingLevel": "off"
             }
@@ -10144,7 +10144,7 @@
           "attempt": 1,
           "maxAttempts": 3,
           "delayMs": 10,
-          "errorMessage": "terminated"
+          "errorMessage": "terminated: other side closed (UND_ERR_SOCKET)"
         },
         {
           "type": "entry_appended",
