@@ -3645,6 +3645,21 @@ struct TuiSelectorState {
 }
 
 impl TuiSelectorState {
+    /// A selector a worker sent ([`TuiSelectorState::to_json`]).
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let items = value["items"].as_array()?.iter().map(|item| SelectorItem {
+            label: item["label"].as_str().unwrap_or_default().to_owned(),
+            value: item["value"].as_str().unwrap_or_default().to_owned(),
+            active: item["active"] == true,
+        });
+        Some(Self::new(
+            value["kind"].as_str()?,
+            Selector::new(value["title"].as_str().unwrap_or_default(), items.collect()),
+            value["query"].as_str().unwrap_or_default(),
+            None,
+        ))
+    }
+
     /// The selector as a worker sends it to a client: its kind, title,
     /// query and rows; a pick comes back as `/select <kind> <value>`.
     fn to_json(&self) -> serde_json::Value {

@@ -1038,6 +1038,20 @@ async fn run_command(
         refresh(controller);
         return (json!({"entries": output.entries}), None);
     }
+    if line == "/undo" {
+        // The prompt goes back to the client's draft.
+        let undone = controller.configure(|runtime, _| runtime.undo_last_turn());
+        let answer = match undone {
+            Ok(Some(prompt)) => json!({
+                "entries": [{"kind": "system", "text": "undid the last turn"}],
+                "next": {"type": "draft", "text": prompt.content},
+            }),
+            Ok(None) => json!({"entries": [{"kind": "system", "text": "nothing to undo"}]}),
+            Err(error) => json!({"entries": [{"kind": "error", "text": error.to_string()}]}),
+        };
+        refresh(controller);
+        return (answer, None);
+    }
     if let Some(switch) = selected_session(controller, &line) {
         match switch {
             Ok(session) => next = json!({"type": "session", "session": session}),

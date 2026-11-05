@@ -72,6 +72,106 @@ pub(crate) async fn run(
         }),
     )
     .await?;
+    let (mut follower, first, early) =
+        match first_view(&client, session, &sender, &mut incoming).await {
+            Ok(attached) => attached,
+            Err(error) => {
+                client.close().await;
+                return Err(error);
+            }
+        };
+
+    let (restore, mut terminal, mut viewport_height) = crate::open_tui_terminal(owned_screen)?;
+    let mut app = TuiApp {
+        owned_screen,
+        status: "Ready".to_owned(),
+        ..TuiApp::default()
+    };
+    app.push(
+        TuiEntryKind::System,
+        format!(
+            "{}\nattached to session {session} on {place} · /help for commands, /quit to detach",
+            crate::terminal_renderer(&config).banner()
+        ),
+    );
+    if let Err(error) = crate::terminal_theme(&config) {
+        app.push(TuiEntryKind::Error, format!("{error}; using system theme"));
+    }
+    let mut session = session.to_owned();
+    let mut first = first;
+    let mut early = early;
+    let result = loop {
+        let mut remote = Remote::new(&session, client.clone(), sender.clone());
+        // What came before the view: starting a server, sending again.
+        for message in std::mem::take(&mut early) {
+            remote.receive(&mut app, message);
+        }
+        // The whole history before the view's window, as reopening a
+        // session shows all of it.
+        if let Err(error) = remote
+            .history
+            .load_earlier(&remote.client, &session, &first)
+            .await
+        {
+            app.push(
+                TuiEntryKind::Error,
+                format!("could not load the earlier history: {error:#}"),
+            );
+        }
+        remote.first(&mut app, first);
+        let ended = remote
+            .drive(
+                &mut app,
+                &mut terminal,
+                &mut viewport_height,
+                &config,
+                &mut incoming,
+            )
+            .await;
+        follower.abort();
+        let next = match ended {
+            Ok(Some(next)) => next,
+            other => break other.map(|_| ()),
+        };
+        // Another session a command named (a fork, a pick): its view, or
+        // back to this one if it cannot be held.
+        let attached = match first_view(&client, &next, &sender, &mut incoming).await {
+            Ok(attached) => {
+                session = next;
+                Ok(attached)
+            }
+            Err(error) => {
+                app.push(TuiEntryKind::Error, format!("{error:#}"));
+                first_view(&client, &session, &sender, &mut incoming).await
+            }
+        };
+        match attached {
+            Ok((next_follower, next_first, next_early)) => {
+                follower = next_follower;
+                first = next_first;
+                early = next_early;
+                app.clear_visible();
+                app.push(
+                    TuiEntryKind::System,
+                    format!("attached to session {session} on {place}"),
+                );
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    crate::close_tui_terminal(terminal, restore, &app)?;
+    client.close().await;
+    result
+}
+
+/// Follows `session` and waits for its first view, keeping what came
+/// before it. An unknown session is an error.
+async fn first_view(
+    client: &Client,
+    session: &str,
+    sender: &mpsc::UnboundedSender<Incoming>,
+    incoming: &mut mpsc::UnboundedReceiver<Incoming>,
+) -> Result<(tokio::task::JoinHandle<anyhow::Error>, Value, Vec<Incoming>)> {
     let mut follower = {
         let (client, session, sender) = (client.clone(), session.to_owned(), sender.clone());
         tokio::spawn(async move {
@@ -82,9 +182,6 @@ pub(crate) async fn run(
                 .await
         })
     };
-
-    // The first view comes before the terminal is taken, so an unknown
-    // session is an error on the plain terminal.
     let mut early = Vec::new();
     let first = tokio::time::timeout(FIRST_VIEW, async {
         loop {
@@ -113,62 +210,13 @@ pub(crate) async fn run(
             FIRST_VIEW.as_secs()
         ))
     });
-    let first = match first {
-        Ok(view) => view,
+    match first {
+        Ok(view) => Ok((follower, view, early)),
         Err(error) => {
             follower.abort();
-            client.close().await;
-            return Err(error);
+            Err(error)
         }
-    };
-
-    let (restore, mut terminal, mut viewport_height) = crate::open_tui_terminal(owned_screen)?;
-    let mut app = TuiApp {
-        owned_screen,
-        status: "Ready".to_owned(),
-        ..TuiApp::default()
-    };
-    app.push(
-        TuiEntryKind::System,
-        format!(
-            "{}\nattached to session {session} on {place} · /help for commands, /quit to detach",
-            crate::terminal_renderer(&config).banner()
-        ),
-    );
-    if let Err(error) = crate::terminal_theme(&config) {
-        app.push(TuiEntryKind::Error, format!("{error}; using system theme"));
     }
-    let mut remote = Remote::new(session, client.clone(), sender);
-    // What came before the view: starting a server, sending again.
-    for message in early {
-        remote.receive(&mut app, message);
-    }
-    // The whole history before the view's window, as reopening a session
-    // shows all of it.
-    if let Err(error) = remote
-        .history
-        .load_earlier(&remote.client, session, &first)
-        .await
-    {
-        app.push(
-            TuiEntryKind::Error,
-            format!("could not load the earlier history: {error:#}"),
-        );
-    }
-    remote.first(&mut app, first);
-    let result = remote
-        .drive(
-            &mut app,
-            &mut terminal,
-            &mut viewport_height,
-            &config,
-            &mut incoming,
-        )
-        .await;
-    follower.abort();
-    crate::close_tui_terminal(terminal, restore, &app)?;
-    client.close().await;
-    result
 }
 
 /// An attach's error, naming an unknown session plainly.
@@ -195,6 +243,8 @@ enum Incoming {
 enum Call {
     /// A submission, with its text.
     Submit(String),
+    /// A slash command for the worker to run, with its line.
+    Command(String),
     /// A withdrawal of a queued submission, with its text; `recall` puts the
     /// text back into an empty draft.
     Withdraw {
@@ -203,8 +253,6 @@ enum Call {
         recall: bool,
     },
     Abort,
-    Configure,
-    Compact,
 }
 
 /// What a key or a command asks of the loop.
@@ -238,6 +286,8 @@ struct Remote {
     last_run: Option<(String, String)>,
     /// Why the view is not current: its worker or the server was lost.
     waiting: Option<&'static str>,
+    /// A session a command named, to attach to next.
+    switch_to: Option<String>,
 }
 
 impl Remote {
@@ -255,6 +305,7 @@ impl Remote {
             withdrawing: Vec::new(),
             last_run: None,
             waiting: None,
+            switch_to: None,
         }
     }
 
@@ -436,7 +487,7 @@ impl Remote {
         viewport_height: &mut u16,
         config: &LoadedConfig,
         incoming: &mut mpsc::UnboundedReceiver<Incoming>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let mut tick = tokio::time::interval(Duration::from_millis(STREAM_RENDER_INTERVAL_MS * 2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         self.refresh_chrome(app, config);
@@ -446,7 +497,7 @@ impl Remote {
             tokio::select! {
                 message = incoming.recv() => {
                     // This holds a sender, so the channel stays open.
-                    let Some(message) = message else { return Ok(()) };
+                    let Some(message) = message else { return Ok(None) };
                     self.receive(app, message);
                     while let Ok(message) = incoming.try_recv() {
                         self.receive(app, message);
@@ -460,7 +511,7 @@ impl Remote {
                             Event::Key(key) if key.kind == KeyEventKind::Press => {
                                 match self.key(key, app, config).await {
                                     Action::None => {}
-                                    Action::Quit => return Ok(()),
+                                    Action::Quit => return Ok(None),
                                     Action::Clear => {
                                         self.clear(app);
                                         crate::clear_terminal_screen(terminal, app.owned_screen)?;
@@ -483,6 +534,9 @@ impl Remote {
                     // The spinner moves while a run is active.
                     changed |= app.turn_running || app.quit_armed_since.is_some();
                 }
+            }
+            if let Some(next) = self.switch_to.take() {
+                return Ok(Some(next));
             }
             if changed {
                 self.refresh_chrome(app, config);
@@ -511,6 +565,10 @@ impl Remote {
             name.as_deref()
                 .is_some_and(|name| bindings.matches(action, name))
         };
+        if app.selector.is_some() {
+            self.selector_key(key, app);
+            return Action::None;
+        }
         if bound("newline") {
             app.insert_input_newline();
             app.quit_armed_since = None;
@@ -636,17 +694,14 @@ impl Remote {
         config: &LoadedConfig,
         steer: bool,
     ) -> Action {
-        let (name, rest) = match line.split_once(char::is_whitespace) {
-            Some((name, rest)) => (name, rest.trim()),
-            None => (line, ""),
-        };
+        let name = line.split_whitespace().next().unwrap_or(line);
         match name {
             "/quit" | "/exit" | "/q" => return Action::Quit,
             "/clear" => return Action::Clear,
             "/help" => app.push(
                 TuiEntryKind::System,
                 format!(
-                    "{}\n\nattached to session {}: /model <provider/id>, /thinking <level>, /compact, /queue, /queue-clear, /interrupt and prompts reach the session; commands for this process's own sessions, settings and accounts are not available",
+                    "{}\n\nattached to session {}: commands run on the session's worker",
                     crate::terminal_renderer(config).help(),
                     self.session
                 ),
@@ -657,90 +712,80 @@ impl Remote {
                 crate::format_history(&app.editor_state),
             ),
             "/status" => app.push(TuiEntryKind::System, format!("status\t{}", app.status)),
-            "/session" => app.push(TuiEntryKind::System, self.describe()),
-            "/app" => app.push(
-                TuiEntryKind::System,
-                crate::open_desktop_app(&self.session),
-            ),
+            "/app" => app.push(TuiEntryKind::System, crate::open_desktop_app(&self.session)),
             "/copy" if app.transcript_view.borrow().has_selection() => {
                 app.transcript_view.get_mut().request_copy();
             }
-            "/model" if !rest.is_empty() => self.call(Call::Configure, json!({"model": rest})),
-            "/model" | "/models" | "/scoped-models" => app.push(
-                TuiEntryKind::System,
-                "when attached, /model names the model: /model <provider/id>",
-            ),
-            "/thinking" if !rest.is_empty() => {
-                self.call(Call::Configure, json!({"thinkingLevel": rest}))
-            }
-            "/thinking" => app.push(
-                TuiEntryKind::System,
-                format!(
-                    "thinking: {}",
-                    self.view["docs"]["pi.agent"]["thinkingLevel"]
-                        .as_str()
-                        .unwrap_or("-")
-                ),
-            ),
-            "/compact" => {
-                let mut args = json!({});
-                if !rest.is_empty() {
-                    args["instructions"] = json!(rest);
-                }
-                self.call(Call::Compact, args);
-            }
-            "/queue" if rest.is_empty() => {
-                let queued = inbox(&self.view);
-                app.push(
-                    TuiEntryKind::System,
-                    if queued.is_empty() {
-                        "no queued submissions".to_owned()
-                    } else {
-                        queued
-                            .iter()
-                            .enumerate()
-                            .map(|(index, (_, mode, text))| format!("{}. {mode}: {text}", index + 1))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    },
-                );
-            }
-            "/queue-clear" => {
+            "/queue-clear" if app.turn_running => {
                 for (id, _, text) in inbox(&self.view) {
                     self.withdraw(id, text, false);
                 }
             }
-            "/interrupt" => self.call(Call::Abort, json!({})),
-            _ if is_prompt_command(line, name) => self.prompt(app, line.to_owned(), steer),
-            _ => app.push(
+            "/interrupt" if app.turn_running => self.call(Call::Abort, json!({})),
+            _ if name.starts_with('!') => app.push(
                 TuiEntryKind::System,
-                format!("{name} is not available when attached"),
+                "! commands are not available when attached yet",
             ),
+            _ if is_prompt_command(line, name) => self.prompt(app, line.to_owned(), steer),
+            _ if app.turn_running => app.push(
+                TuiEntryKind::System,
+                format!("{name}: wait for the run to settle, or abort it"),
+            ),
+            _ => self.run_command(line.to_owned()),
         }
         Action::None
     }
 
-    fn describe(&self) -> String {
-        let conversation = &self.view["conversation"];
-        let agent = &self.view["docs"]["pi.agent"];
-        let mut lines = vec![
-            format!("session: {}", self.session),
-            format!("cwd: {}", conversation["cwd"].as_str().unwrap_or_default()),
-        ];
-        if let Some(name) = conversation["name"].as_str() {
-            lines.push(format!("name: {name}"));
+    /// Runs `line` on the session's worker.
+    fn run_command(&self, line: String) {
+        let args = json!({"line": line, "requestId": new_request_id()});
+        self.call(Call::Command(line), args);
+    }
+
+    /// A key while a selector is open: moving and filtering here, a pick on
+    /// the worker (`/select <kind> <value>`). The model picker's provider
+    /// layer opens that provider's models.
+    fn selector_key(&mut self, key: KeyEvent, app: &mut TuiApp) {
+        match key.code {
+            KeyCode::Esc => {
+                let mut selector = app.selector.take().expect("selector");
+                if let Some(parent) = selector.parent.take() {
+                    app.selector = Some(*parent);
+                }
+            }
+            KeyCode::Up => app.selector.as_mut().expect("selector").move_selection(-1),
+            KeyCode::Down => app.selector.as_mut().expect("selector").move_selection(1),
+            KeyCode::PageUp => app
+                .selector
+                .as_mut()
+                .expect("selector")
+                .move_selection(-(crate::SELECTOR_PAGE_STEP as isize)),
+            KeyCode::PageDown => app
+                .selector
+                .as_mut()
+                .expect("selector")
+                .move_selection(crate::SELECTOR_PAGE_STEP as isize),
+            KeyCode::Home => app.selector.as_mut().expect("selector").jump_to_start(),
+            KeyCode::End => app.selector.as_mut().expect("selector").jump_to_end(),
+            KeyCode::Backspace => app.selector.as_mut().expect("selector").pop_query_char(),
+            KeyCode::Enter => {
+                let selector = app.selector.take().expect("selector");
+                let Some(item) = selector.selected_item().cloned() else {
+                    app.push(TuiEntryKind::System, "no selector match");
+                    app.selector = Some(selector);
+                    return;
+                };
+                if selector.kind == "provider" {
+                    self.run_command(format!("/models {}", item.value));
+                } else {
+                    self.run_command(format!("/select {} {}", selector.kind, item.value));
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.selector.as_mut().expect("selector").push_query_char(ch)
+            }
+            _ => {}
         }
-        lines.push(format!(
-            "model: {} · thinking: {}",
-            agent["model"].as_str().unwrap_or("-"),
-            agent["thinkingLevel"].as_str().unwrap_or("-")
-        ));
-        lines.push(format!("messages: {}", entries(&self.view).len()));
-        if let Some((run_id, status)) = &self.last_run {
-            lines.push(format!("last run: {run_id} {status}"));
-        }
-        lines.push("attached to noel server".to_owned());
-        lines.join("\n")
     }
 
     // ─── calls ──────────────────────────────────────────────────────────────
@@ -771,10 +816,9 @@ impl Remote {
     fn call(&self, call: Call, args: Value) {
         let method = match &call {
             Call::Submit(_) => "submit",
+            Call::Command(_) => "command",
             Call::Withdraw { .. } => "withdraw",
             Call::Abort => "abort",
-            Call::Configure => "configure",
-            Call::Compact => "compact",
         };
         let (client, session, sender) = (
             self.client.clone(),
@@ -833,7 +877,7 @@ impl Remote {
                     Call::Withdraw { text, .. } => {
                         format!("withdraw {}: {error}", one_line(text))
                     }
-                    Call::Configure | Call::Compact => error.to_string(),
+                    Call::Command(line) => format!("{}: {error}", one_line(line)),
                 };
                 app.push(TuiEntryKind::Error, message);
                 return;
@@ -841,6 +885,7 @@ impl Remote {
         };
         match call {
             Call::Submit(_) => {}
+            Call::Command(_) => self.command_answer(app, &value),
             Call::Withdraw { text, recall, .. } => match value["outcome"].as_str() {
                 Some("withdrawn") if recall && app.input.is_empty() => {
                     crate::recall_queued_message(app, text)
@@ -861,21 +906,50 @@ impl Remote {
                     );
                 }
             }
-            Call::Configure => app.push(
+        }
+    }
+}
+
+impl Remote {
+    /// What the worker made of a command: its rows, then what to do next.
+    fn command_answer(&mut self, app: &mut TuiApp, value: &Value) {
+        for entry in value["entries"].as_array().into_iter().flatten() {
+            let kind = if entry["kind"] == "error" {
+                TuiEntryKind::Error
+            } else {
+                TuiEntryKind::System
+            };
+            app.push(kind, entry["text"].as_str().unwrap_or_default());
+        }
+        let next = &value["next"];
+        match next["type"].as_str() {
+            Some("session") => {
+                if let Some(session) = next["session"].as_str() {
+                    if session != self.session {
+                        self.switch_to = Some(session.to_owned());
+                    }
+                }
+            }
+            Some("selector") => match crate::TuiSelectorState::from_json(&next["selector"]) {
+                Some(selector) => app.selector = Some(selector),
+                None => app.push(
+                    TuiEntryKind::Error,
+                    "the worker sent an unreadable selector",
+                ),
+            },
+            Some("draft") if app.input.is_empty() => crate::recall_queued_message(
+                app,
+                next["text"].as_str().unwrap_or_default().to_owned(),
+            ),
+            Some("login") => app.push(
                 TuiEntryKind::System,
                 format!(
-                    "model: {} · thinking: {}",
-                    value["model"].as_str().unwrap_or("-"),
-                    value["thinkingLevel"].as_str().unwrap_or("-")
+                    "log in to {} on the server's machine: noel auth login {}",
+                    next["provider"].as_str().unwrap_or_default(),
+                    next["provider"].as_str().unwrap_or_default()
                 ),
             ),
-            Call::Compact => app.push(
-                TuiEntryKind::System,
-                format!(
-                    "compacted: omitted {} message(s), retained {} message(s)",
-                    value["omittedMessages"], value["retainedMessages"]
-                ),
-            ),
+            _ => {}
         }
     }
 }

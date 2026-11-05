@@ -424,6 +424,22 @@ pub(crate) async fn run(
             let kind = line.trim_start_matches("/selector ").trim();
             return open_selector(ui, config, runtime, kind, "");
         }
+        // A settings pick applies it and lists the settings again.
+        _ if line.starts_with("/select settings ") => {
+            let value = line.trim_start_matches("/select settings ").trim();
+            let message = apply_settings_item(config, runtime, value)?;
+            ui.push(TuiEntryKind::System, message);
+            let selector = selector_for_kind(config, runtime, "settings")?;
+            let mut state = TuiSelectorState::new("settings", selector, "", None);
+            if let Some(index) = state
+                .filtered_indices
+                .iter()
+                .position(|&index| state.items[index].value == value)
+            {
+                state.selected = index;
+            }
+            return Ok(CommandOutcome::Selector(state));
+        }
         _ if line.starts_with("/select ") => {
             let (kind, _) = split_once_text(line.trim_start_matches("/select ").trim());
             let resuming = matches!(kind, "session" | "sessions" | "resume" | "tree");

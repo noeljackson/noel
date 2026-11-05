@@ -444,7 +444,8 @@
                       "repeated",
                       "selector",
                       "session",
-                      "login"
+                      "login",
+                      "draft"
                     ]
                   }
                 }
