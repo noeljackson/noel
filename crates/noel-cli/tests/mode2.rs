@@ -157,6 +157,12 @@ impl Mode2 {
 
 impl Drop for Mode2 {
     fn drop(&mut self) {
+        // A failed test shows what the server said before its directory goes.
+        if std::thread::panicking() {
+            if let Ok(log) = fs::read_to_string(self.run_dir().join("server.log")) {
+                eprintln!("--- server.log ---\n{log}--- end of server.log ---");
+            }
+        }
         for watch in &mut self.watches {
             let _ = watch.kill();
             let _ = watch.wait();
@@ -262,8 +268,14 @@ impl Watch {
     }
 }
 
+/// The messages of the view's entries (each entry's `model[0]`).
 fn entries(view: &Value) -> Vec<Value> {
-    view["entries"].as_array().cloned().unwrap_or_default()
+    view["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["model"].get(0).cloned())
+        .collect()
 }
 
 fn text_of(entry: &Value) -> String {
@@ -324,7 +336,16 @@ fn a_client_creates_a_session_sends_and_a_late_watcher_sees_the_partial_then_del
     // A watcher that joins now gets the view with the committed partial.
     let mut watch = mode2.watch(&session);
     let view = watch.snapshot("the snapshot");
-    assert_eq!(partial(&view), "Hello there, ");
+    // The journal is written a moment before the view: the snapshot has the
+    // partial, at most one delta behind.
+    assert!(
+        "Hello there, ".starts_with(&partial(&view)) && !partial(&view).is_empty(),
+        "{}",
+        partial(&view)
+    );
+    let view = watch.settle("the committed partial", |view| {
+        partial(view) == "Hello there, "
+    });
     assert_eq!(view["docs"]["pi.live"]["run"]["runId"], json!(run_id));
     assert_eq!(entries(&view).len(), 1);
     assert_eq!(text_of(&entries(&view)[0]), "hi");
@@ -409,7 +430,8 @@ fn an_abort_withdraws_the_queue_and_the_next_prompt_starts_without_it() {
     // A prompt while busy is refused, not queued.
     let busy = mode2.noel(&["client", "send", &session, "too soon"]);
     assert!(!busy.status.success());
-    assert!(String::from_utf8_lossy(&busy.stderr).contains("invalid/busy"));
+    let stderr = String::from_utf8_lossy(&busy.stderr);
+    assert!(stderr.contains("busy: "), "{stderr}");
 
     let aborted = mode2.client(&["abort", &session]);
     assert!(aborted.starts_with("aborted run "), "{aborted}");
@@ -625,4 +647,59 @@ fn a_session_is_created_in_a_workspace_only_on_a_trusted_host() {
     let listed: Value = serde_json::from_str(&mode2.client(&["ls", "--json"])).unwrap();
     assert_eq!(listed["sessions"][0]["workspace"], url);
     assert!(mode2.client(&["ls"]).contains(url));
+}
+
+#[test]
+fn a_continue_answers_after_a_failed_run_and_when_idle_reject_never_starts_one() {
+    let mut mode2 = Mode2::new(
+        "continue",
+        json!([[{"error": "provider down"}], [{"text": "Recovered"}]]),
+        json!({}),
+    );
+    let session = mode2.new_session("continue");
+    let mut watch = mode2.watch(&session);
+    watch.snapshot("the snapshot");
+    // Idle, an input with whenIdle reject is refused and writes nothing.
+    let idle = mode2.noel(&[
+        "client",
+        "send",
+        &session,
+        "only if busy",
+        "--when-idle",
+        "reject",
+    ]);
+    assert!(!idle.status.success());
+    let stderr = String::from_utf8_lossy(&idle.stderr);
+    assert!(stderr.contains("idle: "), "{stderr}");
+    assert!(!mode2.journal(&session).contains("only if busy"));
+
+    mode2.client(&["send", &session, "work"]);
+    let view = watch.settle("the run failed", |view| {
+        last_run_status(view).as_deref() == Some("failed")
+    });
+    let failure = &view["docs"]["pi.live"]["runFailure"];
+    assert_eq!(failure["reason"], "model_error", "{failure}");
+
+    // A continue runs on the context as it is: the prompt is asked again.
+    let continued = mode2.client(&["continue", &session, "--request-id", "c1"]);
+    assert!(continued.starts_with("started run "), "{continued}");
+    let view = watch.settle("the continue answered", |view| {
+        last_run_status(view).as_deref() == Some("completed")
+    });
+    assert!(view["docs"]["pi.live"].get("runFailure").is_none());
+    assert_eq!(
+        text_of(&entries(&view).last().cloned().unwrap()),
+        "Recovered"
+    );
+    let requests = mode2.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+
+    // Now the context ends in an answer: a continue has nothing to answer.
+    mode2.client(&["continue", &session]);
+    let view = watch.settle("nothing to answer", |view| {
+        view["docs"]["pi.live"]["runFailure"]["reason"] == "nothing_to_answer"
+    });
+    assert_eq!(last_run_status(&view).as_deref(), Some("failed"));
+    assert_eq!(mode2.requests().len(), 2);
 }

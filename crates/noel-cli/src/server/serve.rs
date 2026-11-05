@@ -12,7 +12,7 @@
 //!   it, and drops one the other machine sent).
 //! - It serves `noel.sessions` (the directory, `create`, `fork`) and
 //!   `noel.models` (the catalog), to the owner only.
-//! - It routes `session:<id>`: `authorize` lets the owner reach any session,
+//! - It routes `Session({id})` addresses: `authorize` lets the owner reach any session,
 //!   and `resolve` gives the session's worker, started if it has none. A
 //!   worker is started with the journal's interrupted last run to resume,
 //!   at most three times per run; one that is lost mid-run is started again
@@ -38,24 +38,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use noel_chord::host::{AcceptOptions, Host, HostEvent, HostOptions, Route};
-use noel_chord::link::{ndjson, websocket, Link, WebSocketOptions};
-use noel_chord::object::BoxFuture;
-use noel_chord::{Cell, ChordError, Implementation, Kind};
+use noel_chord::v2::host::{Host, HostEvent, HostOptions, LinkOptions, Resolved, Role, Route};
+use noel_chord::v2::message::Address;
+use noel_chord::v2::object::{BoxFuture, Cell, Implementation};
+use noel_chord::v2::transport::{framed, websocket, write_control};
+use noel_chord::v2::{ChordError, Link, WireError};
+use noel_client::{server_address, session_address};
 use noel_config::{load_config_with_project_trust, LoadedConfig, ENV_SESSION_DIR, THINKING_LEVELS};
 use noel_core::{ReloadableSystems, RunStatus, Runtime, SessionState, SessionStore};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 
+use super::errors::{forbidden, no_session, refused, unavailable, unavailable_because};
 use super::{
-    build_id, control_line, derived_session_id, models_contract, own_exe, own_uid, owner,
-    parse_control, peer_check, principal_key, remove_stale_socket, sessions_contract, set_mode,
-    valid_session_id, worker_principal, write_record, RuntimeDir, DEFAULT_SERVER_IDLE_MS,
-    ENV_RUNTIME_DIR, EXIT_LOCKED, VIA_HEADER,
+    build_id, derived_session_id, models_contract, own_exe, own_uid, owner, parse_control,
+    peer_check, remove_stale_socket, sessions_contract, set_mode, valid_session_id,
+    worker_principal, write_record, RuntimeDir, DEFAULT_SERVER_IDLE_MS, ENV_RUNTIME_DIR,
+    EXIT_LOCKED, VIA_HEADER,
 };
 
 #[derive(Debug, Parser)]
@@ -69,8 +72,10 @@ pub(crate) struct ServerArgs {
     foreground: bool,
 }
 
-/// How many times the server resumes one run by itself.
-const RESUME_LIMIT: u32 = 3;
+/// How many times one server resumes a run by itself. The run's own
+/// count (Durable's `restartLimit`, in its journal) ends it first; this
+/// only stops a worker that crashes before it counts a restart.
+const RESUME_LIMIT: u32 = 20;
 /// How long a starting worker has to report `ready`.
 const WORKER_START: Duration = Duration::from_secs(30);
 
@@ -269,18 +274,14 @@ async fn foreground() -> Result<i32> {
     let activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
     let touched = activity.clone();
     let host = Host::new(HostOptions {
-        principal_key: Some(Arc::new(principal_key)),
-        on_error: Some(Arc::new(|error| eprintln!("noel server: chord: {error}"))),
-        observer: Some(Arc::new(move |event| {
-            if matches!(
-                event,
-                HostEvent::LinkOpened { .. } | HostEvent::LinkClosed { .. }
-            ) {
-                *lock(&touched) = tokio::time::Instant::now();
-            }
-            log_event(event, &tracked)
-        })),
-        ..HostOptions::host("server")
+        address: Some(server_address()),
+        ..HostOptions::default()
+    });
+    host.observe(move |event| {
+        if matches!(event, HostEvent::Linked { .. } | HostEvent::Closed { .. }) {
+            *lock(&touched) = tokio::time::Instant::now();
+        }
+        log_event(event, &tracked)
     });
     let changed = Arc::new(Notify::new());
     let workers = Arc::new(Workers {
@@ -304,7 +305,15 @@ async fn foreground() -> Result<i32> {
     });
     serve_sessions(&host, sessions.clone());
     serve_models(&host, &config, offline)?;
-    host.route("session:", SessionRoute(workers.clone()));
+    let plugins = super::plugins::Plugins::start(&host, &dir, &config.paths.agent_dir)?;
+    let listen = config
+        .settings
+        .server
+        .as_ref()
+        .and_then(|server| server.listen.clone());
+    let _remote =
+        super::remote::Remote::start(&host, &config.paths.agent_dir, listen.as_deref()).await?;
+    host.route("session", SessionRoute(workers.clone()));
 
     workers.adopt_all().await;
     tokio::spawn(refresh_directory(sessions, workers.clone()));
@@ -330,6 +339,7 @@ async fn foreground() -> Result<i32> {
     };
     // Workers are left running: a new server adopts them.
     workers.closing.store(true, Ordering::SeqCst);
+    plugins.close();
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_file(dir.server_record());
     host.close().await;
@@ -340,38 +350,36 @@ async fn foreground() -> Result<i32> {
 
 fn log_event(event: &HostEvent, clients: &Mutex<HashSet<u64>>) {
     match event {
-        HostEvent::LinkOpened {
+        HostEvent::Linked {
             link,
-            kind,
+            role,
             principal,
         } => {
-            if *kind == Kind::Client {
+            if *role == Role::Child {
                 lock(clients).insert(*link);
             }
-            let principal = principal.as_ref().map(Value::to_string).unwrap_or_default();
-            eprintln!(
-                "noel server: link {link} opened: {} {principal}",
-                kind.as_str()
-            );
+            eprintln!("noel server: link {link} opened: {role:?} {principal}");
         }
-        HostEvent::LinkClosed { link, reason } => {
+        HostEvent::Opened { .. } => {}
+        HostEvent::Closed { link } => {
             lock(clients).remove(link);
-            eprintln!("noel server: link {link} closed: {reason}");
+            eprintln!("noel server: link {link} closed");
+        }
+        HostEvent::ProtocolError { link, error } => {
+            eprintln!("noel server: link {link}: protocol error: {error}")
         }
         HostEvent::Held {
             link,
-            id,
+            hold,
             type_name,
-            input,
+            params,
             ..
-        } => eprintln!("noel server: hold link {link} id {id}: {type_name} {input}"),
+        } => eprintln!("noel server: hold link {link} id {hold}: {type_name} {params}"),
         HostEvent::Released {
             link,
-            id,
+            hold,
             type_name,
-            input,
-            ..
-        } => eprintln!("noel server: release link {link} id {id}: {type_name} {input}"),
+        } => eprintln!("noel server: release link {link} id {hold}: {type_name}"),
     }
 }
 
@@ -438,14 +446,8 @@ pub(crate) async fn accept_clients(listener: UnixListener, host: Host, owner_uid
                 };
             match tokio_tungstenite::accept_hdr_async(stream, upgrade).await {
                 Ok(socket) => {
-                    let link = websocket(
-                        socket,
-                        WebSocketOptions {
-                            accept_packed: false,
-                        },
-                    );
                     let via = *lock(&via);
-                    host.accept(link, AcceptOptions::client(owner(via)));
+                    host.accept(websocket(socket), LinkOptions::new(owner(via)));
                 }
                 Err(error) => eprintln!("noel server: refused: websocket upgrade: {error}"),
             }
@@ -555,7 +557,7 @@ impl Workers {
             let mut attempt = 0;
             loop {
                 match workers.spawn(&id).await {
-                    Err(error) if error.reason.as_deref() == Some("locked") && attempt < 20 => {
+                    Err(error) if error.reason == Some("locked") && attempt < 20 => {
                         attempt += 1;
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
@@ -569,11 +571,11 @@ impl Workers {
     /// while that run's resumes last (spec §8.3), and attaches it.
     async fn spawn(self: &Arc<Self>, id: &str) -> Result<Link, ChordError> {
         if self.closing.load(Ordering::SeqCst) {
-            return Err(ChordError::unavailable("the server is exiting"));
+            return Err(unavailable("the server is exiting"));
         }
         let journal = self.session_dir.join(format!("{id}.jsonl"));
         if !journal.is_file() {
-            return Err(ChordError::invalid("session", format!("no session {id}")));
+            return Err(no_session(id));
         }
         let resume = self.resume_for(id, journal).await;
         let generation = {
@@ -588,9 +590,7 @@ impl Workers {
             .create(true)
             .append(true)
             .open(&log_path)
-            .map_err(|error| {
-                ChordError::unavailable(format!("open {}: {error}", log_path.display()))
-            })?;
+            .map_err(|error| unavailable(format!("open {}: {error}", log_path.display())))?;
         let _ = set_mode(&log_path, 0o600);
         let mut command = tokio::process::Command::new(own_exe());
         command
@@ -617,7 +617,7 @@ impl Workers {
         }
         let mut child = command
             .spawn()
-            .map_err(|error| ChordError::unavailable(format!("start a worker: {error}")))?;
+            .map_err(|error| unavailable(format!("start a worker: {error}")))?;
         let pid = child.id();
         let stdout = child.stdout.take().expect("piped");
         let mut lines = BufReader::new(stdout).lines();
@@ -640,10 +640,10 @@ impl Workers {
             Some("fatal") => {
                 let message = message.as_ref().expect("a message");
                 let text = message.get("message").and_then(Value::as_str).unwrap_or("");
-                let error = ChordError::unavailable(format!("session {id}: {text}"));
+                let text = format!("session {id}: {text}");
                 return Err(match message.get("reason").and_then(Value::as_str) {
-                    Some(reason) => error.with_reason(reason),
-                    None => error,
+                    Some(reason) => unavailable_because(reason, text),
+                    None => unavailable(text),
                 });
             }
             _ => {
@@ -653,7 +653,7 @@ impl Workers {
                         nix::sys::signal::Signal::SIGKILL,
                     );
                 }
-                return Err(ChordError::unavailable(format!(
+                return Err(unavailable(format!(
                     "the worker for {id} did not start; see {}",
                     log_path.display()
                 )));
@@ -673,7 +673,9 @@ impl Workers {
     }
 
     /// The journal's interrupted last run, if the server may resume it once
-    /// more. The resume counts once a worker started with it is ready.
+    /// more. The resume counts once a worker started with it is ready; the
+    /// worker counts the run's restart in its journal and ends the run at
+    /// `restartLimit` (spec §8.3).
     async fn resume_for(&self, id: &str, journal: PathBuf) -> Option<String> {
         let state = tokio::task::spawn_blocking(move || SessionStore::read(&journal))
             .await
@@ -703,7 +705,7 @@ impl Workers {
         pid: Option<u32>,
         adopting: bool,
     ) -> Result<Link, ChordError> {
-        let unavailable = |what: String| ChordError::unavailable(format!("worker {id}: {what}"));
+        let unavailable = |what: String| unavailable(format!("worker {id}: {what}"));
         let socket = self.dir.worker_socket(id);
         let stream = UnixStream::connect(&socket)
             .await
@@ -742,16 +744,14 @@ impl Workers {
         }
         let build = ready.get("build").and_then(Value::as_str).unwrap_or("");
         if adopting && build != self.build {
-            let _ = write
-                .write_all(control_line(&json!({"type": "shutdown"})).as_bytes())
-                .await;
+            let _ = write_control(&mut write, &json!({"type": "shutdown"})).await;
             return Err(unavailable(format!(
                 "build {build} is not this server's {}; told it to shut down",
                 self.build
             )));
         }
         let (control, controls) = mpsc::unbounded_channel();
-        let (link, _) = ndjson(reader, write, Some(control));
+        let (link, _) = framed(reader, write, Some(control));
         {
             let mut state = lock(&self.state);
             state.live.insert(
@@ -764,9 +764,10 @@ impl Workers {
                 },
             );
         }
-        self.host.accept(
+        self.host.route_link(
+            session_address(id),
             link.clone(),
-            AcceptOptions::host(format!("session:{id}"), worker_principal(id, generation)),
+            worker_link(id, generation),
         );
         tokio::spawn(self.clone().watch(id.to_owned(), generation, controls));
         self.changed.notify_one();
@@ -904,34 +905,50 @@ fn recorded_pid(dir: &RuntimeDir, id: &str) -> Option<u32> {
 
 struct SessionRoute(Arc<Workers>);
 
+/// A worker's link as the server runs it: trusted, acting as the worker.
+fn worker_link(id: &str, generation: u64) -> LinkOptions {
+    LinkOptions {
+        trusted: true,
+        ..LinkOptions::new(worker_principal(id, generation))
+    }
+}
+
+/// The session id of a `Session({id})` address, if it is a valid one.
+fn session_of(address: &Address) -> Option<&str> {
+    address
+        .params
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| valid_session_id(id))
+}
+
 impl Route for SessionRoute {
     /// The owner reaches any session, a guest only its own.
-    fn authorize(&self, principal: &Value, host_name: &str) -> BoxFuture<bool> {
-        let allowed = host_name
-            .strip_prefix("session:")
-            .filter(|id| valid_session_id(id))
-            .is_some_and(|id| match principal.get("kind").and_then(Value::as_str) {
-                Some("owner") => true,
-                Some("guest") => principal.get("session").and_then(Value::as_str) == Some(id),
-                _ => false,
-            });
-        Box::pin(async move { allowed })
+    fn authorize(&self, principal: &Value, address: &Address) -> bool {
+        session_of(address).is_some_and(|id| match principal.get("kind").and_then(Value::as_str) {
+            Some("owner") => true,
+            Some("guest") => principal.get("session").and_then(Value::as_str) == Some(id),
+            _ => false,
+        })
     }
 
-    fn resolve(&self, host_name: &str) -> BoxFuture<Result<Link, ChordError>> {
+    fn resolve(&self, address: Address) -> BoxFuture<Result<Resolved, ChordError>> {
         let workers = self.0.clone();
-        let id = host_name.trim_start_matches("session:").to_owned();
-        Box::pin(async move { workers.ensure(&id).await })
-    }
-
-    fn principal(&self, host_name: &str) -> Value {
-        let id = host_name.trim_start_matches("session:");
-        let generation = lock(&self.0.state)
-            .live
-            .get(id)
-            .map(|worker| worker.generation)
-            .unwrap_or(0);
-        worker_principal(id, generation)
+        Box::pin(async move {
+            let id = session_of(&address)
+                .ok_or_else(|| unavailable("not a session address"))?
+                .to_owned();
+            let link = workers.ensure(&id).await?;
+            let generation = lock(&workers.state)
+                .live
+                .get(&id)
+                .map(|worker| worker.generation)
+                .unwrap_or(0);
+            Ok(Resolved {
+                link,
+                options: worker_link(&id, generation),
+            })
+        })
     }
 }
 
@@ -951,41 +968,39 @@ struct Sessions {
 }
 
 fn directory_schema() -> Value {
-    match sessions_contract()
-        .variants
-        .get("owner")
-        .and_then(|members| members.get("directory"))
-    {
-        Some(noel_chord::MemberDescription::State { schema }) => schema.clone(),
-        _ => unreachable!("noel.sessions has a directory"),
-    }
+    sessions_contract().declaration.variants["owner"].state["directory"].clone()
 }
 
 fn serve_sessions(host: &Host, sessions: Arc<Sessions>) {
     host.serve(sessions_contract(), move |_input, principal| {
-        if principal.get("kind").and_then(Value::as_str) != Some("owner") {
-            return Err(ChordError::forbidden("noel.sessions is the owner's"));
+        // The owner, and a plugin granted `sessions`.
+        let allowed = match super::plugins::plugin_permissions(principal) {
+            Some(permissions) => permissions.contains(&"sessions"),
+            None => principal.get("kind").and_then(Value::as_str) == Some("owner"),
+        };
+        if !allowed {
+            return Err(forbidden("noel.sessions is the owner's"));
         }
         let (create, fork) = (sessions.clone(), sessions.clone());
         Ok(Implementation::new("owner")
             .state("directory", &sessions.directory)
             .method("create", move |args, _ctx| {
                 let sessions = create.clone();
-                async move { blocking(move || sessions.create(&args.unwrap_or_default())).await }
+                async move { blocking(move || sessions.create(&args)).await }
             })
             .method("fork", move |args, _ctx| {
                 let sessions = fork.clone();
-                async move { blocking(move || sessions.fork(&args.unwrap_or_default())).await }
+                async move { blocking(move || sessions.fork(&args)).await }
             }))
     });
 }
 
 async fn blocking(
-    work: impl FnOnce() -> Result<Value, ChordError> + Send + 'static,
-) -> Result<Value, ChordError> {
+    work: impl FnOnce() -> Result<Value, WireError> + Send + 'static,
+) -> Result<Value, WireError> {
     tokio::task::spawn_blocking(work)
         .await
-        .unwrap_or_else(|error| Err(ChordError::unavailable(error.to_string())))
+        .unwrap_or_else(|error| Err(unavailable(error.to_string()).into()))
 }
 
 impl Sessions {
@@ -993,12 +1008,12 @@ impl Sessions {
     /// workspace?})`: a session named by its `requestId`, so a repeat returns
     /// it and writes nothing. `workspace` (`ssh://…`, as `--workspace`) runs
     /// its tools on another machine, whose host noel must trust already.
-    fn create(&self, args: &Value) -> Result<Value, ChordError> {
+    fn create(&self, args: &Value) -> Result<Value, WireError> {
         let text = |key: &str| args.get(key).and_then(Value::as_str);
         let request_id = text("requestId").unwrap_or_default();
         let cwd = PathBuf::from(text("cwd").unwrap_or_default());
         if !cwd.is_absolute() || !cwd.is_dir() {
-            return Err(ChordError::invalid(
+            return Err(refused(
                 "cwd",
                 format!("{} is not an absolute path to a directory", cwd.display()),
             ));
@@ -1006,20 +1021,19 @@ impl Sessions {
         let workspace = text("workspace")
             .map(|url| {
                 crate::workspace::from_flag(url, &self.config.paths.agent_dir)
-                    .map_err(|error| ChordError::invalid("workspace", error.to_string()))
+                    .map_err(|error| refused("workspace", error.to_string()))
             })
             .transpose()?;
         let model = text("model")
             .map(|reference| {
-                super::worker::model_reference(&self.config, reference, self.offline).ok_or_else(
-                    || ChordError::invalid("model", format!("Model not found: {reference}")),
-                )
+                super::worker::model_reference(&self.config, reference, self.offline)
+                    .ok_or_else(|| refused("model", format!("Model not found: {reference}")))
             })
             .transpose()?;
         let thinking = text("thinkingLevel")
             .map(|level| {
                 crate::normalized_thinking_level(level).ok_or_else(|| {
-                    ChordError::invalid("thinkingLevel", format!("Unknown thinking level: {level}"))
+                    refused("thinkingLevel", format!("Unknown thinking level: {level}"))
                 })
             })
             .transpose()?;
@@ -1028,7 +1042,8 @@ impl Sessions {
         if self.session_dir.join(format!("{id}.jsonl")).exists() {
             return Ok(json!({"sessionId": id, "created": false}));
         }
-        let failed = |error: &dyn std::fmt::Display| ChordError::unavailable(error.to_string());
+        let failed =
+            |error: &dyn std::fmt::Display| WireError::from(unavailable(error.to_string()));
         let (store, state) = match workspace {
             Some(workspace) => {
                 SessionStore::create_in_workspace(&self.session_dir, cwd, &id, workspace)
@@ -1057,25 +1072,22 @@ impl Sessions {
 
     /// `fork({requestId, sessionId})`: a copy of the session as its journal
     /// holds it, named by the `requestId`.
-    fn fork(&self, args: &Value) -> Result<Value, ChordError> {
+    fn fork(&self, args: &Value) -> Result<Value, WireError> {
         let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
         let source_id = text("sessionId");
         if !valid_session_id(source_id) {
-            return Err(ChordError::invalid(
-                "session",
-                format!("no session {source_id}"),
-            ));
+            return Err(refused("session", format!("no session {source_id}")));
         }
         let source_path = self.session_dir.join(format!("{source_id}.jsonl"));
         let source = SessionStore::read(&source_path)
-            .map_err(|_| ChordError::invalid("session", format!("no session {source_id}")))?;
+            .map_err(|_| refused("session", format!("no session {source_id}")))?;
         let _creating = lock(&self.creating);
         let id = derived_session_id("fork", text("requestId"));
         if self.session_dir.join(format!("{id}.jsonl")).exists() {
             return Ok(json!({"sessionId": id, "created": false}));
         }
         SessionStore::fork_with_id(&self.session_dir, &source, false, &id)
-            .map_err(|error| ChordError::unavailable(error.to_string()))?;
+            .map_err(|error| WireError::from(unavailable(error.to_string())))?;
         self.listed(&id);
         Ok(json!({"sessionId": id, "created": true}))
     }
@@ -1220,14 +1232,7 @@ async fn refresh_directory(sessions: Arc<Sessions>, workers: Arc<Workers>) {
 }
 
 fn serve_models(host: &Host, config: &LoadedConfig, offline: bool) -> Result<()> {
-    let schema = match models_contract()
-        .variants
-        .get("owner")
-        .and_then(|members| members.get("catalog"))
-    {
-        Some(noel_chord::MemberDescription::State { schema }) => schema.clone(),
-        _ => unreachable!("noel.models has a catalog"),
-    };
+    let schema = models_contract().declaration.variants["owner"].state["catalog"].clone();
     let models = crate::model_select::selectable_models(config, offline)
         .into_iter()
         .map(|model| {
@@ -1253,7 +1258,7 @@ fn serve_models(host: &Host, config: &LoadedConfig, offline: bool) -> Result<()>
     let catalog = Cell::new(schema, json!({ "models": models }))?;
     host.serve(models_contract(), move |_input, principal| {
         if principal.get("kind").and_then(Value::as_str) != Some("owner") {
-            return Err(ChordError::forbidden("noel.models is the owner's"));
+            return Err(forbidden("noel.models is the owner's"));
         }
         Ok(Implementation::new("owner").state("catalog", &catalog))
     });
@@ -1263,7 +1268,7 @@ fn serve_models(host: &Host, config: &LoadedConfig, offline: bool) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn a_connection_from_another_uid_is_closed_before_a_byte_is_read() {
@@ -1272,7 +1277,7 @@ mod tests {
         let dir = RuntimeDir::ensure(dir).unwrap();
         let socket = dir.server_socket();
         let listener = UnixListener::bind(&socket).unwrap();
-        let host = Host::new(HostOptions::host("server"));
+        let host = Host::new(HostOptions::default());
         // This process is not the owner this server accepts.
         tokio::spawn(accept_clients(listener, host, own_uid().wrapping_add(1)));
         let mut stream = UnixStream::connect(&socket).await.unwrap();
@@ -1298,13 +1303,11 @@ mod tests {
         let socket = dir.server_socket();
         let listener = UnixListener::bind(&socket).unwrap();
         let (opened, mut principals) = mpsc::unbounded_channel();
-        let host = Host::new(HostOptions {
-            observer: Some(Arc::new(move |event| {
-                if let HostEvent::LinkOpened { principal, .. } = event {
-                    let _ = opened.send(principal.clone());
-                }
-            })),
-            ..HostOptions::host("server")
+        let host = Host::new(HostOptions::default());
+        host.observe(move |event| {
+            if let HostEvent::Linked { principal, .. } = event {
+                let _ = opened.send(Some(principal.clone()));
+            }
         });
         tokio::spawn(accept_clients(listener, host, own_uid()));
         let upgrade = |via: Option<&str>| {

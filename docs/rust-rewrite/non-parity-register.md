@@ -452,7 +452,10 @@ edits stay untouched.
 The per-run provider round cap (`agent.maxToolRounds`, default 200, including
 steering rounds) is configurable in settings and reports a dedicated
 round-limit error that names the cap and the setting instead of masquerading
-as an invalid tool call.
+as an invalid tool call. A run that reaches it ends failed with Durable's
+reason `turn_limit` (`maxTurns`), saved with its end and shown as
+`pi.live.runFailure`; a continue goes on from there. Durable's `run.turns`
+is not in the view.
 
 Reason: the default is a runaway-loop bound, not a usage quota; long working
 sessions legitimately exceed it and the recovery path (continue or raise the
@@ -688,8 +691,11 @@ upstream merges them (`settings.json` fixture). These parts differ:
   `defaultTools` is gone after `/reload`.
 - `enabledTools` is a Rust-only setting: a persistent allowlist, like `--tools`
   with plain names.
-- Upstream's `defaultActive: false` extension tools (`codemode`,
-  `tool_search`) and its MCP rules for `--tools` do not exist in Rust; every
+- `codemode` is a built-in tool that is off unless selected by name
+  (`--tools`, `enabledTools`, or `defaultTools: ["+codemode"]`), as
+  upstream registers it inactive; a pattern such as `*` never selects it
+  (see Codemode). Upstream's other `defaultActive: false` tool,
+  `tool_search` (it loads `deferred` tools, which noel does not have), and its MCP rules for `--tools` do not exist in Rust; every
   extension tool is on unless an allowlist or `--exclude-tools` leaves it out.
 - Tool flags are not saved with the session. Earlier Rust versions saved them
   as the session's disabled tools; a saved list is cleared when the session is
@@ -703,6 +709,68 @@ Reason: Rust's reloadable systems are rebuilt from configuration, and durable
 session state is kept apart from them (see the reload rules in `AGENTS.md`).
 A selection computed from settings and flags needs no session record, and the
 flags mean the same on every run.
+
+### Codemode
+
+`codemode` (`crates/noel-codemode`, `crates/noel-core/src/codemode.rs`) runs
+upstream's script environment on the djs engine (`earendil-works/djs`,
+pinned by commit) instead of QuickJS in a worker thread. The prelude is
+upstream's, byte for byte (`docs/codemode-port.md`). These parts differ:
+
+- **Engine.** djs is always strict and `eval` is always indirect; one
+  upstream sandbox test depends on sloppy mode. Interrupts are polled every
+  10,000 units of fuel. Scripts are JavaScript only, as upstream's.
+- **Description.** Upstream's `createCodemodeDescription`,
+  `describeScriptCall` and `codemode.mode`/`codemode.inlineBudget`, on
+  upstream's declarations (`noel_codemode::declarations`, matched byte for
+  byte against every call of upstream's `declarations.test.ts`). Every noel
+  tool has `direct` exposure, so with `mode: "on"` codemode lists no tools
+  and each callable tool's description ends with upstream's `Codemode:`
+  line; with `"only"` codemode lists them all (budgeted, cheapest first) and
+  they are not declared, but the system prompt still lists them. There are
+  no namespaces or deferred tools, and no `models` line. In declarations,
+  object values of `const`, `enum` and `@default` render with sorted keys,
+  where upstream keeps insertion order. `bash` and `read` have upstream's
+  output schemas; other tools resolve to a string.
+- **Discovery globals.** `searchTools()`, `describeTool()`,
+  `describeNamespace()` and `ALL_TOOLS` samples as upstream's. Without
+  namespaces, a `namespace` filter matches nothing and `describeNamespace()`
+  returns `undefined`. The ranker (`noel_codemode::search`) matches
+  upstream's tokens, documents and BM25 scores on its tests, except that
+  text in Chinese, Japanese and Thai is split by Unicode word boundaries
+  (one word per ideograph, one per Thai run), not by ICU's dictionaries.
+- **Nested tools.** Scripts call the active built-in and extension tools
+  except `todo` (it changes the session; model-only here) and codemode
+  itself. Every call goes through the extension `toolCall` gate and runs in
+  parallel; extension v2 calls share one host lock, so they run one at a
+  time. A nested call resolves to its text output, except as upstream:
+  `bash` resolves to `{output, truncated, full_output_path?, exit_code,
+  wall_time_seconds}` (also on a non-zero exit) and `read` of an image to
+  `{type: "image", data, mimeType, note}`. These are their output schemas. Nested calls are reported as they change (`TurnEvent::NestedToolCalls`):
+  the TUI lists them as upstream's renderer does, above the result once the
+  call ends, and RPC sends upstream's `tool_execution_update` with
+  `details.calls`. They have no `tool_execution_*` events of their own, the
+  result message carries no `nestedCalls`, and the server's view shows them
+  only through the tool's result (no `nestedTools`).
+- **Result.** The text items are joined into the tool result's text and
+  images are attached after it, not interleaved. Spill and image files are
+  `noel-codemode-<random>.<ext>` in the temp directory.
+- **Store.** Saved as a `codemode_store` journal record holding the whole
+  store after each script that wrote to it, not as upstream's `codemode-store`
+  custom entries per branch.
+- **Abort and deadline.** No deadline unless `timeout_ms` is given, as
+  upstream. An abort ends the script, which saves upstream's `Script failed
+  ... Script aborted: <reason>` result with the calls it made, and then the
+  turn ends. The reason is "This operation was aborted" (Node's default
+  `AbortError` message; unverified against a pi abort).
+- **Slots.** At most 2 scripts run at once in the process
+  (`NOEL_CODEMODE_MAX_WORKERS` or `PI_CODEMODE_MAX_WORKERS`), with upstream's
+  60-second wait and failure texts; the number is read once per process,
+  where upstream reads it per call. Starts restore a VM image taken after
+  the prelude when the tools, store and limits are the same, as djs's
+  adapter does.
+- **Not present:** `models.*`, MCP exposure, durable replay,
+  grammar-constrained input.
 
 ### Built-in Tools Run In-Process
 
@@ -829,7 +897,7 @@ documented no-op so upstream invocations keep working. The CLI contract test
 `mcp` command and requires this entry.
 
 Reason: MCP is a large protocol surface (stdio and HTTP transports, OAuth,
-tool exposure modes, codemode) outside the native CLI/TUI scope today.
+tool exposure modes, MCP tools in codemode) outside the native CLI/TUI scope today.
 Revisit if noel adds an MCP client.
 
 ### Local `/bug` Reports for This Port
@@ -894,6 +962,35 @@ refreshed tokens back to their files, so an early refresh from `noel auth` would
 sign the user out of Claude Code or Codex. After noel refreshes such a login it
 keeps its own `claude-import`/`codex-import` account, which refreshes early
 like any stored account.
+
+### Run-End Rules (Durable 1.5)
+
+Durable's run-end rules, adopted by the owner on 2026-11-05 (spec §3.1, §4.1,
+§8.3): the `runFailure` reasons, the restart limit, a crash-interrupted
+request charged to retry, `continue` and `whenIdle: "reject"`. These parts
+differ:
+
+- **Unit.** Durable counts restarts per task (each tool call, compaction and
+  generation). noel has no tasks: it counts per run, and at the limit ends
+  the run, never a single tool call with a `restart_limit` result. The
+  count is cleared by any message the run saves, where Durable clears it on
+  a new checkpoint, wait or outcome.
+- **Close.** A close is a stop whose driver's inbox ended (a worker told to
+  shut down, RPC mode exiting with its run active); it saves `run_closed`.
+  Durable joins the invocations and writes the tasks back as `pending`.
+  Journals from before this change hold no close record, so their
+  interrupted runs count as crashed.
+- **Charging.** A crash counts as one during a request unless the journal's
+  last record about the reply is a `retry_wait` (a retry's backoff, or a
+  compaction after an overflow), saved before the retry is reported; Durable
+  knows the generation's phase. A crash after a tool round's results were
+  saved and before the request left is charged too. The attempt is the
+  cut-off partial's, or 1. RPC reports the charged attempt as upstream pi
+  reports a retry, so a resumed run may have more than one `agent_start`.
+- **Not ported:** `afterFailedRun` (noel keeps the queue: `keep`),
+  `Conversation.submit(tx, draft)`, `no_model`, `reset`, `faulted`,
+  `orphaned`; `continue` and `whenIdle` exist on `noel.chat` only, not in
+  RPC mode.
 
 ### Run Recovery
 
@@ -1254,64 +1351,63 @@ Reason: Rust strings and integers cannot represent the first two. Matching
 the regex differences would need a JavaScript regex engine, and the float
 parser is a choice for the whole workspace, not for this crate.
 
-### Chord Link and Hosts
+### Chord v2
 
-`crates/noel-chord`'s links, connections and hosts send the frames upstream
-Chord sends in every scenario of `chord-link.json`, at the pinned commit, and
-interoperate with upstream's client and server hosts (`make chord-interop`).
-noel implements a subset, and these parts differ:
+`noel_chord::v2` is ported from upstream at `CHORD2_REFERENCE_REF`; noel's
+server, workers and clients speak it, and `make chord2-interop` runs it
+against upstream. (The v1 implementation, link protocol 4, is deleted.)
+Where it differs:
 
-- **No reload, plugins or code versions.** A host runs code version 1. It
-  answers `prepare` with a `vote` carrying `unavailable/not_coordinator` and
-  ignores `commit`, `abort` and `retire`. A child host that announces another
-  code version is closed instead of being fenced and reconciled.
-- **Objects are simpler.** Factories return an implementation (a variant,
-  state cells and methods) and the object is live at once: there are no
-  resources, listeners, tasks, derivations, registries, `lifetime: "host"`
-  objects or `linger`. A subscription that arrives with its hold therefore
-  gets `snap`; upstream sends `reset` when the subscription arrives while
-  the object is still activating, as it does over a real socket.
-- **No `accepts` adapters.** A consumer of another contract version gets
-  `contract_mismatch` (`upgrade_required` for a client).
-- **`Host::get` reaches other hosts only**: a host does not hold its own
-  objects through a reference.
-- **Cell writes are always validated** against the cell's schema; upstream
-  validates them in dev mode only. Values are checked by a subset of JSON
-  Schema (the keywords `noel_chord::validate` lists), not TypeBox's
-  `Value.Check`: `format` and `$ref` are not checked, and `Value.Clean` on a
-  union keeps the first branch the cleaned value fits.
-- **Packed payloads are inflated on receipt.** noel never packs what it
-  sends. A relaying noel host forwards a packed payload inflated, where
-  upstream forwards the deflated bytes unread.
-- **Error messages.** A method that fails with a plain error upstream sends
-  its message bare; a noel method fails with a `ChordError`, whose message
-  carries its `code: ` prefix. Validation messages follow noel's checker.
-  Codes and reasons are the same; the goldens compare no messages.
-- **Tokens.** noel sends its consumer token in its declared member order, but
-  the JSON Schemas inside it, and a token it relays, with sorted keys.
-  Fingerprints are canonical JSON, so they are unchanged; only the first
-  difference upstream's `coverage` names can change.
-- **Frame text.** Frames are written by `serde_json`. A float payload with an
-  exponent is written `1e21` where JavaScript writes `1e+21`, so such a
-  frame's size, as the window counts it, can differ by a character.
-- **Acknowledgements** go out after each batch of queued messages the host
-  processed; upstream sends them from a 0 ms timer. Both acknowledge every
-  frame once processed.
-- **Transports.** NDJSON lines `{"chord2": frame}` and
-  `{"chord2control": message}` carry the shape of Chord's Node IPC messages;
-  upstream serializes them through Node's IPC channel. WebSocket framing
-  over a Unix socket is noel's device transport; Chord has no Unix-socket
-  transport.
-- **Revocation order.** `invalidate_principal` disposes matching objects in
-  address order; upstream disposes holders before what they reference. noel
-  objects hold no references.
-- **Closing.** `Host::close` waits up to two seconds for its links to write
-  what they were sent, so a process that exits after it does not lose its
-  `release` and `bye` frames.
-
-Reason: noel needs Chord's protocol, not its runtime: one code version, no
-plugins, and objects whose state it owns directly. The rest are a native
-JSON library and scheduler standing in for JavaScript's.
+- **Synchronous inflate.** A deflated part is inflated with flate2 when its
+  owner opens it. Upstream hosts without a synchronous compressor inflate
+  ahead of the owner and hold later messages meanwhile; noel's channel has
+  nothing to hold.
+- **Sans-IO channel.** `v2::Channel` takes received bytes and the time and
+  gives the bytes to send; its owner moves them and runs the timer. Upstream's
+  `Channel` owns its link's listeners.
+- **Process links** are noel's framed byte streams (`[u32 BE length][tag]
+  [payload]`, tag 0 a Chord message, tag 1 a JSON control message), not
+  Node IPC.
+- **No text codec yet.** Only the binary codec, upstream's default. The text
+  codec is for debugging and both ends must agree on it.
+- **Error messages of protocol errors** carry the decode error after the
+  handshake message; protocol errors are only reported, never sent.
+- **Objects are cells and methods.** A factory returns a variant, its state
+  members as cells and its methods; the object is live at once and shared by
+  the holds of the same type, params and principal. There are no documents,
+  derives, resources, routines, reload, `accepts` adapters or older contract
+  versions, so a live object never fails, unbinds or swaps: `failed` is sent
+  only for refused holds (not served, another contract, invalid params, a
+  wrong address, a factory error) and `retry` only restarts those.
+- **Pending ops are concatenated**, not folded: a batch that starts with a
+  replacement drops what was pending, and more than 10,000 ops are replaced
+  by the member's value (subscribed afresh). The consumer's value is the
+  same; the ops on the wire can be more.
+- **A batch** is what the host's task drained at once, not a commit of
+  upstream's batch: a cell change made in one step may share a `state`
+  message with others made at the same time.
+- **No byte segments.** noel's contracts have no `bytes()` leaves; results
+  and arguments carry none.
+- **References** go over the route of their address's kind or the parent
+  link; a reference to this host's own address is refused (noel has no
+  in-host references). A call on a loading reference waits until it is
+  live.
+- **Routes** resolve an address again at once when its link drops while it
+  has holders, with no backoff; there is no `suspend` or route `retry`
+  handle. A reference's `retry` on a route failure asks the provider, as
+  for any failed hold.
+- **Relayed calls** are not counted against the downstream call window, and
+  their arguments are not checked against the part limit before they are
+  forwarded (the provider that parses them checks them).
+- **noel's refusals are plugin errors** whose code is the old reason
+  (`busy`, `session`, `cwd`, ...): v2's error table is closed. A session
+  without a journal fails a route's resolve as `unavailable` with
+  `details.missing: "session"`.
+- **Objects are keyed by canonical principal JSON**, not by a principal key
+  that ignores fields such as a guest's name.
+- **Revocation** follows upstream's `host.revoke` with a `revoked_by`
+  function, except that noel has no host principal of its own to exempt and
+  no references of its own acting for a principal.
 
 ### Mode 2 Server, Worker and Client
 
@@ -1327,32 +1423,45 @@ private), so the objects and processes are noel's, and these parts differ:
   `Sessions` at `server` only as examples.
 - **The view** has Durable's shape `{conversation, entries, docs}`
   (`durable/docs/spec.md` §9.3) with what noel's journal holds:
-  - `entries` are upstream pi's `Message` JSON, as RPC mode's `get_messages`
-    reports them (no entry ids, timestamps or usage), not Durable's entry
-    records;
+  - `entries` are a window over the session's history in Durable's
+    `EntryRecord` shape (`{id, kind, model?, data?, head?, timestamp?}`,
+    newest 50, at most 100, `before`, paged back with `noel.chat`'s
+    `entries` method). Ids are numbers counting the session's entries, not
+    Durable's minted ids; each `model` is upstream pi's `Message` JSON, as
+    RPC mode's `get_messages` reports it (no usage). Markers are
+    `pi.compaction` (`data: {reason, summary, omittedMessages,
+    retainedMessages}`) and `pi.reset` (`data: {messages}`, an undo), each
+    with `head` at itself; a window can start at any entry, and the window
+    is not chosen by the subscriber (no `ConversationWindow` argument).
+    `noel-client`'s `Transcript` merges windows and pages; it loads what is
+    before the window when a client attaches, not gaps a long disconnect
+    leaves later;
   - `docs["pi.agent"]` is `{model, thinkingLevel, cwd}`; Durable's stores
     the chosen extensions, tools and instructions;
-  - `docs["pi.live"]` has `run` (`runId`, `requestId`, `inputs`, where
-    Durable names a task), `generation` (`attempt`, `message`, `retry`; no
-    deferred polls), `tools` (`callId`, `name`, `status`, `output`,
-    `truncated`; no task ids, details, diagnostics or dropped counts) and
-    `compaction` (`reason`), and no nested tools or compaction failure. A
-    tool slot can also be `interrupted`: a resumed run's call that gets its
+  - `docs["pi.live"]` is a subset of Durable's v3: `run` (`runId`,
+    `requestId`, `inputs`, `turns`, where Durable names a task), `generation`
+    (`attempt`, `message`, `retry`; no deferred polls), `tools` (`callId`,
+    `name`, `status`, `output`, `truncated`, `entry`; no task ids, details,
+    diagnostics or dropped counts), `compactions` (`[{trigger}]`, one at a
+    time; no task ids, blocking, attempt or retry), `compactionFailure`
+    (`{trigger, error}`) and `runFailure` (`{reason, detail?, inputs}`, with
+    reasons `model_error` and `aborted` only), and no nested tools. A tool
+    slot can also be `interrupted`: a resumed run's call that gets its
     interrupted result. The partial `message` is `{role, content}` only;
   - `docs["pi.inbox"]` items are `{id, mode, content, requestId?}` with the
     text as `content`; there are no writes;
   - `docs["pi.usage"]` is `{total: {input, output, requests}}`: noel counts
     a session's usage, not per model or tool. There is no `pi.provider`;
   - `lastRun` is added: RPC mode's `get_state.lastRun`.
-- **Only committed progress, nearly.** A partial reply and a tool's output
-  come from the journal's own records once saved, as Durable's view shows
-  only committed state. Two things are shown as the run engine reports them,
-  just before it saves them: a message it adds, and, as a resumed run
-  starts, the interrupted results of calls that do not run again.
+- **Only committed progress.** A partial reply, a tool's output and the
+  history's entries come from the journal's own records once saved, as
+  Durable's view shows only committed state.
 - **Ops.** The worker makes ops per change: a splice at the end of
-  `entries`, appends to a streaming text, and diffs of the documents. Durable
-  derives view ops from document ops, and bounds a watch to 100 pending
-  frames; noel relies on Chord's four-window reset.
+  `entries` (and one at the start when the window moves), appends to a
+  streaming text, and diffs of the documents. Durable derives view ops from
+  document ops, folds a watch's pending commits into one call and replaces
+  the value past 10,000 pending operations; noel relies on Chord's
+  four-window reset.
 - **Submissions.** `submit`'s `whenBusy` names the submission's kind
   (`reject` a prompt, `steer`, `followUp`). A refusal is `invalid` with a
   reason (`busy`, Durable's `ConversationBusy`; `request_id_reused`;

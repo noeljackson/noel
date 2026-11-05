@@ -1,13 +1,18 @@
+mod codemode;
+pub mod history;
+pub use codemode::{NestedCallStatus, NestedToolCall};
 mod compaction;
 pub mod controller;
 #[cfg(test)]
 mod controller_tests;
 pub mod extensions;
 mod input;
+pub mod plugins;
 mod progress;
 #[cfg(test)]
 mod recovery_tests;
 mod session_lock;
+pub mod storage;
 mod system_prompt;
 #[cfg(test)]
 mod tool_parity_tests;
@@ -18,6 +23,7 @@ pub use compaction::RuntimeCompactionSettings;
 pub use input::expand_input;
 pub use progress::{interrupted_output, RuntimeProgressSettings};
 use progress::{ReplyProgress, ToolProgress};
+#[cfg(test)]
 use session_lock::SessionLock;
 pub use system_prompt::PRODUCT_NAME;
 use system_prompt::{PromptTool, SystemPromptInput};
@@ -169,6 +175,74 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "SubmissionKind::is_prompt")]
     pub kind: SubmissionKind,
     pub status: RunStatus,
+    /// Why a failed run ended without an answer (Durable's `runFailure`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<RunFailure>,
+    /// Crash restarts since the run last made progress (Durable's task
+    /// `restarts`): a resume after a stop that was not a close counts one,
+    /// and a message the run saves clears them.
+    #[serde(default, skip_serializing_if = "no_restarts")]
+    pub restarts: u32,
+    /// A close stopped the run (not a crash): its resume is not counted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
+}
+
+fn no_restarts(value: &u32) -> bool {
+    *value == 0
+}
+
+impl Run {
+    fn started(start: RunStart, status: RunStatus) -> Self {
+        Self {
+            id: start.id,
+            request_id: start.request_id,
+            kind: start.kind,
+            status,
+            failure: None,
+            restarts: 0,
+            closed: false,
+        }
+    }
+}
+
+/// Why a run ended without an answer, as Durable's `pi.live.runFailure`
+/// names it. An aborted run is [`RunStatus::Aborted`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    /// The model request failed, retries included.
+    ModelError,
+    /// The host died while the model was answering, and the retry policy
+    /// allowed no other attempt.
+    Interrupted,
+    /// The run was restarted `restartLimit` times in a row without
+    /// progress.
+    RestartLimit,
+    /// A continue found nothing to answer.
+    NothingToAnswer,
+    /// The run's tool rounds reached `agent.maxToolRounds`.
+    TurnLimit,
+}
+
+impl FailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelError => "model_error",
+            Self::Interrupted => "interrupted",
+            Self::RestartLimit => "restart_limit",
+            Self::NothingToAnswer => "nothing_to_answer",
+            Self::TurnLimit => "turn_limit",
+        }
+    }
+}
+
+/// A failed run's reason and detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFailure {
+    pub reason: FailureReason,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
 }
 
 /// What a client called a submission (spec §3.1): a prompt, a steer or a
@@ -180,6 +254,8 @@ pub enum SubmissionKind {
     Prompt,
     Steer,
     FollowUp,
+    /// Durable's `{type: "continue"}`: a run on the context as it is.
+    Continue,
 }
 
 impl SubmissionKind {
@@ -192,6 +268,7 @@ impl SubmissionKind {
             Self::Prompt => "prompt",
             Self::Steer => "steer",
             Self::FollowUp => "followUp",
+            Self::Continue => "continue",
         }
     }
 }
@@ -309,6 +386,9 @@ pub struct SessionState {
     pub todos: Vec<TodoItem>,
     #[serde(default)]
     pub edited_files: Vec<String>,
+    /// What codemode scripts keep with `store()` (key to JSON value).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub codemode_store: BTreeMap<String, Value>,
     #[serde(default)]
     pub usage: SessionUsage,
     /// The session's runs, oldest first.
@@ -452,9 +532,13 @@ impl SessionState {
     }
 
     fn set_run_status(&mut self, run_id: &str, status: RunStatus) {
-        if let Some(run) = self.runs.iter_mut().rev().find(|run| run.id == run_id) {
+        if let Some(run) = self.run_mut(run_id) {
             run.status = status;
         }
+    }
+
+    fn run_mut(&mut self, run_id: &str) -> Option<&mut Run> {
+        self.runs.iter_mut().rev().find(|run| run.id == run_id)
     }
 
     /// The tool calls of the last reply that have no saved result, with
@@ -502,6 +586,7 @@ impl SessionState {
             disabled_tools: BTreeSet::new(),
             todos: Vec::new(),
             edited_files: Vec::new(),
+            codemode_store: BTreeMap::new(),
             usage: SessionUsage::default(),
             runs: Vec::new(),
             partial: None,
@@ -606,6 +691,8 @@ pub struct SessionExport {
     pub todos: Vec<TodoItem>,
     #[serde(default)]
     pub edited_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub codemode_store: BTreeMap<String, Value>,
     #[serde(default)]
     pub usage: SessionUsage,
 }
@@ -629,6 +716,7 @@ impl From<&SessionState> for SessionExport {
             disabled_tools: state.disabled_tools.clone(),
             todos: state.todos.clone(),
             edited_files: state.edited_files.clone(),
+            codemode_store: state.codemode_store.clone(),
             usage: state.usage.clone(),
         }
     }
@@ -658,6 +746,7 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         disabled_tools: export.disabled_tools,
         todos: export.todos,
         edited_files: export.edited_files,
+        codemode_store: export.codemode_store,
         usage: export.usage,
         // Runs belong to the session that ran them.
         runs: Vec::new(),
@@ -709,6 +798,9 @@ pub struct ReloadableSystems {
     pub available_accounts: BTreeMap<String, Vec<String>>,
     pub available_tool_names: BTreeSet<String>,
     pub tool_scope_configured: bool,
+    /// The settings' `enabledTools` and `excludedTools`, which choose the
+    /// tools plugins add as they choose extension tools.
+    pub tool_selection: (Option<Vec<String>>, Vec<String>),
     pub extension_tools: BTreeMap<String, ExtensionTool>,
     /// The loaded extension files, for the v2 persistent hosts: which
     /// extensions exist this generation and where their programs are.
@@ -723,6 +815,8 @@ pub struct ReloadableSystems {
     pub retry: RuntimeRetrySettings,
     pub offline: bool,
     pub compaction: RuntimeCompactionSettings,
+    /// How codemode presents the tools (`codemode` settings).
+    pub codemode: codemode::Presentation,
     /// How often a run saves what it has produced so far (spec §4.2).
     pub progress: RuntimeProgressSettings,
     pub model_context_windows: BTreeMap<String, u64>,
@@ -730,6 +824,9 @@ pub struct ReloadableSystems {
     /// `Default` keeps the compiled cap; a derived zero would stop every
     /// turn after zero rounds.
     pub max_tool_rounds: usize,
+    /// Crash restarts in a row after which a run ends `restart_limit`
+    /// (Durable's `settings.restartLimit`, default 5).
+    pub restart_limit: u32,
 }
 
 impl Default for ReloadableSystems {
@@ -746,6 +843,7 @@ impl Default for ReloadableSystems {
             available_accounts: BTreeMap::new(),
             available_tool_names: BTreeSet::new(),
             tool_scope_configured: false,
+            tool_selection: (None, Vec::new()),
             extension_tools: BTreeMap::new(),
             extension_files: Vec::new(),
             keybinding_generation: 0,
@@ -756,9 +854,11 @@ impl Default for ReloadableSystems {
             retry: RuntimeRetrySettings::default(),
             offline: false,
             compaction: RuntimeCompactionSettings::default(),
+            codemode: codemode::Presentation::default(),
             progress: RuntimeProgressSettings::default(),
             model_context_windows: BTreeMap::new(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+            restart_limit: DEFAULT_RESTART_LIMIT,
         }
     }
 }
@@ -779,16 +879,30 @@ fn available_tool_names(
         .into_iter()
         .map(|definition| definition.name)
         .collect::<Vec<_>>();
+    // Built-in tools that are off unless selected: codemode, as upstream
+    // registers it inactive.
+    let selectable = builtin
+        .iter()
+        .cloned()
+        .chain([codemode::CODEMODE.to_owned()])
+        .collect::<Vec<_>>();
     let selected: BTreeSet<String> = match (&settings.enabled_tools, &settings.default_tools) {
-        (Some(allowed), _) => builtin
+        (Some(allowed), _) => selectable
             .iter()
             .chain(extension_tools.keys())
-            .filter(|name| noel_config::tool_name_matches(allowed, name))
+            .filter(|name| {
+                // Off unless selected by name: a pattern never turns it on.
+                if name.as_str() == codemode::CODEMODE {
+                    allowed.iter().any(|entry| entry == codemode::CODEMODE)
+                } else {
+                    noel_config::tool_name_matches(allowed, name)
+                }
+            })
             .cloned()
             .collect(),
         (None, Some(entries)) => noel_config::resolve_default_tools(entries, &builtin)
             .into_iter()
-            .filter(|name| builtin.contains(name))
+            .filter(|name| selectable.contains(name))
             .chain(extension_tools.keys().cloned())
             .collect(),
         (None, None) => builtin
@@ -911,6 +1025,7 @@ impl ReloadableSystems {
                     )
                 })
                 .collect(),
+            codemode: codemode::Presentation::from_settings(config.settings.codemode.as_ref()),
             compaction: {
                 let settings = config.settings.compaction.clone().unwrap_or_default();
                 RuntimeCompactionSettings {
@@ -933,6 +1048,10 @@ impl ReloadableSystems {
             available_accounts,
             available_tool_names,
             tool_scope_configured: true,
+            tool_selection: (
+                config.settings.enabled_tools.clone(),
+                config.settings.excluded_tools.clone(),
+            ),
             extension_tools,
             extension_files: config.extensions.clone(),
             keybinding_generation: generation,
@@ -975,6 +1094,10 @@ impl ReloadableSystems {
                 .and_then(|agent| agent.max_tool_rounds)
                 .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS)
                 .max(1),
+            restart_limit: config
+                .settings
+                .restart_limit
+                .unwrap_or(DEFAULT_RESTART_LIMIT),
         }
     }
 }
@@ -1042,6 +1165,10 @@ fn lock_holder(pid: &Option<u32>) -> String {
 pub enum AgentError {
     #[error("compaction failed: {0}")]
     Compaction(String),
+    /// The host died while the model was answering, and the retry policy
+    /// allows no other attempt (Durable's `interrupted` run failure).
+    #[error("{0}")]
+    Interrupted(String),
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error(transparent)]
@@ -1092,6 +1219,10 @@ enum SessionRecord {
         /// never saved without its prompt. Older versions ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run: Option<RunStart>,
+        /// When it was saved, in milliseconds since the epoch: the history
+        /// entry's timestamp. Older versions ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ts: Option<u64>,
         /// The queued submissions this message places into the run, which
         /// leave the queue with it: one record, so a submission is never
         /// both placed and still queued. Older versions ignore it.
@@ -1121,6 +1252,11 @@ enum SessionRecord {
     },
     EditedFiles {
         paths: Vec<String>,
+    },
+    /// The codemode store as it is after a script wrote to it. Older
+    /// versions ignore it.
+    CodemodeStore {
+        store: BTreeMap<String, Value>,
     },
     Usage {
         usage: SessionUsage,
@@ -1158,6 +1294,30 @@ enum SessionRecord {
     RunFinished {
         run_id: String,
         status: RunStatus,
+        /// A failed run's reason; older versions leave it out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<RunFailure>,
+    },
+    /// A run that saves no message to start it: a continue.
+    RunStarted {
+        run: RunStart,
+    },
+    /// A close stopped the run, which a later resume continues without
+    /// counting a restart.
+    RunClosed {
+        run_id: String,
+    },
+    /// The run resumed after a stop that was not a close (a crash).
+    RunRestarted {
+        run_id: String,
+    },
+    /// A reply's request failed and the turn waits out a retry's backoff
+    /// before attempt `attempt + 1`, or (`attempt` 0) compacts after an
+    /// overflow: a crash now cut off no request.
+    RetryWait {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        attempt: u64,
     },
     /// What a streaming reply has produced so far (spec §4.2), saved at
     /// most every `progress.partialIntervalMs`. A reply's first record
@@ -1225,6 +1385,30 @@ pub enum SavedProgress {
         truncated: bool,
         append: bool,
     },
+    /// A record that adds to the session's history (see [`history`]).
+    History(history::HistoryRecord),
+}
+
+/// What `record` adds to the session's history, if anything.
+fn history_record(record: &SessionRecord) -> Option<history::HistoryRecord> {
+    Some(match record {
+        SessionRecord::Message { message, ts, .. } => history::HistoryRecord::Message {
+            message: message.clone(),
+            timestamp: *ts,
+        },
+        SessionRecord::MessagesSnapshot { messages } => history::HistoryRecord::Reset {
+            messages: messages.len(),
+        },
+        SessionRecord::CompactionCheckpoint { record, .. }
+        | SessionRecord::Compaction { record } => {
+            history::HistoryRecord::Compaction(record.clone())
+        }
+        SessionRecord::Tool { event } => history::HistoryRecord::ToolEvent {
+            call_id: event.id.clone(),
+            is_error: event.is_error,
+        },
+        _ => return None,
+    })
 }
 
 /// Hears each [`SavedProgress`] once it is in the journal, on the task that
@@ -1240,16 +1424,36 @@ impl std::fmt::Debug for ObserverSlot {
     }
 }
 
-/// A session journal opened for writing. Every constructor takes the session
-/// lock (see [`SessionError::Locked`]) and repairs a torn tail before the
-/// first append; clones share the lock and serialize their writes. Read-only
+/// A session journal opened for writing, over a [`storage::JournalStorage`]:
+/// the journal file by default, whose constructors take the session lock
+/// (see [`SessionError::Locked`]) and repair a torn tail before the first
+/// append; clones share the storage and serialize their writes. Read-only
 /// access goes through [`SessionStore::read`], which never locks or repairs.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     path: PathBuf,
-    lock: Arc<SessionLock>,
+    storage: storage::Storage,
     /// Hears the progress this store and its clones save.
     progress: Option<ObserverSlot>,
+    /// What opening the journal found about how its last run stopped.
+    hint: Arc<Mutex<ResumeHint>>,
+}
+
+/// How the journal's last run stopped, as opening it found: for a resume
+/// to charge a model request a crash cut off (Durable section 8.3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeHint {
+    /// The attempt of the reply a stop cut off, recovered as an aborted
+    /// reply.
+    pub attempt: Option<u64>,
+    /// The run was waiting out a retry's backoff (its last record is a
+    /// `retry_wait`): no request was in flight.
+    pub waiting: bool,
+}
+
+fn lock_hint(hint: &Mutex<ResumeHint>) -> std::sync::MutexGuard<'_, ResumeHint> {
+    hint.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl SessionStore {
@@ -1387,6 +1591,7 @@ impl SessionStore {
         })?;
         let store = Self::writer(path)?;
         let mut state = store.load()?;
+        lock_hint(&store.hint).waiting = waiting_retry(&store.path);
         store.recover_partial(&mut state)?;
         Ok((store, state))
     }
@@ -1399,6 +1604,7 @@ impl SessionStore {
         let Some(partial) = state.partial.take() else {
             return Ok(());
         };
+        lock_hint(&self.hint).attempt = Some(partial.attempt);
         if let Some(message) = partial.aborted_message() {
             self.record_message(message.clone())?;
             state.messages.push(message);
@@ -1410,17 +1616,7 @@ impl SessionStore {
     /// fork and clone sources, and import sources. A torn final segment left
     /// by an interrupted append is ignored; a bad line before it is an error.
     pub fn read(path: &Path) -> Result<SessionState, SessionError> {
-        let content = read_journal_bytes(path)?;
-        if jsonl_is_ts_session_export(&content) {
-            let export = read_ts_jsonl_export(path, &content)?;
-            let session_id = if export.session_id.trim().is_empty() {
-                "recovered".to_string()
-            } else {
-                export.session_id.clone()
-            };
-            return Ok(session_state_from_export(export, session_id));
-        }
-        read_rust_journal(path, &content)
+        session_state_from_bytes(path, &read_journal_bytes(path)?)
     }
 
     /// Deletes a session journal. Refuses with [`SessionError::Locked`] while
@@ -1436,16 +1632,53 @@ impl SessionStore {
     }
 
     fn writer(path: PathBuf) -> Result<Self, SessionError> {
-        let store = Self {
-            lock: session_lock::acquire(&path)?,
-            path,
+        Ok(Self::on(Arc::new(storage::JsonlFile::open(path)?)))
+    }
+
+    fn on(storage: storage::Storage) -> Self {
+        Self {
+            path: storage.path().to_path_buf(),
+            storage,
             progress: None,
-        };
-        {
-            let _writer = store.lock.writer();
-            noel_session::repair_jsonl_tail(&store.path)?;
+            hint: Arc::default(),
         }
-        Ok(store)
+    }
+
+    /// How the journal's last run stopped, as opening it found.
+    pub fn resume_hint(&self) -> ResumeHint {
+        *lock_hint(&self.hint)
+    }
+
+    /// Opens the session a storage holds (another backend than the journal
+    /// file): its state, with a reply a stop cut off recovered as for
+    /// [`SessionStore::open`].
+    pub fn open_storage(storage: storage::Storage) -> Result<(Self, SessionState), SessionError> {
+        let store = Self::on(storage);
+        let mut state = store.load()?;
+        store.recover_partial(&mut state)?;
+        Ok((store, state))
+    }
+
+    /// Starts a new session in an empty storage.
+    pub fn create_in_storage(
+        storage: storage::Storage,
+        cwd: PathBuf,
+        session_id: impl Into<String>,
+    ) -> Result<(Self, SessionState), SessionError> {
+        let store = Self::on(storage);
+        let session_id = session_id.into();
+        let state = SessionState::new(session_id.clone(), cwd.clone());
+        store.append(&SessionRecord::Started { session_id, cwd })?;
+        Ok((store, state))
+    }
+
+    #[cfg(test)]
+    fn lock(&self) -> &Arc<SessionLock> {
+        self.storage
+            .as_any()
+            .downcast_ref::<storage::JsonlFile>()
+            .expect("a journal file")
+            .lock()
     }
 
     /// This store, and the clones made of it from now on, tell `observer`
@@ -1475,6 +1708,7 @@ impl SessionStore {
         self.append(&SessionRecord::Message {
             message,
             run: None,
+            ts: Some(history::now_ms()),
             placed,
         })
     }
@@ -1548,6 +1782,13 @@ impl SessionStore {
         self.append(&SessionRecord::Todos { todos })
     }
 
+    pub fn record_codemode_store(
+        &self,
+        store: BTreeMap<String, Value>,
+    ) -> Result<(), SessionError> {
+        self.append(&SessionRecord::CodemodeStore { store })
+    }
+
     pub fn record_edited_files(&self, paths: Vec<String>) -> Result<(), SessionError> {
         self.append(&SessionRecord::EditedFiles { paths })
     }
@@ -1607,6 +1848,9 @@ impl SessionStore {
         let pending: BTreeSet<String> = pending_tool_calls(&messages)
             .map(|(_, calls)| calls.into_iter().map(|call| call.id.clone()).collect())
             .unwrap_or_default();
+        let marker = SessionRecord::Compaction {
+            record: record.clone(),
+        };
         let checkpoint =
             serde_json::to_vec(&SessionRecord::CompactionCheckpoint { record, messages }).map_err(
                 |source| SessionError::Parse {
@@ -1614,26 +1858,20 @@ impl SessionStore {
                     source,
                 },
             )?;
-        // No append from another handle may land between the read and the
-        // rename, or the rewrite would drop it.
-        let _writer = self.lock.writer();
-        let mut journal = fs::read(&self.path).map_err(|source| SessionError::Read {
-            path: self.path.clone(),
-            source,
+        // No append from another handle lands between the read and the
+        // replacement, and a failure leaves the old journal and active
+        // context unchanged, with no partial checkpoint. A torn final
+        // segment is dropped, never patched into a corrupt interior line.
+        self.storage.rewrite(&mut |journal| {
+            // The rewrite drops what the checkpoint and the rest of the
+            // journal supersede of what replies and tool calls saved as they
+            // ran.
+            let mut journal = progress::drop_superseded(&journal, &pending);
+            journal.extend_from_slice(&checkpoint);
+            journal.push(b'\n');
+            Ok(journal)
         })?;
-        // A torn final segment is dropped, never patched with a newline into
-        // a corrupt interior line; a complete record that only lost its
-        // newline is terminated.
-        noel_session::repair_jsonl_tail_bytes(&mut journal);
-        // The rewrite drops what the checkpoint and the rest of the journal
-        // supersede of what replies and tool calls saved as they ran.
-        let mut journal = progress::drop_superseded(&journal, &pending);
-        journal.extend(checkpoint);
-        journal.push(b'\n');
-        // Rename a synced temporary file: a failed write leaves the old
-        // journal and active context unchanged, with no partial checkpoint.
-        // The session lock lives in a separate file, so the rename keeps it.
-        noel_config::write_file_atomic(&self.path, &journal)?;
+        self.observe_history(&marker);
         Ok(())
     }
 
@@ -1770,7 +2008,7 @@ impl SessionStore {
     }
 
     fn load(&self) -> Result<SessionState, SessionError> {
-        Self::read(&self.path)
+        session_state_from_bytes(&self.path, &self.storage.read()?)
     }
 
     /// Replaces the journal with the full state in one atomic rename, so a
@@ -1801,6 +2039,9 @@ impl SessionStore {
             SessionRecord::EditedFiles {
                 paths: state.edited_files.clone(),
             },
+            SessionRecord::CodemodeStore {
+                store: state.codemode_store.clone(),
+            },
             SessionRecord::Usage {
                 usage: state.usage.clone(),
             },
@@ -1814,6 +2055,7 @@ impl SessionStore {
                 .map(|message| SessionRecord::Message {
                     message,
                     run: None,
+                    ts: None,
                     placed: Vec::new(),
                 }),
         );
@@ -1850,15 +2092,61 @@ impl SessionStore {
             })?;
             journal.push(b'\n');
         }
-        let _writer = self.lock.writer();
-        noel_config::write_file_atomic(&self.path, &journal)?;
-        Ok(())
+        self.storage.rewrite(&mut |_| Ok(journal.clone()))
     }
 
     fn append(&self, record: &SessionRecord) -> Result<(), SessionError> {
-        let _writer = self.lock.writer();
-        noel_session::append_jsonl_record(&self.path, record)?;
+        let line = serde_json::to_vec(record).map_err(|source| SessionError::Parse {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.storage.append(&line)?;
+        self.observe_history(record);
         Ok(())
+    }
+
+    /// Tells the observer what `record`, now saved, adds to the history.
+    fn observe_history(&self, record: &SessionRecord) {
+        if let (Some(ObserverSlot(observer)), Some(added)) =
+            (&self.progress, history_record(record))
+        {
+            observer(&SavedProgress::History(added));
+        }
+    }
+
+    /// The session's history as its journal holds it, oldest first (see
+    /// [`history`]). A session imported from pi's format is its messages.
+    pub fn read_history(path: &Path) -> Result<Vec<history::HistoryRecord>, SessionError> {
+        let content = read_journal_bytes(path)?;
+        if jsonl_is_ts_session_export(&content) {
+            let state = Self::read(path)?;
+            return Ok(state
+                .messages
+                .into_iter()
+                .map(|message| history::HistoryRecord::Message {
+                    message,
+                    timestamp: None,
+                })
+                .collect());
+        }
+        let (records, tail) = noel_session::split_jsonl_tail(&content);
+        let mut history = Vec::new();
+        let lines = String::from_utf8_lossy(records);
+        let tail = (!is_blank_line(tail)).then(|| String::from_utf8_lossy(tail).into_owned());
+        for line in lines.lines().map(str::to_owned).chain(tail) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // What the session does not read (a torn tail) is no history.
+            if let Some(added) = serde_json::from_str::<SessionRecord>(&line)
+                .ok()
+                .as_ref()
+                .and_then(history_record)
+            {
+                history.push(added);
+            }
+        }
+        Ok(history)
     }
 }
 
@@ -1903,6 +2191,57 @@ fn queue_items_record(items: &[QueueItem], withdrawn: &[QueueItemId]) -> Session
             .cloned()
             .collect(),
     }
+}
+
+/// A session from its journal's bytes: noel's records, or pi's export.
+fn session_state_from_bytes(path: &Path, content: &[u8]) -> Result<SessionState, SessionError> {
+    if jsonl_is_ts_session_export(content) {
+        let export = read_ts_jsonl_export(path, content)?;
+        let session_id = if export.session_id.trim().is_empty() {
+            "recovered".to_string()
+        } else {
+            export.session_id.clone()
+        };
+        return Ok(session_state_from_export(export, session_id));
+    }
+    read_rust_journal(path, content)
+}
+
+/// Whether the journal's last record about its last reply is a
+/// `retry_wait`: the run stopped during a retry's backoff.
+fn waiting_retry(path: &Path) -> bool {
+    let Ok(content) = fs::read(path) else {
+        return false;
+    };
+    for line in content.split(|byte| *byte == b'\n').rev() {
+        let Ok(record) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        match record.get("type").and_then(Value::as_str) {
+            Some("retry_wait") => return true,
+            Some("partial") => {
+                let streamed = ["text", "thinking"].iter().any(|key| {
+                    record
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                });
+                if streamed {
+                    return false;
+                }
+            }
+            Some(
+                "message"
+                | "messages_snapshot"
+                | "compaction_checkpoint"
+                | "run_finished"
+                | "run_started"
+                | "run_restarted",
+            ) => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn read_journal_bytes(path: &Path) -> Result<Vec<u8>, SessionError> {
@@ -1979,17 +2318,23 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
             message,
             run,
             placed,
+            ..
         } => {
             state.supersede_progress(&message);
             state.messages.push(message);
+            // A message is progress: the active run's restarts start again.
+            if let Some(active) = state
+                .runs
+                .last_mut()
+                .filter(|run| !run.status.is_finished())
+            {
+                active.restarts = 0;
+            }
             // Whatever started a run, a load did not: it was interrupted
             // unless a `run_finished` record follows.
-            state.runs.extend(run.map(|run| Run {
-                id: run.id,
-                request_id: run.request_id,
-                kind: run.kind,
-                status: RunStatus::Interrupted,
-            }));
+            state
+                .runs
+                .extend(run.map(|run| Run::started(run, RunStatus::Interrupted)));
             // Submissions are placed only while a run is active: the last.
             let run_id = state.runs.last().map(|run| run.id.clone());
             state.place_queued(placed, run_id.as_deref());
@@ -2008,6 +2353,7 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         }
         SessionRecord::Todos { todos } => state.todos = todos,
         SessionRecord::EditedFiles { paths } => state.edited_files = paths,
+        SessionRecord::CodemodeStore { store } => state.codemode_store = store,
         SessionRecord::QueuedMessage { message } => {
             state.queued_messages.push(message);
             // Records like this one name no identities.
@@ -2040,8 +2386,30 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         }
         SessionRecord::BranchSummary { summary } => state.branch_summaries.push(summary),
         SessionRecord::Usage { usage } => state.usage = usage,
-        SessionRecord::RunFinished { run_id, status } => {
+        SessionRecord::RetryWait { .. } => {}
+        SessionRecord::RunStarted { run } => {
+            state.runs.push(Run::started(run, RunStatus::Interrupted));
+        }
+        SessionRecord::RunClosed { run_id } => {
+            if let Some(run) = state.run_mut(&run_id) {
+                run.closed = true;
+            }
+        }
+        SessionRecord::RunRestarted { run_id } => {
+            if let Some(run) = state.run_mut(&run_id) {
+                run.closed = false;
+                run.restarts += 1;
+            }
+        }
+        SessionRecord::RunFinished {
+            run_id,
+            status,
+            failure,
+        } => {
             state.set_run_status(&run_id, status);
+            if let Some(run) = state.run_mut(&run_id) {
+                run.failure = failure;
+            }
             // The run settled what it left running.
             state.partial = None;
             state.tool_outputs.clear();
@@ -2769,6 +3137,10 @@ pub struct Runtime {
     /// registrations. Durable session state stays plain data; the hosts
     /// are processes, owned here and dropped with the runtime.
     extension_hosts: Arc<tokio::sync::Mutex<extensions::ExtensionHosts>>,
+    /// Plugin tools (roadmap phase 7) and what runs them: offered with the
+    /// extension tools, and kept across reloads.
+    plugin_tools: Vec<plugins::PluginTool>,
+    plugin_host: Option<Arc<dyn plugins::PluginToolHost>>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -2792,7 +3164,21 @@ impl Runtime {
             workspace_context: None,
             workspace_context_enabled: true,
             extension_hosts: Arc::new(tokio::sync::Mutex::new(extensions::ExtensionHosts::new())),
+            plugin_tools: Vec::new(),
+            plugin_host: None,
         }
+    }
+
+    /// The plugin tools the run offers from now on, run by `host`; they
+    /// replace the ones set before.
+    pub fn set_plugin_tools(
+        &mut self,
+        host: Arc<dyn plugins::PluginToolHost>,
+        tools: Vec<plugins::PluginTool>,
+    ) {
+        self.plugin_host = Some(host);
+        self.plugin_tools = tools;
+        overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
     }
 
     pub fn with_store(
@@ -2927,6 +3313,7 @@ impl Runtime {
         // Overlay the live registrations on the manifest tools the run
         // presents to the model and the prompt.
         overlay_live_registrations(&mut self.systems, &hosts);
+        overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
         diagnostics
     }
 
@@ -2935,6 +3322,7 @@ impl Runtime {
     pub async fn refresh_extension_registrations(&mut self) {
         let hosts = self.extension_hosts.lock().await;
         overlay_live_registrations(&mut self.systems, &hosts);
+        overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
     }
 
     /// Adopt a registration change a host response carried: the host
@@ -3072,6 +3460,18 @@ impl Runtime {
         Ok(())
     }
 
+    /// Saves the codemode store a script changed.
+    pub fn set_codemode_store(
+        &mut self,
+        store: BTreeMap<String, Value>,
+    ) -> Result<(), SessionError> {
+        if let Some(session_store) = &self.store {
+            session_store.record_codemode_store(store.clone())?;
+        }
+        self.session.codemode_store = store;
+        Ok(())
+    }
+
     pub fn note_edited_files(&mut self, paths: Vec<String>) -> Result<(), SessionError> {
         let mut changed = false;
         for path in paths {
@@ -3165,16 +3565,14 @@ impl Runtime {
             store.append(&SessionRecord::Message {
                 message: message.clone(),
                 run: Some(start.clone()),
+                ts: Some(history::now_ms()),
                 placed: Vec::new(),
             })?;
         }
         self.session.messages.push(message.clone());
-        self.session.runs.push(Run {
-            id: start.id,
-            request_id: start.request_id,
-            kind: start.kind,
-            status: RunStatus::Running,
-        });
+        self.session
+            .runs
+            .push(Run::started(start, RunStatus::Running));
         Ok(message)
     }
 
@@ -3202,16 +3600,82 @@ impl Runtime {
     /// Records how run `run_id` ended. The status changes even if saving
     /// it fails, since this process is no longer running the run.
     pub fn finish_run(&mut self, run_id: &str, status: RunStatus) -> Result<(), SessionError> {
+        self.end_run(run_id, status, None)
+    }
+
+    /// Records how run `run_id` ended, with a failed run's reason.
+    pub fn end_run(
+        &mut self,
+        run_id: &str,
+        status: RunStatus,
+        failure: Option<RunFailure>,
+    ) -> Result<(), SessionError> {
         self.session.set_run_status(run_id, status);
+        if let Some(run) = self.session.run_mut(run_id) {
+            run.failure = failure.clone();
+        }
         self.session.partial = None;
         self.session.tool_outputs.clear();
         if let Some(store) = &self.store {
             store.append(&SessionRecord::RunFinished {
                 run_id: run_id.to_owned(),
                 status,
+                failure,
             })?;
         }
         Ok(())
+    }
+
+    /// Starts a run that saves no message of its own (a continue), ending
+    /// an interrupted last run first, as a prompt's start does.
+    pub fn start_bare_run(&mut self, start: RunStart) -> Result<(), SessionError> {
+        let interrupted = self
+            .session
+            .runs
+            .last()
+            .filter(|run| run.status == RunStatus::Interrupted)
+            .map(|run| run.id.clone());
+        if let Some(run_id) = interrupted {
+            self.finish_run(&run_id, RunStatus::Aborted)?;
+        }
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::RunStarted { run: start.clone() })?;
+        }
+        self.session
+            .runs
+            .push(Run::started(start, RunStatus::Running));
+        Ok(())
+    }
+
+    /// A close stops run `run_id`: its next resume is not a restart.
+    pub fn close_run(&mut self, run_id: &str) -> Result<(), SessionError> {
+        if let Some(run) = self.session.run_mut(run_id) {
+            run.closed = true;
+        }
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::RunClosed {
+                run_id: run_id.to_owned(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Counts a crash restart of run `run_id`, and returns its restarts.
+    pub fn count_restart(&mut self, run_id: &str) -> Result<u32, SessionError> {
+        if let Some(store) = &self.store {
+            store.append(&SessionRecord::RunRestarted {
+                run_id: run_id.to_owned(),
+            })?;
+        }
+        Ok(self
+            .session
+            .run_mut(run_id)
+            .map(|run| {
+                run.closed = false;
+                run.restarts += 1;
+                run.restarts
+            })
+            .unwrap_or(0))
     }
 
     /// Turns automatic retries on or off for this runtime's turns; the
@@ -3301,6 +3765,7 @@ impl Runtime {
         let mut next = next;
         next.offline |= self.systems.offline;
         self.systems = next;
+        overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
         // A reload reads context files again, a workspace's at the next run.
         self.workspace_context = None;
         Ok(ReloadReport {
@@ -3316,6 +3781,9 @@ impl Runtime {
 /// (read, edit, run tests, iterate) still needs far more than a handful of
 /// rounds, so keep this generous while still bounding a runaway tool loop.
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 200;
+
+/// Durable's default `settings.restartLimit`.
+pub const DEFAULT_RESTART_LIMIT: u32 = 5;
 
 /// Resolves the effective per-run round cap from `agent.maxToolRounds`.
 pub fn effective_max_tool_rounds(configured: Option<usize>) -> usize {
@@ -3469,6 +3937,10 @@ pub struct RunControl {
     /// The run the turn belongs to, which names what it saves as it goes
     /// (spec §4.2); a mode without runs has none.
     pub run_id: Option<String>,
+    /// A continued turn whose model request was in flight when the host
+    /// died, on this attempt: the attempt failed, and is charged to the
+    /// retry policy before the request is sent again (Durable).
+    pub interrupted_attempt: Option<u64>,
 }
 
 /// Ends the backoff a turn is waiting out before a retry (upstream
@@ -3606,6 +4078,13 @@ pub enum TurnEvent {
         name: String,
         is_error: bool,
     },
+    /// The tool calls a running `codemode` script has made so far, each
+    /// with its status: sent when the script starts and on every change
+    /// (upstream's `details.calls`). Nested calls are not saved as results.
+    NestedToolCalls {
+        call: ChatToolCall,
+        calls: Vec<NestedToolCall>,
+    },
     /// A tool call's result as saved, and how long the tool ran (`None` for
     /// a call of a reply cut off at the output limit, which is not run).
     /// `images` are the attachments of the result (`read` of an image).
@@ -3732,7 +4211,7 @@ pub async fn run_saved_prompt_streaming_events(
         return Ok(result.output);
     }
 
-    run_model_turn_streaming_events(runtime, provider, run, Some(message), on_event).await
+    run_model_turn(runtime, provider, run, Some(message), 0, on_event).await
 }
 
 /// Continues an unfinished turn from its saved context, without adding a
@@ -3755,8 +4234,51 @@ pub async fn continue_turn_streaming_events(
     if !runtime.session().has_unfinished_turn() {
         return Ok(String::new());
     }
+    let retries = match run.interrupted_attempt {
+        Some(attempt) => charge_interrupted_request(runtime, run, attempt, &mut on_event).await?,
+        None => 0,
+    };
     settle_pending_calls(runtime, run, &mut on_event).await?;
-    run_model_turn_streaming_events(runtime, provider, run, None, on_event).await
+    run_model_turn(runtime, provider, run, None, retries, on_event).await
+}
+
+/// The text of a model request the host's death cut off (Durable).
+pub fn interrupted_request_text(attempt: u64) -> String {
+    format!("The host stopped while the model was answering, on attempt {attempt}")
+}
+
+/// Charges a request the host's death cut off to the retry policy, as
+/// Durable does: when another attempt is allowed the turn waits out its
+/// backoff (reported as a retry) and returns the retries so far; otherwise
+/// the turn ends `interrupted`.
+async fn charge_interrupted_request(
+    runtime: &Runtime,
+    run: &RunControl,
+    attempt: u64,
+    on_event: &mut (impl FnMut(&TurnEvent) + Send),
+) -> Result<u64, AgentError> {
+    let message = interrupted_request_text(attempt);
+    let policy = retry_policy(&runtime.systems.retry);
+    let used = attempt.saturating_sub(1);
+    if used >= policy.max_retries {
+        return Err(AgentError::Interrupted(message));
+    }
+    let delay = noel_agent::retry_delay_ms(&policy, used);
+    on_event(&TurnEvent::RetryStarted(RetryNotice {
+        attempt,
+        max_attempts: policy.max_retries,
+        delay_ms: delay,
+        error_message: message.clone(),
+    }));
+    let backoff = run.retry.backoff(Duration::from_millis(delay));
+    if run.until_cancelled(backoff).await? {
+        return Ok(attempt);
+    }
+    on_event(&TurnEvent::RetryFinished {
+        attempt,
+        error: Some(RETRY_CANCELLED.into()),
+    });
+    Err(AgentError::Interrupted(message))
 }
 
 /// Settles the calls the last reply still owes results for, in order:
@@ -3795,11 +4317,13 @@ async fn settle_pending_calls(
 
 /// Runs provider rounds until a reply calls no tools. `prompt` is the user
 /// message the caller just saved; it is reported as the first round's.
-async fn run_model_turn_streaming_events(
+/// `retries` are those the reply asked for has had already.
+async fn run_model_turn(
     runtime: &mut Runtime,
     provider: &dyn Provider,
     run: &RunControl,
     mut prompt: Option<ConversationMessage>,
+    retries: u64,
     mut on_event: impl FnMut(&TurnEvent) + Send,
 ) -> Result<String, AgentError> {
     runtime.load_workspace_context(run).await?;
@@ -3820,7 +4344,10 @@ async fn run_model_turn_streaming_events(
     let mut round_open = false;
     // Replies kept so far. A round whose reply is dropped is not counted.
     let mut rounds = 0;
-    let mut recovery = Recovery::default();
+    let mut recovery = Recovery {
+        retries,
+        ..Recovery::default()
+    };
     // What the reply being asked for has streamed, saved as it goes.
     let mut progress = Mutex::new(ReplyProgress::new(
         runtime.store.clone(),
@@ -4039,6 +4566,12 @@ impl Recovery {
                 });
                 self.finish_retries(Some(&error), on_event);
                 progress.dropped()?;
+                if let Some(store) = &runtime.store {
+                    store.append(&SessionRecord::RetryWait {
+                        run_id: run.run_id.clone(),
+                        attempt: 0,
+                    })?;
+                }
                 if self.compact(runtime, provider, run, on_event).await? {
                     return Ok(());
                 }
@@ -4049,6 +4582,14 @@ impl Recovery {
             if self.retries < policy.max_retries {
                 let delay = noel_agent::retry_delay_ms(&policy, self.retries);
                 self.retries += 1;
+                // Saved before the retry is reported, so a crash the report
+                // races is never taken for one during a request.
+                if let Some(store) = &runtime.store {
+                    store.append(&SessionRecord::RetryWait {
+                        run_id: run.run_id.clone(),
+                        attempt: self.retries,
+                    })?;
+                }
                 on_event(&TurnEvent::RetryStarted(RetryNotice {
                     attempt: self.retries,
                     max_attempts: policy.max_retries,
@@ -4184,8 +4725,10 @@ async fn run_tool_call(
             runtime.systems.progress.output_interval,
         ));
         let put_off = tokio::sync::Notify::new();
+        // Both callbacks report events while the call runs.
+        let events = Mutex::new(&mut *on_event);
         let mut on_output = |output: OutputSoFar<'_>| {
-            on_event(&TurnEvent::ToolUpdate {
+            (lock(&events))(&TurnEvent::ToolUpdate {
                 call: tool_call.clone(),
                 output: output.text.to_owned(),
             });
@@ -4193,7 +4736,22 @@ async fn run_tool_call(
                 put_off.notify_one();
             }
         };
-        let execution = execute_model_tool_call(runtime, &tool_call, &mut on_output);
+        let mut on_nested = |calls: Vec<NestedToolCall>| {
+            (lock(&events))(&TurnEvent::NestedToolCalls {
+                call: tool_call.clone(),
+                calls,
+            });
+        };
+        // A codemode script ends itself on an abort, with upstream's
+        // `Script aborted` result: it is not dropped.
+        let ends_itself = tool_call.name == codemode::CODEMODE;
+        let execution = execute_model_tool_call_with(
+            runtime,
+            &tool_call,
+            &mut on_output,
+            &mut on_nested,
+            Some(&run.cancellation),
+        );
         let execution = async {
             tokio::pin!(execution);
             loop {
@@ -4206,7 +4764,11 @@ async fn run_tool_call(
                 }
             }
         };
-        let result = run.until_cancelled(execution).await;
+        let result = if ends_itself {
+            Ok(execution.await)
+        } else {
+            run.until_cancelled(execution).await
+        };
         let mut progress = progress
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner);
@@ -4260,10 +4822,15 @@ async fn run_tool_call(
     if tool_call.name == "todo" {
         on_event(&TurnEvent::TodosUpdated(runtime.session.todos.clone()));
     }
+    // An aborted codemode call saved its own result; the turn still ends.
+    let aborted = tool_call.name == codemode::CODEMODE && run.cancellation.is_cancelled();
     on_event(&TurnEvent::ToolFinished {
         name: tool_call.name,
         is_error,
     });
+    if aborted {
+        return Err(AgentError::Cancelled);
+    }
     result
 }
 
@@ -4593,6 +5160,27 @@ fn tool_result_media(images: Vec<noel_tools::ToolImage>) -> Vec<MediaInput> {
 /// name replaces it: the model is sent one definition per name, the one
 /// that runs.
 fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
+    let definitions = enabled_tool_definitions(runtime);
+    if !model_tool_enabled(runtime, codemode::CODEMODE) {
+        return definitions;
+    }
+    codemode::present(
+        definitions,
+        &tool_guidelines(runtime),
+        runtime.systems.codemode,
+    )
+}
+
+/// The prompt guidelines of each active tool, by name.
+fn tool_guidelines(runtime: &Runtime) -> BTreeMap<String, Vec<String>> {
+    prompt_tools(runtime)
+        .into_iter()
+        .map(|tool| (tool.name, tool.guidelines))
+        .collect()
+}
+
+/// The enabled tools as they are, before codemode's presentation.
+fn enabled_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
     let mut definitions = builtin_tool_definitions()
         .into_iter()
         .filter(|tool| !runtime.systems.extension_tools.contains_key(&tool.name))
@@ -4615,6 +5203,12 @@ fn active_tool_definitions(runtime: &Runtime) -> Vec<AiToolDefinition> {
 }
 
 fn model_tool_enabled(runtime: &Runtime, name: &str) -> bool {
+    if name == codemode::CODEMODE {
+        return codemode::selected(
+            &runtime.systems.available_tool_names,
+            &runtime.session.disabled_tools,
+        );
+    }
     (runtime.session.active_tool_names.contains(name)
         || runtime.systems.extension_tools.contains_key(name))
         && !runtime.session.disabled_tools.contains(name)
@@ -4928,6 +5522,54 @@ fn overlay_live_registrations(systems: &mut ReloadableSystems, hosts: &extension
     }
 }
 
+/// Offers the plugin tools as extension tools of the protocol `plugin`,
+/// replacing the plugin tools offered before. A tool named like a built-in
+/// or an extension's is left out. They are available as extension tools
+/// are: when `enabledTools` names them (or is unset), and `excludedTools`
+/// does not.
+fn overlay_plugin_tools(systems: &mut ReloadableSystems, tools: &[plugins::PluginTool]) {
+    let previous: Vec<String> = systems
+        .extension_tools
+        .iter()
+        .filter(|(_, tool)| tool.protocol == "plugin")
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in previous {
+        systems.extension_tools.remove(&name);
+        systems.available_tool_names.remove(&name);
+    }
+    let builtin: BTreeSet<String> = builtin_tool_definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    for tool in tools {
+        if builtin.contains(&tool.name) || systems.extension_tools.contains_key(&tool.name) {
+            continue;
+        }
+        systems.extension_tools.insert(
+            tool.name.clone(),
+            ExtensionTool {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+                extension_name: tool.plugin.clone(),
+                extension_path: PathBuf::new(),
+                protocol: "plugin".to_string(),
+                replay_safe: tool.replay_safe,
+                prompt_snippet: None,
+                prompt_guidelines: Vec::new(),
+            },
+        );
+        let (enabled, excluded) = &systems.tool_selection;
+        let selected = enabled
+            .as_ref()
+            .is_none_or(|enabled| noel_config::tool_name_matches(enabled, &tool.name));
+        if selected && !noel_config::tool_name_matches(excluded, &tool.name) {
+            systems.available_tool_names.insert(tool.name.clone());
+        }
+    }
+}
+
 fn extension_tools_from_resources(extensions: &[ResourceFile]) -> BTreeMap<String, ExtensionTool> {
     let mut tools = BTreeMap::new();
     for extension in extensions {
@@ -5054,10 +5696,23 @@ fn fail_truncated_tool_call(
 
 /// Runs a tool call of the model and saves its result. `on_output` gets a
 /// running `bash` command's output so far.
+#[cfg(test)]
 async fn execute_model_tool_call(
     runtime: &mut Runtime,
     tool_call: &ChatToolCall,
     on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
+) -> Result<(), AgentError> {
+    execute_model_tool_call_with(runtime, tool_call, on_output, &mut |_| {}, None).await
+}
+
+/// [`execute_model_tool_call`], with a `codemode` call's nested calls
+/// reported to `on_nested` as they change.
+async fn execute_model_tool_call_with(
+    runtime: &mut Runtime,
+    tool_call: &ChatToolCall,
+    on_output: &mut (dyn FnMut(OutputSoFar<'_>) + Send),
+    on_nested: &mut (dyn FnMut(Vec<NestedToolCall>) + Send),
+    cancellation: Option<&CancellationToken>,
 ) -> Result<(), AgentError> {
     let extension_tool = runtime
         .systems
@@ -5071,8 +5726,30 @@ async fn execute_model_tool_call(
     {
         // A persistent v2 host serves its tools over one process; v1 runs
         // one process per call. Both are started lazily, on the call that
-        // needs them.
-        if extension_tool.protocol == "2" {
+        // needs them. A plugin's tool runs through the plugin host.
+        if extension_tool.protocol == "plugin" {
+            match runtime.plugin_host.clone() {
+                Some(host) => {
+                    let outcome = host
+                        .call(
+                            &extension_tool.extension_name,
+                            &extension_tool.name,
+                            serde_json::from_str(&tool_call.arguments)
+                                .unwrap_or(Value::Object(Default::default())),
+                        )
+                        .await;
+                    is_error = outcome.is_error;
+                    vec![outcome.output]
+                }
+                None => {
+                    is_error = true;
+                    vec![format!(
+                        "plugin {} is not reachable",
+                        extension_tool.extension_name
+                    )]
+                }
+            }
+        } else if extension_tool.protocol == "2" {
             let extension_name = extension_tool.extension_name.clone();
             let tool_name = extension_tool.name.clone();
             let call = tool_call.clone();
@@ -5114,6 +5791,26 @@ async fn execute_model_tool_call(
                     vec![error.to_string()]
                 }
             }
+        }
+    } else if tool_call.name == codemode::CODEMODE {
+        if model_tool_enabled(runtime, codemode::CODEMODE) {
+            let callable = codemode::callable(&enabled_tool_definitions(runtime));
+            let guidelines = tool_guidelines(runtime);
+            let result = codemode::run(
+                runtime,
+                tool_call,
+                &callable,
+                &guidelines,
+                on_nested,
+                cancellation,
+            )
+            .await?;
+            is_error = result.is_error;
+            images = result.images;
+            vec![result.output]
+        } else {
+            is_error = true;
+            vec![format!("Tool {} not found", tool_call.name)]
         }
     } else if tool_call.name == "todo" {
         if model_tool_enabled(runtime, "todo") {
@@ -7146,21 +7843,87 @@ mod tests {
         let base = durable_test_dir("same-process");
         let (store, state) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
         let (again, _) = SessionStore::open(store.path().to_path_buf()).unwrap();
-        assert!(Arc::ptr_eq(&store.lock, &again.lock));
+        assert!(Arc::ptr_eq(store.lock(), again.lock()));
         let spelled = base.join(".").join(store.path().file_name().unwrap());
         let (spelled, _) = SessionStore::open(spelled).unwrap();
-        assert!(Arc::ptr_eq(&store.lock, &spelled.lock));
+        assert!(Arc::ptr_eq(store.lock(), spelled.lock()));
         // Importing onto the id this process holds rewrites it in place.
         let (imported, _) = SessionStore::import(&base, SessionExport::from(&state)).unwrap();
-        assert!(Arc::ptr_eq(&store.lock, &imported.lock));
+        assert!(Arc::ptr_eq(store.lock(), imported.lock()));
 
-        let lock_path = store.lock.lock_path().to_path_buf();
+        let lock_path = store.lock().lock_path().to_path_buf();
         assert!(lock_path.exists());
         drop((store, again, spelled));
         assert!(lock_path.exists(), "a live handle keeps the lock");
         drop(imported);
         assert!(!lock_path.exists(), "the last handle removes the lock file");
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn the_history_heard_live_is_the_history_read_back() {
+        let base = durable_test_dir("history");
+        let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        let store = store.observe_progress(Arc::new(move |saved| {
+            if let SavedProgress::History(record) = saved {
+                lock(&sink).push(record.clone());
+            }
+        }));
+        store
+            .record_message(test_message(MessageRole::User, "one"))
+            .unwrap();
+        store
+            .record_message(test_message(MessageRole::Assistant, "two"))
+            .unwrap();
+        store
+            .record_compaction_checkpoint(
+                CompactionRecord {
+                    kind: CompactionKind::Automatic,
+                    omitted_messages: 2,
+                    retained_messages: 0,
+                    summary: "summary".into(),
+                },
+                vec![test_message(MessageRole::User, "summary")],
+            )
+            .unwrap();
+        store
+            .record_message(test_message(MessageRole::User, "three"))
+            .unwrap();
+        // An undo: the context is cut back to one message.
+        store
+            .record_messages_snapshot(vec![test_message(MessageRole::User, "summary")])
+            .unwrap();
+
+        let read = SessionStore::read_history(store.path()).unwrap();
+        assert_eq!(*lock(&heard), read);
+        let mut history = history::History::default();
+        for record in &read {
+            history.push(record, |message, _| json!(message.content));
+        }
+        let kinds: Vec<(u64, String)> = history
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.to_json()["kind"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        // The checkpoint rewrote the journal, and every message stayed.
+        assert_eq!(
+            kinds,
+            [
+                (1, "pi.user".to_owned()),
+                (2, "pi.assistant".to_owned()),
+                (3, "pi.compaction".to_owned()),
+                (4, "pi.user".to_owned()),
+                (5, "pi.reset".to_owned()),
+            ]
+        );
+        assert!(history.entries()[0].timestamp.is_some());
     }
 
     #[test]
@@ -7188,7 +7951,7 @@ mod tests {
         #[cfg(unix)]
         assert_ne!(inode(), before, "the checkpoint replaces the journal");
 
-        let probe = File::open(store.lock.lock_path()).unwrap();
+        let probe = File::open(store.lock().lock_path()).unwrap();
         assert!(matches!(
             probe.try_lock(),
             Err(std::fs::TryLockError::WouldBlock)
@@ -7273,7 +8036,7 @@ mod tests {
         let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
         // A second description of the same lock inode, to observe the OS lock
         // after the store unlinks the path on drop.
-        let probe = File::open(store.lock.lock_path()).unwrap();
+        let probe = File::open(store.lock().lock_path()).unwrap();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .stdin(std::process::Stdio::null())
@@ -7312,7 +8075,7 @@ mod tests {
 
         let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
         let path = store.path().to_path_buf();
-        let lock_path = store.lock.lock_path().to_path_buf();
+        let lock_path = store.lock().lock_path().to_path_buf();
         drop(store);
         SessionStore::delete(&path).unwrap();
         assert!(!path.exists());
@@ -7321,7 +8084,7 @@ mod tests {
         // The session this process holds can be deleted; its lock file goes
         // away with the last handle.
         let (store, _) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
-        let lock_path = store.lock.lock_path().to_path_buf();
+        let lock_path = store.lock().lock_path().to_path_buf();
         SessionStore::delete(store.path()).unwrap();
         assert!(!store.path().exists());
         assert!(lock_path.exists());
@@ -8874,6 +9637,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_tools_run_through_their_host_and_survive_a_reload() {
+        struct Echo;
+        impl plugins::PluginToolHost for Echo {
+            fn call(
+                &self,
+                plugin: &str,
+                tool: &str,
+                args: Value,
+            ) -> std::pin::Pin<Box<dyn Future<Output = plugins::PluginToolOutput> + Send>>
+            {
+                let output = format!("{plugin}/{tool}: {}", args["text"].as_str().unwrap_or(""));
+                Box::pin(async move {
+                    plugins::PluginToolOutput {
+                        output,
+                        is_error: false,
+                    }
+                })
+            }
+        }
+        let mut runtime = Runtime::new(
+            SessionState::new("session-1", PathBuf::from(".")),
+            ReloadableSystems::default(),
+        );
+        runtime.set_plugin_tools(
+            Arc::new(Echo),
+            vec![plugins::PluginTool {
+                plugin: "sample".into(),
+                name: "shout".into(),
+                description: "Shouts.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                replay_safe: false,
+            }],
+        );
+        let call = ChatToolCall {
+            id: "call_plugin_1".to_string(),
+            name: "shout".to_string(),
+            arguments: serde_json::json!({"text": "hi"}).to_string(),
+        };
+        execute_model_tool_call(&mut runtime, &call, &mut |_| {})
+            .await
+            .expect("the plugin tool runs");
+        let event = runtime.session().tool_history.last().expect("tool event");
+        assert_eq!(event.result, "sample/shout: hi");
+        // A reload keeps the plugin's tools offered.
+        runtime
+            .reload(ReloadableSystems {
+                config_generation: 1,
+                ..ReloadableSystems::default()
+            })
+            .unwrap();
+        assert_eq!(runtime.systems.extension_tools["shout"].protocol, "plugin");
+    }
+
+    #[tokio::test]
     async fn todo_tool_call_updates_session_todos() {
         let mut runtime = Runtime::new(
             SessionState::new("session-1", PathBuf::from(".")),
@@ -9110,6 +9927,24 @@ mod tests {
         assert_eq!(fs::read_to_string(cwd.join("empty.txt")).unwrap(), "");
         assert_eq!(fs::read_to_string(cwd.join("a.rs")).unwrap(), "keep\nend\n");
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn session_store_restores_the_codemode_store_on_load() {
+        let base =
+            std::env::temp_dir().join(format!("noel-session-codemode-test-{}", new_session_id()));
+        let (store, _state) =
+            SessionStore::create(&base, PathBuf::from("/repo")).expect("create session");
+        let mut values = BTreeMap::new();
+        values.insert("seen".to_string(), serde_json::json!(["a", 1]));
+        store
+            .record_codemode_store(values.clone())
+            .expect("record codemode store");
+
+        let loaded = store.load().expect("load session");
+
+        assert_eq!(loaded.codemode_store, values);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -9787,6 +10622,9 @@ mod tests {
             request_id: Some(request_id.into()),
             kind: SubmissionKind::Prompt,
             status,
+            failure: None,
+            restarts: 0,
+            closed: false,
         };
         let runs = || SessionStore::read(&path).unwrap().runs;
 
@@ -10015,6 +10853,15 @@ mod tests {
                     format!("tool {} {} {}", call.id, call.name, call.arguments)
                 }
                 TurnEvent::ToolUpdate { call, output } => format!("update {} {output:?}", call.id),
+                TurnEvent::NestedToolCalls { call, calls } => format!(
+                    "nested {} [{}]",
+                    call.id,
+                    calls
+                        .iter()
+                        .map(|nested| format!("{} {}", nested.name, nested.status.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
                 TurnEvent::ToolOutput {
                     call,
                     output,

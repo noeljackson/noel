@@ -1,0 +1,391 @@
+{
+  "name": "noel.chat",
+  "version": 1,
+  "host": "session",
+  "params": [
+    [
+      "session",
+      {
+        "type": "string"
+      }
+    ]
+  ],
+  "variants": {
+    "viewer": {
+      "state": {
+        "view": {
+          "type": "object",
+          "required": [
+            "conversation",
+            "entries",
+            "docs"
+          ],
+          "properties": {
+            "conversation": {
+              "type": "object",
+              "required": [
+                "id",
+                "cwd"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "cwd": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            },
+            "entries": {
+              "type": "array"
+            },
+            "docs": {
+              "type": "object"
+            },
+            "lastRun": {
+              "type": "object"
+            },
+            "before": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "methods": {
+        "entries": {
+          "args": {
+            "type": "object",
+            "required": [
+              "before"
+            ],
+            "properties": {
+              "before": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "entries"
+            ],
+            "properties": {
+              "entries": {
+                "type": "array"
+              },
+              "before": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
+    },
+    "participant": {
+      "state": {
+        "view": {
+          "type": "object",
+          "required": [
+            "conversation",
+            "entries",
+            "docs"
+          ],
+          "properties": {
+            "conversation": {
+              "type": "object",
+              "required": [
+                "id",
+                "cwd"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "cwd": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            },
+            "entries": {
+              "type": "array"
+            },
+            "docs": {
+              "type": "object"
+            },
+            "lastRun": {
+              "type": "object"
+            },
+            "before": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "methods": {
+        "submit": {
+          "args": {
+            "type": "object",
+            "required": [
+              "requestId"
+            ],
+            "properties": {
+              "requestId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "type": {
+                "enum": [
+                  "input",
+                  "continue"
+                ]
+              },
+              "text": {
+                "type": "string"
+              },
+              "images": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "mimeType"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "string"
+                    },
+                    "mimeType": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "whenBusy": {
+                "enum": [
+                  "reject",
+                  "steer",
+                  "followUp"
+                ]
+              },
+              "whenIdle": {
+                "enum": [
+                  "reject"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "submissionId",
+              "disposition"
+            ],
+            "properties": {
+              "submissionId": {
+                "type": "string"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "disposition": {
+                "enum": [
+                  "started",
+                  "queued",
+                  "repeated"
+                ]
+              },
+              "status": {
+                "enum": [
+                  "queued",
+                  "running",
+                  "interrupted",
+                  "completed",
+                  "failed",
+                  "aborted",
+                  "withdrawn"
+                ]
+              }
+            }
+          }
+        },
+        "withdraw": {
+          "args": {
+            "type": "object",
+            "required": [
+              "submissionId"
+            ],
+            "properties": {
+              "submissionId": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "withdrawn",
+                  "already_placed",
+                  "settled"
+                ]
+              }
+            }
+          }
+        },
+        "abort": {
+          "args": {
+            "type": "object",
+            "properties": {
+              "expectedRunId": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "properties": {
+              "runId": {
+                "type": "string"
+              },
+              "withdrawn": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "compact": {
+          "args": {
+            "type": "object",
+            "properties": {
+              "instructions": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "omittedMessages",
+              "retainedMessages"
+            ],
+            "properties": {
+              "omittedMessages": {
+                "type": "integer"
+              },
+              "retainedMessages": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "configure": {
+          "args": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "thinkingLevel": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "thinkingLevel"
+            ],
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "thinkingLevel": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "resume": {
+          "args": {
+            "type": "object",
+            "required": [
+              "expectedRunId"
+            ],
+            "properties": {
+              "expectedRunId": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "runId"
+            ],
+            "properties": {
+              "runId": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "entries": {
+          "args": {
+            "type": "object",
+            "required": [
+              "before"
+            ],
+            "properties": {
+              "before": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "entries"
+            ],
+            "properties": {
+              "entries": {
+                "type": "array"
+              },
+              "before": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

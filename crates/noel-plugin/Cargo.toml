@@ -1,0 +1,15 @@
+[package]
+name = "noel-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Rust SDK for noel plugins: a Chord v2 host that noel server supervises, contributing tools, commands and panels"
+
+[dependencies]
+noel-chord = { path = "../noel-chord" }
+noel-client = { path = "../noel-client" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "io-util", "io-std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

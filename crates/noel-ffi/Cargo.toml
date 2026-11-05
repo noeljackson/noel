@@ -1,0 +1,29 @@
+[package]
+name = "noel-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "noel-client for Swift and Kotlin through UniFFI: a front end's link to noel server over a byte channel the app opens (an SSH channel to noel bridge), with sessions, transcripts and plugin panels as plain records"
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "noel_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+anyhow.workspace = true
+noel-chord = { path = "../noel-chord" }
+noel-client = { path = "../noel-client" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "io-util", "time", "macros"] }
+uniffi = "=0.32.2"
+
+[dev-dependencies]
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }

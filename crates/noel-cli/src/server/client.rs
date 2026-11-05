@@ -12,7 +12,9 @@
 //! - `watch <id>`: the view, its snapshot then each change, as text (or
 //!   JSON lines with `--json`). It holds again when the worker is lost, and
 //!   reconnects (starting a server) when the server is;
-//! - `abort <id>`, `resume <id> [<runId>]`, `withdraw <id> <submissionId>`.
+//! - `abort <id>`, `resume <id> [<runId>]`, `withdraw <id> <submissionId>`;
+//! - `plugins`, `run <plugin> <command> [args]`, `panel <plugin> <panel>
+//!   <action> [value]`: `noel.plugins` (spec §13).
 //!
 //! With `--remote <ssh-destination>`, the server is another machine's: the
 //! client runs `ssh -T <destination> noel bridge` ([`super::bridge`]) and
@@ -35,17 +37,17 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use noel_chord::delta::{Op, Seg};
-use noel_chord::host::{Host, HostEvent, HostOptions, LinkOptions, RemoteRef, StateUpdate};
-use noel_chord::link::{websocket, WebSocketOptions};
-use noel_chord::{ChordError, ErrorCode};
+use noel_chord::v2::host::StateUpdate;
+use noel_chord::v2::object::BoxFuture;
+use noel_client::{websocket_link, Connector};
+pub(crate) use noel_client::{Client, Followed, Report};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, Join, ReadBuf};
 use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::Notify;
 
 use super::serve::{start_detached, Started};
-use super::{chat_contract, new_request_id, peer_check, sessions_contract, RuntimeDir};
+use super::{new_request_id, peer_check, RuntimeDir};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -62,6 +64,10 @@ pub(crate) struct ClientArgs {
     /// PATH; a leading ~/ is its home).
     #[arg(long, value_name = "PATH", requires = "remote", global = true)]
     remote_noel: Option<String>,
+    /// Use a server this device paired with (`noel client pair`), over TLS
+    /// (spec §16).
+    #[arg(long, value_name = "URL", global = true, conflicts_with = "remote")]
+    server: Option<String>,
     #[command(subcommand)]
     command: ClientCommand,
 }
@@ -110,6 +116,21 @@ enum ClientCommand {
         /// The submission's id; a repeat reports the first submission.
         #[arg(long)]
         request_id: Option<String>,
+        /// `reject`: refuse it while no run is active, so it never starts
+        /// a run (Durable's `whenIdle`).
+        #[arg(long, value_name = "reject")]
+        when_idle: Option<String>,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start a run on the session's context as it is, without a prompt
+    /// (Durable's continue): after a run that ended without an answer.
+    Continue {
+        session: String,
+        /// The submission's id; a repeat reports the first submission.
+        #[arg(long)]
+        request_id: Option<String>,
         /// Print the result as JSON.
         #[arg(long)]
         json: bool,
@@ -138,10 +159,65 @@ enum ClientCommand {
         session: String,
         submission_id: String,
     },
+    /// List the plugins: their permissions, contributions and panels.
+    Plugins {
+        /// Print the directory as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a plugin's command and print its output.
+    Run {
+        plugin: String,
+        command: String,
+        /// The command's arguments, as one string.
+        args: Vec<String>,
+    },
+    /// Pair this device with a server that listens for devices
+    /// (`server.listen`): show a code to approve there, then keep the token.
+    Pair {
+        url: String,
+        /// How the server lists this device.
+        #[arg(long, default_value = "device")]
+        label: String,
+    },
+    /// The devices paired with this machine's server: list, `approve
+    /// <code>`, `revoke <id>`.
+    Devices {
+        action: Option<String>,
+        argument: Option<String>,
+    },
+    /// Send a plugin panel an action (a button's).
+    Panel {
+        plugin: String,
+        panel: String,
+        action: String,
+        value: Option<String>,
+    },
 }
 
 pub(crate) async fn run(args: ClientArgs) -> i32 {
-    let endpoint = match Endpoint::new(args.remote, args.remote_noel) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let agent_dir = match noel_config::ConfigPaths::discover(cwd, None) {
+        Ok((paths, _)) => paths.agent_dir,
+        Err(error) => {
+            eprintln!("noel client: {error}");
+            return 2;
+        }
+    };
+    if let ClientCommand::Pair { url, label } = &args.command {
+        return match super::remote::pair(&agent_dir, url, label).await {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("noel client: pair: {error:#}");
+                1
+            }
+        };
+    }
+    let endpoint = match &args.server {
+        Some(url) => super::remote::paired(&agent_dir, url).map(Endpoint::Paired),
+        None => Endpoint::new(args.remote, args.remote_noel),
+    };
+    let endpoint = match endpoint {
         Ok(endpoint) => endpoint,
         Err(error) => {
             eprintln!("noel client: {error:#}");
@@ -168,13 +244,13 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
             }
         }
     }
-    let client = Client::connect(
+    let client = connect(
         endpoint,
         Arc::new(|message| eprintln!("noel client: {message}")),
     )
     .await?;
     match command {
-        ClientCommand::Ls { json } => client.ls(json).await,
+        ClientCommand::Ls { json } => ls(&client, json).await,
         ClientCommand::New {
             cwd,
             model,
@@ -202,8 +278,7 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
                     args[key] = json!(value);
                 }
             }
-            let sessions = client.host.get(sessions_contract(), json!({}), "server");
-            let result = call(&sessions, "create", args).await?;
+            let result = client.sessions_call("create", args).await?;
             println!("{}", result["sessionId"].as_str().unwrap_or_default());
             Ok(0)
         }
@@ -213,6 +288,7 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
             steer,
             follow_up,
             request_id,
+            when_idle,
             json,
         } => {
             let when_busy = if steer {
@@ -223,7 +299,10 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
                 "reject"
             };
             let request_id = request_id.unwrap_or_else(new_request_id);
-            let args = json!({"requestId": request_id, "text": text, "whenBusy": when_busy});
+            let mut args = json!({"requestId": request_id, "text": text, "whenBusy": when_busy});
+            if let Some(when_idle) = when_idle {
+                args["whenIdle"] = json!(when_idle);
+            }
             let result = client.chat_call(&session, "submit", args, true).await?;
             if json {
                 println!("{}", json!({"requestId": request_id, "result": result}));
@@ -232,7 +311,22 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
             }
             Ok(0)
         }
-        ClientCommand::Watch { session, json } => client.watch(&session, json).await,
+        ClientCommand::Continue {
+            session,
+            request_id,
+            json,
+        } => {
+            let request_id = request_id.unwrap_or_else(new_request_id);
+            let args = json!({"requestId": request_id, "type": "continue"});
+            let result = client.chat_call(&session, "submit", args, true).await?;
+            if json {
+                println!("{}", json!({"requestId": request_id, "result": result}));
+            } else {
+                println!("{}", describe_submit(&result, &request_id));
+            }
+            Ok(0)
+        }
+        ClientCommand::Watch { session, json } => watch(&client, &session, json).await,
         ClientCommand::Abort {
             session,
             expected_run_id,
@@ -277,6 +371,180 @@ async fn command(endpoint: Endpoint, command: ClientCommand) -> Result<i32> {
             println!("{}", result["outcome"].as_str().unwrap_or_default());
             Ok(0)
         }
+        ClientCommand::Pair { .. } => unreachable!("handled before connecting"),
+        ClientCommand::Devices { action, argument } => {
+            let call = |method: &'static str, key: &'static str| {
+                let client = client.clone();
+                let argument = argument.clone();
+                async move {
+                    let value =
+                        argument.ok_or_else(|| anyhow!("devices {method} needs its {key}"))?;
+                    client.devices_call(method, json!({ key: value })).await
+                }
+            };
+            match action.as_deref() {
+                None | Some("ls") => {
+                    let devices = client.device_directory().await?;
+                    println!(
+                        "certificate: {}",
+                        devices["fingerprint"].as_str().unwrap_or_default()
+                    );
+                    match devices["listening"].as_str() {
+                        Some(address) => println!("listening: {address}"),
+                        None => println!("listening: no (set server.listen)"),
+                    }
+                    for device in devices["devices"].as_array().into_iter().flatten() {
+                        println!(
+                            "device {} {}",
+                            device["id"].as_str().unwrap_or_default(),
+                            device["label"].as_str().unwrap_or_default()
+                        );
+                    }
+                    for pending in devices["pending"].as_array().into_iter().flatten() {
+                        println!(
+                            "pending {} {}",
+                            pending["code"].as_str().unwrap_or_default(),
+                            pending["label"].as_str().unwrap_or_default()
+                        );
+                    }
+                }
+                Some("approve") => {
+                    let approved = call("approve", "code").await?;
+                    println!(
+                        "approved: device {}",
+                        approved["id"].as_str().unwrap_or_default()
+                    );
+                }
+                Some("revoke") => {
+                    call("revoke", "id").await?;
+                    println!("revoked");
+                }
+                Some(other) => {
+                    return Err(anyhow!("devices: no action {other} (ls, approve, revoke)"))
+                }
+            }
+            Ok(0)
+        }
+        ClientCommand::Plugins { json } => {
+            let directory = client.plugin_directory().await?;
+            if json {
+                println!("{directory}");
+            } else {
+                for line in render_plugins(&directory) {
+                    println!("{line}");
+                }
+            }
+            Ok(0)
+        }
+        ClientCommand::Run {
+            plugin,
+            command,
+            args,
+        } => {
+            let args = json!({"plugin": plugin, "name": command, "args": args.join(" ")});
+            let result = client.plugins_call("runCommand", args).await?;
+            println!("{}", result["output"].as_str().unwrap_or_default());
+            Ok(0)
+        }
+        ClientCommand::Panel {
+            plugin,
+            panel,
+            action,
+            value,
+        } => {
+            let mut args = json!({"plugin": plugin, "panel": panel, "action": action});
+            if let Some(value) = value {
+                args["value"] = json!(value);
+            }
+            client.plugins_call("panelAction", args).await?;
+            Ok(0)
+        }
+    }
+}
+
+/// The plugin directory as text: each plugin, its permissions, tools,
+/// commands and panels, rendered.
+fn render_plugins(directory: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let plugins = directory["plugins"].as_array().cloned().unwrap_or_default();
+    if plugins.is_empty() {
+        lines.push("no plugins".to_owned());
+    }
+    let names = |list: &Value| {
+        list.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["name"].as_str().or(entry.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for plugin in plugins {
+        let state = if plugin["running"] == json!(true) {
+            "running".to_owned()
+        } else {
+            format!(
+                "stopped{}",
+                plugin["error"]
+                    .as_str()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            )
+        };
+        lines.push(format!(
+            "{} {} restarts {}",
+            plugin["name"].as_str().unwrap_or_default(),
+            state,
+            plugin["restarts"]
+        ));
+        lines.push(format!(
+            "  permissions: {} of {}",
+            names(&plugin["granted"]),
+            names(&plugin["requested"])
+        ));
+        let contributions = &plugin["contributions"];
+        lines.push(format!("  tools: {}", names(&contributions["tools"])));
+        lines.push(format!("  commands: {}", names(&contributions["commands"])));
+        for panel in contributions["panels"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  panel {} ({}):",
+                panel["id"].as_str().unwrap_or_default(),
+                panel["title"].as_str().unwrap_or_default()
+            ));
+            render_panel(&panel["view"], 2, &mut lines);
+        }
+    }
+    lines
+}
+
+/// A panel's view (spec §13's widget vocabulary) as indented text.
+fn render_panel(view: &Value, depth: usize, lines: &mut Vec<String>) {
+    let indent = "  ".repeat(depth);
+    match view["type"].as_str() {
+        Some("text") => lines.push(format!(
+            "{indent}{}",
+            view["text"].as_str().unwrap_or_default()
+        )),
+        Some("button") => lines.push(format!(
+            "{indent}[{}] ({})",
+            view["label"].as_str().unwrap_or_default(),
+            view["action"].as_str().unwrap_or_default()
+        )),
+        Some("list") => {
+            for item in view["items"].as_array().into_iter().flatten() {
+                let mut nested = Vec::new();
+                render_panel(item, 0, &mut nested);
+                for (index, line) in nested.into_iter().enumerate() {
+                    let mark = if index == 0 { "- " } else { "  " };
+                    lines.push(format!("{indent}{mark}{line}"));
+                }
+            }
+        }
+        Some("stack") => {
+            for child in view["children"].as_array().into_iter().flatten() {
+                render_panel(child, depth, lines);
+            }
+        }
+        _ => lines.push(format!("{indent}{view}")),
     }
 }
 
@@ -296,24 +564,6 @@ fn describe_submit(result: &Value, request_id: &str) -> String {
     }
 }
 
-/// Where a client reports what it does on its own: starting a server,
-/// reconnecting, sending a call again. Line mode prints it; the TUI shows
-/// it in its transcript.
-pub(crate) type Report = Arc<dyn Fn(String) + Send + Sync>;
-
-/// What following a session's view ([`Client::follow`]) yields.
-pub(crate) enum Followed {
-    /// The view: its snapshot (again after each hold), then its changes.
-    Update(StateUpdate),
-    /// The link to the server dropped; reconnecting, starting a server if
-    /// none listens.
-    ServerLost,
-    /// Connected again; the view is held again.
-    Reconnected,
-    /// The hold ended (its worker was lost), for this reason; holding again.
-    ViewEnded(String),
-}
-
 /// Where the server is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Endpoint {
@@ -324,6 +574,8 @@ pub(crate) enum Endpoint {
         destination: String,
         program: String,
     },
+    /// A server this device paired with, over TLS.
+    Paired(super::remote::Paired),
 }
 
 impl Endpoint {
@@ -355,227 +607,63 @@ impl Endpoint {
     }
 }
 
-/// A connection to the server, reconnected (and the server started) when
-/// it drops.
-#[derive(Clone)]
-pub(crate) struct Client {
-    host: Host,
-    endpoint: Endpoint,
-    lost: Arc<Notify>,
-    report: Report,
+impl Connector for Endpoint {
+    fn open(&self, interactive: bool, report: Report) -> BoxFuture<Result<noel_chord::v2::Link>> {
+        let endpoint = self.clone();
+        Box::pin(async move { open(&endpoint, interactive, &report).await })
+    }
 }
 
-impl Client {
-    pub(crate) async fn connect(endpoint: Endpoint, report: Report) -> Result<Self> {
-        let lost = Arc::new(Notify::new());
-        let signal = lost.clone();
-        let host = Host::new(HostOptions {
-            on_error: Some(Arc::new(|error| {
-                if std::env::var_os("NOEL_CLIENT_DEBUG").is_some() {
-                    eprintln!("noel client: chord: {error}");
-                }
-            })),
-            observer: Some(Arc::new(move |event| {
-                if matches!(event, HostEvent::LinkClosed { .. }) {
-                    signal.notify_one();
-                }
-            })),
-            ..HostOptions::client("client")
-        });
-        host.connect(
-            open(&endpoint, true, &report).await?,
-            LinkOptions::default(),
-        );
-        Ok(Self {
-            host,
-            endpoint,
-            lost,
-            report,
+/// Connects to the server at `endpoint`, starting a local one when none
+/// listens.
+pub(crate) async fn connect(endpoint: Endpoint, report: Report) -> Result<Client> {
+    Client::connect(Arc::new(endpoint), report).await
+}
+
+async fn ls(client: &Client, json: bool) -> Result<i32> {
+    let directory = client.directory().await?;
+    if json {
+        println!("{directory}");
+        return Ok(0);
+    }
+    let list = directory["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if list.is_empty() {
+        println!("no sessions");
+    }
+    for session in list {
+        println!("{}", describe_session(&session));
+    }
+    Ok(0)
+}
+
+/// Prints the view's snapshot, then each change, holding again when the
+/// worker is lost and reconnecting when the server is.
+async fn watch(client: &Client, session: &str, json: bool) -> Result<i32> {
+    Err(client
+        .follow(session, |followed| match followed {
+            Followed::Update(update) => print_update(&update, json),
+            Followed::ServerLost => print_note("server link lost; reconnecting", json),
+            Followed::Reconnected => print_note("reconnected; holding again", json),
+            Followed::ViewEnded(why) => {
+                print_note(&format!("view ended ({why}); holding again"), json)
+            }
         })
-    }
-
-    /// Closes the connection, releasing what it holds.
-    pub(crate) async fn close(&self) {
-        self.host.close().await;
-    }
-
-    /// Connects again after the server was lost, starting one if needed.
-    async fn reconnect(&self) {
-        let mut delay = Duration::from_millis(100);
-        loop {
-            match open(&self.endpoint, false, &self.report).await {
-                Ok(link) => {
-                    self.host.connect(link, LinkOptions::default());
-                    return;
-                }
-                Err(error) => (self.report)(format!("reconnect: {error:#}")),
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(2));
-        }
-    }
-
-    fn chat(&self, session: &str) -> RemoteRef {
-        self.host.get(
-            chat_contract(),
-            json!({ "session": session }),
-            &format!("session:{session}"),
-        )
-    }
-
-    /// Calls a `noel.chat` method. With `retry`, a call or hold that fails
-    /// `unavailable` is made again, with the same arguments, a few times.
-    pub(crate) async fn chat_call(
-        &self,
-        session: &str,
-        method: &str,
-        args: Value,
-        retry: bool,
-    ) -> Result<Value> {
-        let mut delay = Duration::from_millis(200);
-        let mut attempt = 1;
-        loop {
-            let chat = self.chat(session);
-            let outcome = call(&chat, method, args.clone()).await;
-            chat.release();
-            match outcome {
-                Err(error)
-                    if retry
-                        && attempt < 10
-                        && error
-                            .downcast_ref::<ChordError>()
-                            .is_some_and(|error| error.code == ErrorCode::Unavailable) =>
-                {
-                    (self.report)(format!("{method}: {error}; sending again ({attempt})"));
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(2));
-                }
-                outcome => return outcome,
-            }
-        }
-    }
-
-    /// The session's view as it is now.
-    async fn view(&self, session: &str) -> Result<Value> {
-        let chat = self.chat(session);
-        let mut updates = chat.subscribe("view");
-        chat.ready().await?;
-        loop {
-            match tokio::time::timeout(Duration::from_secs(30), updates.next()).await {
-                Ok(Some(StateUpdate::Snapshot(value) | StateUpdate::Reset(value))) => {
-                    return Ok(value)
-                }
-                Ok(Some(StateUpdate::Error(error))) => return Err(error.into()),
-                Ok(Some(StateUpdate::Ops { .. })) => {}
-                Ok(None) => return Err(anyhow!("the session's view ended")),
-                Err(_) => return Err(anyhow!("no view within 30 s")),
-            }
-        }
-    }
-
-    async fn ls(&self, json: bool) -> Result<i32> {
-        let sessions = self.host.get(sessions_contract(), json!({}), "server");
-        let mut updates = sessions.subscribe("directory");
-        sessions.ready().await?;
-        let directory = loop {
-            match tokio::time::timeout(Duration::from_secs(30), updates.next()).await {
-                Ok(Some(StateUpdate::Snapshot(value) | StateUpdate::Reset(value))) => break value,
-                Ok(Some(StateUpdate::Error(error))) => return Err(error.into()),
-                Ok(Some(StateUpdate::Ops { .. })) => {}
-                Ok(None) => return Err(anyhow!("the directory ended")),
-                Err(_) => return Err(anyhow!("no directory within 30 s")),
-            }
-        };
-        if json {
-            println!("{directory}");
-            return Ok(0);
-        }
-        let list = directory["sessions"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        if list.is_empty() {
-            println!("no sessions");
-        }
-        for session in list {
-            println!("{}", describe_session(&session));
-        }
-        Ok(0)
-    }
-
-    /// Prints the view's snapshot, then each change, holding again when the
-    /// worker is lost and reconnecting when the server is.
-    async fn watch(&self, session: &str, json: bool) -> Result<i32> {
-        Err(self
-            .follow(session, |followed| match followed {
-                Followed::Update(update) => print_update(&update, json),
-                Followed::ServerLost => print_note("server link lost; reconnecting", json),
-                Followed::Reconnected => print_note("reconnected; holding again", json),
-                Followed::ViewEnded(why) => {
-                    print_note(&format!("view ended ({why}); holding again"), json)
-                }
-            })
-            .await)
-    }
-
-    /// Follows the session's view into `sink`: its snapshot, then each
-    /// change. It holds the view again when the worker is lost, and
-    /// reconnects (starting a server) when the server is. It ends only when
-    /// the first hold fails, with that error.
-    pub(crate) async fn follow(
-        &self,
-        session: &str,
-        mut sink: impl FnMut(Followed),
-    ) -> anyhow::Error {
-        let mut first = true;
-        loop {
-            let chat = self.chat(session);
-            let mut updates = chat.subscribe("view");
-            match chat.ready().await {
-                Ok(_) => {}
-                Err(error) if error.code == ErrorCode::Unavailable && !first => {
-                    (self.report)(format!("watch: {error}; holding again"));
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    continue;
-                }
-                Err(error) => return error.into(),
-            }
-            first = false;
-            loop {
-                tokio::select! {
-                    update = updates.next() => match update {
-                        Some(update) => sink(Followed::Update(update)),
-                        None => break,
-                    },
-                    () = self.lost.notified() => {
-                        sink(Followed::ServerLost);
-                        self.reconnect().await;
-                        sink(Followed::Reconnected);
-                    }
-                }
-            }
-            let why = match chat.status() {
-                noel_chord::RefStatus::Gone(error) => error.to_string(),
-                other => format!("{other:?}"),
-            };
-            sink(Followed::ViewEnded(why));
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-}
-
-async fn call(reference: &RemoteRef, method: &str, args: Value) -> Result<Value> {
-    reference.ready().await?;
-    let result = reference.call(method, Some(args)).await?;
-    Ok(result.unwrap_or(Value::Null))
+        .await)
 }
 
 /// A link to the server at `endpoint`. ssh asks on the terminal (a password,
 /// an unknown host key) only when `interactive`.
-async fn open(endpoint: &Endpoint, interactive: bool, report: &Report) -> Result<noel_chord::Link> {
+async fn open(
+    endpoint: &Endpoint,
+    interactive: bool,
+    report: &Report,
+) -> Result<noel_chord::v2::Link> {
     match endpoint {
-        Endpoint::Local => link(dial(true, report).await?).await,
+        Endpoint::Paired(paired) => super::remote::connect(paired).await,
+        Endpoint::Local => websocket_link(dial(true, report).await?).await,
         Endpoint::Ssh {
             destination,
             program,
@@ -606,16 +694,6 @@ pub(crate) async fn dial(autostart: bool, report: &Report) -> Result<UnixStream>
     }
 }
 
-async fn link<S>(stream: S) -> Result<noel_chord::Link>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (socket, _) = tokio_tungstenite::client_async("ws://localhost/chord", stream)
-        .await
-        .map_err(|error| anyhow!("websocket upgrade: {error}"))?;
-    Ok(websocket(socket, WebSocketOptions::default()))
-}
-
 /// The remote command: `<program> bridge`, the program quoted for the
 /// remote shell, a leading `~/` left for it to expand to its home.
 fn bridge_command(program: &str) -> String {
@@ -634,7 +712,7 @@ async fn open_ssh(
     program: &str,
     interactive: bool,
     report: &Report,
-) -> Result<noel_chord::Link> {
+) -> Result<noel_chord::v2::Link> {
     let mut command = tokio::process::Command::new("ssh");
     command.args(["-T", "-e", "none"]);
     if !interactive {
@@ -675,7 +753,7 @@ async fn open_ssh(
         io: Some(tokio::io::join(stdout, stdin)),
         child: Some(child),
     };
-    match link(stream).await {
+    match websocket_link(stream).await {
         Ok(link) => {
             let said = kept
                 .lock()
@@ -807,35 +885,29 @@ fn print_update(update: &StateUpdate, json: bool) {
     if json {
         let line = match update {
             StateUpdate::Snapshot(value) => json!({ "snapshot": value }),
-            StateUpdate::Reset(value) => json!({ "reset": value }),
             StateUpdate::Ops { ops, value } => json!({
                 "ops": ops.iter().map(Op::to_json).collect::<Vec<_>>(),
                 "value": value,
             }),
-            StateUpdate::Error(error) => json!({ "error": error.to_string() }),
+            StateUpdate::Failed(error) => json!({ "error": error.to_string() }),
         };
         println!("{line}");
         return;
     }
     match update {
-        StateUpdate::Snapshot(value) | StateUpdate::Reset(value) => {
-            let kind = if matches!(update, StateUpdate::Snapshot(_)) {
-                "snapshot"
-            } else {
-                "reset"
-            };
-            println!("== {kind}");
+        StateUpdate::Snapshot(value) => {
+            println!("== snapshot");
             for line in render_view(value) {
                 println!("{line}");
             }
-            println!("== end of {kind}");
+            println!("== end of snapshot");
         }
         StateUpdate::Ops { ops, .. } => {
             for op in ops {
                 println!("{}", render_op(op));
             }
         }
-        StateUpdate::Error(error) => println!("== error: {error}"),
+        StateUpdate::Failed(error) => println!("== error: {error}"),
     }
 }
 
@@ -852,8 +924,11 @@ fn render_view(view: &Value) -> Vec<String> {
         agent["model"].as_str().unwrap_or("-"),
         agent["thinkingLevel"].as_str().unwrap_or("-"),
     ));
-    for (index, entry) in view["entries"].as_array().into_iter().flatten().enumerate() {
-        lines.push(format!("[{}] {}", index + 1, render_entry(entry)));
+    if let Some(before) = view["before"].as_u64() {
+        lines.push(format!("(entries 1-{before} not shown)"));
+    }
+    for entry in view["entries"].as_array().into_iter().flatten() {
+        lines.push(format!("[{}] {}", entry["id"], render_entry(entry)));
     }
     let live = &view["docs"]["pi.live"];
     if let Some(run) = live.get("run") {
@@ -895,10 +970,27 @@ fn render_view(view: &Value) -> Vec<String> {
             }
         ));
     }
-    if let Some(compaction) = live.get("compaction") {
+    for compaction in live["compactions"].as_array().into_iter().flatten() {
         lines.push(format!(
             "live: compacting ({})",
-            compaction["reason"].as_str().unwrap_or_default()
+            compaction["trigger"].as_str().unwrap_or_default()
+        ));
+    }
+    if let Some(failure) = live.get("compactionFailure") {
+        lines.push(format!(
+            "live: compaction failed ({}): {}",
+            failure["trigger"].as_str().unwrap_or_default(),
+            failure["error"].as_str().unwrap_or_default()
+        ));
+    }
+    if let Some(failure) = live.get("runFailure") {
+        lines.push(format!(
+            "live: last run ended without an answer ({}){}",
+            failure["reason"].as_str().unwrap_or_default(),
+            failure["detail"]
+                .as_str()
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
         ));
     }
     for item in view["docs"]["pi.inbox"]["items"]
@@ -923,7 +1015,26 @@ fn render_view(view: &Value) -> Vec<String> {
     lines
 }
 
-fn render_entry(entry: &Value) -> String {
+/// A history entry as a line: its message, or what a marker did.
+fn render_entry(record: &Value) -> String {
+    match record["kind"].as_str() {
+        Some("pi.compaction") => {
+            let data = &record["data"];
+            return format!(
+                "compaction ({}): {} messages summarized, {} kept: {}",
+                data["reason"].as_str().unwrap_or_default(),
+                data["omittedMessages"],
+                data["retainedMessages"],
+                one_line(data["summary"].as_str().unwrap_or_default(), 120)
+            );
+        }
+        Some("pi.reset") => return format!("reset to {} messages", record["data"]["messages"]),
+        _ => {}
+    }
+    let entry = record
+        .get("model")
+        .and_then(|model| model.get(0))
+        .unwrap_or(record);
     let role = entry["role"].as_str().unwrap_or_default();
     match role {
         "toolResult" => format!(
@@ -1063,9 +1174,11 @@ mod tests {
     fn a_view_renders_its_entries_partial_tools_and_queue() {
         let view = json!({
             "conversation": {"id": "s1", "cwd": "/w"},
+            "before": 3,
             "entries": [
-                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-                {"role": "assistant", "content": [{"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "ls"}}], "stopReason": "toolUse"},
+                {"id": 4, "kind": "pi.user", "model": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]},
+                {"id": 5, "kind": "pi.assistant", "model": [{"role": "assistant", "content": [{"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "ls"}}], "stopReason": "toolUse"}]},
+                {"id": 6, "kind": "pi.compaction", "head": 6, "data": {"reason": "threshold", "summary": "did things", "omittedMessages": 2, "retainedMessages": 1}},
             ],
             "docs": {
                 "pi.agent": {"model": "faux/script", "thinkingLevel": "off", "cwd": "/w"},
@@ -1083,8 +1196,10 @@ mod tests {
             lines,
             [
                 "session s1 in /w (model faux/script, thinking off)",
-                "[1] user: hi",
-                "[2] assistant:  -> bash({\"command\":\"ls\"})",
+                "(entries 1-3 not shown)",
+                "[4] user: hi",
+                "[5] assistant:  -> bash({\"command\":\"ls\"})",
+                "[6] compaction (threshold): 2 messages summarized, 1 kept: did things",
                 "live: run r1 (inputs 1)",
                 "live: reply attempt 1: partial \"Hel\"",
                 "live: tool bash c1 running: output \"a\\\\nb\"",

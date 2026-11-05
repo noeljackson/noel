@@ -1,14 +1,19 @@
 [workspace]
+exclude = ["apps/desktop"]
 members = [
     "crates/noel-agent",
     "crates/noel-ai",
     "crates/noel-chord",
     "crates/noel-cli",
+    "crates/noel-client",
+    "crates/noel-codemode",
     "crates/noel-config",
     "crates/noel-core",
     "crates/noel-env",
+    "crates/noel-ffi",
     "crates/noel-env-daemon",
     "crates/noel-parity",
+    "crates/noel-plugin",
     "crates/noel-providers",
     "crates/noel-session",
     "crates/noel-tools",

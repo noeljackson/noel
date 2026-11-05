@@ -1,0 +1,869 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "3551ec07eb87afebac20191958163ae58976f1d0",
+    "package": "packages/chord",
+    "packageCommit": "3551ec07eb87afebac20191958163ae58976f1d0",
+    "script": "/ts-parity/chord-v2-messages-fixture.ts"
+  },
+  "messages": [
+    {
+      "message": {
+        "kind": "hello",
+        "protocol": 1,
+        "incarnation": "0190f5a1-2b3c-7d4e-8f00-112233445566",
+        "calls": 256
+      },
+      "hex": "00010190f5a12b3c7d4e8f001122334455668002"
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        }
+      },
+      "hex": "0100096e6f656c2e63686174012a6091124251ff09207b2273657373696f6e223a227331227d0773657373696f6e0b7b226964223a227331227d00"
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "origin": 3,
+        "hold": 200,
+        "type": "noel.sessions",
+        "version": 2,
+        "fingerprint": "0f0f53cdbca05450",
+        "params": "{}",
+        "address": {
+          "kind": "server",
+          "params": {}
+        },
+        "principal": {
+          "kind": "owner",
+          "via": "device"
+        },
+        "incarnation": "0190f5a1-2b3c-7d4e-8f00-112233445566",
+        "chain": [
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-ffeeddccbbaa"
+        ],
+        "limit": 67108864
+      },
+      "hex": "8103c8010d6e6f656c2e73657373696f6e73020f0f53cdbca05450047b7d06736572766572027b7d0f1f7b226b696e64223a226f776e6572222c22766961223a22646576696365227d0190f5a12b3c7d4e8f00112233445566020190f5a12b3c7d4e8f001122334455660190f5a12b3c7d4e8f00ffeeddccbbaa80808020"
+    },
+    {
+      "message": {
+        "kind": "release",
+        "hold": 7
+      },
+      "hex": "0207"
+    },
+    {
+      "message": {
+        "kind": "release",
+        "origin": 1,
+        "hold": 7
+      },
+      "hex": "820107"
+    },
+    {
+      "message": {
+        "kind": "call",
+        "call": 1,
+        "hold": 0,
+        "method": 3,
+        "args": "{\"text\":\"héllo €\"}"
+      },
+      "hex": "03010003012a7b2274657874223a2268c3a96c6c6f20e282ac227d"
+    },
+    {
+      "message": {
+        "kind": "call",
+        "origin": 2,
+        "call": 128,
+        "hold": 0,
+        "method": 0
+      },
+      "hex": "83028001000000"
+    },
+    {
+      "message": {
+        "kind": "call",
+        "call": 2,
+        "hold": 0,
+        "method": 1,
+        "args": "{\"data\":{\"$bytes\":0}}",
+        "segments": [
+          {
+            "bytes": "010203"
+          },
+          {
+            "bytes": ""
+          }
+        ]
+      },
+      "hex": "03020001032a7b2264617461223a7b22246279746573223a307d7d020300010203"
+    },
+    {
+      "message": {
+        "kind": "abort",
+        "call": 16384
+      },
+      "hex": "04808001"
+    },
+    {
+      "message": {
+        "kind": "retry",
+        "hold": 1,
+        "hops": 16
+      },
+      "hex": "0b0110"
+    },
+    {
+      "message": {
+        "kind": "bound",
+        "holds": [
+          {
+            "hold": 0,
+            "variant": 1,
+            "members": [
+              {
+                "member": 0,
+                "value": "{\"entries\":[]}"
+              }
+            ],
+            "failed": []
+          },
+          {
+            "hold": 1,
+            "variant": 0,
+            "members": [],
+            "failed": [
+              {
+                "member": 2,
+                "error": {
+                  "code": "busy",
+                  "kind": "plugin",
+                  "message": "a run is active"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "hex": "0502000101001c7b22656e7472696573223a5b5d7d0001000001023b7b22636f6465223a2262757379222c226b696e64223a22706c7567696e222c226d657373616765223a22612072756e20697320616374697665227d"
+    },
+    {
+      "message": {
+        "kind": "state",
+        "origin": 9,
+        "holds": [
+          {
+            "hold": 0,
+            "members": [
+              {
+                "member": 0,
+                "ops": "[[\"a\",[\"entries\",0],\"x\"]]"
+              }
+            ],
+            "failed": [],
+            "retired": []
+          },
+          {
+            "hold": 1,
+            "members": [
+              {
+                "member": 1,
+                "ops": {
+                  "deflated": "4b4c4a0600"
+                }
+              }
+            ],
+            "failed": [
+              {
+                "member": 0,
+                "error": {
+                  "error": {
+                    "code": "unavailable",
+                    "message": "worker starting",
+                    "reason": "starting"
+                  },
+                  "kind": "chord"
+                }
+              }
+            ],
+            "retired": [
+              0,
+              2
+            ]
+          }
+        ]
+      },
+      "hex": "860902000100325b5b2261222c5b22656e7472696573222c305d2c2278225d5d000101010b4b4c4a060003005f7b226572726f72223a7b22636f6465223a22756e617661696c61626c65222c226d657373616765223a22776f726b6572207374617274696e67222c22726561736f6e223a227374617274696e67227d2c226b696e64223a2263686f7264227d020002"
+    },
+    {
+      "message": {
+        "kind": "ack"
+      },
+      "hex": "0d"
+    },
+    {
+      "message": {
+        "kind": "ack",
+        "origin": 4
+      },
+      "hex": "8d04"
+    },
+    {
+      "message": {
+        "kind": "closed",
+        "origin": 5
+      },
+      "hex": "8e05"
+    },
+    {
+      "message": {
+        "kind": "revoke",
+        "revocation": {
+          "device": "d1"
+        }
+      },
+      "hex": "110f7b22646576696365223a226431227d"
+    },
+    {
+      "message": {
+        "kind": "ping"
+      },
+      "hex": "0f"
+    },
+    {
+      "message": {
+        "kind": "pong"
+      },
+      "hex": "10"
+    },
+    {
+      "message": {
+        "kind": "failed",
+        "hold": 3,
+        "cause": {
+          "kind": "transient",
+          "error": {
+            "error": {
+              "code": "unavailable",
+              "message": "worker starting",
+              "reason": "starting"
+            },
+            "kind": "chord"
+          }
+        },
+        "retryIn": 0
+      },
+      "hex": "0703005f7b226572726f72223a7b22636f6465223a22756e617661696c61626c65222c226d657373616765223a22776f726b6572207374617274696e67222c22726561736f6e223a227374617274696e67227d2c226b696e64223a2263686f7264227d01"
+    },
+    {
+      "message": {
+        "kind": "failed",
+        "origin": 1,
+        "hold": 3,
+        "cause": {
+          "kind": "waiting",
+          "error": {
+            "code": "busy",
+            "kind": "plugin",
+            "message": "a run is active"
+          }
+        }
+      },
+      "hex": "870103023b7b22636f6465223a2262757379222c226b696e64223a22706c7567696e222c226d657373616765223a22612072756e20697320616374697665227d00"
+    },
+    {
+      "message": {
+        "kind": "failed",
+        "hold": 3,
+        "cause": {
+          "kind": "broken",
+          "error": {
+            "code": "busy",
+            "kind": "plugin",
+            "message": "a run is active"
+          }
+        }
+      },
+      "hex": "0703013b7b22636f6465223a2262757379222c226b696e64223a22706c7567696e222c226d657373616765223a22612072756e20697320616374697665227d00"
+    },
+    {
+      "message": {
+        "kind": "loading",
+        "hold": 3
+      },
+      "hex": "0c03"
+    },
+    {
+      "message": {
+        "kind": "result",
+        "call": 1,
+        "value": "{\"ok\":true}"
+      },
+      "hex": "080101167b226f6b223a747275657d"
+    },
+    {
+      "message": {
+        "kind": "result",
+        "origin": 7,
+        "call": 1
+      },
+      "hex": "88070100"
+    },
+    {
+      "message": {
+        "kind": "result",
+        "call": 1,
+        "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "hex": "08010180c080800078787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878"
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 1,
+        "error": {
+          "code": "busy",
+          "kind": "plugin",
+          "message": "a run is active"
+        }
+      },
+      "hex": "09013b7b22636f6465223a2262757379222c226b696e64223a22706c7567696e222c226d657373616765223a22612072756e20697320616374697665227d"
+    },
+    {
+      "message": {
+        "kind": "gone",
+        "hold": 4,
+        "error": {
+          "error": {
+            "code": "unavailable",
+            "message": "worker starting",
+            "reason": "starting"
+          },
+          "kind": "chord"
+        }
+      },
+      "hex": "0a045f7b226572726f72223a7b22636f6465223a22756e617661696c61626c65222c226d657373616765223a22776f726b6572207374617274696e67222c22726561736f6e223a227374617274696e67227d2c226b696e64223a2263686f7264227d"
+    }
+  ],
+  "checks": [
+    {
+      "message": {
+        "kind": "hello",
+        "protocol": 1,
+        "incarnation": "0190f5a1-2b3c-7d4e-8f00-112233445566",
+        "calls": 1
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "hello",
+        "protocol": 1,
+        "incarnation": "0190f5a1-2b3c-7d4e-8f00-112233445566",
+        "calls": 0
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hello",
+        "protocol": 9,
+        "incarnation": "0190f5a1-2b3c-7d4e-8f00-112233445566",
+        "calls": 1
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "ack",
+        "origin": 0
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "ack",
+        "origin": 1
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "closed",
+        "origin": 0
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "retry",
+        "hold": 0,
+        "hops": 0
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "retry",
+        "hold": 0,
+        "hops": 1
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "retry",
+        "hold": 0,
+        "hops": 17
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 0,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "principal": {
+          "via": "device"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "principal": {
+          "kind": 1
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "principal": {
+          "kind": "owner"
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "chain": [
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566"
+        ]
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "chain": [
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566",
+          "0190f5a1-2b3c-7d4e-8f00-112233445566"
+        ]
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "code": "c",
+          "kind": "plugin",
+          "message": "m"
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "code": "c",
+          "details": [
+            1
+          ],
+          "kind": "plugin",
+          "message": "m"
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "code": "c",
+          "kind": "plugin"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "code": "c",
+          "kind": "plugin",
+          "message": "m",
+          "stack": "s"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "error": 1,
+          "kind": "chord"
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "error": {},
+          "kind": "chord",
+          "x": 1
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "error",
+        "call": 0,
+        "error": {
+          "kind": "other"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "gone",
+        "hold": 0,
+        "error": {
+          "kind": "chord"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "failed",
+        "hold": 0,
+        "cause": {
+          "kind": "broken",
+          "error": {
+            "kind": "plugin",
+            "code": 1,
+            "message": "m"
+          }
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "bound",
+        "holds": [
+          {
+            "hold": 0,
+            "variant": 0,
+            "members": [],
+            "failed": [
+              {
+                "member": 0,
+                "error": {
+                  "kind": "x"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "state",
+        "holds": [
+          {
+            "hold": 0,
+            "members": [],
+            "failed": [
+              {
+                "member": 0,
+                "error": {
+                  "kind": "x"
+                }
+              }
+            ],
+            "retired": []
+          }
+        ]
+      },
+      "ok": false
+    }
+  ],
+  "envelopes": [
+    {
+      "input": {
+        "code": "gone",
+        "message": "m"
+      },
+      "json": {
+        "code": "gone",
+        "message": "m"
+      }
+    },
+    {
+      "input": {
+        "code": "invalid",
+        "reason": "args",
+        "message": "m",
+        "details": {
+          "at": [
+            "x"
+          ]
+        }
+      },
+      "json": {
+        "code": "invalid",
+        "reason": "args",
+        "message": "m",
+        "details": {
+          "at": [
+            "x"
+          ]
+        }
+      }
+    },
+    {
+      "input": {
+        "code": "too_large",
+        "reason": "part",
+        "message": "m"
+      },
+      "json": {
+        "code": "too_large",
+        "reason": "part",
+        "message": "m"
+      }
+    },
+    {
+      "input": {
+        "code": "released",
+        "reason": "settled",
+        "message": "m"
+      },
+      "json": {
+        "code": "released",
+        "reason": "settled",
+        "message": "m"
+      }
+    },
+    {
+      "input": {
+        "code": "invalid",
+        "message": "m"
+      },
+      "error": "Invalid ChordError JSON: reason not allowed for invalid"
+    },
+    {
+      "input": {
+        "code": "gone",
+        "reason": "x",
+        "message": "m"
+      },
+      "error": "Invalid ChordError JSON: reason not allowed for gone"
+    },
+    {
+      "input": {
+        "code": "busy",
+        "message": "m"
+      },
+      "error": "Invalid ChordError JSON: unknown code"
+    },
+    {
+      "input": {
+        "code": "gone"
+      },
+      "error": "Invalid ChordError JSON: message is not a string"
+    },
+    {
+      "input": {
+        "code": "gone",
+        "message": "m",
+        "stack": "s"
+      },
+      "error": "Invalid ChordError JSON: unknown key \"stack\""
+    },
+    {
+      "input": [],
+      "error": "Invalid ChordError JSON: not an object"
+    },
+    {
+      "input": "gone",
+      "error": "Invalid ChordError JSON: not an object"
+    }
+  ]
+}

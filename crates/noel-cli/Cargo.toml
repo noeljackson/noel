@@ -3,10 +3,16 @@ name = "noel-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "noel"
 
 [[bin]]
 name = "noel"
 path = "src/main.rs"
+
+# The sample plugin (roadmap phase 7), for its tests and as an example.
+[[bin]]
+name = "noel-sample-plugin"
+path = "src/bin/noel-sample-plugin.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -20,7 +26,10 @@ libc = "=0.2.186"
 nix.workspace = true
 noel-ai = { path = "../noel-ai" }
 noel-chord = { path = "../noel-chord" }
+noel-client = { path = "../noel-client" }
+noel-plugin = { path = "../noel-plugin" }
 noel-config = { path = "../noel-config" }
+noel-codemode = { path = "../noel-codemode" }
 noel-core = { path = "../noel-core" }
 noel-env = { path = "../noel-env" }
 noel-tui = { path = "../noel-tui" }
@@ -29,6 +38,9 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 zip.workspace = true
 time = { workspace = true, features = ["formatting", "parsing"] }
 tokio = { workspace = true, features = ["net"] }

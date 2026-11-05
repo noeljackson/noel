@@ -38,10 +38,10 @@ use tokio::sync::mpsc;
 
 use crate::{
     continue_turn_streaming_events, run_saved_prompt_streaming_events, user_message, AgentError,
-    CancellationToken, CompactionKind, CompactionRecord, ConversationMessage, MessageRole,
-    PastSubmission, QueueItem, QueueItemId, QueueMode, RetryAbort, Run, RunControl, RunStart,
-    RunStatus, Runtime, SessionError, SessionState, SessionStore, SteeringMailbox, SubmissionKind,
-    ToolEvent, TurnEvent, STEERING_JOIN,
+    CancellationToken, CompactionKind, CompactionRecord, ConversationMessage, FailureReason,
+    MessageRole, PastSubmission, QueueItem, QueueItemId, QueueMode, RetryAbort, Run, RunControl,
+    RunFailure, RunStart, RunStatus, Runtime, SessionError, SessionState, SessionStore,
+    SteeringMailbox, SubmissionKind, ToolEvent, TurnEvent, STEERING_JOIN,
 };
 
 /// What a mode supplies to the controller, and where its events go.
@@ -200,7 +200,14 @@ pub enum Withdrawal {
 pub enum Outcome {
     Completed,
     Aborted,
+    /// The model request failed (`model_error`).
     Failed(String),
+    /// The run ended without an answer for another of Durable's reasons:
+    /// `interrupted`, `restart_limit`, `nothing_to_answer`, `turn_limit`.
+    Unanswered {
+        reason: FailureReason,
+        detail: String,
+    },
 }
 
 impl Outcome {
@@ -208,7 +215,31 @@ impl Outcome {
         match self {
             Outcome::Completed => RunStatus::Completed,
             Outcome::Aborted => RunStatus::Aborted,
-            Outcome::Failed(_) => RunStatus::Failed,
+            Outcome::Failed(_) | Outcome::Unanswered { .. } => RunStatus::Failed,
+        }
+    }
+
+    /// A failed run's reason and detail (Durable's `runFailure`).
+    pub fn failure(&self) -> Option<RunFailure> {
+        match self {
+            Outcome::Completed | Outcome::Aborted => None,
+            Outcome::Failed(error) => Some(RunFailure {
+                reason: FailureReason::ModelError,
+                detail: error.clone(),
+            }),
+            Outcome::Unanswered { reason, detail } => Some(RunFailure {
+                reason: *reason,
+                detail: detail.clone(),
+            }),
+        }
+    }
+
+    /// The error a failed run ends with, as a client shows it.
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Outcome::Failed(error) => Some(error),
+            Outcome::Unanswered { detail, .. } => Some(detail),
+            Outcome::Completed | Outcome::Aborted => None,
         }
     }
 }
@@ -344,8 +375,15 @@ enum Call {
         message: ConversationMessage,
         placed: Vec<QueueItemId>,
     },
-    /// The saved context of an interrupted run.
-    Resume,
+    /// The saved context of an interrupted run (or a continue's). With
+    /// `charged`, the host died while the model request of this attempt
+    /// was in flight.
+    Resume { charged: Option<u64> },
+    /// The run ends at once, without an engine call.
+    Settle(Outcome),
+    /// A continue: queued follow-ups, else the context as it is, else
+    /// nothing to answer. Decided once the run is active.
+    Continue,
 }
 
 impl Call {
@@ -353,10 +391,14 @@ impl Call {
         match self {
             Call::Prompt(_) => CallInput::Prompt,
             Call::FollowUps { .. } => CallInput::FollowUps,
-            Call::Resume => CallInput::Resume,
+            Call::Resume { .. } | Call::Settle(_) | Call::Continue => CallInput::Resume,
         }
     }
 }
+
+/// What a continue's run does when the context has nothing to answer.
+const NOTHING_TO_ANSWER: &str =
+    "Nothing to answer: the conversation does not end in a user message or tool results";
 
 /// One open session's driver.
 pub struct SessionController<H> {
@@ -558,15 +600,90 @@ impl<H: Host> SessionController<H> {
         if run.status != RunStatus::Interrupted {
             return Err(format!("run {expected_run_id} is not interrupted"));
         }
+        let crashed = !run.closed;
         let Self { runtime, live } = self;
         let live = live.get_mut().expect("controller state");
         let provider = live.host.provider(runtime).await?;
+        // A stop that was not a close is a crash (Durable section 5.4): it
+        // counts a restart, and a run at the limit ends instead; a model
+        // request it cut off is a failed attempt.
+        let mut call = Call::Resume { charged: None };
+        if crashed {
+            let restarts = runtime
+                .count_restart(expected_run_id)
+                .map_err(|error| error.to_string())?;
+            let limit = runtime.systems.restart_limit;
+            let session = runtime.session();
+            if restarts >= limit {
+                call = Call::Settle(Outcome::Unanswered {
+                    reason: FailureReason::RestartLimit,
+                    detail: format!(
+                        "The run was interrupted {restarts} times in a row; it is not run again"
+                    ),
+                });
+            } else if session.has_unfinished_turn() && session.pending_tool_calls().is_none() {
+                // A crash during a retry's backoff cut off no request; the
+                // partial the open recovered names the attempt.
+                let hint = runtime
+                    .store
+                    .as_ref()
+                    .map(SessionStore::resume_hint)
+                    .unwrap_or_default();
+                if !hint.waiting {
+                    call = Call::Resume {
+                        charged: Some(hint.attempt.unwrap_or(1).max(1)),
+                    };
+                }
+            }
+        }
         runtime.resume_run(expected_run_id);
         Ok(Start {
             run_id: expected_run_id.to_owned(),
             provider,
-            call: Call::Resume,
+            call,
         })
+    }
+
+    /// Durable's `continue` submission, while no run is active: a run on
+    /// the context as it is, without a user message. Queued follow-ups are
+    /// placed into it first; a context with nothing to answer ends it
+    /// `nothing_to_answer`. A repeated `requestId` gets its first
+    /// submission.
+    pub async fn continue_run(
+        &mut self,
+        request_id: Option<String>,
+    ) -> Result<Submitted, SubmitError> {
+        let Self { runtime, live } = self;
+        let live = live.get_mut().expect("controller state");
+        let submission = Submission {
+            kind: SubmissionKind::Continue,
+            request_id,
+            content: String::new(),
+            images: Vec::new(),
+            expected_run_id: None,
+        };
+        if let Some(repeat) = live.repeat(&submission, &runtime.session().runs)? {
+            return Ok(Submitted::Repeated(repeat));
+        }
+        let provider = live
+            .host
+            .provider(runtime)
+            .await
+            .map_err(SubmitError::Refused)?;
+        let run = RunStart {
+            id: new_id(),
+            request_id: submission.request_id,
+            kind: SubmissionKind::Continue,
+        };
+        let run_id = run.id.clone();
+        runtime
+            .start_bare_run(run)
+            .map_err(|error| SubmitError::Refused(error.to_string()))?;
+        Ok(Submitted::Started(Start {
+            run_id,
+            provider,
+            call: Call::Continue,
+        }))
     }
 
     /// Compacts the session now.
@@ -614,6 +731,10 @@ impl<H: Host> SessionController<H> {
             let control = RunControl {
                 steering: live.queue.steering.clone(),
                 run_id: Some(run_id.clone()),
+                interrupted_attempt: match &call {
+                    Call::Resume { charged } => *charged,
+                    _ => None,
+                },
                 ..RunControl::default()
             };
             let mut session = runtime.session().clone();
@@ -637,9 +758,25 @@ impl<H: Host> SessionController<H> {
         let live = &*live;
         let mut next = Some(call);
         let outcome = loop {
-            let Some(call) = next.take() else {
+            let Some(mut call) = next.take() else {
                 break Outcome::Completed;
             };
+            if let Call::Continue = call {
+                let follow_ups = lock(live).take_follow_ups();
+                call = match follow_ups {
+                    Some(call) => call,
+                    None if runtime.session().has_unfinished_turn() => {
+                        Call::Resume { charged: None }
+                    }
+                    None => Call::Settle(Outcome::Unanswered {
+                        reason: FailureReason::NothingToAnswer,
+                        detail: NOTHING_TO_ANSWER.into(),
+                    }),
+                };
+            }
+            if let Call::Settle(outcome) = call {
+                break outcome;
+            }
             lock(live).host.event(Event::CallStarted {
                 input: call.input(),
             });
@@ -664,12 +801,20 @@ impl<H: Host> SessionController<H> {
                         )
                         .await
                     }
-                    Call::Resume => {
+                    Call::Resume { .. } => {
                         continue_turn_streaming_events(runtime, provider, &control, on_event).await
+                    }
+                    Call::Settle(_) | Call::Continue => {
+                        unreachable!("decided before the engine call")
                     }
                 }
             };
             let Some(result) = drive(turn, inbox, live, &mut handle).await else {
+                // A close, not a crash: the resume that continues the run
+                // counts no restart.
+                if let Err(error) = runtime.close_run(&run_id) {
+                    lock(live).host.event(Event::SaveFailed { error: &error });
+                }
                 return false;
             };
             let mut live = lock(live);
@@ -677,10 +822,22 @@ impl<H: Host> SessionController<H> {
             match result {
                 Ok(_) => next = live.take_follow_ups(),
                 Err(AgentError::Cancelled) => break Outcome::Aborted,
+                Err(AgentError::Interrupted(detail)) => {
+                    break Outcome::Unanswered {
+                        reason: FailureReason::Interrupted,
+                        detail,
+                    }
+                }
+                Err(error @ AgentError::RoundLimitReached { .. }) => {
+                    break Outcome::Unanswered {
+                        reason: FailureReason::TurnLimit,
+                        detail: error.to_string(),
+                    }
+                }
                 Err(error) => break Outcome::Failed(error.to_string()),
             }
         };
-        if let Err(error) = runtime.finish_run(&run_id, outcome.status()) {
+        if let Err(error) = runtime.end_run(&run_id, outcome.status(), outcome.failure()) {
             lock(live).host.event(Event::SaveFailed { error: &error });
         }
         lock(live).settle(&run_id, &outcome);
@@ -730,6 +887,10 @@ impl<H: Host> Busy<'_, H> {
         let runs = self.runs();
         if let Some(repeat) = self.live.repeat(&submission, &runs)? {
             return Ok(Enqueued::Repeated(repeat));
+        }
+        // A continue is admitted only while idle (Durable).
+        if submission.kind == SubmissionKind::Continue {
+            return Err(SubmitError::Busy);
         }
         let mode = match when_busy {
             WhenBusy::Reject => return Err(SubmitError::Busy),

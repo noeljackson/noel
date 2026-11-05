@@ -1,0 +1,11 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "commit": "7dc38ff0e9490483b368c2b14531c9199c4cbee1",
+    "file": "packages/codemode/src/runtime/prelude-source.ts"
+  },
+  "maxStoreValueChars": 262144,
+  "maxStoreTotalChars": 1048576,
+  "maxOutputChars": 16777216,
+  "maxOutputItems": 100000
+}
