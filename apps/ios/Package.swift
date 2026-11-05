@@ -5,7 +5,7 @@ import PackageDescription
 
 let package = Package(
     name: "NoelKit",
-    platforms: [.iOS(.v17), .macOS(.v15)],
+    platforms: [.iOS(.v17), .macOS("15.0")],
     products: [.library(name: "NoelKit", targets: ["NoelKit"])],
     dependencies: [
         // withExec (stdin and stdout of one exec channel) is not in a tagged
