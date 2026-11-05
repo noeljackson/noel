@@ -131,7 +131,7 @@ v1 pin `@earendil-works/chord@1.5.0`).
 - Done: `scripts/app-smoke.sh` runs it against a real server locally,
   through `noel app` and through ssh, and draws the window under Xvfb.
 
-### 10. `noel-ffi` and iOS (Rust side done; app needs macOS, #125)
+### 10. `noel-ffi` and iOS (Done, #125)
 - `crates/noel-ffi`: noel-client's app link through UniFFI, over a byte
   channel the app opens (SSH to `noel bridge`), events as records; tested
   over a channel (`tests/channel.rs`); static libraries for
@@ -139,8 +139,10 @@ v1 pin `@earendil-works/chord@1.5.0`).
   (`make ios-libs`). `noel-client::app` is shared with the desktop app.
 - `apps/ios`: NoelKit and the SwiftUI app (sessions, chat, plugin panels),
   `make ios` and `.github/workflows/ios.yml` (macOS runner). Spec §15.
-- Open: the Swift side has not been compiled here (no macOS; the Swift
-  toolchain download is blocked); the macOS workflow is its first build.
+- The macOS workflow (`macos-15`, Xcode 16) builds the static libraries,
+  the xcframework, NoelKit and the app for the arm64 simulator. Citadel is
+  pinned by commit for `withExec` (not in a tagged release yet). The app
+  has not been run against a server from a device or simulator.
 
 ### 11. Pairing and remote access (Done, off by default, #126)
 - `server.listen` adds a TLS listener (self-signed, fingerprint pinned);
