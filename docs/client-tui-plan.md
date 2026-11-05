@@ -69,6 +69,14 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
 
 ## Status
 
+- Done: accepted by the owner (2026-11-05), with slice 4's comparison
+  against the recorded in-process transcript. Two choices stay open, with
+  the current behaviour kept until the owner picks:
+  - `/name` and deleting the session shown run on its worker; the server
+    could instead forward them to the worker holding the session.
+  - A second `noel` with other flags on a running worker gets a notice; the
+    worker could instead restart when idle, or the second `noel` could be
+    refused.
 - Every slice is built, and `make check` and `make e2e` pass. Interactive
   `noel` is always a client; the in-process TUI is removed (slice 7). The
   spec (§7.2, §7.4, §9) and the non-parity register ("The TUI Is a Client
