@@ -100,8 +100,11 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
   - The only difference it found is an empty thinking row the in-process
     TUI kept for a reply that did not think, which neither TUI draws, so
     the comparison drops it.
-  - `make e2e` runs the same suite (`scripts/e2e-render.sh`) without the
-    reference build. Before slice 7, every e2e suite also passed both in
+  - The in-process transcript is recorded in
+    `tests/fixtures/render-inprocess.txt`. `make e2e` runs the same suite
+    (`scripts/e2e-render.sh`) without the reference build and compares the
+    client's transcript with that recording; `make e2e-render-inprocess`
+    records it again. Before slice 7, every e2e suite also passed both in
     process and as a client.
 - Extension UI needs no relay: extension hosts have no UI in process either
   (`hasUI` is false).

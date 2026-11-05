@@ -5,7 +5,9 @@ set -euo pipefail
 # live, as the TUI streams it from the session's view, and reopened, as the
 # TUI rebuilds it from the saved entries (plain noel, and --attach). With
 # NOEL_INPROCESS_BIN (a build with the in-process TUI, `make
-# e2e-render-inprocess`), the same script also runs in process with it. The
+# e2e-render-inprocess`), the same script also runs in process with it, and
+# its transcript is recorded in tests/fixtures/render-inprocess.txt; without
+# it, the client's transcript is compared with that recording. The
 # transcripts must match.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e-isolate.sh
@@ -97,4 +99,14 @@ for name in "${names[@]:1}"; do
   diff -u "${work_dir}/body-live.txt" "${work_dir}/body-${name}.txt" >&2 \
     || fail "the ${name} transcript differs from the live one"
 done
+# The in-process TUI's transcript of the same script, recorded from the
+# reference build: written when it ran here (make e2e-render-inprocess),
+# otherwise compared, so `make e2e` checks the client against it too.
+fixture="${repo_root}/tests/fixtures/render-inprocess.txt"
+if [ -n "${NOEL_INPROCESS_BIN:-}" ]; then
+  cp "${work_dir}/body-inprocess.txt" "${fixture}"
+else
+  diff -u "${fixture}" "${work_dir}/body-live.txt" >&2 \
+    || fail "the client's transcript differs from the in-process one (${fixture})"
+fi
 echo "render e2e passed (artifacts: ${work_dir})"
