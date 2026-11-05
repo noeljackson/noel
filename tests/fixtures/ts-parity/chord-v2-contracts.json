@@ -452,7 +452,8 @@
                           "kind": {
                             "enum": [
                               "system",
-                              "error"
+                              "error",
+                              "tool"
                             ]
                           },
                           "text": {
@@ -489,7 +490,7 @@
           }
         }
       },
-      "fingerprint": "29cd23ce3eda128d"
+      "fingerprint": "ae318bc69debbc73"
     },
     {
       "declaration": {

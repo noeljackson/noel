@@ -971,6 +971,7 @@ impl CommandUi for CommandOutput {
     fn push(&mut self, kind: crate::TuiEntryKind, text: impl Into<String>) {
         let kind = match kind {
             crate::TuiEntryKind::Error => "error",
+            crate::TuiEntryKind::Tool => "tool",
             _ => "system",
         };
         self.entries
@@ -1037,6 +1038,31 @@ async fn run_command(
         }
         refresh(controller);
         return (json!({"entries": output.entries}), None);
+    }
+    // `!command`: a shell command in the session's environment, its output
+    // shown and not sent to the model (the client resolves `!!`).
+    if let Some(command) = line
+        .strip_prefix('!')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        let command = command.to_owned();
+        let (runtime, _) = controller.parts_mut();
+        let entry = match crate::run_excluded_bash_result(runtime, command.clone()).await {
+            Ok(result) => {
+                let text = crate::format_bash_completed(&command, &result.output);
+                let text = if result.is_error {
+                    text.replacen("completed", "failed", 1)
+                } else {
+                    text
+                };
+                json!({"kind": "tool", "text": text})
+            }
+            Err(error) => {
+                json!({"kind": "error", "text": format!("failed bash\n$ {command}\n{error}")})
+            }
+        };
+        return (json!({"entries": [entry]}), None);
     }
     if line == "/undo" {
         // The prompt goes back to the client's draft.
