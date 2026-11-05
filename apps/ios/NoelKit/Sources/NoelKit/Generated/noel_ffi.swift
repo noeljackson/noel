@@ -829,7 +829,7 @@ public func FfiConverterTypeByteChannel_lower(_ value: ByteChannel) -> UInt64 {
  */
 public protocol ChannelOpener: AnyObject, Sendable {
     
-    func `open`(delivery: Delivery)  -> ByteChannel?
+    func openChannel(delivery: Delivery)  -> ByteChannel?
     
 }
 /**
@@ -889,10 +889,10 @@ open class ChannelOpenerImpl: ChannelOpener, @unchecked Sendable {
     
 
     
-open func `open`(delivery: Delivery) -> ByteChannel?  {
+open func openChannel(delivery: Delivery) -> ByteChannel?  {
     return try!  FfiConverterOptionTypeByteChannel.lift(try! rustCall() {
         uniffiCallStatus in
-    uniffi_noel_ffi_fn_method_channelopener_open(
+    uniffi_noel_ffi_fn_method_channelopener_open_channel(
             self.uniffiCloneHandle(),
         FfiConverterTypeDelivery_lower(delivery),uniffiCallStatus
     )
@@ -927,7 +927,7 @@ fileprivate struct UniffiCallbackInterfaceChannelOpener {
                 fatalError("Uniffi callback interface ChannelOpener: handle missing in uniffiClone")
             }
         },
-        `open`: { (
+        openChannel: { (
             uniffiHandle: UInt64,
             delivery: UInt64,
             uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
@@ -938,7 +938,7 @@ fileprivate struct UniffiCallbackInterfaceChannelOpener {
                 guard let uniffiObj = try? FfiConverterTypeChannelOpener.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
-                return uniffiObj.`open`(
+                return uniffiObj.openChannel(
                      delivery: try FfiConverterTypeDelivery_lift(delivery)
                 )
             }
@@ -2160,7 +2160,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_noel_ffi_checksum_method_bytechannel_close() != 29840) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_noel_ffi_checksum_method_channelopener_open() != 24980) {
+    if (uniffi_noel_ffi_checksum_method_channelopener_open_channel() != 14810) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_noel_ffi_checksum_method_delivery_closed() != 58869) {

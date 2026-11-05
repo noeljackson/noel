@@ -46,7 +46,7 @@ struct Opener {
 }
 
 impl ChannelOpener for Opener {
-    fn open(&self, delivery: Arc<Delivery>) -> Option<Arc<dyn ByteChannel>> {
+    fn open_channel(&self, delivery: Arc<Delivery>) -> Option<Arc<dyn ByteChannel>> {
         let (app_end, server_end) = tokio::io::duplex(1 << 16);
         let server = self.server.clone();
         self.runtime.spawn(async move {

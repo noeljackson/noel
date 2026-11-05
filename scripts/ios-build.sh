@@ -36,6 +36,10 @@ rm -rf "${generated}"
 "${cargo_bin}" run -q -p noel-ffi --features bindgen --bin uniffi-bindgen -- \
   generate --library "${library}" --language swift --out-dir "${generated}"
 cp "${generated}/noel_ffi.swift" "${ios}/NoelKit/Sources/NoelKit/Generated/noel_ffi.swift"
+# The C header must parse: UniFFI once escaped a Swift keyword (`open`) there.
+if command -v clang > /dev/null; then
+  clang -fsyntax-only -Wno-pragma-once-outside-header -x c "${generated}/noel_ffiFFI.h"
+fi
 echo "ios-build: static libraries and NoelKit's bindings are up to date"
 
 [ "${mode}" = "app" ] || exit 0
