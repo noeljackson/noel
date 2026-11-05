@@ -476,7 +476,8 @@
                             "repeated",
                             "selector",
                             "session",
-                            "login"
+                            "login",
+                            "draft"
                           ]
                         }
                       }
@@ -488,7 +489,7 @@
           }
         }
       },
-      "fingerprint": "043ca003238bc650"
+      "fingerprint": "29cd23ce3eda128d"
     },
     {
       "declaration": {

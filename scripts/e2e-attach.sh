@@ -136,10 +136,15 @@ done
 grep -Fq '"generation":2' "${run_dir}/workers/e2e-attach.json" || fail "${first}" "the worker was not started again"
 grep -Fq "resuming run" "${run_dir}/server.log" || fail "${first}" "the server did not resume the run"
 
-# Commands with no meaning for a session in a server are refused; a model
-# change is the session's.
+# Commands run on the session's worker: the session picker opens here,
+# a rename shows in both panes, a model change is the session's.
 send_line "${first}" "/resume"
-wait_for "${first}" "/resume is not available when attached"
+wait_for "${first}" "session selector"
+tmux send-keys -t "${first}" Escape
+# Esc on its own, not the start of an Alt chord with the next keys.
+sleep 0.5
+send_line "${first}" "/name attached rename"
+wait_for "${first}" "name: attached rename"
 send_line "${first}" "/model faux/script"
 wait_for "${second}" "faux/script off"
 send_line "${first}" "/model faux/echo"
@@ -152,6 +157,12 @@ wait_for "${second}" "noel-exited=1"
 capture "${second}"
 grep -Fq "no session no-such-session on noel server" "${work_dir}/${second}.txt" || fail "${second}" "no clear error for an unknown session"
 [ "$(tmux display-message -p -t "${second}" '#{alternate_on}')" = 0 ] || fail "${second}" "the alternate screen stayed on"
+
+# A fork is another session: the TUI attaches to it.
+send_line "${first}" "/fork"
+wait_for "${first}" "attached to session"
+capture "${first}"
+grep -q "attached to session [0-9]" "${work_dir}/${first}.txt" || fail "${first}" "the fork was not attached"
 
 quit "${first}"
 echo "attach e2e passed (artifacts: ${work_dir})"
