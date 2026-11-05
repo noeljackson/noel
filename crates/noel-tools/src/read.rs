@@ -180,6 +180,7 @@ fn read_image(bytes: &[u8], mime_type: &'static str, options: &ToolRuntimeOption
                 output,
                 is_error: false,
                 images: vec![image],
+                structured: None,
             }
         }
         Err(message) => ToolResult::text(format!("Read image file [{mime_type}]\n{message}")),

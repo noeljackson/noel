@@ -1468,6 +1468,12 @@ fn retry_commands_answer_whether_or_not_a_retry_is_waiting() {
     assert!(noel.close().success());
 }
 
+/// Retries after a millisecond: a request a crash cut off is a failed
+/// attempt, sent again only while the retry policy allows another.
+fn retrying() -> Value {
+    json!({"retry": {"baseDelayMs": 1}})
+}
+
 /// The golden overflow scenario's settings, with retries off.
 fn compacting() -> Value {
     json!({"retry": {"enabled": false}, "compaction": {"keepRecentTokens": 8}})
@@ -1663,7 +1669,9 @@ fn a_crash_after_an_overflow_compaction_resumes_with_the_compacted_context() {
         [held()],
         [text("Third answer.")]
     ]);
-    let mut noel = Noel::session_with("crash-after-compaction", script, None, compacting());
+    let mut settings = compacting();
+    settings["retry"] = json!({"baseDelayMs": 1});
+    let mut noel = Noel::session_with("crash-after-compaction", script, None, settings);
     two_turns(&mut noel);
     noel.command(json!({"id": "third", "type": "prompt", "message": "third", "requestId": "m-3"}));
     let run_id = noel.response("third")["data"]["runId"].clone();
@@ -1936,7 +1944,12 @@ fn an_interrupted_run_says_where_it_stopped_and_resumes_under_its_run_id() {
             journal.push(saved_reply("", &calls));
         }
         let script = json!([[text("done")]]);
-        let mut noel = Noel::session(&format!("resume-{name}"), script, Some(&journal));
+        let mut noel = Noel::session_with(
+            &format!("resume-{name}"),
+            script,
+            Some(&journal),
+            retrying(),
+        );
         fs::write(noel.root.join("cwd/notes.txt"), "alpha\n").unwrap();
         assert_eq!(
             noel.last_run("before"),
@@ -1955,9 +1968,11 @@ fn an_interrupted_run_says_where_it_stopped_and_resumes_under_its_run_id() {
         );
         assert!(noel.close().success());
 
+        // A request the crash cut off is retried, which RPC reports as a
+        // new agent_start; every one is the same run's.
         let starts = of_type(&noel.records, "agent_start").collect::<Vec<_>>();
-        assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0]["runId"], "run-1");
+        assert!(!starts.is_empty());
+        assert!(starts.iter().all(|start| start["runId"] == "run-1"));
         assert_eq!(settled(&noel.records)[0]["runId"], "run-1");
         let ran = of_type(&noel.records, "tool_execution_start")
             .map(|record| record["toolName"].as_str().unwrap())
@@ -2117,7 +2132,14 @@ fn a_journal_from_before_runs_has_no_last_run() {
 
 #[test]
 fn a_model_request_cut_off_by_a_crash_is_sent_again_on_resume() {
-    let mut noel = Noel::session("crash-model", json!([[held()], [text("done")]]), None);
+    // A crash cut the request off: it is a failed attempt, which the retry
+    // policy allows to be sent again (Durable).
+    let mut noel = Noel::session_with(
+        "crash-model",
+        json!([[held()], [text("done")]]),
+        None,
+        retrying(),
+    );
     noel.command(json!({"id": "run", "type": "prompt", "message": "work", "requestId": "m-1"}));
     let run_id = noel.response("run")["data"]["runId"].clone();
     wait_for_lines(&noel.root.join("requests.jsonl"), 1);
@@ -2228,7 +2250,7 @@ fn a_reply_cut_off_by_a_crash_is_kept_aborted_and_asked_for_again() {
         held()
     ]);
     let script = json!([streaming, [text("The end.")]]);
-    let mut noel = Noel::session("crash-reply", script, None);
+    let mut noel = Noel::session_with("crash-reply", script, None, retrying());
     noel.command(json!({"id": "run", "type": "prompt", "message": "story", "requestId": "m-1"}));
     let run_id = noel.response("run")["data"]["runId"].clone();
     wait_for_record(&noel, "partial", |record| {
@@ -2903,4 +2925,48 @@ fn a_prompt_that_names_no_command_goes_to_the_model() {
         requests[1].as_array().unwrap().last().unwrap(),
         &json!({"role": "user", "text": "/home/user/main.rs is broken"})
     );
+}
+
+#[test]
+fn a_model_request_cut_off_by_a_crash_ends_the_run_interrupted_without_retries() {
+    let mut noel = Noel::session("crash-model-no-retry", json!([[held()]]), None);
+    noel.command(json!({"id": "run", "type": "prompt", "message": "work", "requestId": "m-1"}));
+    let run_id = noel.response("run")["data"]["runId"].clone();
+    wait_for_lines(&noel.root.join("requests.jsonl"), 1);
+    noel.restart();
+    assert_eq!(resume(&mut noel, &run_id)["success"], true);
+    noel.wait_for("agent_settled", 1);
+    let last = noel.last_run("after");
+    assert_eq!(last["status"], "failed", "{last}");
+    let said = noel.records.iter().any(|record| {
+        record
+            .to_string()
+            .contains("The host stopped while the model was answering, on attempt 1")
+    });
+    assert!(said, "{:?}", noel.records);
+    assert!(noel.close().success());
+    // Nothing was sent again.
+    let log = fs::read_to_string(noel.root.join("requests.jsonl")).unwrap();
+    assert_eq!(log.lines().count(), 1);
+}
+
+#[test]
+fn a_run_whose_tool_rounds_reach_the_cap_ends_turn_limit() {
+    let ls = |id: &str| {
+        json!([
+            {"tool_call": {"id": id, "name": "ls", "arguments": {}}},
+            {"stop": "tool_calls"}
+        ])
+    };
+    let script = json!([ls("l1"), ls("l2"), [text("done")]]);
+    let settings = json!({"retry": {"enabled": false}, "agent": {"maxToolRounds": 1}});
+    let mut noel = Noel::session_with("turn-limit", script, None, settings);
+    noel.command(json!({"id": "run", "type": "prompt", "message": "list"}));
+    noel.response("run");
+    noel.wait_for("agent_settled", 1);
+    assert_eq!(noel.last_run("after")["status"], "failed");
+    assert!(noel.close().success());
+    let runs = noel.journal();
+    let finished = of_type(&runs, "run_finished").last().unwrap();
+    assert_eq!(finished["failure"]["reason"], "turn_limit", "{finished}");
 }

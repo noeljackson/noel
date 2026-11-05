@@ -35,6 +35,7 @@ the TUI, print mode, RPC mode and the server alike.
 
 **Built.**
 - **The journal.** A session is a JSONL journal, `<session-id>.jsonl`. Each record is written with its newline in one write, and a torn final line is truncated when a writer opens the file. Listing skips files it cannot read.
+- **Storage (built).** The store writes through `noel_core::storage::JournalStorage` (append a record, read, rewrite atomically): the journal file above (`JsonlFile`, under the lock below) by default, and `MemoryJournal` for tests and embedders. The records and their recovery are the same on any storage; listing, forking and import read journal files.
 - **The lock.** One process writes a session at a time. It holds `File::try_lock` on `<id>.jsonl.lock`; the lock is on that file because compaction replaces the journal itself. A second writer waits up to 5 s, then exits with code 75. Listing, forking and import read without the lock.
 - **Runs.** Each run's start (`runId`, `requestId`) is saved with its prompt and fsynced before the prompt is acknowledged. Its end (completed, failed or aborted) is saved before the run is reported settled. A run with a start and no end is *interrupted*.
 - **The queue.** Queued steers and follow-ups are saved with the session, and each enqueue is saved before it is acknowledged. A queued submission with a `requestId` is saved with its identity `{submission_id, request_id, mode}` (the queue record's `items`); the user message that places it into a run names it (`placed`), so it leaves the queue in the same record; a queue record that withdraws it names it too (`withdrawn`). All three fields are additive: older journals lack them and load as before, and a submission without a `requestId` gets a new `submissionId` each time the session opens, since nothing can ask about it after its process ends.
@@ -55,6 +56,9 @@ reply stays in the transcript.
   - `followUp` queues it for when the run would answer.
 - **Each queued submission has its own id.** A submission that starts a run is named by the run's id. A submission ends either *done*, when the run it was placed into completed, or *unanswered*: withdrawn, or placed into a run that failed or was aborted.
 - **While no run is active,** a prompt starts one, and what is still queued joins it: steering in its first round, follow-ups after it would answer.
+- **`whenIdle: "reject"`** (Durable `spec.md:2924-2932`): while no run is active the input is refused (`idle`) and nothing is written, so it never starts a run of its own; with `whenBusy: "steer"` it steers the current run or is refused, in one step.
+- **A continue** (`type: "continue"`, Durable `spec.md:2958-2977`) starts a run on the context as it is, without a user message, for example after a run that ended without an answer. Only an idle session admits it; a busy one refuses it `busy` before any write. Queued follow-ups are placed into its run first. A context that does not end in a user message or tool results (system messages aside) ends the run without a request, failed with reason `nothing_to_answer`; a reply whose tool calls never ran is continued, its calls settled as on a resume. Its start is saved as a `run_started` record (no message), and its `requestId` deduplicates as a prompt's does.
+- **How a run ends without an answer** is saved with its end (`run_finished.failure`: Durable's `runFailure` reason and detail) and shown in the view's `pi.live.runFailure` until another run starts: `model_error` (the request failed, retries included), `interrupted`, `restart_limit`, `nothing_to_answer`, `turn_limit` (its tool rounds reached `agent.maxToolRounds`; a continue goes on). An aborted run is `aborted`.
 
 **RPC mode** keeps its wire: only a `prompt`'s `requestId` is read (a repeat replies `started` or `handled` with the run's id, as before), a queued `prompt` cannot carry one, and replies carry no submission ids.
 
@@ -79,8 +83,10 @@ reply stays in the transcript.
 **Built.**
 - A supervisor decides when an interrupted run resumes: the Mode 1 driver, or the Mode 2 server (§8.3). noel never resumes in RPC mode on its own.
 - The TUI continues an unfinished session when you reopen it.
+- **Close and crash** (Durable `spec.md:2525-2560`): a stop that closes a run (its driver's inbox ends: the worker shutting down, RPC mode exiting) saves `run_closed`; a resume after any other stop is a crash restart, saved as `run_restarted`. A message the run saves is progress and clears its restarts. At `restartLimit` (setting, default 5) restarts in a row the run ends at its resume instead of running again, failed with reason `restart_limit`.
 - **What runs again on resume:**
-  - a model request that a crash cut off is sent again, after what its reply had streamed is saved as an aborted reply (§4.2);
+  - a model request a close stopped is sent again, after what its reply had streamed is saved as an aborted reply (§4.2);
+  - a model request a crash cut off is a failed attempt (Durable `spec.md:4884-4901`): when the retry policy (`retry`) allows another attempt the run waits out its backoff, reported as a retry with the text "The host stopped while the model was answering, on attempt N", and sends it again; otherwise the run ends failed with reason `interrupted` and that text. A crash while the turn waited out a retry's backoff or compacted after an overflow (a `retry_wait` record is its last) cut off no request and is not charged;
   - replay-safe tools (`read`, `grep`, `find`, `ls`) run again;
   - any other interrupted tool call gets an "interrupted" result holding the output it had saved (§4.2), and never runs again.
 
@@ -117,7 +123,7 @@ reply stays in the transcript.
 
 **Decided (2026-10-14).** noel follows upstream's current direction: Chord's host runtime (`chord/docs/guide.md:657-692`). Upstream removed its experimental `pi server` and `pi client` in 1.2.0 because the runtime they served was replaced (`chord/CHANGELOG.md:53`).
 - **Server:** one host per user. It owns principals, routes and the workers' lifecycle.
-- **Worker:** one host per session, named `session:<id>`. It is the session's only writer: it holds the journal lock (§2) and runs the run engine.
+- **Worker:** one host per session, at the address `Session({id})`. It is the session's only writer: it holds the journal lock (§2) and runs the run engine.
 - **Client:** the TUI, and a line-mode `noel client`. A client holds remote objects through the server, which relays between clients and workers.
 
 **Built** (`crates/noel-cli/src/server`):
@@ -130,7 +136,7 @@ reply stays in the transcript.
 - **Workers:**
   - the server starts each as `noel worker --session <id> --generation <g> [--resume <runId>]` in its own session (`setsid`), with its output in `workers/<id>.log`;
   - the worker opens the journal under its lock (`fatal`, reason `locked`, exit 75 if another process holds it), binds `workers/<id>.sock` (0600), writes `workers/<id>.json` (`pid`, `session`, `generation`, `build`), then prints the control line `ready` on stdout;
-  - the server dials the socket, checks the peer's uid and pid, reads `ready` again, and runs the Chord link as the worker's parent, over NDJSON lines `{"chord2": frame}` and `{"chord2control": message}`: `ready` (`pid`, `build`, `session`, `generation`), `status` (`viewers`, `running`, `queued`, `runId`) and `shutdown`;
+  - the server dials the socket, checks the peer's uid and pid, reads the `ready` line again, and runs the Chord link as the worker's parent, over framed byte streams (`[u32 BE length][tag][payload]`: tag 0 a Chord message, tag 1 a JSON control message): `ready` (`pid`, `build`, `session`, `generation`), `status` (`viewers`, `running`, `queued`, `runId`) and `shutdown`. On the server the link is the `session` route's link for that address;
   - a worker with no holds, no run and no queued input for `server.workerIdleExitMs` (default 60000) exits, removing its socket and record;
   - a worker outlives its server: it finishes its run, then waits up to that same idle time for a new server to adopt it;
   - a new server reads `workers/*.json`, dials each socket and checks uid, pid and `build`. A match is adopted; another build is told `shutdown` and exits once its run settles; a record whose process is gone is removed.
@@ -147,7 +153,7 @@ reply stays in the transcript.
 - **Routing:** a route's `authorize(principal, session)` runs before a worker is resolved or spawned, and again after.
 
 **Build order (Decided; the ssh tunnel was added first on 2026-10-15):**
-1. **Device** (**Built**). The owner-only local socket, with no token. The server checks the peer's uid (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and closes any other uid before reading a byte. Any process running as the owner can connect, including the agent's own `bash`; that grants nothing it could not already do. Accepted links are stamped `{kind:"owner", via:"device"}`; the `session:` route lets the owner reach any session and a guest only its own, and `noel.chat` gives the owner and a `full` guest `participant`, a `view` guest `viewer`. Workers act as `{kind:"worker", session, generation}`. Objects are kept by `principalKey` (`owner@<via>`, `guest:<id>:r<revision>`, `worker:<session>:<generation>`).
+1. **Device** (**Built**). The owner-only local socket, with no token. The server checks the peer's uid (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and closes any other uid before reading a byte. Any process running as the owner can connect, including the agent's own `bash`; that grants nothing it could not already do. Accepted links are stamped `{kind:"owner", via:"device"}`; the `session` route lets the owner reach any session and a guest only its own, and `noel.chat` gives the owner and a `full` guest `participant`, a `view` guest `viewer`. Workers act as `{kind:"worker", session, generation}`. Objects are kept by type, params and principal, each as canonical JSON.
 2. **Tunnel over ssh** (**Built**). `--remote <ssh-destination>` on `noel client` and `noel --attach` runs `ssh -T -e none [-o BatchMode=yes] -- <destination> '<program>' bridge` and runs the same WebSocket link over its stdin and stdout. ssh authenticates with the user's own configuration, keys and known hosts; noel adds no token, crypto or service. The server accepts a link as `{kind:"owner", via:"tunnel"}` when its upgrade request carries exactly `Noel-Via: tunnel`, as `via:"device"` when it has none, and refuses any other `Noel-Via` (400). The bridge, being the user's own process on the server's machine, is what sets it: a device process could claim `tunnel` too, which only describes it as remote, but nothing on the other machine can claim `device`. The first connection may let ssh ask on the terminal; reconnections use `BatchMode=yes`. `new` with `--remote` needs `--cwd`, an absolute path there; `--remote-noel` names the remote program (default `noel` on its `PATH`), quoted for the remote shell except a leading `~/`.
 3. **Relay,** after a design pass of its own.
 4. **Remote authentication,** for clients that cannot run ssh, offering both device-code pairing (the server issues and verifies its own token) and an optional Codewire login. A Codewire tailnet connection may be stamped `via:"tunnel"`, because admission to an environment's tailnet already grants shell access there.
@@ -157,37 +163,24 @@ reply stays in the transcript.
 
 ### 7.1 Link protocol
 
-**Decided:** Chord link protocol version 4 (`chord/docs/spec.md` §9; frames in `chord/src/wire.ts`): the version upstream pinned as `PROTOCOL_VERSION = 4` at the chord reference (`b45e0ebc`, "references hydrate their state before use").
+**Decided (2026-11-04):** Chord v2 (upstream `packages/chord` at `CHORD2_REFERENCE_REF`, link `PROTOCOL_VERSION` 1). The audit and port plan are in `docs/chord-v2-port.md`; v2's wire is not stable upstream, so the pin moves only with the goldens.
 
-**Built** in `crates/noel-chord`, matching upstream's `packages/chord` at the pinned commit (`CHORD_REFERENCE_REF` in the Makefile), checked against `tests/fixtures/ts-parity/chord-delta.json` and `chord-link.json`, and against upstream's runtime by `make chord-interop`:
-- **the delta codec:** the ops `r`, `s`, `d`, `a`, `t`, `p` and `m` applied immutably, with `t` and `a` counting UTF-16 code units; the wire encoder and decoder, with path definitions, numeric references and short tuples; and `diff`, whose batches are compared by the value they produce;
-- **canonical JSON and `hash64`;**
-- **contracts:** descriptions, their fingerprints, `coverage` and `fits`; remote descriptions carry their `host` placement (`hostNamed`/`hostFamily`), which the consumer resolves to route a hold, never where a request says it is going;
-- **frames:** every protocol 4 frame, checked on receipt as upstream's frame schema checks it. A malformed frame, a duplicate id or a control frame from the wrong side closes the link;
-- **links:**
-  - WebSocket, one JSON text message per frame, also over a Unix socket (Chord has no Unix-socket transport of its own); packed binary frames are decoded where accepted, never sent, and refused from clients. When this side closes a link, the peer has 30 s to answer its close frame, then the socket is dropped, as upstream's `ws` destroys a socket after its `closeTimeout`;
-  - NDJSON lines `{"chord2": frame}`, Chord's IPC encoding, with `{"chord2control": message}` lines for control, unwindowed;
-  - an in-memory pair, for tests;
-- **connections:** `hello` with protocol 4, and `bye` with `protocol-version 4` to a peer of another version; holds (`shape` with its `state` member list, `gone`, `release`), whose state is implied (a unit: the shape, then a snapshot of each member the consumer lacks), addresses by hold and member (`state` frames carry `as` `snap`/`reset`/`ops`/`error`), and carry `origin` (the client connection a relayed hold came from) and `again` (a re-hold after a link loss, whose unit is not urgent); calls (`result`, `cancel`, `maxCalls`); `sub` and `unsub` for a hold opened `state: false`, and `resync` when a relay dropped what waited; `ping` and `pong` with a configurable interval and timeout; `ack` with the window, where only state waits, coalesced per hold and member against one link-wide pending budget (four windows), and a stream whose ops outgrow it flushes as a reset of the current value;
-- **hosts:** object types served with contracts and a variant per principal; principal stamping by the accepting side, with forwarded principals honoured only from the parent link; routes whose `authorize(principal, host)` runs before and after `resolve`; relaying between a client and a child host, with roots and `root_end` on relayed calls; and `invalidate_principal`, which re-stamps or closes links, closes their relays and propagates to child hosts.
+**Built** in `crates/noel-chord/src/v2`, checked against `tests/fixtures/ts-parity/chord-v2-contracts.json` and `chord-v2-messages.json`:
+- **contracts:** declarations (`contracts/v2/*.json` in noel-client) with their schema normal form and fingerprints (`hash64` over UTF-8); variants, state members and methods indexed by sorted names; params checked against their fields; host addresses `Server()` and `Session({id})`;
+- **messages:** the 18 kinds in the binary codec, checked on receipt (unless the link is trusted) as upstream's message schema checks them; the closed error table and wire errors (`{kind: "chord", error}`, `{kind: "plugin", code, message, details?}`);
+- **parts:** limits per part (16 MiB on the wire, 64 MiB decoded on untrusted links), deflate above 16 KiB at an origin that compresses, inflate within the decoded limit;
+- **the channel:** `hello` with incarnations (uuidv7) and call windows, messages queued until the peer's `hello`, protocol errors, and the heartbeat (`ping` after 15 s of silence, close after 30 s);
+- **hosts:** placement by address (here, a route of the address's kind, or the parent link); holds bound with a snapshot of each state member, then `state` ops through a window of 2 unacknowledged messages per origin, pending ops replaced by a value past 10,000; calls within 256 per side and the peer's window, `abort`; holds refused `failed {waiting}` (not served, another contract) or `failed {broken}` (params, address, factory), `loading` and `retry`; routes resolving one link per address, again when it drops; relayed holds keeping their ids under a relay origin, with acks returned to the link that sent each message and `closed` when the origin goes; revocation (`revoked_by`, `revoke`, `gone forbidden/revoked`);
+- **transports:** WebSocket binary messages (a text message ends the link), also over a Unix socket; framed byte streams for server and worker (§5); an in-memory pair.
 
-**Left out:** hot reload and plugins. noel sends no reload control; a host that receives `prepare` votes `unavailable/not_coordinator`, and ignores `commit`, `abort` and `retire`.
-
-Where these differ from upstream is listed in `docs/rust-rewrite/non-parity-register.md`.
-
-**Built:** WebSocket framing over the device socket (path `/chord`; packed frames refused from clients), and NDJSON between server and worker (§5).
-
-**Decided (2026-10-14):**
-- noel builds on protocol 4 (Chord 1.3.0's link protocol; the reference is pinned to `b45e0ebc`, the newest commit at which `packages/chord` builds).
-- The goldens are pinned to an exact upstream commit, and `ts-parity-drift` flags drift.
-- Chord commits after the pin that do not build are recorded by `ts-parity-drift` for the next pass.
+`make chord2-interop` (`scripts/chord2-interop.sh`, Bun against a checkout at the pin) runs both directions against upstream: upstream's client host holds `noel.chat` on `noel server` (relayed to the worker), submits, follows the run and holds again after a drop; noel's `chord2-client` holds an upstream server host's object, calls it, follows a burst of commits past the window and holds again after a drop. Where v2 differs from upstream is listed in `docs/rust-rewrite/non-parity-register.md` ("Chord v2").
 
 ### 7.2 Objects
 
-**Built.** Each object has contract version 1; their descriptions, with their JSON Schemas, are checked in as `crates/noel-cli/src/server/contracts/*.json`.
+**Built.** Each object has contract version 1; their declarations, with their JSON Schemas, are checked in as `crates/noel-client/contracts/v2/*.json`.
 
 ```text
-noel.sessions  at "server", input {}           owner only (variant owner)
+noel.sessions  at Server(), params {}          owner only (variant owner)
   state directory: {sessions: [{sessionId, name?, cwd, workspace?, modified,
                                 messageCount, firstPrompt?, model?,
                                 live: {worker, busy, viewers},
@@ -196,7 +189,7 @@ noel.sessions  at "server", input {}           owner only (variant owner)
       -> {sessionId, created}
   fork({requestId, sessionId}) -> {sessionId, created}
 
-noel.chat      at "session:<id>", input {session}
+noel.chat      at Session({id: session}), params {session}
   viewer:      state view
   participant: state view
     submit({requestId, text, images?, whenBusy?: "reject"|"steer"|"followUp"})
@@ -207,18 +200,20 @@ noel.chat      at "session:<id>", input {session}
     configure({model?, thinkingLevel?}) -> {model?, thinkingLevel}
     resume({expectedRunId}) -> {runId}
 
-noel.models    at "server", input {}           owner only (variant owner)
+noel.models    at Server(), params {}          owner only (variant owner)
   state catalog: {models: [{provider, modelId, name, reasoning, thinkingLevels}]}
 ```
 
 The owner, and a guest with `mode:"full"`, get `participant`; a guest with
-`mode:"view"` gets `viewer`. Methods check their arguments: for example, that
-the input names this worker's session.
+`mode:"view"` gets `viewer`. Methods check their arguments against their schemas (`invalid/args`).
+noel's own refusals are plugin errors whose code names the reason (`busy`,
+`session`, `cwd`, `workspace`, `model`, `thinkingLevel`, `configure`, ...):
+v2's error table is closed.
 
-- **`submit`** maps to the session controller (§3.1): `whenBusy` names the kind (`reject` a prompt, `steer`, `followUp`, default `reject`). While idle any submission starts a run. A repeated `requestId` answers `repeated` with the first submission's `status` (`queued`, `running`, `interrupted`, `completed`, `failed`, `aborted`, `withdrawn`) and its `runId`. A refusal writes nothing and is `invalid` with reason `busy`, `queued_prompt`, `request_id_reused` or `refused`.
+- **`submit`** maps to the session controller (§3.1): `whenBusy` names the kind (`reject` a prompt, `steer`, `followUp`, default `reject`). While idle any submission starts a run. A repeated `requestId` answers `repeated` with the first submission's `status` (`queued`, `running`, `interrupted`, `completed`, `failed`, `aborted`, `withdrawn`) and its `runId`. A refusal writes nothing and is the plugin error `busy`, `queued_prompt`, `request_id_reused` or `refused`.
 - **`abort`** follows Mode 2's rule (§3.3): it withdraws the queue, and answers once the run settled.
-- **`compact`, `configure` and `resume`** need no run active (`invalid/busy` otherwise).
-- **`create` and `fork`** name the new session by their `requestId` (`s-` and 24 hex digits of its SHA-256), so a repeat returns the same session with `created: false`. A new session gets its model and thinking level as `noel` would start it; `create` lists it in the directory before answering. `create`'s `workspace` is a URL as `--workspace` takes it (§10): the session's tools run there, and a URL that is not valid, or names a host noel does not trust, is `invalid` with reason `workspace` and a message naming the trust command. A fork keeps its source's workspace. The directory's `workspace` is the URL of a session's workspace, absent for a local one.
+- **`compact`, `configure` and `resume`** need no run active (the plugin error `busy` otherwise).
+- **`create` and `fork`** name the new session by their `requestId` (`s-` and 24 hex digits of its SHA-256), so a repeat returns the same session with `created: false`. A new session gets its model and thinking level as `noel` would start it; `create` lists it in the directory before answering. `create`'s `workspace` is a URL as `--workspace` takes it (§10): the session's tools run there, and a URL that is not valid, or names a host noel does not trust, is the plugin error `workspace` with a message naming the trust command. A fork keeps its source's workspace. The directory's `workspace` is the URL of a session's workspace, absent for a local one.
 - **The directory** is read from the session directory (each journal again only when it changed) and the workers' `status`, on each change and every 5 s. Changes that arrive together are read together, so a listing taken the moment a `submit` is answered may not show it yet; the session's view (§7.3) is current.
 
 ### 7.3 The view and late join
@@ -227,9 +222,9 @@ the input names this worker's session.
 
 **Built** (`crates/noel-cli/src/server/view.rs`): the view follows Durable's shape `{conversation, entries, docs}` (`durable/docs/spec.md:4542-4558`), plus `lastRun`:
 - **`conversation`:** `{id, cwd, name?}`;
-- **`entries`:** messages in upstream pi's `Message` JSON, as RPC mode's `get_messages`;
+- **`entries`:** a window over the session's history (`crates/noel-core/src/history.rs`): every message the session saved, with markers where compaction or an undo cut the model's context, as Durable's entry records `{id, kind, model?, data?, head?, timestamp?}`. Ids count entries in journal order, so they survive restarts and compaction checkpoints. The view starts with the newest 50; past 100 the oldest leave in one splice down to 50, and `before` names the entry before the window. `noel.chat`'s `entries({before, limit?})` pages back, and `noel-client`'s `Transcript` keeps every entry a client has seen and loads the ones before the window. The attached TUI shows the whole history: compaction and undo show as markers in place, not as a rewritten transcript;
 - **`docs["pi.agent"]`:** `{model?, thinkingLevel, cwd}`;
-- **`docs["pi.live"]`:** `{}` while idle; during a run `run` (`{runId, requestId?, inputs}`), `generation` (`{attempt, message?, retry?}`, where `message` is the committed partial, §4.2), `tools` (`{callId, name, status, output?, truncated?}` with the committed output; `status` is `pending`, `running`, `done`, or `interrupted` for a resumed run's call that does not run again) and `compaction` (`{reason}`);
+- **`docs["pi.live"]`:** `{}` while idle; during a run `run` (`{runId, requestId?, inputs, turns}`), `generation` (`{attempt, message?, retry?}`, where `message` is the committed partial, §4.2), `tools` (`{callId, name, status, output?, truncated?, entry?}` with the committed output and the result's entry once saved; `status` is `pending`, `running`, `done`, or `interrupted` for a resumed run's call that does not run again) `compactions` (`[{trigger}]`, `manual`, `threshold` or `overflow`) while one runs; after a failed compaction `compactionFailure` (`{trigger, error}`), and after a run that ended without an answer `runFailure` (`{reason, detail?, inputs}`, reason `model_error` or `aborted`) until the next run starts;
 - **`docs["pi.inbox"]`:** `{items: [{id, mode, content, requestId?}]}`;
 - **`docs["pi.usage"]`:** `{total: {input, output, requests}}`;
 - **`lastRun`:** `get_state.lastRun`.
@@ -239,7 +234,7 @@ Partials and tool output reach the view from the journal's records as each is sa
 ### 7.4 The attached TUI
 
 **Built** (`crates/noel-cli/src/attach.rs`). `noel --attach <session-id>` opens the TUI on a session the server holds, starting the server when none listens (§5). It is the local TUI (terminal, editor, keys and transcript rendering) with a remote backend: a `noel.chat` reference through the server instead of a `Runtime` in the process. The local TUI's in-process path is unchanged.
-- **Before the terminal:** the TUI holds the session and waits for its first view before it takes the terminal, so an unknown session (`invalid/session` from the server's route) or an invalid id is an error on the plain terminal, exit status 1. `--attach` takes no prompt, print mode or session flag, and refuses the options that shape a local session (model, thinking, tools, skills, templates, extensions, images and the like): the session runs with its own settings.
+- **Before the terminal:** the TUI holds the session and waits for its first view before it takes the terminal, so an unknown session (`unavailable` with `details.missing: "session"` from the server's route) or an invalid id is an error on the plain terminal, exit status 1. `--attach` takes no prompt, print mode or session flag, and refuses the options that shape a local session (model, thinking, tools, skills, templates, extensions, images and the like): the session runs with its own settings.
 - **The transcript** is rebuilt from the view's `entries` as reopening a session rebuilds it from saved messages: a reply's thinking, then its text, then `aborted` for an aborted reply; a prompt; a tool's result with its call's command or path. After the entries, what the run streams in `docs["pi.live"]`: the committed partial's thinking and text, a retry it waits out, and each running or interrupted tool with its committed output. Each change of the view updates the rows it touches in place (a text that grows is appended to), so a streaming reply is one entry that becomes the saved reply, and the TUI's own notes stay where they were added.
 - **Input:** Enter while no run is active submits with `whenBusy: "reject"`; during a run Enter queues a follow-up and the steer key (ctrl+s) a steer. Each submission has a new `requestId`, and one that fails `unavailable` is sent again with the same id (§8.1). A prompt refused `busy` because another client started a run meanwhile is queued as a follow-up, as Enter does during a run. Esc (or the interrupt key) during a run sends `abort` with the run as `expectedRunId`, once; Up on an empty draft withdraws the session's last queued submission into the draft.
 - **Commands:** `/model <provider/id>` and `/thinking <level>` are `configure`, `/compact [instructions]` is `compact`, `/interrupt` is `abort`, `/queue` lists `pi.inbox` and `/queue-clear` withdraws it. Tool commands (`/bash`, `/read`, …), skills, templates and other text are prompts, which the worker expands with the session's configuration. The TUI's own display commands work (`/help`, `/hotkeys`, `/history`, `/status`, `/session`, `/clear`, `/copy` of a selection, `/quit`); any other of its commands acts on a session in this process and says it is not available when attached.
@@ -265,8 +260,8 @@ Where the attached TUI differs from the local one is in the non-parity register 
 ### 8.3 Worker
 - **A worker crash:** the kernel releases its lock, and the run is interrupted.
 - **Restart:** the server starts it again with the next generation. The new worker repairs a torn tail, applies §4.2, and resumes the run.
-- **Resume limit:** the server resumes a run by itself at most 3 times. After that the run stays interrupted until a client resumes or aborts it.
-- **When:** a worker lost with its run interrupted is started again at once. Any worker the server starts resumes the journal's interrupted last run while its resumes last, so after a machine stopped the first hold resumes it. The count is the server's: a new server counts again.
+- **Restart limit:** the worker counts each crash restart of a run in its journal and ends the run `restart_limit` at `restartLimit` (§4.1), so the count holds across servers. One server also stops resuming a run by itself after 20 resumes, for a worker that crashes before it counts one.
+- **When:** a worker lost with its run interrupted is started again at once. Any worker the server starts resumes the journal's interrupted last run, so after a machine stopped the first hold resumes it.
 - **Clients:** they see `gone`, hold the object again, and get a snapshot.
 
 ## 9. Mode 1 relationship
@@ -338,7 +333,7 @@ Where remote workspaces differ from upstream and from a local workspace is liste
 
 **Decided:** compatibility is proved by goldens recorded from upstream, as the RPC goldens are.
 - **No server or client to record.** Upstream publishes no `pi server` or `pi client`, so the Chord goldens drive upstream's public `packages/chord` with noel's contracts, covering delta and canonical-JSON vectors and the link frames.
-- **Interop:** a test in Docker connects an upstream Chord client to a noel server, and the reverse (`make chord-interop`). **Built**, including upstream's client holding `noel.chat` on `noel server` through its relay to a worker, following the view's snapshot and ops.
+- **Interop:** `make chord2-interop` connects an upstream Chord v2 client host to `noel server`, and noel's client to an upstream server host (§7.1). **Built**, including upstream's client holding `noel.chat` on `noel server` through its relay to a worker, following a run and holding again after a drop.
 - **pi-env goldens** come from upstream's `RemoteExecutionEnv` talking to its own daemon (`pi-env.json`), and from upstream's SSH deployment through a stand-in for `ssh` (`pi-env-ssh.json`). **Built** for the daemon and the client, with interop both ways (`make env-interop`): upstream's client against `noel-env serve`, and noel's client against upstream's `pi-env`.
 - **`LocalEnv`** is checked against the conformance results of upstream's `NodeExecutionEnv` (**Built**: `local-env.json`).
 
@@ -355,3 +350,43 @@ The attached TUI added "The TUI Attached to a Server Session": where it
 differs from the TUI on a local session. Remote workspaces added "Remote
 Workspaces": noel's selection and trust, and where tools there differ from
 local ones.
+
+## 13. Plugins
+
+**Built (2026-11-04, roadmap phase 7).** A plugin is a process `noel server` starts and keeps running, a Chord v2 host at `Plugin({name})` serving `noel.plugin`. The Rust SDK is `crates/noel-plugin`; `noel-sample-plugin` is its example and the tests' plugin.
+
+- **Manifests:** `<agent dir>/plugins/<dir>/plugin.json`: `{name, version?, description?, command: [program, args...], permissions: [...]}`, the program relative to the manifest's directory when it is there. Names are `[a-z0-9-]`.
+- **Grants:** `<agent dir>/plugins.json`: `{"<name>": {"permissions": [...]}}`. A plugin gets the permissions it requests that are granted there: `tools`, `commands` and `panels` for its contributions to count, `sessions` to hold `noel.sessions`. The server stamps its link `{kind: "plugin", name, permissions}`, and each object checks that principal (`forbidden` otherwise).
+- **Supervision:** the plugin's stdin and stdout are its framed link to the server (§5's framing), the `plugin` route's link for its address; its stderr goes to `plugins/<name>.log` in the runtime directory. One that exits is started again after a backoff (0.5 s doubling to 30 s, back to 0.5 s after a minute up). Only the server's own references reach a plugin.
+- **`noel.plugin`** (params `{plugin}`, variant `host`): state `contributions` `{tools: [{name, description, parameters, replaySafe?}], commands: [{name, description}], panels: [{id, title, view}]}`; `callTool({name, args})` (`args` as JSON text) `-> {output, isError}`, `runCommand({name, args?}) -> {output}`, `panelAction({panel, action, value?})`.
+- **`noel.plugins`** (at `Server()`): state `directory` `{plugins: [{name, version?, description?, running, restarts, requested, granted, contributions, error?}]}`, each plugin's contributions limited to the kinds it was granted. The owner gets `runCommand` and `panelAction` (`{plugin, ...}`), a worker gets `callTool`; the server forwards each to the plugin when its kind is granted.
+- **Tools:** each worker follows the directory and offers the plugins' tools to its model as extension tools (protocol `plugin`), selected by `enabledTools` and `excludedTools` as extension tools are, and kept across reloads; a new worker waits up to 3 s for the first directory before it handles a command. Calls go through the server's `callTool`.
+- **Commands and panels:** `noel client plugins [--json]` lists the plugins with their panels rendered as text, `noel client run <plugin> <command> [args]` runs a command, and `noel client panel <plugin> <panel> <action> [value]` sends a panel action.
+- **Panels** are views in a declarative vocabulary each client renders natively: `{type: "text", text}`, `{type: "stack", children}`, `{type: "list", items}` and `{type: "button", label, action}`.
+- **Script plugins (built, roadmap phase 8):** a manifest with `script` instead of `command` (and optional `limits: {timeoutMs, memoryBytes}`, default 5000 ms and 64 MiB) runs in the server's process on the codemode VM (djs: sandboxed, fuel and memory limited, no JIT, so it also runs on iOS). The script defines `const plugin = {tools, commands, panels}`; tools and commands have `run(args, ctx)`, panels `view(state)` and `action(action, value, ctx)`. Each call runs on a fresh VM with no host calls; `ctx.state` and `ctx.save(state)` keep the plugin's state in `state.json` beside its manifest, across restarts, and the panels are drawn again from it after each call. It is served by the same `noel-plugin` host as a process plugin, over a link in memory, so grants, `noel.plugins` and tools work alike; a call past its limits fails (`timeout`, `sandbox`) and the plugin goes on. Its state is the plugin's, not a session's: plugins belong to the server.
+- **Not built yet:** a Bun SDK; pi's extensions keep working through the extension host (unchanged).
+
+## 14. Desktop app
+
+**Built (2026-11-04, roadmap phase 9).** `noel-app` (`apps/desktop`, GPUI's community edition, gpui-ce) is a window on `noel server`; `noel app [--remote <ssh-destination>] [--session <id>]` runs it (beside `noel` or on the PATH; `make app` builds it), and `/app` in the TUI (local or attached) opens the current session in it. Plain `noel` is unchanged: the app is its own workspace, outside `make check`, checked by `make app-check`.
+
+- **Link:** noel-client over the bridge's stdin and stdout: `noel bridge` for the local server (started when none runs), `ssh -T <destination> '<noel>' bridge` for a remote one (§6, tunnel), reconnected as `noel client` reconnects.
+- **Window:** the sessions (from `noel.sessions`' directory) with a new-session button; the selected session's transcript (Durable entries, with the history before the view's window loaded once, the streaming reply and running tools from `pi.live`, tool results with `+`/`-` lines colored as diffs); a composer (secondary-enter sends a `followUp` submission; Abort); the plugins (`noel.plugins`) with their commands and panels drawn natively (§13's widgets; buttons send panel actions); and a command palette (secondary-k: new session, abort, open a session, plugin commands; a typed `/directory` is where a new session starts, which a remote server needs).
+- **`--smoke`:** connects, waits for the directories and the session's view, prints them as JSON and exits, without a window; `scripts/app-smoke.sh` runs it locally, through `noel app`, and through a stand-in ssh, and with `SCREENSHOT=<file>` draws the window under Xvfb (software Vulkan).
+- **A Mode 1 session** open in this TUI holds its lock: the app shows it once this process lets it go (one writer at a time).
+
+## 15. iOS
+
+**Built (Rust side, 2026-11-04, roadmap phase 10).** `crates/noel-ffi` is noel-client's [`app`](../crates/noel-client/src/app.rs) link through UniFFI for Swift and Kotlin: `Noel.connect(opener, listener)`, then `select`, `send`, `newSession`, `abort`, `runPluginCommand`, `panelAction`; events (`connected`, `status`, `sessions`, `view` with the history's entries and the streaming reply, `plugins` with panels as JSON) come to the listener as records. The app opens the byte channel itself: `ChannelOpener.openChannel(delivery)` returns a `ByteChannel` for what the link writes, and the app hands what arrives to `delivery`; on iOS that channel is an SSH exec channel running `noel bridge` (`SSHChannelOpener`, on Citadel), and a lost channel is opened again. Its static library builds for `aarch64-apple-ios` and `aarch64-apple-ios-sim` on any host (`make ios-libs`, which also writes NoelKit's Swift bindings); `tests/channel.rs` runs it over a channel to a server it routes to a session host. The app builds on macOS in `.github/workflows/ios.yml` (`make ios`: xcframework, NoelKit and the app for the arm64 simulator; UniFFI's C header is syntax-checked with clang by `make ios-libs`). NoelKit pins Citadel by commit for `withExec`, which gives one exec channel's stdin and stdout.
+
+**Written, built only on macOS:** `apps/ios`: NoelKit (the bindings, `NoelModel`, `SSHChannelOpener`) and a SwiftUI app (connect over SSH, sessions, chat with a composer and Abort, plugins with commands and panels in §13's widgets). `make ios` (macOS, Xcode, xcodegen) makes `NoelFFI.xcframework` and builds the app for the simulator; `.github/workflows/ios.yml` runs it on a macOS runner.
+
+## 16. Pairing and remote access
+
+**Built (2026-11-04, roadmap phase 11); off by default.** After upstream Chord's app kit (`node/app/pairing.ts`, `owner.ts`), without its web pages (noel has no web UI): the owner approves pairings from the device socket.
+
+- **Listening:** `server.listen` (`host:port`) makes `noel server` also listen over TLS. Its certificate is self-signed and kept in `<agent dir>/server-tls/` (0600); devices pin its SHA-256 fingerprint, which `noel client devices` shows on the server's machine.
+- **Pairing:** a device runs `noel client pair https://host:port [--label L]`: `POST /_chord/pair` (public, `{label?}` → `{code, poll}`; 429 past 100 pending pairings or 10 per client address) gives a code, shown with the certificate's fingerprint; the owner compares the fingerprint and runs `noel client devices approve <code>` (`noel.devices`' `approve`); the device's poll (`POST /_chord/pair/poll`) gets its token once and keeps it, pinned to the certificate, in `<agent dir>/remotes.json` (0600). Codes are `XXXX-XXXX` without 0/O/1/I/L, single use, ten minutes; poll secrets and device tokens are stored only as SHA-256 hashes (`<agent dir>/devices.json`, 0600).
+- **Using it:** `noel client --server https://host:port <command>` opens `GET /chord` over TLS with `Authorization: Bearer <token>`; the server stamps the link `{kind: "owner", via: "remote", device}`, an owner for everything but `noel.devices`, which only the owner on the server's machine holds. No valid token: 401. A certificate other than the pinned one: the TLS handshake fails.
+- **Revoking:** `noel client devices revoke <id>` drops the device's token and revokes `{device: id}` (v2 revocation): its objects end and its links close.
+- **Not built:** guests (§6), owner links for browsers, and a security review, which comes before `server.listen` is ever on by default.

@@ -615,24 +615,6 @@ impl Message {
         })
     }
 
-    /// A tool call's result as a run reports it, before the session that
-    /// saved it is read again.
-    pub fn tool_result(
-        call: &ChatToolCall,
-        output: &str,
-        images: &[MediaInput],
-        is_error: bool,
-    ) -> Self {
-        Message::ToolResult {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            content: Content::text_and_images(output, images),
-            is_error,
-            duration_ms: None,
-            timestamp: None,
-        }
-    }
-
     /// A message as the session saved it. The journal keeps no timestamps,
     /// usage, model or timings, so those fields are left out.
     pub fn saved(message: &ConversationMessage, session: &SessionState) -> Self {
@@ -1019,10 +1001,13 @@ pub(crate) enum AssistantEvent<'a> {
     },
 }
 
-/// A tool's result, or what it has printed so far: its output as text.
+/// A tool's result, or what it has printed so far: its output as text,
+/// and for a running `codemode` call its nested calls (`details.calls`).
 #[derive(Serialize)]
 pub(crate) struct ExecutionResult<'a> {
     content: &'a [Content],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
 
 /// Where records go, in order.
@@ -1211,6 +1196,18 @@ impl Recorder {
                     args: parse_arguments(&call.arguments),
                     partial_result: ExecutionResult {
                         content: content.as_slice(),
+                        details: None,
+                    },
+                });
+            }
+            TurnEvent::NestedToolCalls { call, calls } => {
+                sink(Event::ToolExecutionUpdate {
+                    tool_call_id: &call.id,
+                    tool_name: &call.name,
+                    args: parse_arguments(&call.arguments),
+                    partial_result: ExecutionResult {
+                        content: &[],
+                        details: Some(serde_json::json!({ "calls": calls })),
                     },
                 });
             }
@@ -1263,10 +1260,7 @@ impl Recorder {
     /// agent_settled.
     pub fn finish(mut self, outcome: &Outcome, sink: Sink) {
         let aborted = matches!(outcome, Outcome::Aborted);
-        let error = match outcome {
-            Outcome::Failed(error) => Some(error.as_str()),
-            Outcome::Completed | Outcome::Aborted => None,
-        };
+        let error = outcome.error();
         if self.ended {
             // Only the compaction that was to recover the dropped reply can
             // still be open.
@@ -1478,7 +1472,10 @@ impl Recorder {
         sink(Event::ToolExecutionEnd {
             tool_call_id: &call.id,
             tool_name: &call.name,
-            result: ExecutionResult { content: &content },
+            result: ExecutionResult {
+                content: &content,
+                details: None,
+            },
             is_error,
             duration_ms,
         });

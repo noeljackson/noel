@@ -106,6 +106,11 @@ pub struct ToolResult {
     /// Images that go to the model with the output (`read` of an image).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ToolImage>,
+    /// What a programmatic caller such as a codemode script gets instead of
+    /// the text (upstream `structuredContent`): `bash`'s output, exit code
+    /// and wall time. Never shown to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<serde_json::Value>,
 }
 
 impl ToolResult {
@@ -114,6 +119,7 @@ impl ToolResult {
             output: output.into(),
             is_error: false,
             images: Vec::new(),
+            structured: None,
         }
     }
 
@@ -488,6 +494,7 @@ async fn bash_tool(
         Some(prefix) if !prefix.trim().is_empty() => format!("{prefix}\n{command}"),
         _ => command.to_string(),
     };
+    let started = std::time::Instant::now();
     let cwd = PathBuf::from(env.cwd());
     let io_error = |source| ToolError::Io {
         path: cwd.clone(),
@@ -600,13 +607,90 @@ async fn bash_tool(
         )));
     };
     let text = bash_output_text(&snapshot, "(no output)");
-    Ok(match code {
+    let mut result = match code {
         0 => ToolResult::text(text),
         code => ToolResult::error(with_status(
             text,
             &format!("Command exited with code {code}"),
         )),
-    })
+    };
+    // Upstream's `structuredContent`: scripts get the output unlimited by
+    // the model's limits (up to 1 MiB), and a non-zero exit code as data.
+    let (full, truncated) = read_full_output(&snapshot, STRUCTURED_OUTPUT_MAX_BYTES);
+    let mut structured = serde_json::json!({
+        "output": full,
+        "truncated": truncated,
+        "exit_code": code,
+        "wall_time_seconds": (started.elapsed().as_millis() as f64 / 100.0).round() / 10.0,
+    });
+    if let (true, Some(path)) = (truncated, &snapshot.full_output_path) {
+        structured["full_output_path"] = serde_json::json!(path.display().to_string());
+    }
+    result.structured = Some(structured);
+    Ok(result)
+}
+
+/// Output limit of `bash`'s structured output (upstream
+/// `STRUCTURED_OUTPUT_MAX_BYTES`).
+const STRUCTURED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+
+/// A command's whole output, or its first and last halves of `max_bytes`
+/// around `[... N bytes omitted ...]` when it is larger (upstream
+/// `readFullOutput`). Output kept only on another machine is its tail.
+fn read_full_output(snapshot: &OutputSnapshot, max_bytes: usize) -> (String, bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    let truncation = &snapshot.truncation;
+    let fallback = || (truncation.content.clone(), truncation.truncated);
+    let Some(path) = snapshot
+        .full_output_path
+        .as_ref()
+        .filter(|_| truncation.truncated)
+    else {
+        return fallback();
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return fallback();
+    };
+    let Ok(size) = file.metadata().map(|metadata| metadata.len() as usize) else {
+        return fallback();
+    };
+    if size <= max_bytes {
+        let mut bytes = Vec::with_capacity(size);
+        return match file.read_to_end(&mut bytes) {
+            Ok(_) => (String::from_utf8_lossy(&bytes).into_owned(), false),
+            Err(_) => fallback(),
+        };
+    }
+    let head_bytes = max_bytes / 2;
+    let tail_bytes = max_bytes - head_bytes;
+    let mut head = vec![0; head_bytes];
+    let mut tail = vec![0; tail_bytes];
+    let read = file
+        .read_exact(&mut head)
+        .and_then(|()| file.seek(SeekFrom::Start((size - tail_bytes) as u64)))
+        .and_then(|_| file.read_exact(&mut tail));
+    if read.is_err() {
+        return fallback();
+    }
+    // Cut at character boundaries: the head drops an incomplete trailing
+    // sequence, the tail skips leading continuation bytes.
+    let head_end = match std::str::from_utf8(&head) {
+        Ok(_) => head.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    let tail_start = tail
+        .iter()
+        .take_while(|byte| (**byte & 0xc0) == 0x80)
+        .count();
+    let omitted = size - head_bytes - tail_bytes;
+    (
+        format!(
+            "{}\n\n[... {omitted} bytes omitted ...]\n\n{}",
+            String::from_utf8_lossy(&head[..head_end]),
+            String::from_utf8_lossy(&tail[tail_start..])
+        ),
+        true,
+    )
 }
 
 /// The error code Node reports for a failure, where upstream's tools put it
@@ -805,6 +889,67 @@ mod tests {
         .unwrap();
         assert!(result.is_error);
         assert_eq!(result.output, "failed-output\n\nCommand exited with code 7");
+    }
+
+    #[tokio::test]
+    async fn bash_gives_scripts_its_structured_output() {
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command: "printf failed-output; exit 7".into(),
+                timeout_ms: Some(1000),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let structured = result.structured.expect("structured output");
+        assert_eq!(structured["output"], "failed-output");
+        assert_eq!(structured["exit_code"], 7);
+        assert_eq!(structured["truncated"], false);
+        assert!(structured["wall_time_seconds"].is_number());
+        assert!(structured.get("full_output_path").is_none());
+
+        // Past the model's limits the script still gets all of it, up to
+        // 1 MiB: here, 3000 lines of 10 bytes.
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command: "seq -w 1 3000 | sed 's/$/-abcd/'".into(),
+                timeout_ms: Some(5000),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let structured = result.structured.expect("structured output");
+        assert_eq!(structured["truncated"], false);
+        assert_eq!(structured["output"].as_str().unwrap().lines().count(), 3000);
+        assert!(result.output.contains("Full output:"));
+    }
+
+    #[tokio::test]
+    async fn bash_structured_output_over_its_limit_keeps_head_and_tail() {
+        let result = execute_tool(
+            Path::new("."),
+            ToolRequest::Bash {
+                command: "head -c 1200000 /dev/zero | tr '\\0' a; printf END".into(),
+                timeout_ms: Some(10000),
+            },
+            &ToolRuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let structured = result.structured.expect("structured output");
+        let output = structured["output"].as_str().unwrap();
+        assert_eq!(structured["truncated"], true);
+        assert!(
+            output.contains("\n\n[... 151427 bytes omitted ...]\n\n"),
+            "{}",
+            &output[524280..524330]
+        );
+        assert!(output.ends_with("END"));
+        assert!(structured["full_output_path"].is_string());
     }
 
     #[tokio::test]

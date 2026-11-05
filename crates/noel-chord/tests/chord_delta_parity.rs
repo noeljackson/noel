@@ -1,14 +1,12 @@
 //! noel-chord against upstream Chord's goldens
 //! (`tests/fixtures/ts-parity/chord-delta.json`, made by
 //! `scripts/ts-parity/chord-delta-fixture.ts`): the delta codec, the
-//! immutable applier, diff results, canonical JSON, `hash64`, and contract
-//! fingerprints, coverage and `fits`.
+//! immutable applier, diff results and canonical JSON. (Its v1 sections,
+//! `hash64` over UTF-16 and v1 contracts, have no counterpart since Chord v2:
+//! `chord-v2-contracts.json` covers v2's.)
 
+use noel_chord::canonical_json;
 use noel_chord::delta::{apply_owned, diff, Decoder, DeltaError, Encoder, Op};
-use noel_chord::{
-    canonical_json, coverage, fingerprint, fits, hash64, Description, MemberDescription, Placement,
-};
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/ts-parity/chord-delta.json");
@@ -40,28 +38,6 @@ fn ops_json(ops: &[Op]) -> Value {
 
 fn error_json(error: &DeltaError) -> Value {
     json!({"name": error.upstream_name(), "message": error.to_string()})
-}
-
-/// The descriptions parsed straight from the text, so variants and members
-/// keep their order.
-#[derive(Deserialize)]
-struct Contracts {
-    contracts: Vec<ContractCase>,
-}
-
-#[derive(Deserialize)]
-struct ContractCase {
-    label: String,
-    description: Description,
-}
-
-fn descriptions() -> Vec<(String, Description)> {
-    let parsed: Contracts = serde_json::from_str(FIXTURE).expect("contracts parse");
-    parsed
-        .contracts
-        .into_iter()
-        .map(|case| (case.label, case.description))
-        .collect()
 }
 
 #[test]
@@ -188,13 +164,12 @@ fn diffs_produce_upstream_results() {
 }
 
 #[test]
-fn canonical_json_and_hash64_match_upstream() {
+fn canonical_json_matches_upstream() {
     let fixture = fixture();
     for case in section(&fixture, "canonicalJson", 20) {
         let value: Value = serde_json::from_str(case["json"].as_str().unwrap()).unwrap();
         let canonical = canonical_json(&value);
         assert_eq!(canonical, case["canonical"], "{}", case["name"]);
-        assert_eq!(hash64(&canonical), case["hash64"], "{}", case["name"]);
     }
     for case in section(&fixture, "numbers", 30) {
         let literal = case["literal"].as_str().unwrap();
@@ -203,121 +178,5 @@ fn canonical_json_and_hash64_match_upstream() {
         let number: f64 = literal.parse().unwrap();
         let canonical = canonical_json(&Value::from(number));
         assert_eq!(canonical, case["canonical"], "{literal}");
-        assert_eq!(hash64(&canonical), case["hash64"], "{literal}");
     }
-    for case in section(&fixture, "hash64", 15) {
-        assert_eq!(
-            hash64(case["text"].as_str().unwrap()),
-            case["hash64"],
-            "{}",
-            case["text"]
-        );
-    }
-}
-
-#[test]
-fn contract_fingerprints_match_upstream() {
-    let fixture = fixture();
-    let cases = section(&fixture, "contracts", 25);
-    let typed = descriptions();
-    assert_eq!(typed.len(), cases.len());
-    for (case, (label, description)) in cases.iter().zip(&typed) {
-        assert_eq!(case["label"], label.as_str());
-        assert_eq!(
-            fingerprint(&case["description"]),
-            case["fingerprint"],
-            "{label}"
-        );
-        assert_eq!(description.fingerprint(), case["fingerprint"], "{label}");
-        assert_eq!(
-            description.to_value(),
-            case["description"],
-            "{label}: lossless"
-        );
-    }
-}
-
-#[test]
-fn coverage_matches_upstream() {
-    let fixture = fixture();
-    let typed = descriptions();
-    let find = |label: &Value| {
-        &typed
-            .iter()
-            .find(|(name, _)| label == name.as_str())
-            .unwrap_or_else(|| panic!("no contract {label}"))
-            .1
-    };
-    for case in section(&fixture, "coverage", 30) {
-        let reason = coverage(find(&case["provider"]), find(&case["consumer"]));
-        assert_eq!(
-            reason.map_or(Value::Null, Value::String),
-            case["reason"],
-            "{} covering {}",
-            case["provider"],
-            case["consumer"]
-        );
-    }
-}
-
-#[test]
-fn fits_matches_upstream() {
-    let fixture = fixture();
-    for case in section(&fixture, "fits", 50) {
-        assert_eq!(
-            Value::Bool(fits(&case["sub"], &case["sup"])),
-            case["fits"],
-            "{}",
-            case["name"]
-        );
-    }
-}
-
-#[test]
-fn builders_reproduce_upstream_fingerprints() {
-    let fixture = fixture();
-    let expected = |label: &str| {
-        section(&fixture, "contracts", 1)
-            .iter()
-            .find(|case| case["label"] == label)
-            .map(|case| case["fingerprint"].clone())
-            .unwrap()
-    };
-    let input = json!({"type": "object", "properties": {}});
-    let number = json!({"type": "number"});
-    let counter = Description::remote(
-        "fixture.counter",
-        1,
-        input.clone(),
-        Placement::Named { name: "fixture".to_string() },
-        [(
-            "owner",
-            vec![
-                ("count", MemberDescription::state(number.clone())),
-                (
-                    "add",
-                    MemberDescription::method(
-                        Some(json!({"type": "object", "required": ["n"], "properties": {"n": number}})),
-                        Some(number.clone()),
-                    ),
-                ),
-                ("reset", MemberDescription::method(None, None)),
-            ],
-        )],
-    )
-    .unwrap();
-    assert_eq!(counter.fingerprint(), expected("counter"));
-
-    let native = Description::local(
-        "fixture.native",
-        1,
-        input,
-        [
-            ("handle", MemberDescription::opaque("fixture.handle@1")),
-            ("size", MemberDescription::state(number)),
-            ("ping", MemberDescription::method(None, None)),
-        ],
-    )
-    .unwrap();
-    assert_eq!(native.fingerprint(), expected("native"));
 }

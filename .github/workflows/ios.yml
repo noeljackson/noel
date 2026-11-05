@@ -1,0 +1,18 @@
+name: ios
+
+on:
+  push:
+    paths: ["apps/ios/**", "crates/noel-ffi/**", "crates/noel-client/**", "crates/noel-chord/**", "scripts/ios-build.sh", ".github/workflows/ios.yml"]
+  pull_request:
+    paths: ["apps/ios/**", "crates/noel-ffi/**", "crates/noel-client/**", "crates/noel-chord/**", "scripts/ios-build.sh", ".github/workflows/ios.yml"]
+  workflow_dispatch:
+
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install xcodegen
+      - name: noel-ffi, NoelKit and the app
+        run: make ios

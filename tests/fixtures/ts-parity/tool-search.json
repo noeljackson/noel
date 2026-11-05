@@ -1,0 +1,2565 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "commit": "7dc38ff0e9490483b368c2b14531c9199c4cbee1",
+    "script": "/ts-parity/tool-search-fixture.ts",
+    "files": [
+      "packages/coding-agent/src/extensions/tool-search/tool.ts",
+      "packages/coding-agent/test/tool-search.test.ts"
+    ]
+  },
+  "defaultLimit": 8,
+  "tokenize": [
+    {
+      "text": "listIssues for the GitHub_repo",
+      "terms": [
+        "list",
+        "issue",
+        "git",
+        "hub",
+        "repo"
+      ]
+    },
+    {
+      "text": "searches queries HTTPServer",
+      "terms": [
+        "search",
+        "query",
+        "http",
+        "server"
+      ]
+    },
+    {
+      "text": "repo.issues/search:queries",
+      "terms": [
+        "repo",
+        "issue",
+        "search",
+        "query"
+      ]
+    },
+    {
+      "text": "搜索仓库问题",
+      "terms": [
+        "搜索",
+        "仓库",
+        "问题"
+      ]
+    },
+    {
+      "text": "文書を検索",
+      "terms": [
+        "文書",
+        "を",
+        "検索"
+      ]
+    },
+    {
+      "text": "문서 검색",
+      "terms": [
+        "문서",
+        "검색"
+      ]
+    },
+    {
+      "text": "ค้นหาเอกสาร",
+      "terms": [
+        "ค้นหา",
+        "เอกสาร"
+      ]
+    },
+    {
+      "text": "Поиск документов",
+      "terms": [
+        "поиск",
+        "документов"
+      ]
+    },
+    {
+      "text": "البحث عن الملفات",
+      "terms": [
+        "البحث",
+        "عن",
+        "الملفات"
+      ]
+    },
+    {
+      "text": "फ़ाइल खोजें",
+      "terms": [
+        "फ़ाइल",
+        "खोजें"
+      ]
+    },
+    {
+      "text": "Éléments cafés",
+      "terms": [
+        "éléments",
+        "cafés"
+      ]
+    },
+    {
+      "text": "搜索GitHub_repoIssues résumé cafés",
+      "terms": [
+        "搜索",
+        "git",
+        "hub",
+        "repo",
+        "issue",
+        "résumé",
+        "cafés"
+      ]
+    },
+    {
+      "text": "CAFÉ café",
+      "terms": [
+        "café",
+        "café"
+      ]
+    },
+    {
+      "text": " \t，。!? 😀 ",
+      "terms": []
+    },
+    {
+      "text": "boxes buzzes classes ties pies glass is as",
+      "terms": [
+        "box",
+        "buzz",
+        "class",
+        "tie",
+        "pie",
+        "glass"
+      ]
+    },
+    {
+      "text": "XMLHttpRequest parseJSON v2Api ABCdef",
+      "terms": [
+        "xml",
+        "http",
+        "request",
+        "parse",
+        "json",
+        "v2",
+        "api",
+        "ab",
+        "cdef"
+      ]
+    },
+    {
+      "text": "mcp__dev-app__thread_read",
+      "terms": [
+        "mcp",
+        "dev",
+        "app",
+        "thread",
+        "read"
+      ]
+    }
+  ],
+  "rank": [
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "issue",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__linear__search_issues",
+          "score": 2.7541865847027918
+        },
+        {
+          "name": "mcp__github__list_issues",
+          "score": 2.6359830735162886
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "pull requests",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__github__create_pull_request",
+          "score": 9.846351845279438
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "search",
+      "limit": 1,
+      "matches": [
+        {
+          "name": "mcp__docs__search",
+          "score": 3.629287484729601
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "closed",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__github__list_issues",
+          "score": 0.9666934925244742
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "kubernetes",
+      "limit": 8,
+      "matches": []
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "the",
+      "limit": 8,
+      "matches": []
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "tickets",
+      "limit": 8,
+      "matches": []
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "",
+      "limit": 8,
+      "matches": []
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "search issues",
+      "limit": 0,
+      "matches": []
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "localized",
+          "description": "Поиск документов",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        },
+        {
+          "name": "localized",
+          "text": "Поиск документов",
+          "namespaceText": ""
+        }
+      ],
+      "query": "документов",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "localized",
+          "score": 1.6671192638547883
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "localized",
+          "description": "البحث عن الملفات",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        },
+        {
+          "name": "localized",
+          "text": "البحث عن الملفات",
+          "namespaceText": ""
+        }
+      ],
+      "query": "الملفات",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "localized",
+          "score": 1.487730533884761
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "localized",
+          "description": "फ़ाइल खोजें",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        },
+        {
+          "name": "localized",
+          "text": "फ़ाइल खोजें",
+          "namespaceText": ""
+        }
+      ],
+      "query": "खोजें",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "localized",
+          "score": 1.6671192638547883
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "localized",
+          "description": "Rechercher un café",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        },
+        {
+          "name": "localized",
+          "text": "Rechercher un café",
+          "namespaceText": ""
+        }
+      ],
+      "query": "café",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "localized",
+          "score": 1.487730533884761
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "description": "List issues in a repository.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "description": "open or closed"
+              }
+            }
+          }
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "description": "Open a pull request.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "description": "Search Linear issues by text.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__docs__search",
+          "description": "Search the documentation.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "localized",
+          "description": "문서 검색",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__github__list_issues",
+          "text": "List issues in a repository. state open or closed",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__github__create_pull_request",
+          "text": "Open a pull request.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__linear__search_issues",
+          "text": "Search Linear issues by text.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__docs__search",
+          "text": "Search the documentation.",
+          "namespaceText": ""
+        },
+        {
+          "name": "localized",
+          "text": "문서 검색",
+          "namespaceText": ""
+        }
+      ],
+      "query": "검색",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "localized",
+          "score": 1.6671192638547883
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "thread_read",
+      "limit": 1,
+      "matches": [
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 1.7427357526789993
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "dev_app__thread_read",
+      "limit": 1,
+      "matches": [
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 5.244610702094599
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "mcp__dev-app__thread_read",
+      "limit": 1,
+      "matches": [
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 5.973896929270418
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "Thread_Read",
+      "limit": 1,
+      "matches": [
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 1.7427357526789993
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "thread read",
+      "limit": 1,
+      "matches": [
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 1.7427357526789993
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "read",
+      "limit": 1,
+      "matches": [
+        {
+          "name": "mcp__app__queue_read",
+          "score": 0.8013254764456249
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "read",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__app__queue_read",
+          "score": 0.8013254764456249
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 0.6890463195455451
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__ci__status",
+          "description": "Deploy status: last deploy, deploy log, deploy errors.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__ci__deploy_release",
+          "description": "Start a release of the current branch to an environment, run the migrations, switch traffic over, and wait until the new version is live and healthy.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__ci__status",
+          "text": "Deploy status: last deploy, deploy log, deploy errors.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__ci__deploy_release",
+          "text": "Start a release of the current branch to an environment, run the migrations, switch traffic over, and wait until the new version is live and healthy.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "deploy",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__ci__deploy_release",
+          "score": 0.5469646703818638
+        },
+        {
+          "name": "mcp__ci__status",
+          "score": 0.3274346326095511
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__peekaboo__see",
+          "description": "Capture the app window of the peekaboo app and describe the app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "description": "Click a menu item of an app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "description": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__peekaboo__see",
+          "text": "Capture the app window of the peekaboo app and describe the app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "text": "Click a menu item of an app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "text": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "peekaboo app",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__peekaboo__app",
+          "score": 2.817035449750426
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "score": 2.6813056705707137
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "score": 2.04427704068739
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "score": 0.2610341309688891
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 0.2610341309688891
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__peekaboo__see",
+          "description": "Capture the app window of the peekaboo app and describe the app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "description": "Click a menu item of an app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "description": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__peekaboo__see",
+          "text": "Capture the app window of the peekaboo app and describe the app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "text": "Click a menu item of an app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "text": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "open the peekaboo app tool",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__peekaboo__app",
+          "score": 7.786848749326426
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "score": 2.6813056705707137
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "score": 2.04427704068739
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "score": 0.2610341309688891
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 0.2610341309688891
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__peekaboo__see",
+          "description": "Capture the app window of the peekaboo app and describe the app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "description": "Click a menu item of an app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "description": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__peekaboo__see",
+          "text": "Capture the app window of the peekaboo app and describe the app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "text": "Click a menu item of an app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "text": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "read thread_read state",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 10.94040362764473
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "score": 4.926144984812243
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__peekaboo__see",
+          "description": "Capture the app window of the peekaboo app and describe the app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "description": "Click a menu item of an app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "description": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__peekaboo__see",
+          "text": "Capture the app window of the peekaboo app and describe the app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "text": "Click a menu item of an app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "text": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "describe window",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__peekaboo__see",
+          "score": 3.118055048653045
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__peekaboo__see",
+          "description": "Capture the app window of the peekaboo app and describe the app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "description": "Click a menu item of an app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "description": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__peekaboo",
+            "instructions": "Peekaboo controls macOS apps by app name."
+          }
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "description": "Read a queued message of this thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "description": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__peekaboo__see",
+          "text": "Capture the app window of the peekaboo app and describe the app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "text": "Click a menu item of an app.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "text": "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.",
+          "namespaceText": "mcp__peekaboo  Peekaboo controls macOS apps by app name."
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "text": "Read a queued message of this thread.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "text": "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "app",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__peekaboo__app",
+          "score": 0.39155119645333364
+        },
+        {
+          "name": "mcp__app__queue_read",
+          "score": 0.2610341309688891
+        },
+        {
+          "name": "mcp__dev-app__thread_read",
+          "score": 0.2610341309688891
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "score": 0.18866210887561893
+        },
+        {
+          "name": "mcp__peekaboo__menu",
+          "score": 0.15778928812298523
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__peekaboo__app",
+          "description": "Launch, quit, focus, or switch applications by name or bundle identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "description": "Capture the app window and describe the UI elements of the app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "description": "Move, resize, or close a window of an app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "description": "Take a screenshot of the screen, an app, or a window.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__peekaboo__app",
+          "text": "Launch, quit, focus, or switch applications by name or bundle identifier.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "text": "Capture the app window and describe the UI elements of the app.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "text": "Move, resize, or close a window of an app.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "text": "Take a screenshot of the screen, an app, or a window.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "screenshot window",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__peekaboo__image",
+          "score": 1.6997153693971638
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "score": 3.019130439816119
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "score": 0.33998478191733594
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__peekaboo__app",
+          "description": "Launch, quit, focus, or switch applications by name or bundle identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "description": "Capture the app window and describe the UI elements of the app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "description": "Move, resize, or close a window of an app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "description": "Take a screenshot of the screen, an app, or a window.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__peekaboo__app",
+          "text": "Launch, quit, focus, or switch applications by name or bundle identifier.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "text": "Capture the app window and describe the UI elements of the app.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "text": "Move, resize, or close a window of an app.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "text": "Take a screenshot of the screen, an app, or a window.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "describe app",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__peekaboo__see",
+          "score": 1.2877753407750017
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "score": 1.6254148669572415
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "score": 0.1147490764590188
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "score": 0.1147490764590188
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__peekaboo__app",
+          "description": "Launch, quit, focus, or switch applications by name or bundle identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "description": "Capture the app window and describe the UI elements of the app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "description": "Move, resize, or close a window of an app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "description": "Take a screenshot of the screen, an app, or a window.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__peekaboo__app",
+          "text": "Launch, quit, focus, or switch applications by name or bundle identifier.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "text": "Capture the app window and describe the UI elements of the app.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "text": "Move, resize, or close a window of an app.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "text": "Take a screenshot of the screen, an app, or a window.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "window",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__peekaboo__window",
+          "score": 1.8151576354901828
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "score": 0.38845785973525315
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "score": 0.33998478191733594
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__peekaboo__app",
+          "description": "Launch, quit, focus, or switch applications by name or bundle identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "description": "Capture the app window and describe the UI elements of the app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "description": "Move, resize, or close a window of an app.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "description": "Take a screenshot of the screen, an app, or a window.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__peekaboo__app",
+          "text": "Launch, quit, focus, or switch applications by name or bundle identifier.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "text": "Capture the app window and describe the UI elements of the app.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__window",
+          "text": "Move, resize, or close a window of an app.",
+          "namespaceText": ""
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "text": "Take a screenshot of the screen, an app, or a window.",
+          "namespaceText": ""
+        }
+      ],
+      "query": "app window",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__peekaboo__window",
+          "score": 2.035267227607028
+        },
+        {
+          "name": "mcp__peekaboo__image",
+          "score": 0.5032069361942719
+        },
+        {
+          "name": "mcp__peekaboo__see",
+          "score": 0.48012573382012796
+        },
+        {
+          "name": "mcp__peekaboo__app",
+          "score": 0.7781170065700378
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "mcp__x__run",
+          "description": "Run it.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "namespace": {
+            "name": "mcp__x",
+            "description": "Kubernetes cluster tools"
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "mcp__x__run",
+          "text": "Run it.",
+          "namespaceText": "mcp__x Kubernetes cluster tools "
+        }
+      ],
+      "query": "kubernetes",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "mcp__x__run",
+          "score": 0.14384103622589042
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "deep",
+          "description": "Nested schema.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "filter": {
+                "type": "object",
+                "description": "Filter rows",
+                "properties": {
+                  "owner": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "description": "label name"
+                    }
+                  }
+                }
+              },
+              "mode": {
+                "anyOf": [
+                  {
+                    "description": "fast path"
+                  },
+                  {
+                    "description": "slow path"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "name": "blank",
+          "description": "   ",
+          "parameters": {
+            "description": ""
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "deep",
+          "text": "Nested schema. filter Filter rows owner tags label name mode fast path slow path",
+          "namespaceText": ""
+        },
+        {
+          "name": "blank",
+          "text": "",
+          "namespaceText": ""
+        }
+      ],
+      "query": "label owner",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "deep",
+          "score": 0.9838218046657289
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "deep",
+          "description": "Nested schema.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "filter": {
+                "type": "object",
+                "description": "Filter rows",
+                "properties": {
+                  "owner": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "description": "label name"
+                    }
+                  }
+                }
+              },
+              "mode": {
+                "anyOf": [
+                  {
+                    "description": "fast path"
+                  },
+                  {
+                    "description": "slow path"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "name": "blank",
+          "description": "   ",
+          "parameters": {
+            "description": ""
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "deep",
+          "text": "Nested schema. filter Filter rows owner tags label name mode fast path slow path",
+          "namespaceText": ""
+        },
+        {
+          "name": "blank",
+          "text": "",
+          "namespaceText": ""
+        }
+      ],
+      "query": "slow rows",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "deep",
+          "score": 0.9838218046657289
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "deep",
+          "description": "Nested schema.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "filter": {
+                "type": "object",
+                "description": "Filter rows",
+                "properties": {
+                  "owner": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "description": "label name"
+                    }
+                  }
+                }
+              },
+              "mode": {
+                "anyOf": [
+                  {
+                    "description": "fast path"
+                  },
+                  {
+                    "description": "slow path"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "name": "blank",
+          "description": "   ",
+          "parameters": {
+            "description": ""
+          }
+        }
+      ],
+      "documents": [
+        {
+          "name": "deep",
+          "text": "Nested schema. filter Filter rows owner tags label name mode fast path slow path",
+          "namespaceText": ""
+        },
+        {
+          "name": "blank",
+          "text": "",
+          "namespaceText": ""
+        }
+      ],
+      "query": "blank",
+      "limit": 8,
+      "matches": [
+        {
+          "name": "blank",
+          "score": 2.772588722239781
+        }
+      ]
+    }
+  ]
+}

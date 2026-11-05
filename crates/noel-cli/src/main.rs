@@ -3864,6 +3864,9 @@ struct TuiApp {
     previews_expanded: bool,
     live_thinking_index: Option<usize>,
     live_tool_indices: Vec<usize>,
+    /// The running `codemode` call's nested calls as rows, kept above its
+    /// result once it ends.
+    nested_rows: Option<String>,
     queued_messages: Vec<String>,
     turn_running: bool,
     /// True once the running turn has made a tool call; a prose-only turn
@@ -4334,6 +4337,7 @@ impl TuiApp {
         self.live_entry_index = None;
         self.live_thinking_index = None;
         self.live_tool_indices.clear();
+        self.nested_rows = None;
         self.previews_expanded = false;
     }
 
@@ -7224,6 +7228,7 @@ fn apply_turn_event(
             // below this tool call.
             *text_after_tool = true;
             app.live_tool_indices.push(app.entries.len());
+            app.nested_rows = None;
             app.push(TuiEntryKind::Tool, format!("running {}\n\n", call.name));
         }
         // A running command's output so far. The collapsed preview shows
@@ -7240,17 +7245,34 @@ fn apply_turn_event(
                 );
             }
         }
+        // A codemode script's nested calls, one row each, as they run.
+        TurnEvent::NestedToolCalls { call, calls } => {
+            let rows = nested_call_rows(calls);
+            if let Some(index) = app.live_tool_indices.last().copied() {
+                app.replace_entry(
+                    index,
+                    format!("running {}\n{}\n{rows}", call.name, tool_call_detail(call)),
+                );
+            }
+            app.nested_rows = Some(rows);
+        }
         TurnEvent::ToolOutput {
             call,
             output,
             is_error,
             ..
         } => {
+            let rows = app
+                .nested_rows
+                .take()
+                .filter(|rows| !rows.is_empty())
+                .map(|rows| format!("{rows}\n"))
+                .unwrap_or_default();
             if let Some(index) = app.live_tool_indices.last().copied() {
                 app.replace_entry(
                     index,
                     format!(
-                        "{} {}\n{}\n{}",
+                        "{} {}\n{}\n{rows}{}",
                         if *is_error { "failed" } else { "completed" },
                         call.name,
                         tool_call_detail(call),
@@ -7897,6 +7919,10 @@ async fn handle_tui_submission(
             app.replace_entry(checking, usage::format_account_status(&rows, now));
         }
         "/session" => app.push(TuiEntryKind::System, format_session(runtime)),
+        "/app" => app.push(
+            TuiEntryKind::System,
+            open_desktop_app(&runtime.session().session_id),
+        ),
         "/changelog" => app.push(TuiEntryKind::System, format_changelog()),
         "/settings" => open_tui_selector(app, config, runtime, "settings", "")?,
         "/settings show" => app.push(TuiEntryKind::System, format_settings(config, runtime)),
@@ -9303,6 +9329,41 @@ fn durable_tool_texts(runtime: &Runtime, tool_start: usize) -> Vec<String> {
         .collect()
 }
 
+/// A codemode script's nested calls as upstream's renderer lists them: a
+/// status mark, the tool, its arguments cut to 80 characters, and how long
+/// it took.
+fn nested_call_rows(calls: &[noel_core::NestedToolCall]) -> String {
+    const COLLAPSED_ARGS_CHARS: usize = 80;
+    calls
+        .iter()
+        .map(|call| {
+            let mark = match call.status {
+                noel_core::NestedCallStatus::Running => "…",
+                noel_core::NestedCallStatus::Ok => "✓",
+                noel_core::NestedCallStatus::Error => "✗",
+                noel_core::NestedCallStatus::Cancelled => "⊘",
+            };
+            let mut line = format!("{mark} {}", call.name);
+            let args: Vec<char> = call.args.chars().collect();
+            if args.len() > COLLAPSED_ARGS_CHARS {
+                let cut: String = args[..COLLAPSED_ARGS_CHARS - 3].iter().collect();
+                line.push_str(&format!(" {cut}..."));
+            } else if !args.is_empty() {
+                line.push_str(&format!(" {}", call.args));
+            }
+            if let Some(ms) = call.duration_ms {
+                if ms < 1000 {
+                    line.push_str(&format!(" {ms}ms"));
+                } else {
+                    line.push_str(&format!(" {:.1}s", (ms as f64 / 100.0).round() / 10.0));
+                }
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn tool_call_detail(call: &noel_ai::ChatToolCall) -> String {
     let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_default();
     if let Some(command) = args["command"].as_str() {
@@ -9998,6 +10059,24 @@ fn keybinding_map(config: &LoadedConfig) -> KeybindingMap {
             })
             .collect(),
     )
+}
+
+/// `/app`: the desktop app (`noel app`, spec §14) on this session, started
+/// apart from the terminal. A session this process holds opens there once
+/// it lets the session go (one writer at a time).
+pub(crate) fn open_desktop_app(session: &str) -> String {
+    let started = std::env::current_exe().and_then(|noel| {
+        std::process::Command::new(noel)
+            .args(["app", "--session", session])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    });
+    match started {
+        Ok(_) => format!("opening session {session} in the desktop app"),
+        Err(error) => format!("could not start the desktop app: {error}"),
+    }
 }
 
 fn format_session(runtime: &Runtime) -> String {
@@ -11417,6 +11496,39 @@ fn remove_stored_auth(config: &mut LoadedConfig, provider: &str, account: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codemode_nested_calls_are_rows_like_upstreams() {
+        let row = |status, args: &str, duration_ms| noel_core::NestedToolCall {
+            id: "c/1".to_string(),
+            name: "read".to_string(),
+            args: args.to_string(),
+            status,
+            duration_ms,
+            error: None,
+        };
+        let long = format!("{{\"path\":\"{}\"}}", "x".repeat(100));
+        let rows = nested_call_rows(&[
+            row(
+                noel_core::NestedCallStatus::Running,
+                "{\"path\":\"a\"}",
+                None,
+            ),
+            row(noel_core::NestedCallStatus::Ok, "", Some(12)),
+            row(noel_core::NestedCallStatus::Error, &long, Some(1250)),
+            row(noel_core::NestedCallStatus::Cancelled, "", None),
+        ]);
+        let lines: Vec<&str> = rows.lines().collect();
+        assert_eq!(lines[0], "… read {\"path\":\"a\"}");
+        assert_eq!(lines[1], "✓ read 12ms");
+        assert!(lines[2].starts_with("✗ read {\"path\":\"xxx"));
+        assert!(lines[2].ends_with("... 1.3s"), "{}", lines[2]);
+        assert_eq!(
+            lines[2].chars().count(),
+            "✗ read ".chars().count() + 80 + " 1.3s".len()
+        );
+        assert_eq!(lines[3], "⊘ read");
+    }
     use noel_config::{PromptTemplate, Skill, SourceInfo, SourceScope};
     use std::io::BufRead;
 

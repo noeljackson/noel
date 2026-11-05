@@ -141,40 +141,6 @@ pub(crate) fn array_index(key: &str) -> Option<u32> {
         .map(|index| index as u32)
 }
 
-/// Where a new key goes in JavaScript property order: array indices first,
-/// ascending, then other keys in insertion order.
-pub(crate) fn property_insert_at<'a>(
-    keys: impl Iterator<Item = &'a str>,
-    key: &str,
-) -> Option<usize> {
-    let index = array_index(key)?;
-    let mut position = 0;
-    for existing in keys {
-        match array_index(existing) {
-            Some(other) if other < index => position += 1,
-            _ => break,
-        }
-    }
-    Some(position)
-}
-
-/// Properties every plain object inherits from `Object.prototype`, which
-/// JavaScript's `in` operator finds on any object.
-pub(crate) const OBJECT_PROTOTYPE_KEYS: [&str; 12] = [
-    "__defineGetter__",
-    "__defineSetter__",
-    "__lookupGetter__",
-    "__lookupSetter__",
-    "__proto__",
-    "constructor",
-    "hasOwnProperty",
-    "isPrototypeOf",
-    "propertyIsEnumerable",
-    "toLocaleString",
-    "toString",
-    "valueOf",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;

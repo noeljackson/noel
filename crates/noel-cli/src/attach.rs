@@ -33,14 +33,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use noel_chord::delta::{Op, Seg};
-use noel_chord::host::StateUpdate;
-use noel_chord::{ChordError, ErrorCode};
+use noel_chord::v2::host::StateUpdate;
+use noel_chord::v2::WireError;
 use noel_config::LoadedConfig;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::server::client::{Client, Endpoint, Followed};
+use crate::server::client::{connect, Client, Endpoint, Followed};
 use crate::server::{new_request_id, valid_session_id};
 use crate::{
     Activity, TuiApp, TuiEntry, TuiEntryKind, TuiTerminal, QUIT_CONFIRM_WINDOW,
@@ -64,8 +63,9 @@ pub(crate) async fn run(
     let place = match &endpoint {
         Endpoint::Local => "noel server".to_owned(),
         Endpoint::Ssh { destination, .. } => format!("noel server on {destination}"),
+        Endpoint::Paired(paired) => format!("noel server on {}:{}", paired.host, paired.port),
     };
-    let client = Client::connect(
+    let client = connect(
         endpoint,
         Arc::new(move |message| {
             let _ = reports.send(Incoming::Report(message));
@@ -90,10 +90,10 @@ pub(crate) async fn run(
         loop {
             tokio::select! {
                 message = incoming.recv() => match message {
-                    Some(Incoming::Followed(Followed::Update(
-                        StateUpdate::Snapshot(view) | StateUpdate::Reset(view),
-                    ))) => return Ok(view),
-                    Some(Incoming::Followed(Followed::Update(StateUpdate::Error(error)))) => {
+                    Some(Incoming::Followed(Followed::Update(StateUpdate::Snapshot(view)))) => {
+                        return Ok(view)
+                    }
+                    Some(Incoming::Followed(Followed::Update(StateUpdate::Failed(error)))) => {
                         return Err(attach_error(session, error.into()))
                     }
                     Some(other) => early.push(other),
@@ -143,6 +143,18 @@ pub(crate) async fn run(
     for message in early {
         remote.receive(&mut app, message);
     }
+    // The whole history before the view's window, as reopening a session
+    // shows all of it.
+    if let Err(error) = remote
+        .history
+        .load_earlier(&remote.client, session, &first)
+        .await
+    {
+        app.push(
+            TuiEntryKind::Error,
+            format!("could not load the earlier history: {error:#}"),
+        );
+    }
     remote.first(&mut app, first);
     let result = remote
         .drive(
@@ -161,10 +173,8 @@ pub(crate) async fn run(
 
 /// An attach's error, naming an unknown session plainly.
 fn attach_error(session: &str, error: anyhow::Error) -> anyhow::Error {
-    match error.downcast_ref::<ChordError>() {
-        Some(chord)
-            if chord.code == ErrorCode::Invalid && chord.reason.as_deref() == Some("session") =>
-        {
+    match error.downcast_ref::<WireError>() {
+        Some(chord) if crate::server::errors::is_no_session(chord) => {
             anyhow!("no session {session} on noel server (`noel client ls` lists its sessions)")
         }
         _ => anyhow!("could not attach to session {session}: {error}"),
@@ -210,8 +220,11 @@ struct Remote {
     session: String,
     client: Client,
     sender: mpsc::UnboundedSender<Incoming>,
-    /// The view as of the last update.
+    /// The view as of the last update, its entries every entry the
+    /// session's history holds here (not only the view's window).
     view: Value,
+    /// The session's history: the windows seen and the pages loaded.
+    history: noel_client::Transcript,
     transcript: Transcript,
     /// The active run and when this TUI first saw it.
     run: Option<(String, Instant)>,
@@ -234,6 +247,7 @@ impl Remote {
             client,
             sender,
             view: Value::Null,
+            history: noel_client::Transcript::default(),
             transcript: Transcript::default(),
             run: None,
             saw_tools: false,
@@ -247,7 +261,7 @@ impl Remote {
     /// The first view: the transcript, and its prompts as the editor's
     /// history, as reopening a session restores them.
     fn first(&mut self, app: &mut TuiApp, view: Value) {
-        for entry in entries(&view) {
+        for entry in self.history.merge(&view).iter().map(message_of) {
             if entry["role"] == "user" {
                 app.editor_state.record_history(blocks(entry, "text"));
             }
@@ -286,23 +300,25 @@ impl Remote {
     }
 
     fn update(&mut self, app: &mut TuiApp, update: StateUpdate) {
-        let (view, dirty) = match update {
-            StateUpdate::Snapshot(view) | StateUpdate::Reset(view) => {
+        let mut view = match update {
+            StateUpdate::Snapshot(view) => {
                 if self.waiting.take().is_some() {
                     app.push(
                         TuiEntryKind::System,
                         "holding the session again: redrawn from its snapshot",
                     );
                 }
-                let dirty = first_difference(&self.view, &view);
-                (view, dirty)
+                view
             }
-            StateUpdate::Ops { ops, value } => (value, entries_changed_from(&ops)),
-            StateUpdate::Error(error) => {
+            StateUpdate::Ops { value, .. } => value,
+            StateUpdate::Failed(error) => {
                 app.push(TuiEntryKind::Error, format!("the session's view: {error}"));
                 return;
             }
         };
+        // The view holds a window of the history; the TUI shows all of it.
+        view["entries"] = Value::Array(self.history.merge(&view));
+        let dirty = first_difference(&self.view, &view);
         self.view = view;
         self.transcript.sync(app, &self.view, dirty);
         self.note_last_run(app);
@@ -331,7 +347,7 @@ impl Remote {
             "aborted"
                 if entries(&self.view)
                     .last()
-                    .is_none_or(|entry| entry["stopReason"] != "aborted") =>
+                    .is_none_or(|entry| message_of(entry)["stopReason"] != "aborted") =>
             {
                 app.push(TuiEntryKind::System, "aborted")
             }
@@ -642,6 +658,10 @@ impl Remote {
             ),
             "/status" => app.push(TuiEntryKind::System, format!("status\t{}", app.status)),
             "/session" => app.push(TuiEntryKind::System, self.describe()),
+            "/app" => app.push(
+                TuiEntryKind::System,
+                crate::open_desktop_app(&self.session),
+            ),
             "/copy" if app.transcript_view.borrow().has_selection() => {
                 app.transcript_view.get_mut().request_copy();
             }
@@ -860,15 +880,13 @@ impl Remote {
     }
 }
 
-/// A refusal because a run is active: `invalid/busy`.
+/// A refusal because a run is active: the plugin error `busy`.
 fn refused_busy(result: &Result<Value>) -> bool {
     result
         .as_ref()
         .err()
-        .and_then(|error| error.downcast_ref::<ChordError>())
-        .is_some_and(|error| {
-            error.code == ErrorCode::Invalid && error.reason.as_deref() == Some("busy")
-        })
+        .and_then(|error| error.downcast_ref::<WireError>())
+        .is_some_and(|error| error.is_plugin("busy"))
 }
 
 /// Whether a slash command goes to the session as a prompt: a tool command
@@ -904,6 +922,14 @@ fn entries(view: &Value) -> &[Value] {
     view["entries"].as_array().map_or(&[], Vec::as_slice)
 }
 
+/// The message of a history entry (`model[0]`), or the entry itself.
+fn message_of(entry: &Value) -> &Value {
+    match entry.get("model").and_then(|model| model.get(0)) {
+        Some(message) => message,
+        None => entry,
+    }
+}
+
 /// `pi.inbox`'s items: `(id, mode, content)`.
 fn inbox(view: &Value) -> Vec<(String, String, String)> {
     view["docs"]["pi.inbox"]["items"]
@@ -927,7 +953,10 @@ fn last_run(view: &Value) -> Option<(String, String)> {
 
 /// What the active run is doing, for the footer's spinner.
 fn activity(live: &Value) -> Activity {
-    if live.get("compaction").is_some() {
+    if live["compactions"]
+        .as_array()
+        .is_some_and(|running| !running.is_empty())
+    {
         return Activity::Compacting;
     }
     if let Some(tool) = live["tools"]
@@ -955,29 +984,6 @@ fn first_difference(old: &Value, new: &Value) -> usize {
         .zip(entries(new))
         .take_while(|(old, new)| old == new)
         .count()
-}
-
-/// The first entry `ops` may have changed; none when they leave the entries
-/// alone.
-fn entries_changed_from(ops: &[Op]) -> usize {
-    ops.iter()
-        .filter_map(|op| {
-            let Some(path) = op.path() else {
-                return Some(0);
-            };
-            match path.first() {
-                Some(Seg::Key(key)) if key == "entries" => {}
-                Some(_) => return None,
-                None => return Some(0),
-            }
-            Some(match (path.get(1), op) {
-                (None, Op::Splice(_, index, _, _)) => *index as usize,
-                (Some(Seg::Index(index)), _) => *index as usize,
-                _ => 0,
-            })
-        })
-        .min()
-        .unwrap_or(usize::MAX)
 }
 
 /// The text of a message's content blocks of type `kind` (`text` or
@@ -1027,8 +1033,35 @@ fn add(rows: &mut Vec<Row>, kind: TuiEntryKind, text: String, source: Source) {
 /// a reply's thinking, then its text, then `aborted` if it was; a prompt
 /// and its images; a tool's result with its call.
 fn entry_rows(entries: &[Value], index: usize) -> Vec<Row> {
-    let entry = &entries[index];
+    let record = &entries[index];
     let mut rows = Vec::new();
+    // Markers of the history: where the model's context was cut or reset.
+    match record["kind"].as_str() {
+        Some("pi.compaction") => {
+            let data = &record["data"];
+            add(
+                &mut rows,
+                TuiEntryKind::System,
+                format!(
+                    "compacted: {} messages summarized, {} kept",
+                    data["omittedMessages"], data["retainedMessages"]
+                ),
+                Source::Entry,
+            );
+            return rows;
+        }
+        Some("pi.reset") => {
+            add(
+                &mut rows,
+                TuiEntryKind::System,
+                format!("context reset to {} messages", record["data"]["messages"]),
+                Source::Entry,
+            );
+            return rows;
+        }
+        _ => {}
+    }
+    let entry = message_of(record);
     match entry["role"].as_str().unwrap_or_default() {
         "assistant" => {
             add(
@@ -1166,6 +1199,7 @@ fn call_detail(entries: &[Value], id: Option<&str>) -> String {
     entries
         .iter()
         .rev()
+        .map(message_of)
         .filter(|entry| entry["role"] == "assistant")
         .flat_map(|entry| entry["content"].as_array().into_iter().flatten())
         .find(|block| block["type"] == "toolCall" && block["id"] == id)
@@ -1445,21 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn ops_name_the_first_entry_they_change() {
-        let entries = |index| vec![Seg::Key("entries".into()), Seg::Index(index)];
-        let live = vec![Seg::Key("docs".into()), Seg::Key("pi.live".into())];
-        assert_eq!(
-            entries_changed_from(&[Op::Append(live.clone(), "x".into())]),
-            usize::MAX
-        );
-        assert_eq!(
-            entries_changed_from(&[
-                Op::Splice(vec![Seg::Key("entries".into())], 4, 0, vec![]),
-                Op::Set(entries(2), json!({})),
-            ]),
-            2
-        );
-        assert_eq!(entries_changed_from(&[Op::Replace(json!({}))]), 0);
+    fn views_differ_from_their_first_changed_entry() {
         assert_eq!(
             first_difference(
                 &json!({"entries": [1, 2, 3]}),

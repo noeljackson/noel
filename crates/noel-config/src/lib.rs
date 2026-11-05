@@ -467,6 +467,13 @@ pub struct Settings {
     pub markdown: Option<MarkdownSettings>,
     #[serde(default)]
     pub warnings: Option<WarningSettings>,
+    /// Crash restarts in a row after which a Mode 2 run ends
+    /// `restart_limit` (Durable's `settings.restartLimit`, default 5).
+    #[serde(default)]
+    pub restart_limit: Option<u32>,
+    /// How codemode presents tools (upstream `codemode`).
+    #[serde(default)]
+    pub codemode: Option<CodemodeSettings>,
     #[serde(default)]
     pub model_refresh: Option<ModelRefreshSettings>,
     /// Failover-only multi-account rotation. Disabled by default.
@@ -563,6 +570,8 @@ impl Settings {
             show_hardware_cursor: overrides.show_hardware_cursor.or(self.show_hardware_cursor),
             markdown: merge_optional_settings(self.markdown, overrides.markdown),
             warnings: merge_optional_settings(self.warnings, overrides.warnings),
+            codemode: merge_optional_settings(self.codemode, overrides.codemode),
+            restart_limit: overrides.restart_limit.or(self.restart_limit),
             model_refresh: merge_optional_settings(self.model_refresh, overrides.model_refresh),
             failover: merge_optional_settings(self.failover, overrides.failover),
             server: merge_optional_settings(self.server, overrides.server),
@@ -877,6 +886,9 @@ pub struct ServerSettings {
     /// queued; one that lost its server waits this long to be adopted.
     /// Default 60000.
     pub worker_idle_exit_ms: Option<u64>,
+    /// Where the server also listens for paired devices over TLS
+    /// (`host:port`); unset, it does not (spec §16).
+    pub listen: Option<String>,
 }
 
 impl MergeSettings for ServerSettings {
@@ -884,6 +896,7 @@ impl MergeSettings for ServerSettings {
         Self {
             idle_exit_ms: overrides.idle_exit_ms.or(self.idle_exit_ms),
             worker_idle_exit_ms: overrides.worker_idle_exit_ms.or(self.worker_idle_exit_ms),
+            listen: overrides.listen.or(self.listen),
         }
     }
 }
@@ -1001,6 +1014,27 @@ impl MergeSettings for MarkdownSettings {
     fn merge(self, overrides: Self) -> Self {
         Self {
             code_block_indent: overrides.code_block_indent.or(self.code_block_indent),
+        }
+    }
+}
+
+/// Upstream's `codemode` settings: `mode` is `"on"` (the default: tools stay
+/// declared and their descriptions say how scripts call them) or `"only"`
+/// (codemode lists every script-callable tool and the others are not
+/// declared); `inlineBudget` is the estimated tokens codemode's description
+/// may spend on tool declarations (default 3000).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodemodeSettings {
+    pub mode: Option<String>,
+    pub inline_budget: Option<serde_json::Number>,
+}
+
+impl MergeSettings for CodemodeSettings {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            mode: overrides.mode.or(self.mode),
+            inline_budget: overrides.inline_budget.or(self.inline_budget),
         }
     }
 }
@@ -4029,8 +4063,26 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Runs `test` with no provider base-URL variable ([`BASE_URL_ENV`]) set,
+    /// so models keep the addresses the test gives them wherever it runs.
+    fn without_base_url_env(test: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let saved = BASE_URL_ENV.map(|(_, name)| save_env(name));
+        for (_, name) in BASE_URL_ENV {
+            env::remove_var(name);
+        }
+        test();
+        for (name, value) in saved {
+            restore_env(name, value);
+        }
+    }
+
     #[test]
     fn model_cache_extends_builtin_and_explicit_models() {
+        without_base_url_env(model_cache_extends_builtin_and_explicit_models_here);
+    }
+
+    fn model_cache_extends_builtin_and_explicit_models_here() {
         let root = test_dir("noel-config-model-cache");
         let agent_dir = root.join("agent");
         let cwd = root.join("repo");

@@ -1,0 +1,33 @@
+{
+  "name": "interop.counter",
+  "version": 1,
+  "host": "server",
+  "params": [],
+  "variants": {
+    "owner": {
+      "state": {
+        "count": {"type": "integer"}
+      },
+      "methods": {
+        "add": {
+          "args": {
+            "type": "object",
+            "required": ["by"],
+            "properties": {"by": {"type": "integer"}},
+            "additionalProperties": false
+          },
+          "result": {"type": "null"}
+        },
+        "burst": {
+          "args": {
+            "type": "object",
+            "required": ["times"],
+            "properties": {"times": {"type": "integer"}},
+            "additionalProperties": false
+          },
+          "result": {"type": "null"}
+        }
+      }
+    }
+  }
+}

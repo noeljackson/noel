@@ -1,5 +1,5 @@
 //! `noel worker --session <id> --generation <g> [--resume <runId>]`: the host
-//! `session:<id>` (spec §5), which the server starts and dials.
+//! at `Session({id})` (spec §5), which the server starts and dials.
 //!
 //! - It opens the session's journal under its lock (`fatal`, reason
 //!   `locked`, exit 75 if another process holds it), binds
@@ -7,7 +7,7 @@
 //!   control line, `{"chord2control": {"type": "ready", ...}}`, on stdout.
 //! - Each connection to its socket (from this user only) is its parent: it
 //!   sends `ready` again (`pid`, `build`, `session`, `generation`), then
-//!   speaks Chord as NDJSON lines `{"chord2": frame}`, with control lines for
+//!   speaks Chord v2 in framed messages, with tagged control frames for
 //!   `status` (worker to server: `viewers`, `running`, `queued`, `runId`),
 //!   `shutdown` (server to worker: exit once no run is active; worker to
 //!   server: this worker is exiting). A new connection replaces the parent.
@@ -31,15 +31,17 @@ use std::time::Duration;
 use base64::Engine;
 use clap::Parser;
 use noel_ai::{MediaInput, ModelRef};
-use noel_chord::host::{Host, HostEvent, HostOptions, LinkOptions};
-use noel_chord::link::{ndjson, ControlSender};
-use noel_chord::object::BoxFuture;
-use noel_chord::{CallContext, Cell, ChordError, Implementation};
+use noel_chord::v2::host::{Host, HostEvent, HostOptions, LinkOptions, RemoteRef, StateUpdate};
+use noel_chord::v2::object::{BoxFuture, CallContext, Cell, Implementation};
+use noel_chord::v2::transport::{framed, ControlSender};
+use noel_chord::v2::{ChordError, WireError};
+use noel_client::session_address;
 use noel_config::{load_config_with_resources, project_is_trusted, LoadedConfig};
 use noel_core::controller::{
     AbortPolicy, Busy, Enqueued, Event, Host as ControllerHost, Image, Repeat, SessionController,
     Start, Submission, SubmissionState, SubmitError, Submitted, WhenBusy, Withdrawal,
 };
+use noel_core::plugins::{PluginTool, PluginToolHost, PluginToolOutput};
 use noel_core::{
     expand_input, ReloadableSystems, RunStatus, Runtime, SessionError, SessionStore, SubmissionKind,
 };
@@ -48,11 +50,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, Notify};
 
+use super::errors::{forbidden, refused, unavailable};
 use super::view::{self, View};
 use super::{
-    build_id, chat_contract, chat_variant, control_line, peer_check, principal_key,
-    remove_stale_socket, set_mode, valid_session_id, write_record, RuntimeDir,
-    DEFAULT_WORKER_IDLE_MS, EXIT_LOCKED,
+    build_id, chat_contract, chat_variant, control_line, peer_check, remove_stale_socket, set_mode,
+    valid_session_id, write_record, RuntimeDir, DEFAULT_WORKER_IDLE_MS, EXIT_LOCKED,
 };
 
 #[derive(Debug, Parser)]
@@ -170,7 +172,8 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     );
 
     // The view hears each partial and tool output once it is saved.
-    let view = Arc::new(Mutex::new(View::new(&state)));
+    let saved = SessionStore::read_history(store.path())?;
+    let view = Arc::new(Mutex::new(View::new(&state, &saved)));
     let heard = view.clone();
     let store = store.observe_progress(Arc::new(move |saved| lock(&heard).saved(saved)));
     let mut runtime = Runtime::with_store(state, systems, store);
@@ -212,14 +215,18 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     let status = Arc::new(StatusBoard::default());
     let host = chat_host(&session_id, status.clone());
     let (commands, inbox) = mpsc::unbounded_channel::<Command>();
-    serve_chat(&host, &session_id, lock(&view).cell().clone(), commands);
+    serve_chat(&host, &session_id, view.clone(), commands.clone());
 
+    let plugins = Arc::new(host.get(noel_client::contracts::plugins(), json!({})));
+    follow_plugin_tools(plugins.clone(), commands.clone());
     let worker = WorkerHost {
         config,
         offline,
         view,
         status: status.clone(),
         aborts: Vec::new(),
+        plugin_host: Arc::new(ServerPluginTools(plugins)),
+        pending_plugin_tools: None,
     };
     let mut controller = SessionController::new(runtime, worker, AbortPolicy::WithdrawQueue);
     refresh(&mut controller);
@@ -345,26 +352,25 @@ impl StatusBoard {
 // ─── the chord side ─────────────────────────────────────────────────────────
 
 fn chat_host(session_id: &str, status: Arc<StatusBoard>) -> Host {
-    Host::new(HostOptions {
-        principal_key: Some(Arc::new(principal_key)),
-        on_error: Some(Arc::new(|error| eprintln!("noel worker: chord: {error}"))),
-        observer: Some(Arc::new(move |event| match event {
-            HostEvent::Held { type_name, .. } if type_name == "noel.chat" => {
-                status.update(|status| status.holds += 1)
-            }
-            HostEvent::Released { type_name, .. } if type_name == "noel.chat" => {
-                status.update(|status| status.holds = status.holds.saturating_sub(1))
-            }
-            HostEvent::LinkClosed { reason, .. } => {
-                eprintln!("noel worker: link closed: {reason}")
-            }
-            _ => {}
-        })),
-        ..HostOptions::host(format!("session:{session_id}"))
-    })
+    let host = Host::new(HostOptions {
+        address: Some(session_address(session_id)),
+        ..HostOptions::default()
+    });
+    host.observe(move |event| match event {
+        HostEvent::Held { type_name, .. } if type_name == "noel.chat" => {
+            status.update(|status| status.holds += 1)
+        }
+        HostEvent::Released { type_name, .. } if type_name == "noel.chat" => {
+            status.update(|status| status.holds = status.holds.saturating_sub(1))
+        }
+        HostEvent::Closed { .. } => eprintln!("noel worker: link closed"),
+        HostEvent::ProtocolError { error, .. } => eprintln!("noel worker: chord: {error}"),
+        _ => {}
+    });
+    host
 }
 
-type Reply = oneshot::Sender<Result<Value, ChordError>>;
+type Reply = oneshot::Sender<Result<Value, WireError>>;
 
 /// A `noel.chat` method call, for the task that drives the session.
 enum Command {
@@ -374,44 +380,76 @@ enum Command {
     Compact(Value, Reply),
     Configure(Value, Reply),
     Resume(Value, Reply),
+    /// The plugin tools the server's directory offers now.
+    PluginTools(Vec<PluginTool>),
 }
 
-fn serve_chat(host: &Host, session_id: &str, cell: Cell, commands: mpsc::UnboundedSender<Command>) {
+fn serve_chat(
+    host: &Host,
+    session_id: &str,
+    view: Arc<Mutex<View>>,
+    commands: mpsc::UnboundedSender<Command>,
+) {
     let session_id = session_id.to_owned();
+    let cell = lock(&view).cell().clone();
     host.serve(chat_contract(), move |input, principal| {
         if input.get("session").and_then(Value::as_str) != Some(session_id.as_str()) {
-            return Err(ChordError::invalid(
-                "input",
+            return Err(refused(
+                "session",
                 format!("this host serves session {session_id}"),
             ));
         }
         match chat_variant(principal, &session_id) {
-            Some("participant") => Ok(participant(&cell, &commands)),
-            Some(_) => Ok(Implementation::new("viewer").state("view", &cell)),
-            None => Err(ChordError::forbidden(format!(
+            Some("participant") => {
+                Ok(participant(&cell, &commands).method("entries", entries_method(&view)))
+            }
+            Some(_) => Ok(Implementation::new("viewer")
+                .state("view", &cell)
+                .method("entries", entries_method(&view))),
+            None => Err(forbidden(format!(
                 "session {session_id} is not for this principal"
             ))),
         }
     });
 }
 
+/// Entries before the view's window, for scrolling back: `entries({before,
+/// limit?})` gives up to `limit` (default and at most 100) entries just
+/// before entry `before`, and the entry before those.
+fn entries_method(
+    view: &Arc<Mutex<View>>,
+) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static {
+    let view = view.clone();
+    move |args, _ctx| {
+        let page = match args.get("before").and_then(Value::as_u64) {
+            Some(before) => {
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map_or(super::view::WINDOW_MAX, |limit| limit as usize)
+                    .clamp(1, super::view::WINDOW_MAX);
+                Ok(lock(&view).page(before, limit))
+            }
+            None => Err(ChordError::invalid("args", "`before` must be an entry id").into()),
+        };
+        Box::pin(async move { page })
+    }
+}
+
 fn participant(cell: &Cell, commands: &mpsc::UnboundedSender<Command>) -> Implementation {
     fn method(
         commands: &mpsc::UnboundedSender<Command>,
         make: fn(Value, Reply) -> Command,
-    ) -> impl Fn(Option<Value>, CallContext) -> BoxFuture<Result<Value, ChordError>>
-           + Send
-           + Sync
-           + 'static {
+    ) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static
+    {
         let commands = commands.clone();
         move |args, _ctx| {
             let commands = commands.clone();
             Box::pin(async move {
                 let (reply, answer) = oneshot::channel();
-                let closing = || ChordError::unavailable("the session is closing");
-                commands
-                    .send(make(args.unwrap_or_else(|| json!({})), reply))
-                    .map_err(|_| closing())?;
+                let closing = || WireError::from(unavailable("the session is closing"));
+                let args = if args.is_null() { json!({}) } else { args };
+                commands.send(make(args, reply)).map_err(|_| closing())?;
                 answer.await.unwrap_or_else(|_| Err(closing()))
             })
         }
@@ -457,10 +495,16 @@ async fn accept_parents(
             continue;
         }
         let (control, mut controls) = mpsc::unbounded_channel();
-        let (link, sender) = ndjson(read, write, Some(control));
+        let (link, sender) = framed(read, write, Some(control));
         sender.send(&status.get().control());
         *lock(&parent) = Some(sender);
-        host.connect(link, LinkOptions::default());
+        host.connect(
+            link,
+            LinkOptions {
+                trusted: true,
+                ..LinkOptions::new(json!({"kind": "server"}))
+            },
+        );
         eprintln!("noel worker: a server connected");
         let (status, draining) = (status.clone(), draining.clone());
         tokio::spawn(async move {
@@ -584,6 +628,10 @@ struct WorkerHost {
     /// Aborts to answer once the run settles, with how many queued
     /// submissions they withdrew.
     aborts: Vec<(Reply, usize)>,
+    /// Runs plugin tools through the server's `noel.plugins`.
+    plugin_host: Arc<dyn PluginToolHost>,
+    /// Plugin tools that changed during a run, set once it settles.
+    pending_plugin_tools: Option<Vec<PluginTool>>,
 }
 
 impl ControllerHost for WorkerHost {
@@ -657,6 +705,10 @@ fn refresh(controller: &mut SessionController<WorkerHost>) {
 
 /// Handles commands; a run they start is driven here, and what arrives
 /// meanwhile is handled through [`Busy`].
+/// How long a new worker waits for the server's plugin tools before it
+/// handles its first command.
+const PLUGIN_TOOLS_WAIT: Duration = Duration::from_secs(3);
+
 async fn drive(
     mut controller: SessionController<WorkerHost>,
     mut inbox: mpsc::UnboundedReceiver<Command>,
@@ -673,7 +725,25 @@ async fn drive(
             Err(error) => eprintln!("noel worker: run {run_id} not resumed: {error}"),
         }
     }
-    while let Some(command) = inbox.recv().await {
+    // The server's plugin tools come first, so a run started at once
+    // offers them; what arrives meanwhile waits its turn.
+    let mut early = std::collections::VecDeque::new();
+    let deadline = tokio::time::Instant::now() + PLUGIN_TOOLS_WAIT;
+    while let Ok(Some(command)) = tokio::time::timeout_at(deadline, inbox.recv()).await {
+        if let Command::PluginTools(tools) = command {
+            set_plugin_tools(&mut controller, tools);
+            break;
+        }
+        early.push_back(command);
+    }
+    loop {
+        let command = match early.pop_front() {
+            Some(command) => command,
+            None => match inbox.recv().await {
+                Some(command) => command,
+                None => break,
+            },
+        };
         controller
             .host()
             .status
@@ -698,8 +768,89 @@ async fn run_session(
     inbox: &mut mpsc::UnboundedReceiver<Command>,
 ) -> bool {
     let finished = controller.run(start, inbox, busy_command).await;
+    if let Some(tools) = controller.host().pending_plugin_tools.take() {
+        set_plugin_tools(controller, tools);
+    }
     refresh(controller);
     finished
+}
+
+fn set_plugin_tools(controller: &mut SessionController<WorkerHost>, tools: Vec<PluginTool>) {
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    eprintln!("noel worker: plugin tools: {}", names.join(", "));
+    controller.configure(|runtime, host| {
+        runtime.set_plugin_tools(host.plugin_host.clone(), tools);
+    });
+}
+
+/// Follows the server's plugin directory: its tools, as the worker's
+/// runtime offers them.
+fn follow_plugin_tools(plugins: Arc<RemoteRef>, commands: mpsc::UnboundedSender<Command>) {
+    let mut updates = plugins.subscribe("directory");
+    tokio::spawn(async move {
+        let _keep = plugins;
+        while let Some(update) = updates.next().await {
+            let directory = match update {
+                StateUpdate::Snapshot(value) | StateUpdate::Ops { value, .. } => value,
+                StateUpdate::Failed(_) => continue,
+            };
+            let tools = directory["plugins"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|plugin| plugin["running"] == json!(true))
+                .flat_map(|plugin| {
+                    let name = plugin["name"].as_str().unwrap_or_default().to_owned();
+                    plugin["contributions"]["tools"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |tool| PluginTool {
+                            plugin: name.clone(),
+                            name: tool["name"].as_str().unwrap_or_default().to_owned(),
+                            description: tool["description"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                            parameters: tool["parameters"].clone(),
+                            replay_safe: tool["replaySafe"] == json!(true),
+                        })
+                })
+                .collect();
+            if commands.send(Command::PluginTools(tools)).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Plugin tools run through the server, which forwards each call to the
+/// plugin when it is granted `tools`.
+struct ServerPluginTools(Arc<RemoteRef>);
+
+impl PluginToolHost for ServerPluginTools {
+    fn call(
+        &self,
+        plugin: &str,
+        tool: &str,
+        args: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginToolOutput> + Send>> {
+        let plugins = self.0.clone();
+        let args = json!({"plugin": plugin, "name": tool, "args": args.to_string()});
+        Box::pin(async move {
+            match plugins.call("callTool", args).await {
+                Ok(result) => PluginToolOutput {
+                    output: result["output"].as_str().unwrap_or_default().to_owned(),
+                    is_error: result["isError"] == json!(true),
+                },
+                Err(error) => PluginToolOutput {
+                    output: error.to_string(),
+                    is_error: true,
+                },
+            }
+        })
+    }
 }
 
 /// A command while no run is active; a run it starts is returned.
@@ -709,14 +860,28 @@ async fn idle_command(
 ) -> Option<Start> {
     match command {
         Command::Submit(args, reply) => {
-            let (submission, _) = match submission(&args) {
+            let (submission, _, reject_when_idle) = match submission(&args) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     let _ = reply.send(Err(error));
                     return None;
                 }
             };
-            match controller.submit(submission).await {
+            // Durable's whenIdle: "reject": an idle session refuses the
+            // input and writes nothing, so it never starts a run.
+            if reject_when_idle && submission.kind != SubmissionKind::Continue {
+                let _ = reply.send(Err(refused(
+                    "idle",
+                    "no run is active; the input was not admitted (whenIdle reject)",
+                )));
+                return None;
+            }
+            let submitted = if submission.kind == SubmissionKind::Continue {
+                controller.continue_run(submission.request_id).await
+            } else {
+                controller.submit(submission).await
+            };
+            match submitted {
                 Ok(Submitted::Started(start)) => {
                     let run_id = start.run_id().to_owned();
                     let _ = reply.send(Ok(json!({
@@ -744,7 +909,7 @@ async fn idle_command(
             let result = controller
                 .abort(expected)
                 .map(|()| json!({"withdrawn": queued}));
-            let _ = reply.send(result.map_err(|error| ChordError::invalid("abort", error)));
+            let _ = reply.send(result.map_err(|error| refused("abort", error)));
         }
         Command::Compact(args, reply) => {
             let focus = args.get("instructions").and_then(Value::as_str);
@@ -754,7 +919,7 @@ async fn idle_command(
                     "retainedMessages": record.retained_messages,
                 })
             });
-            let _ = reply.send(result.map_err(|error| ChordError::invalid("compact", error)));
+            let _ = reply.send(result.map_err(|error| refused("compact", error)));
         }
         Command::Configure(args, reply) => {
             let result = controller.configure(|runtime, host| configure(runtime, host, &args));
@@ -768,10 +933,11 @@ async fn idle_command(
                     return Some(start);
                 }
                 Err(error) => {
-                    let _ = reply.send(Err(ChordError::invalid("resume", error)));
+                    let _ = reply.send(Err(refused("resume", error)));
                 }
             }
         }
+        Command::PluginTools(tools) => set_plugin_tools(controller, tools),
     }
     None
 }
@@ -780,7 +946,7 @@ async fn idle_command(
 fn busy_command(command: Command, busy: &mut Busy<'_, WorkerHost>) {
     match command {
         Command::Submit(args, reply) => {
-            let result = submission(&args).and_then(|(submission, when_busy)| {
+            let result = submission(&args).and_then(|(submission, when_busy, _)| {
                 let active = busy.run_id().to_owned();
                 match busy.submit(submission, when_busy) {
                     Ok(Enqueued::Queued(id)) => Ok(json!({
@@ -804,16 +970,17 @@ fn busy_command(command: Command, busy: &mut Busy<'_, WorkerHost>) {
                 // Answered once the run settles.
                 Ok(()) => busy.host().aborts.push((reply, queued)),
                 Err(error) => {
-                    let _ = reply.send(Err(ChordError::invalid("abort", error)));
+                    let _ = reply.send(Err(refused("abort", error)));
                 }
             }
         }
         Command::Compact(_, reply) | Command::Configure(_, reply) | Command::Resume(_, reply) => {
-            let _ = reply.send(Err(ChordError::invalid(
+            let _ = reply.send(Err(refused(
                 "busy",
                 "a run is active; wait for it to settle",
             )));
         }
+        Command::PluginTools(tools) => busy.host().pending_plugin_tools = Some(tools),
     }
 }
 
@@ -825,8 +992,45 @@ fn text(args: &Value, key: &str) -> String {
 }
 
 /// `submit`'s arguments as a submission: `whenBusy` names its kind, as
-/// `prompt`, `steer` and `follow_up` do over RPC.
-fn submission(args: &Value) -> Result<(Submission, WhenBusy), ChordError> {
+/// `prompt`, `steer` and `follow_up` do over RPC; `type: "continue"` is
+/// Durable's continue. The flag is `whenIdle: "reject"`.
+fn submission(args: &Value) -> Result<(Submission, WhenBusy, bool), WireError> {
+    let reject_when_idle = match args.get("whenIdle").and_then(Value::as_str) {
+        None => false,
+        Some("reject") => true,
+        Some(other) => {
+            return Err(
+                ChordError::invalid("args", format!("whenIdle {other:?} is not reject")).into(),
+            )
+        }
+    };
+    let continuing = match args.get("type").and_then(Value::as_str) {
+        None | Some("input") => false,
+        Some("continue") => true,
+        Some(other) => {
+            return Err(ChordError::invalid(
+                "args",
+                format!("type {other:?} is not input or continue"),
+            )
+            .into())
+        }
+    };
+    if continuing {
+        return Ok((
+            Submission {
+                kind: SubmissionKind::Continue,
+                request_id: Some(text(args, "requestId")),
+                content: String::new(),
+                images: Vec::new(),
+                expected_run_id: None,
+            },
+            WhenBusy::Reject,
+            reject_when_idle,
+        ));
+    }
+    if !args.get("text").is_some_and(Value::is_string) {
+        return Err(ChordError::invalid("args", "an input needs its text").into());
+    }
     let (kind, when_busy) = match args.get("whenBusy").and_then(Value::as_str) {
         None | Some("reject") => (SubmissionKind::Prompt, WhenBusy::Reject),
         Some("steer") => (SubmissionKind::Steer, WhenBusy::Steer),
@@ -835,7 +1039,8 @@ fn submission(args: &Value) -> Result<(Submission, WhenBusy), ChordError> {
             return Err(ChordError::invalid(
                 "args",
                 format!("whenBusy {other:?} is not reject, steer or followUp"),
-            ))
+            )
+            .into())
         }
     };
     let images = args
@@ -860,6 +1065,7 @@ fn submission(args: &Value) -> Result<(Submission, WhenBusy), ChordError> {
             expected_run_id: None,
         },
         when_busy,
+        reject_when_idle,
     ))
 }
 
@@ -899,8 +1105,8 @@ fn run_status(status: RunStatus) -> &'static str {
     }
 }
 
-fn withdrawn(result: Result<Withdrawal, String>) -> Result<Value, ChordError> {
-    let outcome = match result.map_err(|error| ChordError::invalid("withdraw", error))? {
+fn withdrawn(result: Result<Withdrawal, String>) -> Result<Value, WireError> {
+    let outcome = match result.map_err(|error| refused("withdraw", error))? {
         Withdrawal::Withdrawn => "withdrawn",
         Withdrawal::AlreadyPlaced => "already_placed",
         Withdrawal::Settled => "settled",
@@ -910,7 +1116,7 @@ fn withdrawn(result: Result<Withdrawal, String>) -> Result<Value, ChordError> {
 
 /// A refused submission. Nothing was written, so none of these is
 /// `unavailable`: retrying the same submission cannot succeed.
-fn refusal(error: SubmitError) -> ChordError {
+fn refusal(error: SubmitError) -> WireError {
     let reason = match &error {
         SubmitError::Busy => "busy",
         SubmitError::QueuedPrompt => "queued_prompt",
@@ -923,7 +1129,7 @@ fn refusal(error: SubmitError) -> ChordError {
         }
         error => error.to_string(),
     };
-    ChordError::invalid(reason, message)
+    refused(reason, message)
 }
 
 /// `configure`: the session's model, then its thinking level, as RPC's
@@ -932,21 +1138,20 @@ fn configure(
     runtime: &mut Runtime,
     host: &mut WorkerHost,
     args: &Value,
-) -> Result<Value, ChordError> {
-    let invalid = |error: anyhow::Error| ChordError::invalid("configure", error.to_string());
+) -> Result<Value, WireError> {
+    let invalid = |error: anyhow::Error| refused("configure", error.to_string());
     let level = args.get("thinkingLevel").and_then(Value::as_str);
     if let Some(level) = level {
         if crate::normalized_thinking_level(level).is_none() {
-            return Err(ChordError::invalid(
+            return Err(refused(
                 "configure",
                 format!("Unknown thinking level: {level}"),
             ));
         }
     }
     if let Some(reference) = args.get("model").and_then(Value::as_str) {
-        let model = model_reference(&host.config, reference, host.offline).ok_or_else(|| {
-            ChordError::invalid("configure", format!("Model not found: {reference}"))
-        })?;
+        let model = model_reference(&host.config, reference, host.offline)
+            .ok_or_else(|| refused("configure", format!("Model not found: {reference}")))?;
         crate::switch_model(runtime, &host.config, &model, level).map_err(invalid)?;
     } else if let Some(level) = level {
         crate::set_thinking_level(runtime, &host.config, level).map_err(invalid)?;
@@ -992,7 +1197,7 @@ mod tests {
             if !when.is_null() {
                 args["whenBusy"] = when;
             }
-            submission(&args).map(|(submission, when_busy)| (submission.kind, when_busy))
+            submission(&args).map(|(submission, when_busy, _)| (submission.kind, when_busy))
         };
         assert_eq!(
             parse(Value::Null).unwrap(),
@@ -1010,6 +1215,19 @@ mod tests {
     }
 
     #[test]
+    fn a_continue_and_when_idle_are_read_from_submit() {
+        let (continuing, _, reject) =
+            submission(&json!({"requestId": "r", "type": "continue"})).unwrap();
+        assert_eq!((continuing.kind, reject), (SubmissionKind::Continue, false));
+        let (_, _, reject) =
+            submission(&json!({"requestId": "r", "text": "hi", "whenIdle": "reject"})).unwrap();
+        assert!(reject);
+        assert!(submission(&json!({"requestId": "r"})).is_err());
+        assert!(submission(&json!({"requestId": "r", "type": "later"})).is_err());
+        assert!(submission(&json!({"requestId": "r", "text": "x", "whenIdle": "start"})).is_err());
+    }
+
+    #[test]
     fn refusals_are_never_retryable() {
         for error in [
             SubmitError::Busy,
@@ -1017,9 +1235,9 @@ mod tests {
             SubmitError::Refused("no credential".into()),
         ] {
             let error = refusal(error);
-            assert_eq!(error.code, noel_chord::ErrorCode::Invalid);
+            assert!(matches!(error, WireError::Plugin(_)), "{error}");
         }
-        assert_eq!(refusal(SubmitError::Busy).reason.as_deref(), Some("busy"));
+        assert!(refusal(SubmitError::Busy).is_plugin("busy"));
     }
 
     #[test]

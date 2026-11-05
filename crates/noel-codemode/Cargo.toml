@@ -1,0 +1,24 @@
+[package]
+name = "noel-codemode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Upstream pi's codemode on the djs engine: model-written JavaScript or TypeScript that calls tools, run in a sandboxed VM with fuel, memory and output limits."
+
+[dependencies]
+base64.workspace = true
+# The djs engine (earendil-works/djs), pinned by commit: a `no_std` Rust
+# JavaScript/TypeScript interpreter with fuel, memory limits and no JIT, so it
+# also runs on iOS. djs-prelude's build script makes the base snapshot.
+djs-core = { git = "https://github.com/earendil-works/djs", rev = "16b7438f433890dae1589eeaee972afbee073104", default-features = false, features = ["full", "unicode"] }
+djs-prelude = { git = "https://github.com/earendil-works/djs", rev = "16b7438f433890dae1589eeaee972afbee073104", default-features = false, features = ["raw", "full", "unicode"] }
+futures-util = { version = "=0.3.32", default-features = false, features = ["std"] }
+icu_normalizer = "2.2"
+regex = "=1.12.3"
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+thiserror.workspace = true
+unicode-segmentation = "1.13.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

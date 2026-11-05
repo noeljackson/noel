@@ -17,8 +17,8 @@ use crate::controller::{
     Submission, SubmissionState, SubmitError, Submitted, WhenBusy, Withdrawal,
 };
 use crate::{
-    new_session_id, QueueItem, QueueItemId, QueueMode, ReloadableSystems, RunStart, RunStatus,
-    Runtime, SessionStore, SubmissionKind, TurnEvent,
+    new_session_id, FailureReason, QueueItem, QueueItemId, QueueMode, ReloadableSystems,
+    RunFailure, RunStart, RunStatus, Runtime, SessionStore, SubmissionKind, TurnEvent,
 };
 
 /// One scripted reply: optionally wait for a gate, or never answer, then
@@ -669,8 +669,9 @@ async fn an_abort_withdraws_the_queue_under_durables_rule() {
 }
 
 #[tokio::test]
-async fn an_interrupted_run_resumes_after_a_crash() {
-    // A process saved a run's start, queued a steer for it, and died.
+async fn an_interrupted_run_resumes_after_a_close() {
+    // A process saved a run's start, queued a steer for it, and was closed
+    // (a close sends the request again; a crash charges it, below).
     let base = std::env::temp_dir().join(format!("noel-controller-crash-{}", new_session_id()));
     let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
     let path = store.path().to_path_buf();
@@ -692,6 +693,7 @@ async fn an_interrupted_run_resumes_after_a_crash() {
     store
         .record_queue_items(std::slice::from_ref(&look), &[])
         .unwrap();
+    runtime.close_run("run-1").unwrap();
     drop((runtime, store));
 
     let mut fixture = Fixture::reopen(&path, AbortPolicy::KeepQueue);
@@ -783,7 +785,12 @@ async fn a_journal_written_by_noel_main_opens_and_resumes_unchanged() {
     assert!(state.queued_ids.is_empty() && state.past_submissions.is_empty());
     let (first, second) = (state.runs[0].id.clone(), state.runs[1].id.clone());
 
-    let mut fixture = Fixture::reopen(&path, AbortPolicy::KeepQueue);
+    // Main wrote no close records, so its interrupted run was a crash:
+    // the request it cut off is charged to the retry policy (Durable).
+    let mut retrying = systems();
+    retrying.retry.enabled = true;
+    retrying.retry.base_delay_ms = 1;
+    let mut fixture = reopen_with(&path, retrying);
     // Opening it wrote nothing.
     assert_eq!(fs::read_to_string(&path).unwrap(), written);
     let items = fixture.controller.queue().items();
@@ -846,4 +853,268 @@ fn outcomes_name_the_status_they_save() {
     assert_eq!(Outcome::Completed.status(), RunStatus::Completed);
     assert_eq!(Outcome::Aborted.status(), RunStatus::Aborted);
     assert_eq!(Outcome::Failed("x".into()).status(), RunStatus::Failed);
+    let limit = Outcome::Unanswered {
+        reason: FailureReason::TurnLimit,
+        detail: "cap".into(),
+    };
+    assert_eq!(limit.status(), RunStatus::Failed);
+    assert_eq!(limit.error(), Some("cap"));
+    assert_eq!(
+        Outcome::Failed("x".into())
+            .failure()
+            .map(|failure| failure.reason),
+        Some(FailureReason::ModelError)
+    );
+}
+
+/// A session whose run `run-1` (prompt "work") a process started and then
+/// lost without a close: a crash.
+fn crashed_run(name: &str, systems: ReloadableSystems) -> PathBuf {
+    let base = std::env::temp_dir().join(format!("noel-controller-{name}-{}", new_session_id()));
+    let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+    let path = store.path().to_path_buf();
+    let mut runtime = Runtime::with_store(state, systems, store);
+    let start = RunStart {
+        id: "run-1".into(),
+        request_id: Some("m-1".into()),
+        kind: SubmissionKind::Prompt,
+    };
+    runtime.start_run(start, "work".into(), Vec::new()).unwrap();
+    path
+}
+
+fn reopen_with(path: &Path, systems: ReloadableSystems) -> Fixture {
+    let (store, state) = SessionStore::open(path.to_path_buf()).unwrap();
+    Fixture::open(
+        Runtime::with_store(state, systems, store),
+        path.to_path_buf(),
+        AbortPolicy::KeepQueue,
+    )
+}
+
+async fn resume_to_end(fixture: &mut Fixture, run_id: &str) {
+    let start = fixture.controller.resume(run_id).await.unwrap();
+    let (_sender, mut inbox) = mpsc::unbounded_channel::<Action>();
+    assert!(fixture.controller.run(start, &mut inbox, |a, b| a(b)).await);
+}
+
+#[tokio::test]
+async fn a_request_a_crash_cut_off_is_a_failed_attempt_and_ends_interrupted_without_retries() {
+    let path = crashed_run("charged", systems());
+    let mut fixture = reopen_with(&path, systems());
+    resume_to_end(&mut fixture, "run-1").await;
+    let detail = "The host stopped while the model was answering, on attempt 1";
+    assert_eq!(
+        fixture.take_events(),
+        [
+            "run started".to_owned(),
+            format!("settled Unanswered {{ reason: Interrupted, detail: {detail:?} }}"),
+        ]
+    );
+    // Nothing was sent again.
+    assert!(fixture.requests().is_empty());
+    let records = journal(&path);
+    assert!(records
+        .iter()
+        .any(|record| record == &json!({"type": "run_restarted", "run_id": "run-1"})));
+    assert_eq!(
+        records.last().unwrap(),
+        &json!({
+            "type": "run_finished",
+            "run_id": "run-1",
+            "status": "failed",
+            "failure": {"reason": "interrupted", "detail": detail},
+        })
+    );
+    let run = SessionStore::read(&path).unwrap().runs.pop().unwrap();
+    assert_eq!(
+        run.failure,
+        Some(RunFailure {
+            reason: FailureReason::Interrupted,
+            detail: detail.into(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_request_a_crash_cut_off_is_sent_again_after_a_retry_backoff() {
+    let mut retrying = systems();
+    retrying.retry.enabled = true;
+    retrying.retry.max_retries = 3;
+    retrying.retry.base_delay_ms = 1;
+    let path = crashed_run("retried", retrying.clone());
+    let mut fixture = reopen_with(&path, retrying);
+    fixture.script([says("done")]);
+    resume_to_end(&mut fixture, "run-1").await;
+    assert_eq!(
+        fixture.take_events(),
+        ["run started", "assistant done", "settled Completed"]
+    );
+    assert_eq!(fixture.requests(), [vec!["work"]]);
+}
+
+#[tokio::test]
+async fn a_run_restarted_restart_limit_times_ends_restart_limit() {
+    let mut limited = systems();
+    limited.restart_limit = 2;
+    let path = crashed_run("limit", limited.clone());
+    {
+        // One crash restart already counted; the next one reaches the limit.
+        let (store, state) = SessionStore::open(path.clone()).unwrap();
+        let mut runtime = Runtime::with_store(state, limited.clone(), store);
+        assert_eq!(runtime.count_restart("run-1").unwrap(), 1);
+    }
+    let mut fixture = reopen_with(&path, limited);
+    resume_to_end(&mut fixture, "run-1").await;
+    assert_eq!(
+        fixture.take_events(),
+        [
+            "run started",
+            "settled Unanswered { reason: RestartLimit, detail: \"The run was interrupted 2 times in a row; it is not run again\" }",
+        ]
+    );
+    assert!(fixture.requests().is_empty());
+}
+
+#[tokio::test]
+async fn progress_clears_a_runs_restarts_and_a_close_counts_none() {
+    let path = crashed_run("progress", systems());
+    let (store, state) = SessionStore::open(path.clone()).unwrap();
+    let mut runtime = Runtime::with_store(state, systems(), store.clone());
+    assert_eq!(runtime.count_restart("run-1").unwrap(), 1);
+    assert_eq!(runtime.count_restart("run-1").unwrap(), 2);
+    runtime.close_run("run-1").unwrap();
+    let run = SessionStore::read(&path).unwrap().runs.pop().unwrap();
+    assert_eq!((run.restarts, run.closed), (2, true));
+    // A message the run saves is progress.
+    store
+        .append(&crate::SessionRecord::Message {
+            message: crate::user_message("more".into(), Vec::new()),
+            run: None,
+            ts: None,
+            placed: Vec::new(),
+        })
+        .unwrap();
+    let run = SessionStore::read(&path).unwrap().runs.pop().unwrap();
+    assert_eq!(run.restarts, 0);
+}
+
+#[tokio::test]
+async fn a_continue_answers_the_context_as_it_is_or_ends_nothing_to_answer() {
+    let mut fixture = Fixture::new("continue", AbortPolicy::KeepQueue);
+    // A completed run ends in its answer: nothing to answer.
+    fixture.script([says("hi")]);
+    fixture.start("hello", "m-1", Vec::new()).await;
+    fixture.take_events();
+    let Ok(Submitted::Started(start)) = fixture.controller.continue_run(Some("c-1".into())).await
+    else {
+        panic!("a continue starts a run while idle");
+    };
+    let run_id = start.run_id().to_owned();
+    let (_sender, mut inbox) = mpsc::unbounded_channel::<Action>();
+    assert!(fixture.controller.run(start, &mut inbox, |a, b| a(b)).await);
+    assert_eq!(
+        fixture.take_events(),
+        [
+            "run started",
+            "settled Unanswered { reason: NothingToAnswer, detail: \"Nothing to answer: the conversation does not end in a user message or tool results\" }",
+        ]
+    );
+    // The same requestId repeats it.
+    let Ok(Submitted::Repeated(repeat)) = fixture.controller.continue_run(Some("c-1".into())).await
+    else {
+        panic!("a repeated continue");
+    };
+    assert_eq!(repeat.submission_id, run_id);
+    assert_eq!(repeat.kind, SubmissionKind::Continue);
+
+    // A queued follow-up is placed into the continue's run first.
+    let follow = fixture
+        .controller
+        .enqueue(QueueMode::FollowUp, follow_up("and then?", "f-1"));
+    queued(follow);
+    fixture.take_events();
+    fixture.script([says("then this")]);
+    let Ok(Submitted::Started(start)) = fixture.controller.continue_run(None).await else {
+        panic!("a continue starts a run while idle");
+    };
+    assert!(fixture.controller.run(start, &mut inbox, |a, b| a(b)).await);
+    assert_eq!(
+        fixture.take_events(),
+        [
+            "run started",
+            "placed f-1",
+            "user and then?",
+            "assistant then this",
+            "settled Completed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_continue_after_a_failed_run_asks_the_model_again() {
+    let mut fixture = Fixture::new("continue-failed", AbortPolicy::KeepQueue);
+    fixture.script([Step {
+        gate: None,
+        hangs: false,
+        text: "",
+    }]);
+    // A run whose request failed leaves the context ending in the prompt.
+    {
+        let path = fixture.path.clone();
+        drop(fixture);
+        let (store, state) = SessionStore::open(path.clone()).unwrap();
+        let mut runtime = Runtime::with_store(state, systems(), store);
+        let start = RunStart {
+            id: "run-1".into(),
+            request_id: None,
+            kind: SubmissionKind::Prompt,
+        };
+        runtime.start_run(start, "work".into(), Vec::new()).unwrap();
+        runtime
+            .end_run(
+                "run-1",
+                RunStatus::Failed,
+                Some(RunFailure {
+                    reason: FailureReason::ModelError,
+                    detail: "provider down".into(),
+                }),
+            )
+            .unwrap();
+        fixture = Fixture::reopen(&path, AbortPolicy::KeepQueue);
+    }
+    fixture.script([says("answered")]);
+    let Ok(Submitted::Started(start)) = fixture.controller.continue_run(None).await else {
+        panic!("a continue starts a run while idle");
+    };
+    let (_sender, mut inbox) = mpsc::unbounded_channel::<Action>();
+    assert!(fixture.controller.run(start, &mut inbox, |a, b| a(b)).await);
+    assert_eq!(
+        fixture.take_events(),
+        ["run started", "assistant answered", "settled Completed"]
+    );
+    assert_eq!(fixture.requests(), [vec!["work"]]);
+}
+
+#[tokio::test]
+async fn a_continue_is_refused_while_a_run_is_active() {
+    let mut fixture = Fixture::new("continue-busy", AbortPolicy::KeepQueue);
+    let gate = Arc::new(Notify::new());
+    fixture.script([after(&gate, "done")]);
+    let refusal: Arc<Mutex<Option<SubmitError>>> = Arc::default();
+    let seen = refusal.clone();
+    fixture
+        .start(
+            "work",
+            "m-1",
+            vec![
+                act(move |busy| {
+                    let continuing = input(SubmissionKind::Continue, "", Some("c-1"));
+                    *seen.lock().unwrap() = busy.submit(continuing, WhenBusy::Steer).err();
+                }),
+                release(&gate),
+            ],
+        )
+        .await;
+    assert_eq!(*refusal.lock().unwrap(), Some(SubmitError::Busy));
 }

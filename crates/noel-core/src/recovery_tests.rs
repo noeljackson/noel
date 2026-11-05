@@ -820,3 +820,91 @@ async fn an_abort_during_a_round_answers_the_running_call_and_the_ones_after_it(
     assert_journal_matches(&store, &runtime);
     fs::remove_dir_all(base).unwrap();
 }
+
+// ─── the same recovery over another storage (roadmap phase 6) ───────────────
+
+/// A saved session in a [`crate::storage::MemoryJournal`], holding
+/// `history`.
+fn memory_session(
+    history: &[(MessageRole, &str)],
+) -> (
+    Runtime,
+    SessionStore,
+    std::sync::Arc<crate::storage::MemoryJournal>,
+) {
+    let journal = std::sync::Arc::new(crate::storage::MemoryJournal::new("memory/session.jsonl"));
+    let (store, state) =
+        SessionStore::create_in_storage(journal.clone(), PathBuf::from("/w"), new_session_id())
+            .unwrap();
+    let mut runtime = Runtime::with_store(state, systems(), store.clone());
+    for (role, content) in history {
+        runtime
+            .push_message(message(role.clone(), content))
+            .unwrap();
+    }
+    (runtime, store, journal)
+}
+
+#[tokio::test]
+async fn an_overflow_compaction_rewrites_a_journal_in_memory_too() {
+    let (mut runtime, store, journal) = memory_session(ONE_TURN);
+    let provider = Steps::new([
+        broken(Vec::new(), OVERFLOW),
+        says("Summary of the first turn."),
+        says("Second answer."),
+    ]);
+    let (result, _) = turn(&mut runtime, &provider, "second", &RunControl::default()).await;
+    assert_eq!(result.unwrap(), "Second answer.");
+    let bytes = String::from_utf8(journal.bytes()).unwrap();
+    assert!(bytes.contains("compaction_checkpoint"), "{bytes}");
+    assert_journal_matches(&store, &runtime);
+    // Opened again from the same storage: the same session.
+    let (_, reopened) = SessionStore::open_storage(journal).unwrap();
+    assert_eq!(&reopened, runtime.session());
+}
+
+#[tokio::test]
+async fn an_aborted_reply_is_recovered_from_a_journal_in_memory() {
+    let (mut runtime, store, journal) = memory_session(&[]);
+    let provider = Steps::new([Step {
+        events: vec![StreamEvent::Text("Once".into())],
+        error: None,
+        hangs: true,
+    }]);
+    let run = RunControl::default();
+    let turn = run_user_turn_streaming_events_with_media(
+        &mut runtime,
+        &provider,
+        "tell a story".into(),
+        Vec::new(),
+        &run,
+        |_| {},
+    );
+    // The process stops while the reply streams: its partial is saved.
+    assert!(tokio::time::timeout(Duration::from_millis(300), turn)
+        .await
+        .is_err());
+    drop((runtime, store));
+    let (_, state) = SessionStore::open_storage(journal).unwrap();
+    assert_eq!(state.messages.len(), 2);
+    assert_eq!(state.messages[1].content, "Once");
+    assert!(state.messages[1].aborted);
+}
+
+#[test]
+fn a_torn_tail_in_memory_is_dropped_and_appends_start_on_their_own_line() {
+    let (runtime, _, journal) = memory_session(ONE_TURN);
+    let mut bytes = journal.bytes();
+    bytes.extend_from_slice(br#"{"type":"message","mess"#);
+    let torn = std::sync::Arc::new(crate::storage::MemoryJournal::with_bytes(
+        "memory/torn.jsonl",
+        bytes,
+    ));
+    let (store, state) = SessionStore::open_storage(torn.clone()).unwrap();
+    assert_eq!(&state, runtime.session());
+    store
+        .record_message(message(MessageRole::User, "again"))
+        .unwrap();
+    let (_, state) = SessionStore::open_storage(torn).unwrap();
+    assert_eq!(state.messages.len(), 3);
+}

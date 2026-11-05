@@ -38,18 +38,31 @@ The committed TypeScript parity fixtures are:
   after `applyImmutable`; wire batches the decoder rejects; `applyImmutable`
   results and errors; `diffRevisions` cases, by their result only; vectors of
   `canonicalJson` and `hash64` with non-ASCII and astral text, `-0`, large and
-  small numbers and control characters; and contract descriptions with their
-  fingerprints, `coverage` between them, and `fits` cases.
-- `chord-link.json`: every frame upstream Chord's hosts send on their links,
-  recorded from `packages/chord` at the same pinned commit, in fifteen
-  scenarios run with noel's kind of contracts (a counter on the server, a
-  session object on a `session:` worker): hello; holds, `shape` and `gone`;
-  subscriptions with `snap`, `ops` and `unsub`; calls, results and errors;
-  cancel, `maxCalls` and release; relay through the server's route, with roots
-  and `root_end`; refused routes and a forged principal; `invalidatePrincipal`
-  with re-stamping and closing; pings and the ping timeout; window
-  coalescing and the four-window reset; version mismatches both ways; and
-  protocol violations. Each frame has its link and the side that sent it.
+  small numbers and control characters. (Its v1 sections, `hash64` over
+  UTF-16 and v1 contract descriptions with `coverage` and `fits`, are no
+  longer checked: noel speaks Chord v2, whose contracts
+  `chord-v2-contracts.json` covers.)
+- `codemode-declarations.json`: every call upstream's
+  `packages/codemode/test/declarations.test.ts` makes to `schemaToType`,
+  `renderToolSignature`, `renderToolSample` and `renderDeclarations`, plus
+  noel's own cases. `noel-codemode`'s `declarations` matches each byte for
+  byte (`crates/noel-codemode/src/declarations.rs`).
+- `tool-search.json`: upstream's tool-search `tokenize`, search documents
+  and BM25 rankings on the cases of its `tool-search.test.ts`.
+  `noel-codemode`'s `search` matches them, except dictionary-segmented
+  scripts (`crates/noel-codemode/src/search.rs`).
+- `chord-v2-contracts.json`: Chord v2's `hash64` and the fingerprints of
+  contracts as upstream's `remote()` declares them at `CHORD2_REFERENCE_REF`
+  (noel's three v2 contracts, upstream's pinned `notes`, normal-form edge
+  cases). `noel-chord`'s `v2::contract` matches every fingerprint
+  (`crates/noel-chord/tests/chord_v2_contracts.rs`).
+- `chord-v2-messages.json`: every Chord v2 message kind in upstream's JSON
+  form and binary encoding at `CHORD2_REFERENCE_REF`, plus decode errors.
+  `noel-chord`'s `v2::message` and `v2::binary` round-trip each message
+  byte for byte (`crates/noel-chord/tests/chord_v2_messages.rs`). Its
+  `checks` hold upstream's `checkMessage` verdicts on decoded messages, and
+  its `envelopes` what `chordErrorFromJson` makes of ChordError envelopes;
+  `v2::check` and `v2::error` give the same.
 - `cli-contract.json`: upstream CLI option and command contract.
 - `cloudflare-ai-gateway-kimi.json`: Cloudflare AI Gateway OpenAI-compatible
   request shape.

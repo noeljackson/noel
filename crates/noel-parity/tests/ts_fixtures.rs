@@ -15,9 +15,11 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "bedrock-claude-opus-4.6.json",
     "bedrock-tools.json",
     "chord-delta.json",
-    "chord-link.json",
+    "chord-v2-contracts.json",
+    "chord-v2-messages.json",
     "cli-contract.json",
     "cloudflare-ai-gateway-kimi.json",
+    "codemode-declarations.json",
     "error-classification.json",
     "github-copilot-gpt-6.1-sol.json",
     "google-gemini-2.5-pro.json",
@@ -44,6 +46,7 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "slash-commands.json",
     "system-prompt.json",
     "tool-behavior.json",
+    "tool-search.json",
     "tui-transcripts.json",
 ];
 
@@ -53,9 +56,11 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "auth-discovery-fixture.ts",
     "bedrock-fixture.ts",
     "chord-delta-fixture.ts",
-    "chord-link-fixture.ts",
+    "chord-v2-contracts-fixture.ts",
+    "chord-v2-messages-fixture.ts",
     "cli-contract-fixture.ts",
     "cloudflare-fixture.ts",
+    "codemode-declarations-fixture.ts",
     "codex-oauth-fixture.ts",
     "copilot-fixture.ts",
     "error-classification-fixture.ts",
@@ -77,6 +82,7 @@ const EXPECTED_SCRIPTS: &[&str] = &[
     "slash-command-fixture.ts",
     "system-prompt-fixture.ts",
     "tool-behavior-fixture.ts",
+    "tool-search-fixture.ts",
     "tui-transcript-fixture.ts",
 ];
 
@@ -158,7 +164,14 @@ fn every_script_output_is_committed() {
             fixture_set(&["bedrock-claude-opus-4.6.json", "bedrock-tools.json"]),
         ),
         ("chord-delta-fixture.ts", fixture_set(&["chord-delta.json"])),
-        ("chord-link-fixture.ts", fixture_set(&["chord-link.json"])),
+        (
+            "chord-v2-contracts-fixture.ts",
+            fixture_set(&["chord-v2-contracts.json"]),
+        ),
+        (
+            "chord-v2-messages-fixture.ts",
+            fixture_set(&["chord-v2-messages.json"]),
+        ),
         (
             "cli-contract-fixture.ts",
             fixture_set(&["cli-contract.json"]),
@@ -166,6 +179,10 @@ fn every_script_output_is_committed() {
         (
             "cloudflare-fixture.ts",
             fixture_set(&["cloudflare-ai-gateway-kimi.json"]),
+        ),
+        (
+            "codemode-declarations-fixture.ts",
+            fixture_set(&["codemode-declarations.json"]),
         ),
         (
             "codex-oauth-fixture.ts",
@@ -244,6 +261,7 @@ fn every_script_output_is_committed() {
             "tool-behavior-fixture.ts",
             fixture_set(&["tool-behavior.json"]),
         ),
+        ("tool-search-fixture.ts", fixture_set(&["tool-search.json"])),
         (
             "tui-transcript-fixture.ts",
             fixture_set(&["tui-transcripts.json"]),
@@ -260,13 +278,19 @@ fn every_script_output_is_committed() {
 /// `LocalEnv`'s and pi-env's (daemon and SSH deployment), which are pinned to
 /// `CHORD_REFERENCE_REF` in the Makefile.
 fn expected_ref(fixture_name: &str) -> String {
+    // Chord v2's fixtures follow its own pin, while v1 still runs.
+    if fixture_name.starts_with("chord-v2-") {
+        let makefile = fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
+        return makefile
+            .lines()
+            .find_map(|line| line.strip_prefix("CHORD2_REFERENCE_REF ?= "))
+            .expect("the Makefile pins Chord v2")
+            .trim()
+            .to_string();
+    }
     if !matches!(
         fixture_name,
-        "chord-delta.json"
-            | "chord-link.json"
-            | "local-env.json"
-            | "pi-env.json"
-            | "pi-env-ssh.json"
+        "chord-delta.json" | "local-env.json" | "pi-env.json" | "pi-env-ssh.json"
     ) {
         return "main".to_string();
     }
@@ -325,13 +349,21 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "crates/noel-chord/tests/chord_delta_parity.rs",
         ),
         (
-            "chord-link.json",
-            "crates/noel-chord/tests/chord_link_parity.rs",
+            "chord-v2-contracts.json",
+            "crates/noel-chord/tests/chord_v2_contracts.rs",
+        ),
+        (
+            "chord-v2-messages.json",
+            "crates/noel-chord/tests/chord_v2_messages.rs",
         ),
         ("cli-contract.json", "crates/noel-cli/src/main.rs"),
         (
             "cloudflare-ai-gateway-kimi.json",
             "crates/noel-ai/src/lib.rs",
+        ),
+        (
+            "codemode-declarations.json",
+            "crates/noel-codemode/src/declarations.rs",
         ),
         ("error-classification.json", "crates/noel-ai/src/lib.rs"),
         (
@@ -386,6 +418,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "tool-behavior.json",
             "crates/noel-core/src/tool_parity_tests.rs",
         ),
+        ("tool-search.json", "crates/noel-codemode/src/search.rs"),
         ("tui-transcripts.json", "crates/noel-tui/src/lib.rs"),
     ]
     .into_iter()
