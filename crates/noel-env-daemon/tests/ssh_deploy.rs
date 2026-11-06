@@ -34,7 +34,6 @@ use support::{daemon, Scratch};
 
 const FAKE_SSH: &str = include_str!("../../../scripts/ts-parity/fake-ssh.sh");
 const FIXTURE: &str = include_str!("../../../tests/fixtures/ts-parity/pi-env-ssh.json");
-const MAKEFILE: &str = include_str!("../../../Makefile");
 
 /// Where upstream's deployment says `pi-env` and noel's says `noel-env`; nothing else may differ.
 const RENAMES: &[(&str, &str)] = &[
@@ -242,11 +241,7 @@ async fn start(connection: Connection) {
 #[tokio::test(flavor = "multi_thread")]
 async fn invokes_ssh_as_upstream_does() {
     let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
-    let pin = MAKEFILE
-        .lines()
-        .find_map(|line| line.strip_prefix("CHORD_REFERENCE_REF ?= "))
-        .unwrap();
-    assert_eq!(fixture["source"]["ref"], pin.trim());
+    assert_eq!(fixture["source"]["ref"], "main");
 
     let full = SshTarget {
         host: "gpu-box".to_string(),

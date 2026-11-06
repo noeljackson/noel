@@ -69,6 +69,9 @@ pub(super) struct RelayedHold {
     pub(super) incarnation: String,
     pub(super) chain: Option<Vec<String>>,
     pub(super) limit: Option<u64>,
+    /// The caller's trace carrier, sent on the first upstream hold as it
+    /// came; a re-hold after an upstream drop sends none (upstream slice 9).
+    pub(super) trace: Option<Value>,
     pub(super) path: PathKey,
     /// The upstream link and this origin's number on it, while held there.
     pub(super) upstream: Option<(u64, u64)>,
@@ -361,6 +364,7 @@ impl Actor {
         let relayed = provider.relayed.get_mut(&hold).expect("the hold");
         relayed.upstream = Some((up, relay));
         let request = relayed.request.clone();
+        let trace = relayed.trace.take();
         let message = Message::Hold {
             origin: Some(relay),
             hold,
@@ -373,6 +377,7 @@ impl Actor {
             incarnation: route.then(|| relayed.incarnation.clone()),
             chain: relayed.chain.clone(),
             limit: relayed.limit,
+            trace,
         };
         self.send(up, &message);
     }
@@ -454,6 +459,12 @@ impl Actor {
                         provider.relayed_calls.insert(*call, *hold);
                         let mut forwarded = message.clone();
                         set_origin(&mut forwarded, Some(relay));
+                        // Old work of a reload counts only from a trusted link.
+                        if !self.links.get(&link).is_some_and(|l| l.trusted) {
+                            if let Message::Call { old, .. } = &mut forwarded {
+                                *old = false;
+                            }
+                        }
                         self.send(up, &forwarded);
                     }
                     None => {
@@ -654,6 +665,9 @@ impl Actor {
             }
             _ => return,
         };
+        if matches!(forwarded, Message::Result { .. } | Message::Error { .. }) {
+            self.answer_follows_state(link, origin);
+        }
         self.send_origin(link, origin, forwarded);
     }
 }

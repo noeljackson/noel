@@ -2,7 +2,9 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "/ts-reference/packages/ai/src/index.ts";
+// pi-ai stopped re-exporting TypeBox (upstream 6536f801); tools import it
+// from typebox, as upstream's coding-agent does.
+import { Type } from "/ts-reference/node_modules/typebox/build/index.mjs";
 import { getDocsPath, getExamplesPath, getReadmePath } from "/ts-reference/packages/coding-agent/src/config.ts";
 import { DefaultResourceLoader } from "/ts-reference/packages/coding-agent/src/core/resource-loader.ts";
 import { createAgentSession } from "/ts-reference/packages/coding-agent/src/core/sdk.ts";
@@ -41,7 +43,7 @@ const PLACEHOLDERS = {
 };
 
 /** The one place upstream's prompt names the product outside the docs section. */
-const PRODUCT_SENTENCE = "operating inside pi, a coding agent harness";
+const PRODUCT_SENTENCE = "running inside pi, a coding agent harness";
 
 type ExtensionTool = { name: string; description: string; promptSnippet?: string; promptGuidelines?: string[] };
 

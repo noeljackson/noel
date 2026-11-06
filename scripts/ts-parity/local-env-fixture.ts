@@ -4,8 +4,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { NodeExecutionEnv } from "/chord-reference/packages/durable/src/env/node.ts";
-import { createEnvConformance } from "/chord-reference/packages/durable/src/testing/env-conformance.ts";
+import { NodeExecutionEnv } from "/ts-reference/packages/durable/src/env/node.ts";
+import { createEnvConformance } from "/ts-reference/packages/durable/src/testing/env-conformance.ts";
 
 /**
  * Goldens for noel-env's LocalEnv: upstream Durable's env conformance cases
@@ -14,11 +14,11 @@ import { createEnvConformance } from "/chord-reference/packages/durable/src/test
  *
  * Every assertion a case makes is recorded in order with its actual and
  * expected values, so the Rust test can run the same case against LocalEnv
- * and compare what it observes. Durable is read from /chord-reference, the
- * checkout of the pinned commit (CHORD_REFERENCE_REF in the Makefile).
+ * and compare what it observes. Durable is read from /ts-reference, upstream at
+ * TS_REFERENCE_REF like every other fixture.
  */
 
-const REFERENCE = "/chord-reference";
+const REFERENCE = "/ts-reference";
 const SHELL = ["sh", "-c"];
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -167,7 +167,7 @@ async function main(): Promise<void> {
 			{
 				source: {
 					repository: "https://github.com/earendil-works/pi",
-					ref: git("rev-parse", "HEAD"),
+					ref: "main",
 					package: "packages/durable",
 					envCommit: git(
 						"log",

@@ -3,14 +3,14 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BACKGROUND_CONTEXT, withAbortSignal } from "/chord-reference/packages/chord/src/context/index.ts";
-import { Connection } from "/chord-reference/packages/env/src/connection.ts";
-import { RemoteExecutionEnv } from "/chord-reference/packages/env/src/remote-env.ts";
-import { openTerminal } from "/chord-reference/packages/env/src/terminal.ts";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "/ts-reference/packages/chord/src/context/index.ts";
+import { Connection } from "/ts-reference/packages/env/src/connection.ts";
+import { RemoteExecutionEnv } from "/ts-reference/packages/env/src/remote-env.ts";
+import { openTerminal } from "/ts-reference/packages/env/src/terminal.ts";
 
 /**
  * Goldens for `noel-env serve` (crates/noel-env-daemon): upstream pi-env's own client (`Connection`,
- * `RemoteExecutionEnv`, `openTerminal`) drives upstream's own daemon, built from the pinned checkout
+ * `RemoteExecutionEnv`, `openTerminal`) drives upstream's own daemon, built from the same checkout
  * (/usr/local/bin/pi-env in the ts-parity image), through a tap (pi-env-tap.mjs) that records the bytes both ways.
  * The frames are written to pi-env.json; crates/noel-env-daemon/tests/pi_env_golden.rs sends the client's frames to
  * `noel-env serve` and compares what it answers.
@@ -19,7 +19,7 @@ import { openTerminal } from "/chord-reference/packages/env/src/terminal.ts";
  * `node --conditions=source /ts-parity/pi-env-fixture.ts <fixtures-dir>`.
  */
 
-const REFERENCE = "/chord-reference";
+const REFERENCE = "/ts-reference";
 const DAEMON = "/usr/local/bin/pi-env";
 const TAP = join(import.meta.dirname, "pi-env-tap.mjs");
 const context = BACKGROUND_CONTEXT;
@@ -151,12 +151,15 @@ function frameJson(frame: Frame, json: Json): Json {
  * The goldens' steps: the client's frames, and the daemon's in the order the tap saw them. A request's `output` events
  * are merged per stream into one event each, placed right before the request's result or error, since how output is
  * split into events depends on timing. Pings are kept only where the scenario asks for them: the first each way, at
- * the end (the client's first), since when each side pings depends on when it started.
+ * the end (the client's first), since when each side pings depends on when it started. A request the client cancelled
+ * that the daemon answers `timeout` is recorded as `aborted`: the client's own timer cancels at the request's timeout
+ * (c96e368e), so which the daemon sees first is a race, and a daemon that reads the cancel first answers `aborted`.
  */
 function steps(frames: { from: "client" | "daemon"; frame: Frame }[], root: string, keepPings: boolean): Step[] {
 	const result: Step[] = [];
 	const output = new Map<number, Map<string, Buffer[]>>();
 	const pings: { client?: Step; daemon?: Step } = {};
+	const cancelled = new Set<number>();
 	for (const { from, frame } of frames) {
 		if (frame.type === 6) {
 			if (keepPings && pings[from] === undefined) {
@@ -165,10 +168,14 @@ function steps(frames: { from: "client" | "daemon"; frame: Frame }[], root: stri
 			continue;
 		}
 		if (from === "client") {
+			if (frame.type === 5) cancelled.add(frame.id);
 			result.push({ send: frameJson(frame, rooted(frame.json, root)) });
 			continue;
 		}
-		const json = normalized(rooted(frame.json, root)) as { [key: string]: Json };
+		let json = normalized(rooted(frame.json, root)) as { [key: string]: Json };
+		if (frame.type === 3 && cancelled.has(frame.id) && json.code === "timeout") {
+			json = { code: "aborted", message: "aborted" };
+		}
 		if (frame.type === 4 && json.kind === "output") {
 			if ("skipped" in json) throw new Error("the goldens do not record windowed output");
 			const streams = output.get(frame.id) ?? new Map<string, Buffer[]>();
@@ -340,7 +347,7 @@ const SCENARIOS: Scenario[] = [
 			const written = await env.writeFile("w.txt", "w", context);
 			check(written.ok, "writeFile w.txt");
 			await Promise.race([seen, sleep(5000).then(() => check(false, "a change within 5 s"))]);
-			await watcher.value.close(context);
+			await watcher.value.stop(context);
 		},
 	},
 	{
@@ -400,7 +407,7 @@ async function main(): Promise<void> {
 			{
 				source: {
 					repository: "https://github.com/earendil-works/pi",
-					ref: git("rev-parse", "HEAD"),
+					ref: "main",
 					package: "packages/env",
 					envCommit: git("log", "-1", "--format=%H", "HEAD", "--", "packages/env"),
 					daemon: `pi-env ${version}, built from packages/env/daemon at ref (release, musl)`,

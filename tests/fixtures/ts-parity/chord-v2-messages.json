@@ -1,9 +1,9 @@
 {
   "source": {
     "repository": "https://github.com/earendil-works/pi",
-    "ref": "3551ec07eb87afebac20191958163ae58976f1d0",
+    "ref": "4b11a7228d20c37637dd8cb01dabf1fd3c154297",
     "package": "packages/chord",
-    "packageCommit": "3551ec07eb87afebac20191958163ae58976f1d0",
+    "packageCommit": "4b11a7228d20c37637dd8cb01dabf1fd3c154297",
     "script": "/ts-parity/chord-v2-messages-fixture.ts"
   },
   "messages": [
@@ -58,6 +58,65 @@
         "limit": 67108864
       },
       "hex": "8103c8010d6e6f656c2e73657373696f6e73020f0f53cdbca05450047b7d06736572766572027b7d0f1f7b226b696e64223a226f776e6572222c22766961223a22646576696365227d0190f5a12b3c7d4e8f00112233445566020190f5a12b3c7d4e8f001122334455660190f5a12b3c7d4e8f00ffeeddccbbaa80808020"
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 1,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "trace": {
+          "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+          "tracestate": "k=v"
+        }
+      },
+      "hex": "415c7b227472616365706172656e74223a2230302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031222c2274726163657374617465223a226b3d76227d01096e6f656c2e63686174012a6091124251ff09207b2273657373696f6e223a227331227d0773657373696f6e0b7b226964223a227331227d00"
+    },
+    {
+      "message": {
+        "kind": "call",
+        "origin": 2,
+        "call": 3,
+        "hold": 0,
+        "method": 0,
+        "trace": {
+          "a": "b"
+        }
+      },
+      "hex": "c302097b2261223a2262227d03000000"
+    },
+    {
+      "message": {
+        "kind": "call",
+        "call": 4,
+        "hold": 0,
+        "method": 2,
+        "args": "{\"x\":1}",
+        "old": true
+      },
+      "hex": "23040002010e7b2278223a317d"
+    },
+    {
+      "message": {
+        "kind": "call",
+        "origin": 6,
+        "call": 5,
+        "hold": 0,
+        "method": 0,
+        "trace": {
+          "a": ""
+        },
+        "old": true
+      },
+      "hex": "e306087b2261223a22227d05000000"
     },
     {
       "message": {
@@ -614,6 +673,158 @@
     },
     {
       "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+          "params": {}
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "trace": {
+          "k0": "v",
+          "k1": "v",
+          "k2": "v",
+          "k3": "v",
+          "k4": "v",
+          "k5": "v",
+          "k6": "v",
+          "k7": "v"
+        }
+      },
+      "ok": true
+    },
+    {
+      "message": {
+        "kind": "hold",
+        "hold": 0,
+        "type": "noel.chat",
+        "version": 1,
+        "fingerprint": "2a6091124251ff09",
+        "params": "{\"session\":\"s1\"}",
+        "address": {
+          "kind": "session",
+          "params": {
+            "id": "s1"
+          }
+        },
+        "trace": {
+          "k0": "v",
+          "k1": "v",
+          "k2": "v",
+          "k3": "v",
+          "k4": "v",
+          "k5": "v",
+          "k6": "v",
+          "k7": "v",
+          "k8": "v"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "call",
+        "call": 0,
+        "hold": 0,
+        "method": 0,
+        "trace": {
+          "a": "x\u0001"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "call",
+        "call": 0,
+        "hold": 0,
+        "method": 0,
+        "trace": {
+          "a b": "x"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "call",
+        "call": 0,
+        "hold": 0,
+        "method": 0,
+        "trace": {
+          "a": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
+        "kind": "call",
+        "call": 0,
+        "hold": 0,
+        "method": 0,
+        "trace": {
+          "a": 1
+        }
+      },
+      "ok": false
+    },
+    {
+      "message": {
         "kind": "error",
         "call": 0,
         "error": {
@@ -818,6 +1029,30 @@
       "json": {
         "code": "released",
         "reason": "settled",
+        "message": "m"
+      }
+    },
+    {
+      "input": {
+        "code": "unavailable",
+        "reason": "version",
+        "message": "m"
+      },
+      "json": {
+        "code": "unavailable",
+        "reason": "version",
+        "message": "m"
+      }
+    },
+    {
+      "input": {
+        "code": "unavailable",
+        "reason": "reload_cycle",
+        "message": "m"
+      },
+      "json": {
+        "code": "unavailable",
+        "reason": "reload_cycle",
         "message": "m"
       }
     },

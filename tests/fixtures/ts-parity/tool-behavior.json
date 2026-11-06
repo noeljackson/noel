@@ -1169,7 +1169,7 @@
         "context": 2
       },
       "result": {
-        "text": "alpha.ts-1- export const alpha = 1;\nalpha.ts-2- // needle one\nalpha.ts:3: const beta = 2;\nalpha.ts-4- // Needle two\nalpha.ts-5- const gamma = 3;\nalpha.ts-3- const beta = 2;\nalpha.ts-4- // Needle two\nalpha.ts:5: const gamma = 3;\nalpha.ts-6- ",
+        "text": "alpha.ts-1- export const alpha = 1;\nalpha.ts-2- // needle one\nalpha.ts:3: const beta = 2;\nalpha.ts-4- // Needle two\nalpha.ts:5: const gamma = 3;",
         "isError": false
       }
     },
@@ -1267,7 +1267,7 @@
         "limit": 2
       },
       "result": {
-        "text": "long-line.txt:1: needle xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... [truncated]\nlong-line.txt:2: short needle\n\n[2 matches limit reached. Use limit=4 for more, or refine pattern. Some lines truncated to 500 chars. Use read tool to see full lines]",
+        "text": "long-line.txt:1: needle xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... [truncated]\nlong-line.txt:2: short needle\n\n[Some lines truncated to 500 chars. Use read tool to see full lines]",
         "isError": false
       }
     },
@@ -1460,7 +1460,7 @@
       },
       "normalize": "result-count",
       "result": {
-        "text": "<30 results>\n\n[30 results limit reached. Use limit=60 for more, or refine pattern]",
+        "text": "<30 results>",
         "isError": false
       }
     },

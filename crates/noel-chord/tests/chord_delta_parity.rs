@@ -1,16 +1,15 @@
 //! noel-chord against upstream Chord's goldens
 //! (`tests/fixtures/ts-parity/chord-delta.json`, made by
 //! `scripts/ts-parity/chord-delta-fixture.ts`): the delta codec, the
-//! immutable applier, diff results and canonical JSON. (Its v1 sections,
-//! `hash64` over UTF-16 and v1 contracts, have no counterpart since Chord v2:
-//! `chord-v2-contracts.json` covers v2's.)
+//! immutable applier, diff results and canonical JSON, at upstream `main`.
+//! (Chord v1's sections, `hash64` over UTF-16 and v1 contracts, went with
+//! Chord v1: `chord-v2-contracts.json` covers v2's.)
 
 use noel_chord::canonical_json;
 use noel_chord::delta::{apply_owned, diff, Decoder, DeltaError, Encoder, Op};
 use serde_json::{json, Value};
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/ts-parity/chord-delta.json");
-const MAKEFILE: &str = include_str!("../../../Makefile");
 
 fn fixture() -> Value {
     serde_json::from_str(FIXTURE).expect("the fixture is JSON")
@@ -41,16 +40,9 @@ fn error_json(error: &DeltaError) -> Value {
 }
 
 #[test]
-fn the_fixture_comes_from_the_pinned_commit() {
+fn the_fixture_comes_from_upstream_main() {
     let fixture = fixture();
-    let pin = MAKEFILE
-        .lines()
-        .find_map(|line| line.strip_prefix("CHORD_REFERENCE_REF ?= "))
-        .expect("the Makefile pins Chord");
-    assert_eq!(
-        fixture["source"]["ref"], pin,
-        "regenerate chord-delta.json after moving the pin"
-    );
+    assert_eq!(fixture["source"]["ref"], "main");
     let package_commit = fixture["source"]["packageCommit"].as_str().unwrap();
     assert_eq!(package_commit.len(), 40);
 }

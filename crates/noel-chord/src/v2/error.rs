@@ -79,6 +79,10 @@ impl Code {
                 "busy",
                 "storage_failed",
                 "undeclared",
+                // A dependency refused for its version, and old work waiting
+                // on its own drain during an upstream reload (a5d209af).
+                "version",
+                "reload_cycle",
             ],
         }
     }

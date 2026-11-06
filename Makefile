@@ -6,16 +6,9 @@ RUST_CI_IMAGE ?= noel-rust-ci:1.99.0
 TS_REFERENCE_REPO ?= https://github.com/earendil-works/pi.git
 TS_REFERENCE_REF ?= main
 TS_PARITY_TRACKING_REF ?= main
-# chord-delta.json, local-env.json, pi-env.json and pi-env-ssh.json are
-# pinned to this upstream commit, whatever TS_REFERENCE_REF
-# is. ts-parity-drift reports commits to packages/chord, to Durable's env
-# (packages/durable/src/env and its conformance cases) and to pi-env
-# (packages/env) on the tracking ref that came after it; move the pin here and
-# regenerate.
-CHORD_REFERENCE_REF ?= b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb
 # Chord v2 (docs/chord-v2-port.md), what noel speaks: chord-v2-*.json come
 # from upstream at this commit, and `make chord2-interop` runs against it.
-CHORD2_REFERENCE_REF ?= 3551ec07eb87afebac20191958163ae58976f1d0
+CHORD2_REFERENCE_REF ?= 4b11a7228d20c37637dd8cb01dabf1fd3c154297
 TS_PARITY_FIXTURES_DIR ?= tests/fixtures/ts-parity
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -226,7 +219,7 @@ ts-parity-build:
 	$(DOCKER) build -f Dockerfile.ts-parity \
 		--build-arg TS_REFERENCE_REPO="$(TS_REFERENCE_REPO)" \
 		--build-arg TS_REFERENCE_REF="$(TS_REFERENCE_REF)" \
-		--build-arg CHORD_REFERENCE_REF="$(CHORD_REFERENCE_REF)" \
+		--build-arg CHORD2_REFERENCE_REF="$(CHORD2_REFERENCE_REF)" \
 		-t $(TS_PARITY_IMAGE) .
 
 ts-parity-fixtures: ts-parity-build
@@ -236,16 +229,18 @@ ts-parity-fixtures: ts-parity-build
 ts-parity-chord: ts-parity-build
 	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
 	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE) \
-		sh -c 'for fixture in /ts-parity/chord-*-fixture.ts; do npx tsx "$$fixture" /fixtures || exit 1; done'
+		sh -c 'npx tsx /ts-parity/chord-delta-fixture.ts /fixtures \
+			&& bun --conditions=source /ts-parity/chord-v2-contracts-fixture.ts /chord2-reference /noel-contracts /fixtures \
+			&& bun --conditions=source /ts-parity/chord-v2-messages-fixture.ts /chord2-reference /fixtures'
 
-# Durable's env conformance cases against NodeExecutionEnv, from the pinned
+# Durable's env conformance cases against NodeExecutionEnv, from upstream's
 # checkout, for noel-env's LocalEnv.
 ts-parity-env: ts-parity-build
 	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
 	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE) \
 		npx tsx /ts-parity/local-env-fixture.ts /fixtures
 
-# Upstream pi-env's client driving its own daemon (both from the pinned
+# Upstream pi-env's client driving its own daemon (both from upstream's
 # checkout) through a tap, for noel-env serve's goldens. Runs as the caller, so
 # the fixture is the caller's.
 ts-parity-pi-env: ts-parity-build

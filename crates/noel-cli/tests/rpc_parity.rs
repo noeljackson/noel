@@ -455,7 +455,7 @@ fn golden_records(name: &str, script: Value) -> Vec<Value> {
     for request in noel.logged_requests() {
         let prompt = request["system_prompt"].as_str().unwrap_or_default();
         assert!(
-            prompt.starts_with("You are an expert coding assistant") && prompt.contains("<cwd>")
+            prompt.starts_with("You are a coding assistant") && prompt.contains("<cwd>")
                 || prompt.starts_with("Create a concise continuation checkpoint"),
             "{name}: system prompt {prompt:?}"
         );
@@ -478,7 +478,7 @@ fn stub_failure(name: &str) -> Value {
 }
 
 /// A failed request in noel's words. Upstream reports `<status>: <body>`,
-/// and `terminated` for the connection its stub dropped, which the faux
+/// and Node's `terminated: ...` for the connection its stub dropped, which the faux
 /// script fails like any request without a status: as an HTTP 503.
 fn noel_error(upstream: &str) -> String {
     let (status, body) = match upstream.split_once(": ") {
@@ -919,7 +919,9 @@ fn golden_mid_stream_drop() {
     golden(
         "mid-stream-drop",
         json!([
-            [text("Hel"), {"error": "terminated"}],
+            // Node's words for the dropped connection, with its cause since
+            // upstream 4c992154.
+            [text("Hel"), {"error": "terminated: other side closed (UND_ERR_SOCKET)"}],
             [text("Hello again.")]
         ]),
     );
