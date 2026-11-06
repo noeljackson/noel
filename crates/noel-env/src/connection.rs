@@ -102,6 +102,18 @@ pub(crate) fn lost(message: &str) -> RemoteError {
     RemoteError::with("unknown", message, true)
 }
 
+/// The caller aborted (upstream env c96e368e).
+fn aborted() -> RemoteError {
+    RemoteError::with("aborted", "aborted", false)
+}
+
+/// How long an aborted request waits for the daemon's answer to its cancel
+/// before it settles as aborted on its own: a live daemon answers within a
+/// round trip, with its own result (an `exec`'s spill file); a connection
+/// that died unnoticed (a rebooting host) would otherwise hold the request
+/// until the keepalive gives up (upstream env c96e368e).
+const ABORT_GRACE: Duration = Duration::from_secs(1);
+
 fn closed() -> RemoteError {
     RemoteError::with("unknown", "Connection closed", false)
 }
@@ -332,6 +344,9 @@ impl PendingRequest {
     ) -> Result<Reply, RemoteError> {
         let background = Context::background();
         let cx = cx.unwrap_or(&background);
+        // Set once the request is cancelled because the caller aborted: an
+        // unanswered cancel settles it as aborted then.
+        let mut grace: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 biased;
@@ -351,7 +366,21 @@ impl PendingRequest {
                         return Err(lost("pi-env connection lost"));
                     }
                 },
-                () = cx.aborted(), if !self.cancelled => self.cancel(),
+                () = cx.aborted(), if !self.cancelled => {
+                    self.cancel();
+                    grace = Some(tokio::time::Instant::now() + ABORT_GRACE);
+                }
+                () = async {
+                    match grace {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Unanswered: a late answer finds no pending request.
+                    lock(&self.session.pending).remove(&self.id);
+                    self.settled = true;
+                    return Err(aborted());
+                }
             }
         }
     }
@@ -533,7 +562,19 @@ impl Connection {
             Some(session) => self
                 .current(session)
                 .ok_or_else(|| lost("pi-env connection lost"))?,
-            None => self.connect().await?.session,
+            // Aborting stops waiting for the start, not the start itself.
+            None => match cx {
+                Some(cx) => {
+                    if cx.is_aborted() {
+                        return Err(aborted());
+                    }
+                    tokio::select! {
+                        started = self.connect() => started?.session,
+                        () = cx.aborted() => return Err(aborted()),
+                    }
+                }
+                None => self.connect().await?.session,
+            },
         };
         let mut pending = self.send(&session, op, json, payload, cx, on_start)?;
         pending.cancel_on_drop = cancel_on_drop;

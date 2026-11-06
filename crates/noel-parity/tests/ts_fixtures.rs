@@ -274,11 +274,9 @@ fn every_script_output_is_committed() {
     assert_eq!(by_script, expected);
 }
 
-/// The upstream ref a fixture records: `main`, except for Chord's goldens,
-/// `LocalEnv`'s and pi-env's (daemon and SSH deployment), which are pinned to
-/// `CHORD_REFERENCE_REF` in the Makefile.
+/// The upstream ref a fixture records: `main`, except for Chord v2's, which
+/// follow `CHORD2_REFERENCE_REF` in the Makefile.
 fn expected_ref(fixture_name: &str) -> String {
-    // Chord v2's fixtures follow its own pin, while v1 still runs.
     if fixture_name.starts_with("chord-v2-") {
         let makefile = fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
         return makefile
@@ -288,18 +286,7 @@ fn expected_ref(fixture_name: &str) -> String {
             .trim()
             .to_string();
     }
-    if !matches!(
-        fixture_name,
-        "chord-delta.json" | "local-env.json" | "pi-env.json" | "pi-env-ssh.json"
-    ) {
-        return "main".to_string();
-    }
-    let makefile = fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
-    makefile
-        .lines()
-        .find_map(|line| line.strip_prefix("CHORD_REFERENCE_REF ?= "))
-        .expect("the Makefile pins Chord")
-        .to_string()
+    "main".to_string()
 }
 
 fn fixture_set(names: &[&str]) -> BTreeSet<String> {

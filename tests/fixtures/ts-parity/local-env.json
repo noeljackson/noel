@@ -1,9 +1,10 @@
 {
   "source": {
     "repository": "https://github.com/earendil-works/pi",
-    "ref": "b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb",
+    "ref": "main",
+    "commit": "4b11a7228d20c37637dd8cb01dabf1fd3c154297",
     "package": "packages/durable",
-    "envCommit": "abfe62928b39414ea2be4d6feb65ae608c67674f",
+    "envCommit": "e9c0ff4d84a69773ae16950e6d8cb0ef224e538f",
     "script": "/ts-parity/local-env-fixture.ts"
   },
   "format": {
@@ -490,7 +491,7 @@
       "recorded": "outcome"
     },
     {
-      "name": "watch stops reporting once closed",
+      "name": "watch stops reporting once stopped",
       "outcome": "pass",
       "recorded": "outcome"
     },

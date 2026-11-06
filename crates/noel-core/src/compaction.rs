@@ -14,12 +14,16 @@ unfinished work. Keep final code state and lessons, not redundant output or inte
 Use headings: Goals and constraints; Decisions; Completed work and files; Errors and open issues; \
 Next steps; Important references. Output only the checkpoint, without tools or commentary.";
 
+/// The settings file's compaction policy, its defaults filled in, with its
+/// per-model overrides. A conversation's own settings resolve over it for
+/// the model it acts for ([`Runtime::compaction_policy`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeCompactionSettings {
     pub enabled: bool,
     pub reserve_tokens: u64,
     pub keep_recent_tokens: u64,
     pub trigger_percent: u8,
+    pub model_overrides: std::collections::BTreeMap<String, noel_config::CompactionPolicyFields>,
 }
 
 impl Default for RuntimeCompactionSettings {
@@ -29,6 +33,43 @@ impl Default for RuntimeCompactionSettings {
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
             trigger_percent: 80,
+            model_overrides: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl Runtime {
+    /// The compaction policy for this conversation and its active model
+    /// (Durable section 8.7): the session's own settings over the settings
+    /// file's, model overrides first.
+    pub fn compaction_policy(&self) -> RuntimeCompactionSettings {
+        let base = &self.systems.compaction;
+        let settings = noel_config::CompactionSettings {
+            enabled: Some(base.enabled),
+            reserve_tokens: Some(base.reserve_tokens),
+            keep_recent_tokens: Some(base.keep_recent_tokens),
+            trigger_percent: Some(base.trigger_percent),
+            model_overrides: Some(base.model_overrides.clone()),
+        };
+        let model = self
+            .session
+            .active_model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .unwrap_or_default();
+        let resolved =
+            noel_config::resolve_compaction(&settings, self.session.compaction.as_ref(), &model);
+        RuntimeCompactionSettings {
+            enabled: resolved.enabled.unwrap_or(base.enabled),
+            reserve_tokens: resolved.reserve_tokens.unwrap_or(base.reserve_tokens),
+            keep_recent_tokens: resolved
+                .keep_recent_tokens
+                .unwrap_or(base.keep_recent_tokens),
+            trigger_percent: resolved
+                .trigger_percent
+                .unwrap_or(base.trigger_percent)
+                .clamp(1, 99),
+            model_overrides: base.model_overrides.clone(),
         }
     }
 }
@@ -166,14 +207,14 @@ impl Runtime {
     }
 
     fn exceeds_compaction_budget(&self, tokens: u64) -> bool {
-        let settings = &self.systems.compaction;
+        let settings = &self.compaction_policy();
         let window = self.context_window();
         tokens >= window.saturating_mul(u64::from(settings.trigger_percent.clamp(1, 99))) / 100
             || tokens.saturating_add(settings.reserve_tokens.min(window / 2)) >= window
     }
 
     pub fn needs_auto_compaction(&self) -> bool {
-        self.systems.compaction.enabled
+        self.compaction_policy().enabled
             && self.exceeds_compaction_budget(self.estimated_context_tokens())
     }
 
@@ -259,8 +300,7 @@ impl Runtime {
 
     /// The recent messages a compaction keeps, in tokens.
     fn keep_recent_tokens(&self) -> u64 {
-        self.systems
-            .compaction
+        self.compaction_policy()
             .keep_recent_tokens
             .min(self.context_window() / 4)
     }
@@ -404,7 +444,7 @@ impl Runtime {
                 })
                 .fold(0u64, u64::saturating_add);
             let retained = messages_tokens(&self.session.messages[start..]);
-            let budget = self.systems.compaction.trigger_percent.clamp(1, 99) as u64
+            let budget = self.compaction_policy().trigger_percent.clamp(1, 99) as u64
                 * self.context_window()
                 / 100;
             return Err(AgentError::Compaction(format!(
@@ -462,8 +502,7 @@ impl Runtime {
             .join("\n");
         let window = self.context_window();
         let reserve = self
-            .systems
-            .compaction
+            .compaction_policy()
             .reserve_tokens
             .max(1_024)
             .min(window / 4);

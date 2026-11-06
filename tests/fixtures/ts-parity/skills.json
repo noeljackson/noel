@@ -3322,7 +3322,7 @@
           "disableModelInvocation": false
         }
       ],
-      "text": "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n  <skill>\n    <name>pdf-tools</name>\n    <description>Extract text and tables from PDF files. Use when reading PDFs.</description>\n    <location>/home/user/.pi/agent/skills/pdf-tools/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>release</name>\n    <description>Cut a release &lt;major|minor&gt; &amp; &quot;tag&quot; it; it&apos;s quick.</description>\n    <location>/work/repo/.pi/skills/release &amp; ship/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>notes</name>\n    <description>Two lines\nof description.</description>\n    <location>/work/repo/.agents/skills/notes/SKILL.md</location>\n  </skill>\n</available_skills>"
+      "text": "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\nResolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.\n\n<available_skills>\n  <skill>\n    <name>pdf-tools</name>\n    <description>Extract text and tables from PDF files. Use when reading PDFs.</description>\n    <location>/home/user/.pi/agent/skills/pdf-tools/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>release</name>\n    <description>Cut a release &lt;major|minor&gt; &amp; &quot;tag&quot; it; it&apos;s quick.</description>\n    <location>/work/repo/.pi/skills/release &amp; ship/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>notes</name>\n    <description>Two lines\nof description.</description>\n    <location>/work/repo/.agents/skills/notes/SKILL.md</location>\n  </skill>\n</available_skills>"
     },
     {
       "name": "bash",
@@ -3358,7 +3358,7 @@
           "disableModelInvocation": false
         }
       ],
-      "text": "\n\nThe following skills provide specialized instructions for specific tasks.\nUse bash to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n  <skill>\n    <name>pdf-tools</name>\n    <description>Extract text and tables from PDF files. Use when reading PDFs.</description>\n    <location>/home/user/.pi/agent/skills/pdf-tools/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>release</name>\n    <description>Cut a release &lt;major|minor&gt; &amp; &quot;tag&quot; it; it&apos;s quick.</description>\n    <location>/work/repo/.pi/skills/release &amp; ship/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>notes</name>\n    <description>Two lines\nof description.</description>\n    <location>/work/repo/.agents/skills/notes/SKILL.md</location>\n  </skill>\n</available_skills>"
+      "text": "\n\nThe following skills provide specialized instructions for specific tasks.\nUse bash to load a skill's file when the task matches its description.\nResolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.\n\n<available_skills>\n  <skill>\n    <name>pdf-tools</name>\n    <description>Extract text and tables from PDF files. Use when reading PDFs.</description>\n    <location>/home/user/.pi/agent/skills/pdf-tools/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>release</name>\n    <description>Cut a release &lt;major|minor&gt; &amp; &quot;tag&quot; it; it&apos;s quick.</description>\n    <location>/work/repo/.pi/skills/release &amp; ship/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>notes</name>\n    <description>Two lines\nof description.</description>\n    <location>/work/repo/.agents/skills/notes/SKILL.md</location>\n  </skill>\n</available_skills>"
     },
     {
       "name": "only-hidden-skills",
@@ -3772,13 +3772,15 @@
       {
         "input": "\"unterminated quote",
         "args": [
-          "unterminated quote"
+          "\"unterminated",
+          "quote"
         ]
       },
       {
         "input": "it's unterminated",
         "args": [
-          "its unterminated"
+          "it's",
+          "unterminated"
         ]
       },
       {
@@ -3792,13 +3794,15 @@
       {
         "input": "a\"b c\"d",
         "args": [
-          "ab cd"
+          "a\"b",
+          "c\"d"
         ]
       },
       {
         "input": "x=\"1 2\" y",
         "args": [
-          "x=1 2",
+          "x=\"1",
+          "2\"",
           "y"
         ]
       },
@@ -3806,7 +3810,7 @@
         "input": "back\\slash \\\"quote",
         "args": [
           "back\\slash",
-          "\\quote"
+          "\\\"quote"
         ]
       },
       {

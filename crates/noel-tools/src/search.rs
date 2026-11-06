@@ -165,7 +165,8 @@ fn grep_overrides(cwd: &Path, glob: &str) -> Result<Override, ToolError> {
     overrides.build().map_err(|error| failed(error.to_string()))
 }
 
-/// The matches of one `grep` call so far.
+/// The matches of one `grep` call so far, as upstream formats ripgrep's
+/// match and context events (upstream 8da141c2).
 struct GrepSearch {
     matcher: regex::bytes::Regex,
     context: usize,
@@ -173,6 +174,13 @@ struct GrepSearch {
     output: Vec<String>,
     match_count: usize,
     lines_truncated: bool,
+    /// Set at the last allowed match: its trailing context is still shown,
+    /// up to `trailing_end` in `limit_file`.
+    limit_hit: bool,
+    limit_file: String,
+    trailing_end: usize,
+    /// A match after the last allowed one: the limit cut results off.
+    more: bool,
 }
 
 impl GrepSearch {
@@ -184,19 +192,29 @@ impl GrepSearch {
             output: Vec::new(),
             match_count: 0,
             lines_truncated: false,
+            limit_hit: false,
+            limit_file: String::new(),
+            trailing_end: 0,
+            more: false,
         }
     }
 
-    fn push_line(&mut self, path: &str, number: usize, separator: char, text: &str) {
-        let (text, was_cut) = truncate_line(&text.replace('\r', ""));
+    /// One row: `path:N: text` for a match, `path-N- text` for context.
+    /// Only the line terminator is stripped; a lone CR inside is content.
+    fn push_line(&mut self, path: &str, number: usize, is_match: bool, line: &[u8]) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let text = String::from_utf8_lossy(line);
+        let (text, was_cut) = truncate_line(&text);
         self.lines_truncated |= was_cut;
+        let separator = if is_match { ':' } else { '-' };
         self.output
             .push(format!("{path}{separator}{number}{separator} {text}"));
     }
 
-    /// Searches one file's bytes, shown as `display`; true once the match
-    /// limit is reached. Only an `explicit` file (the search path itself)
-    /// is searched past a NUL byte.
+    /// Searches one file's bytes, shown as `display`; true once the search
+    /// is done (the limit reached and one more match seen). Only an
+    /// `explicit` file (the search path itself) is searched past a NUL
+    /// byte.
     fn file(&mut self, bytes: &[u8], explicit: bool, display: &str) -> bool {
         let mut searched = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
         if !explicit {
@@ -210,40 +228,47 @@ impl GrepSearch {
                 searched = &searched[..end];
             }
         }
-        // Context lines come from the file as upstream reads it: all of it,
-        // with every line ending normalized.
-        let mut file_lines: Option<Vec<String>> = None;
         let mut lines = searched.split(|byte| *byte == b'\n').collect::<Vec<_>>();
         if searched.last().is_none_or(|byte| *byte == b'\n') {
             lines.pop();
         }
+        // The last line printed in this file, so context runs merge, and
+        // where the current match's trailing context ends.
+        let mut printed = 0;
+        let mut after_end = 0;
         for (index, line) in lines.iter().enumerate() {
-            if !self.matcher.is_match(line) {
+            let number = index + 1;
+            let is_match = self.matcher.is_match(line);
+            if !self.limit_hit {
+                if is_match {
+                    for before in printed.max(number.saturating_sub(self.context + 1)) + 1..number {
+                        self.push_line(display, before, false, lines[before - 1]);
+                    }
+                    self.push_line(display, number, true, line);
+                    printed = number;
+                    after_end = number + self.context;
+                    self.match_count += 1;
+                    if self.match_count >= self.limit {
+                        self.limit_hit = true;
+                        self.limit_file = display.to_owned();
+                        self.trailing_end = number + self.context;
+                    }
+                } else if number <= after_end && number > printed {
+                    self.push_line(display, number, false, line);
+                    printed = number;
+                }
                 continue;
             }
-            self.match_count += 1;
-            let number = index + 1;
-            match std::str::from_utf8(line) {
-                Ok(text) if self.context == 0 => self.push_line(display, number, ':', text),
-                _ => {
-                    let file_lines = file_lines.get_or_insert_with(|| {
-                        String::from_utf8_lossy(bytes)
-                            .replace("\r\n", "\n")
-                            .replace('\r', "\n")
-                            .split('\n')
-                            .map(ToString::to_string)
-                            .collect()
-                    });
-                    let first = number.saturating_sub(self.context).max(1);
-                    let last = number.saturating_add(self.context).min(file_lines.len());
-                    for current in first..=last {
-                        let separator = if current == number { ':' } else { '-' };
-                        let text = file_lines[current - 1].clone();
-                        self.push_line(display, current, separator, &text);
-                    }
-                }
+            let in_window = display == self.limit_file && number <= self.trailing_end;
+            // A match inside the last match's trailing context is shown as
+            // context.
+            if in_window && number > printed {
+                self.push_line(display, number, false, line);
+                printed = number;
             }
-            if self.match_count >= self.limit {
+            // Only another match proves that the limit cut results off.
+            self.more |= is_match;
+            if self.more && !(in_window && number < self.trailing_end) {
                 return true;
             }
         }
@@ -256,7 +281,7 @@ impl GrepSearch {
         }
         let limit = self.limit;
         let mut notices = Vec::new();
-        if self.match_count >= limit {
+        if self.more {
             notices.push(format!(
                 "{limit} matches limit reached. Use limit={} for more, or refine pattern",
                 limit.saturating_mul(2)
@@ -446,13 +471,17 @@ fn find_matcher(pattern: &str) -> Result<(GlobMatcher, bool), ToolError> {
     Ok((matcher, full_path))
 }
 
-/// The output of a `find` call that listed `results`.
+/// The output of a `find` call that listed `results`: up to `limit + 1`,
+/// the first `limit` shown and the limit notice only when there was one
+/// more (upstream 676af1d7).
 fn find_output(results: &[String], limit: usize, extra: Option<String>) -> ToolResult {
     if results.is_empty() {
         return ToolResult::text("No files found matching pattern");
     }
+    let more = results.len() > limit;
+    let results = &results[..results.len().min(limit)];
     let mut notices = Vec::new();
-    if results.len() >= limit {
+    if more {
         notices.push(format!(
             "{limit} results limit reached. Use limit={} for more, or refine pattern",
             limit.saturating_mul(2)
@@ -519,7 +548,8 @@ pub(crate) async fn find_tool(
             result.push('/');
         }
         results.push(result);
-        if results.len() >= limit {
+        // One past the limit says whether there are more.
+        if results.len() > limit {
             break;
         }
     }
@@ -561,7 +591,7 @@ async fn find_remote(
             result.push('/');
         }
         results.push(result);
-        if results.len() >= limit {
+        if results.len() > limit {
             break;
         }
     }

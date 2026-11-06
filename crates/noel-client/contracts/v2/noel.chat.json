@@ -306,6 +306,62 @@
           "args": {
             "type": "object",
             "properties": {
+              "compaction": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "reserveTokens": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "keepRecentTokens": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "triggerPercent": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 99
+                      },
+                      "modelOverrides": {
+                        "type": "object",
+                        "patternProperties": {
+                          "^.+$": {
+                            "type": "object",
+                            "properties": {
+                              "enabled": {
+                                "type": "boolean"
+                              },
+                              "reserveTokens": {
+                                "type": "integer",
+                                "minimum": 0
+                              },
+                              "keepRecentTokens": {
+                                "type": "integer",
+                                "minimum": 0
+                              },
+                              "triggerPercent": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 99
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "model": {
                 "type": "string"
               },
@@ -321,6 +377,55 @@
               "thinkingLevel"
             ],
             "properties": {
+              "compaction": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "reserveTokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "keepRecentTokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "triggerPercent": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 99
+                  },
+                  "modelOverrides": {
+                    "type": "object",
+                    "patternProperties": {
+                      "^.+$": {
+                        "type": "object",
+                        "properties": {
+                          "enabled": {
+                            "type": "boolean"
+                          },
+                          "reserveTokens": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "keepRecentTokens": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "triggerPercent": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 99
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    }
+                  }
+                },
+                "additionalProperties": false
+              },
               "model": {
                 "type": "string"
               },

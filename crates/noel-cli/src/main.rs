@@ -5464,6 +5464,9 @@ fn restyle_rows_with_markdown(
     // source that numbers every item `1.` still displays `1. 2. 3.`. A
     // plain line or a bullet ends the sequence.
     let mut ordered_list: Option<(u64, u64)> = None;
+    // Inside an HTML comment that began on an earlier row: rows show
+    // nothing until it closes (upstream tui 54280c4f).
+    let mut in_comment = false;
     for row in rows.iter_mut() {
         if row.synthetic {
             continue;
@@ -5493,6 +5496,19 @@ fn restyle_rows_with_markdown(
                 Span::styled("  ┆ ", Style::default().fg(accent)),
                 Span::styled(row_text.to_string(), base),
             ]);
+            continue;
+        }
+        // HTML comments are not shown (upstream tui 54280c4f): what is
+        // left of the row is plain text, and a row that was only a comment
+        // is blank.
+        if in_comment || row_text.contains("<!--") {
+            let (visible, open) = without_html_comments(row_text, in_comment);
+            in_comment = open;
+            row.line = if visible.trim().is_empty() {
+                Line::from(Span::styled(String::new(), base))
+            } else {
+                Line::from(styled_spans(&visible, base, accent))
+            };
             continue;
         }
         // The first logical line carries the "[provider/model] " echo
@@ -5587,6 +5603,31 @@ fn restyle_rows_with_markdown(
                 let spans = styled_spans(row_text, base, accent);
                 row.line = Line::from(spans);
             }
+        }
+    }
+}
+
+/// `text` without its HTML comments, `<!-- ... -->`, starting inside one
+/// when `in_comment`; and whether a comment is still open at its end.
+fn without_html_comments(text: &str, in_comment: bool) -> (String, bool) {
+    let mut visible = String::new();
+    let mut rest = text;
+    if in_comment {
+        match rest.find("-->") {
+            Some(end) => rest = &rest[end + 3..],
+            None => return (visible, true),
+        }
+    }
+    loop {
+        let Some(start) = rest.find("<!--") else {
+            visible.push_str(rest);
+            return (visible, false);
+        };
+        visible.push_str(&rest[..start]);
+        rest = &rest[start + 4..];
+        match rest.find("-->") {
+            Some(end) => rest = &rest[end + 3..],
+            None => return (visible, true),
         }
     }
 }
@@ -8654,6 +8695,32 @@ mod tests {
         }
     }
 
+    /// HTML comments are hidden (upstream tui 54280c4f): inline, on a row
+    /// of their own, and across rows.
+    #[test]
+    fn html_comments_are_not_shown() {
+        assert_eq!(
+            without_html_comments("a <!-- b --> c", false),
+            ("a  c".to_string(), false)
+        );
+        assert_eq!(
+            without_html_comments("<!-- release-notes:start -->", false),
+            (String::new(), false)
+        );
+        assert_eq!(
+            without_html_comments("x <!-- open", false),
+            ("x ".to_string(), true)
+        );
+        assert_eq!(
+            without_html_comments("still inside", true),
+            (String::new(), true)
+        );
+        assert_eq!(
+            without_html_comments("end --> after", true),
+            (" after".to_string(), false)
+        );
+    }
+
     #[test]
     fn assistant_markdown_renders_styled_spans_but_plain_logical_lines() {
         let entry = TuiEntry {
@@ -9751,11 +9818,11 @@ mod tests {
             .insert("anthropic", DEFAULT_ACCOUNT_NAME, key("anthropic-key"));
         config.models.extend([
             model("anthropic", "claude-opus-4-1-20250805"),
-            model("anthropic", "claude-opus-4-8"),
+            model("anthropic", "claude-opus-5-5"),
         ]);
         assert_eq!(
             pick(&config, &[], false).as_deref(),
-            Some("anthropic/claude-opus-4-8")
+            Some("anthropic/claude-opus-5-5")
         );
 
         // A saved default counts only when its provider has credentials.
@@ -9763,7 +9830,7 @@ mod tests {
         config.settings.default_model = Some("saved".to_string());
         assert_eq!(
             pick(&config, &[], false).as_deref(),
-            Some("anthropic/claude-opus-4-8")
+            Some("anthropic/claude-opus-5-5")
         );
         config.settings.default_provider = Some("keyed".to_string());
         config.settings.default_model = Some("first".to_string());

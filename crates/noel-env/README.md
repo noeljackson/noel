@@ -6,8 +6,8 @@ noel's workspaces: where tools read, write and run commands, on this machine
 ## The interface
 
 `ExecutionEnv` mirrors upstream Durable's `ExecutionEnv`
-(`packages/durable/src/env/index.ts`) at the pinned commit
-(`CHORD_REFERENCE_REF` in the Makefile). It is a `FileSystem` plus a `Shell`,
+(`packages/durable/src/env/index.ts`) at upstream `main` (the TS parity
+fixtures' reference). It is a `FileSystem` plus a `Shell`,
 async on tokio and object-safe, so callers hold an `Arc<dyn ExecutionEnv>`.
 
 - **Results, not panics.** Every operation returns `Result`. File system

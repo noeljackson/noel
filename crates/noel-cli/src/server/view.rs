@@ -10,7 +10,7 @@
 //!   and past 100 the oldest leave in one splice down to 50. `before` names
 //!   the entry just before the window; `noel.chat`'s `entries` method pages
 //!   back from it.
-//! - `docs["pi.agent"]`: `{model?, thinkingLevel, cwd}`.
+//! - `docs["pi.agent"]`: `{model?, thinkingLevel, cwd, compaction?}`.
 //! - `docs["pi.live"]`: a subset of Durable's `pi.live` v3. While a run is
 //!   active, `run` (`{runId, requestId?, inputs, turns}`), `generation`
 //!   (`{attempt, message?, retry?}`, where `message` is the reply's
@@ -882,8 +882,8 @@ fn inbox(items: &[QueueItem]) -> Value {
     json!({ "items": items })
 }
 
-/// `pi.agent`: the session's model, its thinking level in effect, and its
-/// working directory.
+/// `pi.agent`: the session's model, its thinking level in effect, its
+/// working directory, and its own compaction settings when it has them.
 pub(crate) fn agent(runtime: &Runtime, config: &noel_config::LoadedConfig) -> Value {
     let session = runtime.session();
     let mut doc = json!({
@@ -892,6 +892,9 @@ pub(crate) fn agent(runtime: &Runtime, config: &noel_config::LoadedConfig) -> Va
     });
     if let Some(model) = &session.active_model {
         doc["model"] = json!(format!("{}/{}", model.provider, model.id));
+    }
+    if let Some(compaction) = &session.compaction {
+        doc["compaction"] = json!(compaction);
     }
     doc
 }

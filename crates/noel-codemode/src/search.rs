@@ -105,26 +105,45 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn schema_text(schema: &Value, parts: &mut Vec<String>) {
+/// Schema descriptions and property names, recursively, following local
+/// `$ref`s into `root` (upstream 6d3e342b). `seen` holds the subschemas
+/// already reached through a reference, so recursive and shared
+/// definitions are read once, and definitions no property references are
+/// not read.
+fn schema_text(
+    schema: &Value,
+    root: &Value,
+    parts: &mut Vec<String>,
+    seen: &mut Vec<*const Value>,
+) {
     let Some(object) = schema.as_object() else {
         return;
     };
+    if let Some(Value::String(reference)) = object.get("$ref") {
+        if let Some(target) = crate::declarations::resolve_schema_ref(reference, root) {
+            let pointer: *const Value = target;
+            if target.is_object() && !seen.contains(&pointer) {
+                seen.push(pointer);
+                schema_text(target, root, parts, seen);
+            }
+        }
+    }
     if let Some(Value::String(description)) = object.get("description") {
         parts.push(description.clone());
     }
     if let Some(Value::Object(properties)) = object.get("properties") {
         for (name, property) in properties {
             parts.push(name.clone());
-            schema_text(property, parts);
+            schema_text(property, root, parts, seen);
         }
     }
     if let Some(items) = object.get("items") {
-        schema_text(items, parts);
+        schema_text(items, root, parts, seen);
     }
     for key in ["anyOf", "oneOf", "allOf"] {
         if let Some(Value::Array(variants)) = object.get(key) {
             for variant in variants {
-                schema_text(variant, parts);
+                schema_text(variant, root, parts, seen);
             }
         }
     }
@@ -140,7 +159,8 @@ pub fn create_tool_search_document(
 ) -> ToolSearchDocument {
     let mut parts = vec![description.to_string()];
     if let Some(parameters) = parameters {
-        schema_text(parameters, &mut parts);
+        let root: *const Value = parameters;
+        schema_text(parameters, parameters, &mut parts, &mut vec![root]);
     }
     let namespace_text = namespace.map_or_else(String::new, |namespace| {
         [
@@ -339,6 +359,49 @@ mod tests {
         text.chars().any(|c| {
             matches!(c as u32, 0x0E00..=0x0E7F | 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF)
         })
+    }
+
+    /// A field behind a local `$ref` is searched, a recursive or shared
+    /// definition once, and an unreferenced one not at all (upstream
+    /// 6d3e342b, MCP servers that put models in `$defs`).
+    #[test]
+    fn search_text_follows_local_refs_once() {
+        let parameters = serde_json::json!({
+            "properties": {
+                "options": {"$ref": "#/$defs/options"},
+                "again": {"$ref": "#/$defs/options"},
+                "remote": {"$ref": "https://example.com/schema"}
+            },
+            "$defs": {
+                "options": {
+                    "properties": {
+                        "mode": {"description": "reconciliation"},
+                        "child": {"$ref": "#/$defs/options"}
+                    }
+                },
+                "unused": {"description": "never read"}
+            }
+        });
+        let document =
+            create_tool_search_document("inspect", "Inspect records", Some(&parameters), None);
+        // Upstream's text, as words (BM25 ignores their order; this map
+        // keeps keys sorted): `options` is read once though referenced
+        // three times, and `unused` not at all.
+        let mut words: Vec<&str> = document.text.split(' ').collect();
+        words.sort_unstable();
+        assert_eq!(
+            words,
+            [
+                "Inspect",
+                "again",
+                "child",
+                "mode",
+                "options",
+                "reconciliation",
+                "records",
+                "remote"
+            ]
+        );
     }
 
     #[test]

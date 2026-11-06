@@ -1325,17 +1325,69 @@ impl Shell for RemoteEnv {
                 ));
             }
         }
-        let cwd = match options.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
-            Some(cwd) => self.resolve(cwd).await.map_err(|failure| {
+        // The daemon enforces the timeout once it runs the command. This
+        // timer also covers starting the connection and a daemon that
+        // stopped answering (a rebooting host), so the call ends on time
+        // whatever the remote host does (upstream env c96e368e).
+        let controller = crate::AbortController::new();
+        let inner = Context::with_abort_signal(controller.signal());
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (outer, timeout, timed_out) = (cx.clone(), options.timeout, timed_out.clone());
+            async move {
+                let timer = async {
+                    match timeout {
+                        Some(timeout) => tokio::time::sleep(timeout).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    () = outer.aborted() => {}
+                    () = timer => timed_out.store(true, std::sync::atomic::Ordering::SeqCst),
+                }
+                controller.abort();
+            }
+        };
+        let stopped = |timed_out: &std::sync::atomic::AtomicBool| {
+            if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
                 ExecutionError::new(
-                    ExecutionErrorCode::Unknown,
-                    to_file_error(failure, None).message,
+                    ExecutionErrorCode::Timeout,
+                    format!(
+                        "timeout:{}",
+                        options.timeout.unwrap_or_default().as_secs_f64()
+                    ),
                 )
-            })?,
+            } else {
+                ExecutionError::aborted()
+            }
+        };
+        let watching = tokio::spawn(watcher);
+        let cx = &inner;
+        let cwd = match options.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+            Some(cwd) => {
+                let resolved = tokio::select! {
+                    resolved = self.resolve(cwd) => resolved,
+                    () = cx.aborted() => {
+                        watching.abort();
+                        return Err(stopped(&timed_out));
+                    }
+                };
+                match resolved {
+                    Ok(cwd) => cwd,
+                    Err(failure) => {
+                        watching.abort();
+                        return Err(ExecutionError::new(
+                            ExecutionErrorCode::Unknown,
+                            to_file_error(failure, None).message,
+                        ));
+                    }
+                }
+            }
             None => self.cwd.clone(),
         };
         if cx.is_aborted() {
-            return Err(ExecutionError::aborted());
+            watching.abort();
+            return Err(stopped(&timed_out));
         }
         // The daemon's environment, then `shell_env`, then the command's own; an entry without a value only removes
         // what an earlier layer here added, as upstream skips `undefined` values.
@@ -1444,6 +1496,7 @@ impl Shell for RemoteEnv {
                 },
             )
             .await;
+        watching.abort();
         if let Some(id) = started {
             self.running
                 .lock()
@@ -1478,7 +1531,7 @@ impl Shell for RemoteEnv {
                             options.timeout.unwrap_or_default().as_secs_f64()
                         ),
                     ),
-                    "aborted" => ExecutionError::aborted(),
+                    "aborted" => stopped(&timed_out),
                     "shell_unavailable" => {
                         ExecutionError::new(ExecutionErrorCode::ShellUnavailable, error.message)
                     }
@@ -1545,5 +1598,72 @@ mod tests {
             to_info("/a", &json!({"kind": "other"})).unwrap_err().code,
             FileErrorCode::Invalid
         );
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use crate::{AbortController, Connection, Shell};
+    use std::time::{Duration, Instant};
+
+    /// A daemon that never answers its `hello`, like a host that is down.
+    fn silent_env() -> RemoteEnv {
+        let connection = Connection::command(vec!["sh".into(), "-c".into(), "sleep 30".into()]);
+        RemoteEnv::new(RemoteEnvOptions::new(connection, "silent", "/"))
+    }
+
+    /// Aborting while the connection starts ends the call at once, with
+    /// `aborted` (upstream env c96e368e).
+    #[tokio::test]
+    async fn an_abort_while_connecting_ends_the_call_at_once() {
+        let env = silent_env();
+        let controller = AbortController::new();
+        let cx = Context::with_abort_signal(controller.signal());
+        let started = Instant::now();
+        let call = env.exec(
+            ShellCommand::Script("true".into()),
+            ExecOptions::default(),
+            &cx,
+        );
+        tokio::pin!(call);
+        tokio::select! {
+            result = &mut call => panic!("the silent daemon answered: {:?}", result.err().map(|error| error.message)),
+            () = tokio::time::sleep(Duration::from_millis(100)) => controller.abort(),
+        }
+        let error = call.await.expect_err("aborted");
+        assert_eq!(error.code, ExecutionErrorCode::Aborted);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        env.connection().close();
+    }
+
+    /// An exec's timeout also covers starting the connection, so the call
+    /// ends on time whatever the host does.
+    #[tokio::test]
+    async fn an_execs_timeout_covers_starting_the_connection() {
+        let env = silent_env();
+        let started = Instant::now();
+        let error = env
+            .exec(
+                ShellCommand::Script("true".into()),
+                ExecOptions {
+                    timeout: Some(Duration::from_millis(200)),
+                    ..ExecOptions::default()
+                },
+                &Context::background(),
+            )
+            .await
+            .expect_err("timed out");
+        assert_eq!(error.code, ExecutionErrorCode::Timeout);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        env.connection().close();
     }
 }

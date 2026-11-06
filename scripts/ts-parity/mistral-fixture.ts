@@ -1,7 +1,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "/ts-reference/packages/ai/src/index.ts";
+// pi-ai stopped re-exporting TypeBox (upstream 6536f801); tools import it
+// from typebox, as upstream's coding-agent does.
+import { Type } from "/ts-reference/node_modules/typebox/build/index.mjs";
 import { stableUserAgent } from "./user-agent.ts";
 
 type CapturedRequest = {
