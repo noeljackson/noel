@@ -804,14 +804,96 @@ fn merge_optional_settings<T: MergeSettings>(base: Option<T>, overrides: Option<
     }
 }
 
+/// Compaction settings: of the settings file, or of one conversation
+/// (Durable's `CompactionSettings`, upstream 922c3ff2). `modelOverrides`
+/// is keyed by exact `"provider/modelId"`; each field it sets replaces the
+/// general one for that model.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserve_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_recent_tokens: Option<u64>,
     /// Percentage of the model context window that triggers automatic compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_overrides: Option<BTreeMap<String, CompactionPolicyFields>>,
+}
+
+/// The fields of a compaction policy, each optional: what a settings
+/// layer or a model override sets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionPolicyFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_recent_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_percent: Option<u8>,
+}
+
+impl CompactionSettings {
+    /// This layer's general fields.
+    pub fn general(&self) -> CompactionPolicyFields {
+        CompactionPolicyFields {
+            enabled: self.enabled,
+            reserve_tokens: self.reserve_tokens,
+            keep_recent_tokens: self.keep_recent_tokens,
+            trigger_percent: self.trigger_percent,
+        }
+    }
+
+    /// This layer's override for `model` (`"provider/modelId"`).
+    pub fn for_model(&self, model: &str) -> CompactionPolicyFields {
+        self.model_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(model))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// The compaction policy for a conversation and the model it acts for,
+/// field by field from the first layer that sets it (Durable section 8.7):
+/// the conversation's override for the model, the settings' override for
+/// it, the conversation's own fields, then the settings'. A model-specific
+/// value beats a general one, and the conversation beats the settings at
+/// the same level. One exception: when the conversation's override leaves
+/// `enabled` unset, the conversation's own `enabled: false` wins over the
+/// settings' override.
+pub fn resolve_compaction(
+    settings: &CompactionSettings,
+    conversation: Option<&CompactionSettings>,
+    model: &str,
+) -> CompactionPolicyFields {
+    let none = CompactionSettings::default();
+    let conversation = conversation.unwrap_or(&none);
+    let layers = [
+        conversation.for_model(model),
+        settings.for_model(model),
+        conversation.general(),
+        settings.general(),
+    ];
+    let first =
+        |pick: &dyn Fn(&CompactionPolicyFields) -> Option<u64>| layers.iter().find_map(pick);
+    let enabled = match (layers[0].enabled, conversation.enabled) {
+        (Some(enabled), _) => Some(enabled),
+        (None, Some(false)) => Some(false),
+        _ => layers.iter().find_map(|layer| layer.enabled),
+    };
+    CompactionPolicyFields {
+        enabled,
+        reserve_tokens: first(&|layer| layer.reserve_tokens),
+        keep_recent_tokens: first(&|layer| layer.keep_recent_tokens),
+        trigger_percent: layers.iter().find_map(|layer| layer.trigger_percent),
+    }
 }
 
 impl MergeSettings for CompactionSettings {
@@ -821,6 +903,7 @@ impl MergeSettings for CompactionSettings {
             reserve_tokens: overrides.reserve_tokens.or(self.reserve_tokens),
             keep_recent_tokens: overrides.keep_recent_tokens.or(self.keep_recent_tokens),
             trigger_percent: overrides.trigger_percent.or(self.trigger_percent),
+            model_overrides: overrides.model_overrides.or(self.model_overrides),
         }
     }
 }
@@ -1980,9 +2063,27 @@ pub struct AuthFileLock {
     _file: fs::File,
 }
 
+/// `auth_path` with its links resolved: the file's own path when it
+/// exists, else its directory's real path joined with its name.
+fn real_auth_path(auth_path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(auth_path) {
+        return real;
+    }
+    match (auth_path.parent(), auth_path.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or_else(|_| auth_path.to_path_buf()),
+        _ => auth_path.to_path_buf(),
+    }
+}
+
 impl AuthFileLock {
     /// Takes the lock unless another holder has it.
     pub fn try_acquire(auth_path: &Path) -> Result<Option<Self>, ConfigError> {
+        // Every path to the same file shares one lock: a symlinked
+        // `auth.json` locks its target (upstream 081a6e87).
+        let real = real_auth_path(auth_path);
+        let auth_path = real.as_path();
         let file_name = auth_path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -5929,6 +6030,46 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Durable's example (spec section 8.7, upstream 922c3ff2).
+    #[test]
+    fn compaction_resolves_per_conversation_and_model() {
+        let settings: CompactionSettings = serde_json::from_value(serde_json::json!({
+            "keepRecentTokens": 20000,
+            "modelOverrides": {"local/small-32k": {"keepRecentTokens": 8000, "enabled": true}}
+        }))
+        .unwrap();
+        let conversation: CompactionSettings =
+            serde_json::from_value(serde_json::json!({"keepRecentTokens": 60000})).unwrap();
+        let large = resolve_compaction(&settings, Some(&conversation), "large/1m");
+        assert_eq!(large.keep_recent_tokens, Some(60000));
+        // The settings' model override beats the conversation's general field.
+        let small = resolve_compaction(&settings, Some(&conversation), "local/small-32k");
+        assert_eq!(small.keep_recent_tokens, Some(8000));
+        // Without the conversation's: the settings'.
+        assert_eq!(
+            resolve_compaction(&settings, None, "large/1m").keep_recent_tokens,
+            Some(20000)
+        );
+        // A conversation's `enabled: false` turns compaction off for every
+        // model, even one whose settings override enables it.
+        let off: CompactionSettings =
+            serde_json::from_value(serde_json::json!({"enabled": false})).unwrap();
+        assert_eq!(
+            resolve_compaction(&settings, Some(&off), "local/small-32k").enabled,
+            Some(false)
+        );
+        // Unless the conversation's own override for that model says so.
+        let on_for_small: CompactionSettings = serde_json::from_value(serde_json::json!({
+            "enabled": false,
+            "modelOverrides": {"local/small-32k": {"enabled": true}}
+        }))
+        .unwrap();
+        assert_eq!(
+            resolve_compaction(&settings, Some(&on_for_small), "local/small-32k").enabled,
+            Some(true)
+        );
+    }
+
     #[test]
     fn auth_file_lock_excludes_other_holders_until_released() {
         let root = test_dir("noel-config-auth-lock");
@@ -5946,6 +6087,28 @@ mod tests {
         assert!(AuthFileLock::try_acquire(&auth_path)
             .expect("try lock")
             .is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A symlinked `auth.json` shares its target's lock (upstream
+    /// 081a6e87), so two agent dirs pointing at one file cannot both write.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_auth_file_shares_its_targets_lock() {
+        let root = test_dir("noel-config-auth-lock-link");
+        let shared = root.join("shared");
+        let agent = root.join("agent");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(shared.join("auth.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(shared.join("auth.json"), agent.join("auth.json")).unwrap();
+        let held = AuthFileLock::try_acquire(&shared.join("auth.json"))
+            .expect("lock")
+            .expect("free lock");
+        assert!(AuthFileLock::try_acquire(&agent.join("auth.json"))
+            .expect("try lock")
+            .is_none());
+        drop(held);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6049,8 +6212,8 @@ mod tests {
     #[test]
     fn upstream_text_takes_noels_names_only_for_what_noel_renamed() {
         assert_eq!(
-            with_noel_names("operating inside <product>, a coding agent harness"),
-            "operating inside noel, a coding agent harness"
+            with_noel_names("running inside <product>, a coding agent harness"),
+            "running inside noel, a coding agent harness"
         );
         assert_eq!(
             with_noel_names("You can inspect PI_* environment variables"),

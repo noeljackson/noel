@@ -4,7 +4,6 @@
 // Writes <output-dir>/tool-search.json: tokenize() of each text, and rank() of each query over
 // documents built by createToolSearchDocument(), with the cases of upstream's tool-search.test.ts.
 // `typebox` is stubbed: tool.ts uses it only for its input schema.
-import { execFileSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -145,13 +144,11 @@ async function main() {
 		},
 	});
 	const search = await import(join(reference, "packages/coding-agent/src/extensions/tool-search/tool.ts"));
-	const commit = execFileSync("git", ["-C", reference, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 	const ranker = new search.Bm25Ranker();
 	const fixture = {
 		source: {
 			repository: "https://github.com/earendil-works/pi",
 			ref: process.env.TS_REFERENCE_REF ?? "main",
-			commit,
 			script: "/ts-parity/tool-search-fixture.ts",
 			files: [
 				"packages/coding-agent/src/extensions/tool-search/tool.ts",

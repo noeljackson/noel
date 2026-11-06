@@ -1607,6 +1607,40 @@ fn configure(
             ));
         }
     }
+    // Durable's `configure({compaction})`: replaces the conversation's
+    // settings whole; `null` clears them (upstream 922c3ff2).
+    let compaction = match args.get("compaction") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(value) => Some(Some(
+            serde_json::from_value::<noel_config::CompactionSettings>(value.clone()).map_err(
+                |error| refused("configure", format!("Invalid compaction settings: {error}")),
+            )?,
+        )),
+    };
+    if let Some(Some(settings)) = &compaction {
+        let percents = std::iter::once(settings.trigger_percent).chain(
+            settings
+                .model_overrides
+                .iter()
+                .flatten()
+                .map(|(_, fields)| fields.trigger_percent),
+        );
+        if percents
+            .flatten()
+            .any(|percent| !(1..=99).contains(&percent))
+        {
+            return Err(refused(
+                "configure",
+                "compaction triggerPercent must be from 1 to 99",
+            ));
+        }
+    }
+    if let Some(settings) = compaction {
+        runtime
+            .set_compaction_settings(settings)
+            .map_err(|error| refused("configure", error.to_string()))?;
+    }
     if let Some(reference) = args.get("model").and_then(Value::as_str) {
         let model = model_reference(&host.config, reference, host.offline)
             .ok_or_else(|| refused("configure", format!("Model not found: {reference}")))?;
@@ -1619,6 +1653,9 @@ fn configure(
     let mut answer = json!({"thinkingLevel": agent["thinkingLevel"]});
     if let Some(model) = agent.get("model") {
         answer["model"] = model.clone();
+    }
+    if let Some(compaction) = agent.get("compaction") {
+        answer["compaction"] = compaction.clone();
     }
     Ok(answer)
 }

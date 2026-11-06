@@ -2,7 +2,6 @@
   "source": {
     "repository": "https://github.com/earendil-works/pi",
     "ref": "main",
-    "commit": "7dc38ff0e9490483b368c2b14531c9199c4cbee1",
     "script": "/ts-parity/tool-search-fixture.ts",
     "files": [
       "packages/coding-agent/src/extensions/tool-search/tool.ts",

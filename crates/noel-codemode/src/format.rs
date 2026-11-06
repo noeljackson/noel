@@ -177,8 +177,9 @@ fn truncate_output(
     let head_chars = budget / 2;
     let tail_chars = budget - head_chars;
     let removed = length - head_chars - tail_chars;
-    let head = String::from_utf16_lossy(&units[..head_chars as usize]);
-    let tail = String::from_utf16_lossy(&units[(length - tail_chars) as usize..]);
+    // Never splitting a character (upstream's sliceHead and sliceTail).
+    let head = slice_head_utf16(&combined, head_chars as usize);
+    let tail = slice_tail_utf16(&combined, tail_chars as usize);
     let lines = combined.split('\n').count();
     let mut text = format!(
         "Warning: truncated output (original token count: {})\nTotal output lines: {lines}\n\n{head}…{} tokens truncated…{tail}",
@@ -329,6 +330,32 @@ pub fn format_result(
         full_output_path,
         is_error: !ok,
     }
+}
+
+/// At most the first `max` UTF-16 units of `text`, never splitting a
+/// character: upstream's `sliceHead` (9e870f6f).
+fn slice_head_utf16(text: &str, max: usize) -> &str {
+    let mut units = 0;
+    for (index, character) in text.char_indices() {
+        units += character.len_utf16();
+        if units > max {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+/// At most the last `max` UTF-16 units of `text`, never splitting a
+/// character: upstream's `sliceTail` (9e870f6f).
+fn slice_tail_utf16(text: &str, max: usize) -> &str {
+    let mut units = 0;
+    for (index, character) in text.char_indices().rev() {
+        units += character.len_utf16();
+        if units > max {
+            return &text[index + character.len_utf8()..];
+        }
+    }
+    text
 }
 
 #[cfg(test)]

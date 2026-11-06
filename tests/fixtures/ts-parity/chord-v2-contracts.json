@@ -1,9 +1,9 @@
 {
   "source": {
     "repository": "https://github.com/earendil-works/pi",
-    "ref": "3551ec07eb87afebac20191958163ae58976f1d0",
+    "ref": "4b11a7228d20c37637dd8cb01dabf1fd3c154297",
     "package": "packages/chord",
-    "packageCommit": "3551ec07eb87afebac20191958163ae58976f1d0",
+    "packageCommit": "4b11a7228d20c37637dd8cb01dabf1fd3c154297",
     "script": "/ts-parity/chord-v2-contracts-fixture.ts"
   },
   "hash64": [
@@ -550,6 +550,62 @@
                 "args": {
                   "type": "object",
                   "properties": {
+                    "compaction": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "enabled": {
+                              "type": "boolean"
+                            },
+                            "reserveTokens": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "keepRecentTokens": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "triggerPercent": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 99
+                            },
+                            "modelOverrides": {
+                              "type": "object",
+                              "patternProperties": {
+                                "^.+$": {
+                                  "type": "object",
+                                  "properties": {
+                                    "enabled": {
+                                      "type": "boolean"
+                                    },
+                                    "reserveTokens": {
+                                      "type": "integer",
+                                      "minimum": 0
+                                    },
+                                    "keepRecentTokens": {
+                                      "type": "integer",
+                                      "minimum": 0
+                                    },
+                                    "triggerPercent": {
+                                      "type": "integer",
+                                      "minimum": 1,
+                                      "maximum": 99
+                                    }
+                                  },
+                                  "additionalProperties": false
+                                }
+                              }
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "model": {
                       "type": "string"
                     },
@@ -565,6 +621,55 @@
                     "thinkingLevel"
                   ],
                   "properties": {
+                    "compaction": {
+                      "type": "object",
+                      "properties": {
+                        "enabled": {
+                          "type": "boolean"
+                        },
+                        "reserveTokens": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "keepRecentTokens": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "triggerPercent": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 99
+                        },
+                        "modelOverrides": {
+                          "type": "object",
+                          "patternProperties": {
+                            "^.+$": {
+                              "type": "object",
+                              "properties": {
+                                "enabled": {
+                                  "type": "boolean"
+                                },
+                                "reserveTokens": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "keepRecentTokens": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "triggerPercent": {
+                                  "type": "integer",
+                                  "minimum": 1,
+                                  "maximum": 99
+                                }
+                              },
+                              "additionalProperties": false
+                            }
+                          }
+                        }
+                      },
+                      "additionalProperties": false
+                    },
                     "model": {
                       "type": "string"
                     },
@@ -712,7 +817,7 @@
           }
         }
       },
-      "fingerprint": "7464a70af036b18f"
+      "fingerprint": "893ae1e68ee49027"
     },
     {
       "declaration": {

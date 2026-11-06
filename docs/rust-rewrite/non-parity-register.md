@@ -441,8 +441,11 @@ The `edit` tool follows upstream's rules (unique `oldText`, no overlapping
 edits, all edits applied at once, empty `newText`, `edits` as a JSON string,
 BOM and CRLF kept) but matches exactly: it does not fall back to upstream's
 fuzzy matching of smart quotes, Unicode dashes and spaces, and trailing
-whitespace. It also converts only the edited text to the file's line endings
-instead of normalizing a mixed-ending file.
+whitespace. As upstream since d448c51e2, lines the edit does not touch keep
+their endings and the new text takes the ending of the line its range starts
+on; but `oldText` is matched in the file's first-line ending, where upstream
+matches on LF-normalized text, so an `oldText` spanning lines of different
+endings matches upstream and not here.
 
 Reason: an exact match cannot edit the wrong region, and bytes outside the
 edits stay untouched.
@@ -852,9 +855,26 @@ parts differ:
   of base64), the PNG-then-JPEG candidates, and the notes are the same.
 - `edit` matches exactly (see Exact-Match edit Tool) and, like `write`,
   returns no diff: tool results are text.
+- `read` loads the file into a byte buffer rather than streaming it as
+  upstream does since 3a7bb6f4; the output is the same, and Rust has no
+  string-length limit to avoid.
 
 Reason: the remaining differences are either invisible to the model or need a
 dependency (Unicode normalization) for a rare case.
+
+### No Session Affinity or Prompt Cache Keys on OpenAI-Style Requests
+
+Upstream passes the session id to its providers: OpenAI Responses sends it as
+`session-id` and `x-client-request-id` (since c5d39783), OpenRouter as
+`x-session-id`, and OpenAI-style APIs as `prompt_cache_key` (also through
+compatible proxies since 0f4d5e96), unless `PI_CACHE_RETENTION` or the
+request's cache retention is `none`. noel builds its providers with no session
+id, so it sends none of these; only Cloudflare AI Gateway and Mistral requests
+built with one carry it.
+
+Reason: not ported yet. OpenAI's automatic prompt caching still applies to
+repeated prefixes without a key; the key only improves routing to the same
+cache.
 
 ### Tool Result Images Depend on the Provider API and the Catalog
 
@@ -1321,9 +1341,11 @@ has to find it.
 
 ### Chord Delta, Canonical JSON and Contracts
 
-`crates/noel-chord` matches upstream Chord's delta ops, wire codec,
-`canonicalJson`, `hash64`, contract fingerprints, `coverage` and `fits` at the
-pinned commit (`chord-delta.json`). These parts differ:
+`crates/noel-chord` matches upstream Chord's delta ops, wire codec and
+`canonicalJson` at `main` (`chord-delta.json`); its v1 `hash64`, contract
+fingerprints, `coverage` and `fits` have had no upstream counterpart since
+Chord v1 was removed, and Chord v2's contracts are checked against
+`chord-v2-contracts.json`. These parts differ:
 
 - noel's strings are Unicode text, so they cannot hold a lone surrogate. A `t`
   op that would cut a surrogate pair in half fails with `SplitSurrogate`
@@ -1368,6 +1390,17 @@ Where it differs:
 - **Process links** are noel's framed byte streams (`[u32 BE length][tag]
   [payload]`, tag 0 a Chord message, tag 1 a JSON control message), not
   Node IPC.
+- **No telemetry.** noel records no spans or metrics (`chord.link.bytes`,
+  `chord.link.checks`). A `hold`'s or `call`'s trace carrier is decoded,
+  checked and forwarded by relays as it came (none on a re-hold), and noel's
+  own holds and calls send none.
+- **No reload.** noel's providers never unbind or rebind a bound hold, so
+  `loading` on a bound hold, a call's `old` flag and the reasons `version`
+  and `reload_cycle` arise only from upstream peers: noel decodes them,
+  relays `old` only from a trusted link, and ignores it when serving.
+- **The heartbeat** measures silence on tokio's monotonic clock, which does
+  not advance while the machine sleeps, instead of upstream's late-tick
+  allowance (9f7d909f); a stalled host task still counts as silence.
 - **No text codec yet.** Only the binary codec, upstream's default. The text
   codec is for debugging and both ends must agree on it.
 - **Error messages of protocol errors** carry the decode error after the
@@ -1557,7 +1590,7 @@ only the connection tells apart (owner's decision, 2026-11-05).
 `crates/noel-env`'s `ExecutionEnv` has upstream Durable's methods, results
 and error codes, and `LocalEnv` makes the same observations as
 `NodeExecutionEnv` in every case of upstream's env conformance suite that it
-runs (`local-env.json`, at the pinned commit). These parts differ:
+runs (`local-env.json`, at upstream `main`). These parts differ:
 
 - **No watching yet.** `LocalEnv::watch` fails with `not_supported`, so the
   suite's nine watch cases are not run against it; the fixture records them
@@ -1618,7 +1651,7 @@ it was, and the rest are Rust's type system and noel being Unix-only.
 ### noel-env Daemon
 
 `noel-env serve` (`crates/noel-env-daemon`) is a port of upstream's pi-env
-daemon (`packages/env/daemon`) at the pinned commit and speaks pi-env
+daemon (`packages/env/daemon`) at upstream `main` and speaks pi-env
 protocol 1 unchanged, so upstream's client and noel's can use either daemon.
 It answers upstream's client as upstream's daemon does in every recorded
 scenario of `pi-env.json`, and passes the same 78 upstream client tests
@@ -1641,6 +1674,12 @@ scenario of `pi-env.json`, and passes the same 78 upstream client tests
   results. A `scanLines` range whose line numbers are above 2^53 - 1 fails
   with `EINVAL`, as noel-env's `LineScanner` rejects them; upstream scans
   such a range, which a JavaScript client cannot send exactly.
+- **No `process` operation.** Upstream's daemon runs long-lived programs
+  with plain pipes (`process`, `processWrite`, `processCloseStdin`, since
+  9c9ce854, and kills what such a program leaves running, 032656b6) and lists
+  `process` in `hello.features`. noel's daemon has no such operation and
+  lists only `listFiles`; its goldens leave `process` out of upstream's
+  features, and `make env-interop` does not run upstream's process suite.
 - **Build profile.** Upstream's release profile (LTO, one codegen unit,
   stripped) is `profile.env-daemon` (`make env-daemon`), so the noel CLI's
   release build is unchanged.
@@ -1653,14 +1692,15 @@ entries are compared by name, not in the file system's order; a request's
 paths they report, since how they are split depends on timing.
 
 Reason: noel ships its own daemon, versioned with noel; noel runs on Linux
-and macOS; and reusing noel-env's decoder and line scanner keeps one
+and macOS; upstream's `process` operation serves MCP servers over pi-env, and
+noel has no MCP support (see No MCP Support); and reusing noel-env's decoder and line scanner keeps one
 implementation of each, checked against the same goldens, and one dependency
 fewer.
 
 ### noel-env Client
 
 `crates/noel-env`'s `Connection`, `RemoteEnv` and `ssh` module port upstream's
-pi-env client (`packages/env/src`) at the pinned commit. Over `noel-env serve`
+pi-env client (`packages/env/src`) at upstream `main`. Over `noel-env serve`
 `RemoteEnv` makes the observations `NodeExecutionEnv` makes in every case of
 `local-env.json` and passes upstream's watch and `listFiles` cases; it sends
 exactly the frames upstream's client sent in `pi-env.json`; its `ssh`

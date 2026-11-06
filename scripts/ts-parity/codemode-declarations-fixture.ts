@@ -6,7 +6,6 @@
 // recorders, and writes <output-dir>/codemode-declarations.json: every call of schemaToType,
 // renderToolSignature, renderToolSample and renderDeclarations with its arguments and result,
 // plus cases of noel's own.
-import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,7 +47,6 @@ async function main() {
 	}
 	const source = join(reference, "packages/codemode/src/declarations.ts");
 	const upstream = await import(source);
-	const commit = execFileSync("git", ["-C", reference, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 
 	const calls: Call[] = [];
 	const record =
@@ -59,7 +57,7 @@ async function main() {
 			return result;
 		};
 	const recorders = Object.fromEntries(
-		["schemaToType", "renderToolSignature", "renderToolSample", "renderDeclarations"].map((fn) => [fn, record(fn)]),
+		["schemaToType", "renderToolSignature", "renderToolSample", "renderDeclarations", "resolveSchemaRef"].map((fn) => [fn, record(fn)]),
 	);
 	(globalThis as Record<string, unknown>).__codemodeRecorders = recorders;
 
@@ -72,6 +70,13 @@ async function main() {
 		},
 		toContain(expected: string) {
 			if (typeof actual !== "string" || !actual.includes(expected)) failures.push(`missing ${expected}`);
+		},
+		toBeUndefined() {
+			if (actual !== undefined) failures.push(`${JSON.stringify(actual)} !== undefined`);
+		},
+		toEqual(expected: unknown) {
+			if (JSON.stringify(actual) !== JSON.stringify(expected))
+				failures.push(`${JSON.stringify(actual)} != ${JSON.stringify(expected)}`);
 		},
 	});
 	(globalThis as Record<string, unknown>).__codemodeVitest = {
@@ -94,7 +99,7 @@ async function main() {
 		);
 		await writeFile(
 			join(work, "index.ts"),
-			"const r = (globalThis as any).__codemodeRecorders;\nexport const schemaToType = r.schemaToType, renderToolSignature = r.renderToolSignature, renderToolSample = r.renderToolSample, renderDeclarations = r.renderDeclarations;\n",
+			"const r = (globalThis as any).__codemodeRecorders;\nexport const schemaToType = r.schemaToType, renderToolSignature = r.renderToolSignature, renderToolSample = r.renderToolSample, renderDeclarations = r.renderDeclarations, resolveSchemaRef = r.resolveSchemaRef;\n",
 		);
 		const test = await readFile(join(reference, "packages/codemode/test/declarations.test.ts"), "utf8");
 		const rewritten = test
@@ -117,7 +122,6 @@ async function main() {
 				source: {
 					repository: "https://github.com/earendil-works/pi",
 					ref: process.env.TS_REFERENCE_REF ?? "main",
-					commit,
 					script: "/ts-parity/codemode-declarations-fixture.ts",
 					files: ["packages/codemode/src/declarations.ts", "packages/codemode/test/declarations.test.ts"],
 				},

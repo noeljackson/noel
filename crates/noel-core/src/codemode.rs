@@ -289,11 +289,31 @@ pub(crate) fn description(listed: &[ToolDeclaration], inline_budget: Option<u64>
     sections.join("\n\n")
 }
 
+/// The subschema the local `$ref` chain of `schema` names in `root`;
+/// remote, missing and cyclic references stop at the schema holding them
+/// (upstream `followRef`, 6d3e342b).
+fn follow_ref<'a>(schema: &'a Value, root: &'a Value) -> &'a Value {
+    let mut current = schema;
+    let mut seen: Vec<*const Value> = Vec::new();
+    while let Some(Value::String(reference)) = current.get("$ref") {
+        let pointer: *const Value = current;
+        if seen.contains(&pointer) {
+            break;
+        }
+        let Some(target) = noel_codemode::declarations::resolve_schema_ref(reference, root) else {
+            break;
+        };
+        seen.push(pointer);
+        current = target;
+    }
+    current
+}
+
 /// The field names of an object schema with the fields of object fields
 /// `depth` levels deep and the value of `const` fields (upstream
-/// `describeFields`).
-fn describe_fields(schema: &Value, depth: usize, order: &[&str]) -> Option<String> {
-    let object = schema.as_object()?;
+/// `describeFields`); local `$ref`s resolve against `root`.
+fn describe_fields(schema: &Value, root: &Value, depth: usize, order: &[&str]) -> Option<String> {
+    let object = follow_ref(schema, root).as_object()?;
     if object.get("type") != Some(&Value::String("object".into())) {
         return None;
     }
@@ -309,9 +329,9 @@ fn describe_fields(schema: &Value, depth: usize, order: &[&str]) -> Option<Strin
         .into_iter()
         .map(|name| {
             let field = &properties[name.as_str()];
-            let nested = match field.get("const") {
+            let nested = match follow_ref(field, root).get("const") {
                 Some(constant) => Some(constant.to_string()),
-                None if depth > 0 => describe_fields(field, depth - 1, &[]),
+                None if depth > 0 => describe_fields(field, root, depth - 1, &[]),
                 None => None,
             };
             let optional = if required.contains(&name.as_str()) {
@@ -329,7 +349,8 @@ fn describe_fields(schema: &Value, depth: usize, order: &[&str]) -> Option<Strin
 }
 
 /// The field names of each variant of a union whose variants are all objects.
-fn describe_union_fields(schema: &Value, order: &[&str]) -> Option<String> {
+fn describe_union_fields(schema: &Value, root: &Value, order: &[&str]) -> Option<String> {
+    let schema = follow_ref(schema, root);
     let variants = match (schema.get("anyOf"), schema.get("oneOf")) {
         (Some(variants), _) | (None, Some(variants)) => variants.as_array()?,
         _ => return None,
@@ -339,7 +360,7 @@ fn describe_union_fields(schema: &Value, order: &[&str]) -> Option<String> {
     }
     variants
         .iter()
-        .map(|variant| describe_fields(variant, 0, order))
+        .map(|variant| describe_fields(variant, root, 0, order))
         .collect::<Option<Vec<_>>>()
         .map(|described| described.join(" | "))
 }
@@ -351,8 +372,8 @@ fn describe_output(name: &str, schema: &Value) -> String {
         return "a string".into();
     }
     let order = property_order(name);
-    if let Some(fields) =
-        describe_fields(schema, 1, order).or_else(|| describe_union_fields(schema, order))
+    if let Some(fields) = describe_fields(schema, schema, 1, order)
+        .or_else(|| describe_union_fields(schema, schema, order))
     {
         return format!("`{fields}`");
     }
@@ -579,13 +600,12 @@ const ARGS_PREVIEW_CHARS: usize = 200;
 const ERROR_PREVIEW_CHARS: usize = 500;
 
 /// `text` cut to `max` characters (UTF-16 units, as upstream counts) with
-/// `...` at the end.
+/// `...` at the end, never splitting a character (upstream 9e870f6f).
 fn truncate_text(text: &str, max: usize) -> String {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    if units.len() <= max {
+    if text.encode_utf16().count() <= max {
         return text.to_owned();
     }
-    format!("{}...", String::from_utf16_lossy(&units[..max - 3]))
+    format!("{}...", noel_tools::slice_head_utf16(text, max - 3))
 }
 
 /// What a nested call is doing.
@@ -1017,6 +1037,31 @@ pub(crate) fn selected(available: &BTreeSet<String>, disabled: &BTreeSet<String>
 
 #[cfg(test)]
 mod tests {
+    /// An output schema whose fields sit behind a local `$ref` still shows
+    /// them (upstream 6d3e342b).
+    #[test]
+    fn the_output_summary_follows_local_refs() {
+        let schema = serde_json::json!({
+            "$ref": "#/$defs/result",
+            "$defs": {
+                "result": {
+                    "type": "object",
+                    "required": ["status"],
+                    "properties": {
+                        "status": {"$ref": "#/$defs/status"},
+                        "detail": {"$ref": "#/$defs/detail"}
+                    }
+                },
+                "status": {"const": "ok"},
+                "detail": {"type": "object", "properties": {"rows": {"type": "integer"}}}
+            }
+        });
+        assert_eq!(
+            describe_fields(&schema, &schema, 1, &[]).as_deref(),
+            Some("{ detail?: { rows? }, status: \"ok\" }")
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1135,5 +1180,7 @@ mod tests {
     fn previews_are_cut_with_dots() {
         assert_eq!(truncate_text("abcdef", 10), "abcdef");
         assert_eq!(truncate_text("abcdefghijkl", 10), "abcdefg...");
+        // An emoji across the cut is left out whole, not split.
+        assert_eq!(truncate_text("abcdef\u{1f600}xyz", 10), "abcdef...");
     }
 }

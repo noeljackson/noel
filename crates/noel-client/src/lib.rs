@@ -194,9 +194,18 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(connector: Arc<dyn Connector>, report: Report) -> Result<Self> {
+        Self::connect_with(connector, report, HostOptions::default()).await
+    }
+
+    /// [`Client::connect`] with these host options (a test's heartbeat).
+    async fn connect_with(
+        connector: Arc<dyn Connector>,
+        report: Report,
+        options: HostOptions,
+    ) -> Result<Self> {
         let lost = Arc::new(Notify::new());
         let signal = lost.clone();
-        let host = Host::new(HostOptions::default());
+        let host = Host::new(options);
         host.observe(move |event| match event {
             HostEvent::Closed { .. } => signal.notify_one(),
             HostEvent::ProtocolError { error, .. }
@@ -638,6 +647,118 @@ mod tests {
         );
         client.close().await;
         server.close().await;
+    }
+
+    /// A link that goes silent without a close (a laptop that slept while
+    /// a relay dropped the connection; upstream p2 4b11a722): the
+    /// heartbeat closes it, and the client connects again and holds the
+    /// view again.
+    #[tokio::test]
+    async fn a_link_gone_silent_without_a_close_is_reconnected() {
+        let server = host_at(session_address("s1"));
+        let view = Cell::new(
+            state_schema(&contracts::chat(), "viewer", "view"),
+            json!({"conversation": {"id": "s1", "cwd": "/w"}, "entries": [], "docs": {}}),
+        )
+        .unwrap();
+        let served = view.clone();
+        server.serve(contracts::chat(), move |_input, _principal| {
+            Ok(Implementation::new("viewer")
+                .state("view", &served)
+                .method("entries", |_args, _ctx| async {
+                    Ok(json!({"entries": []}))
+                }))
+        });
+        let silent = Silent::new(&server);
+        let options = HostOptions {
+            ping_ms: 100,
+            close_ms: 300,
+            tick_ms: 20,
+            ..HostOptions::default()
+        };
+        let client = Client::connect_with(silent.clone(), quiet(), options)
+            .await
+            .unwrap();
+        let (sender, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let follower = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .follow("s1", |followed| {
+                        let _ = sender.send(match followed {
+                            Followed::Update(StateUpdate::Snapshot(_)) => "snapshot".to_owned(),
+                            Followed::ServerLost => "lost".into(),
+                            Followed::Reconnected => "reconnected".into(),
+                            _ => "other".into(),
+                        });
+                    })
+                    .await
+            })
+        };
+        assert_eq!(next(&mut seen).await, "snapshot");
+        // Nothing crosses the first link any more, and nothing closes it.
+        silent.mute_first();
+        let mut events = Vec::new();
+        while events.last().map(String::as_str) != Some("reconnected") {
+            events.push(next(&mut seen).await);
+        }
+        assert!(events.contains(&"lost".to_owned()), "{events:?}");
+        let mut after = next(&mut seen).await;
+        while after != "snapshot" {
+            after = next(&mut seen).await;
+        }
+        assert_eq!(silent.opens.lock().unwrap().len(), 2);
+        follower.abort();
+        client.close().await;
+        server.close().await;
+    }
+
+    /// A connector whose links run through a relay that can stop
+    /// delivering without closing anything.
+    struct Silent {
+        server: Host,
+        opens: Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>,
+    }
+
+    impl Silent {
+        fn new(server: &Host) -> Arc<Self> {
+            Arc::new(Silent {
+                server: server.clone(),
+                opens: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn mute_first(&self) {
+            self.opens.lock().unwrap()[0].store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Connector for Silent {
+        fn open(&self, _interactive: bool, _report: Report) -> BoxFuture<Result<Link>> {
+            let (ours, relay_client) = Link::memory_pair();
+            let (relay_server, theirs) = Link::memory_pair();
+            self.server.accept(
+                theirs,
+                LinkOptions::new(json!({"kind": "owner", "via": "device"})),
+            );
+            let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.opens.lock().unwrap().push(muted.clone());
+            for (from, to) in [
+                (relay_client.clone(), relay_server.clone()),
+                (relay_server, relay_client),
+            ] {
+                let muted = muted.clone();
+                let mut inbound = from.take_inbound().expect("relay inbound");
+                tokio::spawn(async move {
+                    while let Some(message) = inbound.recv().await {
+                        if !muted.load(std::sync::atomic::Ordering::SeqCst) {
+                            to.send(message);
+                        }
+                    }
+                });
+            }
+            Box::pin(async move { Ok(ours) })
+        }
     }
 
     #[tokio::test]

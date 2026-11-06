@@ -30,6 +30,7 @@ pub use noel_env::{kill_running_tool_groups, spawn_tool_process, ToolProcessGrou
 use output::{OutputAccumulator, OutputSnapshot};
 use paths::resolve_tool_path;
 use truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+pub use truncate::{slice_head_utf16, slice_tail_utf16};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -743,8 +744,9 @@ async fn edit_tool(
 /// Applies every edit to `content`, or none (upstream
 /// `applyEditsToNormalizedContent`, without fuzzy matching). Each `find` must
 /// occur exactly once in the original content and the matched regions must
-/// not overlap. Edits use the file's line endings (CRLF when its first line
-/// ends in CRLF); the rest of the file, including a BOM, is kept byte for
+/// not overlap. `oldText` is matched in the file's first-line ending; the
+/// new text takes the ending of the line where its range starts (upstream
+/// d448c51e2), and the rest of the file, including a BOM, is kept byte for
 /// byte.
 fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<String, ToolError> {
     if edits.is_empty() {
@@ -790,7 +792,12 @@ fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<Str
                 format!("Found {count} occurrences of edits[{index}] in {path}. Each oldText must be unique. Please provide more context to make it unique.")
             }));
         }
-        matches.push((start, find.len(), in_file_endings(&edit.replace), index));
+        let replace = edit.replace.replace("\r\n", "\n");
+        let replace = match line_ending_at(content, start) {
+            "\n" => replace,
+            ending => replace.replace('\n', ending),
+        };
+        matches.push((start, find.len(), replace, index));
     }
     matches.sort_by_key(|(start, ..)| *start);
     for pair in matches.windows(2) {
@@ -810,6 +817,29 @@ fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<Str
     }
     next.push_str(&content[cursor..]);
     Ok(next)
+}
+
+/// The line ending new text at `at` takes (upstream d448c51e2): that of the
+/// line `at` is on, or of the line before when it is the unterminated last
+/// line. A lone CR only in a file without any LF (classic Mac); elsewhere a
+/// lone CR is a character inside a line.
+fn line_ending_at(content: &str, at: usize) -> &'static str {
+    let crlf_before = |newline: usize| newline > 0 && content.as_bytes()[newline - 1] == b'\r';
+    if let Some(offset) = content[at..].find('\n') {
+        return if crlf_before(at + offset) {
+            "\r\n"
+        } else {
+            "\n"
+        };
+    }
+    if let Some(newline) = content[..at].rfind('\n') {
+        return if crlf_before(newline) { "\r\n" } else { "\n" };
+    }
+    if content.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    }
 }
 
 async fn write_tool(
@@ -1521,6 +1551,55 @@ mod tests {
         cwd
     }
 
+    /// ripgrep's context, as upstream now formats it (8da141c2): runs
+    /// merge so a shared line shows once, the last allowed match keeps its
+    /// trailing context, the limit notice needs one more match, and only
+    /// the line terminator is stripped.
+    #[tokio::test]
+    async fn grep_context_merges_and_the_limit_notice_needs_one_more_match() {
+        let cwd = temp_dir("grep-context");
+        fs::write(
+            cwd.join("a.txt"),
+            "one\nhit 1\ntwo\nhit 2\nthree\nfour\nfive\nhit 3\nsix\r\nCR\rinside hit 4\n",
+        )
+        .unwrap();
+        let request = |context, limit| ToolRequest::Grep {
+            path: None,
+            pattern: "hit".to_string(),
+            glob: None,
+            literal: None,
+            ignore_case: None,
+            context: Some(context),
+            limit: Some(limit),
+        };
+        // Context 1 around hits 1 and 2 shares "two": once.
+        let merged = run(&cwd, request(1, 2)).await.expect("grep").output;
+        assert!(
+            merged.starts_with(
+                "a.txt-1- one\na.txt:2: hit 1\na.txt-3- two\na.txt:4: hit 2\na.txt-5- three\n"
+            ),
+            "{merged}"
+        );
+        assert!(
+            merged.contains("[2 matches limit reached. Use limit=4"),
+            "{merged}"
+        );
+        // Exactly as many matches as the limit: no notice; a lone CR stays.
+        let all = run(&cwd, request(0, 4)).await.expect("grep").output;
+        assert_eq!(
+            all,
+            "a.txt:2: hit 1\na.txt:4: hit 2\na.txt:8: hit 3\na.txt:10: CR\rinside hit 4"
+        );
+        // A match inside the last allowed match's trailing context is shown
+        // as context.
+        let trailing = run(&cwd, request(2, 1)).await.expect("grep").output;
+        assert!(
+            trailing.starts_with("a.txt-1- one\na.txt:2: hit 1\na.txt-3- two\na.txt-4- hit 2\n"),
+            "{trailing}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
     #[tokio::test]
     async fn grep_searches_what_ripgrep_would() {
         let cwd = search_tree("grep");
@@ -1570,6 +1649,24 @@ mod tests {
             "No files found matching pattern"
         );
         assert_eq!(run(&cwd, find("src")).await.expect("find").output, "src/");
+        // The limit notice only when there are more than `limit` (upstream
+        // 676af1d7): four matches with limit 4 have none, limit 3 has one.
+        let limited = |limit| ToolRequest::Find {
+            pattern: "*.txt".to_string(),
+            path: None,
+            limit: Some(limit),
+        };
+        assert_eq!(
+            run(&cwd, limited(4)).await.expect("find").output,
+            "bom.txt\nlink.txt\nonly-rg-skips.txt\nsrc/real.txt"
+        );
+        let three = run(&cwd, limited(3)).await.expect("find").output;
+        assert!(
+            three.starts_with("bom.txt\nlink.txt\nonly-rg-skips.txt\n")
+                && three
+                    .contains("[3 results limit reached. Use limit=6 for more, or refine pattern]"),
+            "{three}"
+        );
         assert_eq!(
             run(&cwd, find(".github/*.yml")).await.expect("find").output,
             ".github/ci.yml"
@@ -1825,6 +1922,31 @@ mod tests {
             "x = 1;\nx = 1;\nabcdef\n"
         );
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// Upstream d448c51e2: lines the edit does not touch keep their endings,
+    /// and the new text takes the ending of the line its range starts on.
+    #[test]
+    fn edits_take_the_line_ending_where_they_start() {
+        let edit = |content: &str, find: &str, replace: &str| {
+            let edits = [TextEdit {
+                find: find.to_owned(),
+                replace: replace.to_owned(),
+            }];
+            apply_text_edits(content, &edits, "f").expect("edit")
+        };
+        assert_eq!(
+            edit("a\nb\r\nX = 1\r\n", "X = 1", "X = 2"),
+            "a\nb\r\nX = 2\r\n"
+        );
+        assert_eq!(edit("a\r\nb\nc", "c", "C"), "a\r\nb\nC");
+        assert_eq!(edit("a\rb\nX = 1\n", "X = 1", "X = 2"), "a\rb\nX = 2\n");
+        assert_eq!(edit("a\r\nb\nc\n", "b", "B\nB2"), "a\r\nB\nB2\nc\n");
+        assert_eq!(edit("a\nb\r\nc", "b", "x\ny"), "a\nx\r\ny\r\nc");
+        // The unterminated last line takes the ending of the line before.
+        assert_eq!(edit("a\r\nb", "b", "b\nc"), "a\r\nb\r\nc");
+        // A file of lone CRs (classic Mac) keeps them.
+        assert_eq!(edit("a\rb", "b", "b\nc"), "a\rb\rc");
     }
 
     #[tokio::test]

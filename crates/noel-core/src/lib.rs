@@ -379,6 +379,10 @@ pub struct SessionState {
     pub active_thinking_level: Option<String>,
     #[serde(default)]
     pub active_account: Option<String>,
+    /// This conversation's compaction settings over the settings file's
+    /// (Durable's `AgentState.compaction`); forks inherit them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<noel_config::CompactionSettings>,
     pub active_tool_names: BTreeSet<String>,
     #[serde(default)]
     pub disabled_tools: BTreeSet<String>,
@@ -582,6 +586,7 @@ impl SessionState {
             active_model: None,
             active_thinking_level: None,
             active_account: None,
+            compaction: None,
             active_tool_names: default_active_tool_names(),
             disabled_tools: BTreeSet::new(),
             todos: Vec::new(),
@@ -742,6 +747,8 @@ fn session_state_from_export(export: SessionExport, session_id: String) -> Sessi
         active_model: export.active_model,
         active_thinking_level: export.active_thinking_level,
         active_account: export.active_account,
+        // An export does not carry them.
+        compaction: None,
         active_tool_names,
         disabled_tools: export.disabled_tools,
         todos: export.todos,
@@ -1033,6 +1040,7 @@ impl ReloadableSystems {
                     reserve_tokens: settings.reserve_tokens.unwrap_or(16_384),
                     keep_recent_tokens: settings.keep_recent_tokens.unwrap_or(20_000),
                     trigger_percent: settings.trigger_percent.unwrap_or(80).clamp(1, 99),
+                    model_overrides: settings.model_overrides.clone().unwrap_or_default(),
                 }
             },
             progress: {
@@ -1243,6 +1251,11 @@ enum SessionRecord {
     },
     ActiveThinkingLevel {
         level: Option<String>,
+    },
+    /// The conversation's compaction settings, replaced whole; `null`
+    /// clears them.
+    CompactionSettings {
+        settings: Option<noel_config::CompactionSettings>,
     },
     DisabledTools {
         tools: Vec<String>,
@@ -1779,6 +1792,13 @@ impl SessionStore {
         self.append(&SessionRecord::ActiveAccount { account })
     }
 
+    pub fn record_compaction_settings(
+        &self,
+        settings: Option<noel_config::CompactionSettings>,
+    ) -> Result<(), SessionError> {
+        self.append(&SessionRecord::CompactionSettings { settings })
+    }
+
     pub fn record_active_thinking_level(&self, level: Option<String>) -> Result<(), SessionError> {
         self.append(&SessionRecord::ActiveThinkingLevel { level })
     }
@@ -2038,6 +2058,9 @@ impl SessionStore {
             },
             SessionRecord::ActiveThinkingLevel {
                 level: state.active_thinking_level.clone(),
+            },
+            SessionRecord::CompactionSettings {
+                settings: state.compaction.clone(),
             },
             SessionRecord::DisabledTools {
                 tools: state.disabled_tools.iter().cloned().collect(),
@@ -2357,6 +2380,7 @@ fn apply_session_record(state: &mut Option<SessionState>, record: SessionRecord)
         SessionRecord::ActiveModel { model } => state.active_model = model,
         SessionRecord::ActiveAccount { account } => state.active_account = account,
         SessionRecord::ActiveThinkingLevel { level } => state.active_thinking_level = level,
+        SessionRecord::CompactionSettings { settings } => state.compaction = settings,
         SessionRecord::DisabledTools { tools } => {
             state.disabled_tools = tools.into_iter().collect();
             state.active_tool_names = active_tools_with(&state.disabled_tools);
@@ -3442,6 +3466,19 @@ impl Runtime {
             store.record_active_account(account.clone())?;
         }
         self.session.active_account = account;
+        Ok(())
+    }
+
+    /// Replaces this conversation's compaction settings (`None` clears
+    /// them); Durable's `configure({compaction})`.
+    pub fn set_compaction_settings(
+        &mut self,
+        settings: Option<noel_config::CompactionSettings>,
+    ) -> Result<(), SessionError> {
+        if let Some(store) = &self.store {
+            store.record_compaction_settings(settings.clone())?;
+        }
+        self.session.compaction = settings;
         Ok(())
     }
 
@@ -4642,7 +4679,7 @@ impl Recovery {
     /// compaction is on, there is something to summarize, and the reply
     /// before this one did not overflow too. Asking takes the one attempt.
     fn can_compact(&mut self, runtime: &Runtime) -> bool {
-        let can = !self.overflowed && runtime.systems.compaction.enabled && runtime.can_compact();
+        let can = !self.overflowed && runtime.compaction_policy().enabled && runtime.can_compact();
         self.overflowed |= can;
         can
     }
@@ -7805,6 +7842,53 @@ mod tests {
         assert_eq!(listed[0].path, good);
         assert_eq!(SessionStore::resolve(&base, "1").unwrap(), Some(good));
         fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Durable's `configure({compaction})` (upstream 922c3ff2): the
+    /// conversation's settings are journaled, survive a reopen and a fork,
+    /// and resolve over the settings file's per model.
+    #[test]
+    fn a_conversations_compaction_settings_persist_and_resolve_per_model() {
+        let base = durable_test_dir("compaction-settings");
+        let (store, state) = SessionStore::create(&base, PathBuf::from("/repo")).unwrap();
+        let path = store.path().to_path_buf();
+        let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
+        runtime
+            .set_active_model(Some(ModelRef {
+                provider: "local".into(),
+                id: "small-32k".into(),
+            }))
+            .unwrap();
+        runtime.systems.compaction.model_overrides.insert(
+            "local/small-32k".into(),
+            noel_config::CompactionPolicyFields {
+                keep_recent_tokens: Some(8_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(runtime.compaction_policy().keep_recent_tokens, 8_000);
+        let settings: noel_config::CompactionSettings =
+            serde_json::from_value(serde_json::json!({"enabled": false, "reserveTokens": 4096}))
+                .unwrap();
+        runtime
+            .set_compaction_settings(Some(settings.clone()))
+            .unwrap();
+        let policy = runtime.compaction_policy();
+        assert!(!policy.enabled);
+        assert_eq!(policy.reserve_tokens, 4096);
+        // The settings' model override still beats the conversation's
+        // general field it does not set.
+        assert_eq!(policy.keep_recent_tokens, 8_000);
+        drop(runtime);
+        let (store, reopened) = SessionStore::open(path.clone()).unwrap();
+        assert_eq!(reopened.compaction, Some(settings.clone()));
+        let (_fork, forked) = SessionStore::fork(&base, &reopened, false).unwrap();
+        assert_eq!(forked.compaction, Some(settings));
+        let mut runtime = Runtime::with_store(reopened, ReloadableSystems::default(), store);
+        runtime.set_compaction_settings(None).unwrap();
+        drop(runtime);
+        assert_eq!(SessionStore::read(&path).unwrap().compaction, None);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

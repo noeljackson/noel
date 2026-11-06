@@ -578,7 +578,7 @@
       },
       "examples": [
         "baseten/openai/gpt-oss-120b",
-        "openrouter/upstage/solar-mini4"
+        "openrouter/particle-ai/particle-1"
       ],
       "supported": [
         "off",
@@ -1069,36 +1069,6 @@
       "reasoning": true,
       "thinkingLevelMap": {
         "off": null,
-        "minimal": "minimal",
-        "low": null,
-        "medium": null,
-        "high": "high",
-        "xhigh": null,
-        "max": null
-      },
-      "examples": [
-        "google/gemini-3.1-flash-lite-image",
-        "google-vertex/gemini-3.1-flash-lite-image"
-      ],
-      "supported": [
-        "minimal",
-        "high"
-      ],
-      "clamp": {
-        "off": "minimal",
-        "minimal": "minimal",
-        "low": "high",
-        "medium": "high",
-        "high": "high",
-        "xhigh": "high",
-        "max": "high",
-        "invalid": "minimal"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
         "minimal": "MINIMAL",
         "low": null,
         "medium": null,
@@ -1412,6 +1382,36 @@
     {
       "reasoning": true,
       "thinkingLevelMap": {
+        "xhigh": "xhigh",
+        "max": "max",
+        "off": null
+      },
+      "examples": [
+        "opencode/claude-opus-5-5",
+        "opencode/claude-sonnet-5-5"
+      ],
+      "supported": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "clamp": {
+        "off": "minimal",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
+        "invalid": "minimal"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
         "off": "none",
         "minimal": "minimal",
         "low": "low",
@@ -1632,8 +1632,7 @@
         "max": null
       },
       "examples": [
-        "openrouter/nvidia/nemotron-3-super-120b-a12b",
-        "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+        "openrouter/nvidia/nemotron-3-super-120b-a12b"
       ],
       "supported": [
         "off",
@@ -1796,39 +1795,6 @@
         "xhigh": "max",
         "max": "max",
         "invalid": "off"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": null,
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "xhigh"
-      },
-      "examples": [
-        "radius/glm-5.3"
-      ],
-      "supported": [
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ],
-      "clamp": {
-        "off": "minimal",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "xhigh",
-        "max": "max",
-        "invalid": "minimal"
       }
     },
     {
