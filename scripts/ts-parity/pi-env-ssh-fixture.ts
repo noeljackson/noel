@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import type { Connection } from "/chord-reference/packages/env/src/connection.ts";
+import type { Connection } from "/ts-reference/packages/env/src/connection.ts";
 import {
 	acceptHostKey,
 	connectSsh,
@@ -11,7 +11,7 @@ import {
 	type SshTarget,
 	sshArguments,
 	sshConnection,
-} from "/chord-reference/packages/env/src/ssh.ts";
+} from "/ts-reference/packages/env/src/ssh.ts";
 
 /**
  * Goldens for noel-env's SSH deployment (crates/noel-env/src/ssh.rs): upstream pi-env's `ssh.ts` drives a stand-in
@@ -24,7 +24,7 @@ import {
  * `node --conditions=source /ts-parity/pi-env-ssh-fixture.ts <fixtures-dir>`.
  */
 
-const REFERENCE = "/chord-reference";
+const REFERENCE = "/ts-reference";
 const DAEMON = "/usr/local/bin/pi-env";
 const FAKE = join(import.meta.dirname, "fake-ssh.sh");
 
@@ -151,7 +151,8 @@ async function main(): Promise<void> {
 			{
 				source: {
 					repository: "https://github.com/earendil-works/pi",
-					ref: git("rev-parse", "HEAD"),
+					ref: "main",
+					commit: git("rev-parse", "HEAD"),
 					package: "packages/env",
 					envCommit: git("log", "-1", "--format=%H", "HEAD", "--", "packages/env"),
 					// Where the image puts it (`make ts-parity-pi-env-ssh`).

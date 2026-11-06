@@ -43,8 +43,8 @@ make chord2-interop  CHORD2_REFERENCE_DIR=<pi checkout at the pin>
   framed streams: state and calls, refused holds, the window against a
   consumer that does not acknowledge, drops and re-holds, relays to
   workers, revocation.
-- `tests/chord_delta_parity.rs` matches `chord-delta.json`
-  (`CHORD_REFERENCE_REF`).
+- `tests/chord_delta_parity.rs` matches `chord-delta.json` (Chord's delta
+  codec, applier, diff and canonical JSON at upstream `main`).
 - `make chord2-interop` (`scripts/chord2-interop.sh`) runs both directions
   against upstream with Bun over Unix sockets; `examples/chord2-client.rs`
   is noel's side.

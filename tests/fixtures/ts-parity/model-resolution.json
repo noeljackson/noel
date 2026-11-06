@@ -87,6 +87,11 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
             "xhigh": "xhigh",
             "max": "max"
           },
@@ -95,10 +100,10 @@
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 25,
-            "cacheRead": 0.5,
-            "cacheWrite": 6.25
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.2,
+            "cacheWrite": 5
           },
           "contextWindow": 1000000,
           "maxTokens": 128000
@@ -175,7 +180,7 @@
         "model": null,
         "thinkingLevel": null,
         "warning": null,
-        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5, radius/gpt-5.5. No matching provider is authenticated. Use --provider or provider/model."
+        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5. No matching provider is authenticated. Use --provider or provider/model."
       }
     },
     {
@@ -207,7 +212,7 @@
         "model": null,
         "thinkingLevel": null,
         "warning": null,
-        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5, radius/gpt-5.5. More than one matching provider is authenticated. Use --provider or provider/model."
+        "error": "Model \"gpt-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5. More than one matching provider is authenticated. Use --provider or provider/model."
       }
     },
     {
@@ -221,7 +226,7 @@
         "model": null,
         "thinkingLevel": null,
         "warning": null,
-        "error": "Model \"GPT-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5, radius/gpt-5.5. No matching provider is authenticated. Use --provider or provider/model."
+        "error": "Model \"GPT-5.5\" is ambiguous across providers: azure/gpt-5.5, cloudflare-ai-gateway/gpt-5.5, openai/gpt-5.5, opencode/gpt-5.5. No matching provider is authenticated. Use --provider or provider/model."
       }
     },
     {
@@ -392,7 +397,7 @@
       "expected": {
         "model": {
           "provider": "openai",
-          "id": "gpt-realtime-2.1"
+          "id": "gpt-daybreak-red-latest"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -424,7 +429,7 @@
       "expected": {
         "model": {
           "provider": "google",
-          "id": "gemini-pro-latest"
+          "id": "gemini-robotics-er-2-preview"
         },
         "thinkingLevel": null,
         "warning": null,
@@ -716,30 +721,30 @@
           "baseUrl": "https://api.openai.com/v1",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": "none",
+            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": null
+            "max": "max"
           },
           "input": [
             "text",
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 30,
-            "cacheRead": 0.5,
-            "cacheWrite": 0,
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.1,
+            "cacheWrite": 2.5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 10,
-                "output": 45,
-                "cacheRead": 1,
-                "cacheWrite": 0
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               }
             ]
           },
@@ -814,6 +819,11 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
             "xhigh": "xhigh",
             "max": "max"
           },
@@ -822,10 +832,10 @@
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 25,
-            "cacheRead": 0.5,
-            "cacheWrite": 6.25
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.2,
+            "cacheWrite": 5
           },
           "contextWindow": 1000000,
           "maxTokens": 128000
@@ -853,6 +863,11 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
             "xhigh": "xhigh",
             "max": "max"
           },
@@ -861,10 +876,10 @@
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 25,
-            "cacheRead": 0.5,
-            "cacheWrite": 6.25
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.2,
+            "cacheWrite": 5
           },
           "contextWindow": 1000000,
           "maxTokens": 128000
@@ -892,6 +907,11 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
             "xhigh": "xhigh",
             "max": "max"
           },
@@ -900,10 +920,10 @@
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 25,
-            "cacheRead": 0.5,
-            "cacheWrite": 6.25
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.2,
+            "cacheWrite": 5
           },
           "contextWindow": 1000000,
           "maxTokens": 128000
@@ -931,6 +951,11 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
             "xhigh": "xhigh",
             "max": "max"
           },
@@ -939,10 +964,10 @@
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 25,
-            "cacheRead": 0.5,
-            "cacheWrite": 6.25
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.2,
+            "cacheWrite": 5
           },
           "contextWindow": 1000000,
           "maxTokens": 128000
@@ -971,6 +996,11 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
             "xhigh": "xhigh",
             "max": "max"
           },
@@ -979,10 +1009,10 @@
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 25,
-            "cacheRead": 0.5,
-            "cacheWrite": 6.25
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.2,
+            "cacheWrite": 5
           },
           "contextWindow": 1000000,
           "maxTokens": 128000
@@ -1011,6 +1041,11 @@
           "baseUrl": "https://api.anthropic.com",
           "reasoning": true,
           "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
             "xhigh": "xhigh",
             "max": "max"
           },
@@ -1019,10 +1054,10 @@
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 25,
-            "cacheRead": 0.5,
-            "cacheWrite": 6.25
+            "input": 4,
+            "output": 20,
+            "cacheRead": 0.2,
+            "cacheWrite": 5
           },
           "contextWindow": 1000000,
           "maxTokens": 128000
@@ -1050,30 +1085,30 @@
           "baseUrl": "https://api.openai.com/v1",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": "none",
+            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": null
+            "max": "max"
           },
           "input": [
             "text",
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 30,
-            "cacheRead": 0.5,
-            "cacheWrite": 0,
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.1,
+            "cacheWrite": 2.5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 10,
-                "output": 45,
-                "cacheRead": 1,
-                "cacheWrite": 0
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               }
             ]
           },
@@ -1104,30 +1139,30 @@
           "baseUrl": "https://api.openai.com/v1",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": "none",
+            "off": null,
             "minimal": null,
             "low": "low",
             "medium": "medium",
             "high": "high",
             "xhigh": "xhigh",
-            "max": null
+            "max": "max"
           },
           "input": [
             "text",
             "image"
           ],
           "cost": {
-            "input": 5,
-            "output": 30,
-            "cacheRead": 0.5,
-            "cacheWrite": 0,
+            "input": 2,
+            "output": 10,
+            "cacheRead": 0.1,
+            "cacheWrite": 2.5,
             "tiers": [
               {
                 "inputTokensAbove": 272000,
-                "input": 10,
-                "output": 45,
-                "cacheRead": 1,
-                "cacheWrite": 0
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               }
             ]
           },
@@ -1916,6 +1951,11 @@
           },
           {
             "provider": "openrouter",
+            "id": "openrouter/auto-code",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
             "id": "openrouter/free",
             "thinkingLevel": null
           },
@@ -2278,6 +2318,11 @@
           {
             "provider": "openai",
             "id": "gpt-5.5-pro",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openai",
+            "id": "gpt-5.6-cyber",
             "thinkingLevel": null
           },
           {
@@ -2743,7 +2788,7 @@
       },
       "expected": {
         "provider": "anthropic",
-        "id": "claude-opus-4-8"
+        "id": "claude-opus-5-5"
       }
     },
     {
@@ -2755,7 +2800,7 @@
       },
       "expected": {
         "provider": "anthropic",
-        "id": "claude-opus-4-8"
+        "id": "claude-opus-5-5"
       }
     },
     {
@@ -2767,7 +2812,7 @@
       },
       "expected": {
         "provider": "openrouter",
-        "id": "moonshotai/kimi-k2.6"
+        "id": "moonshotai/kimi-k2.7-code"
       }
     },
     {
@@ -2802,7 +2847,7 @@
       },
       "expected": {
         "provider": "anthropic",
-        "id": "claude-opus-4-8"
+        "id": "claude-opus-5-5"
       }
     },
     {
@@ -2815,7 +2860,7 @@
       },
       "expected": {
         "provider": "anthropic",
-        "id": "claude-opus-4-8"
+        "id": "claude-opus-5-5"
       }
     },
     {
@@ -2827,7 +2872,7 @@
       },
       "expected": {
         "provider": "openai",
-        "id": "gpt-5.5"
+        "id": "gpt-6.1-sol"
       }
     }
   ],
@@ -2882,7 +2927,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -2905,7 +2950,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -2957,7 +3002,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -2985,7 +3030,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -3013,7 +3058,7 @@
         ],
         "initialModel": {
           "provider": "openai",
-          "id": "gpt-5.5"
+          "id": "gpt-6.1-sol"
         }
       }
     },
@@ -3041,7 +3086,7 @@
         ],
         "initialModel": {
           "provider": "anthropic",
-          "id": "claude-opus-4-8"
+          "id": "claude-opus-5-5"
         }
       }
     },
@@ -3067,7 +3112,7 @@
         ],
         "initialModel": {
           "provider": "anthropic",
-          "id": "claude-opus-4-8"
+          "id": "claude-opus-5-5"
         }
       }
     },
@@ -3090,7 +3135,7 @@
         ],
         "initialModel": {
           "provider": "anthropic",
-          "id": "claude-opus-4-8"
+          "id": "claude-opus-5-5"
         }
       }
     },
@@ -3125,7 +3170,7 @@
         ],
         "initialModel": {
           "provider": "anthropic",
-          "id": "claude-opus-4-8"
+          "id": "claude-opus-5-5"
         }
       }
     },
@@ -3181,7 +3226,7 @@
         ],
         "initialModel": {
           "provider": "cloudflare-workers-ai",
-          "id": "@cf/moonshotai/kimi-k2.6"
+          "id": "@cf/moonshotai/kimi-k2.7-code"
         }
       }
     },
@@ -3206,7 +3251,7 @@
         ],
         "initialModel": {
           "provider": "cloudflare-workers-ai",
-          "id": "@cf/moonshotai/kimi-k2.6"
+          "id": "@cf/moonshotai/kimi-k2.7-code"
         }
       }
     },
@@ -4240,6 +4285,11 @@
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -4248,10 +4298,10 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -4294,30 +4344,30 @@
               "baseUrl": "https://api.openai.com/v1",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": "none",
+                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": null
+                "max": "max"
               },
               "input": [
                 "text",
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 30,
-                "cacheRead": 0.5,
-                "cacheWrite": 0,
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
                 "tiers": [
                   {
                     "inputTokensAbove": 272000,
-                    "input": 10,
-                    "output": 45,
-                    "cacheRead": 1,
-                    "cacheWrite": 0
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
                   }
                 ]
               },
@@ -4493,13 +4543,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "claude-opus-4-8",
-              "name": "Claude Opus 4.8",
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
               "api": "anthropic-messages",
               "provider": "anthropic",
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -4508,10 +4563,10 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -4541,13 +4596,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "claude-opus-4-8",
-              "name": "Claude Opus 4.8",
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
               "api": "anthropic-messages",
               "provider": "anthropic",
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -4556,10 +4616,10 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -4656,13 +4716,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "claude-opus-4-8",
-              "name": "Claude Opus 4.8",
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
               "api": "anthropic-messages",
               "provider": "anthropic",
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -4671,10 +4736,10 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -4705,13 +4770,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "claude-opus-4-8",
-              "name": "Claude Opus 4.8",
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
               "api": "anthropic-messages",
               "provider": "anthropic",
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -4720,10 +4790,10 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -4757,13 +4827,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "claude-opus-4-8",
-              "name": "Claude Opus 4.8",
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
               "api": "anthropic-messages",
               "provider": "anthropic",
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -4772,15 +4847,15 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
             },
-            "thinkingLevel": "xhigh"
+            "thinkingLevel": "high"
           }
         }
       ]
@@ -4812,13 +4887,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "claude-opus-4-8",
-              "name": "Claude Opus 4.8",
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
               "api": "anthropic-messages",
               "provider": "anthropic",
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -4827,10 +4907,10 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -5067,13 +5147,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "claude-opus-4-8",
-              "name": "Claude Opus 4.8",
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
               "api": "anthropic-messages",
               "provider": "anthropic",
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -5082,10 +5167,10 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -6056,37 +6141,37 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-5.5",
-              "name": "GPT-5.5",
+              "id": "gpt-6.1-sol",
+              "name": "GPT-6.1 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": "none",
+                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": null
+                "max": "max"
               },
               "input": [
                 "text",
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 30,
-                "cacheRead": 0.5,
-                "cacheWrite": 0,
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
                 "tiers": [
                   {
                     "inputTokensAbove": 272000,
-                    "input": 10,
-                    "output": 45,
-                    "cacheRead": 1,
-                    "cacheWrite": 0
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
                   }
                 ]
               },
@@ -6117,37 +6202,37 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-5.5",
-              "name": "GPT-5.5",
+              "id": "gpt-6.1-sol",
+              "name": "GPT-6.1 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": "none",
+                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": null
+                "max": "max"
               },
               "input": [
                 "text",
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 30,
-                "cacheRead": 0.5,
-                "cacheWrite": 0,
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
                 "tiers": [
                   {
                     "inputTokensAbove": 272000,
-                    "input": 10,
-                    "output": 45,
-                    "cacheRead": 1,
-                    "cacheWrite": 0
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
                   }
                 ]
               },
@@ -6177,37 +6262,37 @@
           "response": {
             "success": true,
             "model": {
-              "id": "gpt-5.5",
-              "name": "GPT-5.5",
+              "id": "gpt-6.1-sol",
+              "name": "GPT-6.1 Sol",
               "api": "openai-responses",
               "provider": "openai",
               "baseUrl": "https://api.openai.com/v1",
               "reasoning": true,
               "thinkingLevelMap": {
-                "off": "none",
+                "off": null,
                 "minimal": null,
                 "low": "low",
                 "medium": "medium",
                 "high": "high",
                 "xhigh": "xhigh",
-                "max": null
+                "max": "max"
               },
               "input": [
                 "text",
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 30,
-                "cacheRead": 0.5,
-                "cacheWrite": 0,
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
                 "tiers": [
                   {
                     "inputTokensAbove": 272000,
-                    "input": 10,
-                    "output": 45,
-                    "cacheRead": 1,
-                    "cacheWrite": 0
+                    "input": 4,
+                    "output": 15,
+                    "cacheRead": 0.2,
+                    "cacheWrite": 5
                   }
                 ]
               },
@@ -6243,13 +6328,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "claude-opus-4-8",
-              "name": "Claude Opus 4.8",
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
               "api": "anthropic-messages",
               "provider": "anthropic",
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -6258,10 +6348,10 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000
@@ -6289,13 +6379,18 @@
           "response": {
             "success": true,
             "model": {
-              "id": "claude-opus-4-8",
-              "name": "Claude Opus 4.8",
+              "id": "claude-opus-5-5",
+              "name": "Claude Opus 5.5",
               "api": "anthropic-messages",
               "provider": "anthropic",
               "baseUrl": "https://api.anthropic.com",
               "reasoning": true,
               "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
                 "xhigh": "xhigh",
                 "max": "max"
               },
@@ -6304,10 +6399,10 @@
                 "image"
               ],
               "cost": {
-                "input": 5,
-                "output": 25,
-                "cacheRead": 0.5,
-                "cacheWrite": 6.25
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
               },
               "contextWindow": 1000000,
               "maxTokens": 128000

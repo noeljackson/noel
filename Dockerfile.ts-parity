@@ -42,29 +42,12 @@ RUN set -eu; \
     install -m 0755 "${rg}/rg" "${fd}/fd" /usr/local/bin/; \
     rm -rf "${rg}" "${fd}" "${rg}.tar.gz" "${fd}.tar.gz"
 
-# Chord's goldens (chord-delta.json, chord-link.json) come from their own
-# pinned commit, not from TS_REFERENCE_REF: link protocol 2 is unreleased and
-# changes often. The pin is checked out at /chord-reference with Chord's locked
-# dependencies and built once, so an image exists only for a pin at which
-# packages/chord builds. LocalEnv's goldens (local-env.json) run Durable's
-# NodeExecutionEnv and env conformance cases from the same checkout. pi-env's
-# client and tests (packages/env) run from it too, for the pi-env goldens
-# (pi-env.json) and `make env-interop`, so its workspace is installed as well.
-ARG CHORD_REFERENCE_REF=1692bba6347a287ab0f3cb554a4430fafffc474b
-RUN set -eu; \
-    cd /ts-reference; \
-    git cat-file -e "${CHORD_REFERENCE_REF}^{commit}" 2>/dev/null \
-        || git fetch --filter=blob:none origin "${CHORD_REFERENCE_REF}"; \
-    git worktree add --detach /chord-reference "${CHORD_REFERENCE_REF}"; \
-    cd /chord-reference; \
-    npm ci --ignore-scripts --no-audit --no-fund --workspace packages/chord --workspace packages/env --include-workspace-root; \
-    npm --prefix packages/chord run build
-
-# Upstream's pi-env daemon from the same pinned checkout, built as upstream
-# ships it for Linux (static musl, release), with upstream's lock file. The
-# pi-env goldens record upstream's client talking to it.
+# Upstream's pi-env daemon from the same checkout, built as upstream ships it
+# for Linux (static musl, release), with upstream's lock file. The pi-env
+# goldens record upstream's client talking to it, and `make env-interop` runs
+# upstream's packages/env tests against noel's daemon.
 FROM rust:1.99.0 AS pi-env-daemon
-COPY --from=reference /chord-reference/packages/env /pi-env
+COPY --from=reference /ts-reference/packages/env /pi-env
 RUN set -eu; \
     target="$(uname -m)-unknown-linux-musl"; \
     rustup target add --toolchain 1.99.0 "${target}"; \
@@ -74,6 +57,10 @@ RUN set -eu; \
 
 FROM reference
 COPY --from=pi-env-daemon /pi-env/pi-env /usr/local/bin/pi-env
+# Fixtures that start pi with their own HOME run `npx tsx` with an empty npm
+# cache; a pinned global tsx keeps them offline and reproducible.
+ARG TSX_VERSION=4.23.15
+RUN npm install -g --no-audit --no-fund "tsx@${TSX_VERSION}"
 COPY scripts/ts-parity /ts-parity
 
 # pi-env-fixture.ts and pi-env-ssh-fixture.ts load upstream's packages from

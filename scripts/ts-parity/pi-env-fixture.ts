@@ -3,14 +3,14 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BACKGROUND_CONTEXT, withAbortSignal } from "/chord-reference/packages/chord/src/context/index.ts";
-import { Connection } from "/chord-reference/packages/env/src/connection.ts";
-import { RemoteExecutionEnv } from "/chord-reference/packages/env/src/remote-env.ts";
-import { openTerminal } from "/chord-reference/packages/env/src/terminal.ts";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "/ts-reference/packages/chord/src/context/index.ts";
+import { Connection } from "/ts-reference/packages/env/src/connection.ts";
+import { RemoteExecutionEnv } from "/ts-reference/packages/env/src/remote-env.ts";
+import { openTerminal } from "/ts-reference/packages/env/src/terminal.ts";
 
 /**
  * Goldens for `noel-env serve` (crates/noel-env-daemon): upstream pi-env's own client (`Connection`,
- * `RemoteExecutionEnv`, `openTerminal`) drives upstream's own daemon, built from the pinned checkout
+ * `RemoteExecutionEnv`, `openTerminal`) drives upstream's own daemon, built from the same checkout
  * (/usr/local/bin/pi-env in the ts-parity image), through a tap (pi-env-tap.mjs) that records the bytes both ways.
  * The frames are written to pi-env.json; crates/noel-env-daemon/tests/pi_env_golden.rs sends the client's frames to
  * `noel-env serve` and compares what it answers.
@@ -19,7 +19,7 @@ import { openTerminal } from "/chord-reference/packages/env/src/terminal.ts";
  * `node --conditions=source /ts-parity/pi-env-fixture.ts <fixtures-dir>`.
  */
 
-const REFERENCE = "/chord-reference";
+const REFERENCE = "/ts-reference";
 const DAEMON = "/usr/local/bin/pi-env";
 const TAP = join(import.meta.dirname, "pi-env-tap.mjs");
 const context = BACKGROUND_CONTEXT;
@@ -340,7 +340,7 @@ const SCENARIOS: Scenario[] = [
 			const written = await env.writeFile("w.txt", "w", context);
 			check(written.ok, "writeFile w.txt");
 			await Promise.race([seen, sleep(5000).then(() => check(false, "a change within 5 s"))]);
-			await watcher.value.close(context);
+			await watcher.value.stop(context);
 		},
 	},
 	{
@@ -400,7 +400,8 @@ async function main(): Promise<void> {
 			{
 				source: {
 					repository: "https://github.com/earendil-works/pi",
-					ref: git("rev-parse", "HEAD"),
+					ref: "main",
+					commit: git("rev-parse", "HEAD"),
 					package: "packages/env",
 					envCommit: git("log", "-1", "--format=%H", "HEAD", "--", "packages/env"),
 					daemon: `pi-env ${version}, built from packages/env/daemon at ref (release, musl)`,

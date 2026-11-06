@@ -26,7 +26,6 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 const FIXTURE: &str = include_str!("../../../../tests/fixtures/ts-parity/local-env.json");
-const MAKEFILE: &str = include_str!("../../../../Makefile");
 
 fn cx() -> Context {
     Context::background()
@@ -906,7 +905,7 @@ async fn watch_replaced_directory(env: &dyn ExecutionEnv) -> Result<(), String> 
     })
 }
 
-async fn watch_stops_once_closed(env: &dyn ExecutionEnv) -> Result<(), String> {
+async fn watch_stops_once_stopped(env: &dyn ExecutionEnv) -> Result<(), String> {
     let changes = Arc::new(Mutex::new(Vec::new()));
     let sink = changes.clone();
     let mut watcher = ok(
@@ -974,7 +973,7 @@ async fn run_watch_case(name: &str, env: &dyn ExecutionEnv) -> Option<Result<(),
         "watch follows a directory replaced at the same path" => {
             watch_replaced_directory(env).await
         }
-        "watch stops reporting once closed" => watch_stops_once_closed(env).await,
+        "watch stops reporting once stopped" => watch_stops_once_stopped(env).await,
         "watch reports changes to the file a watched symbolic link points to" => {
             watch_symlink_target(env).await
         }
@@ -1290,17 +1289,10 @@ fn fixture() -> Value {
     serde_json::from_str(FIXTURE).expect("the fixture is JSON")
 }
 
-/// The fixture is from the commit the Makefile pins, made with the options the ports assume.
+/// The fixture is from upstream `main`, made with the options the ports assume.
 pub fn check_fixture_source() {
     let fixture = fixture();
-    let pin = MAKEFILE
-        .lines()
-        .find_map(|line| line.strip_prefix("CHORD_REFERENCE_REF ?= "))
-        .expect("the Makefile pins the reference");
-    assert_eq!(
-        fixture["source"]["ref"], pin,
-        "regenerate local-env.json after moving the pin"
-    );
+    assert_eq!(fixture["source"]["ref"], "main");
     assert_eq!(fixture["options"]["shell"], json!(shell()));
     assert_eq!(fixture["options"]["listFiles"], json!(false));
 }

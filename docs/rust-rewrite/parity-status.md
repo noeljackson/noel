@@ -32,16 +32,14 @@ The committed TypeScript parity fixtures are:
 - `bedrock-tools.json`: Bedrock Claude Converse payload shape with
   model-callable tools.
 - `chord-delta.json`: upstream Chord's delta ops, recorded from
-  `packages/chord` at its own pinned commit (`CHORD_REFERENCE_REF` in the
-  Makefile) rather than `main`. Streams of op batches through one `encoder()`
+  `packages/chord` at `main`. Streams of op batches through one `encoder()`
   and `decoder()`, with the exact wire tuples, the decoded ops and each value
   after `applyImmutable`; wire batches the decoder rejects; `applyImmutable`
   results and errors; `diffRevisions` cases, by their result only; vectors of
-  `canonicalJson` and `hash64` with non-ASCII and astral text, `-0`, large and
-  small numbers and control characters. (Its v1 sections, `hash64` over
-  UTF-16 and v1 contract descriptions with `coverage` and `fits`, are no
-  longer checked: noel speaks Chord v2, whose contracts
-  `chord-v2-contracts.json` covers.)
+  `canonicalJson` with non-ASCII and astral text, `-0`, large and small
+  numbers and control characters. (Chord v1's `hash64` and contract sections
+  went with v1: noel speaks Chord v2, whose contracts `chord-v2-contracts.json`
+  covers.)
 - `codemode-declarations.json`: every call upstream's
   `packages/codemode/test/declarations.test.ts` makes to `schemaToType`,
   `renderToolSignature`, `renderToolSample` and `renderDeclarations`, plus

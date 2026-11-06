@@ -2,27 +2,29 @@ import { execFileSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "/chord-reference/node_modules/typebox/build/index.mjs";
-import { coverage, hostNamed, local, method, opaque, remote } from "/chord-reference/packages/chord/src/contract.ts";
+import { BACKGROUND_CONTEXT } from "/ts-reference/packages/chord/src/context/index.ts";
+import { canonicalJson as chordCanonicalJson } from "/ts-reference/packages/chord/src/data/principal.ts";
 import {
 	applyImmutable,
 	decoder,
 	diffRevisions,
 	encoder,
 	type Op,
-} from "/chord-reference/packages/chord/src/delta/index.ts";
-import { canonicalJson, fits, hash64 } from "/chord-reference/packages/chord/src/schema.ts";
+} from "/ts-reference/packages/chord/src/delta/index.ts";
 
 /**
  * Goldens for noel-chord: upstream Chord's delta ops and their wire codec,
- * canonical JSON, hash64, and contract fingerprints, coverage and fits.
+ * the immutable applier, diff results and canonical JSON.
  *
- * Chord is read from /chord-reference, a checkout of its own pinned commit
- * (CHORD_REFERENCE_REF in the Makefile), not from TS_REFERENCE_REF: link
- * protocol 2 is unreleased and changes often.
+ * Chord is read from /ts-reference, upstream at TS_REFERENCE_REF, like every
+ * other fixture. (Chord v1's sections, hash64 over UTF-16 and v1 contracts,
+ * coverage and fits, went with Chord v1; chord-v2-contracts.json covers v2's
+ * contracts.)
  */
 
-const CHORD = "/chord-reference";
+const CHORD = "/ts-reference";
+
+const canonicalJson = (value: unknown): string => chordCanonicalJson(value as never, BACKGROUND_CONTEXT);
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -418,9 +420,9 @@ function diffCases() {
 	];
 }
 
-// ─── canonicalJson and hash64 ────────────────────────────────────────────────
+// ─── canonicalJson ───────────────────────────────────────────────────────────
 
-function canonicalCases(description: string) {
+function canonicalCases() {
 	const texts: [string, string][] = [
 		["null", "null"],
 		["true", "true"],
@@ -446,11 +448,11 @@ function canonicalCases(description: string) {
 		["empty containers", "[[],{},[{}]]"],
 		["nested object", '{"b":1,"a":{"d":[3,{"z":0,"y":1}],"c":null},"":true}'],
 		["keys sort by UTF-16", String.raw`{"😀":1,"｡":2,"a":3,"Z":4,"10":5,"9":6,"":7,"é":8}`],
-		["contract description", description],
+		["contract-like description", '{"name":"noel.chat","version":2,"methods":{"submit":{"args":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string"}}},"result":{"type":"null"}}},"state":{"anyOf":[{"type":"null"},{"type":"object"}]}}'],
 	];
 	return texts.map(([name, text]) => {
 		const canonical = canonicalJson(JSON.parse(text));
-		return { name, json: text, canonical, hash64: hash64(canonical) };
+		return { name, json: text, canonical };
 	});
 }
 
@@ -494,299 +496,7 @@ function numberCases() {
 	];
 	return literals.map((literal) => {
 		const canonical = canonicalJson(JSON.parse(literal));
-		return { literal, canonical, hash64: hash64(canonical) };
-	});
-}
-
-function hashCases() {
-	const texts = [
-		"",
-		"a",
-		"ab",
-		"abc",
-		"hello, world",
-		"The quick brown fox jumps over the lazy dog",
-		"é",
-		"中文",
-		"😀",
-		"𝄞 music",
-		"a😀b𝄞c",
-		"\u0000",
-		"\u001f",
-		"\u007f",
-		"퟿",
-		"",
-		"￿",
-		" ",
-		"x".repeat(1000),
-		"😀".repeat(300),
-	];
-	return texts.map((text) => ({ text, hash64: hash64(text) }));
-}
-
-// ─── Contracts ───────────────────────────────────────────────────────────────
-
-function contracts() {
-	const Input = Type.Object({});
-	const counterOwner = {
-		state: { count: Type.Number() },
-		methods: { add: method(Type.Object({ n: Type.Number() }), Type.Number()), reset: method() },
-	};
-	const counter = (methods: Record<string, unknown>, state: Record<string, unknown> = counterOwner.state) =>
-		remote("fixture.counter", {
-			host: hostNamed("fixture"),
-			version: 1,
-			input: Input,
-			variants: { owner: { state, methods } } as never,
-		});
-
-	const Busy = (...values: string[]) => Type.Union(values.map((value) => Type.Literal(value)));
-	const Submission = (whenBusy = Busy("reject", "steer", "followUp"), requestId = Type.String({ minLength: 1 })) =>
-		Type.Object({ requestId, text: Type.String(), whenBusy });
-	const Submitted = Type.Object({
-		submissionId: Type.String(),
-		runId: Type.Optional(Type.String()),
-		disposition: Busy("started", "queued", "repeated"),
-	});
-	const View = Type.Object({
-		conversation: Type.Object({ id: Type.String(), cwd: Type.String() }),
-		entries: Type.Array(Type.Unknown()),
-		docs: Type.Record(Type.String(), Type.Unknown()),
-	});
-	const chat = (options: { input?: unknown; submit?: unknown; viewerOnly?: boolean } = {}) =>
-		remote("fixture.chat", {
-			host: hostNamed("fixture"),
-			version: 1,
-			input: (options.input ?? Type.Object({ session: Type.String() })) as never,
-			variants: (options.viewerOnly
-				? { viewer: { state: { view: View } } }
-				: {
-						viewer: { state: { view: View } },
-						participant: {
-							state: { view: View },
-							methods: {
-								submit: options.submit ?? method(Submission(), Submitted),
-								abort: method(Type.Object({ expectedRunId: Type.Optional(Type.String()) }), Type.Object({})),
-							},
-						},
-					}) as never,
-		});
-	const empty = (variants: Record<string, object>) =>
-		remote("fixture.counter", { host: hostNamed("fixture"), version: 1, input: Input, variants: variants as never });
-
-	return {
-		counter: counter(counterOwner.methods),
-		"counter, more members": remote("fixture.counter", {
-			host: hostNamed("fixture"),
-			version: 1,
-			input: Input,
-			variants: {
-				owner: {
-					state: { count: Type.Number(), label: Type.String() },
-					methods: {
-						add: method(Type.Object({ n: Type.Number(), note: Type.Optional(Type.String()) }), Type.Integer()),
-						reset: method(),
-						log: method(Type.Object({})),
-					},
-				},
-				guest: { state: { count: Type.Number() } },
-			},
-		}),
-		"counter, version 2": remote("fixture.counter", { host: hostNamed("fixture"), version: 2, input: Input, variants: { owner: counterOwner } }),
-		"counter, string arguments": counter({ ...counterOwner.methods, add: method(Type.Object({ n: Type.String() }), Type.Number()) }),
-		"counter, no arguments": counter({ ...counterOwner.methods, add: method(undefined, Type.Number()) }),
-		"counter, no result": counter({ ...counterOwner.methods, add: method(Type.Object({ n: Type.Number() })) }),
-		"counter, string result": counter({ ...counterOwner.methods, add: method(Type.Object({ n: Type.Number() }), Type.String()) }),
-		"counter, string state": counter(counterOwner.methods, { count: Type.String() }),
-		"counter, count as a method": counter({ ...counterOwner.methods, count: method() }, {}),
-		"counter, input required": remote("fixture.counter", {
-			host: hostNamed("fixture"),
-			version: 1,
-			input: Type.Object({ owner: Type.String() }),
-			variants: { owner: counterOwner },
-		}),
-		"counter as local": local("fixture.counter", { version: 1, input: Input, members: { count: Type.Number() } }),
-		other: remote("fixture.other", { host: hostNamed("fixture"), version: 1, input: Input, variants: { owner: counterOwner } }),
-		"variants beta and alpha": empty({ beta: {}, alpha: {} }),
-		"variants x, 10 and 9": empty({ x: {}, "10": {}, "9": {} }),
-		"variant constructor, empty": empty({ constructor: {} }),
-		"variant constructor, with a member": empty({ constructor: { state: { count: Type.Number() } } }),
-		"variant admin, empty": empty({ admin: {} }),
-		native: local("fixture.native", {
-			version: 1,
-			input: Input,
-			members: { handle: opaque("fixture.handle@1"), size: Type.Number(), ping: method() },
-		}),
-		"native, other handle": local("fixture.native", {
-			version: 1,
-			input: Input,
-			members: { handle: opaque("fixture.handle@2"), size: Type.Number(), ping: method() },
-		}),
-		chat: chat(),
-		"chat, viewer only": chat({ viewerOnly: true }),
-		"chat, wider input": chat({ input: Type.Object({ session: Type.String(), mode: Type.Optional(Type.String()) }) }),
-		"chat, narrower input": chat({ input: Type.Object({ session: Type.String(), token: Type.String() }) }),
-		"chat, wider whenBusy": chat({ submit: method(Submission(Busy("reject", "steer", "followUp", "later")), Submitted) }),
-		"chat, narrower whenBusy": chat({ submit: method(Submission(Busy("reject", "steer")), Submitted) }),
-		"chat, looser requestId": chat({ submit: method(Submission(undefined, Type.String()), Submitted) }),
-		"chat, capped requestId": chat({
-			submit: method(Submission(undefined, Type.String({ minLength: 1, maxLength: 64 })), Submitted),
-		}),
-		"chat, result with more": chat({
-			submit: method(Submission(), Type.Object({ ...Submitted.properties, position: Type.Integer() })),
-		}),
-		"chat, result without disposition": chat({
-			submit: method(
-				Submission(),
-				Type.Object({ submissionId: Type.String(), runId: Type.Optional(Type.String()) }),
-			),
-		}),
-	};
-}
-
-function contractCases(all: ReturnType<typeof contracts>) {
-	return Object.entries(all).map(([label, contract]) => {
-		const description = json(contract.description);
-		check(hash64(canonicalJson(description)) === contract.fingerprint, `${label}: the fingerprint survives JSON`);
-		return { label, description, fingerprint: contract.fingerprint };
-	});
-}
-
-function coverageCases(all: ReturnType<typeof contracts>) {
-	type Label = keyof typeof all;
-	const pairs: [Label, Label][] = [
-		["counter", "counter"],
-		["counter, more members", "counter"],
-		["counter", "counter, more members"],
-		["counter, version 2", "counter"],
-		["counter, string arguments", "counter"],
-		["counter, no arguments", "counter"],
-		["counter", "counter, no arguments"],
-		["counter, no result", "counter"],
-		["counter", "counter, no result"],
-		["counter, string result", "counter"],
-		["counter, string state", "counter"],
-		["counter, count as a method", "counter"],
-		["counter, input required", "counter"],
-		["counter", "counter, input required"],
-		["counter as local", "counter"],
-		["other", "counter"],
-		["counter", "variants beta and alpha"],
-		["counter", "variants x, 10 and 9"],
-		["counter", "variant constructor, empty"],
-		["counter", "variant constructor, with a member"],
-		["counter", "variant admin, empty"],
-		["native", "native"],
-		["native, other handle", "native"],
-		["chat", "chat"],
-		["chat, viewer only", "chat"],
-		["chat", "chat, viewer only"],
-		["chat, wider input", "chat"],
-		["chat, narrower input", "chat"],
-		["chat, wider whenBusy", "chat"],
-		["chat, narrower whenBusy", "chat"],
-		["chat, looser requestId", "chat"],
-		["chat, capped requestId", "chat"],
-		["chat, result with more", "chat"],
-		["chat, result without disposition", "chat"],
-	];
-	return pairs.map(([provider, consumer]) => ({
-		provider,
-		consumer,
-		reason: coverage(json(all[provider].description), json(all[consumer].description)) ?? null,
-	}));
-}
-
-function fitsCases() {
-	const T = Type;
-	const cases: [string, unknown, unknown][] = [
-		["anything fits an empty schema", T.String(), T.Unknown()],
-		["identical", T.Object({ a: T.String() }), T.Object({ a: T.String() })],
-		["annotations are ignored", { type: "string", description: "x" }, { type: "string", title: "y", default: "z" }],
-		["integer into number", T.Integer(), T.Number()],
-		["number into integer", T.Number(), T.Integer()],
-		["string into number", T.String(), T.Number()],
-		["literal union into string", T.Union([T.Literal("a"), T.Literal("b")]), T.String()],
-		["string into a union", T.String(), T.Union([T.String(), T.Number()])],
-		["boolean into a union", T.Boolean(), T.Union([T.String(), T.Number()])],
-		["equal const", { const: "x", type: "string", description: "d" }, { const: "x" }],
-		["other const", T.Literal("x"), T.Literal("y")],
-		["no const into const", T.String(), T.Literal("x")],
-		["const into enum", T.Literal("a"), T.Enum(["a", "b"])],
-		["enum subset", { enum: ["a"] }, T.Enum(["a", "b"])],
-		["enum outside", { enum: ["a", "c"] }, T.Enum(["a", "b"])],
-		["string into enum", T.String(), T.Enum(["a", "b"])],
-		["same constraint", T.String({ maxLength: 10, minLength: 1 }), T.String({ maxLength: 10 })],
-		["tighter constraint", T.String({ maxLength: 5 }), T.String({ maxLength: 10 })],
-		["missing constraint", T.String(), T.String({ maxLength: 10 })],
-		["unknown keyword", T.String(), { type: "string", not: { const: "" } }],
-		["unknown keyword, identical", { type: "string", not: { const: "" } }, { type: "string", not: { const: "" } }],
-		["additionalProperties schema", { type: "object" }, { type: "object", additionalProperties: { type: "string" } }],
-		["object with more", T.Object({ a: T.String(), b: T.Number() }), T.Object({ a: T.String() })],
-		[
-			"object missing a required field",
-			T.Object({ a: T.String(), b: T.Optional(T.Number()) }),
-			T.Object({ a: T.String(), b: T.Number() }),
-		],
-		["object property mismatch", T.Object({ a: T.Number() }), T.Object({ a: T.String() })],
-		[
-			"closed into closed",
-			T.Object({ a: T.String() }, { additionalProperties: false }),
-			T.Object({ a: T.String(), b: T.Optional(T.Number()) }, { additionalProperties: false }),
-		],
-		["open into closed", T.Object({ a: T.String() }), T.Object({ a: T.String() }, { additionalProperties: false })],
-		[
-			"extra property into closed",
-			T.Object({ a: T.String(), c: T.String() }, { additionalProperties: false }),
-			T.Object({ a: T.String() }, { additionalProperties: false }),
-		],
-		[
-			"additional schema meets a property",
-			{ type: "object", additionalProperties: { type: "number" } },
-			T.Object({ x: T.Optional(T.String()) }),
-		],
-		["record into record", T.Record(T.String(), T.Integer()), T.Record(T.String(), T.Number())],
-		["record value mismatch", T.Record(T.String(), T.String()), T.Record(T.String(), T.Number())],
-		[
-			"closed object into patterns",
-			T.Object({ "x-a": T.Number() }, { additionalProperties: false }),
-			{ type: "object", patternProperties: { "^x-": { type: "number" } } },
-		],
-		[
-			"closed object breaks a pattern",
-			T.Object({ "x-a": T.String() }, { additionalProperties: false }),
-			{ type: "object", patternProperties: { "^x-": { type: "number" } } },
-		],
-		[
-			"open object into patterns",
-			T.Object({ "x-a": T.Number() }),
-			{ type: "object", patternProperties: { "^x-": { type: "number" } } },
-		],
-		["array items", T.Array(T.Integer()), T.Array(T.Number())],
-		["array items reversed", T.Array(T.Number()), T.Array(T.Integer())],
-		["tuple into tuple", T.Tuple([T.String(), T.Integer()]), T.Tuple([T.String(), T.Number()])],
-		["tuple of another length", T.Tuple([T.String()]), T.Tuple([T.String(), T.Number()])],
-		["tuple into list", T.Tuple([T.Integer(), T.Integer()]), T.Array(T.Number())],
-		["list into tuple", T.Array(T.Number()), T.Tuple([T.Number()])],
-		["function", T.Function([T.Number()], T.Integer()), T.Function([T.Integer(), T.String()], T.Number())],
-		["function with more parameters", T.Function([T.Number(), T.Number()], T.Number()), T.Function([T.Number()], T.Number())],
-		["function parameter is narrower", T.Function([T.Integer()], T.Number()), T.Function([T.Number()], T.Number())],
-		["false as the wider schema", T.String(), false],
-		["false into false", false, false],
-		["true as the wider schema", T.String(), true],
-		["type list", { type: ["string", "null"] }, { type: ["string", "null", "number"] }],
-		["type list into one type", { type: ["string", "null"] }, { type: "string" }],
-		["wider schema without a type", T.Object({ a: T.String() }), { properties: { a: { type: "string" } } }],
-		["const into number", { const: 1, type: "integer" }, T.Number()],
-		["inherited property name", T.Object({}), T.Object({ constructor: T.Optional(T.String()) })],
-		["own property named constructor", T.Object({ constructor: T.String() }), T.Object({ constructor: T.Optional(T.String()) })],
-		["nested union", T.Object({ mode: T.Union([T.Literal("a")]) }), T.Object({ mode: T.Union([T.Literal("a"), T.Literal("b")]) })],
-		["null as a schema", null, T.String()],
-		["empty into empty", {}, {}],
-	];
-	return cases.map(([name, sub, sup]) => {
-		const [a, b] = [json(sub), json(sup)];
-		return { name, sub: a, sup: b, fits: fits(a, b) };
+		return { literal, canonical };
 	});
 }
 
@@ -795,7 +505,6 @@ async function main() {
 	if (!outputDir) {
 		throw new Error("usage: chord-delta-fixture.ts <output-dir>");
 	}
-	const all = contracts();
 	await mkdir(outputDir, { recursive: true });
 	await writeFile(
 		join(outputDir, "chord-delta.json"),
@@ -803,7 +512,8 @@ async function main() {
 			{
 				source: {
 					repository: "https://github.com/earendil-works/pi",
-					ref: git("rev-parse", "HEAD"),
+					ref: "main",
+					commit: git("rev-parse", "HEAD"),
 					package: "packages/chord",
 					packageCommit: git("log", "-1", "--format=%H", "HEAD", "--", "packages/chord"),
 					script: fileURLToPath(import.meta.url),
@@ -815,25 +525,15 @@ async function main() {
 						"Wire batches through one decoder(), in order; the last one throws. Errors are the class name and message.",
 					apply: "applyImmutable(base, ops) on decoded tuples: the result, or the error's class name and message.",
 					diff: "diffRevisions(before, after) applied to before. Batches are exact but not canonical, so only the result is recorded.",
-					canonicalJson: "canonicalJson(JSON.parse(json)), and hash64 of that.",
-					numbers:
-						"canonicalJson(JSON.parse(literal)), and hash64 of that. Parse the literal as a correctly rounded double.",
-					hash64: "hash64(text).",
-					contracts:
-						"Descriptions built with remote() and local(), after a JSON round trip, and their fingerprints.",
-					coverage: "coverage(provider, consumer) on descriptions after a JSON round trip, by label: the reason, or null.",
-					fits: "fits(sub, sup) on schemas after a JSON round trip.",
+					canonicalJson: "canonicalJson(JSON.parse(json)).",
+					numbers: "canonicalJson(JSON.parse(literal)). Parse the literal as a correctly rounded double.",
 				},
 				codec: codecStreams(),
 				decodeErrors: decodeErrors(),
 				apply: applyCases(),
 				diff: diffCases(),
-				canonicalJson: canonicalCases(JSON.stringify(all.chat.description)),
+				canonicalJson: canonicalCases(),
 				numbers: numberCases(),
-				hash64: hashCases(),
-				contracts: contractCases(all),
-				coverage: coverageCases(all),
-				fits: fitsCases(),
 			},
 			null,
 			2,

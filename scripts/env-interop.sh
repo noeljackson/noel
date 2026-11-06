@@ -66,8 +66,8 @@ run_suites() {
   printf '== %s (%s)\n' "${name}" "$(run_image "${name}-version" "${image}" "${path}" --version)"
   set +e
   # The runner config loader needs no temporary file beside the root-owned config.
-  run_image "${name}" -e PI_ENV_DAEMON="${path}" -w /chord-reference/packages/env "${image}" \
-    /chord-reference/node_modules/.bin/vitest --run --configLoader runner "${suites[@]}" \
+  run_image "${name}" -e PI_ENV_DAEMON="${path}" -w /ts-reference/packages/env "${image}" \
+    /ts-reference/node_modules/.bin/vitest --run --configLoader runner "${suites[@]}" \
     --reporter=default --reporter=json --outputFile.json="/out/${name}.json" > "${work}/${name}.log" 2>&1
   local status=$?
   set -e

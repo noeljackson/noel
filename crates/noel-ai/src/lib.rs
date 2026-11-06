@@ -262,7 +262,8 @@ pub enum ProviderError {
     #[error("provider {provider} requires an API key")]
     MissingApiKey { provider: String },
     #[error(
-        "request failed: {0}{timed_out}",
+        "request failed: {detail}{timed_out}",
+        detail = with_cause_detail(.0),
         timed_out = if .0.is_timeout() { " (timed out)" } else { "" }
     )]
     Request(#[from] reqwest::Error),
@@ -280,6 +281,26 @@ pub enum ProviderError {
     Config(String),
     #[error("provider returned an invalid response: {0}")]
     InvalidResponse(String),
+}
+
+/// An error's message with the deepest cause in its chain appended, so a
+/// connection that failed says why (refused, DNS, TLS) rather than only that
+/// the request could not be sent (upstream 4c992154 `withCauseDetail`).
+pub fn with_cause_detail(error: &(dyn std::error::Error + 'static)) -> String {
+    let message = error.to_string();
+    let mut deepest = None;
+    let mut source = error.source();
+    for _ in 0..5 {
+        let Some(cause) = source else { break };
+        deepest = Some(cause);
+        source = cause.source();
+    }
+    match deepest.map(|cause| cause.to_string()) {
+        Some(cause) if !cause.is_empty() && !message.contains(&cause) => {
+            format!("{message}: {cause}")
+        }
+        _ => message,
+    }
 }
 
 impl ProviderError {
@@ -412,6 +433,7 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     r"input is too long for requested model",
     r"exceeds the context window",
     r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))",
+    r"context window exceeded",
     r"input token count.*exceeds the maximum",
     r"maximum prompt length is \d+",
     r"reduce the length of the messages",
@@ -1507,8 +1529,21 @@ fn normalize_openai_chat_tool_call_id(config: &ProviderConfig, id: &str) -> Stri
             .take(40)
             .collect();
     }
-    if config.model.provider == "openai" && id.len() > 40 {
-        id.chars().take(40).collect()
+    // OpenAI rejects tool call ids over 40 characters, and OpenRouter can
+    // route a model to it, so both get the cap; a hash keeps ids that share
+    // a prefix distinct (upstream 5bdf988b).
+    let openrouter = config.model.provider == "openrouter"
+        || config
+            .base_url
+            .as_deref()
+            .is_some_and(|url| url.contains("openrouter.ai"));
+    if (config.model.provider == "openai" || openrouter) && id.encode_utf16().count() > 40 {
+        let head: String =
+            String::from_utf16_lossy(&id.encode_utf16().take(31).collect::<Vec<_>>());
+        format!(
+            "{head}_{}",
+            short_hash(id).chars().take(8).collect::<String>()
+        )
     } else {
         id.to_string()
     }
@@ -3312,10 +3347,10 @@ fn pi_user_agent() -> &'static str {
 
 /// The `@earendil-works/pi-ai` version of the TS parity reference, which
 /// upstream embeds in the detailed `User-Agent`.
-const REFERENCE_PI_AI_VERSION: &str = "1.4.0";
+const REFERENCE_PI_AI_VERSION: &str = "1.5.0";
 /// The Node version of the TS parity reference image, which upstream
 /// embeds as the runtime in the detailed `User-Agent`.
-const REFERENCE_NODE_VERSION: &str = "v24.22.1";
+const REFERENCE_NODE_VERSION: &str = "v24.22.2";
 
 fn format_pi_user_agent(platform: &str, arch: &str) -> String {
     format!("pi/{REFERENCE_PI_AI_VERSION} ({platform}; node/{REFERENCE_NODE_VERSION}; {arch})")
@@ -5516,8 +5551,9 @@ mod tests {
         // Without the URL: its port is random, and a port such as 35033
         // contains one of upstream's patterns ("503").
         let error = ProviderError::Request(error.without_url());
-        // The text names no cause upstream's patterns know; the kind does.
-        assert!(!is_retryable_error_text(&error.to_string()), "{error}");
+        // The text carries the cause (upstream 4c992154), and the kind alone
+        // makes it retryable.
+        assert!(error.to_string().contains("Connection refused"), "{error}");
         assert!(error.is_retryable());
         assert!(!error.is_context_overflow("openai"));
     }
@@ -6834,6 +6870,52 @@ mod tests {
             catalog::provider_base_model(provider)
                 .unwrap_or_else(|| panic!("{provider} has no built-in model")),
         )
+    }
+
+    /// Upstream 4c992154: a request that never reached the provider says why.
+    #[tokio::test]
+    async fn a_connection_error_keeps_its_underlying_cause() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let error = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("closed port");
+        let message = ProviderError::Request(error).to_string();
+        assert!(message.to_lowercase().contains("refused"), "{message}");
+    }
+
+    /// Upstream 5bdf988b: ids over 40 characters replayed to OpenAI or
+    /// OpenRouter keep 31 and add a hash, so ids sharing a prefix stay apart.
+    #[test]
+    fn long_tool_call_ids_are_shortened_for_openai_and_openrouter() {
+        let long_a = format!("{}a", "x".repeat(45));
+        let long_b = format!("{}b", "x".repeat(45));
+        for provider in ["openai", "openrouter"] {
+            let config = provider_config(provider);
+            let a = normalize_openai_chat_tool_call_id(&config, &long_a);
+            let b = normalize_openai_chat_tool_call_id(&config, &long_b);
+            assert_eq!(a.len(), 40, "{provider}: {a}");
+            assert!(a.starts_with(&format!("{}_", "x".repeat(31))));
+            assert_ne!(a, b);
+            assert_eq!(
+                normalize_openai_chat_tool_call_id(&config, "short"),
+                "short"
+            );
+        }
+        let mut routed = provider_config("openai");
+        routed.model.provider = "custom".into();
+        routed.base_url = Some("https://openrouter.ai/api/v1".into());
+        assert_eq!(
+            normalize_openai_chat_tool_call_id(&routed, &long_a).len(),
+            40
+        );
+        routed.base_url = Some("https://example.com/v1".into());
+        assert_eq!(normalize_openai_chat_tool_call_id(&routed, &long_a), long_a);
     }
 
     /// The catalog's base URLs are API roots, as upstream's SDK clients take

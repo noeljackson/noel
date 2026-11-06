@@ -30,6 +30,7 @@ pub use noel_env::{kill_running_tool_groups, spawn_tool_process, ToolProcessGrou
 use output::{OutputAccumulator, OutputSnapshot};
 use paths::resolve_tool_path;
 use truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+pub use truncate::{slice_head_utf16, slice_tail_utf16};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -1521,6 +1522,55 @@ mod tests {
         cwd
     }
 
+    /// ripgrep's context, as upstream now formats it (8da141c2): runs
+    /// merge so a shared line shows once, the last allowed match keeps its
+    /// trailing context, the limit notice needs one more match, and only
+    /// the line terminator is stripped.
+    #[tokio::test]
+    async fn grep_context_merges_and_the_limit_notice_needs_one_more_match() {
+        let cwd = temp_dir("grep-context");
+        fs::write(
+            cwd.join("a.txt"),
+            "one\nhit 1\ntwo\nhit 2\nthree\nfour\nfive\nhit 3\nsix\r\nCR\rinside hit 4\n",
+        )
+        .unwrap();
+        let request = |context, limit| ToolRequest::Grep {
+            path: None,
+            pattern: "hit".to_string(),
+            glob: None,
+            literal: None,
+            ignore_case: None,
+            context: Some(context),
+            limit: Some(limit),
+        };
+        // Context 1 around hits 1 and 2 shares "two": once.
+        let merged = run(&cwd, request(1, 2)).await.expect("grep").output;
+        assert!(
+            merged.starts_with(
+                "a.txt-1- one\na.txt:2: hit 1\na.txt-3- two\na.txt:4: hit 2\na.txt-5- three\n"
+            ),
+            "{merged}"
+        );
+        assert!(
+            merged.contains("[2 matches limit reached. Use limit=4"),
+            "{merged}"
+        );
+        // Exactly as many matches as the limit: no notice; a lone CR stays.
+        let all = run(&cwd, request(0, 4)).await.expect("grep").output;
+        assert_eq!(
+            all,
+            "a.txt:2: hit 1\na.txt:4: hit 2\na.txt:8: hit 3\na.txt:10: CR\rinside hit 4"
+        );
+        // A match inside the last allowed match's trailing context is shown
+        // as context.
+        let trailing = run(&cwd, request(2, 1)).await.expect("grep").output;
+        assert!(
+            trailing.starts_with("a.txt-1- one\na.txt:2: hit 1\na.txt-3- two\na.txt-4- hit 2\n"),
+            "{trailing}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
     #[tokio::test]
     async fn grep_searches_what_ripgrep_would() {
         let cwd = search_tree("grep");
@@ -1570,6 +1620,24 @@ mod tests {
             "No files found matching pattern"
         );
         assert_eq!(run(&cwd, find("src")).await.expect("find").output, "src/");
+        // The limit notice only when there are more than `limit` (upstream
+        // 676af1d7): four matches with limit 4 have none, limit 3 has one.
+        let limited = |limit| ToolRequest::Find {
+            pattern: "*.txt".to_string(),
+            path: None,
+            limit: Some(limit),
+        };
+        assert_eq!(
+            run(&cwd, limited(4)).await.expect("find").output,
+            "bom.txt\nlink.txt\nonly-rg-skips.txt\nsrc/real.txt"
+        );
+        let three = run(&cwd, limited(3)).await.expect("find").output;
+        assert!(
+            three.starts_with("bom.txt\nlink.txt\nonly-rg-skips.txt\n")
+                && three
+                    .contains("[3 results limit reached. Use limit=6 for more, or refine pattern]"),
+            "{three}"
+        );
         assert_eq!(
             run(&cwd, find(".github/*.yml")).await.expect("find").output,
             ".github/ci.yml"

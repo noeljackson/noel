@@ -20,7 +20,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/ts-parity/pi-env.json");
-const MAKEFILE: &str = include_str!("../../../Makefile");
 /// What the recorder masks in daemon frames (`MASKED` in pi-env-fixture.ts).
 const MASKED: &[&str] = &[
     "version",
@@ -344,7 +343,7 @@ fn replay(name: &str) {
             expected.add(
                 kind_of(receive["type"].as_str().unwrap()),
                 receive["id"].as_u64().unwrap() as u32,
-                receive["json"].clone(),
+                without_process_feature(receive["json"].clone()),
                 &payload(&receive["payload"]),
             );
             continue;
@@ -400,14 +399,20 @@ fn printable(output: &BTreeMap<(u32, String), Vec<u8>>) -> BTreeMap<(u32, String
         .collect()
 }
 
+/// Upstream's daemon has a `process` operation (long-lived programs with plain
+/// pipes, for MCP servers) and says so in hello's `features`; noel's daemon has
+/// none (non-parity register, "noel-env Daemon"), so hello's answer leaves it out.
+fn without_process_feature(mut json: Value) -> Value {
+    if let Some(features) = json.get_mut("features").and_then(Value::as_array_mut) {
+        features.retain(|feature| feature != "process");
+    }
+    json
+}
+
 #[test]
-fn the_goldens_are_from_the_pinned_upstream_commit() {
+fn the_goldens_are_from_upstream_main() {
     let fixture = fixture();
-    let pin = MAKEFILE
-        .lines()
-        .find_map(|line| line.strip_prefix("CHORD_REFERENCE_REF ?= "))
-        .expect("CHORD_REFERENCE_REF in the Makefile");
-    assert_eq!(fixture["source"]["ref"], pin.trim());
+    assert_eq!(fixture["source"]["ref"], "main");
     let names: Vec<&str> = fixture["scenarios"]
         .as_array()
         .unwrap()

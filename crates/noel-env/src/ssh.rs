@@ -169,6 +169,11 @@ pub fn ssh_arguments(
         "RemoteCommand=none",
         "PermitLocalCommand=no",
         "SendEnv=-*",
+        // A host that is down or rebooting fails a connection attempt within
+        // 15 s, not the system's TCP timeout (upstream env c96e368e);
+        // keepalives end an established connection whose host stopped
+        // answering.
+        "ConnectTimeout=15",
         "ServerAliveInterval=15",
     ] {
         option(setting.to_string());

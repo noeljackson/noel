@@ -5,11 +5,10 @@ iOS client. Tracked in GitHub issue #114, one sub-issue per phase. Each phase li
 **Done**, **Next**, **Planned**. Update this file in the same change that moves
 a phase.
 
-Upstream reference: `earendil-works/pi` tip `7dc38ff` (2026-11-03). noel's
-parity pins are older: Durable `1692bba` and Chord `b45e0ebc` (both
-2026-10-14). Since then Durable has 77 commits (1.5.0, many breaking changes)
-and Chord 215; Chord v2 is the package root and v1 is removed upstream (apps on
-v1 pin `@earendil-works/chord@1.5.0`).
+Upstream reference: `earendil-works/pi` `main` (`4b11a722`, 2026-11-06). Every
+TS parity fixture, the env goldens and `chord-delta.json` included, is made
+from `main`; Chord v2 has its own pin, `CHORD2_REFERENCE_REF`
+(`docs/upstream-reconcile-2026-11.md`).
 
 ## Direction
 

@@ -156,22 +156,37 @@ fn first_line_summary(body: &str) -> String {
     }
 }
 
-/// Splits a command's arguments at white space; single or double quotes
-/// keep white space in an argument. Upstream's `parseCommandArgs`: a quote
-/// has no escape, and an empty argument is dropped.
+/// Splits a command's arguments at white space; upstream's
+/// `parseCommandArgs` (upstream 96667f34):
+///
+/// - a single or double quote opens a quoted argument only at the start of
+///   an argument, so an apostrophe inside a word (`doesn't`) is text;
+/// - inside one, a backslash before its quote character is that quote;
+///   any other backslash is kept;
+/// - a quote that never closes is text, and the rest is read again;
+/// - a quoted empty string (`""` or `''`) is an argument.
 pub fn parse_command_args(input: &str) -> Vec<String> {
+    let chars: Vec<char> = input.chars().collect();
     let mut args = Vec::new();
     let mut current = String::new();
-    let mut quote = None;
-    // Whether a token has started, so a quoted empty string (`""` or
-    // `''`) stays an argument (upstream `hasToken`).
+    let mut quote: Option<char> = None;
+    // Where the open quote started, so an unclosed one is read again as text.
+    let mut quote_start = 0;
+    // Whether a token has started (upstream `hasToken`).
     let mut has_token = false;
-    for ch in input.chars() {
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
         match quote {
+            Some(open) if ch == '\\' && chars.get(index + 1) == Some(&open) => {
+                current.push(open);
+                index += 1;
+            }
             Some(open) if ch == open => quote = None,
             Some(_) => current.push(ch),
-            None if ch == '"' || ch == '\'' => {
+            None if (ch == '"' || ch == '\'') && !has_token => {
                 quote = Some(ch);
+                quote_start = index;
                 has_token = true;
             }
             None if is_js_whitespace(ch) => {
@@ -185,6 +200,14 @@ pub fn parse_command_args(input: &str) -> Vec<String> {
                 has_token = true;
             }
         }
+        if quote.is_some() && index == chars.len() - 1 {
+            // Unclosed: the quote is text, and what follows it is parsed
+            // again (`current` was empty when the quote opened).
+            quote = None;
+            current = chars[quote_start].to_string();
+            index = quote_start;
+        }
+        index += 1;
     }
     if has_token {
         args.push(current);
@@ -330,6 +353,29 @@ mod tests {
             "../../../tests/fixtures/ts-parity/skills.json"
         ))
         .expect("parse TS parity fixture")
+    }
+
+    /// Upstream's cases for apostrophes, unclosed quotes and escaped
+    /// quotes (96667f34, `prompt-templates.test.ts`).
+    #[test]
+    fn apostrophes_unclosed_and_escaped_quotes_split_as_upstream() {
+        let cases: [(&str, &[&str]); 9] = [
+            (
+                "why doesn't the user's cache work",
+                &["why", "doesn't", "the", "user's", "cache", "work"],
+            ),
+            ("'tis the season", &["'tis", "the", "season"]),
+            (r#""quoted \"text\"""#, &[r#"quoted "text""#]),
+            (r"'it\'s here'", &["it's here"]),
+            (r#""C:\dir\file""#, &[r"C:\dir\file"]),
+            (r"'\\server\share'", &[r"\\server\share"]),
+            (r#""a b" 'c d' "" ''"#, &["a b", "c d", "", ""]),
+            (r#"one "two"#, &["one", "\"two"]),
+            (r#""C:\dir\""#, &[r#""C:\dir\""#]),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_command_args(input), expected, "{input}");
+        }
     }
 
     /// Every argument string of `skills.json` splits as upstream splits it,

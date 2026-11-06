@@ -339,6 +339,13 @@ fn decode_pointer_segment(segment: &str) -> Option<String> {
     Some(decoded.replace("~1", "/").replace("~0", "~"))
 }
 
+/// The subschema a local `$ref` (`#` or `#/...`) names in `root`; nothing
+/// for a remote ref, a missing target or a malformed escape (upstream
+/// `resolveSchemaRef`, 6d3e342b).
+pub fn resolve_schema_ref<'a>(reference: &str, root: &'a Value) -> Option<&'a Value> {
+    resolve_ref(reference, root)
+}
+
 fn resolve_ref<'a>(reference: &str, root: &'a Value) -> Option<&'a Value> {
     if reference != "#" && !reference.starts_with("#/") {
         return None;
