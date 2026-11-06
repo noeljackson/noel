@@ -42,6 +42,18 @@ RUN set -eu; \
     install -m 0755 "${rg}/rg" "${fd}/fd" /usr/local/bin/; \
     rm -rf "${rg}" "${fd}" "${rg}.tar.gz" "${fd}.tar.gz"
 
+# Chord v2's goldens (chord-v2-*.json) come from their own pin,
+# CHORD2_REFERENCE_REF in the Makefile: a worktree of it at /chord2-reference
+# with Chord's dependencies, so the drift job regenerates them too.
+ARG CHORD2_REFERENCE_REF=main
+RUN set -eu; \
+    cd /ts-reference; \
+    git cat-file -e "${CHORD2_REFERENCE_REF}^{commit}" 2>/dev/null \
+        || git fetch --filter=blob:none origin "${CHORD2_REFERENCE_REF}"; \
+    git worktree add --detach /chord2-reference "${CHORD2_REFERENCE_REF}"; \
+    cd /chord2-reference; \
+    npm ci --ignore-scripts --no-audit --no-fund --workspace packages/chord --include-workspace-root
+
 # Upstream's pi-env daemon from the same checkout, built as upstream ships it
 # for Linux (static musl, release), with upstream's lock file. The pi-env
 # goldens record upstream's client talking to it, and `make env-interop` runs
@@ -65,8 +77,11 @@ RUN npm install -g --no-audit --no-fund "tsx@${TSX_VERSION}"
 ARG BUN_VERSION=1.4.4
 RUN npm install -g --no-audit --no-fund "bun@${BUN_VERSION}"
 COPY scripts/ts-parity /ts-parity
+# chord-v2-contracts-fixture.ts fingerprints noel's own contracts too.
+COPY crates/noel-client/contracts/v2 /noel-contracts
 
 # pi-env-fixture.ts and pi-env-ssh-fixture.ts load upstream's packages from
 # their sources (`source` export condition) with Node's own type stripping.
-# codemode's fixtures take the reference checkout as well; tool-search's runs in Bun.
-CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do case \"$fixture\" in */pi-env-fixture.ts|*/pi-env-ssh-fixture.ts) node --conditions=source \"$fixture\" /fixtures ;; */codemode-declarations-fixture.ts) npx tsx \"$fixture\" /ts-reference /fixtures ;; */tool-search-fixture.ts) bun \"$fixture\" /ts-reference /fixtures ;; *) npx tsx \"$fixture\" /fixtures ;; esac; done"]
+# codemode's fixtures take the reference checkout as well; tool-search's runs in
+# Bun; Chord v2's run in Bun at their pin.
+CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do case \"$fixture\" in */pi-env-fixture.ts|*/pi-env-ssh-fixture.ts) node --conditions=source \"$fixture\" /fixtures ;; */codemode-declarations-fixture.ts) npx tsx \"$fixture\" /ts-reference /fixtures ;; */tool-search-fixture.ts) bun \"$fixture\" /ts-reference /fixtures ;; */chord-v2-contracts-fixture.ts) bun --conditions=source \"$fixture\" /chord2-reference /noel-contracts /fixtures ;; */chord-v2-messages-fixture.ts) bun --conditions=source \"$fixture\" /chord2-reference /fixtures ;; *) npx tsx \"$fixture\" /fixtures ;; esac; done"]
