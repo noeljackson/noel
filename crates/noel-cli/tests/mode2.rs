@@ -91,6 +91,33 @@ impl Mode2 {
         String::from_utf8(output.stdout).unwrap()
     }
 
+    /// `noel client <args>` with `input` on its stdin, which must succeed.
+    fn client_with_input(&self, args: &[&str], input: &str) -> String {
+        use std::io::Write as _;
+        let mut child = self
+            .command(&[&["client"], args].concat())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        eprintln!(
+            "$ noel client {} -> {}\n{}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "noel client {args:?} failed");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
     fn new_session(&self, request_id: &str) -> String {
         self.client(&["new", "--model", "faux/script", "--request-id", request_id])
             .trim()
@@ -702,4 +729,223 @@ fn a_continue_answers_after_a_failed_run_and_when_idle_reject_never_starts_one()
     });
     assert_eq!(last_run_status(&view).as_deref(), Some("failed"));
     assert_eq!(mode2.requests().len(), 2);
+}
+
+#[test]
+fn slash_commands_run_on_the_worker_as_the_tui_types_them() {
+    let mut mode2 = Mode2::new("commands", json!([[{"text": "Hello there"}]]), json!({}));
+    let session = mode2.new_session("commands");
+    let mut watch = mode2.watch(&session);
+    watch.snapshot("the snapshot");
+
+    // A command that changes the session shows in its view.
+    let named = mode2.client(&["command", &session, "/name release notes"]);
+    assert!(named.contains("release notes"), "{named}");
+    watch.settle("the name", |view| {
+        view["conversation"]["name"] == "release notes"
+    });
+    let shown = mode2.client(&["command", &session, "/session"]);
+    assert!(shown.contains(&session), "{shown}");
+    assert_eq!(
+        mode2.client(&["command", &session, "/queue"]),
+        "queue is empty\n"
+    );
+    // A ! command runs in the session's cwd, on the worker.
+    let shell = mode2.client(&["command", &session, "!echo from-the-worker && pwd"]);
+    assert!(shell.contains("from-the-worker"), "{shell}");
+    assert!(shell.contains("/cwd"), "{shell}");
+
+    // A prompt starts a run.
+    let started = mode2.client(&["command", &session, "say hello"]);
+    assert!(started.starts_with("started run "), "{started}");
+    watch.settle("the answer", |view| {
+        last_run_status(view).as_deref() == Some("completed")
+    });
+
+    // A fork is another session, for the client to attach to.
+    let forked = mode2.client(&["command", &session, "/fork"]);
+    let fork_id = forked
+        .lines()
+        .find_map(|line| line.strip_prefix("session "))
+        .unwrap_or_else(|| panic!("{forked}"))
+        .to_owned();
+    assert_ne!(fork_id, session);
+    // The directory reads the new journal soon after; attaching to it by id
+    // does not wait for that.
+    wait_until("the fork listed", || {
+        mode2.client(&["ls"]).contains(&fork_id)
+    });
+    let forked_view = mode2.client(&["command", &fork_id, "/session"]);
+    assert!(forked_view.contains(&fork_id), "{forked_view}");
+
+    // A selector comes back as data; an unknown command is an error.
+    let selector = mode2.client(&["command", &session, "/selector settings"]);
+    assert!(selector.lines().count() > 1, "{selector}");
+    let unknown = mode2.noel(&["client", "command", &session, "/model nope/nothing"]);
+    assert!(unknown.status.success());
+}
+
+/// The worker expands typed input with the session's configuration, as the
+/// TUI's prompts were expanded in process: a prompt template, whether it
+/// starts a run or is queued during one.
+#[test]
+fn the_worker_expands_templates_in_prompts_and_queued_follow_ups() {
+    let mode2 = Mode2::new(
+        "expand",
+        json!([
+            [{"text": "first, "}, {"wait_for_file": "release"}, {"text": "done."}],
+            [{"text": "second."}],
+        ]),
+        json!({}),
+    );
+    fs::create_dir_all(mode2.root.join("agent/prompts")).unwrap();
+    fs::write(mode2.root.join("agent/prompts/fix.md"), "Fix issue $1.\n").unwrap();
+    let session = mode2.new_session("expand");
+    let started = mode2.client(&["send", &session, "/fix 1"]);
+    assert!(started.starts_with("started run "), "{started}");
+    wait_until("the first partial saved", || {
+        mode2.journal(&session).contains("\"type\":\"partial\"")
+    });
+    let queued = mode2.client(&["send", &session, "/fix 2", "--follow-up"]);
+    assert!(queued.contains("queued"), "{queued}");
+    mode2.release("release");
+    wait_until("both turns answered", || {
+        mode2.journal(&session).contains("second.")
+    });
+    let journal = mode2.journal(&session);
+    for prompt in ["Fix issue 1.", "Fix issue 2."] {
+        assert!(
+            journal.contains(&format!("\"role\":\"user\",\"content\":\"{prompt}\\n\"")),
+            "{prompt} in {journal}"
+        );
+    }
+}
+
+/// The server's objects for what is not a session's (spec §7.2): session
+/// management, the models, accounts with a relayed login, and settings.
+#[test]
+fn the_server_manages_sessions_accounts_and_settings_for_a_client() {
+    let mode2 = Mode2::new("objects", json!([[{"text": "Hello."}]]), json!({}));
+    // noel.sessions: rename, a clone, a fork, delete, import.
+    let session = mode2.new_session("objects");
+    mode2.client(&["rename", &session, "release notes"]);
+    wait_until("the name listed", || {
+        mode2.client(&["ls"]).contains("release notes")
+    });
+    let clone = mode2
+        .client(&["fork", &session, "--clone"])
+        .trim()
+        .to_owned();
+    let fork = mode2.client(&["fork", &session]).trim().to_owned();
+    assert_ne!(clone, fork);
+    assert!(mode2.journal(&fork).contains(&session));
+    mode2.client(&["delete", &clone]);
+    wait_until("the clone gone", || !mode2.client(&["ls"]).contains(&clone));
+    assert!(!mode2
+        .root
+        .join(format!("agent/sessions/{clone}.jsonl"))
+        .exists());
+    // A journal from elsewhere on the server's machine (only read).
+    let export = mode2.root.join("elsewhere.jsonl");
+    fs::write(
+        &export,
+        format!(
+            "{{\"type\":\"started\",\"session_id\":\"from-elsewhere\",\"cwd\":\"{}\"}}\n\
+             {{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"imported prompt\",\"tool_calls\":[],\"media\":[]}}}}\n",
+            mode2.root.join("cwd").display()
+        ),
+    )
+    .unwrap();
+    let imported = mode2
+        .client(&["import", export.to_str().unwrap()])
+        .trim()
+        .to_owned();
+    assert_ne!(imported, session);
+    wait_until("the import listed", || {
+        mode2.client(&["ls"]).contains("imported prompt")
+    });
+    assert!(mode2.journal(&imported).contains("imported prompt"));
+
+    // noel.models: what a session can use, each saying whether it can.
+    let models: Value = serde_json::from_str(&mode2.client(&["models", "--json"])).unwrap();
+    let script = models["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["provider"] == "faux" && model["modelId"] == "script")
+        .unwrap_or_else(|| panic!("{models}"));
+    assert_eq!(script["available"], true);
+    assert_eq!(script["scoped"], false);
+
+    // noel.accounts: an API-key login relayed from the client, which only
+    // hands over the key; the auth file is the server's.
+    assert_eq!(mode2.client(&["accounts"]), "no accounts\n");
+    let login = mode2.client_with_input(
+        &["login", "openai", "--account", "work"],
+        "sk-relayed-key\n",
+    );
+    assert_eq!(login, "logged in openai as account work\n");
+    assert_eq!(mode2.client(&["accounts"]), "openai work api_key\n");
+    let auth = fs::read_to_string(mode2.root.join("agent/auth.json")).unwrap();
+    assert!(auth.contains("sk-relayed-key"), "{auth}");
+    let listed = mode2.client(&["accounts", "--json"]);
+    assert!(!listed.contains("sk-relayed-key"), "{listed}");
+    assert_eq!(
+        mode2.client(&["logout", "openai", "--account", "work"]),
+        "logged out openai account work\n"
+    );
+    assert_eq!(mode2.client(&["accounts"]), "no accounts\n");
+
+    // noel.settings: read and write the server machine's settings.
+    mode2.client(&["settings", "theme", "\"dark\""]);
+    assert_eq!(mode2.client(&["settings", "theme"]), "\"dark\"\n");
+    let settings = fs::read_to_string(mode2.root.join("agent/settings.json")).unwrap();
+    assert!(settings.contains("\"theme\": \"dark\""), "{settings}");
+    mode2.client(&["settings", "theme", "null"]);
+    assert_eq!(mode2.client(&["settings", "theme"]), "null\n");
+    let settings = fs::read_to_string(mode2.root.join("agent/settings.json")).unwrap();
+    assert!(
+        settings.contains("modelRefresh") && !settings.contains("theme"),
+        "{settings}"
+    );
+}
+
+/// A session its worker holds is renamed and deleted through that worker:
+/// a rename at once, a delete once no client holds it and it runs nothing.
+#[test]
+fn an_open_session_is_renamed_and_deleted_through_its_worker() {
+    let mut mode2 = Mode2::new("open", json!([[{"text": "Hello."}]]), json!({}));
+    let session = mode2.new_session("open");
+    let mut watch = mode2.watch(&session);
+    watch.snapshot("the snapshot");
+    let worker = mode2.worker_pid(&session);
+    mode2.client(&["rename", &session, "renamed while open"]);
+    watch.settle("the name", |view| {
+        view["conversation"]["name"] == "renamed while open"
+    });
+    // A client holds it: not deleted.
+    let refused = mode2.noel(&["client", "delete", &session]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("open in a client"),
+        "{refused:?}"
+    );
+    assert!(mode2
+        .root
+        .join(format!("agent/sessions/{session}.jsonl"))
+        .exists());
+    // With the client gone, the worker (still running) ends and it goes.
+    let mut child = mode2.watches.pop().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(alive(worker));
+    mode2.client(&["delete", &session]);
+    assert!(!mode2
+        .root
+        .join(format!("agent/sessions/{session}.jsonl"))
+        .exists());
+    wait_until("the worker gone", || !alive(worker));
+    wait_until("the session unlisted", || {
+        !mode2.client(&["ls"]).contains(&session)
+    });
 }

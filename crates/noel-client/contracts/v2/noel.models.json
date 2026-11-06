@@ -21,7 +21,9 @@
                   "modelId",
                   "name",
                   "reasoning",
-                  "thinkingLevels"
+                  "thinkingLevels",
+                  "available",
+                  "scoped"
                 ],
                 "properties": {
                   "provider": {
@@ -41,6 +43,15 @@
                     "items": {
                       "type": "string"
                     }
+                  },
+                  "available": {
+                    "type": "boolean"
+                  },
+                  "scoped": {
+                    "type": "boolean"
+                  },
+                  "thinkingLevel": {
+                    "type": "string"
                   }
                 }
               }

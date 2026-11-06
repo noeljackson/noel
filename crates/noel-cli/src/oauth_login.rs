@@ -377,7 +377,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use noel_config::{AuthCredential, AuthData, DEFAULT_ACCOUNT_NAME};
     use std::io::{BufRead, BufReader, Read, Write};
@@ -386,13 +386,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    struct StubServer {
-        url: String,
+    pub(crate) struct StubServer {
+        pub(crate) url: String,
         hits: Arc<AtomicUsize>,
-        requests: Arc<Mutex<Vec<String>>>,
+        pub(crate) requests: Arc<Mutex<Vec<String>>>,
     }
 
-    fn spawn_stub(responses: Vec<(u16, &'static str)>) -> StubServer {
+    pub(crate) fn spawn_stub(responses: Vec<(u16, &'static str)>) -> StubServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let url = format!("http://{}", listener.local_addr().expect("stub addr"));
         let hits = Arc::new(AtomicUsize::new(0));
@@ -454,7 +454,7 @@ mod tests {
         server
     }
 
-    fn fake_jwt(payload: &str) -> String {
+    pub(crate) fn fake_jwt(payload: &str) -> String {
         let encode = |json: &str| URL_SAFE_NO_PAD.encode(json.as_bytes());
         format!(
             "{}.{}.signature",

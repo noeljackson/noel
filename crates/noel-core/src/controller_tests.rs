@@ -1118,3 +1118,58 @@ async fn a_continue_is_refused_while_a_run_is_active() {
         .await;
     assert_eq!(*refusal.lock().unwrap(), Some(SubmitError::Busy));
 }
+
+#[tokio::test]
+async fn a_queued_slash_tool_command_is_placed_alone() {
+    let mut fixture = Fixture::new("tool-follow-ups", AbortPolicy::KeepQueue);
+    let gate = Arc::new(Notify::new());
+    fixture.script([after(&gate, "first"), says("prose")]);
+    let release_gate = gate.clone();
+    fixture
+        .start(
+            "work",
+            "r-1",
+            vec![
+                act(|busy| {
+                    queued(busy.submit(follow_up("one", "f-1"), WhenBusy::FollowUp));
+                    queued(busy.submit(follow_up("two", "f-2"), WhenBusy::FollowUp));
+                    queued(busy.submit(
+                        follow_up("/read missing-tool-fixture.txt", "f-3"),
+                        WhenBusy::FollowUp,
+                    ));
+                    queued(busy.submit(follow_up("three", "f-4"), WhenBusy::FollowUp));
+                }),
+                release(&release_gate),
+            ],
+        )
+        .await;
+    let events = fixture.take_events();
+    let placed = events
+        .iter()
+        .filter(|event| event.starts_with("placed") || event.starts_with("user"))
+        .cloned()
+        .collect::<Vec<_>>();
+    // Prose up to the command is one message; the command is placed alone
+    // and fails (the file is missing), so `three` is still queued.
+    assert_eq!(
+        placed,
+        [
+            "user work",
+            "placed f-1,f-2",
+            "user one\n---\ntwo",
+            "placed f-3",
+        ],
+        "{events:?}"
+    );
+    assert!(
+        events.last().unwrap().starts_with("settled Failed"),
+        "{events:?}"
+    );
+    let left = fixture.controller.queue().items();
+    assert_eq!(
+        left.iter()
+            .map(|item| item.content.as_str())
+            .collect::<Vec<_>>(),
+        ["three"]
+    );
+}

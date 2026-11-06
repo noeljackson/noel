@@ -56,6 +56,7 @@ use super::{
     build_id, chat_contract, chat_variant, control_line, peer_check, remove_stale_socket, set_mode,
     valid_session_id, write_record, RuntimeDir, DEFAULT_WORKER_IDLE_MS, EXIT_LOCKED,
 };
+use crate::session_commands::{self, CommandOutcome, CommandUi, SessionSwitch};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -69,6 +70,9 @@ pub(crate) struct WorkerArgs {
     /// Which start of this session's worker this is, from 1.
     #[arg(long)]
     generation: u64,
+    /// The session's journal when it is kept outside the session directory.
+    #[arg(long, value_name = "PATH")]
+    journal: Option<std::path::PathBuf>,
     /// Continue this interrupted run once ready.
     #[arg(long, value_name = "RUN_ID")]
     resume: Option<String>,
@@ -126,11 +130,14 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     // The server names its session directory in NOEL_SESSION_DIR.
     let here = std::env::current_dir().unwrap_or_else(|_| "/".into());
     let session_dir = crate::config_paths(here, None)?.session_dir;
-    let journal = session_dir.join(format!("{session_id}.jsonl"));
+    let journal = args
+        .journal
+        .clone()
+        .unwrap_or_else(|| session_dir.join(format!("{session_id}.jsonl")));
     if !journal.exists() {
         return Err(Fatal::new(format!("no session {session_id}")));
     }
-    let (store, state) = match SessionStore::open(journal) {
+    let (store, mut state) = match SessionStore::open(journal) {
         Ok(opened) => opened,
         Err(error @ SessionError::Locked { .. }) => {
             return Err(Fatal {
@@ -143,7 +150,33 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     };
 
     // The session's configuration, as `noel` started in its directory
-    // builds it with no flags.
+    // builds it: with the flags of the `noel` that opened it, when one left
+    // them (they hold while this worker runs), else with none.
+    // The environment comes with them, as `noel` would have run in it (a
+    // key exported in that shell, a provider setting).
+    let launched = fs::read_to_string(dir.worker_args(&session_id))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_default();
+    let _ = fs::remove_file(dir.worker_args(&session_id));
+    for (key, value) in launched["env"].as_object().into_iter().flatten() {
+        if let Some(value) = value.as_str() {
+            std::env::set_var(key, value);
+        }
+    }
+    let launch: Vec<String> = serde_json::from_value(launched["args"].clone()).unwrap_or_default();
+    let cli = crate::Cli::try_parse_from(std::iter::once("noel".to_owned()).chain(launch.clone()))
+        .unwrap_or_else(|_| crate::Cli::parse_from(["noel"]));
+    let _ = fs::write(
+        dir.worker_applied_args(&session_id),
+        serde_json::to_string(&launch).unwrap_or_default(),
+    );
+    // A relative directory is the opening `noel`'s, as there.
+    if state.cwd.is_relative() {
+        if let Some(base) = launched["cwd"].as_str() {
+            state.cwd = std::path::Path::new(base).join(&state.cwd);
+        }
+    }
     let cwd = state.cwd.clone();
     if let Err(error) = std::env::set_current_dir(&cwd) {
         eprintln!(
@@ -152,14 +185,24 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
         );
     }
     let paths = crate::config_paths(cwd.clone(), Some(session_dir))?;
-    let trusted = project_is_trusted(&paths.agent_dir, &cwd).unwrap_or(false);
-    let cli = crate::Cli::parse_from(["noel"]);
+    let trusted = if cli.approve {
+        true
+    } else if cli.no_approve {
+        false
+    } else {
+        project_is_trusted(&paths.agent_dir, &cwd).unwrap_or(false)
+    };
     let resources = crate::resource_commands::resource_options(&cli);
     let mut config = load_config_with_resources(paths, trusted, &resources)?;
     crate::apply_cli_overrides(&cli, &cwd, &mut config)?;
-    let offline = crate::offline_enabled(false);
+    let offline = crate::offline_enabled(cli.offline);
     crate::apply_cached_claude_code_version(&config);
-    let selection = crate::resolve_cli_selection(&cli, &mut config, offline)?;
+    let mut selection = crate::resolve_cli_selection(&cli, &mut config, offline)?;
+    // A session the client switched to keeps its model, as `/resume` does.
+    if launched["switched"] == true {
+        selection.model = None;
+        selection.thinking = None;
+    }
     let mut systems = ReloadableSystems::from_config(&config, 1);
     systems.offline = offline;
     let idle_limit = Duration::from_millis(
@@ -216,6 +259,7 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     let host = chat_host(&session_id, status.clone());
     let (commands, inbox) = mpsc::unbounded_channel::<Command>();
     serve_chat(&host, &session_id, view.clone(), commands.clone());
+    let clients = view.clone();
 
     let plugins = Arc::new(host.get(noel_client::contracts::plugins(), json!({})));
     follow_plugin_tools(plugins.clone(), commands.clone());
@@ -254,6 +298,7 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
         idle_limit,
         host,
         files: Files { socket, record },
+        view: clients,
     }));
     drive(controller, inbox, args.resume).await;
     // The controller only stops when every command sender is gone, which
@@ -292,6 +337,8 @@ struct Status {
     queued: usize,
     /// A command that runs no run (a compaction, a configure) is in hand.
     working: bool,
+    /// The last client quit, as a local `noel` quits: exit once idle.
+    leaving: bool,
 }
 
 impl Status {
@@ -305,6 +352,7 @@ impl Status {
             "viewers": self.holds,
             "running": self.running.is_some(),
             "queued": self.queued,
+            "working": self.working,
         });
         if let Some(run_id) = &self.running {
             message["runId"] = json!(run_id);
@@ -380,6 +428,8 @@ enum Command {
     Compact(Value, Reply),
     Configure(Value, Reply),
     Resume(Value, Reply),
+    /// A slash command or prompt, as the TUI types it.
+    Run(Value, Reply),
     /// The plugin tools the server's directory offers now.
     PluginTools(Vec<PluginTool>),
 }
@@ -462,6 +512,7 @@ fn participant(cell: &Cell, commands: &mpsc::UnboundedSender<Command>) -> Implem
         .method("compact", method(commands, Command::Compact))
         .method("configure", method(commands, Command::Configure))
         .method("resume", method(commands, Command::Resume))
+        .method("command", method(commands, Command::Run))
 }
 
 /// Takes each connection to the worker's socket as its parent.
@@ -548,6 +599,7 @@ struct Supervision {
     idle_limit: Duration,
     host: Host,
     files: Files,
+    view: Arc<Mutex<View>>,
 }
 
 /// Reports status to the parent, and ends the worker: idle for the limit,
@@ -561,6 +613,7 @@ async fn supervise(supervision: Supervision) {
         idle_limit,
         host,
         files,
+        view,
     } = supervision;
     let mut terminate = signal(SignalKind::terminate()).ok();
     let mut interrupt = signal(SignalKind::interrupt()).ok();
@@ -583,6 +636,7 @@ async fn supervise(supervision: Supervision) {
             std::process::exit(128 + signal);
         }
         let now = status.get();
+        lock(&view).set_clients(now.holds);
         let report = now.control();
         if sent.as_ref() != Some(&report) {
             if let Some(parent) = &*lock(&parent) {
@@ -593,6 +647,10 @@ async fn supervise(supervision: Supervision) {
         let idle_since = status.idle_since();
         let done = if draining.load(Ordering::SeqCst) && now.running.is_none() && !now.working {
             Some("shut down by the server")
+        } else if now.leaving && now.holds == 0 && now.running.is_none() && !now.working {
+            // Once the quitting client let go: a hold left would bind the
+            // session's next worker.
+            Some("its last client quit")
         } else if idle_since.is_some_and(|since| since.elapsed() >= idle_limit) {
             Some("idle")
         } else {
@@ -664,6 +722,7 @@ impl ControllerHost for WorkerHost {
     fn event(&mut self, event: Event<'_>) {
         for notice in crate::account_failover::drain_notices() {
             eprintln!("noel worker: {notice}");
+            lock(&self.view).notice(notice);
         }
         match &event {
             Event::RunStarted { run_id, .. } => {
@@ -905,9 +964,13 @@ async fn idle_command(
         }
         Command::Abort(args, reply) => {
             let expected = args.get("expectedRunId").and_then(Value::as_str);
-            let queued = controller.queue().pending();
+            let policy = abort_policy(&args);
+            let queued = match policy {
+                AbortPolicy::WithdrawQueue => controller.queue().pending(),
+                AbortPolicy::KeepQueue => 0,
+            };
             let result = controller
-                .abort(expected)
+                .abort_with(expected, policy)
                 .map(|()| json!({"withdrawn": queued}));
             let _ = reply.send(result.map_err(|error| refused("abort", error)));
         }
@@ -937,9 +1000,387 @@ async fn idle_command(
                 }
             }
         }
+        Command::Run(args, reply) => {
+            // Working while it runs; the status change it ends with also
+            // has the server read its directory again (a fork, a new
+            // session).
+            let status = controller.parts().1.status.clone();
+            status.update(|status| status.working = true);
+            let (answer, start) = run_command(controller, &args).await;
+            status.update(|status| status.working = false);
+            let _ = reply.send(Ok(answer));
+            if start.is_some() {
+                return start;
+            }
+        }
         Command::PluginTools(tools) => set_plugin_tools(controller, tools),
     }
     None
+}
+
+/// A command's output, as the worker answers `command`.
+#[derive(Default)]
+struct CommandOutput {
+    entries: Vec<Value>,
+    resume_pending: bool,
+}
+
+impl CommandUi for CommandOutput {
+    fn push(&mut self, kind: crate::TuiEntryKind, text: impl Into<String>) {
+        let kind = match kind {
+            crate::TuiEntryKind::Error => "error",
+            crate::TuiEntryKind::Tool => "tool",
+            _ => "system",
+        };
+        self.entries
+            .push(json!({"kind": kind, "text": text.into()}));
+    }
+
+    fn placeholder(&mut self, kind: crate::TuiEntryKind, text: impl Into<String>) -> usize {
+        self.push(kind, text);
+        self.entries.len() - 1
+    }
+
+    fn replace(&mut self, index: usize, text: impl Into<String>) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry["text"] = json!(text.into());
+        }
+    }
+
+    fn redraw(&mut self, _config: &noel_config::LoadedConfig) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn set_resume_pending(&mut self, pending: bool) {
+        self.resume_pending = pending;
+    }
+
+    fn switch_session(
+        &mut self,
+        runtime: &mut Runtime,
+        config: &noel_config::LoadedConfig,
+        switch: SessionSwitch,
+    ) -> anyhow::Result<CommandOutcome> {
+        // This worker serves one session: the client attaches to the other.
+        open_elsewhere(runtime, config, switch).map(CommandOutcome::Session)
+    }
+}
+
+/// `command({line, requestId?})`: runs `line` as the TUI would, on this
+/// session (docs/client-tui-plan.md). The answer is `{entries, next?}`:
+/// the rows to show, then what the client does next (`run` it started,
+/// `selector` to open, `session` to attach to, `login` to run). A prompt
+/// starts a run, returned to be driven.
+async fn run_command(
+    controller: &mut SessionController<WorkerHost>,
+    args: &Value,
+) -> (Value, Option<Start>) {
+    let line = text(args, "line");
+    let mut output = CommandOutput::default();
+    let mut next = Value::Null;
+    let mut start = None;
+    // The queue is the controller's; the session's own fields are not.
+    if let Some(text) = line
+        .strip_prefix("/queue ")
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        let content = controller.parts().1.expand(text);
+        let submission = Submission {
+            kind: SubmissionKind::FollowUp,
+            request_id: args
+                .get("requestId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            content,
+            images: Vec::new(),
+            expected_run_id: None,
+        };
+        let answer = match controller.enqueue(noel_core::QueueMode::FollowUp, submission) {
+            Ok(_) => format!("queued: {}", controller.queue().pending()),
+            Err(error) => error.to_string(),
+        };
+        refresh(controller);
+        return (
+            json!({"entries": [{"kind": "system", "text": answer}]}),
+            None,
+        );
+    }
+    let queued = match line.as_str() {
+        "/queue" => Some(Ok(queue_text(&controller.queue().items()))),
+        "/queue-clear" | "/interrupt" => Some(controller.clear_queue().map(|items| {
+            let cleared = format!("cleared {} queued message(s)", items.len());
+            if line == "/interrupt" {
+                format!("interrupted; {cleared}")
+            } else {
+                cleared
+            }
+        })),
+        _ => None,
+    };
+    if let Some(result) = queued {
+        match result {
+            Ok(text) => output.push(crate::TuiEntryKind::System, text),
+            Err(error) => output.push(crate::TuiEntryKind::Error, error),
+        }
+        refresh(controller);
+        return (json!({"entries": output.entries}), None);
+    }
+    // `!command`: a shell command in the session's environment, its output
+    // shown and not sent to the model (the client resolves `!!`).
+    if let Some(command) = line
+        .strip_prefix('!')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        let command = command.to_owned();
+        let (runtime, _) = controller.parts_mut();
+        let entry = match crate::run_excluded_bash_result(runtime, command.clone()).await {
+            Ok(result) => {
+                let text = crate::format_bash_completed(&command, &result.output);
+                let text = if result.is_error {
+                    text.replacen("completed", "failed", 1)
+                } else {
+                    text
+                };
+                json!({"kind": "tool", "text": text})
+            }
+            Err(error) => {
+                json!({"kind": "error", "text": format!("failed bash\n$ {command}\n{error}")})
+            }
+        };
+        return (json!({"entries": [entry]}), None);
+    }
+    // The diff panel: the edited files and each one's diff, read here.
+    if line == "/diff" {
+        let session = controller.runtime().session();
+        let files = crate::collect_diff_file_entries(&session.cwd, &session.edited_files);
+        let files = files.iter().map(|entry| {
+            let detail = crate::build_diff_detail(&session.cwd, entry);
+            json!({
+                "path": entry.path,
+                "added": entry.added,
+                "removed": entry.removed,
+                "untracked": entry.untracked,
+                "lines": detail.lines,
+            })
+        });
+        let files = files.collect::<Vec<_>>();
+        return (
+            json!({"entries": [], "next": {"type": "diff", "files": files}}),
+            None,
+        );
+    }
+    // A local `noel` quitting (docs/client-tui-plan.md): with no other
+    // client and no run, the session ends as the in-process TUI's does,
+    // its extensions told so; otherwise the client only detaches.
+    if matches!(line.as_str(), "/quit" | "/exit" | "/q") {
+        let (runtime, host) = controller.parts_mut();
+        let alone = host.status.get().holds <= 1;
+        let mut entries = Vec::new();
+        if alone
+            && runtime
+                .session()
+                .runs
+                .last()
+                .is_none_or(|run| run.status.is_finished())
+        {
+            let cwd = runtime.session().cwd.clone();
+            let mut diagnostics =
+                crate::notify_extension_lifecycle(&host.config.extensions, "shutdown", &cwd);
+            {
+                let hosts = runtime.extension_hosts();
+                let mut hosts = hosts.lock().await;
+                diagnostics.extend(hosts.notify("shutdown", &cwd).await);
+                hosts.shutdown(&cwd).await;
+            }
+            entries.extend(
+                diagnostics
+                    .into_iter()
+                    .map(|text| json!({"kind": "error", "text": text})),
+            );
+            host.status.update(|status| status.leaving = true);
+            return (json!({"entries": entries, "leaving": true}), None);
+        }
+        return (json!({"entries": entries}), None);
+    }
+    // `/bug`: the report goes into the session's directory, with the error
+    // rows the client shows (`errors`).
+    if line.split_whitespace().next() == Some("/bug") {
+        let errors: Vec<String> =
+            serde_json::from_value(args["errors"].clone()).unwrap_or_default();
+        let errors = errors.iter().map(String::as_str).collect::<Vec<_>>();
+        let (runtime, host) = controller.parts();
+        let dir = std::env::current_dir().unwrap_or_else(|_| runtime.session().cwd.clone());
+        let entry =
+            match crate::bug_report::report_into(runtime, &host.config, &line, &errors, &dir) {
+                Ok(text) => json!({"kind": "system", "text": text}),
+                Err(text) => json!({"kind": "error", "text": text}),
+            };
+        return (json!({"entries": [entry]}), None);
+    }
+    if line == "/undo" {
+        // The prompt goes back to the client's draft.
+        let undone = controller.configure(|runtime, _| runtime.undo_last_turn());
+        let answer = match undone {
+            Ok(Some(prompt)) => json!({
+                "entries": [{"kind": "system", "text": "undid the last turn"}],
+                "next": {"type": "draft", "text": prompt.content, "media": prompt.media},
+            }),
+            Ok(None) => json!({"entries": [{"kind": "system", "text": "nothing to undo"}]}),
+            Err(error) => json!({"entries": [{"kind": "error", "text": error.to_string()}]}),
+        };
+        refresh(controller);
+        return (answer, None);
+    }
+    if let Some(switch) = selected_session(controller, &line) {
+        match switch {
+            Ok(session) => next = json!({"type": "session", "session": session}),
+            Err(error) => output.push(crate::TuiEntryKind::Error, format!("{error:#}")),
+        }
+        return (json!({"entries": output.entries, "next": next}), None);
+    }
+    let outcome = {
+        let (runtime, host) = controller.parts_mut();
+        let offline = host.offline;
+        session_commands::run(&mut output, runtime, &mut host.config, offline, line).await
+    };
+    match outcome {
+        Ok(CommandOutcome::Handled) => {}
+        Ok(CommandOutcome::Submit { prompt, media }) => {
+            if !media.is_empty() {
+                output.push(
+                    crate::TuiEntryKind::Error,
+                    "images are sent with the prompt",
+                );
+            } else {
+                let submission = Submission {
+                    kind: SubmissionKind::Prompt,
+                    request_id: args
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    content: prompt.prompt,
+                    images: Vec::new(),
+                    expected_run_id: None,
+                };
+                match controller.submit(submission).await {
+                    Ok(Submitted::Started(started)) => {
+                        next = json!({"type": "run", "runId": started.run_id()});
+                        start = Some(started);
+                    }
+                    Ok(Submitted::Repeated(repeat)) => {
+                        next = json!({"type": "repeated", "result": repeated(&repeat, None)});
+                    }
+                    Err(error) => output.push(crate::TuiEntryKind::Error, error.to_string()),
+                }
+            }
+        }
+        Ok(CommandOutcome::Compact { focus }) => {
+            let focus = Some(focus.as_str()).filter(|focus| !focus.is_empty());
+            match controller.compact(focus).await {
+                Ok(record) => output.push(
+                    crate::TuiEntryKind::System,
+                    format!(
+                        "compacted: {} messages summarized, {} kept",
+                        record.omitted_messages, record.retained_messages
+                    ),
+                ),
+                Err(error) => output.push(crate::TuiEntryKind::Error, error),
+            }
+        }
+        Ok(CommandOutcome::Login { provider, account }) => {
+            next = json!({"type": "login", "provider": provider, "account": account});
+        }
+        Ok(CommandOutcome::Selector(state)) => {
+            let mut selector = state.to_json();
+            // The model picker's provider layer carries each provider's
+            // models, so the client opens them at once, in key order.
+            if state.kind == "provider" {
+                let (runtime, host) = controller.parts();
+                selector["layers"] = crate::provider_model_layers(&host.config, runtime);
+            }
+            next = json!({"type": "selector", "selector": selector});
+        }
+        Ok(CommandOutcome::Session(session)) => {
+            next = json!({"type": "session", "session": session});
+        }
+        Err(error) => output.push(crate::TuiEntryKind::Error, format!("{error:#}")),
+    }
+    refresh(controller);
+    let mut answer = json!({"entries": output.entries});
+    if output.resume_pending {
+        answer["resumePending"] = json!(true);
+    }
+    if !next.is_null() {
+        answer["next"] = next;
+    }
+    (answer, start)
+}
+
+/// The queue as `/queue` lists it, as the in-process TUI does.
+fn queue_text(items: &[noel_core::QueueItem]) -> String {
+    if items.is_empty() {
+        return "queue is empty".to_owned();
+    }
+    let lines = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| format!("{}.\t{}", index + 1, item.content));
+    lines.collect::<Vec<_>>().join("\n")
+}
+
+/// The session `switch` names, for the client to attach to. A journal
+/// another process holds is refused, as `noel` refuses it (its own worker
+/// holding it is no refusal); one outside the session directory is
+/// registered with the server, which looks there.
+fn open_elsewhere(
+    runtime: &Runtime,
+    config: &noel_config::LoadedConfig,
+    switch: SessionSwitch,
+) -> anyhow::Result<String> {
+    let SessionSwitch::Open { path } = &switch else {
+        return session_commands::switch_elsewhere(runtime, config, switch);
+    };
+    let session = SessionStore::read(path)?.session_id;
+    match SessionStore::open(path.clone()) {
+        Ok(opened) => drop(opened),
+        Err(SessionError::Locked { pid: Some(pid), .. })
+            if crate::held_by_worker(path, pid).as_deref() == Some(session.as_str()) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let dir = RuntimeDir::check(RuntimeDir::locate())?;
+    let registered = dir.worker_journal(&session);
+    let canonical = fs::canonicalize(path)?;
+    if fs::canonicalize(config.paths.session_dir.join(format!("{session}.jsonl"))).ok()
+        == Some(canonical.clone())
+    {
+        let _ = fs::remove_file(registered);
+    } else {
+        fs::write(registered, format!("{}\n", canonical.display()))?;
+    }
+    Ok(session)
+}
+
+/// A pick of the session or branch selector names another session here:
+/// the client attaches to it.
+fn selected_session(
+    controller: &mut SessionController<WorkerHost>,
+    line: &str,
+) -> Option<anyhow::Result<String>> {
+    let rest = line.strip_prefix("/select ")?.trim();
+    let (kind, value) = rest.split_once(char::is_whitespace)?;
+    if !matches!(
+        kind,
+        "session" | "sessions" | "resume" | "tree" | "branches"
+    ) {
+        return None;
+    }
+    let (runtime, host) = controller.parts();
+    Some(
+        crate::resolve_session_reference(&host.config.paths.session_dir, value.trim())
+            .and_then(|path| open_elsewhere(runtime, &host.config, SessionSwitch::Open { path })),
+    )
 }
 
 /// A command while a run is active.
@@ -965,8 +1406,12 @@ fn busy_command(command: Command, busy: &mut Busy<'_, WorkerHost>) {
         }
         Command::Abort(args, reply) => {
             let expected = args.get("expectedRunId").and_then(Value::as_str);
-            let queued = busy.queue().pending();
-            match busy.abort(expected) {
+            let policy = abort_policy(&args);
+            let queued = match policy {
+                AbortPolicy::WithdrawQueue => busy.queue().pending(),
+                AbortPolicy::KeepQueue => 0,
+            };
+            match busy.abort_with(expected, policy) {
                 // Answered once the run settles.
                 Ok(()) => busy.host().aborts.push((reply, queued)),
                 Err(error) => {
@@ -974,7 +1419,10 @@ fn busy_command(command: Command, busy: &mut Busy<'_, WorkerHost>) {
                 }
             }
         }
-        Command::Compact(_, reply) | Command::Configure(_, reply) | Command::Resume(_, reply) => {
+        Command::Compact(_, reply)
+        | Command::Configure(_, reply)
+        | Command::Resume(_, reply)
+        | Command::Run(_, reply) => {
             let _ = reply.send(Err(refused(
                 "busy",
                 "a run is active; wait for it to settle",
@@ -992,6 +1440,16 @@ fn text(args: &Value, key: &str) -> String {
 }
 
 /// `submit`'s arguments as a submission: `whenBusy` names its kind, as
+/// What an abort does to the queue: Durable's rule, everything queued is
+/// withdrawn, unless `keepQueue` (`noel`'s interrupt, which keeps it).
+fn abort_policy(args: &Value) -> AbortPolicy {
+    if args.get("keepQueue").and_then(Value::as_bool) == Some(true) {
+        AbortPolicy::KeepQueue
+    } else {
+        AbortPolicy::WithdrawQueue
+    }
+}
+
 /// `prompt`, `steer` and `follow_up` do over RPC; `type: "continue"` is
 /// Durable's continue. The flag is `whenIdle: "reject"`.
 fn submission(args: &Value) -> Result<(Submission, WhenBusy, bool), WireError> {

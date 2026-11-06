@@ -81,6 +81,12 @@
                         "type": "string"
                       }
                     }
+                  },
+                  "labels": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -148,6 +154,97 @@
                 "minLength": 1
               },
               "sessionId": {
+                "type": "string"
+              },
+              "clone": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "sessionId",
+              "created"
+            ],
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              },
+              "created": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "rename": {
+          "args": {
+            "type": "object",
+            "required": [
+              "sessionId",
+              "name"
+            ],
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "sessionId"
+            ],
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "delete": {
+          "args": {
+            "type": "object",
+            "required": [
+              "sessionId"
+            ],
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "sessionId"
+            ],
+            "properties": {
+              "sessionId": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "import": {
+          "args": {
+            "type": "object",
+            "required": [
+              "requestId",
+              "path"
+            ],
+            "properties": {
+              "requestId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "path": {
                 "type": "string"
               }
             },

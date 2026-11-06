@@ -257,6 +257,9 @@
             "properties": {
               "expectedRunId": {
                 "type": "string"
+              },
+              "keepQueue": {
+                "type": "boolean"
               }
             },
             "additionalProperties": false
@@ -381,6 +384,82 @@
               },
               "before": {
                 "type": "integer"
+              }
+            }
+          }
+        },
+        "command": {
+          "args": {
+            "type": "object",
+            "required": [
+              "line"
+            ],
+            "properties": {
+              "errors": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "line": {
+                "type": "string"
+              },
+              "requestId": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "entries"
+            ],
+            "properties": {
+              "entries": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "text"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "system",
+                        "error",
+                        "tool"
+                      ]
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "resumePending": {
+                "type": "boolean"
+              },
+              "next": {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "enum": [
+                      "run",
+                      "repeated",
+                      "selector",
+                      "session",
+                      "login",
+                      "draft",
+                      "diff"
+                    ]
+                  }
+                }
               }
             }
           }

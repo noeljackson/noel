@@ -29,8 +29,11 @@ wait_record() {
 }
 send() { tmux send-keys -t "${session}" -l "$1"; tmux send-keys -t "${session}" Enter; }
 # Fixtures are plain ASCII, allowing exact journal checks without new tools.
+# Only `messages` is compared: a session's worker also saves each item's
+# submission ids (`items`).
 snapshot_is() {
   grep -F '"type":"queued_messages_snapshot"' "${journal}" | tail -n 1 | \
+    sed 's/,"items":.*}$/}/' | \
     grep -Fxq "{\"type\":\"queued_messages_snapshot\",\"messages\":$1}"
 }
 not_sent() {
@@ -126,13 +129,16 @@ for mode in default legacy-setting; do
     sleep 0.2
     snapshot_is '["after-quit"]' && not_sent 'after-quit' || fail 'quit consumed a pending follow-up'
     tmux kill-session -t "${session}" >/dev/null 2>&1 || true
-    # Reopen an unfinished turn: finish saved context, then drain pending work.
+    # Reopen an unfinished turn: Durable's continue places the pending work
+    # first and the model answers once.
     tmux new-session -d -s "${session}" -x 100 -y 30
     tmux send-keys -t "${session}" \
       "cd '${case_dir}' && env -u NOEL_TUI_E2E_DUMP NOEL_DIR='${case_dir}/agent' '${noel_bin}' --session '${journal}' --offline ${args}" Enter
     wait_for 'continuing automatically'
-    wait_record assistant "[faux/echo] ${initial}-quit"
     wait_record assistant '[faux/echo] after-quit'
+    if grep -Fq "\"role\":\"assistant\",\"content\":\"[faux/echo] ${initial}-quit\"" "${journal}"; then
+      fail 'the saved turn was answered before the queue was placed'
+    fi
     for _ in $(seq 1 50); do if snapshot_is '[]'; then break; fi; sleep 0.1; done
     snapshot_is '[]' || fail 'resumed turn did not drain the persisted queue'
     [ "$(grep -Fc "\"role\":\"user\",\"content\":\"${initial}-quit\"" "${journal}")" = 1 ] || fail 'resume duplicated the interrupted prompt'
