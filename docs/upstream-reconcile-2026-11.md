@@ -71,8 +71,9 @@ Outcomes: **ported** (noel now does what upstream does, with a test),
 
 ### Slices 1-3: fixtures at upstream `main`
 
-Every fixture regenerates at upstream `main` (4b11a722) and has content.
-Fixes to the scripts:
+Every fixture regenerates at upstream `main` and has content: the image
+builds from `Dockerfile.ts-parity` at `main` (7860ff52 at the last run), and
+`make ts-parity-drift` reports no drift. Fixes to the scripts:
 
 - pi-ai dropped its TypeBox re-export (6536f801): seven scripts import
   `Type` from TypeBox itself.
@@ -83,8 +84,13 @@ Fixes to the scripts:
 - `chord-delta.json` is made from Chord v2's delta module at `main`: the
   codec, decode errors, the applier, diffs and canonical JSON. Its v1
   sections (`hash64`, contracts, coverage, fits) are gone with Chord v1.
+- pi-env's exec timeout races the client's own cancel (c96e368e); a
+  cancelled request's `timeout` answer is recorded as `aborted`, so the
+  golden does not depend on which the daemon reads first.
+- The drift diff leaves out the fixtures recorded outside the image (Chord
+  v2's and codemode's); the Chord v2 pin is reported separately.
 - `local-env.json`, `pi-env.json`, `pi-env-ssh.json` and `chord-delta.json`
-  record `ref: main` and the commit; `CHORD_REFERENCE_REF` and the
+  record `ref: main`; `CHORD_REFERENCE_REF` and the
   `/chord-reference` worktree are removed, and the drift job reports Chord v2
   commits after `CHORD2_REFERENCE_REF` instead.
 
@@ -166,7 +172,10 @@ cases are unchanged. `make chord2-interop` passes both ways.
 | c13f6acf, 51313540, dca1f555, df0d88aa, ea0f49a3, 8a3e163b, 2cfab7c2, 3b57ed7e | pi interactive-mode components (selectors, footer, dialogs) | n/a: noel's TUI is its own; no counterpart components |
 | 9a195396 | the changelog shown since the last-seen version | n/a: noel shows no changelog |
 | e6865ec7 | extension loading through jiti | n/a: noel's extensions run in Bun |
-| 5bdf988b | tool call ids over 40 characters replayed to OpenRouter are shortened with a hash | ported: `normalize_openai_chat_tool_call_id` (OpenAI and OpenRouter, by provider or base URL); test `long_tool_call_ids_are_shortened_for_openai_and_openrouter` |
+| 5bdf988b, 7fd1ee050 | tool call ids over 40 characters replayed to OpenRouter shortened with a hash; reverted upstream | already: ported, then reverted with upstream; OpenAI's ids are cut at 40 as before |
+| 566344046 | a stream cut short after the reply had begun is retried | ported: the retryable pattern (`error-classification.json`) |
+| 7860ff528 | the live thinking level is recorded on the branch before each prompt | already: noel keeps the thinking level as session state, not on a branch, so tree navigation cannot restore a stale one |
+| acd059b72 | ctrl+o reaches `!` output shown while the agent works | n/a: the worker refuses `!` while a run is active |
 | 4c992154 | a connection error keeps its underlying cause | ported: `ProviderError::Request` appends the deepest cause (`with_cause_detail`); test against a closed port |
 | c5d39783, 0f4d5e96 | `session-id` instead of `session_id` on OpenAI Responses; prompt cache keys for compatible proxies | recorded: noel passes no session id to providers, so it sends no session-affinity header and no `prompt_cache_key` (non-parity register) |
 | 14b804d8 | `requiresNonNullAssistantContent` compat flag | n/a: noel has no per-model compat flags |
@@ -182,11 +191,15 @@ cases are unchanged. `make chord2-interop` passes both ways.
 | 4b11a722 | a link gone silent without a close reconnects | already: Chord's heartbeat closes it and the client reconnects; test `a_link_gone_silent_without_a_close_is_reconnected` |
 | a7a75a9d | `hideThinkingBlock` applies to the TUI's thinking view | already: the client renders with the shared renderer, which honours it |
 | f0811457 | exit on a repeated signal, SIGHUP or a stalled close | already: SIGTERM and SIGHUP exit at once (`signals.rs`), and the raw-mode TUI reads ctrl+c as a key |
+| 63bc4da65 | a click keeps keyboard focus on the runtime | n/a: noel's TUI has one editor and reads every key itself |
+| 07791d6cc, b58642efa, 72e231bd3, abc14343f, 5043adc98, fe637a5a8, e12dbfc92 | transcript spacing, projects, mark read, tool activity | n/a here: p2 app features, candidates in `docs/p2-audit.md` |
 | others | app features of p2 (sandboxes, files, MCP, subagents, tree, artifacts) | n/a here: candidates in `docs/p2-audit.md`, not gaps |
 
 ## Status
 
 Started 2026-11-06.
 
-- Every slice is done; `make check` and `make e2e` pass.
+- Every slice is done; `make check` and `make e2e` pass. `make
+  ts-parity-drift` against `main` (7860ff52) reports no fixture drift and no
+  Chord v2 commits after the pin.
 - PR #86 (the nightly drift) is superseded by these fixtures.

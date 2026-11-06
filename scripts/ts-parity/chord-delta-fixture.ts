@@ -513,7 +513,6 @@ async function main() {
 				source: {
 					repository: "https://github.com/earendil-works/pi",
 					ref: "main",
-					commit: git("rev-parse", "HEAD"),
 					package: "packages/chord",
 					packageCommit: git("log", "-1", "--format=%H", "HEAD", "--", "packages/chord"),
 					script: fileURLToPath(import.meta.url),

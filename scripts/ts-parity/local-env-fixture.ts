@@ -168,7 +168,6 @@ async function main(): Promise<void> {
 				source: {
 					repository: "https://github.com/earendil-works/pi",
 					ref: "main",
-					commit: git("rev-parse", "HEAD"),
 					package: "packages/durable",
 					envCommit: git(
 						"log",
