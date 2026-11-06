@@ -61,8 +61,12 @@ COPY --from=pi-env-daemon /pi-env/pi-env /usr/local/bin/pi-env
 # cache; a pinned global tsx keeps them offline and reproducible.
 ARG TSX_VERSION=4.23.15
 RUN npm install -g --no-audit --no-fund "tsx@${TSX_VERSION}"
+# tool-search-fixture.ts mocks modules with Bun's plugin API.
+ARG BUN_VERSION=1.4.4
+RUN npm install -g --no-audit --no-fund "bun@${BUN_VERSION}"
 COPY scripts/ts-parity /ts-parity
 
 # pi-env-fixture.ts and pi-env-ssh-fixture.ts load upstream's packages from
 # their sources (`source` export condition) with Node's own type stripping.
-CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do case \"$fixture\" in */pi-env-fixture.ts|*/pi-env-ssh-fixture.ts) node --conditions=source \"$fixture\" /fixtures ;; *) npx tsx \"$fixture\" /fixtures ;; esac; done"]
+# codemode's fixtures take the reference checkout as well; tool-search's runs in Bun.
+CMD ["sh", "-c", "for fixture in /ts-parity/*-fixture.ts; do case \"$fixture\" in */pi-env-fixture.ts|*/pi-env-ssh-fixture.ts) node --conditions=source \"$fixture\" /fixtures ;; */codemode-declarations-fixture.ts) npx tsx \"$fixture\" /ts-reference /fixtures ;; */tool-search-fixture.ts) bun \"$fixture\" /ts-reference /fixtures ;; *) npx tsx \"$fixture\" /fixtures ;; esac; done"]
