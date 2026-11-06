@@ -188,7 +188,8 @@ restart_fixture "${work_dir}/direct.jsonl"
 wait_for completed-direct-read-marker
 absent 'resumed mid-turn'
 # Model-linked results resume automatically without a synthetic user prompt
-# or replaying saved/uncertain tools. Queued prompts follow the saved turn.
+# or replaying saved/uncertain tools. Queued prompts are placed first, as
+# Durable's continue places them, and the model answers once.
 cat > "${work_dir}/unfinished.jsonl" <<'JSONL'
 {"type":"started","session_id":"unfinished","cwd":"."}
 {"type":"message","message":{"role":"user","content":"inspect fixture","tool_calls":[],"media":[]}}
@@ -199,8 +200,8 @@ JSONL
 restart_fixture "${work_dir}/unfinished.jsonl"
 wait_for 'resumed mid-turn'
 wait_for 'continuing automatically'
-wait_for '[faux/echo] inspect fixture'
 wait_for_pair '[faux/echo] first-resumed-followup' 'second-resumed-followup'
+absent '[faux/echo] inspect fixture'
 [ "$(grep -Fc '"role":"user"' "${work_dir}/unfinished.jsonl")" = 2 ] || fail 'resume inserted a synthetic user prompt'
 grep -Fq '"type":"queued_messages_snapshot","messages":[]' "${work_dir}/unfinished.jsonl" || fail 'resume did not drain follow-ups'
 [ "$(grep -Fc '"role":"tool"' "${work_dir}/unfinished.jsonl")" = 1 ] || fail 'resume reran a saved tool result'
@@ -232,6 +233,8 @@ for route in command selector select-message; do
 done
 # Interrupted/quit resumed runs must not schedule themselves again. A pending
 # development rebuild must not turn an intentional stop into another resume.
+# The resume is Durable's continue, which placed the queued follow-up into the
+# run it stopped: it is answered by no reply and not queued again.
 long_resume="resume-interruption-$(printf 'x%.0s' $(seq 1 250))"
 for stop in interrupt quit; do
   printf '{"type":"started","session_id":"%s","cwd":"."}\n{"type":"message","message":{"role":"user","content":"%s","tool_calls":[],"media":[]}}\n{"type":"queued_messages_snapshot","messages":["retained-after-resume-stop"]}\n' "${stop}" "${long_resume}" > "${work_dir}/${stop}.jsonl"
@@ -244,15 +247,17 @@ for stop in interrupt quit; do
     wait_for interrupted
     touch "${work_dir}/watched-restart"
     sleep 2.5
-    wait_for '❯ retained-after-resume-stop'
     absent 'esc to interrupt'
+    absent '❯ retained-after-resume-stop'
     absent 'resume-fixture-shell'
     tmux send-keys -t "${session}" '/quit' Enter
   else
     tmux send-keys -t "${session}" '/quit' Enter
   fi
   wait_for resume-fixture-shell
-  [ "$(grep -Fc '"role":"user"' "${work_dir}/${stop}.jsonl")" = 1 ] || fail 'resumed stop drained a follow-up'
+  [ "$(grep -Fc '"role":"user"' "${work_dir}/${stop}.jsonl")" = 2 ] || fail 'the resumed run did not place its follow-up once'
+  grep -Fq '"content":"retained-after-resume-stop"' "${work_dir}/${stop}.jsonl" || fail 'the follow-up was not placed'
+  grep -Fq '"type":"queued_messages_snapshot","messages":[]' "${work_dir}/${stop}.jsonl" || fail 'the placed follow-up is still queued'
   # What the stopped reply had streamed is kept as an aborted reply; no
   # reply may have completed.
   if grep -F '"role":"assistant"' "${work_dir}/${stop}.jsonl" | grep -Fvq '"aborted":true'; then fail 'resumed stop retried generation'; fi

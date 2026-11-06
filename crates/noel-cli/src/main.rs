@@ -3457,11 +3457,11 @@ fn close_tui_terminal(
     Ok(())
 }
 
-/// Infer unfinished model work, not its stop reason. Direct slash-tool
-/// results have no call id and complete their turn without an assistant reply.
-fn resume_hint(runtime: &Runtime) -> Option<String> {
-    let queued = runtime.session().queued_messages.len();
-    let mid_turn = runtime.session().has_unfinished_turn();
+/// What opening a session says of its saved work: a turn the saved context
+/// left unfinished (direct slash-tool results have no call id and complete
+/// their turn without an assistant reply) continues, with what is queued
+/// placed first (Durable's `continue`).
+pub(crate) fn resume_hint(mid_turn: bool, queued: usize) -> Option<String> {
     match (mid_turn, queued) {
         (false, 0) => None,
         (true, 0) => {
@@ -3471,7 +3471,7 @@ fn resume_hint(runtime: &Runtime) -> Option<String> {
             "{n} queued message(s) pending; they run after your next prompt (/queue to list, /queue-clear to clear)"
         )),
         (true, n) => Some(format!(
-            "resumed mid-turn; continuing automatically from saved context, then {n} queued message(s)"
+            "resumed mid-turn; continuing automatically from saved context with {n} queued message(s) first"
         )),
     }
 }
@@ -11314,9 +11314,7 @@ mod tests {
     #[test]
     fn resume_hint_flags_interrupted_turns_and_pending_queue() {
         let mut session = SessionState::new("session-1", PathBuf::from("."));
-        assert!(
-            resume_hint(&Runtime::new(session.clone(), ReloadableSystems::default())).is_none()
-        );
+        assert!(hint_of(&session).is_none());
 
         session.messages.push(ConversationMessage {
             thinking: String::new(),
@@ -11328,16 +11326,19 @@ mod tests {
             tool_calls: Vec::new(),
             aborted: false,
         });
-        let hint = resume_hint(&Runtime::new(session.clone(), ReloadableSystems::default()))
-            .expect("mid-turn hint");
+        let hint = hint_of(&session).expect("mid-turn hint");
         assert!(hint.contains("mid-turn"));
         assert!(hint.contains("continuing automatically"));
 
         session.queued_messages = vec!["follow up".to_string()];
-        let hint = resume_hint(&Runtime::new(session, ReloadableSystems::default()))
-            .expect("mid-turn and queue hint");
+        let hint = hint_of(&session).expect("mid-turn and queue hint");
         assert!(hint.contains("mid-turn"));
-        assert!(hint.contains("1 queued"));
+        // Durable's continue places the queue first.
+        assert!(hint.contains("with 1 queued message(s) first"), "{hint}");
+    }
+
+    fn hint_of(session: &SessionState) -> Option<String> {
+        resume_hint(session.has_unfinished_turn(), session.queued_messages.len())
     }
 
     #[tokio::test]
@@ -11370,13 +11371,8 @@ mod tests {
             runtime.session().messages.last().unwrap().role,
             MessageRole::Tool
         );
-        let (store, state) = SessionStore::open(path).unwrap();
-        assert!(resume_hint(&Runtime::with_store(
-            state,
-            ReloadableSystems::default(),
-            store
-        ))
-        .is_none());
+        let (_store, state) = SessionStore::open(path).unwrap();
+        assert!(hint_of(&state).is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

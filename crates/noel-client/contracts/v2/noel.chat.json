@@ -333,6 +333,9 @@
         "resume": {
           "args": {
             "type": "object",
+            "required": [
+              "expectedRunId"
+            ],
             "properties": {
               "expectedRunId": {
                 "type": "string"
