@@ -1,0 +1,209 @@
+{
+  "name": "noel.accounts",
+  "version": 1,
+  "host": "server",
+  "params": [],
+  "variants": {
+    "owner": {
+      "state": {
+        "accounts": {
+          "type": "object",
+          "required": [
+            "providers",
+            "logins"
+          ],
+          "properties": {
+            "providers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "provider",
+                  "accounts"
+                ],
+                "properties": {
+                  "provider": {
+                    "type": "string"
+                  },
+                  "accounts": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "name",
+                        "kind"
+                      ],
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "kind": {
+                          "enum": [
+                            "api_key",
+                            "oauth"
+                          ]
+                        },
+                        "limitedUntil": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  },
+                  "current": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "logins": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "loginId",
+                  "provider",
+                  "account",
+                  "status"
+                ],
+                "properties": {
+                  "loginId": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "account": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "enum": [
+                      "waiting",
+                      "done",
+                      "failed"
+                    ]
+                  },
+                  "error": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "methods": {
+        "login": {
+          "args": {
+            "type": "object",
+            "required": [
+              "provider",
+              "account"
+            ],
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "account": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "loginId",
+              "kind"
+            ],
+            "properties": {
+              "loginId": {
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "device",
+                  "code",
+                  "key"
+                ]
+              },
+              "url": {
+                "type": "string"
+              },
+              "userCode": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "finishLogin": {
+          "args": {
+            "type": "object",
+            "required": [
+              "loginId"
+            ],
+            "properties": {
+              "loginId": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "provider",
+              "account",
+              "replaced"
+            ],
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "account": {
+                "type": "string"
+              },
+              "replaced": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "logout": {
+          "args": {
+            "type": "object",
+            "required": [
+              "provider",
+              "account"
+            ],
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "account": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "removed"
+            ],
+            "properties": {
+              "removed": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

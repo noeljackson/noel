@@ -1392,9 +1392,18 @@ pub enum SavedProgress {
 /// What `record` adds to the session's history, if anything.
 fn history_record(record: &SessionRecord) -> Option<history::HistoryRecord> {
     Some(match record {
-        SessionRecord::Message { message, ts, .. } => history::HistoryRecord::Message {
+        SessionRecord::Message {
+            message,
+            ts,
+            placed,
+            ..
+        } => history::HistoryRecord::Message {
             message: message.clone(),
             timestamp: *ts,
+            queued: placed.first().map(|id| match id.mode {
+                QueueMode::Steer => "steer",
+                QueueMode::FollowUp => "followUp",
+            }),
         },
         SessionRecord::MessagesSnapshot { messages } => history::HistoryRecord::Reset {
             messages: messages.len(),
@@ -2126,6 +2135,7 @@ impl SessionStore {
                 .map(|message| history::HistoryRecord::Message {
                     message,
                     timestamp: None,
+                    queued: None,
                 })
                 .collect());
         }
@@ -6216,6 +6226,12 @@ pub async fn run_excluded_bash_result(
 struct ParsedToolCommand {
     name: String,
     request: ToolRequest,
+}
+
+/// Whether `prompt` is a slash-tool command (`/read path`, ...), which runs
+/// the tool directly instead of asking the model; a malformed one counts.
+pub fn is_tool_command(prompt: &str) -> bool {
+    !matches!(parse_tool_command(prompt), Ok(None))
 }
 
 fn parse_tool_command(prompt: &str) -> Result<Option<ParsedToolCommand>, AgentError> {

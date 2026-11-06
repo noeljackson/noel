@@ -23,6 +23,9 @@ pub enum HistoryRecord {
         message: ConversationMessage,
         /// Milliseconds since the epoch, for records that saved one.
         timestamp: Option<u64>,
+        /// Placed from the queue (follow-ups or steering, joined): how
+        /// they were queued, `steer` or `followUp`.
+        queued: Option<&'static str>,
     },
     /// The context was compacted: earlier messages are summarized.
     Compaction(CompactionRecord),
@@ -54,6 +57,8 @@ pub enum EntryKind {
     Message {
         kind: &'static str,
         message: Value,
+        /// A user message placed from the queue (`data: {queued: mode}`).
+        queued: Option<&'static str>,
     },
     Compaction {
         reason: &'static str,
@@ -69,8 +74,16 @@ pub enum EntryKind {
 impl Entry {
     pub fn to_json(&self) -> Value {
         let mut entry = match &self.kind {
-            EntryKind::Message { kind, message } => {
-                json!({"id": self.id, "kind": kind, "model": [message]})
+            EntryKind::Message {
+                kind,
+                message,
+                queued,
+            } => {
+                let mut entry = json!({"id": self.id, "kind": kind, "model": [message]});
+                if let Some(mode) = queued {
+                    entry["data"] = json!({"queued": mode});
+                }
+                entry
             }
             EntryKind::Compaction {
                 reason,
@@ -144,7 +157,11 @@ impl History {
         }
         let id = self.next_id();
         let (timestamp, kind) = match record {
-            HistoryRecord::Message { message, timestamp } => (
+            HistoryRecord::Message {
+                message,
+                timestamp,
+                queued,
+            } => (
                 *timestamp,
                 EntryKind::Message {
                     kind: match message.role {
@@ -160,6 +177,7 @@ impl History {
                             .as_ref()
                             .is_some_and(|id| self.failed_calls.contains(id)),
                     ),
+                    queued: *queued,
                 },
             ),
             HistoryRecord::Compaction(record) => (
@@ -246,6 +264,7 @@ mod tests {
                 aborted: false,
             },
             timestamp: Some(7),
+            queued: None,
         }
     }
 

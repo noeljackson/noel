@@ -1,0 +1,14 @@
+user> look at the notes
+thinking> I should look at the notes.
+assistant> Reading them.
+tool> completed bash
+$ cat notes.txt
+render-file-line-1
+render-file-line-2
+
+assistant> The notes say **two lines**:
+
+- render-file-line-1
+- render-file-line-2
+user> and again
+assistant> Second answer.

@@ -28,6 +28,7 @@
 //!   watch` does.
 //! - An unknown session is an error before the terminal is taken.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,17 +50,24 @@ use crate::{
 /// How long the first view may take: starting a server and a worker.
 const FIRST_VIEW: Duration = Duration::from_secs(30);
 
+/// `quit_ends`: quitting ends the session's run and, with no other client,
+/// the session, as a local `noel` quits (plain `noel` as a client);
+/// otherwise quitting detaches (`--attach`). Returns the session shown last
+/// when the TUI should restart (a rebuilt binary, dogfood).
 pub(crate) async fn run(
     session: &str,
     endpoint: Endpoint,
-    config: LoadedConfig,
+    mut config: LoadedConfig,
     owned_screen: bool,
-) -> Result<()> {
+    quit_ends: bool,
+    no_splash: bool,
+) -> Result<Option<String>> {
     if !valid_session_id(session) {
         return Err(anyhow!("--attach: {session:?} is not a session id"));
     }
     let (sender, mut incoming) = mpsc::unbounded_channel();
     let reports = sender.clone();
+    let local_machine = matches!(endpoint, Endpoint::Local);
     let place = match &endpoint {
         Endpoint::Local => "noel server".to_owned(),
         Endpoint::Ssh { destination, .. } => format!("noel server on {destination}"),
@@ -72,6 +80,235 @@ pub(crate) async fn run(
         }),
     )
     .await?;
+    let (mut follower, first, early) =
+        match first_view(&client, session, &sender, &mut incoming).await {
+            Ok(attached) => attached,
+            Err(error) => {
+                client.close().await;
+                return Err(error);
+            }
+        };
+
+    let (restore, mut terminal, mut viewport_height) = crate::open_tui_terminal(owned_screen)?;
+    let mut app = TuiApp {
+        owned_screen,
+        status: "Ready".to_owned(),
+        ..TuiApp::default()
+    };
+    // A local `noel` greets as it always has; an attach says where it is.
+    let greeting = if quit_ends {
+        let renderer = crate::terminal_renderer(&config);
+        format!(
+            "{}\ntype /help for commands, /reload to reload config, /quit to exit",
+            if no_splash {
+                renderer.banner()
+            } else {
+                renderer.splash()
+            }
+        )
+    } else {
+        format!(
+            "{}\nattached to session {session} on {place} · /help for commands, /quit to detach",
+            crate::terminal_renderer(&config).banner()
+        )
+    };
+    app.push(TuiEntryKind::System, greeting);
+    if let Err(error) = crate::terminal_theme(&config) {
+        app.push(TuiEntryKind::Error, format!("{error}; using system theme"));
+    }
+    let mut session = session.to_owned();
+    let mut first = first;
+    let mut early = early;
+    let mut switched = false;
+    let mut auto_restart = crate::AutoRestart::from_env();
+    // A local `noel` that a signal ends takes its session's worker with it
+    // when no other client holds the session, as its tools would end with
+    // it in process.
+    let local = Arc::new(LocalHolds::default());
+    if quit_ends {
+        let local = local.clone();
+        crate::signals::set_exit_hook(Some(Box::new(move || {
+            if let Some(session) = local.alone() {
+                stop_local_worker(&session);
+            }
+        })));
+    }
+    let result = loop {
+        let mut remote = Remote::new(&session, client.clone(), sender.clone());
+        remote.local_machine = local_machine;
+        if let Ok(mut held) = local.session.lock() {
+            held.clone_from(&session);
+        }
+        remote.local = local.clone();
+        if std::mem::take(&mut switched) {
+            remote.run_command("/session".to_owned());
+        }
+        // What came before the view: starting a server, sending again.
+        for message in std::mem::take(&mut early) {
+            remote.receive(&mut app, message);
+        }
+        // The whole history before the view's window, as reopening a
+        // session shows all of it.
+        if let Err(error) = remote
+            .history
+            .load_earlier(&remote.client, &session, &first)
+            .await
+        {
+            app.push(
+                TuiEntryKind::Error,
+                format!("could not load the earlier history: {error:#}"),
+            );
+        }
+        remote.first(&mut app, first);
+        let ended = remote
+            .drive(
+                &mut app,
+                &mut terminal,
+                &mut viewport_height,
+                &mut config,
+                &mut incoming,
+                &mut auto_restart,
+            )
+            .await;
+        follower.abort();
+        let next = match ended {
+            Ok(Some(next)) => next,
+            Ok(None) if quit_ends => {
+                // As a local quit: the run is aborted, then the session ends
+                // unless another client holds it.
+                if remote.run.is_some() {
+                    let _ = client
+                        .chat_call(&session, "abort", json!({"keepQueue": true}), false)
+                        .await;
+                }
+                let args = json!({"line": "/quit", "requestId": new_request_id()});
+                if let Ok(answer) = client.chat_call(&session, "command", args, false).await {
+                    remote.command_answer(&mut app, "/quit", &answer);
+                    // The session ends with its worker, which lets go of the
+                    // journal: the next `noel` opens it as this one quit it.
+                    // Released first: a hold left would start it again.
+                    if answer["leaving"] == true {
+                        client.close().await;
+                        wait_for_worker_exit(&session).await;
+                    }
+                }
+                break Ok(remote.restart.then(|| session.clone()));
+            }
+            Ok(None) => break Ok(remote.restart.then(|| session.clone())),
+            Err(error) => break Err(error),
+        };
+        // Another session a command named (a fork, a pick): its view, or
+        // back to this one if it cannot be held. A local `noel`'s flags go
+        // with it, as with the session it opened.
+        if quit_ends {
+            match crate::hand_over_flags(&next, true) {
+                Ok(Some(notice)) => app.push(TuiEntryKind::System, notice),
+                Ok(None) => {}
+                Err(error) => app.push(TuiEntryKind::Error, format!("{error:#}")),
+            }
+        }
+        let attached = match first_view(&client, &next, &sender, &mut incoming).await {
+            Ok(attached) => {
+                session = next;
+                Ok(attached)
+            }
+            Err(error) => {
+                app.push(TuiEntryKind::Error, format!("{error:#}"));
+                first_view(&client, &session, &sender, &mut incoming).await
+            }
+        };
+        match attached {
+            Ok((next_follower, next_first, next_early)) => {
+                follower = next_follower;
+                first = next_first;
+                early = next_early;
+                // What was shown stays, as a local switch keeps it; the
+                // session's details follow, as a local switch prints them.
+                switched = true;
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    crate::signals::set_exit_hook(None);
+    crate::close_tui_terminal(terminal, restore, &app)?;
+    client.close().await;
+    result
+}
+
+/// What the signal hook knows of the session's holds.
+#[derive(Default)]
+struct LocalHolds {
+    session: std::sync::Mutex<String>,
+    /// The holds the view last reported (`noel.clients`).
+    holds: AtomicU64,
+    /// This client's calls in flight, each a hold of its own.
+    calls: Arc<AtomicUsize>,
+}
+
+impl LocalHolds {
+    /// The session, when no other client holds it.
+    fn alone(&self) -> Option<String> {
+        let holds = self.holds.load(Ordering::SeqCst);
+        let ours = 1 + self.calls.load(Ordering::SeqCst) as u64;
+        let session = self.session.lock().ok()?.clone();
+        (holds > 0 && holds <= ours && !session.is_empty()).then_some(session)
+    }
+
+    /// Counts a call until the guard drops.
+    fn calling(&self) -> Calling {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Calling(self.calls.clone())
+    }
+}
+
+struct Calling(Arc<AtomicUsize>);
+
+impl Drop for Calling {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Ends the local worker of `session` (SIGTERM: it kills its tools' groups
+/// and exits).
+fn stop_local_worker(session: &str) {
+    let Ok(dir) = crate::server::RuntimeDir::check(crate::server::RuntimeDir::locate()) else {
+        return;
+    };
+    let record = std::fs::read_to_string(dir.worker_record(session))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    if let Some(pid) = record.and_then(|record| record["pid"].as_i64()) {
+        if let Ok(pid) = i32::try_from(pid) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+    }
+}
+
+/// Waits, briefly, for the local worker of `session` to exit: its socket
+/// goes when it does.
+async fn wait_for_worker_exit(session: &str) {
+    let Ok(dir) = crate::server::RuntimeDir::check(crate::server::RuntimeDir::locate()) else {
+        return;
+    };
+    let socket = dir.worker_socket(session);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while socket.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Follows `session` and waits for its first view, keeping what came
+/// before it. An unknown session is an error.
+async fn first_view(
+    client: &Client,
+    session: &str,
+    sender: &mpsc::UnboundedSender<Incoming>,
+    incoming: &mut mpsc::UnboundedReceiver<Incoming>,
+) -> Result<(tokio::task::JoinHandle<anyhow::Error>, Value, Vec<Incoming>)> {
     let mut follower = {
         let (client, session, sender) = (client.clone(), session.to_owned(), sender.clone());
         tokio::spawn(async move {
@@ -82,9 +319,6 @@ pub(crate) async fn run(
                 .await
         })
     };
-
-    // The first view comes before the terminal is taken, so an unknown
-    // session is an error on the plain terminal.
     let mut early = Vec::new();
     let first = tokio::time::timeout(FIRST_VIEW, async {
         loop {
@@ -113,62 +347,13 @@ pub(crate) async fn run(
             FIRST_VIEW.as_secs()
         ))
     });
-    let first = match first {
-        Ok(view) => view,
+    match first {
+        Ok(view) => Ok((follower, view, early)),
         Err(error) => {
             follower.abort();
-            client.close().await;
-            return Err(error);
+            Err(error)
         }
-    };
-
-    let (restore, mut terminal, mut viewport_height) = crate::open_tui_terminal(owned_screen)?;
-    let mut app = TuiApp {
-        owned_screen,
-        status: "Ready".to_owned(),
-        ..TuiApp::default()
-    };
-    app.push(
-        TuiEntryKind::System,
-        format!(
-            "{}\nattached to session {session} on {place} · /help for commands, /quit to detach",
-            crate::terminal_renderer(&config).banner()
-        ),
-    );
-    if let Err(error) = crate::terminal_theme(&config) {
-        app.push(TuiEntryKind::Error, format!("{error}; using system theme"));
     }
-    let mut remote = Remote::new(session, client.clone(), sender);
-    // What came before the view: starting a server, sending again.
-    for message in early {
-        remote.receive(&mut app, message);
-    }
-    // The whole history before the view's window, as reopening a session
-    // shows all of it.
-    if let Err(error) = remote
-        .history
-        .load_earlier(&remote.client, session, &first)
-        .await
-    {
-        app.push(
-            TuiEntryKind::Error,
-            format!("could not load the earlier history: {error:#}"),
-        );
-    }
-    remote.first(&mut app, first);
-    let result = remote
-        .drive(
-            &mut app,
-            &mut terminal,
-            &mut viewport_height,
-            &config,
-            &mut incoming,
-        )
-        .await;
-    follower.abort();
-    crate::close_tui_terminal(terminal, restore, &app)?;
-    client.close().await;
-    result
 }
 
 /// An attach's error, naming an unknown session plainly.
@@ -178,6 +363,82 @@ fn attach_error(session: &str, error: anyhow::Error) -> anyhow::Error {
             anyhow!("no session {session} on noel server (`noel client ls` lists its sessions)")
         }
         _ => anyhow!("could not attach to session {session}: {error}"),
+    }
+}
+
+/// Runs a session command on `noel.sessions` for the TUI showing `session`
+/// (in `cwd`): the session made or deleted, or null when the worker runs it
+/// (deleting `session` itself, importing into a session a worker holds).
+async fn sessions_request(client: &Client, session: &str, cwd: &str, line: &str) -> Result<Value> {
+    let (command, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let rest = rest.trim();
+    let named = |reference: &str| {
+        let reference = reference.to_owned();
+        async move { resolve_listed(client, &reference).await }
+    };
+    match command {
+        "/fork" | "/clone" => {
+            let source = if rest.is_empty() {
+                session.to_owned()
+            } else {
+                named(rest).await?
+            };
+            let args = json!({
+                "requestId": new_request_id(),
+                "sessionId": source,
+                "clone": command == "/clone",
+            });
+            client.sessions_call("fork", args).await
+        }
+        "/import" => {
+            let path = std::path::Path::new(cwd).join(rest);
+            let args = json!({"requestId": new_request_id(), "path": path});
+            match client.sessions_call("import", args).await {
+                // The export of a session a worker holds (this one) goes
+                // in through that worker.
+                Err(error) if format!("{error:#}").contains("in use by another noel process") => {
+                    Ok(Value::Null)
+                }
+                imported => imported,
+            }
+        }
+        _ => {
+            let target = named(rest).await?;
+            if target == session {
+                return Ok(Value::Null);
+            }
+            client
+                .sessions_call("delete", json!({ "sessionId": target }))
+                .await
+        }
+    }
+}
+
+/// The session the server lists under `reference`: its id, the one id it
+/// begins, or its name.
+async fn resolve_listed(client: &Client, reference: &str) -> Result<String> {
+    let directory = client.directory().await?;
+    let sessions = directory["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let id = |session: &Value| session["sessionId"].as_str().unwrap_or_default().to_owned();
+    if let Some(exact) = sessions
+        .iter()
+        .find(|session| session["sessionId"] == reference)
+    {
+        return Ok(id(exact));
+    }
+    let matching = sessions
+        .iter()
+        .filter(|session| {
+            id(session).starts_with(reference) || session["name"].as_str() == Some(reference)
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [one] => Ok(id(one)),
+        [] => Err(anyhow!("no session {reference}")),
+        _ => Err(anyhow!("{reference} names {} sessions", matching.len())),
     }
 }
 
@@ -195,6 +456,8 @@ enum Incoming {
 enum Call {
     /// A submission, with its text.
     Submit(String),
+    /// A slash command for the worker to run, with its line.
+    Command(String),
     /// A withdrawal of a queued submission, with its text; `recall` puts the
     /// text back into an empty draft.
     Withdraw {
@@ -203,8 +466,9 @@ enum Call {
         recall: bool,
     },
     Abort,
-    Configure,
-    Compact,
+    /// A session command `noel.sessions` answers, with its line: the session
+    /// it made, the one it deleted, or `None` to leave it to the worker.
+    Sessions(String),
 }
 
 /// What a key or a command asks of the loop.
@@ -217,6 +481,18 @@ enum Action {
 
 /// The session as the server shows it, and the calls into it.
 struct Remote {
+    /// The server runs on this machine: a login runs here, in the terminal,
+    /// writing the auth file the worker reads; otherwise it runs on the
+    /// server's machine, relayed (`noel.accounts`).
+    local_machine: bool,
+    /// A login the worker asked for, run once the loop has the terminal.
+    login: Option<(String, String)>,
+    /// How many holds the session has and how many are this client's
+    /// calls, for the signal hook.
+    local: Arc<LocalHolds>,
+    /// The last submission sent: the next waits for its answer, so the
+    /// worker queues them in the order typed.
+    last_submit: Option<tokio::task::JoinHandle<()>>,
     session: String,
     client: Client,
     sender: mpsc::UnboundedSender<Incoming>,
@@ -232,12 +508,33 @@ struct Remote {
     saw_tools: bool,
     /// The run an abort was sent for.
     aborting: Option<String>,
+    /// The run this TUI interrupted, noted as locally once it ends.
+    interrupted: Option<String>,
+    /// The binary was rebuilt: the TUI restarts (dogfood).
+    restart: bool,
+    /// The retry last noted (its `at`).
+    retry_noted: Option<u64>,
+    /// The worker's notes shown, by id; `None` until the first view, whose
+    /// notes are old.
+    notices_seen: Option<u64>,
     /// Queued submissions a withdrawal was sent for.
     withdrawing: Vec<String>,
     /// The last run as last shown: `(runId, status)`.
     last_run: Option<(String, String)>,
     /// Why the view is not current: its worker or the server was lost.
     waiting: Option<&'static str>,
+    /// A session a command named, to attach to next.
+    switch_to: Option<String>,
+    /// The model picker's provider layer: each provider's models.
+    provider_layers: std::collections::HashMap<String, Value>,
+    /// Prompts sent to start a run, not answered yet.
+    submitting: usize,
+    /// A run a prompt started that the view has not shown yet.
+    starting: Option<String>,
+    /// The row of the `!` command running on the worker.
+    shell_row: Option<usize>,
+    /// The diff panel's files' diffs, by path, as the worker read them.
+    diff_lines: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Remote {
@@ -252,9 +549,23 @@ impl Remote {
             run: None,
             saw_tools: false,
             aborting: None,
+            interrupted: None,
+            restart: false,
+            retry_noted: None,
+            notices_seen: None,
             withdrawing: Vec::new(),
             last_run: None,
             waiting: None,
+            switch_to: None,
+            diff_lines: std::collections::HashMap::new(),
+            shell_row: None,
+            submitting: 0,
+            starting: None,
+            provider_layers: std::collections::HashMap::new(),
+            last_submit: None,
+            local: Arc::default(),
+            local_machine: false,
+            login: None,
         }
     }
 
@@ -267,7 +578,20 @@ impl Remote {
             }
         }
         self.last_run = last_run(&view);
+        // As `noel` opening a session: a turn its saved context left
+        // unfinished continues once, then what is queued after it.
+        let docs = &view["docs"];
+        let unfinished =
+            docs["noel.turn"]["unfinished"] == true && docs["pi.live"]["run"].is_null();
+        let queued = docs["pi.inbox"]["items"].as_array().map_or(0, Vec::len);
+        let hint = crate::resume_hint(unfinished, queued);
         self.update(app, StateUpdate::Snapshot(view));
+        if let Some(hint) = hint {
+            app.push(TuiEntryKind::System, hint);
+        }
+        if unfinished {
+            self.continue_turn();
+        }
     }
 
     fn receive(&mut self, app: &mut TuiApp, message: Incoming) {
@@ -321,7 +645,65 @@ impl Remote {
         let dirty = first_difference(&self.view, &view);
         self.view = view;
         self.transcript.sync(app, &self.view, dirty);
+        if let Some(count) = self.view["docs"]["noel.clients"]["count"].as_u64() {
+            self.local.holds.store(count, Ordering::SeqCst);
+        }
+        self.note_retry(app);
+        self.note_notices(app);
         self.note_last_run(app);
+    }
+
+    /// Shows the worker's new notes (an account failover's switch).
+    fn note_notices(&mut self, app: &mut TuiApp) {
+        let items = self.view["docs"]["noel.notices"]["items"].as_array();
+        let newest = items
+            .and_then(|items| items.last())
+            .and_then(|item| item["id"].as_u64())
+            .unwrap_or(0);
+        let Some(seen) = self
+            .notices_seen
+            .replace(newest.max(self.notices_seen.unwrap_or(0)))
+        else {
+            return;
+        };
+        for item in items.into_iter().flatten() {
+            if item["id"].as_u64().is_some_and(|id| id > seen) {
+                if let Some(text) = item["text"].as_str() {
+                    app.push(TuiEntryKind::System, text.to_owned());
+                }
+            }
+        }
+    }
+
+    /// Notes each retry the run waits out once, as the in-process TUI
+    /// does: the attempt that failed, the backoff and why.
+    fn note_retry(&mut self, app: &mut TuiApp) {
+        let generation = &self.view["docs"]["pi.live"]["generation"];
+        let retry = &generation["retry"];
+        let Some(error) = retry["error"].as_str() else {
+            return;
+        };
+        let at = retry["at"].as_u64();
+        if at.is_none() || at == self.retry_noted {
+            return;
+        }
+        self.retry_noted = at;
+        let attempt = generation["attempt"]
+            .as_u64()
+            .unwrap_or(2)
+            .saturating_sub(1);
+        let text = match (retry["delayMs"].as_u64(), retry["maxAttempts"].as_u64()) {
+            (Some(delay), Some(most)) => {
+                let delay = if delay >= 1000 {
+                    format!("{}s", delay / 1000)
+                } else {
+                    format!("{delay}ms")
+                };
+                format!("retrying in {delay} (attempt {attempt} of {most}): {error}")
+            }
+            _ => format!("retrying (attempt {attempt}): {error}"),
+        };
+        app.push(TuiEntryKind::System, text);
     }
 
     /// Notes a run that another client's abort or a failure ended; a
@@ -332,7 +714,12 @@ impl Remote {
             return;
         }
         self.last_run.clone_from(&now);
-        let Some((_, status)) = now else { return };
+        let Some((run_id, status)) = now else { return };
+        if status == "aborted" && self.interrupted.as_deref() == Some(run_id.as_str()) {
+            self.interrupted = None;
+            app.push(TuiEntryKind::System, "interrupted");
+            return;
+        }
         match status.as_str() {
             "failed" => app.push(
                 TuiEntryKind::Error,
@@ -358,7 +745,9 @@ impl Remote {
     /// The footer and the panels: the queue from `pi.inbox`, the run and
     /// what it does from `pi.live`, the model from `pi.agent`.
     fn refresh_chrome(&mut self, app: &mut TuiApp, config: &LoadedConfig) {
+        app.show_hardware_cursor = config.settings.show_hardware_cursor.unwrap_or(true);
         let docs = &self.view["docs"];
+        app.todos = serde_json::from_value(docs["noel.todos"]["items"].clone()).unwrap_or_default();
         let live = &docs["pi.live"];
         app.queued_messages = docs["pi.inbox"]["items"]
             .as_array()
@@ -381,11 +770,22 @@ impl Remote {
                 self.aborting = None;
             }
         }
+        let seen = |id: &str| {
+            self.run.as_ref().is_some_and(|(run, _)| run == id)
+                || self.last_run.as_ref().is_some_and(|(run, _)| run == id)
+        };
+        if self.starting.as_deref().is_some_and(seen) {
+            self.starting = None;
+        }
         app.turn_running = self.run.is_some();
         app.turn_saw_tools = self.saw_tools;
         let queued = app.queued_messages.len();
         app.status = if let Some(why) = self.waiting {
             format!("{why}… · /quit to detach")
+        } else if self.run.is_none() && (self.submitting > 0 || self.starting.is_some()) {
+            // Sent, and not shown running yet: as the in-process TUI shows a
+            // prompt it is about to run.
+            "Working...".to_owned()
         } else if let Some((_, started)) = &self.run {
             let status = crate::activity_status(*started, &activity(live), queued);
             if self.aborting.is_some() {
@@ -434,9 +834,10 @@ impl Remote {
         app: &mut TuiApp,
         terminal: &mut TuiTerminal,
         viewport_height: &mut u16,
-        config: &LoadedConfig,
+        config: &mut LoadedConfig,
         incoming: &mut mpsc::UnboundedReceiver<Incoming>,
-    ) -> Result<()> {
+        auto_restart: &mut crate::AutoRestart,
+    ) -> Result<Option<String>> {
         let mut tick = tokio::time::interval(Duration::from_millis(STREAM_RENDER_INTERVAL_MS * 2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         self.refresh_chrome(app, config);
@@ -446,7 +847,7 @@ impl Remote {
             tokio::select! {
                 message = incoming.recv() => {
                     // This holds a sender, so the channel stays open.
-                    let Some(message) = message else { return Ok(()) };
+                    let Some(message) = message else { return Ok(None) };
                     self.receive(app, message);
                     while let Ok(message) = incoming.try_recv() {
                         self.receive(app, message);
@@ -460,7 +861,7 @@ impl Remote {
                             Event::Key(key) if key.kind == KeyEventKind::Press => {
                                 match self.key(key, app, config).await {
                                     Action::None => {}
-                                    Action::Quit => return Ok(()),
+                                    Action::Quit => return Ok(None),
                                     Action::Clear => {
                                         self.clear(app);
                                         crate::clear_terminal_screen(terminal, app.owned_screen)?;
@@ -471,11 +872,17 @@ impl Remote {
                                 crate::handle_transcript_mouse(mouse, app);
                             }
                             Event::Paste(text) => app.paste_text(&text),
-                            Event::Resize(_, _) => crate::resize_tui_viewport(
-                                terminal,
-                                viewport_height,
-                                app.owned_screen,
-                            )?,
+                            Event::Resize(_, _) => {
+                                crate::resize_tui_viewport(
+                                    terminal,
+                                    viewport_height,
+                                    app.owned_screen,
+                                )?;
+                                // As the in-process loop: drawn once at the
+                                // new size, then again below, which places
+                                // the cursor.
+                                crate::redraw_tui(terminal, app, config)?;
+                            }
                             _ => {}
                         }
                     }
@@ -483,6 +890,61 @@ impl Remote {
                     // The spinner moves while a run is active.
                     changed |= app.turn_running || app.quit_armed_since.is_some();
                 }
+            }
+            if let Some(next) = self.switch_to.take() {
+                return Ok(Some(next));
+            }
+            // A login runs on the plain terminal, as locally; the worker then
+            // reloads, so the new account is selectable at once.
+            if let Some((provider, account)) = self.login.take() {
+                let mut surface = crate::TuiSurface {
+                    terminal,
+                    viewport_height,
+                };
+                let login = if self.local_machine {
+                    crate::run_tui_login(&mut surface, app, config, &provider, &account).await
+                } else {
+                    let client = self.client.clone();
+                    let flow = async {
+                        crate::server::client::relay_login(&client, &provider, &account, |kind| {
+                            use std::io::{BufRead, Write};
+                            match kind {
+                                "key" => println!("paste the {provider} API key:"),
+                                _ => println!(
+                                    "after signing in, paste the full code shown (code#state):"
+                                ),
+                            }
+                            let _ = std::io::stdout().flush();
+                            let mut input = String::new();
+                            std::io::stdin().lock().read_line(&mut input)?;
+                            Ok(input.trim().to_owned())
+                        })
+                        .await
+                    };
+                    crate::with_suspended_tui(&mut surface, app, config, flow)
+                        .await
+                        .and_then(|outcome| outcome)
+                };
+                match login {
+                    Ok(line) => {
+                        app.push(TuiEntryKind::System, line);
+                        self.run_command("/reload".to_owned());
+                    }
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+                changed = true;
+            }
+            // A rebuilt `noel` (dogfood) restarts between turns, as the
+            // in-process TUI does: never mid-run or mid-turn.
+            if self.run.is_none()
+                && !app.turn_running
+                && self.view["docs"]["noel.turn"]["unfinished"] != true
+                && auto_restart.should_restart()?
+            {
+                app.push(TuiEntryKind::System, "rebuilt; restarting");
+                crate::redraw_tui(terminal, app, config)?;
+                self.restart = true;
+                return Ok(None);
             }
             if changed {
                 self.refresh_chrome(app, config);
@@ -504,13 +966,28 @@ impl Remote {
 
     // ─── keys ───────────────────────────────────────────────────────────────
 
-    async fn key(&mut self, key: KeyEvent, app: &mut TuiApp, config: &LoadedConfig) -> Action {
+    async fn key(&mut self, key: KeyEvent, app: &mut TuiApp, config: &mut LoadedConfig) -> Action {
         let bindings = crate::keybinding_map(config);
         let name = crate::key_event_name(&key);
         let bound = |action: &str| {
             name.as_deref()
                 .is_some_and(|name| bindings.matches(action, name))
         };
+        if app.selector.is_some() {
+            self.selector_key(key, app, config);
+            return Action::None;
+        }
+        if app.diff_panel.is_some() {
+            let lines = &self.diff_lines;
+            let handled = crate::diff_panel_key(&key, app, |entry| crate::DiffDetail {
+                path: entry.path.clone(),
+                lines: lines.get(&entry.path).cloned().unwrap_or_default(),
+                scroll: 0,
+            });
+            if handled {
+                return Action::None;
+            }
+        }
         if bound("newline") {
             app.insert_input_newline();
             app.quit_armed_since = None;
@@ -541,10 +1018,7 @@ impl Remote {
         }
         app.quit_armed_since = None;
         if bound("paste-image") {
-            app.push(
-                TuiEntryKind::System,
-                "images are not available when attached",
-            );
+            crate::paste_clipboard_image(app, config).await;
             return Action::None;
         }
         if bound("expand") {
@@ -576,7 +1050,7 @@ impl Remote {
             return Action::None;
         }
         if bound("steer") {
-            return self.enter(app, config, true);
+            return self.enter(app, config, true).await;
         }
         match key.code {
             KeyCode::Esc if app.turn_running => self.abort(),
@@ -591,7 +1065,7 @@ impl Remote {
             }
             KeyCode::Up => app.history_previous(),
             KeyCode::Down => app.history_next(),
-            KeyCode::Enter => return self.enter(app, config, false),
+            KeyCode::Enter => return self.enter(app, config, false).await,
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.push_input_char(ch)
             }
@@ -602,14 +1076,37 @@ impl Remote {
 
     /// Sends the draft: a command, or a submission. While a run is active a
     /// submission is a follow-up, or with the steer key a steer.
-    fn enter(&mut self, app: &mut TuiApp, config: &LoadedConfig, steer: bool) -> Action {
+    async fn enter(&mut self, app: &mut TuiApp, config: &mut LoadedConfig, steer: bool) -> Action {
+        // As locally: a draft with images waits while a run is active (they
+        // are not queued), and is sent once idle.
+        if app.turn_running && !app.input_media.is_empty() {
+            return Action::None;
+        }
         let line = app.input.trim().to_owned();
+        let media = std::mem::take(&mut app.input_media);
         app.clear_input();
+        app.input_media = media;
+        // As locally: an image alone has a default prompt.
+        let line = if line.is_empty() && !app.input_media.is_empty() {
+            "Describe this image.".to_owned()
+        } else {
+            line
+        };
         if line.is_empty() {
             return Action::None;
         }
+        if let Some(lines) = app.multiline.as_mut() {
+            if line == "." {
+                let prompt = lines.join("\n");
+                app.multiline = None;
+                self.prompt(app, prompt, steer);
+            } else {
+                lines.push(line);
+            }
+            return Action::None;
+        }
         if line.starts_with('/') || line.starts_with('!') {
-            return self.command(&line, app, config, steer);
+            return self.command(&line, app, config, steer).await;
         }
         self.prompt(app, line, steer);
         Action::None
@@ -622,31 +1119,32 @@ impl Remote {
             (true, true) => "steer",
             (true, false) => "followUp",
         };
-        self.submit(text, when_busy);
+        let images = std::mem::take(&mut app.input_media)
+            .into_iter()
+            .map(|media| json!({"data": media.data_base64, "mimeType": media.mime_type}))
+            .collect();
+        self.submit(text, images, when_busy);
     }
 
     /// A slash command. What has a meaning for the session is a call; what
     /// acts on this process's own session is not available; anything else
     /// is a prompt, which the worker expands as `noel` would (a skill, a
     /// template, a tool command such as `/bash`).
-    fn command(
+    async fn command(
         &mut self,
         line: &str,
         app: &mut TuiApp,
-        config: &LoadedConfig,
+        config: &mut LoadedConfig,
         steer: bool,
     ) -> Action {
-        let (name, rest) = match line.split_once(char::is_whitespace) {
-            Some((name, rest)) => (name, rest.trim()),
-            None => (line, ""),
-        };
+        let name = line.split_whitespace().next().unwrap_or(line);
         match name {
             "/quit" | "/exit" | "/q" => return Action::Quit,
             "/clear" => return Action::Clear,
             "/help" => app.push(
                 TuiEntryKind::System,
                 format!(
-                    "{}\n\nattached to session {}: /model <provider/id>, /thinking <level>, /compact, /queue, /queue-clear, /interrupt and prompts reach the session; commands for this process's own sessions, settings and accounts are not available",
+                    "{}\n\nattached to session {}: commands run on the session's worker",
                     crate::terminal_renderer(config).help(),
                     self.session
                 ),
@@ -657,90 +1155,273 @@ impl Remote {
                 crate::format_history(&app.editor_state),
             ),
             "/status" => app.push(TuiEntryKind::System, format!("status\t{}", app.status)),
-            "/session" => app.push(TuiEntryKind::System, self.describe()),
-            "/app" => app.push(
-                TuiEntryKind::System,
-                crate::open_desktop_app(&self.session),
-            ),
+            "/app" => app.push(TuiEntryKind::System, crate::open_desktop_app(&self.session)),
+            // The theme is this terminal's.
+            "/theme" if line != "/theme" => {
+                let name = line.trim_start_matches("/theme").trim();
+                match crate::persist_theme(config, name) {
+                    Ok(name) => app.push(TuiEntryKind::System, format!("theme: {name}")),
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+            }
+            "/accent" if line != "/accent" => {
+                let color = line.trim_start_matches("/accent").trim();
+                match crate::persist_accent(config, color) {
+                    Ok(()) => app.push(TuiEntryKind::System, format!("accent: {color}")),
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+            }
+            "/diff" if app.diff_panel.is_some() => app.diff_panel = None,
+            "/changelog" => app.push(TuiEntryKind::System, crate::format_changelog()),
+            "/themes" => app.push(TuiEntryKind::System, crate::format_themes(config)),
+            "/theme" => {
+                let items = crate::theme_names(config).into_iter().map(|name| {
+                    let active = config.settings.theme.as_deref().unwrap_or("system") == name
+                        || (name == "system"
+                            && config.settings.theme.as_deref() == Some("default"));
+                    json!({"label": name, "value": name, "active": active})
+                });
+                let selector = json!({
+                    "kind": "theme",
+                    "title": "theme",
+                    "items": items.collect::<Vec<_>>(),
+                });
+                if let Some(selector) = crate::TuiSelectorState::from_json(&selector) {
+                    app.push(TuiEntryKind::System, format!("{} selector", selector.title));
+                    app.selector = Some(selector);
+                }
+            }
             "/copy" if app.transcript_view.borrow().has_selection() => {
                 app.transcript_view.get_mut().request_copy();
             }
-            "/model" if !rest.is_empty() => self.call(Call::Configure, json!({"model": rest})),
-            "/model" | "/models" | "/scoped-models" => app.push(
-                TuiEntryKind::System,
-                "when attached, /model names the model: /model <provider/id>",
-            ),
-            "/thinking" if !rest.is_empty() => {
-                self.call(Call::Configure, json!({"thinkingLevel": rest}))
-            }
-            "/thinking" => app.push(
-                TuiEntryKind::System,
-                format!(
-                    "thinking: {}",
-                    self.view["docs"]["pi.agent"]["thinkingLevel"]
-                        .as_str()
-                        .unwrap_or("-")
-                ),
-            ),
-            "/compact" => {
-                let mut args = json!({});
-                if !rest.is_empty() {
-                    args["instructions"] = json!(rest);
+            "/copy" => {
+                let last = entries(&self.view)
+                    .iter()
+                    .rev()
+                    .map(message_of)
+                    .find(|message| message["role"] == "assistant")
+                    .map(|message| blocks(message, "text"));
+                match last {
+                    None => app.push(TuiEntryKind::System, "no assistant message"),
+                    Some(text) => {
+                        let copied = crate::clipboard::copy_text(&text).await;
+                        match copied {
+                            Ok(status) => {
+                                app.push(TuiEntryKind::System, format!("{text}\n{status}"))
+                            }
+                            Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                        }
+                    }
                 }
-                self.call(Call::Compact, args);
             }
-            "/queue" if rest.is_empty() => {
-                let queued = inbox(&self.view);
+            // The external editor is this terminal's.
+            "/editor" => {
+                let initial = line.trim_start_matches("/editor").trim();
+                match crate::read_external_editor_prompt(initial) {
+                    Ok(prompt) if !prompt.trim().is_empty() => self.prompt(app, prompt, steer),
+                    Ok(_) => app.push(TuiEntryKind::System, "editor returned an empty prompt"),
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+            }
+            "/multiline" => {
+                app.multiline = Some(Vec::new());
                 app.push(
                     TuiEntryKind::System,
-                    if queued.is_empty() {
-                        "no queued submissions".to_owned()
-                    } else {
-                        queued
-                            .iter()
-                            .enumerate()
-                            .map(|(index, (_, mode, text))| format!("{}. {mode}: {text}", index + 1))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    },
+                    "enter multiline prompt; submit . on its own line",
                 );
             }
-            "/queue-clear" => {
-                for (id, _, text) in inbox(&self.view) {
-                    self.withdraw(id, text, false);
+            // While a run is active, as the in-process TUI does mid-turn.
+            "/queue" if app.turn_running && line == "/queue" => {
+                let pending = inbox(&self.view);
+                if pending.is_empty() {
+                    app.push(TuiEntryKind::System, "no pending follow-ups");
+                } else {
+                    let list = pending
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (_, _, text))| format!("{}. {text}", index + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    app.push(TuiEntryKind::System, format!("pending follow-ups:\n{list}"));
                 }
             }
-            "/interrupt" => self.call(Call::Abort, json!({})),
-            _ if is_prompt_command(line, name) => self.prompt(app, line.to_owned(), steer),
-            _ => app.push(
+            "/queue" if app.turn_running => {
+                let text = line.trim_start_matches("/queue").trim();
+                if !text.is_empty() {
+                    self.submit(text.to_owned(), Vec::new(), "followUp");
+                }
+            }
+            "/todos" if app.turn_running => app.todos_expanded = !app.todos_expanded,
+            "/queue-clear" if app.turn_running => {
+                let pending = inbox(&self.view);
+                let cleared = pending.len();
+                for (id, _, text) in pending {
+                    self.withdraw(id, text, false);
+                }
+                app.push(
+                    TuiEntryKind::System,
+                    format!("cleared {cleared} pending follow-up(s)"),
+                );
+            }
+            "/interrupt" if app.turn_running => self.call(Call::Abort, json!({"keepQueue": true})),
+            "!!" if app.last_shell_command.is_none() => {
+                app.push(TuiEntryKind::System, "no previous shell command")
+            }
+            "!" if line == "!" => app.push(TuiEntryKind::System, "usage: ! <command>"),
+            _ if name.starts_with('!') => {
+                match crate::resolve_bang_command(line, &app.last_shell_command) {
+                    Some(command) if !app.turn_running && self.shell_row.is_none() => {
+                        app.last_shell_command = Some(command.clone());
+                        app.previews_expanded = false;
+                        self.shell_row = Some(app.push_placeholder(
+                            TuiEntryKind::Tool,
+                            crate::format_bash_running(&command),
+                        ));
+                        self.run_command(format!("!{command}"));
+                    }
+                    Some(_) => app.push(
+                        TuiEntryKind::System,
+                        "! commands wait for the run to settle",
+                    ),
+                    None => self.prompt(app, line.to_owned(), steer),
+                }
+            }
+            "/image" if line == "/image" => {
+                app.push(TuiEntryKind::System, "usage: /image <path> [prompt]")
+            }
+            "/image" => {
+                let rest = line.trim_start_matches("/image").trim();
+                let (path, prompt) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                let cwd = std::env::current_dir().unwrap_or_default();
+                match crate::load_media_input(&cwd, std::path::Path::new(path), config) {
+                    Ok(media) => {
+                        app.push(TuiEntryKind::System, crate::format_media_fallback(&media));
+                        app.input_media.push(media);
+                        if !prompt.trim().is_empty() {
+                            self.prompt(app, prompt.trim().to_owned(), steer);
+                        }
+                    }
+                    Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                }
+            }
+            // While a run is active a prompt-like command queues as a
+            // prompt; otherwise the worker runs it as `noel` would (an
+            // extension's command, a skill, a template, a tool command).
+            _ if app.turn_running && is_prompt_command(line, name) => {
+                self.prompt(app, line.to_owned(), steer)
+            }
+            _ if app.turn_running => app.push(
                 TuiEntryKind::System,
-                format!("{name} is not available when attached"),
+                format!("{line} is not available while a turn is running"),
             ),
+            // Managing sessions is the server's (`noel.sessions`): a fork, a
+            // clone, an import, deleting another session. Deleting the
+            // session shown stays the worker's, which opens a new one.
+            _ if matches!(name, "/fork" | "/clone")
+                || (matches!(name, "/import" | "/delete") && line.trim() != name) =>
+            {
+                self.sessions_command(line.to_owned());
+            }
+            // `/bug` takes the error rows shown here into its report.
+            _ if line.split_whitespace().next() == Some("/bug") => {
+                let errors = app
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind == TuiEntryKind::Error)
+                    .map(|entry| entry.text.clone())
+                    .collect::<Vec<_>>();
+                self.submitting += 1;
+                let args = json!({"line": line, "requestId": new_request_id(), "errors": errors});
+                self.call(Call::Command(line.to_owned()), args);
+            }
+            _ => self.run_command(line.to_owned()),
         }
         Action::None
     }
 
-    fn describe(&self) -> String {
-        let conversation = &self.view["conversation"];
-        let agent = &self.view["docs"]["pi.agent"];
-        let mut lines = vec![
-            format!("session: {}", self.session),
-            format!("cwd: {}", conversation["cwd"].as_str().unwrap_or_default()),
-        ];
-        if let Some(name) = conversation["name"].as_str() {
-            lines.push(format!("name: {name}"));
+    /// Runs `line` on the session's worker; the TUI shows it working until
+    /// the answer, as the in-process TUI blocks on a command.
+    fn run_command(&mut self, line: String) {
+        self.submitting += 1;
+        let args = json!({"line": line, "requestId": new_request_id()});
+        self.call(Call::Command(line), args);
+    }
+
+    /// A key while a selector is open: moving and filtering here, a pick on
+    /// the worker (`/select <kind> <value>`). The model picker's provider
+    /// layer opens that provider's models.
+    fn selector_key(&mut self, key: KeyEvent, app: &mut TuiApp, config: &mut LoadedConfig) {
+        match key.code {
+            KeyCode::Esc => {
+                let mut selector = app.selector.take().expect("selector");
+                if let Some(parent) = selector.parent.take() {
+                    app.selector = Some(*parent);
+                }
+            }
+            KeyCode::Up => app.selector.as_mut().expect("selector").move_selection(-1),
+            KeyCode::Down => app.selector.as_mut().expect("selector").move_selection(1),
+            KeyCode::PageUp => app
+                .selector
+                .as_mut()
+                .expect("selector")
+                .move_selection(-(crate::SELECTOR_PAGE_STEP as isize)),
+            KeyCode::PageDown => app
+                .selector
+                .as_mut()
+                .expect("selector")
+                .move_selection(crate::SELECTOR_PAGE_STEP as isize),
+            KeyCode::Home => app.selector.as_mut().expect("selector").jump_to_start(),
+            KeyCode::End => app.selector.as_mut().expect("selector").jump_to_end(),
+            KeyCode::Backspace => app.selector.as_mut().expect("selector").pop_query_char(),
+            KeyCode::Enter => {
+                let selector = app.selector.take().expect("selector");
+                let Some(item) = selector.selected_item().cloned() else {
+                    app.push(TuiEntryKind::System, "no selector match");
+                    // As locally: only the settings list stays open.
+                    if selector.kind == "settings" {
+                        app.selector = Some(selector);
+                    }
+                    return;
+                };
+                // A settings pick keeps the list open; the worker's answer
+                // redraws it, unless it was closed meanwhile.
+                if selector.kind == "settings" {
+                    self.run_command(format!("/select settings {}", item.value));
+                    app.selector = Some(selector);
+                    return;
+                }
+                if selector.kind == "provider" {
+                    let models = self.provider_layers.get(&item.value).and_then(|items| {
+                        crate::TuiSelectorState::from_json(&json!({
+                            "kind": "model",
+                            "title": format!("model · {}", item.value),
+                            "items": items,
+                        }))
+                    });
+                    match models {
+                        Some(mut models) if !models.items.is_empty() => {
+                            models.parent = Some(Box::new(selector));
+                            app.selector = Some(models);
+                        }
+                        _ => app.push(
+                            TuiEntryKind::System,
+                            format!("no models for {}", item.value),
+                        ),
+                    }
+                } else if matches!(selector.kind.as_str(), "theme" | "themes") {
+                    match crate::persist_theme(config, &item.value) {
+                        Ok(name) => app.push(TuiEntryKind::System, format!("theme: {name}")),
+                        Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
+                    }
+                } else {
+                    self.run_command(format!("/select {} {}", selector.kind, item.value));
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.selector.as_mut().expect("selector").push_query_char(ch)
+            }
+            _ => {}
         }
-        lines.push(format!(
-            "model: {} · thinking: {}",
-            agent["model"].as_str().unwrap_or("-"),
-            agent["thinkingLevel"].as_str().unwrap_or("-")
-        ));
-        lines.push(format!("messages: {}", entries(&self.view).len()));
-        if let Some((run_id, status)) = &self.last_run {
-            lines.push(format!("last run: {run_id} {status}"));
-        }
-        lines.push("attached to noel server".to_owned());
-        lines.join("\n")
     }
 
     // ─── calls ──────────────────────────────────────────────────────────────
@@ -748,16 +1429,28 @@ impl Remote {
     /// Submits `text` with a new `requestId`, sent again with that id while
     /// it fails `unavailable`. A prompt that meets a run another client
     /// started meanwhile is queued after it, as Enter queues during a run.
-    fn submit(&self, text: String, when_busy: &'static str) {
+    fn submit(&mut self, text: String, images: Vec<Value>, when_busy: &'static str) {
+        if when_busy == "reject" {
+            self.submitting += 1;
+        }
         let (client, session, sender) = (
             self.client.clone(),
             self.session.clone(),
             self.sender.clone(),
         );
-        tokio::spawn(async move {
+        let previous = self.last_submit.take();
+        let calling = self.local.calling();
+        self.last_submit = Some(tokio::spawn(async move {
+            let _calling = calling;
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
             let send = |when_busy: &str| {
-                let args =
+                let mut args =
                     json!({"requestId": new_request_id(), "text": text, "whenBusy": when_busy});
+                if !images.is_empty() {
+                    args["images"] = json!(images);
+                }
                 client.chat_call(&session, "submit", args, true)
             };
             let mut result = send(when_busy).await;
@@ -765,26 +1458,69 @@ impl Remote {
                 result = send("followUp").await;
             }
             let _ = sender.send(Incoming::Answer(Call::Submit(text), result));
+        }));
+    }
+
+    /// `/fork [session]`, `/clone [session]`, `/import <path>` or
+    /// `/delete <session>` through `noel.sessions`. A session is named as the
+    /// picker names it: its id, a prefix of it, or its name.
+    fn sessions_command(&mut self, line: String) {
+        self.submitting += 1;
+        let (client, session, sender) = (
+            self.client.clone(),
+            self.session.clone(),
+            self.sender.clone(),
+        );
+        let cwd = self.view["conversation"]["cwd"]
+            .as_str()
+            .unwrap_or("/")
+            .to_owned();
+        tokio::spawn(async move {
+            let result = sessions_request(&client, &session, &cwd, &line).await;
+            let _ = sender.send(Incoming::Answer(Call::Sessions(line), result));
         });
     }
 
-    fn call(&self, call: Call, args: Value) {
+    /// Continues the turn the saved context left unfinished: Durable's
+    /// `continue` submission, which places what is queued first.
+    fn continue_turn(&mut self) {
+        self.submitting += 1;
+        let args = json!({"requestId": new_request_id(), "type": "continue"});
+        self.call(Call::Submit(String::new()), args);
+    }
+
+    fn call(&mut self, call: Call, args: Value) {
         let method = match &call {
             Call::Submit(_) => "submit",
+            Call::Command(_) => "command",
             Call::Withdraw { .. } => "withdraw",
             Call::Abort => "abort",
-            Call::Configure => "configure",
-            Call::Compact => "compact",
+            Call::Sessions(_) => unreachable!("sent by sessions_command"),
         };
         let (client, session, sender) = (
             self.client.clone(),
             self.session.clone(),
             self.sender.clone(),
         );
-        tokio::spawn(async move {
+        // Commands keep their order with submissions (`/queue x`, then a
+        // prompt); the rest go at once.
+        let previous = match &call {
+            Call::Command(_) => self.last_submit.take(),
+            _ => None,
+        };
+        let ordered = matches!(&call, Call::Command(_));
+        let calling = self.local.calling();
+        let task = tokio::spawn(async move {
+            let _calling = calling;
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
             let result = client.chat_call(&session, method, args, false).await;
             let _ = sender.send(Incoming::Answer(call, result));
         });
+        if ordered {
+            self.last_submit = Some(task);
+        }
     }
 
     /// Aborts the active run, once.
@@ -794,7 +1530,11 @@ impl Remote {
             return;
         }
         self.aborting = Some(run_id.clone());
-        self.call(Call::Abort, json!({"expectedRunId": run_id}));
+        self.interrupted = Some(run_id.clone());
+        self.call(
+            Call::Abort,
+            json!({"expectedRunId": run_id, "keepQueue": true}),
+        );
     }
 
     /// Withdraws the last queued submission, to edit it.
@@ -818,6 +1558,20 @@ impl Remote {
     }
 
     fn answer(&mut self, app: &mut TuiApp, call: Call, result: Result<Value>) {
+        if matches!(
+            &call,
+            Call::Submit(_) | Call::Command(_) | Call::Sessions(_)
+        ) {
+            self.submitting = self.submitting.saturating_sub(1);
+            let started = result.as_ref().ok().and_then(|value| {
+                let next = &value["next"];
+                let from_command = (next["type"] == "run").then(|| next["runId"].as_str());
+                value["runId"].as_str().or(from_command.flatten())
+            });
+            if let Some(run_id) = started {
+                self.starting = Some(run_id.to_owned());
+            }
+        }
         if let Call::Withdraw { id, .. } = &call {
             self.withdrawing.retain(|withdrawing| withdrawing != id);
         }
@@ -830,10 +1584,18 @@ impl Remote {
                         self.aborting = None;
                         format!("abort: {error}")
                     }
+                    Call::Sessions(line) => format!("{}: {error:#}", one_line(line)),
                     Call::Withdraw { text, .. } => {
                         format!("withdraw {}: {error}", one_line(text))
                     }
-                    Call::Configure | Call::Compact => error.to_string(),
+                    Call::Command(line) => {
+                        if let Some(row) = self.shell_row.take() {
+                            app.replace_entry(row, format!("failed bash\n{error}"));
+                            app.finish_live_entry();
+                            return;
+                        }
+                        format!("{}: {error}", one_line(line))
+                    }
                 };
                 app.push(TuiEntryKind::Error, message);
                 return;
@@ -841,6 +1603,19 @@ impl Remote {
         };
         match call {
             Call::Submit(_) => {}
+            // The worker's: deleting the session shown.
+            Call::Sessions(line) if value.is_null() => self.run_command(line),
+            Call::Sessions(line) if line.starts_with("/delete") => app.push(
+                TuiEntryKind::System,
+                format!(
+                    "deleted {}",
+                    value["sessionId"].as_str().unwrap_or_default()
+                ),
+            ),
+            Call::Sessions(_) => {
+                self.switch_to = value["sessionId"].as_str().map(str::to_owned);
+            }
+            Call::Command(line) => self.command_answer(app, &line, &value),
             Call::Withdraw { text, recall, .. } => match value["outcome"].as_str() {
                 Some("withdrawn") if recall && app.input.is_empty() => {
                     crate::recall_queued_message(app, text)
@@ -861,21 +1636,105 @@ impl Remote {
                     );
                 }
             }
-            Call::Configure => app.push(
-                TuiEntryKind::System,
-                format!(
-                    "model: {} · thinking: {}",
-                    value["model"].as_str().unwrap_or("-"),
-                    value["thinkingLevel"].as_str().unwrap_or("-")
+        }
+    }
+}
+
+impl Remote {
+    /// What the worker made of a command: its rows, then what to do next.
+    fn command_answer(&mut self, app: &mut TuiApp, line: &str, value: &Value) {
+        let mut entries = value["entries"].as_array().cloned().unwrap_or_default();
+        // A `!` command's result fills the row that showed it running.
+        if let Some(row) = self.shell_row.take() {
+            let text = if entries.is_empty() {
+                String::new()
+            } else {
+                let first = entries.remove(0);
+                first["text"].as_str().unwrap_or_default().to_owned()
+            };
+            app.replace_entry(row, text);
+            app.finish_live_entry();
+        }
+        for entry in &entries {
+            let kind = match entry["kind"].as_str() {
+                Some("error") => TuiEntryKind::Error,
+                Some("tool") => TuiEntryKind::Tool,
+                _ => TuiEntryKind::System,
+            };
+            app.push(kind, entry["text"].as_str().unwrap_or_default());
+        }
+        let next = &value["next"];
+        match next["type"].as_str() {
+            Some("session") => {
+                if let Some(session) = next["session"].as_str() {
+                    if session == self.session {
+                        // The session open here: its details, as locally.
+                        self.run_command("/session".to_owned());
+                    } else {
+                        self.switch_to = Some(session.to_owned());
+                    }
+                }
+            }
+            Some("selector") => match crate::TuiSelectorState::from_json(&next["selector"]) {
+                // A settings pick's list again, after the list was closed.
+                Some(_)
+                    if line.starts_with("/select settings ")
+                        && app
+                            .selector
+                            .as_ref()
+                            .is_none_or(|open| open.kind != "settings") => {}
+                Some(selector) => {
+                    if let Some(layers) = next["selector"]["layers"].as_object() {
+                        self.provider_layers = layers
+                            .iter()
+                            .map(|(provider, items)| (provider.clone(), items.clone()))
+                            .collect();
+                    }
+                    app.selector = Some(selector);
+                }
+                None => app.push(
+                    TuiEntryKind::Error,
+                    "the worker sent an unreadable selector",
                 ),
-            ),
-            Call::Compact => app.push(
-                TuiEntryKind::System,
-                format!(
-                    "compacted: omitted {} message(s), retained {} message(s)",
-                    value["omittedMessages"], value["retainedMessages"]
-                ),
-            ),
+            },
+            Some("diff") => {
+                let mut files = Vec::new();
+                self.diff_lines.clear();
+                for file in next["files"].as_array().into_iter().flatten() {
+                    let path = file["path"].as_str().unwrap_or_default().to_owned();
+                    let lines = file["lines"].as_array().into_iter().flatten();
+                    let lines = lines.filter_map(Value::as_str).map(str::to_owned).collect();
+                    self.diff_lines.insert(path.clone(), lines);
+                    files.push(crate::DiffFileEntry {
+                        path,
+                        added: file["added"].as_u64(),
+                        removed: file["removed"].as_u64(),
+                        untracked: file["untracked"] == true,
+                    });
+                }
+                app.diff_panel = Some(crate::DiffPanelState {
+                    files,
+                    selected: 0,
+                    detail: None,
+                });
+            }
+            Some("draft") if app.input.is_empty() => {
+                crate::recall_queued_message(
+                    app,
+                    next["text"].as_str().unwrap_or_default().to_owned(),
+                );
+                // Its images come back to the draft too, as locally.
+                app.input_media = serde_json::from_value(next["media"].clone()).unwrap_or_default();
+            }
+            // Run once the loop has the terminal: here on this machine, or
+            // relayed from the server's (`noel.accounts`).
+            Some("login") => {
+                self.login = Some((
+                    next["provider"].as_str().unwrap_or_default().to_owned(),
+                    next["account"].as_str().unwrap_or("default").to_owned(),
+                ));
+            }
+            _ => {}
         }
     }
 }
@@ -1085,6 +1944,24 @@ fn entry_rows(entries: &[Value], index: usize) -> Vec<Row> {
                 );
             }
         }
+        // Placed from the queue: each queued text as the in-process TUI
+        // shows it.
+        "user" if record["data"]["queued"].is_string() => {
+            // As locally: steering is a system row, a follow-up a prompt.
+            let (prefix, kind) = if record["data"]["queued"] == "steer" {
+                ("steering>", TuiEntryKind::System)
+            } else {
+                ("queued>", TuiEntryKind::User)
+            };
+            for text in blocks(entry, "text").split(noel_core::STEERING_JOIN) {
+                add(
+                    &mut rows,
+                    kind.clone(),
+                    format!("{prefix} {text}"),
+                    Source::Entry,
+                );
+            }
+        }
         "user" => {
             add(
                 &mut rows,
@@ -1159,14 +2036,6 @@ fn live_rows(live: &Value, entries: &[Value]) -> Vec<Row> {
         blocks(message, "text"),
         Source::Text,
     );
-    if let Some(error) = generation["retry"]["error"].as_str() {
-        add(
-            &mut rows,
-            TuiEntryKind::System,
-            format!("retrying (attempt {}): {error}", generation["attempt"]),
-            Source::Tool,
-        );
-    }
     for tool in live["tools"].as_array().into_iter().flatten() {
         let verb = match tool["status"].as_str() {
             Some("running") => "running",
@@ -1373,6 +2242,7 @@ mod tests {
 
     #[test]
     fn live_rows_show_the_partial_and_running_tools() {
+        // A retry is a note (`note_retry`), not a live row.
         let entries = [json!({"role": "assistant", "content": [
             {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "make"}},
             {"type": "toolCall", "id": "c2", "name": "read", "arguments": {"path": "x"}},
@@ -1396,11 +2266,6 @@ mod tests {
             [
                 (TuiEntryKind::Thinking, "hmm".to_owned(), Source::Thinking),
                 (TuiEntryKind::Assistant, "Hel".to_owned(), Source::Text),
-                (
-                    TuiEntryKind::System,
-                    "retrying (attempt 2): overloaded".to_owned(),
-                    Source::Tool
-                ),
                 (
                     TuiEntryKind::Tool,
                     "running bash\n$ make\nbuilt".to_owned(),

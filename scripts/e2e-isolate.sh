@@ -39,7 +39,7 @@ if [ -z "${NOEL_E2E_ROOT:-}" ]; then
     case "${e2e_var}" in
       *TOKEN* | *SECRET* | *PASSWORD* | *KEY*) ;;
       CARGO_HOME | RUSTUP_HOME) ;;
-      CARGO_* | RUST* | NOEL_BIN | TMPDIR) e2e_env+=("${e2e_var}=${!e2e_var}") ;;
+      CARGO_* | RUST* | NOEL_BIN | NOEL_INPROCESS_BIN | TMPDIR) e2e_env+=("${e2e_var}=${!e2e_var}") ;;
     esac
   done
   exec env -i "${e2e_env[@]}" bash "$0" "$@"

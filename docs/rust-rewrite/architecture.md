@@ -33,7 +33,8 @@ The Rust implementation uses a Cargo workspace with explicit crate boundaries:
   - Binary entrypoint.
   - Argument parsing.
   - Mode dispatch.
-  - Interactive TUI loop.
+  - The TUI, always a client of a session in `noel server` (`attach.rs`).
+  - `noel server`, its session workers and `noel client` (`server/`).
   - Slash command dispatch.
   - Package/config CLI commands.
 - `crates/noel-core`
@@ -151,7 +152,9 @@ There is no file-watch hot module reload.
 
 `noel-cli` dispatches:
 
-- `interactive`: default when stdin is a TTY.
+- `interactive`: default when stdin is a TTY. The session runs in a worker
+  under the local `noel server`, started when none runs, and the TUI attaches
+  to it (`docs/spec.md` §7.4).
 - `print`: `--print` or piped stdin.
 - `json`: `--mode json`.
 - `rpc`: `--mode rpc` with stdin not a TTY.

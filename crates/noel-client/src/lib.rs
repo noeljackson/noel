@@ -79,6 +79,20 @@ pub mod contracts {
         declared(&CELL, include_str!("../contracts/v2/noel.devices.json"))
     }
 
+    /// `noel.accounts`, served by `Server()`: the server machine's provider
+    /// accounts, and logins relayed to a client.
+    pub fn accounts() -> Arc<Contract> {
+        static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
+        declared(&CELL, include_str!("../contracts/v2/noel.accounts.json"))
+    }
+
+    /// `noel.settings`, served by `Server()`: the server machine's user
+    /// settings.
+    pub fn settings() -> Arc<Contract> {
+        static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
+        declared(&CELL, include_str!("../contracts/v2/noel.settings.json"))
+    }
+
     /// `noel.models`, served by `Server()`.
     pub fn models() -> Arc<Contract> {
         static CELL: OnceLock<Arc<Contract>> = OnceLock::new();
@@ -230,6 +244,32 @@ impl Client {
     /// A reference on the server's `noel.models`.
     pub fn models(&self) -> RemoteRef {
         self.host.get(contracts::models(), json!({}))
+    }
+
+    /// Calls a method of a server object (`noel.accounts`, `noel.settings`,
+    /// `noel.sessions`, …) and lets the reference go.
+    pub async fn server_call(
+        &self,
+        contract: Arc<noel_chord::v2::Contract>,
+        method: &str,
+        args: Value,
+    ) -> Result<Value> {
+        let reference = self.host.get(contract, json!({}));
+        let outcome = call(&reference, method, args).await;
+        reference.release();
+        outcome
+    }
+
+    /// A server object's state `name` as it is now.
+    pub async fn server_state(
+        &self,
+        contract: Arc<noel_chord::v2::Contract>,
+        name: &str,
+    ) -> Result<Value> {
+        let reference = self.host.get(contract, json!({}));
+        let value = current(&reference, name).await;
+        reference.release();
+        value
     }
 
     /// A reference on a session's `noel.chat`.

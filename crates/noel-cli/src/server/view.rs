@@ -14,7 +14,8 @@
 //! - `docs["pi.live"]`: a subset of Durable's `pi.live` v3. While a run is
 //!   active, `run` (`{runId, requestId?, inputs, turns}`), `generation`
 //!   (`{attempt, message?, retry?}`, where `message` is the reply's
-//!   committed partial) and `tools` (the round's calls, `{callId, name,
+//!   committed partial and `retry` is `{at, error, delayMs, maxAttempts}`,
+//!   the last two noel's) and `tools` (the round's calls, `{callId, name,
 //!   status, output?, truncated?, entry?}`, with their committed output and,
 //!   once saved, their result's entry); `compactions` (`[{trigger}]`) while
 //!   one runs and `compactionFailure` (`{trigger, error}`) after one failed;
@@ -22,6 +23,13 @@
 //!   without an answer, until the next starts. Otherwise `{}`.
 //! - `docs["pi.inbox"]`: `{items: [{id, mode, content, requestId?}]}`.
 //! - `docs["pi.usage"]`: `{total: {input, output, requests}}`.
+//! - `docs["noel.todos"]`: `{items}`, the session's todo list.
+//! - `docs["noel.turn"]`: `{unfinished}`, whether the saved context ends
+//!   mid-turn; a client opening the session continues it, as `noel` does.
+//! - `docs["noel.notices"]`: `{items: [{id, text}]}`, the newest notes
+//!   (an account failover's switch); a client shows each new one once.
+//! - `docs["noel.clients"]`: `{count}`, the clients holding the session (a
+//!   local `noel` that is the only one ends the session with itself).
 //! - `lastRun`: `get_state.lastRun`.
 //!
 //! Only committed progress is shown: partial replies and tool output come
@@ -51,6 +59,9 @@ pub(crate) fn schema() -> Value {
     super::chat_contract().declaration.variants["participant"].state["view"].clone()
 }
 
+/// How many notes `noel.notices` keeps.
+const NOTICES_KEPT: usize = 20;
+
 /// Entries a view starts with, and the most it holds before the oldest
 /// leave (Durable's `ConversationWindow` defaults).
 pub(crate) const WINDOW_MIN: usize = 50;
@@ -70,6 +81,18 @@ pub(crate) struct View {
     trimmed: usize,
     agent: Value,
     usage: Value,
+    /// `docs["noel.todos"]`: the session's todo list, as the TUI's panel
+    /// shows it.
+    todos: Value,
+    /// `docs["noel.turn"]`: `{unfinished}`, whether the saved context ends
+    /// mid-turn (a client opening the session continues it).
+    turn: Value,
+    /// `docs["noel.notices"]`: `{items: [{id, text}]}`, the newest notes
+    /// for clients to show once (an account failover).
+    notices: Vec<Value>,
+    notices_next: u64,
+    /// `docs["noel.clients"]`: `{count}`, the clients holding the session.
+    clients: usize,
     inbox: Value,
     live: Live,
     last_run: Option<Value>,
@@ -118,7 +141,9 @@ struct Generation {
     attempt: u64,
     text: String,
     thinking: String,
-    retry: Option<(u64, String)>,
+    /// When the next attempt goes out (ms since the epoch), why, the
+    /// backoff, and the most attempts.
+    retry: Option<(u64, String, u64, u64)>,
 }
 
 struct ToolSlot {
@@ -156,6 +181,11 @@ impl View {
             trimmed: 0,
             agent: json!({}),
             usage: json!({}),
+            todos: json!({"items": session.todos}),
+            turn: turn(session),
+            notices: Vec::new(),
+            notices_next: 1,
+            clients: 0,
             inbox: json!({"items": []}),
             live: Live::default(),
             last_run: None,
@@ -187,8 +217,34 @@ impl View {
         self.conversation = conversation(session);
         self.agent = agent;
         self.usage = usage(session);
+        self.todos = json!({"items": session.todos});
+        self.turn = turn(session);
         self.inbox = inbox(queue);
         self.last_run = LastRun::of(runtime).map(|last| to_json(&last));
+        // A failed run keeps its error, which the journal saved with it.
+        if let (Some(last), Some(run)) = (self.last_run.as_mut(), session.runs.last()) {
+            if let Some(failure) = run.failure.as_ref().filter(|f| !f.detail.is_empty()) {
+                last["error"] = json!(failure.detail);
+            }
+        }
+        self.publish();
+    }
+
+    /// How many clients hold the session.
+    pub fn set_clients(&mut self, count: usize) {
+        if count != self.clients {
+            self.clients = count;
+            self.publish();
+        }
+    }
+
+    /// Adds a note for clients to show (the newest few are kept).
+    pub fn notice(&mut self, text: String) {
+        self.notices
+            .push(json!({"id": self.notices_next, "text": text}));
+        self.notices_next += 1;
+        let excess = self.notices.len().saturating_sub(NOTICES_KEPT);
+        self.notices.drain(..excess);
         self.publish();
     }
 
@@ -209,6 +265,8 @@ impl View {
             Event::Turn { event, .. } => self.turn(event),
             Event::CallReturned { session, queue, .. } => {
                 self.usage = usage(session);
+                self.todos = json!({"items": session.todos});
+                self.turn = turn(session);
                 self.inbox = inbox(&queue.items());
                 true
             }
@@ -469,6 +527,8 @@ impl View {
                     retry: Some((
                         super::now_ms() + notice.delay_ms,
                         notice.error_message.clone(),
+                        notice.delay_ms,
+                        notice.max_attempts,
                     )),
                     ..Generation::default()
                 });
@@ -604,8 +664,13 @@ impl View {
             if !content.is_empty() {
                 doc["message"] = json!({"role": "assistant", "content": content});
             }
-            if let Some((at, error)) = &generation.retry {
-                doc["retry"] = json!({"at": at, "error": error});
+            if let Some((at, error, delay, most)) = &generation.retry {
+                doc["retry"] = json!({
+                    "at": at,
+                    "error": error,
+                    "delayMs": delay,
+                    "maxAttempts": most,
+                });
             }
             live.insert("generation".into(), doc);
         }
@@ -685,11 +750,15 @@ impl View {
             }
             self.published_entries = self.entries.len();
         }
-        let docs: [(&'static str, Value); 4] = [
+        let docs: [(&'static str, Value); 8] = [
             ("pi.agent", self.agent.clone()),
             ("pi.live", self.live_json()),
             ("pi.inbox", self.inbox.clone()),
             ("pi.usage", self.usage.clone()),
+            ("noel.todos", self.todos.clone()),
+            ("noel.turn", self.turn.clone()),
+            ("noel.notices", json!({"items": self.notices})),
+            ("noel.clients", json!({"count": self.clients})),
         ];
         for (name, doc) in docs {
             let path = vec![key("docs"), key(name)];
@@ -781,6 +850,10 @@ fn conversation(session: &SessionState) -> Value {
     doc
 }
 
+fn turn(session: &SessionState) -> Value {
+    json!({"unfinished": session.has_unfinished_turn()})
+}
+
 fn usage(session: &SessionState) -> Value {
     let usage = &session.usage;
     json!({"total": {
@@ -847,6 +920,7 @@ mod tests {
         SavedProgress::History(HistoryRecord::Message {
             message,
             timestamp: Some(5),
+            queued: None,
         })
     }
 
@@ -866,6 +940,7 @@ mod tests {
         let history = [HistoryRecord::Message {
             message: message(MessageRole::User, "hello"),
             timestamp: Some(1),
+            queued: None,
         }];
         let mut view = View::new(&session, &history);
         view.refresh(&runtime, json!({"thinkingLevel": "off", "cwd": "/w"}), &[]);
@@ -978,6 +1053,7 @@ mod tests {
             .map(|message| HistoryRecord::Message {
                 message: message.clone(),
                 timestamp: None,
+                queued: None,
             })
             .collect();
         let mut view = View::new(&session, &history);
@@ -1025,6 +1101,7 @@ mod tests {
             .map(|index| HistoryRecord::Message {
                 message: message(MessageRole::User, &index.to_string()),
                 timestamp: None,
+                queued: None,
             })
             .collect();
         let mut view = View::new(&session, &history);

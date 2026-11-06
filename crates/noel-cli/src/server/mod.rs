@@ -20,6 +20,7 @@
 //! peer uid (`via: "device"`), and through the bridge, as the user ssh let
 //! in (`via: "tunnel"`). There is no relay, pairing or guest yet.
 
+pub(crate) mod accounts;
 pub(crate) mod bridge;
 pub(crate) mod client;
 mod djs_plugins;
@@ -121,14 +122,66 @@ pub(crate) struct RuntimeDir {
     root: PathBuf,
 }
 
+/// This user's home directory as the password database names it.
+fn passwd_home() -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: getpwuid_r writes only into `entry` and `buffer`, whose
+    // lengths it is given; `found` points at `entry` or is null.
+    unsafe {
+        let mut entry: libc::passwd = std::mem::zeroed();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let status = libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        );
+        if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr(entry.pw_dir);
+        Some(std::ffi::OsStr::from_bytes(dir.to_bytes()).to_os_string())
+    }
+}
+
+/// `-<hash>` of NOEL_DIR, NOEL_SESSION_DIR and a HOME other than the
+/// user's own (which moves the default agent and session dirs) when any is
+/// set, so each has its own server; empty for the defaults.
+fn scope_suffix() -> String {
+    use sha2::{Digest, Sha256};
+    let dir = std::env::var_os("NOEL_DIR").filter(|dir| !dir.is_empty());
+    let sessions = std::env::var_os(noel_config::ENV_SESSION_DIR).filter(|dir| !dir.is_empty());
+    let own_home = passwd_home();
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .filter(|home| Some(home) != own_home.as_ref());
+    if dir.is_none() && sessions.is_none() && home.is_none() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    for part in [dir, sessions, home] {
+        hasher.update(part.unwrap_or_default().as_encoded_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let hex = digest[..8].iter().map(|byte| format!("{byte:02x}"));
+    format!("-{}", hex.collect::<String>())
+}
+
 impl RuntimeDir {
     pub fn locate() -> PathBuf {
         if let Some(dir) = std::env::var_os(ENV_RUNTIME_DIR).filter(|dir| !dir.is_empty()) {
             return PathBuf::from(dir);
         }
+        // A server serves one agent dir and one session dir: a `noel` with
+        // other ones (NOEL_DIR, NOEL_SESSION_DIR) has its own server, in a
+        // directory named after them next to the default one.
+        let scope = scope_suffix();
         match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
-            Some(dir) => PathBuf::from(dir).join("noel"),
-            None => PathBuf::from(format!("/tmp/noel-{}", own_uid())),
+            Some(dir) => PathBuf::from(dir).join(format!("noel{scope}")),
+            None => PathBuf::from(format!("/tmp/noel-{}{scope}", own_uid())),
         }
     }
 
@@ -216,6 +269,23 @@ impl RuntimeDir {
 
     pub fn worker_record(&self, session: &str) -> PathBuf {
         self.workers().join(format!("{session}.json"))
+    }
+
+    /// The flags of the `noel` that opened the session, for its next
+    /// worker (docs/client-tui-plan.md).
+    pub fn worker_args(&self, session: &str) -> PathBuf {
+        self.workers().join(format!("{session}.args.json"))
+    }
+
+    /// The journal of a session kept outside the session directory
+    /// (`noel --session <path>`): its path, one line.
+    pub fn worker_journal(&self, session: &str) -> PathBuf {
+        self.workers().join(format!("{session}.journal"))
+    }
+
+    /// The flags the session's running worker started with.
+    pub fn worker_applied_args(&self, session: &str) -> PathBuf {
+        self.workers().join(format!("{session}.applied.json"))
     }
 
     pub fn worker_log(&self, session: &str) -> PathBuf {
@@ -371,7 +441,9 @@ pub(crate) fn worker_principal(session: &str, generation: u64) -> Value {
 /// else gets nothing (spec §6, §7.2).
 pub(crate) fn chat_variant(principal: &Value, session: &str) -> Option<&'static str> {
     match principal.get("kind").and_then(Value::as_str) {
-        Some("owner") => Some("participant"),
+        // The server itself (the worker's parent link), which renames and
+        // deletes a session it holds through it (`noel.sessions`).
+        Some("owner") | Some("server") => Some("participant"),
         Some("guest") if principal.get("session").and_then(Value::as_str) == Some(session) => {
             match principal.get("mode").and_then(Value::as_str) {
                 Some("full") => Some("participant"),

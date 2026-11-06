@@ -31,6 +31,218 @@
   "contracts": [
     {
       "declaration": {
+        "name": "noel.accounts",
+        "version": 1,
+        "host": "server",
+        "params": [],
+        "variants": {
+          "owner": {
+            "state": {
+              "accounts": {
+                "type": "object",
+                "required": [
+                  "providers",
+                  "logins"
+                ],
+                "properties": {
+                  "providers": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "provider",
+                        "accounts"
+                      ],
+                      "properties": {
+                        "provider": {
+                          "type": "string"
+                        },
+                        "accounts": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "name",
+                              "kind"
+                            ],
+                            "properties": {
+                              "name": {
+                                "type": "string"
+                              },
+                              "kind": {
+                                "enum": [
+                                  "api_key",
+                                  "oauth"
+                                ]
+                              },
+                              "limitedUntil": {
+                                "type": "integer"
+                              }
+                            }
+                          }
+                        },
+                        "current": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "logins": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "loginId",
+                        "provider",
+                        "account",
+                        "status"
+                      ],
+                      "properties": {
+                        "loginId": {
+                          "type": "string"
+                        },
+                        "provider": {
+                          "type": "string"
+                        },
+                        "account": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "enum": [
+                            "waiting",
+                            "done",
+                            "failed"
+                          ]
+                        },
+                        "error": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "methods": {
+              "login": {
+                "args": {
+                  "type": "object",
+                  "required": [
+                    "provider",
+                    "account"
+                  ],
+                  "properties": {
+                    "provider": {
+                      "type": "string"
+                    },
+                    "account": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "result": {
+                  "type": "object",
+                  "required": [
+                    "loginId",
+                    "kind"
+                  ],
+                  "properties": {
+                    "loginId": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "enum": [
+                        "device",
+                        "code",
+                        "key"
+                      ]
+                    },
+                    "url": {
+                      "type": "string"
+                    },
+                    "userCode": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "finishLogin": {
+                "args": {
+                  "type": "object",
+                  "required": [
+                    "loginId"
+                  ],
+                  "properties": {
+                    "loginId": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "key": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "result": {
+                  "type": "object",
+                  "required": [
+                    "provider",
+                    "account",
+                    "replaced"
+                  ],
+                  "properties": {
+                    "provider": {
+                      "type": "string"
+                    },
+                    "account": {
+                      "type": "string"
+                    },
+                    "replaced": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              "logout": {
+                "args": {
+                  "type": "object",
+                  "required": [
+                    "provider",
+                    "account"
+                  ],
+                  "properties": {
+                    "provider": {
+                      "type": "string"
+                    },
+                    "account": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "result": {
+                  "type": "object",
+                  "required": [
+                    "removed"
+                  ],
+                  "properties": {
+                    "removed": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "fingerprint": "31599b341a5a7ae3"
+    },
+    {
+      "declaration": {
         "name": "noel.chat",
         "version": 1,
         "host": "session",
@@ -289,6 +501,9 @@
                   "properties": {
                     "expectedRunId": {
                       "type": "string"
+                    },
+                    "keepQueue": {
+                      "type": "boolean"
                     }
                   },
                   "additionalProperties": false
@@ -416,12 +631,88 @@
                     }
                   }
                 }
+              },
+              "command": {
+                "args": {
+                  "type": "object",
+                  "required": [
+                    "line"
+                  ],
+                  "properties": {
+                    "errors": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "line": {
+                      "type": "string"
+                    },
+                    "requestId": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "result": {
+                  "type": "object",
+                  "required": [
+                    "entries"
+                  ],
+                  "properties": {
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "text"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "system",
+                              "error",
+                              "tool"
+                            ]
+                          },
+                          "text": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "resumePending": {
+                      "type": "boolean"
+                    },
+                    "next": {
+                      "type": "object",
+                      "required": [
+                        "type"
+                      ],
+                      "properties": {
+                        "type": {
+                          "enum": [
+                            "run",
+                            "repeated",
+                            "selector",
+                            "session",
+                            "login",
+                            "draft",
+                            "diff"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
               }
             }
           }
         }
       },
-      "fingerprint": "5a15a5b7885ce1be"
+      "fingerprint": "7464a70af036b18f"
     },
     {
       "declaration": {
@@ -562,7 +853,9 @@
                         "modelId",
                         "name",
                         "reasoning",
-                        "thinkingLevels"
+                        "thinkingLevels",
+                        "available",
+                        "scoped"
                       ],
                       "properties": {
                         "provider": {
@@ -582,6 +875,15 @@
                           "items": {
                             "type": "string"
                           }
+                        },
+                        "available": {
+                          "type": "boolean"
+                        },
+                        "scoped": {
+                          "type": "boolean"
+                        },
+                        "thinkingLevel": {
+                          "type": "string"
                         }
                       }
                     }
@@ -592,7 +894,7 @@
           }
         }
       },
-      "fingerprint": "9ec1b8bbc2ec18d8"
+      "fingerprint": "d48346ca236a27ad"
     },
     {
       "declaration": {
@@ -1264,6 +1566,12 @@
                               "type": "string"
                             }
                           }
+                        },
+                        "labels": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
                       }
                     }
@@ -1332,6 +1640,97 @@
                     },
                     "sessionId": {
                       "type": "string"
+                    },
+                    "clone": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "result": {
+                  "type": "object",
+                  "required": [
+                    "sessionId",
+                    "created"
+                  ],
+                  "properties": {
+                    "sessionId": {
+                      "type": "string"
+                    },
+                    "created": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              "rename": {
+                "args": {
+                  "type": "object",
+                  "required": [
+                    "sessionId",
+                    "name"
+                  ],
+                  "properties": {
+                    "sessionId": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "result": {
+                  "type": "object",
+                  "required": [
+                    "sessionId"
+                  ],
+                  "properties": {
+                    "sessionId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "delete": {
+                "args": {
+                  "type": "object",
+                  "required": [
+                    "sessionId"
+                  ],
+                  "properties": {
+                    "sessionId": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "result": {
+                  "type": "object",
+                  "required": [
+                    "sessionId"
+                  ],
+                  "properties": {
+                    "sessionId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "import": {
+                "args": {
+                  "type": "object",
+                  "required": [
+                    "requestId",
+                    "path"
+                  ],
+                  "properties": {
+                    "requestId": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "path": {
+                      "type": "string"
                     }
                   },
                   "additionalProperties": false
@@ -1356,7 +1755,66 @@
           }
         }
       },
-      "fingerprint": "0f0f53cdbca05450"
+      "fingerprint": "7abfae6367a2545a"
+    },
+    {
+      "declaration": {
+        "name": "noel.settings",
+        "version": 1,
+        "host": "server",
+        "params": [],
+        "variants": {
+          "owner": {
+            "state": {
+              "settings": {
+                "type": "object",
+                "required": [
+                  "path",
+                  "values"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "values": {
+                    "type": "object"
+                  }
+                }
+              }
+            },
+            "methods": {
+              "set": {
+                "args": {
+                  "type": "object",
+                  "required": [
+                    "key"
+                  ],
+                  "properties": {
+                    "key": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "value": {}
+                  },
+                  "additionalProperties": false
+                },
+                "result": {
+                  "type": "object",
+                  "required": [
+                    "values"
+                  ],
+                  "properties": {
+                    "values": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "fingerprint": "76934f7f6ea983a4"
     },
     {
       "declaration": {
