@@ -126,3 +126,15 @@ fn chord_error_envelopes_are_checked_as_upstream_does() {
         }
     }
 }
+
+/// The kind byte's old-work flag (0x20) belongs to `call` only, and a trace
+/// carrier (0x40) to `hold` and `call`: on another kind upstream's decoder
+/// calls it an unknown kind, and its schema refuses the trace.
+#[test]
+fn old_and_trace_flags_on_other_kinds_are_refused() {
+    // `release` (kind 2) of hold 7.
+    assert!(decode(&[0x02, 0x07]).is_ok());
+    assert!(decode(&[0x02 | 0x20, 0x07]).is_err());
+    // A trace `{}` (length-prefixed JSON) on a release.
+    assert!(decode(&[0x02 | 0x40, 0x02, b'{', b'}', 0x07]).is_err());
+}

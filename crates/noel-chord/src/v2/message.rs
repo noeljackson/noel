@@ -110,6 +110,9 @@ pub enum Message {
         incarnation: Option<String>,
         chain: Option<Vec<String>>,
         limit: Option<u64>,
+        /// The caller's trace carrier (upstream slice 9): an opaque record of
+        /// at most 8 printable-ASCII strings, forwarded by relays as it came.
+        trace: Option<Value>,
     },
     Release {
         origin: Option<u64>,
@@ -122,6 +125,11 @@ pub enum Message {
         method: u64,
         args: Option<Part>,
         segments: Option<Vec<Vec<u8>>>,
+        /// The caller's trace carrier, as on `Hold`.
+        trace: Option<Value>,
+        /// Old work of a reload upstream (`call.old`): honoured only from a
+        /// trusted link. noel's providers never reload, so they ignore it.
+        old: bool,
     },
     Abort {
         origin: Option<u64>,
@@ -312,6 +320,7 @@ impl Message {
                 incarnation,
                 chain,
                 limit,
+                trace,
                 ..
             } => {
                 put("hold", json!(hold));
@@ -332,6 +341,9 @@ impl Message {
                 if let Some(limit) = limit {
                     put("limit", json!(limit));
                 }
+                if let Some(trace) = trace {
+                    put("trace", trace.clone());
+                }
             }
             Message::Release { hold, .. } | Message::Loading { hold, .. } => put("hold", json!(hold)),
             Message::Retry { hold, hops, .. } => {
@@ -344,6 +356,8 @@ impl Message {
                 method,
                 args,
                 segments: parts,
+                trace,
+                old,
                 ..
             } => {
                 put("call", json!(call));
@@ -354,6 +368,12 @@ impl Message {
                 }
                 if let Some(parts) = parts {
                     put("segments", segments(parts));
+                }
+                if let Some(trace) = trace {
+                    put("trace", trace.clone());
+                }
+                if *old {
+                    put("old", json!(true));
                 }
             }
             Message::Abort { call, .. } => put("call", json!(call)),
@@ -547,6 +567,7 @@ impl Message {
                         .collect()
                 }),
                 limit: value.get("limit").and_then(Value::as_u64),
+                trace: value.get("trace").cloned(),
             },
             "release" => Message::Release {
                 origin,
@@ -568,6 +589,8 @@ impl Message {
                 method: int("method")?,
                 args: optional_part("args")?,
                 segments: segments()?,
+                trace: value.get("trace").cloned(),
+                old: value.get("old") == Some(&Value::Bool(true)),
             },
             "abort" => Message::Abort {
                 origin,
