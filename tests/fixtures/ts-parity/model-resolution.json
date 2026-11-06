@@ -1951,6 +1951,11 @@
           },
           {
             "provider": "openrouter",
+            "id": "openrouter/auto-code",
+            "thinkingLevel": null
+          },
+          {
+            "provider": "openrouter",
             "id": "openrouter/free",
             "thinkingLevel": null
           },
