@@ -69,7 +69,8 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
 
 ## Status
 
-- Done: accepted by the owner (2026-11-05), with these decisions:
+- Done: accepted by the owner as built at f89844e (2026-11-06), with the
+  owner's decisions:
   - Slice 4 compares against the recorded in-process transcript.
   - `noel.sessions` forwards `rename` and `delete` of a session a worker
     holds to that worker: a rename at once, a delete once no client holds
