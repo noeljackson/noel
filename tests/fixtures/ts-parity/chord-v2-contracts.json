@@ -1,9 +1,9 @@
 {
   "source": {
     "repository": "https://github.com/earendil-works/pi",
-    "ref": "3551ec07eb87afebac20191958163ae58976f1d0",
+    "ref": "4b11a7228d20c37637dd8cb01dabf1fd3c154297",
     "package": "packages/chord",
-    "packageCommit": "3551ec07eb87afebac20191958163ae58976f1d0",
+    "packageCommit": "4b11a7228d20c37637dd8cb01dabf1fd3c154297",
     "script": "/ts-parity/chord-v2-contracts-fixture.ts"
   },
   "hash64": [

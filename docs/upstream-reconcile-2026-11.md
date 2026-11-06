@@ -108,6 +108,27 @@ What the regenerated fixtures changed, and noel's outcome:
 Slices 1, 2, 3 and 5-7 land in one commit: the env port (c96e368e) and the
 regenerated env goldens need each other, as do the prompt and its fixtures.
 
+### Slice 4: Chord v2 at upstream `main`
+
+`CHORD2_REFERENCE_REF` is 4b11a722. `make chord2-fixtures` adds upstream's
+bytes and verdicts for traces, `old` and the new reasons, and the existing
+cases are unchanged. `make chord2-interop` passes both ways.
+
+| upstream | change | outcome |
+|---|---|---|
+| 378d45a0, 2205a824 | trace carrier on `hold` and `call` (kind flag 0x40), at most 8 printable-ASCII strings; type and host kind names at most 256 | ported: `binary`, `Message`, `check`; relays forward the carrier once; fixture cases; no spans (recorded) |
+| a5d209af, 9ff0ebfd | `call.old` (kind flag 0x20, calls only), honoured from trusted links; `unavailable` reasons `version` and `reload_cycle` | ported: decoded, refused on other kinds, relayed only from a trusted link; reasons accepted; noel never reloads (recorded) |
+| d7a988d1 | a call's answer follows its state, past a full window | ported: `answer_follows_state` for own and relayed answers; test `a_calls_answer_follows_its_state_past_a_full_window` |
+| 6515a797, d6bf3549, edc9c698 | calls in flight survive a `loading` unbind; reload suite | already: the consumer rejects only unsent calls on `loading`, and the relay keeps relayed calls; noel's provider never unbinds a bound hold |
+| 9f7d909f | a late heartbeat tick after a sleep is not silence; a worker's lost link is a stop | recorded: noel's heartbeat runs on a monotonic clock that stops during sleep; workers are noel's own |
+| 8f9446a0 | `invalid` and `forbidden` helpers, page state | already: `forbidden` without a reason is accepted; the rest is the app kit |
+| 7aed50ae, 5ff8c027, 7ac1a9e3 | Node worker locks and base code | n/a: noel's workers are its own |
+| 2439933c, 8889e623, e5f3b415 | live queries, group commit, replication | n/a: store internals |
+| 3d11c351, 0efe50cb, f4427f8a, 15a51145, ff33ef42 | i18n, tutorial, telemetry ingest | n/a: app kit and telemetry |
+| 0c2b568f | swaps never answer `not_ready` | n/a: in-process reload |
+| 20d86c36, bb5eafa8, f617ed31 | p2 cleanup, per-host stores, Files v2 | n/a: p2's app (`docs/p2-audit.md`) |
+| docs: d6fb784c, 828bcadc, 596523e0, 72dd26e0, f6660876, 80f7a114, 395f3e03, fcebc099, 55d3fda7, 67afac18 | design decisions | n/a: no wire decision beyond the rows above |
+
 ### Slice 5: Durable, env and schema
 
 | upstream | change | outcome |
@@ -167,5 +188,5 @@ regenerated env goldens need each other, as do the prompt and its fixtures.
 
 Started 2026-11-06.
 
-- Slices 1, 2, 3, 5, 6 and 7 are done; `make check` and `make e2e` pass.
-- Slice 4: audit below; porting in progress.
+- Every slice is done; `make check` and `make e2e` pass.
+- PR #86 (the nightly drift) is superseded by these fixtures.

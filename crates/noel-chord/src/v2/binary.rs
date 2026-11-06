@@ -1,6 +1,7 @@
 //! Chord v2's binary codec (upstream `src/link/binary.ts`), the default of
 //! every link: a kind byte (its high bit set when an origin follows as a
-//! varint), then the kind's fields as unsigned LEB128 varints,
+//! varint, the next when a trace carrier follows as JSON, the next on a call
+//! that is old work of a reload), then the kind's fields as unsigned LEB128 varints,
 //! length-prefixed UTF-8 strings and JSON, raw incarnations (16 bytes) and
 //! fingerprints (8 bytes), parts behind their length doubled (plus one when
 //! deflated), and byte segments only beside payloads marked as carrying
@@ -25,6 +26,11 @@ const KINDS: [&str; 18] = [
 
 /// The kind byte's flag for an origin.
 const ORIGIN: u8 = 0x80;
+/// The kind byte's flag for a trace carrier (a hold's or a call's).
+const TRACE: u8 = 0x40;
+/// The kind byte's flag for a call that is old work of a reload; another
+/// kind with it is an unknown kind.
+const OLD: u8 = 0x20;
 /// A payload's flags: present, and carrying byte segments.
 const PRESENT: u64 = 1;
 const SEGMENTS: u64 = 2;
@@ -53,13 +59,22 @@ pub fn encode(message: &Message) -> Vec<u8> {
         .iter()
         .position(|kind| *kind == message.kind())
         .expect("every kind has a byte") as u8;
-    match (message, message.origin()) {
-        // `closed` always carries its origin in the kind byte.
-        (_, Some(origin)) => {
-            writer.byte(kind | ORIGIN);
-            writer.varint(origin);
-        }
-        (_, None) => writer.byte(kind),
+    let (trace, old) = match message {
+        Message::Hold { trace, .. } => (trace.as_ref(), false),
+        Message::Call { trace, old, .. } => (trace.as_ref(), *old),
+        _ => (None, false),
+    };
+    let origin = message.origin();
+    writer.byte(
+        kind | origin.map_or(0, |_| ORIGIN)
+            | trace.map_or(0, |_| TRACE)
+            | if old { OLD } else { 0 },
+    );
+    if let Some(origin) = origin {
+        writer.varint(origin);
+    }
+    if let Some(trace) = trace {
+        writer.json(trace);
     }
     encode_fields(message, &mut writer);
     writer.bytes
@@ -306,15 +321,23 @@ impl Writer {
 pub fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
     let mut reader = Reader { bytes, offset: 0 };
     let byte = reader.byte()?;
+    let Some(kind) = KINDS.get(usize::from(byte & !(ORIGIN | TRACE | OLD))) else {
+        return fail("an unknown kind");
+    };
+    if byte & OLD != 0 && *kind != "call" {
+        return fail("an unknown kind");
+    }
     let origin = if byte & ORIGIN != 0 {
         Some(reader.varint()?)
     } else {
         None
     };
-    let Some(kind) = KINDS.get(usize::from(byte & !ORIGIN)) else {
-        return fail("an unknown kind");
+    let trace = if byte & TRACE != 0 {
+        Some(reader.json()?)
+    } else {
+        None
     };
-    let message = decode_fields(kind, origin, &mut reader)?;
+    let mut message = decode_fields(kind, origin, &mut reader)?;
     if reader.offset != bytes.len() {
         return fail("bytes after the message");
     }
@@ -326,6 +349,18 @@ pub fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
         )
     {
         return fail("an origin on a kind without one");
+    }
+    // Only holds and calls carry a trace (upstream's schema check).
+    match &mut message {
+        Message::Hold { trace: slot, .. } => *slot = trace,
+        Message::Call {
+            trace: slot, old, ..
+        } => {
+            *slot = trace;
+            *old = byte & OLD != 0;
+        }
+        _ if trace.is_some() => return fail("a trace on a kind without one"),
+        _ => {}
     }
     Ok(message)
 }
@@ -392,6 +427,7 @@ fn decode_fields(
                 incarnation,
                 chain,
                 limit,
+                trace: None,
             }
         }
         "release" => Message::Release {
@@ -417,6 +453,8 @@ fn decode_fields(
                 method,
                 args,
                 segments,
+                trace: None,
+                old: false,
             }
         }
         "abort" => Message::Abort {

@@ -1348,6 +1348,7 @@ impl Actor {
             incarnation,
             chain,
             limit,
+            trace,
         } = message
         else {
             unreachable!("a hold");
@@ -1394,6 +1395,7 @@ impl Actor {
                     incarnation,
                     chain,
                     limit: (limits.decoded != u64::MAX).then_some(limits.decoded),
+                    trace,
                     path,
                     upstream: None,
                 };
@@ -1739,23 +1741,50 @@ impl Actor {
                     },
                 );
             } else if !provider.waiting.is_empty() {
-                let holds = std::mem::take(&mut provider.waiting);
-                provider.binding_turn = !provider.binding.is_empty();
-                let entries = holds
-                    .into_iter()
-                    .filter_map(|hold| self.pending_entry(link, origin, hold))
-                    .collect();
-                self.send_own(
-                    link,
-                    origin,
-                    Message::State {
-                        origin: None,
-                        holds: entries,
-                    },
-                );
+                self.send_waiting(link, origin);
             } else {
                 return;
             }
+        }
+    }
+
+    /// The waiting state as one `state` message, taking a slot: a freed one,
+    /// or one past the window before an answer. Waiting bindings take the
+    /// next slot.
+    fn send_waiting(&mut self, link: u64, origin: u64) {
+        let Some(provider) = self.provider(link, origin) else {
+            return;
+        };
+        let holds = std::mem::take(&mut provider.waiting);
+        provider.binding_turn = !provider.binding.is_empty();
+        let entries = holds
+            .into_iter()
+            .filter_map(|hold| self.pending_entry(link, origin, hold))
+            .collect();
+        self.send_own(
+            link,
+            origin,
+            Message::State {
+                origin: None,
+                holds: entries,
+            },
+        );
+    }
+
+    /// Before a call's answer (its own or a relayed one) goes to `origin`,
+    /// every change this host committed before it goes first: the current
+    /// batch, then the state waiting for a slot, past the window if it is
+    /// full (upstream d7a988d1, "a call's answer follows its state"). At most
+    /// one extra message per answer.
+    pub(super) fn answer_follows_state(&mut self, link: u64, origin: u64) {
+        if self.dirty.contains(&(link, origin)) {
+            self.flush();
+        }
+        if self
+            .provider(link, origin)
+            .is_some_and(|provider| !provider.waiting.is_empty())
+        {
+            self.send_waiting(link, origin);
         }
     }
 
@@ -2098,6 +2127,7 @@ impl Actor {
                 error: error.to_json(),
             },
         };
+        self.answer_follows_state(link, origin);
         self.send_origin(link, origin, reply);
     }
 
@@ -2128,6 +2158,7 @@ impl Actor {
             incarnation: None,
             chain: None,
             limit: None,
+            trace: None,
         };
         host_link.channel.send(&message);
         let entry = self.refs.get_mut(&reference).expect("the reference");
@@ -2484,6 +2515,8 @@ impl Actor {
                 method: call.method,
                 args: call.args.clone(),
                 segments: None,
+                trace: None,
+                old: false,
             };
             host_link.channel.send(&message);
         }

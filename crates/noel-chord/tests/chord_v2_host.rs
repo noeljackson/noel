@@ -335,6 +335,7 @@ async fn the_window_holds_state_until_acknowledged() {
         incarnation: None,
         chain: None,
         limit: None,
+        trace: None,
     });
     let mut received = Vec::new();
     let receive = |channel: &mut Channel, bytes: Vec<u8>| match channel.receive(&bytes, 0).unwrap()
@@ -385,6 +386,100 @@ async fn the_window_holds_state_until_acknowledged() {
     };
     let ops: Value = serde_json::from_slice(ops).unwrap();
     assert_eq!(ops, json!([["r", 5]]));
+}
+
+/// Upstream d7a988d1: a call's answer follows its state. With the window
+/// full, the changes the method committed still go first, past the window,
+/// so the call settles at the consumer with them applied.
+#[tokio::test]
+async fn a_calls_answer_follows_its_state_past_a_full_window() {
+    let cell = Cell::new(json!({"type": "integer"}), json!(0)).unwrap();
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let server = server(&cell, &disposed);
+    let (raw, down) = Link::memory_pair();
+    server.accept(down, LinkOptions::new(json!({"kind": "device"})));
+    let mut inbound = raw.take_inbound().unwrap();
+    let mut channel = Channel::new(
+        BinaryCodec,
+        ChannelOptions {
+            incarnation: uuidv7(),
+            calls: 1,
+            trusted: false,
+        },
+        0,
+    );
+    let contract = counter();
+    channel.send(&Message::Hold {
+        origin: None,
+        hold: 0,
+        type_name: contract.declaration.name.clone(),
+        version: 1,
+        fingerprint: contract.fingerprint.clone(),
+        params: Part::Text(json!({"session": "s1"}).to_string()),
+        address: contract.address(&json!({"session": "s1"})),
+        principal: None,
+        incarnation: None,
+        chain: None,
+        limit: None,
+        trace: None,
+    });
+    let receive = |channel: &mut Channel, bytes: Vec<u8>| match channel.receive(&bytes, 0).unwrap()
+    {
+        Received::Message(message) => Some(*message),
+        _ => None,
+    };
+    let mut received = Vec::new();
+    while received.is_empty() {
+        let bytes = inbound.recv().await.unwrap();
+        if let Some(message) = receive(&mut channel, bytes) {
+            received.push(message);
+        }
+        for bytes in channel.outgoing() {
+            raw.send(bytes);
+        }
+    }
+    assert_eq!(received[0].kind(), "bound");
+    // One state message fills the window (bound + state, unacknowledged).
+    cell.replace(json!(1)).unwrap();
+    let bytes = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receive(&mut channel, bytes).unwrap().kind(), "state");
+    // The window is full; the call's own change waits for no ack.
+    channel.send(&Message::Call {
+        origin: None,
+        call: 0,
+        hold: 0,
+        method: 0,
+        args: Some(Part::Text(json!({"by": 10}).to_string())),
+        segments: None,
+        trace: None,
+        old: false,
+    });
+    for bytes in channel.outgoing() {
+        raw.send(bytes);
+    }
+    let mut kinds = Vec::new();
+    let mut state_ops = None;
+    while kinds.last() != Some(&"result") {
+        let bytes = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+            .await
+            .expect("an answer without an ack")
+            .unwrap();
+        let Some(message) = receive(&mut channel, bytes) else {
+            continue;
+        };
+        if let Message::State { holds, .. } = &message {
+            let Part::Bytes(ops) = &holds[0].members[0].1 else {
+                panic!("bytes")
+            };
+            state_ops = Some(serde_json::from_slice::<Value>(ops).unwrap());
+        }
+        kinds.push(message.kind());
+    }
+    assert_eq!(kinds, ["state", "result"]);
+    assert_eq!(state_ops, Some(json!([["r", 11]])));
 }
 
 /// A route to one worker per session: each `resolve` makes a fresh memory

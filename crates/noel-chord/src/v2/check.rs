@@ -13,6 +13,13 @@ use super::message::{FailedMember, Message};
 /// The longest activation chain a hold carries.
 pub const CHAIN: usize = 32;
 
+/// The longest name a message carries (a type's, a host kind's).
+pub const NAME_LENGTH: usize = 256;
+
+/// The most keys a trace carrier has, and the longest key or value.
+pub const CARRIER_KEYS: usize = 8;
+pub const CARRIER_LENGTH: usize = 256;
+
 /// A `retry`'s hop budget as the first host sends it.
 pub const RETRY_HOPS: u64 = 16;
 
@@ -39,14 +46,20 @@ fn valid(message: &Message) -> bool {
             incarnation, calls, ..
         } => *calls >= 1 && is_incarnation(incarnation),
         Message::Hold {
+            type_name,
+            address,
             version,
             fingerprint,
             principal,
             incarnation,
             chain,
+            trace,
             ..
         } => {
-            *version >= 1
+            is_name(type_name)
+                && is_name(&address.kind)
+                && trace.as_ref().is_none_or(is_carrier)
+                && *version >= 1
                 && fingerprint.len() == 16
                 && fingerprint
                     .bytes()
@@ -65,8 +78,8 @@ fn valid(message: &Message) -> bool {
         Message::Failed { error, .. }
         | Message::Error { error, .. }
         | Message::Gone { error, .. } => check_wire_error(error).is_ok(),
+        Message::Call { trace, .. } => trace.as_ref().is_none_or(is_carrier),
         Message::Release { .. }
-        | Message::Call { .. }
         | Message::Abort { .. }
         | Message::Ack { .. }
         | Message::Closed { .. }
@@ -76,6 +89,28 @@ fn valid(message: &Message) -> bool {
         | Message::Loading { .. }
         | Message::Result { .. } => true,
     }
+}
+
+fn is_name(name: &str) -> bool {
+    name.chars().count() <= NAME_LENGTH
+}
+
+/// A trace carrier: an object of at most 8 strings, keys of printable ASCII
+/// without spaces, values of printable ASCII, each at most 256 long.
+fn is_carrier(trace: &Value) -> bool {
+    let Some(fields) = trace.as_object() else {
+        return false;
+    };
+    fields.len() <= CARRIER_KEYS
+        && fields.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= CARRIER_LENGTH
+                && key.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                && value.as_str().is_some_and(|value| {
+                    value.len() <= CARRIER_LENGTH
+                        && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+                })
+        })
 }
 
 fn failed_ok(failed: &[FailedMember]) -> bool {

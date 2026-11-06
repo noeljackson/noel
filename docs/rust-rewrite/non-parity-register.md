@@ -1387,6 +1387,17 @@ Where it differs:
 - **Process links** are noel's framed byte streams (`[u32 BE length][tag]
   [payload]`, tag 0 a Chord message, tag 1 a JSON control message), not
   Node IPC.
+- **No telemetry.** noel records no spans or metrics (`chord.link.bytes`,
+  `chord.link.checks`). A `hold`'s or `call`'s trace carrier is decoded,
+  checked and forwarded by relays as it came (none on a re-hold), and noel's
+  own holds and calls send none.
+- **No reload.** noel's providers never unbind or rebind a bound hold, so
+  `loading` on a bound hold, a call's `old` flag and the reasons `version`
+  and `reload_cycle` arise only from upstream peers: noel decodes them,
+  relays `old` only from a trusted link, and ignores it when serving.
+- **The heartbeat** measures silence on tokio's monotonic clock, which does
+  not advance while the machine sleeps, instead of upstream's late-tick
+  allowance (9f7d909f); a stalled host task still counts as silence.
 - **No text codec yet.** Only the binary codec, upstream's default. The text
   codec is for debugging and both ends must agree on it.
 - **Error messages of protocol errors** carry the decode error after the
