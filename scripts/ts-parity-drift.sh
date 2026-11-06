@@ -40,7 +40,13 @@ chord2_pin="$(sed -n 's/^CHORD2_REFERENCE_REF ?= //p' "${repo_root}/Makefile")"
   "${TS_PARITY_IMAGE:-pi-ts-parity}"
 
 fixtures_drift=0
-diff -ru "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}" || fixtures_drift=1
+# The image skips the fixtures recorded outside it (Chord v2's with Bun at
+# CHORD2_REFERENCE_REF, codemode's with Bun): the Chord v2 pin is reported
+# below, and codemode's follow their own reference.
+diff -ru \
+  -x chord-v2-contracts.json -x chord-v2-messages.json \
+  -x codemode-declarations.json -x tool-search.json \
+  "${fixtures_dir}" "${fresh_fixtures_dir}" > "${diff_file}" || fixtures_drift=1
 
 if [ "${fixtures_drift}" -ne 0 ] || [ -s "${chord2_file}" ]; then
   {

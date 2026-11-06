@@ -151,12 +151,15 @@ function frameJson(frame: Frame, json: Json): Json {
  * The goldens' steps: the client's frames, and the daemon's in the order the tap saw them. A request's `output` events
  * are merged per stream into one event each, placed right before the request's result or error, since how output is
  * split into events depends on timing. Pings are kept only where the scenario asks for them: the first each way, at
- * the end (the client's first), since when each side pings depends on when it started.
+ * the end (the client's first), since when each side pings depends on when it started. A request the client cancelled
+ * that the daemon answers `timeout` is recorded as `aborted`: the client's own timer cancels at the request's timeout
+ * (c96e368e), so which the daemon sees first is a race, and a daemon that reads the cancel first answers `aborted`.
  */
 function steps(frames: { from: "client" | "daemon"; frame: Frame }[], root: string, keepPings: boolean): Step[] {
 	const result: Step[] = [];
 	const output = new Map<number, Map<string, Buffer[]>>();
 	const pings: { client?: Step; daemon?: Step } = {};
+	const cancelled = new Set<number>();
 	for (const { from, frame } of frames) {
 		if (frame.type === 6) {
 			if (keepPings && pings[from] === undefined) {
@@ -165,10 +168,14 @@ function steps(frames: { from: "client" | "daemon"; frame: Frame }[], root: stri
 			continue;
 		}
 		if (from === "client") {
+			if (frame.type === 5) cancelled.add(frame.id);
 			result.push({ send: frameJson(frame, rooted(frame.json, root)) });
 			continue;
 		}
-		const json = normalized(rooted(frame.json, root)) as { [key: string]: Json };
+		let json = normalized(rooted(frame.json, root)) as { [key: string]: Json };
+		if (frame.type === 3 && cancelled.has(frame.id) && json.code === "timeout") {
+			json = { code: "aborted", message: "aborted" };
+		}
 		if (frame.type === 4 && json.kind === "output") {
 			if ("skipped" in json) throw new Error("the goldens do not record windowed output");
 			const streams = output.get(frame.id) ?? new Map<string, Buffer[]>();
@@ -401,7 +408,6 @@ async function main(): Promise<void> {
 				source: {
 					repository: "https://github.com/earendil-works/pi",
 					ref: "main",
-					commit: git("rev-parse", "HEAD"),
 					package: "packages/env",
 					envCommit: git("log", "-1", "--format=%H", "HEAD", "--", "packages/env"),
 					daemon: `pi-env ${version}, built from packages/env/daemon at ref (release, musl)`,

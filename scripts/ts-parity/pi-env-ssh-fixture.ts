@@ -152,7 +152,6 @@ async function main(): Promise<void> {
 				source: {
 					repository: "https://github.com/earendil-works/pi",
 					ref: "main",
-					commit: git("rev-parse", "HEAD"),
 					package: "packages/env",
 					envCommit: git("log", "-1", "--format=%H", "HEAD", "--", "packages/env"),
 					// Where the image puts it (`make ts-parity-pi-env-ssh`).

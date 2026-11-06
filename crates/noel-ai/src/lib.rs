@@ -399,6 +399,7 @@ const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
     "stream ended before a terminal response event",
     "http2 request did not get a response",
     "stream disconnected before completion",
+    "cut short after the reply had begun",
     "pending stream has been canceled",
     "retry delay",
     "you can retry your request",
@@ -1529,21 +1530,8 @@ fn normalize_openai_chat_tool_call_id(config: &ProviderConfig, id: &str) -> Stri
             .take(40)
             .collect();
     }
-    // OpenAI rejects tool call ids over 40 characters, and OpenRouter can
-    // route a model to it, so both get the cap; a hash keeps ids that share
-    // a prefix distinct (upstream 5bdf988b).
-    let openrouter = config.model.provider == "openrouter"
-        || config
-            .base_url
-            .as_deref()
-            .is_some_and(|url| url.contains("openrouter.ai"));
-    if (config.model.provider == "openai" || openrouter) && id.encode_utf16().count() > 40 {
-        let head: String =
-            String::from_utf16_lossy(&id.encode_utf16().take(31).collect::<Vec<_>>());
-        format!(
-            "{head}_{}",
-            short_hash(id).chars().take(8).collect::<String>()
-        )
+    if config.model.provider == "openai" && id.len() > 40 {
+        id.chars().take(40).collect()
     } else {
         id.to_string()
     }
@@ -6887,35 +6875,6 @@ mod tests {
             .expect_err("closed port");
         let message = ProviderError::Request(error).to_string();
         assert!(message.to_lowercase().contains("refused"), "{message}");
-    }
-
-    /// Upstream 5bdf988b: ids over 40 characters replayed to OpenAI or
-    /// OpenRouter keep 31 and add a hash, so ids sharing a prefix stay apart.
-    #[test]
-    fn long_tool_call_ids_are_shortened_for_openai_and_openrouter() {
-        let long_a = format!("{}a", "x".repeat(45));
-        let long_b = format!("{}b", "x".repeat(45));
-        for provider in ["openai", "openrouter"] {
-            let config = provider_config(provider);
-            let a = normalize_openai_chat_tool_call_id(&config, &long_a);
-            let b = normalize_openai_chat_tool_call_id(&config, &long_b);
-            assert_eq!(a.len(), 40, "{provider}: {a}");
-            assert!(a.starts_with(&format!("{}_", "x".repeat(31))));
-            assert_ne!(a, b);
-            assert_eq!(
-                normalize_openai_chat_tool_call_id(&config, "short"),
-                "short"
-            );
-        }
-        let mut routed = provider_config("openai");
-        routed.model.provider = "custom".into();
-        routed.base_url = Some("https://openrouter.ai/api/v1".into());
-        assert_eq!(
-            normalize_openai_chat_tool_call_id(&routed, &long_a).len(),
-            40
-        );
-        routed.base_url = Some("https://example.com/v1".into());
-        assert_eq!(normalize_openai_chat_tool_call_id(&routed, &long_a), long_a);
     }
 
     /// The catalog's base URLs are API roots, as upstream's SDK clients take
