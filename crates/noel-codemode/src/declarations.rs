@@ -749,6 +749,18 @@ mod tests {
         for call in calls {
             let args = call["args"].as_array().unwrap();
             let rendered = match call["fn"].as_str().unwrap() {
+                // A schema, or nothing (upstream's `undefined`, absent here).
+                "resolveSchemaRef" => {
+                    let found = resolve_schema_ref(args[0].as_str().unwrap(), &args[1]);
+                    if found != call.get("result") {
+                        failures.push(format!(
+                            "resolveSchemaRef {}\n  rust:     {found:?}\n  upstream: {:?}",
+                            call["args"],
+                            call.get("result")
+                        ));
+                    }
+                    continue;
+                }
                 "schemaToType" => schema_to_type(&args[0], max_chars(args.get(1), "maxChars")),
                 "renderToolSignature" => render_tool_signature(
                     &declaration(&args[0]),
