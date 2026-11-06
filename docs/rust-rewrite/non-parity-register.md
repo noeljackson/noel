@@ -441,8 +441,11 @@ The `edit` tool follows upstream's rules (unique `oldText`, no overlapping
 edits, all edits applied at once, empty `newText`, `edits` as a JSON string,
 BOM and CRLF kept) but matches exactly: it does not fall back to upstream's
 fuzzy matching of smart quotes, Unicode dashes and spaces, and trailing
-whitespace. It also converts only the edited text to the file's line endings
-instead of normalizing a mixed-ending file.
+whitespace. As upstream since d448c51e2, lines the edit does not touch keep
+their endings and the new text takes the ending of the line its range starts
+on; but `oldText` is matched in the file's first-line ending, where upstream
+matches on LF-normalized text, so an `oldText` spanning lines of different
+endings matches upstream and not here.
 
 Reason: an exact match cannot edit the wrong region, and bytes outside the
 edits stay untouched.

@@ -219,6 +219,7 @@ ts-parity-build:
 	$(DOCKER) build -f Dockerfile.ts-parity \
 		--build-arg TS_REFERENCE_REPO="$(TS_REFERENCE_REPO)" \
 		--build-arg TS_REFERENCE_REF="$(TS_REFERENCE_REF)" \
+		--build-arg CHORD2_REFERENCE_REF="$(CHORD2_REFERENCE_REF)" \
 		-t $(TS_PARITY_IMAGE) .
 
 ts-parity-fixtures: ts-parity-build
@@ -228,7 +229,9 @@ ts-parity-fixtures: ts-parity-build
 ts-parity-chord: ts-parity-build
 	mkdir -p "$(TS_PARITY_FIXTURES_DIR)"
 	$(DOCKER) run --rm -v "$(CURDIR)/$(TS_PARITY_FIXTURES_DIR):/fixtures" $(TS_PARITY_IMAGE) \
-		sh -c 'for fixture in /ts-parity/chord-*-fixture.ts; do npx tsx "$$fixture" /fixtures || exit 1; done'
+		sh -c 'npx tsx /ts-parity/chord-delta-fixture.ts /fixtures \
+			&& bun --conditions=source /ts-parity/chord-v2-contracts-fixture.ts /chord2-reference /noel-contracts /fixtures \
+			&& bun --conditions=source /ts-parity/chord-v2-messages-fixture.ts /chord2-reference /fixtures'
 
 # Durable's env conformance cases against NodeExecutionEnv, from upstream's
 # checkout, for noel-env's LocalEnv.

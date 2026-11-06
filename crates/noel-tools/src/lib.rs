@@ -744,8 +744,9 @@ async fn edit_tool(
 /// Applies every edit to `content`, or none (upstream
 /// `applyEditsToNormalizedContent`, without fuzzy matching). Each `find` must
 /// occur exactly once in the original content and the matched regions must
-/// not overlap. Edits use the file's line endings (CRLF when its first line
-/// ends in CRLF); the rest of the file, including a BOM, is kept byte for
+/// not overlap. `oldText` is matched in the file's first-line ending; the
+/// new text takes the ending of the line where its range starts (upstream
+/// d448c51e2), and the rest of the file, including a BOM, is kept byte for
 /// byte.
 fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<String, ToolError> {
     if edits.is_empty() {
@@ -791,7 +792,12 @@ fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<Str
                 format!("Found {count} occurrences of edits[{index}] in {path}. Each oldText must be unique. Please provide more context to make it unique.")
             }));
         }
-        matches.push((start, find.len(), in_file_endings(&edit.replace), index));
+        let replace = edit.replace.replace("\r\n", "\n");
+        let replace = match line_ending_at(content, start) {
+            "\n" => replace,
+            ending => replace.replace('\n', ending),
+        };
+        matches.push((start, find.len(), replace, index));
     }
     matches.sort_by_key(|(start, ..)| *start);
     for pair in matches.windows(2) {
@@ -811,6 +817,29 @@ fn apply_text_edits(content: &str, edits: &[TextEdit], path: &str) -> Result<Str
     }
     next.push_str(&content[cursor..]);
     Ok(next)
+}
+
+/// The line ending new text at `at` takes (upstream d448c51e2): that of the
+/// line `at` is on, or of the line before when it is the unterminated last
+/// line. A lone CR only in a file without any LF (classic Mac); elsewhere a
+/// lone CR is a character inside a line.
+fn line_ending_at(content: &str, at: usize) -> &'static str {
+    let crlf_before = |newline: usize| newline > 0 && content.as_bytes()[newline - 1] == b'\r';
+    if let Some(offset) = content[at..].find('\n') {
+        return if crlf_before(at + offset) {
+            "\r\n"
+        } else {
+            "\n"
+        };
+    }
+    if let Some(newline) = content[..at].rfind('\n') {
+        return if crlf_before(newline) { "\r\n" } else { "\n" };
+    }
+    if content.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    }
 }
 
 async fn write_tool(
@@ -1893,6 +1922,31 @@ mod tests {
             "x = 1;\nx = 1;\nabcdef\n"
         );
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// Upstream d448c51e2: lines the edit does not touch keep their endings,
+    /// and the new text takes the ending of the line its range starts on.
+    #[test]
+    fn edits_take_the_line_ending_where_they_start() {
+        let edit = |content: &str, find: &str, replace: &str| {
+            let edits = [TextEdit {
+                find: find.to_owned(),
+                replace: replace.to_owned(),
+            }];
+            apply_text_edits(content, &edits, "f").expect("edit")
+        };
+        assert_eq!(
+            edit("a\nb\r\nX = 1\r\n", "X = 1", "X = 2"),
+            "a\nb\r\nX = 2\r\n"
+        );
+        assert_eq!(edit("a\r\nb\nc", "c", "C"), "a\r\nb\nC");
+        assert_eq!(edit("a\rb\nX = 1\n", "X = 1", "X = 2"), "a\rb\nX = 2\n");
+        assert_eq!(edit("a\r\nb\nc\n", "b", "B\nB2"), "a\r\nB\nB2\nc\n");
+        assert_eq!(edit("a\nb\r\nc", "b", "x\ny"), "a\nx\r\ny\r\nc");
+        // The unterminated last line takes the ending of the line before.
+        assert_eq!(edit("a\r\nb", "b", "b\nc"), "a\r\nb\r\nc");
+        // A file of lone CRs (classic Mac) keeps them.
+        assert_eq!(edit("a\rb", "b", "b\nc"), "a\rb\rc");
     }
 
     #[tokio::test]

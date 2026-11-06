@@ -72,8 +72,9 @@ Outcomes: **ported** (noel now does what upstream does, with a test),
 ### Slices 1-3: fixtures at upstream `main`
 
 Every fixture regenerates at upstream `main` and has content: the image
-builds from `Dockerfile.ts-parity` at `main` (7a6bd5a9 at the last run), and
-`make ts-parity-drift` reports no drift. Fixes to the scripts:
+builds from `Dockerfile.ts-parity` at `main` (d448c51e at the last run);
+`make ts-parity-fixtures` writes all 41 fixtures with content, and `make
+ts-parity-drift` reports no drift. Fixes to the scripts:
 
 - pi-ai dropped its TypeBox re-export (6536f801): seven scripts import
   `Type` from TypeBox itself.
@@ -92,8 +93,12 @@ builds from `Dockerfile.ts-parity` at `main` (7a6bd5a9 at the last run), and
   (`BUN_VERSION`). The declarations script records `resolveSchemaRef`,
   newly exported (6d3e342b), and its stand-in `expect` gained
   `toBeUndefined`; noel replays it with `resolve_schema_ref`.
-- The drift diff leaves out only Chord v2's fixtures, recorded with Bun at
-  `CHORD2_REFERENCE_REF`; that pin is reported separately.
+- Chord v2's fixtures run in the image too, from a worktree at
+  `CHORD2_REFERENCE_REF` (`/chord2-reference`), so the drift diff covers
+  every fixture; commits after the pin are reported as well.
+- `model-catalog.json` is built by upstream's `generate-models` from live
+  provider listings, so a provider's price can change between two runs (an
+  OpenRouter price did); such a diff is new model data, taken in as it is.
 - `local-env.json`, `pi-env.json`, `pi-env-ssh.json` and `chord-delta.json`
   record `ref: main`; `CHORD_REFERENCE_REF` and the
   `/chord-reference` worktree are removed, and the drift job reports Chord v2
@@ -183,6 +188,7 @@ cases are unchanged. `make chord2-interop` passes both ways.
 | acd059b72 | ctrl+o reaches `!` output shown while the agent works | n/a: the worker refuses `!` while a run is active |
 | 7a6bd5a97 | no empty `tools` array for tool history on chat completions | already: noel sends `tools` only when there are tools |
 | 4622edb79 | fullscreen Kitty images drawn after the rows they cover | n/a: noel's TUI draws no inline images |
+| d448c51e2 | edit keeps the endings of untouched lines; new text takes the ending of the line it starts on | ported: noel already kept untouched lines; the new text's ending now follows its line (`line_ending_at`), test `edits_take_the_line_ending_where_they_start`; matching in mixed-ending files recorded (Exact-Match edit Tool) |
 | 4c992154 | a connection error keeps its underlying cause | ported: `ProviderError::Request` appends the deepest cause (`with_cause_detail`); test against a closed port |
 | c5d39783, 0f4d5e96 | `session-id` instead of `session_id` on OpenAI Responses; prompt cache keys for compatible proxies | recorded: noel passes no session id to providers, so it sends no session-affinity header and no `prompt_cache_key` (non-parity register) |
 | 14b804d8 | `requiresNonNullAssistantContent` compat flag | n/a: noel has no per-model compat flags |
@@ -207,7 +213,7 @@ cases are unchanged. `make chord2-interop` passes both ways.
 Started 2026-11-06.
 
 - Every slice is done; `make check` and `make e2e` pass. `make
-  ts-parity-drift` against `main` (7a6bd5a9), with the image built from the
-  Dockerfile, regenerates every fixture it makes (39, codemode's included)
-  with content, reports no drift, and no Chord v2 commits after the pin.
+  ts-parity-fixtures` at `main` writes all 41 fixtures with content, and
+  `make ts-parity-drift` regenerates them all with no exclusions and reports
+  no drift and no Chord v2 commits after the pin.
 - PR #86 (the nightly drift) is superseded by these fixtures.
