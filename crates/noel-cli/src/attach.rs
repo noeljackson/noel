@@ -442,20 +442,6 @@ async fn resolve_listed(client: &Client, reference: &str) -> Result<String> {
     }
 }
 
-/// What opening a session says of its saved work, as `noel` says it.
-fn resume_hint(unfinished: bool, queued: usize) -> Option<String> {
-    match (unfinished, queued) {
-        (false, 0) => None,
-        (true, 0) => Some("resumed mid-turn; continuing automatically from saved context".to_owned()),
-        (false, n) => Some(format!(
-            "{n} queued message(s) pending; they run after your next prompt (/queue to list, /queue-clear to clear)"
-        )),
-        (true, n) => Some(format!(
-            "resumed mid-turn; continuing automatically from saved context, then {n} queued message(s)"
-        )),
-    }
-}
-
 /// What reaches the TUI from the server.
 enum Incoming {
     /// The view, and what happened to the link or the hold.
@@ -480,8 +466,6 @@ enum Call {
         recall: bool,
     },
     Abort,
-    /// A resume of the turn the saved context left unfinished.
-    Resume,
     /// A session command `noel.sessions` answers, with its line: the session
     /// it made, the one it deleted, or `None` to leave it to the worker.
     Sessions(String),
@@ -600,7 +584,7 @@ impl Remote {
         let unfinished =
             docs["noel.turn"]["unfinished"] == true && docs["pi.live"]["run"].is_null();
         let queued = docs["pi.inbox"]["items"].as_array().map_or(0, Vec::len);
-        let hint = resume_hint(unfinished, queued);
+        let hint = crate::resume_hint(unfinished, queued);
         self.update(app, StateUpdate::Snapshot(view));
         if let Some(hint) = hint {
             app.push(TuiEntryKind::System, hint);
@@ -1497,10 +1481,12 @@ impl Remote {
         });
     }
 
-    /// Continues the turn the saved context left unfinished: `resume`
-    /// without a run named.
+    /// Continues the turn the saved context left unfinished: Durable's
+    /// `continue` submission, which places what is queued first.
     fn continue_turn(&mut self) {
-        self.call(Call::Resume, json!({}));
+        self.submitting += 1;
+        let args = json!({"requestId": new_request_id(), "type": "continue"});
+        self.call(Call::Submit(String::new()), args);
     }
 
     fn call(&mut self, call: Call, args: Value) {
@@ -1509,7 +1495,6 @@ impl Remote {
             Call::Command(_) => "command",
             Call::Withdraw { .. } => "withdraw",
             Call::Abort => "abort",
-            Call::Resume => "resume",
             Call::Sessions(_) => unreachable!("sent by sessions_command"),
         };
         let (client, session, sender) = (
@@ -1573,15 +1558,6 @@ impl Remote {
     }
 
     fn answer(&mut self, app: &mut TuiApp, call: Call, result: Result<Value>) {
-        if matches!(&call, Call::Resume) {
-            if let Some(run_id) = result
-                .as_ref()
-                .ok()
-                .and_then(|value| value["runId"].as_str())
-            {
-                self.starting = Some(run_id.to_owned());
-            }
-        }
         if matches!(
             &call,
             Call::Submit(_) | Call::Command(_) | Call::Sessions(_)
@@ -1608,7 +1584,6 @@ impl Remote {
                         self.aborting = None;
                         format!("abort: {error}")
                     }
-                    Call::Resume => format!("resume: {error}"),
                     Call::Sessions(line) => format!("{}: {error:#}", one_line(line)),
                     Call::Withdraw { text, .. } => {
                         format!("withdraw {}: {error}", one_line(text))
@@ -1627,7 +1602,7 @@ impl Remote {
             }
         };
         match call {
-            Call::Submit(_) | Call::Resume => {}
+            Call::Submit(_) => {}
             // The worker's: deleting the session shown.
             Call::Sessions(line) if value.is_null() => self.run_command(line),
             Call::Sessions(line) if line.starts_with("/delete") => app.push(

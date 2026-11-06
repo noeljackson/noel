@@ -137,8 +137,8 @@ Each slice keeps `make check` and `make e2e` green and is committed on its own.
   - A session its worker already holds is attached to without waiting for
     the lock.
 - The rules that keep `noel`'s behaviour:
-  - Opening a session whose context ends mid-turn resumes it once: `resume`
-    without a run named answers first, then the queue.
+  - Opening a session whose context ends mid-turn continues it once with
+    Durable's `continue`, which places what is queued first.
   - Ctrl+C, `/interrupt` and quitting abort with `keepQueue`.
   - `/quit` ends the worker once no client holds the session.
   - A signal that ends a local `noel` that is the only client stops the

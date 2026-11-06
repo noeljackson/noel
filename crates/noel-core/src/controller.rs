@@ -703,34 +703,6 @@ impl<H: Host> SessionController<H> {
         }))
     }
 
-    /// While no run is active, continues the turn the saved context left
-    /// unfinished, as `noel` opening the session does: the model answers
-    /// first, then follow-ups queued meanwhile are placed (unlike
-    /// [`Self::continue_run`], which places them first). Refused when no
-    /// turn is unfinished.
-    pub async fn resume_unfinished(&mut self) -> Result<Start, String> {
-        if !self.runtime.session().has_unfinished_turn() {
-            return Err("no turn is unfinished".to_owned());
-        }
-        let Self { runtime, live } = self;
-        let live = live.get_mut().expect("controller state");
-        let provider = live.host.provider(runtime).await?;
-        let run = RunStart {
-            id: new_id(),
-            request_id: None,
-            kind: SubmissionKind::Continue,
-        };
-        let run_id = run.id.clone();
-        runtime
-            .start_bare_run(run)
-            .map_err(|error| error.to_string())?;
-        Ok(Start {
-            run_id,
-            provider,
-            call: Call::Resume { charged: None },
-        })
-    }
-
     /// Compacts the session now.
     pub async fn compact(&mut self, focus: Option<&str>) -> Result<CompactionRecord, String> {
         let Self { runtime, live } = self;

@@ -989,13 +989,8 @@ async fn idle_command(
             let _ = reply.send(result);
         }
         Command::Resume(args, reply) => {
-            // Without a run named, the turn the saved context left
-            // unfinished (a client opening the session).
-            let resumed = match args.get("expectedRunId").and_then(Value::as_str) {
-                Some(expected) => controller.resume(expected).await,
-                None => controller.resume_unfinished().await,
-            };
-            match resumed {
+            let expected = text(&args, "expectedRunId");
+            match controller.resume(&expected).await {
                 Ok(start) => {
                     let _ = reply.send(Ok(json!({"runId": start.run_id()})));
                     return Some(start);

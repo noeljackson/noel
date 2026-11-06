@@ -413,7 +413,10 @@ pub(crate) async fn run(
             );
             if resuming {
                 ui.set_resume_pending(runtime.session().has_unfinished_turn());
-                if let Some(hint) = resume_hint(runtime) {
+                if let Some(hint) = resume_hint(
+                    runtime.session().has_unfinished_turn(),
+                    runtime.session().queued_messages.len(),
+                ) {
                     ui.push(TuiEntryKind::System, hint);
                 }
             }

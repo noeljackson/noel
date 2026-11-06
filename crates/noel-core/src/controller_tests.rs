@@ -1119,63 +1119,6 @@ async fn a_continue_is_refused_while_a_run_is_active() {
     assert_eq!(*refusal.lock().unwrap(), Some(SubmitError::Busy));
 }
 
-/// A context ending in the prompt, as a run whose request failed leaves it.
-fn unanswered(name: &str) -> Fixture {
-    let fixture = Fixture::new(name, AbortPolicy::KeepQueue);
-    let path = fixture.path.clone();
-    drop(fixture);
-    let (store, state) = SessionStore::open(path.clone()).unwrap();
-    let mut runtime = Runtime::with_store(state, systems(), store);
-    let start = RunStart {
-        id: "run-1".into(),
-        request_id: None,
-        kind: SubmissionKind::Prompt,
-    };
-    runtime.start_run(start, "work".into(), Vec::new()).unwrap();
-    runtime
-        .end_run(
-            "run-1",
-            RunStatus::Failed,
-            Some(RunFailure {
-                reason: FailureReason::ModelError,
-                detail: "provider down".into(),
-            }),
-        )
-        .unwrap();
-    drop(runtime);
-    Fixture::reopen(&path, AbortPolicy::KeepQueue)
-}
-
-#[tokio::test]
-async fn resuming_an_unfinished_turn_answers_it_before_the_queue() {
-    let mut fixture = unanswered("resume-unfinished");
-    queued(
-        fixture
-            .controller
-            .enqueue(QueueMode::FollowUp, follow_up("and then?", "f-1")),
-    );
-    fixture.take_events();
-    fixture.script([says("answered"), says("then this")]);
-    let Ok(start) = fixture.controller.resume_unfinished().await else {
-        panic!("an unfinished turn resumes while idle");
-    };
-    let (_sender, mut inbox) = mpsc::unbounded_channel::<Action>();
-    assert!(fixture.controller.run(start, &mut inbox, |a, b| a(b)).await);
-    assert_eq!(
-        fixture.take_events(),
-        [
-            "run started",
-            "assistant answered",
-            "placed f-1",
-            "user and then?",
-            "assistant then this",
-            "settled Completed",
-        ]
-    );
-    // Nothing is unfinished now.
-    assert!(fixture.controller.resume_unfinished().await.is_err());
-}
-
 #[tokio::test]
 async fn a_queued_slash_tool_command_is_placed_alone() {
     let mut fixture = Fixture::new("tool-follow-ups", AbortPolicy::KeepQueue);

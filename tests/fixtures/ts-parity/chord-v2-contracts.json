@@ -577,6 +577,9 @@
               "resume": {
                 "args": {
                   "type": "object",
+                  "required": [
+                    "expectedRunId"
+                  ],
                   "properties": {
                     "expectedRunId": {
                       "type": "string"
@@ -709,7 +712,7 @@
           }
         }
       },
-      "fingerprint": "495c954f26d44c88"
+      "fingerprint": "7464a70af036b18f"
     },
     {
       "declaration": {

@@ -261,7 +261,7 @@ Partials and tool output reach the view from the journal's records as each is sa
   - A journal outside the server's session directory is named to the server in `workers/<id>.journal`. `--no-session` uses a journal in the runtime directory that is deleted on exit.
   - A session its own worker already holds is attached to without waiting for the lock.
   - Quitting aborts the active run and keeps the queue. With no other client, the worker ends, so the next `noel` opens the session as this one left it. A SIGTERM or SIGHUP that ends the only client also stops the worker, and the worker's tools with it.
-  - Opening a session whose context ends mid-turn resumes it once: `resume` without `expectedRunId` answers the turn, then the queue.
+  - Opening a session whose context ends mid-turn continues it once with Durable's `continue` submission, which places what is queued first.
   - `/login` runs on the terminal, as before, and the worker then reloads. A rebuilt binary (dogfood auto-restart) restarts the client between turns.
 - **`--attach`:**
   - It takes no prompt, print mode or session flag, and refuses the options that shape a local session (model, thinking, tools, skills, templates, extensions, images and the like): the session runs with its own settings.
