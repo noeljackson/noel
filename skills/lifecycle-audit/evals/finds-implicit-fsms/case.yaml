@@ -1,0 +1,7 @@
+schema_version: "1.1"
+name: finds-implicit-fsms
+expected_outcome: |
+  The response partitions the repo, runs read-only searches, verifies the
+  strongest findings against cited lines, and reports a tiered list in chat
+  with file:line references, each finding marked verified or from static read.
+  It offers to file issues rather than filing them.
