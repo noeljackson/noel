@@ -1060,16 +1060,28 @@ pub(crate) struct Recorder {
     reported_round: bool,
     round: Option<Round>,
     reply: Option<Streaming>,
-    tool: Option<ChatToolCall>,
+    /// Tools started and not ended, in the order they started (#143: one
+    /// slot, which a second tool overwrote).
+    tools: Vec<ChatToolCall>,
     /// The retry not yet reported as ended, and the error it ended with if
     /// the engine has reported one.
     retry: Option<(u64, Option<String>)>,
-    compacting: bool,
-    /// The compaction answers a context overflow: its reason is overflow,
-    /// and the run asks again once it succeeds.
-    overflowed: bool,
+    compaction: CompactionPhase,
     /// agent_end is written and nothing has started since.
     ended: bool,
+}
+
+/// Where the run's compaction is (#143: two flags, reset at different
+/// points).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CompactionPhase {
+    #[default]
+    None,
+    /// The reply ran out of context: the next compaction answers it.
+    Overflowed,
+    /// A compaction runs; `overflow` when it answers an overflow (its
+    /// reason, and the run asks again once it succeeds).
+    Running { overflow: bool },
 }
 
 /// An open turn: when it started and where its reply is in the run's
@@ -1096,10 +1108,9 @@ impl Recorder {
             reported_round: false,
             round: None,
             reply: None,
-            tool: None,
+            tools: Vec::new(),
             retry: None,
-            compacting: false,
-            overflowed: false,
+            compaction: CompactionPhase::None,
             ended: false,
         }
     }
@@ -1109,7 +1120,7 @@ impl Recorder {
     }
 
     pub fn compacting(&self) -> bool {
-        self.compacting
+        matches!(self.compaction, CompactionPhase::Running { .. })
     }
 
     /// An engine call starts with `prompt`, or continues a stopped run.
@@ -1176,7 +1187,7 @@ impl Recorder {
             TurnEvent::Overflowed { error } => {
                 let stop = if error.is_some() { "error" } else { "length" };
                 self.drop_reply(stop, error.as_deref(), false, sink);
-                self.overflowed = true;
+                self.compaction = CompactionPhase::Overflowed;
             }
             TurnEvent::ToolStarted { call } => {
                 sink(Event::ToolExecutionStart {
@@ -1184,7 +1195,7 @@ impl Recorder {
                     tool_name: &call.name,
                     args: parse_arguments(&call.arguments),
                 });
-                self.tool = Some(call.clone());
+                self.tools.push(call.clone());
             }
             TurnEvent::ToolUpdate { call, output } => {
                 // Like upstream's bash, the report that the command starts
@@ -1221,8 +1232,12 @@ impl Recorder {
                 let content = Content::text_and_images(output, images);
                 self.tool_output(call, content, *is_error, duration.map(millis), sink);
             }
+            // The compaction's end reports it.
+            TurnEvent::HistoryRewritten(_) => {}
             TurnEvent::CompactionStarted => {
-                self.compacting = true;
+                self.compaction = CompactionPhase::Running {
+                    overflow: self.compaction == CompactionPhase::Overflowed,
+                };
                 sink(Event::CompactionStart {
                     reason: self.compaction_reason(),
                 });
@@ -1317,17 +1332,16 @@ impl Recorder {
     }
 
     fn compaction_reason(&self) -> &'static str {
-        if self.overflowed {
-            "overflow"
-        } else {
-            "threshold"
+        match self.compaction {
+            CompactionPhase::Overflowed | CompactionPhase::Running { overflow: true } => "overflow",
+            _ => "threshold",
         }
     }
 
     /// Ends a compaction the engine left open when it stopped (`error` is
     /// `None` for an abort).
     fn interrupt_compaction(&mut self, error: Option<&str>, sink: Sink) {
-        if std::mem::take(&mut self.compacting) {
+        if let CompactionPhase::Running { .. } = self.compaction {
             sink(Event::CompactionEnd {
                 reason: self.compaction_reason(),
                 result: None,
@@ -1336,6 +1350,8 @@ impl Recorder {
                 error_message: error,
             });
         }
+        // The overflow went with the stop: nothing asks again.
+        self.compaction = CompactionPhase::None;
     }
 
     /// Closes what the engine left open when it stopped (`error` is `None`
@@ -1343,7 +1359,7 @@ impl Recorder {
     /// the turn awaiting one, or of a new turn, with no further delivery.
     fn stop(&mut self, error: Option<&str>, sink: Sink) {
         let message = error.unwrap_or(ABORTED);
-        if let Some(call) = self.tool.take() {
+        for call in std::mem::take(&mut self.tools) {
             let content = vec![Content::text(error.unwrap_or("Operation aborted"))];
             self.tool_output(&call, content, true, None, sink);
         }
@@ -1468,7 +1484,7 @@ impl Recorder {
         duration_ms: Option<u64>,
         sink: Sink,
     ) {
-        self.tool = None;
+        self.tools.retain(|open| open.id != call.id);
         sink(Event::ToolExecutionEnd {
             tool_call_id: &call.id,
             tool_name: &call.name,
@@ -1493,16 +1509,16 @@ impl Recorder {
     }
 
     fn end_compaction(&mut self, result: Result<&CompactionRecord, &String>, sink: Sink) {
-        self.compacting = false;
+        let overflow = matches!(self.compaction, CompactionPhase::Running { overflow: true });
         sink(Event::CompactionEnd {
             reason: self.compaction_reason(),
             result: result.ok().map(Compaction::from),
             aborted: false,
             // After an overflow, the run asks again with the smaller context.
-            will_retry: self.overflowed && result.is_ok(),
+            will_retry: overflow && result.is_ok(),
             error_message: result.err().map(String::as_str),
         });
-        self.overflowed = false;
+        self.compaction = CompactionPhase::None;
     }
 }
 
@@ -1633,4 +1649,46 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(millis)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod recorder_tests {
+    use super::*;
+
+    /// #143: two tools running at once each end, in order, when the run
+    /// stops; one slot used to keep only the last.
+    #[test]
+    fn a_stop_ends_every_open_tool() {
+        let mut ended = Vec::new();
+        let mut sink = |event: Event<'_>| {
+            if let Event::ToolExecutionEnd {
+                tool_call_id,
+                is_error,
+                ..
+            } = event
+            {
+                ended.push((tool_call_id.to_owned(), is_error));
+            }
+        };
+        let source = Source {
+            api: ProviderApi::Faux,
+            provider: "faux".into(),
+            model: "script".into(),
+            thinking_level: "off".into(),
+        };
+        let mut recorder = Recorder::start("r1".into(), source, &mut sink);
+        recorder.call(Some(Prompt::Initial));
+        let queue = Queue::default();
+        recorder.record(&TurnEvent::RoundStarted, &queue, &mut sink);
+        for id in ["c1", "c2"] {
+            let call = ChatToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            };
+            recorder.record(&TurnEvent::ToolStarted { call }, &queue, &mut sink);
+        }
+        recorder.finish(&Outcome::Aborted, &mut sink);
+        assert_eq!(ended, [("c1".to_owned(), true), ("c2".to_owned(), true)]);
+    }
 }

@@ -105,6 +105,8 @@ impl CodemodeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallStatus {
+    /// Called, and not answered yet.
+    Running,
     Ok,
     Error,
     /// Still running when the execution ended.
@@ -446,7 +448,7 @@ pub async fn execute(
                                 break 'run Err(bridge_broken(&format!("duplicate call id {id}")));
                             }
                             let record = (target == CallTarget::Tool).then(|| {
-                                calls.push(CallRecord { name: name.clone(), status: CallStatus::Cancelled, duration: Duration::ZERO });
+                                calls.push(CallRecord { name: name.clone(), status: CallStatus::Running, duration: Duration::ZERO });
                                 calls.len() - 1
                             });
                             pending.insert(id, (record, Instant::now()));
@@ -496,8 +498,8 @@ pub async fn execute(
                     calls[index].duration = started.elapsed();
                 }
                 let reply = match result {
-                    Ok(value) => VmResult { id, ok: true, payload: value.map(|value| value.to_string()), properties: None },
-                    Err(message) => VmResult { id, ok: false, payload: Some(message), properties: None },
+                    Ok(value) => VmResult { id, outcome: Ok(value.map(|value| value.to_string())), properties: None },
+                    Err(message) => VmResult { id, outcome: Err(message), properties: None },
                 };
                 if commands.send(Command::Deliver(reply)).is_err() {
                     break 'run Err(CodemodeError::new(ErrorKind::Sandbox, "The VM stopped"));
@@ -512,9 +514,10 @@ pub async fn execute(
             }
         }
     };
-    // Calls still running are cancelled: their records keep `cancelled`.
+    // Calls still running are cancelled.
     for (record, started) in pending.into_values() {
         if let Some(index) = record {
+            calls[index].status = CallStatus::Cancelled;
             calls[index].duration = started.elapsed();
         }
     }

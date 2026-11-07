@@ -717,7 +717,10 @@ mod tests {
         );
         result.tool_call_id = Some("read-old".into());
         runtime.session.messages.insert(3, result);
-        runtime.session.queued_messages.push("next question".into());
+        runtime
+            .session
+            .queue
+            .push(crate::QueuedEntry::follow_up("next question"));
         runtime.session.edited_files.push("db.rs".into());
         let before = runtime.session.clone();
         let tail = before.messages[4..].to_vec();

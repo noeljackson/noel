@@ -218,10 +218,20 @@ fn follow_state(client: &Client, which: &'static str, events: Events) {
     });
 }
 
+/// Aborts its task when dropped: a follower ends with the task that
+/// started it (#137: aborting `follow_session` left its follower running).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Follows the session's view, with the history before its window.
 async fn follow_session(client: Client, session: String, events: Events) {
     let (views, mut incoming) = mpsc::unbounded_channel();
-    let follower = {
+    let follower = AbortOnDrop({
         let (client, session) = (client.clone(), session.clone());
         let events = events.clone();
         tokio::spawn(async move {
@@ -249,7 +259,7 @@ async fn follow_session(client: Client, session: String, events: Events) {
                 .await;
             let _ = events.unbounded_send(Event::Status(format!("{session}: {error:#}")));
         })
-    };
+    });
     let mut transcript = Transcript::default();
     let mut loaded_earlier = false;
     while let Some(view) = incoming.recv().await {
@@ -269,5 +279,5 @@ async fn follow_session(client: Client, session: String, events: Events) {
             break;
         }
     }
-    follower.abort();
+    drop(follower);
 }
