@@ -421,6 +421,21 @@ struct Live<H> {
     /// Submissions that left the queue, oldest first.
     past: Vec<PastSubmission>,
     run: Option<ActiveRun>,
+    /// Whether a run was accepted and not run yet, or the controller closed.
+    gate: Gate,
+}
+
+/// What the controller handed out (#140): a [`Start`] saves its run as
+/// running before `run` takes it, so a Start dropped unrun must not leave
+/// that run running, and a controller whose run a close stopped takes no
+/// more work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Gate {
+    Open,
+    /// A Start for run `0` was returned and `run` has not taken it.
+    Accepted(String),
+    /// A close stopped the run: the controller is done.
+    Closed,
 }
 
 /// The active run.
@@ -443,6 +458,7 @@ impl<H: Host> SessionController<H> {
             saved: Vec::new(),
             past: Vec::new(),
             run: None,
+            gate: Gate::Open,
         };
         live.open(&runtime);
         Self {
@@ -453,6 +469,28 @@ impl<H: Host> SessionController<H> {
 
     fn live(&mut self) -> &mut Live<H> {
         self.live.get_mut().expect("controller state")
+    }
+
+    /// Before new work: a Start dropped without running left its run
+    /// interrupted, as a crash would; a closed controller refuses.
+    fn settle_unrun(&mut self) -> Result<(), String> {
+        let gate = std::mem::replace(&mut self.live().gate, Gate::Open);
+        match gate {
+            Gate::Open => Ok(()),
+            Gate::Accepted(run_id) => {
+                self.runtime.interrupt_unrun(&run_id);
+                Ok(())
+            }
+            Gate::Closed => {
+                self.live().gate = Gate::Closed;
+                Err("the session closed; open it again".to_owned())
+            }
+        }
+    }
+
+    /// Notes that a Start for `run_id` is handed out.
+    fn accepted(&mut self, run_id: &str) {
+        self.live().gate = Gate::Accepted(run_id.to_owned());
     }
 
     pub fn runtime(&self) -> &Runtime {
@@ -507,6 +545,16 @@ impl<H: Host> SessionController<H> {
     /// its first submission, and anything else starts a run, saved with
     /// its prompt. Steering and follow-ups still queued join that run.
     pub async fn submit(&mut self, submission: Submission) -> Result<Submitted, SubmitError> {
+        self.settle_unrun().map_err(SubmitError::Refused)?;
+        let submitted = self.submit_settled(submission).await?;
+        if let Submitted::Started(start) = &submitted {
+            let run_id = start.run_id.clone();
+            self.accepted(&run_id);
+        }
+        Ok(submitted)
+    }
+
+    async fn submit_settled(&mut self, submission: Submission) -> Result<Submitted, SubmitError> {
         let Self { runtime, live } = self;
         let live = live.get_mut().expect("controller state");
         if let Some(repeat) = live.repeat(&submission, &runtime.session().runs)? {
@@ -576,6 +624,7 @@ impl<H: Host> SessionController<H> {
         expected_run_id: Option<&str>,
         policy: AbortPolicy,
     ) -> Result<(), String> {
+        self.settle_unrun()?;
         let interrupted = self
             .runtime
             .session()
@@ -603,6 +652,13 @@ impl<H: Host> SessionController<H> {
 
     /// Accepts continuing the session's last run, if a stop interrupted it.
     pub async fn resume(&mut self, expected_run_id: &str) -> Result<Start, String> {
+        self.settle_unrun()?;
+        let start = self.resume_settled(expected_run_id).await?;
+        self.accepted(expected_run_id);
+        Ok(start)
+    }
+
+    async fn resume_settled(&mut self, expected_run_id: &str) -> Result<Start, String> {
         let Some(run) = self.runtime.session().runs.last() else {
             return Err(format!(
                 "expectedRunId {expected_run_id} does not match: the session has no run"
@@ -669,6 +725,19 @@ impl<H: Host> SessionController<H> {
     /// `nothing_to_answer`. A repeated `requestId` gets its first
     /// submission.
     pub async fn continue_run(
+        &mut self,
+        request_id: Option<String>,
+    ) -> Result<Submitted, SubmitError> {
+        self.settle_unrun().map_err(SubmitError::Refused)?;
+        let submitted = self.continue_settled(request_id).await?;
+        if let Submitted::Started(start) = &submitted {
+            let run_id = start.run_id.clone();
+            self.accepted(&run_id);
+        }
+        Ok(submitted)
+    }
+
+    async fn continue_settled(
         &mut self,
         request_id: Option<String>,
     ) -> Result<Submitted, SubmitError> {
@@ -747,6 +816,8 @@ impl<H: Host> SessionController<H> {
         let Self { runtime, live } = self;
         let control = {
             let live = live.get_mut().expect("controller state");
+            // The Start is taken: its run is this one now.
+            live.gate = Gate::Open;
             let control = RunControl {
                 steering: live.queue.steering.clone(),
                 run_id: Some(run_id.clone()),
@@ -834,6 +905,7 @@ impl<H: Host> SessionController<H> {
                 if let Err(error) = runtime.close_run(&run_id) {
                     lock(live).host.event(Event::SaveFailed { error: &error });
                 }
+                lock(live).gate = Gate::Closed;
                 return false;
             };
             let mut live = lock(live);
