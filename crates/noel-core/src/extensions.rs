@@ -207,7 +207,8 @@ pub struct HostOutcome {
 /// One persistent extension process.
 struct HostProcess {
     child: Child,
-    stdin: ChildStdin,
+    /// `None` once closed for shutdown: the host reads end of input.
+    stdin: Option<ChildStdin>,
     pipe: Pipe,
 }
 
@@ -273,7 +274,7 @@ impl HostProcess {
         let stdout = child.stdout.take().expect("piped stdout");
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             pipe: Pipe::Idle(BufReader::new(stdout)),
         })
     }
@@ -290,8 +291,9 @@ impl HostProcess {
             Pipe::Broken(reason) => return Err(self.broken(&reason)),
         };
         let exchange = async {
-            self.stdin.write_all(line.as_bytes()).await?;
-            self.stdin.flush().await?;
+            let stdin = self.stdin.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await?;
             // One line of JSON back per request, like v1's single response.
             let mut response = String::new();
             stdout.read_line(&mut response).await?;
@@ -318,11 +320,12 @@ impl HostProcess {
     async fn notify(&mut self, request: &HostRequest<'_>) -> Result<(), String> {
         let mut line = serde_json::to_string(request).map_err(|error| error.to_string())?;
         line.push('\n');
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(io_error)?;
-        self.stdin.flush().await.map_err(io_error)
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "extension input is closed".to_string())?;
+        stdin.write_all(line.as_bytes()).await.map_err(io_error)?;
+        stdin.flush().await.map_err(io_error)
     }
 
     /// Marks the pipe broken and returns why.
@@ -393,6 +396,9 @@ pub struct ExtensionHosts {
     /// How each host was started, to start it again when it broke.
     specs: BTreeMap<String, HostSpec>,
 }
+
+/// How long a host gets to run its shutdown handlers and exit.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What a host's `init` was given.
 #[derive(Debug, Clone)]
@@ -681,9 +687,16 @@ impl ExtensionHosts {
     /// Stop every host, notifying `shutdown` first.
     pub async fn shutdown(&mut self, cwd: &Path) {
         self.notify("shutdown", cwd).await;
+        // A host runs its shutdown handlers and exits; end of input asks a
+        // host that ignores the notification to exit too. One that has not
+        // exited in time is killed.
         for host in self.hosts.values() {
             let mut host = host.lock().await;
-            let _ = host.child.kill().await;
+            drop(host.stdin.take());
+            let exited = tokio::time::timeout(SHUTDOWN_GRACE, host.child.wait()).await;
+            if exited.is_err() {
+                let _ = host.child.kill().await;
+            }
         }
         self.hosts.clear();
         self.registrations.clear();
@@ -1112,6 +1125,50 @@ mod tests {
             .expect("gate call");
         assert_eq!(gate, GateDecision::allow());
         hosts.shutdown(&cwd).await;
+        let _ = fs::remove_dir_all(cwd);
+        drop(bun);
+    }
+
+    /// #132: `session_start` handlers run when the session starts (the
+    /// host's `init`), and `session_shutdown` handlers, their own list, run
+    /// before the host exits.
+    #[tokio::test]
+    async fn bun_host_runs_session_start_and_shutdown_handlers() {
+        let Ok(bun) = which_bun() else {
+            eprintln!("skipping: bun not found");
+            return;
+        };
+        let Some(shim) = repo_bun_host_shim() else {
+            eprintln!("skipping: shim not found");
+            return;
+        };
+        let cwd = std::env::temp_dir().join(format!("noel-ext-session-{}", std::process::id()));
+        fs::create_dir_all(&cwd).expect("mkdir");
+        let extension = cwd.join("session.ts");
+        fs::write(
+            &extension,
+            r#"
+            export default function (pi) {
+              pi.on("session_start", async (_event, ctx) => {
+                await Bun.write(ctx.cwd + "/started-" + ctx.sessionId, "");
+              });
+              pi.on("session_shutdown", async (_event, ctx) => {
+                await Bun.write(ctx.cwd + "/stopped-" + ctx.sessionId, "");
+              });
+            }
+            "#,
+        )
+        .expect("write extension");
+        let _guard = bun_host_env(&shim).await;
+        let mut hosts = ExtensionHosts::new();
+        hosts
+            .start("session", &extension, &cwd, "s1")
+            .await
+            .expect("start bun host");
+        assert!(cwd.join("started-s1").exists(), "session_start ran");
+        assert!(!cwd.join("stopped-s1").exists(), "not a shutdown");
+        hosts.shutdown(&cwd).await;
+        assert!(cwd.join("stopped-s1").exists(), "session_shutdown ran");
         let _ = fs::remove_dir_all(cwd);
         drop(bun);
     }

@@ -616,9 +616,14 @@ Rust supports:
   - Any response can carry new `tools`/`commands`, which replace that
     extension's registrations (upstream's dynamic tools: a command or a
     gate decides what the model may call next).
-  - Lifecycle notifications `sessionStart`-adjacent init, `agentSettled`
-    after a run settles, and `reload`/`shutdown`, matching upstream's
-    event names for the events the JSON protocol can carry.
+  - Lifecycle: `init` starts the session (the Bun host runs upstream's
+    `session_start` handlers there), `agentSettled` follows a run, and
+    `reload`/`shutdown` are notifications. On `shutdown` the Bun host runs
+    the `session_shutdown` handlers and exits; noel then closes the host's
+    input and kills one that has not exited within 2 seconds.
+  - A host's pipe is idle, busy or broken: a request cancelled mid-read or
+    one that failed breaks it, and a broken or exited host is started again
+    (spawn and `init`) on its next call.
   - `kind: "toolCall"` gate requests run before a tool the model asked for
     executes (upstream's `tool_call` handlers, a permission gate). A gate
     answers `{"allow":bool,"reason":str}`; a blocked call never runs and
