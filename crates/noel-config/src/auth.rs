@@ -195,21 +195,25 @@ impl ResolvedAuth {
         }
     }
 
-    pub fn expires(&self) -> u64 {
+    /// When the credential expires, in epoch seconds: `None` for an API
+    /// key, or a token whose expiry is not known (stored as 0).
+    pub fn expires(&self) -> Option<u64> {
         match self {
             ResolvedAuth::ClaudeCodeOAuth { expires, .. }
-            | ResolvedAuth::ChatGptOAuth { expires, .. } => *expires,
-            ResolvedAuth::ApiKey(_) => 0,
+            | ResolvedAuth::ChatGptOAuth { expires, .. } => (*expires != 0).then_some(*expires),
+            ResolvedAuth::ApiKey(_) => None,
         }
     }
 }
 
-pub fn is_expired(expires: u64, now: u64) -> bool {
-    expires != 0 && now >= expires
+/// Whether a credential expiring at `expires` has expired; one without a
+/// known expiry never has.
+pub fn is_expired(expires: Option<u64>, now: u64) -> bool {
+    expires.is_some_and(|expires| now >= expires)
 }
 
-pub fn expires_within(expires: u64, now: u64, within_seconds: u64) -> bool {
-    expires != 0 && now.saturating_add(within_seconds) >= expires
+pub fn expires_within(expires: Option<u64>, now: u64, within_seconds: u64) -> bool {
+    expires.is_some_and(|expires| now.saturating_add(within_seconds) >= expires)
 }
 
 pub fn api_key_for_provider(

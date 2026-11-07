@@ -315,7 +315,7 @@ fn imported_login(auth: &AuthData, provider: &str, account: Option<&str>) -> Opt
 fn expires_soon(auth: &ResolvedAuth, now: u64, window_seconds: u64) -> Option<u64> {
     let expires = auth.expires();
     (is_oauth(auth) && expires_within(expires, now, window_seconds) && !is_expired(expires, now))
-        .then(|| expires - now)
+        .then(|| expires.unwrap_or(now) - now)
 }
 
 /// Stderr text for a token with `remaining` seconds left, short of the
