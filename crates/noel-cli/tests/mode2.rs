@@ -613,7 +613,17 @@ fn a_server_of_another_build_shuts_down_the_old_worker_once_its_run_settles() {
     // The same program as another file is another build.
     let copy = mode2.root.join("noel-copy");
     fs::copy(env!("CARGO_BIN_EXE_noel"), &copy).unwrap();
-    let started = mode2.command_of(&copy, &["server"]).output().unwrap();
+    // A child another test forks meanwhile may still hold the copy open for
+    // writing (until its exec closes it): running it then fails "text file
+    // busy" for a moment.
+    let started = loop {
+        match mode2.command_of(&copy, &["server"]).output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            started => break started.unwrap(),
+        }
+    };
     assert!(started.status.success(), "{started:?}");
     let log = || fs::read_to_string(mode2.run_dir().join("server.log")).unwrap();
     wait_until("the refused adoption", || {

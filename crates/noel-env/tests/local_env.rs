@@ -175,14 +175,29 @@ async fn output_past_the_thresholds_spills_whole() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cleanup_kills_running_commands_which_settle_with_137() {
     let env = std::sync::Arc::new(LocalEnv::new("."));
+    // The command says when it runs (#181: a signal, not a guessed sleep).
+    let (started, mut running_now) = tokio::sync::mpsc::unbounded_channel();
     let running = tokio::spawn({
         let env = env.clone();
         async move {
-            env.exec(sh("sleep 30"), ExecOptions::default(), &cx())
-                .await
+            let mut on_output = |_chunk: noel_env::OutputChunk<'_>| {
+                let _ = started.send(());
+                Ok(())
+            };
+            env.exec(
+                sh("echo started; sleep 30"),
+                ExecOptions {
+                    on_output: Some(&mut on_output),
+                    ..Default::default()
+                },
+                &cx(),
+            )
+            .await
         }
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::timeout(Duration::from_secs(10), running_now.recv())
+        .await
+        .expect("the command starts");
     env.cleanup(&cx()).await;
     let result = tokio::time::timeout(Duration::from_secs(10), running)
         .await

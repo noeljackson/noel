@@ -115,7 +115,7 @@ pub(crate) async fn run(args: WorkerArgs) -> i32 {
             let mut stdout = std::io::stdout().lock();
             let _ = stdout.write_all(control_line(&message).as_bytes());
             let _ = stdout.flush();
-            eprintln!("noel worker: {}", fatal.message);
+            tracing::info!("noel worker: {}", fatal.message);
             fatal.code
         }
     }
@@ -183,7 +183,7 @@ async fn start(args: WorkerArgs) -> Result<i32, Fatal> {
     }
     let cwd = state.cwd.clone();
     if let Err(error) = std::env::set_current_dir(&cwd) {
-        eprintln!(
+        tracing::warn!(
             "noel worker: the session's directory {}: {error}",
             cwd.display()
         );
@@ -289,7 +289,7 @@ async fn start(args: WorkerArgs) -> Result<i32, Fatal> {
         status.clone(),
     ));
     announce_ready(&ready);
-    eprintln!(
+    tracing::info!(
         "noel worker: session {session_id} generation {} ready (pid {})",
         args.generation,
         std::process::id()
@@ -467,8 +467,8 @@ fn chat_host(session_id: &str, status: Arc<StatusBoard>) -> Host {
         HostEvent::Released { type_name, .. } if type_name == "noel.chat" => {
             status.update(|status| status.holds = status.holds.saturating_sub(1))
         }
-        HostEvent::Closed { .. } => eprintln!("noel worker: link closed"),
-        HostEvent::ProtocolError { error, .. } => eprintln!("noel worker: chord: {error}"),
+        HostEvent::Closed { .. } => tracing::info!("noel worker: link closed"),
+        HostEvent::ProtocolError { error, .. } => tracing::warn!("noel worker: chord: {error}"),
         _ => {}
     });
     host
@@ -584,13 +584,13 @@ async fn accept_parents(
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(error) => {
-                eprintln!("noel worker: accept: {error}");
+                tracing::warn!("noel worker: accept: {error}");
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
         if let Err(reason) = peer_check(&stream) {
-            eprintln!("noel worker: refused a connection: {reason}");
+            tracing::warn!("noel worker: refused a connection: {reason}");
             continue;
         }
         let (read, mut write) = stream.into_split();
@@ -612,7 +612,7 @@ async fn accept_parents(
                 ..LinkOptions::new(json!({"kind": "server"}))
             },
         );
-        eprintln!("noel worker: a server connected");
+        tracing::info!("noel worker: a server connected");
         // A server that connects again wants the worker: a drain asked by
         // the one before it is over.
         status.update(|status| {
@@ -624,7 +624,7 @@ async fn accept_parents(
         tokio::spawn(async move {
             while let Some(message) = controls.recv().await {
                 if message.get("type").and_then(Value::as_str) == Some("shutdown") {
-                    eprintln!("noel worker: asked to shut down once no run is active");
+                    tracing::info!("noel worker: asked to shut down once no run is active");
                     status.update(|status| {
                         if status.phase == Phase::Serving {
                             status.phase = Phase::Draining;
@@ -632,7 +632,7 @@ async fn accept_parents(
                     });
                 }
             }
-            eprintln!("noel worker: the server's link ended");
+            tracing::info!("noel worker: the server's link ended");
         });
     }
 }
@@ -694,7 +694,7 @@ async fn supervise(supervision: Supervision) -> i32 {
         };
         if let Some(signal) = signalled {
             // The run stays interrupted; the server resumes it.
-            eprintln!("noel worker: signal {signal}; exiting");
+            tracing::info!("noel worker: signal {signal}; exiting");
             noel_core::kill_running_tool_groups();
             files.remove();
             host.close().await;
@@ -712,7 +712,7 @@ async fn supervise(supervision: Supervision) -> i32 {
         let idle_for = status.idle_since().map(|since| since.elapsed());
         let done = now.exit_reason(idle_for, idle_limit);
         if let Some(why) = done {
-            eprintln!("noel worker: exiting ({why})");
+            tracing::info!("noel worker: exiting ({why})");
             if let Some(parent) = &*lock(&parent) {
                 parent.send(&json!({"type": "shutdown"}));
             }
@@ -779,7 +779,7 @@ impl ControllerHost for WorkerHost {
 
     fn event(&mut self, event: Event<'_>) {
         for notice in crate::account_failover::drain_notices() {
-            eprintln!("noel worker: {notice}");
+            tracing::info!("noel worker: {notice}");
             lock(&self.view).notice(notice);
         }
         match &event {
@@ -792,12 +792,12 @@ impl ControllerHost for WorkerHost {
                 let pending = queue.pending();
                 self.status.update(|status| status.queued = pending);
             }
-            Event::SaveFailed { error } => eprintln!("noel worker: {error}"),
+            Event::SaveFailed { error } => tracing::warn!("noel worker: {error}"),
             _ => {}
         }
         lock(&self.view).event(&event);
         if let Event::RunSettled { run_id, outcome } = &event {
-            eprintln!("noel worker: run {run_id} settled: {:?}", outcome.status());
+            tracing::info!("noel worker: run {run_id} settled: {:?}", outcome.status());
             self.status.update(|status| status.slot = Slot::Idle);
             for (reply, withdrawn) in self.aborts.drain(..) {
                 let _ = reply.send(Ok(json!({"runId": run_id, "withdrawn": withdrawn})));
@@ -835,12 +835,12 @@ async fn drive(
     if let Some(run_id) = resume {
         match controller.resume(&run_id).await {
             Ok(start) => {
-                eprintln!("noel worker: resuming run {run_id}");
+                tracing::info!("noel worker: resuming run {run_id}");
                 if !run_session(&mut controller, start, &mut inbox).await {
                     return;
                 }
             }
-            Err(error) => eprintln!("noel worker: run {run_id} not resumed: {error}"),
+            Err(error) => tracing::warn!("noel worker: run {run_id} not resumed: {error}"),
         }
     }
     // The server's plugin tools come first, so a run started at once
@@ -932,7 +932,7 @@ async fn run_session(
 
 fn set_plugin_tools(controller: &mut SessionController<WorkerHost>, tools: Vec<PluginTool>) {
     let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-    eprintln!("noel worker: plugin tools: {}", names.join(", "));
+    tracing::info!("noel worker: plugin tools: {}", names.join(", "));
     controller.configure(|runtime, host| {
         runtime.set_plugin_tools(host.plugin_host.clone(), tools);
     });

@@ -880,6 +880,7 @@ and dogfooding; nothing else needs them.
 | `NOEL_EDITOR_COMMAND` | The external editor for `/editor` and ctrl+g, before `VISUAL` and `EDITOR`. |
 | `NOEL_CLIPBOARD_COMMAND` | The command `/copy` pipes text into, instead of the platform's. |
 | `NOEL_CLIPBOARD_IMAGE_COMMAND` | The command that reads an image from the clipboard for a paste. |
+| `NOEL_LOG` | Which diagnostics are written (a tracing filter such as `debug` or `noel_core=debug`; `RUST_LOG` if unset; default `info`). They go to stderr, which is the log for `noel server` and its workers, and nowhere while the TUI holds the terminal. |
 | `NOEL_SEARXNG_URL` | A SearXNG instance for `web_search`. |
 | `NOEL_CODEMODE_MAX_WORKERS` | How many codemode scripts run at once. |
 | `NOEL_CLAUDE_CODE_VERSION` | The Claude Code version the Anthropic OAuth requests name. |
