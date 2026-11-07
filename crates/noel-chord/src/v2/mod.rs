@@ -24,7 +24,9 @@ pub mod object;
 pub mod part;
 pub mod transport;
 
-pub use channel::{BinaryCodec, Channel, ChannelOptions, Codec, ProtocolError, Received, Tick};
+pub use channel::{
+    BinaryCodec, Channel, ChannelOptions, Codec, DecodeError, ProtocolError, Received, Tick,
+};
 pub use contract::{hash64, Contract, ContractError, Declaration, HostKind};
 pub use error::{ChordError, Code, PluginError, WireError, PROTOCOL_VERSION};
 pub use host::{

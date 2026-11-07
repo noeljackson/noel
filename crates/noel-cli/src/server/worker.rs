@@ -37,8 +37,9 @@ use noel_chord::v2::{ChordError, WireError};
 use noel_client::session_address;
 use noel_config::{load_config_with_resources, project_is_trusted, LoadedConfig};
 use noel_core::controller::{
-    AbortPolicy, Busy, Enqueued, Event, Host as ControllerHost, Image, Repeat, SessionController,
-    Start, Submission, SubmissionState, SubmitError, Submitted, WhenBusy, Withdrawal,
+    AbortPolicy, Busy, ControllerError, Enqueued, Event, Host as ControllerHost, Image, Repeat,
+    SessionController, Start, Submission, SubmissionState, SubmitError, Submitted, WhenBusy,
+    Withdrawal,
 };
 use noel_core::plugins::{PluginTool, PluginToolHost, PluginToolOutput};
 use noel_core::{
@@ -1011,7 +1012,7 @@ impl PluginToolHost for ServerPluginTools {
 async fn compact(
     controller: &mut SessionController<WorkerHost>,
     focus: Option<&str>,
-) -> Result<noel_core::CompactionRecord, String> {
+) -> Result<noel_core::CompactionRecord, ControllerError> {
     let cancel = controller.host().compaction.clone().unwrap_or_default();
     let status = controller.host().status.clone();
     status.update(|status| status.compacting = true);
@@ -1751,7 +1752,7 @@ fn run_status(status: RunStatus) -> &'static str {
     }
 }
 
-fn withdrawn(result: Result<Withdrawal, String>) -> Result<Value, WireError> {
+fn withdrawn(result: Result<Withdrawal, ControllerError>) -> Result<Value, WireError> {
     let outcome = match result.map_err(|error| refused("withdraw", error))? {
         Withdrawal::Withdrawn => "withdrawn",
         Withdrawal::AlreadyPlaced => "already_placed",
