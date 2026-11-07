@@ -724,22 +724,59 @@ struct RefEntry {
     status: watch::Sender<RefStatus>,
     /// Where it is held.
     path: Option<PathKey>,
-    /// (link, hold) while held.
-    held: Option<(u64, u64)>,
-    variant: Option<String>,
-    methods: Vec<String>,
-    members: BTreeMap<String, MemberReplica>,
-    /// Member to index, for the binding's state entries.
-    state_names: Vec<String>,
+    /// Its hold, and what the hold's last `bound` gave (#150).
+    binding: Binding,
     subscribers: Vec<(u64, String, mpsc::UnboundedSender<StateUpdate>)>,
     /// Calls made while loading, sent once live: (token, method, args,
     /// reply).
     queued: Vec<QueuedCall>,
 }
 
+/// A reference's hold: none, or one on a link, bound or not.
+enum Binding {
+    Unheld,
+    Held {
+        link: u64,
+        hold: u64,
+        /// From its `bound`, until the hold goes loading, fails or ends.
+        replica: Option<Replica>,
+    },
+}
+
+/// What a `bound` gave a hold: its variant, methods and state members.
+struct Replica {
+    variant: String,
+    methods: Vec<String>,
+    members: BTreeMap<String, MemberReplica>,
+    /// Member to index, for the binding's state entries.
+    state_names: Vec<String>,
+}
+
 impl RefEntry {
     fn set_status(&self, status: RefStatus) {
         self.status.send_replace(status);
+    }
+
+    /// (link, hold) while held.
+    fn held(&self) -> Option<(u64, u64)> {
+        match self.binding {
+            Binding::Held { link, hold, .. } => Some((link, hold)),
+            Binding::Unheld => None,
+        }
+    }
+
+    fn replica(&self) -> Option<&Replica> {
+        match &self.binding {
+            Binding::Held { replica, .. } => replica.as_ref(),
+            Binding::Unheld => None,
+        }
+    }
+
+    /// The hold stays, unbound: loading again, or failed.
+    fn unbind(&mut self) {
+        if let Binding::Held { replica, .. } = &mut self.binding {
+            *replica = None;
+        }
     }
 
     fn notify(&mut self, member: &str, update: StateUpdate) {
@@ -866,11 +903,7 @@ impl Actor {
                         params,
                         status,
                         path: None,
-                        held: None,
-                        variant: None,
-                        methods: Vec::new(),
-                        members: BTreeMap::new(),
-                        state_names: Vec::new(),
+                        binding: Binding::Unheld,
                         subscribers: Vec::new(),
                         queued: Vec::new(),
                     },
@@ -910,7 +943,10 @@ impl Actor {
                 let Some(entry) = self.refs.get_mut(&reference) else {
                     return;
                 };
-                if let Some(value) = entry.members.get(&member).and_then(|m| m.value.clone()) {
+                let value = entry
+                    .replica()
+                    .and_then(|replica| replica.members.get(&member));
+                if let Some(value) = value.and_then(|m| m.value.clone()) {
                     let _ = sender.send(StateUpdate::Snapshot(value));
                 }
                 entry.subscribers.push((sink, member, sender));
@@ -925,7 +961,7 @@ impl Actor {
                     return;
                 };
                 let failed = matches!(*entry.status.borrow(), RefStatus::Failed { .. });
-                if let (Some((link, hold)), true) = (entry.held, failed) {
+                if let (Some((link, hold)), true) = (entry.held(), failed) {
                     self.send(
                         link,
                         &Message::Retry {
@@ -1117,8 +1153,7 @@ impl Actor {
         }
         for reference in link.consumer.holds.values() {
             if let Some(entry) = self.refs.get_mut(reference) {
-                entry.held = None;
-                entry.variant = None;
+                entry.binding = Binding::Unheld;
                 entry.set_status(RefStatus::Loading);
             }
         }
@@ -1263,7 +1298,7 @@ impl Actor {
                         ChordError::new(Code::Unavailable, format!("hold {hold}: rebinding")),
                     );
                     if let Some(entry) = self.refs.get_mut(&reference) {
-                        entry.variant = None;
+                        entry.unbind();
                         entry.set_status(RefStatus::Loading);
                     }
                 }
@@ -2162,7 +2197,11 @@ impl Actor {
         };
         host_link.channel.send(&message);
         let entry = self.refs.get_mut(&reference).expect("the reference");
-        entry.held = Some((link, hold));
+        entry.binding = Binding::Held {
+            link,
+            hold,
+            replica: None,
+        };
     }
 
     fn consumer_ref(&self, link: u64, hold: u64) -> Option<u64> {
@@ -2221,10 +2260,14 @@ impl Actor {
                     snapshots.push(((*name).to_owned(), StateUpdate::Failed(error)));
                 }
             }
-            ref_entry.variant = Some((*variant).to_owned());
-            ref_entry.methods = methods.iter().map(|name| (*name).to_owned()).collect();
-            ref_entry.state_names = state.iter().map(|name| (*name).to_owned()).collect();
-            ref_entry.members = members;
+            if let Binding::Held { replica, .. } = &mut ref_entry.binding {
+                *replica = Some(Replica {
+                    variant: (*variant).to_owned(),
+                    methods: methods.iter().map(|name| (*name).to_owned()).collect(),
+                    state_names: state.iter().map(|name| (*name).to_owned()).collect(),
+                    members,
+                });
+            }
             for (member, update) in snapshots {
                 ref_entry.notify(&member, update);
             }
@@ -2251,9 +2294,16 @@ impl Actor {
             let Some(ref_entry) = self.refs.get_mut(&reference) else {
                 continue;
             };
+            let Binding::Held {
+                replica: Some(replica),
+                ..
+            } = &mut ref_entry.binding
+            else {
+                return Err(format!("hold {}: state before bound", entry.hold));
+            };
             let mut updates = Vec::new();
             for (index, part) in &entry.members {
-                let Some(name) = ref_entry.state_names.get(*index as usize).cloned() else {
+                let Some(name) = replica.state_names.get(*index as usize).cloned() else {
                     return Err(format!("hold {}: no member {index}", entry.hold));
                 };
                 let wire: Value = match open_part(part, limits) {
@@ -2268,19 +2318,19 @@ impl Actor {
                 let Value::Array(wire) = wire else {
                     return Err(format!("hold {}: ops are no list", entry.hold));
                 };
-                let replica = ref_entry.members.get_mut(&name).expect("a member");
-                let ops = replica
+                let member = replica.members.get_mut(&name).expect("a member");
+                let ops = member
                     .decoder
                     .decode(&wire)
                     .map_err(|error| format!("hold {}: {error}", entry.hold))?;
-                let base = replica.value.take().unwrap_or(Value::Null);
+                let base = member.value.take().unwrap_or(Value::Null);
                 let value = apply_owned(base, &ops)
                     .map_err(|error| format!("hold {}: {error}", entry.hold))?;
-                replica.value = Some(value.clone());
+                member.value = Some(value.clone());
                 updates.push((name, StateUpdate::Ops { ops, value }));
             }
             for failed in &entry.failed {
-                if let Some(name) = ref_entry.state_names.get(failed.member as usize).cloned() {
+                if let Some(name) = replica.state_names.get(failed.member as usize).cloned() {
                     let error = WireError::from_json(&failed.error)?;
                     updates.push((name, StateUpdate::Failed(error)));
                 }
@@ -2306,7 +2356,7 @@ impl Actor {
         };
         self.fail_waiting_calls(reference, error.clone());
         if let Some(entry) = self.refs.get_mut(&reference) {
-            entry.variant = None;
+            entry.unbind();
             entry.set_status(RefStatus::Failed {
                 cause,
                 error,
@@ -2344,8 +2394,8 @@ impl Actor {
         let Some(entry) = self.refs.get_mut(&reference) else {
             return;
         };
-        let held = entry.held.take();
-        entry.variant = None;
+        let held = entry.held();
+        entry.binding = Binding::Unheld;
         let tokens: Vec<u64> = self
             .outgoing
             .iter()
@@ -2375,7 +2425,7 @@ impl Actor {
         let Some(entry) = self.refs.get(&reference) else {
             return;
         };
-        if let Some((link, hold)) = entry.held {
+        if let Some((link, hold)) = entry.held() {
             self.send(link, &Message::Release { origin: None, hold });
         }
         self.forget_reference(reference, released().into());
@@ -2432,12 +2482,12 @@ impl Actor {
             let _ = reply.send(Err(released().into()));
             return;
         };
-        let Some((link, hold)) = entry.held else {
+        let (Some((link, hold)), Some(replica)) = (entry.held(), entry.replica()) else {
             let _ = reply.send(Err(link_closed().into()));
             return;
         };
-        let Some(index) = entry.methods.iter().position(|name| name == method) else {
-            let variant = entry.variant.clone().unwrap_or_default();
+        let Some(index) = replica.methods.iter().position(|name| name == method) else {
+            let variant = replica.variant.clone();
             let error =
                 ChordError::invalid("member", format!("{method}: not a method of {variant}"));
             let _ = reply.send(Err(error.into()));
