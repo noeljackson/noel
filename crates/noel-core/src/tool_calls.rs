@@ -86,7 +86,7 @@ pub(crate) fn overlay_live_registrations(
                     parameters: registration.parameters.clone(),
                     extension_name: set.extension_name.clone(),
                     extension_path: PathBuf::new(),
-                    protocol: "2".to_string(),
+                    protocol: ExtensionToolProtocol::V2,
                     replay_safe: registration.replay_safe,
                     prompt_snippet: system_prompt::normalize_snippet(
                         registration.prompt_snippet.as_deref(),
@@ -109,7 +109,7 @@ pub(crate) fn overlay_plugin_tools(systems: &mut ReloadableSystems, tools: &[plu
     let previous: Vec<String> = systems
         .extension_tools
         .iter()
-        .filter(|(_, tool)| tool.protocol == "plugin")
+        .filter(|(_, tool)| tool.protocol == ExtensionToolProtocol::Plugin)
         .map(|(name, _)| name.clone())
         .collect();
     for name in previous {
@@ -132,7 +132,7 @@ pub(crate) fn overlay_plugin_tools(systems: &mut ReloadableSystems, tools: &[plu
                 parameters: tool.parameters.clone(),
                 extension_name: tool.plugin.clone(),
                 extension_path: PathBuf::new(),
-                protocol: "plugin".to_string(),
+                protocol: ExtensionToolProtocol::Plugin,
                 replay_safe: tool.replay_safe,
                 prompt_snippet: None,
                 prompt_guidelines: Vec::new(),
@@ -156,8 +156,13 @@ pub(crate) fn extension_tools_from_resources(
         let Some(manifest) = read_extension_manifest(&extension.path) else {
             continue;
         };
-        let protocol = manifest.protocol.unwrap_or_else(|| "json".to_string());
-        if protocol != "json" {
+        // A v1 manifest's tools run over `json`; another protocol has no
+        // tools of its own here.
+        if manifest
+            .protocol
+            .as_deref()
+            .is_some_and(|protocol| protocol != "json")
+        {
             continue;
         }
         for tool in manifest.tools {
@@ -181,7 +186,7 @@ pub(crate) fn extension_tools_from_resources(
                     }),
                     extension_name: extension.name.clone(),
                     extension_path: extension.path.clone(),
-                    protocol: protocol.clone(),
+                    protocol: ExtensionToolProtocol::Json,
                     replay_safe: tool.replay_safe,
                     prompt_snippet: system_prompt::normalize_snippet(
                         tool.prompt_snippet.as_deref(),
@@ -307,7 +312,7 @@ pub(crate) async fn execute_model_tool_call_with(
         // A persistent v2 host serves its tools over one process; v1 runs
         // one process per call. Both are started lazily, on the call that
         // needs them. A plugin's tool runs through the plugin host.
-        if extension_tool.protocol == "plugin" {
+        if extension_tool.protocol == ExtensionToolProtocol::Plugin {
             match runtime.plugin_host.clone() {
                 Some(host) => {
                     let outcome = host
@@ -329,7 +334,7 @@ pub(crate) async fn execute_model_tool_call_with(
                     )]
                 }
             }
-        } else if extension_tool.protocol == "2" {
+        } else if extension_tool.protocol == ExtensionToolProtocol::V2 {
             let extension_name = extension_tool.extension_name.clone();
             let tool_name = extension_tool.name.clone();
             let call = tool_call.clone();
@@ -498,12 +503,12 @@ pub(crate) async fn execute_extension_tool(
         .current_dir(cwd)
         .env("NOEL_EXTENSION_NAME", &extension.extension_name)
         .env("NOEL_EXTENSION_PATH", &extension.extension_path)
-        .env("NOEL_EXTENSION_PROTOCOL", &extension.protocol)
+        .env("NOEL_EXTENSION_PROTOCOL", extension.protocol.as_str())
         .env("NOEL_EXTENSION_TOOL", &extension.name)
         // Extensions written for pi read the same values under PI_ names.
         .env("PI_EXTENSION_NAME", &extension.extension_name)
         .env("PI_EXTENSION_PATH", &extension.extension_path)
-        .env("PI_EXTENSION_PROTOCOL", &extension.protocol)
+        .env("PI_EXTENSION_PROTOCOL", extension.protocol.as_str())
         .env("PI_EXTENSION_TOOL", &extension.name)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
