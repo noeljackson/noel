@@ -986,6 +986,27 @@ fn image_setting(
         .unwrap_or(default)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionToolProtocol {
+    /// A v1 manifest tool: a one-shot process per call, JSON on stdin.
+    Json,
+    /// A tool a v2 host registered; its calls go to the persistent host.
+    V2,
+    /// A tool a server plugin contributes.
+    Plugin,
+}
+
+impl ExtensionToolProtocol {
+    /// The name extensions are told (`NOEL_EXTENSION_PROTOCOL`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::V2 => "2",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionTool {
     pub name: String,
@@ -993,7 +1014,7 @@ pub struct ExtensionTool {
     pub parameters: Value,
     pub extension_name: String,
     pub extension_path: PathBuf,
-    pub protocol: String,
+    pub protocol: ExtensionToolProtocol,
     /// The manifest's `replaySafe`: a call cut off by a stop may run again
     /// when the turn continues.
     pub replay_safe: bool,

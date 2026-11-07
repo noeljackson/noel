@@ -3346,7 +3346,10 @@ async fn plugin_tools_run_through_their_host_and_survive_a_reload() {
             ..ReloadableSystems::default()
         })
         .unwrap();
-    assert_eq!(runtime.systems.extension_tools["shout"].protocol, "plugin");
+    assert_eq!(
+        runtime.systems.extension_tools["shout"].protocol,
+        ExtensionToolProtocol::Plugin
+    );
 }
 
 #[tokio::test]
