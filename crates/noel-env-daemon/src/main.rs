@@ -501,6 +501,9 @@ fn serve(token: &str) -> io::Result<()> {
             // A client that went silent (a phone that lost its network) leaves nothing running.
             if now_ms().saturating_sub(last_seen.load(Ordering::Relaxed)) > SILENCE_LIMIT_MS {
                 kill_all(&groups);
+                // From this watchdog thread, as a signal handler would: the
+                // main thread is blocked reading a stdin that never ends,
+                // so returning is not an option; what it started is killed.
                 std::process::exit(0);
             }
         });
@@ -522,7 +525,7 @@ fn serve(token: &str) -> io::Result<()> {
 
 const USAGE: &str = "usage: noel-env serve --token <hex>";
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("serve") => {
@@ -532,19 +535,24 @@ fn main() {
                 .and_then(|index| args.get(index + 1));
             let Some(token) = token else {
                 eprintln!("{USAGE}");
-                std::process::exit(2);
+                return std::process::ExitCode::from(2);
             };
             if let Err(error) = serve(token) {
                 eprintln!("noel-env: {error}");
-                std::process::exit(1);
+                return std::process::ExitCode::FAILURE;
             }
-            // Request threads may still be blocked (a FIFO open); nothing is left to answer them.
-            std::process::exit(0);
+            // Request threads may still be blocked (a FIFO open); returning
+            // from main ends the process with them, nothing is left to
+            // answer them (#179: no `exit` that skips this thread's drops).
+            std::process::ExitCode::SUCCESS
         }
-        Some("--version") => println!("noel-env {VERSION}"),
+        Some("--version") => {
+            println!("noel-env {VERSION}");
+            std::process::ExitCode::SUCCESS
+        }
         _ => {
             eprintln!("{USAGE}");
-            std::process::exit(2);
+            std::process::ExitCode::from(2)
         }
     }
 }

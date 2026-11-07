@@ -118,10 +118,10 @@ impl Contract {
             let mut normal = Map::new();
             for (member, schema) in &members.state {
                 check_member(member, &format!("{path}.{member}"))?;
-                if let Some((kind, _)) = kinds.insert(member, ("state", None)) {
-                    if kind != "state" {
-                        return Err(error(format!("{path}.{member}: a member has one kind")));
-                    }
+                if let Some((kind, _)) = kinds.insert(member, ("state", None))
+                    && kind != "state"
+                {
+                    return Err(error(format!("{path}.{member}: a member has one kind")));
                 }
                 let state = snapshot(schema, &format!("{path}.state.{member}"), Objects::Open)?;
                 normal.insert(member.clone(), json!({ "state": state }));

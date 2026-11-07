@@ -54,7 +54,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn random_hex(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
-    getrandom::getrandom(&mut buffer).expect("system randomness");
+    getrandom::fill(&mut buffer).expect("system randomness");
     buffer.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -251,7 +251,7 @@ impl Remote {
         }
         let code = loop {
             let mut bytes = [0u8; 8];
-            getrandom::getrandom(&mut bytes).expect("system randomness");
+            getrandom::fill(&mut bytes).expect("system randomness");
             let letters: String = bytes
                 .iter()
                 .map(|byte| ALPHABET[usize::from(*byte) % ALPHABET.len()] as char)

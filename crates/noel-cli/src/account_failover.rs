@@ -853,7 +853,7 @@ mod tests {
             &self,
             _request: ProviderRequest,
         ) -> Result<Vec<StreamEvent>, ProviderError> {
-            unimplemented!("streaming path is the product path")
+            unreachable!("streaming path is the product path")
         }
 
         async fn complete_streaming(
@@ -902,7 +902,7 @@ mod tests {
             &self,
             _request: ProviderRequest,
         ) -> Result<Vec<StreamEvent>, ProviderError> {
-            unimplemented!("streaming path is the product path")
+            unreachable!("streaming path is the product path")
         }
 
         async fn complete_streaming(
@@ -923,7 +923,7 @@ mod tests {
             &self,
             _request: ProviderRequest,
         ) -> Result<Vec<StreamEvent>, ProviderError> {
-            unimplemented!("streaming path is the product path")
+            unreachable!("streaming path is the product path")
         }
 
         async fn complete_streaming(

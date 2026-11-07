@@ -263,11 +263,12 @@ pub(crate) fn openai_chat_messages(
                 .peek()
                 .is_some_and(|next| next.role == ChatRole::Tool);
             messages.push(openai_chat_tool_message(config, message));
-            if group_has_images && !group_continues {
-                if let Some(image_message) = pending_images.get(image_group) {
-                    messages.push(image_message.clone());
-                    image_group += 1;
-                }
+            if group_has_images
+                && !group_continues
+                && let Some(image_message) = pending_images.get(image_group)
+            {
+                messages.push(image_message.clone());
+                image_group += 1;
             }
             continue;
         }
@@ -489,10 +490,10 @@ impl SseParser for OpenAiChatCompletionsSseParser {
         let Some(delta) = event.pointer("/choices/0/delta") else {
             return Ok(());
         };
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                on_event(StreamEvent::Text(text.to_string()))?;
-            }
+        if let Some(text) = delta.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            on_event(StreamEvent::Text(text.to_string()))?;
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
@@ -504,15 +505,15 @@ impl SseParser for OpenAiChatCompletionsSseParser {
                 // The first id and name stand, as upstream keeps them: a
                 // provider may send them again with every chunk.
                 let entry = &mut self.tool_calls[index];
-                if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    if entry.0.is_empty() {
-                        entry.0 = id.to_owned();
-                    }
+                if let Some(id) = call.get("id").and_then(Value::as_str)
+                    && entry.0.is_empty()
+                {
+                    entry.0 = id.to_owned();
                 }
-                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                    if entry.1.is_empty() {
-                        entry.1 = name.to_owned();
-                    }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+                    && entry.1.is_empty()
+                {
+                    entry.1 = name.to_owned();
                 }
                 if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
                 {
@@ -545,10 +546,10 @@ impl SseParser for OpenAiChatCompletionsSseParser {
 pub(crate) fn parse_openai_chat_completions_events(response: &Value) -> Option<Vec<StreamEvent>> {
     let message = response.pointer("/choices/0/message")?;
     let mut events = Vec::new();
-    if let Some(text) = message.get("content").and_then(Value::as_str) {
-        if !text.is_empty() {
-            events.push(StreamEvent::Text(text.to_string()));
-        }
+    if let Some(text) = message.get("content").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        events.push(StreamEvent::Text(text.to_string()));
     }
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in calls {

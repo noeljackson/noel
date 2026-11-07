@@ -54,18 +54,17 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let run = self.root.join("run-owner");
-        if std::thread::panicking() {
-            if let Ok(log) = fs::read_to_string(run.join("server.log")) {
-                eprintln!("--- server.log ---\n{log}--- end ---");
-            }
+        if std::thread::panicking()
+            && let Ok(log) = fs::read_to_string(run.join("server.log"))
+        {
+            eprintln!("--- server.log ---\n{log}--- end ---");
         }
-        if let Ok(text) = fs::read_to_string(run.join("server.json")) {
-            if let Some(pid) = serde_json::from_str::<Value>(&text)
+        if let Ok(text) = fs::read_to_string(run.join("server.json"))
+            && let Some(pid) = serde_json::from_str::<Value>(&text)
                 .ok()
                 .and_then(|r| r["pid"].as_u64())
-            {
-                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
-            }
+        {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
         }
         let _ = fs::remove_dir_all(&self.root);
     }

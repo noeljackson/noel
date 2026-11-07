@@ -59,13 +59,12 @@ pub async fn get_usage(
         .ok()
         .flatten()
         .and_then(|cache| cache.accounts.get(&key).cloned());
-    if !request.refresh {
-        if let Some(usage) = cached
+    if !request.refresh
+        && let Some(usage) = cached
             .as_ref()
             .filter(|usage| now - usage.fetched_at < USAGE_CACHE_TTL_SECONDS)
-        {
-            return UsageProbeResult::Usage(usage.clone());
-        }
+    {
+        return UsageProbeResult::Usage(usage.clone());
     }
 
     match probe(
@@ -1058,10 +1057,9 @@ fn scoped_weekly_labels(group: &[&AccountStatusRow]) -> Vec<String> {
                 .label
                 .strip_prefix("weekly (")
                 .and_then(|rest| rest.strip_suffix(')'))
+                && !labels.iter().any(|seen| seen == label)
             {
-                if !labels.iter().any(|seen| seen == label) {
-                    labels.push(label.to_string());
-                }
+                labels.push(label.to_string());
             }
         }
     }
@@ -1871,7 +1869,8 @@ mod tests {
     async fn collect_account_status_covers_stored_and_env_accounts() {
         let root = test_dir("noel-cli-accounts-status");
         let saved = std::env::var("OPENROUTER_API_KEY").ok();
-        std::env::set_var("OPENROUTER_API_KEY", "or-env-key");
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        unsafe { std::env::set_var("OPENROUTER_API_KEY", "or-env-key") };
 
         let mut auth = AuthData::default();
         auth.insert(
@@ -1930,8 +1929,10 @@ mod tests {
         assert_eq!(stub.hits.load(Ordering::SeqCst), 2);
 
         match saved {
-            Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
-            None => std::env::remove_var("OPENROUTER_API_KEY"),
+            // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+            Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+            // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
         }
         let _ = std::fs::remove_dir_all(root);
     }

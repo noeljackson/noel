@@ -263,10 +263,10 @@ impl View {
         self.inbox = inbox(queue);
         self.last_run = LastRun::of(runtime).map(|last| to_json(&last));
         // A failed run keeps its error, which the journal saved with it.
-        if let (Some(last), Some(run)) = (self.last_run.as_mut(), session.runs.last()) {
-            if let Some(failure) = run.failure.as_ref().filter(|f| !f.detail.is_empty()) {
-                last["error"] = json!(failure.detail);
-            }
+        if let (Some(last), Some(run)) = (self.last_run.as_mut(), session.runs.last())
+            && let Some(failure) = run.failure.as_ref().filter(|f| !f.detail.is_empty())
+        {
+            last["error"] = json!(failure.detail);
         }
         self.publish();
     }
@@ -637,10 +637,10 @@ impl View {
                 true
             }
             TurnEvent::RoundFinished => {
-                if !self.live.tools.is_empty() {
-                    if let Some(run) = &mut self.live.run {
-                        run.turns += 1;
-                    }
+                if !self.live.tools.is_empty()
+                    && let Some(run) = &mut self.live.run
+                {
+                    run.turns += 1;
                 }
                 self.live.generation = None;
                 self.live.tools.clear();

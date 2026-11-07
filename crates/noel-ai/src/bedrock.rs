@@ -94,16 +94,14 @@ pub(crate) fn bedrock_messages_with_cache(
     messages: &[ChatMessage],
 ) -> Vec<Value> {
     let mut messages = bedrock_messages(messages);
-    if bedrock_supports_prompt_cache(&config.model.id) {
-        if let Some(last_user) = messages
+    if bedrock_supports_prompt_cache(&config.model.id)
+        && let Some(last_user) = messages
             .iter_mut()
             .rev()
             .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        {
-            if let Some(content) = last_user.get_mut("content").and_then(Value::as_array_mut) {
-                content.push(json!({ "cachePoint": { "type": "default" } }));
-            }
-        }
+        && let Some(content) = last_user.get_mut("content").and_then(Value::as_array_mut)
+    {
+        content.push(json!({ "cachePoint": { "type": "default" } }));
     }
     messages
 }
@@ -194,10 +192,10 @@ pub(crate) fn parse_bedrock_response_events(response: &Value) -> Option<Vec<Stre
         .and_then(Value::as_array)?;
     let mut events = Vec::new();
     for item in content {
-        if let Some(text) = item.get("text").and_then(Value::as_str) {
-            if !text.is_empty() {
-                events.push(StreamEvent::Text(text.to_string()));
-            }
+        if let Some(text) = item.get("text").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            events.push(StreamEvent::Text(text.to_string()));
         }
         if let Some(tool_use) = item.get("toolUse") {
             let Some(id) = tool_use.get("toolUseId").and_then(Value::as_str) else {

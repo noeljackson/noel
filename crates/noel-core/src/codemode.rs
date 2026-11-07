@@ -489,10 +489,10 @@ impl Nested {
                 .gate_tool_call(&call.name, &call.arguments, &self.cwd)
                 .await
         };
-        if let Ok(decision) = gate {
-            if !decision.allow {
-                return Err(decision.reason);
-            }
+        if let Ok(decision) = gate
+            && !decision.allow
+        {
+            return Err(decision.reason);
         }
         let (output, is_error) = match self.extension_tools.get(name) {
             Some(tool) if tool.protocol == crate::ExtensionToolProtocol::V2 => {

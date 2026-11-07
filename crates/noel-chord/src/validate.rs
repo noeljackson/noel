@@ -72,46 +72,44 @@ fn check_at(schema: &Value, value: &Value, path: &mut String) -> Result<(), Stri
             return fail(path, format!("must be {}", types.join(" or ")));
         }
     }
-    if let Some(constant) = schema.get("const") {
-        if !deep_equal(Some(constant), Some(value)) {
-            return fail(
-                path,
-                format!("must be equal to constant {}", canonical_json(constant)),
-            );
-        }
+    if let Some(constant) = schema.get("const")
+        && !deep_equal(Some(constant), Some(value))
+    {
+        return fail(
+            path,
+            format!("must be equal to constant {}", canonical_json(constant)),
+        );
     }
-    if let Some(Value::Array(options)) = schema.get("enum") {
-        if !options
+    if let Some(Value::Array(options)) = schema.get("enum")
+        && !options
             .iter()
             .any(|option| deep_equal(Some(option), Some(value)))
-        {
-            return fail(path, "must be equal to one of the allowed values");
-        }
+    {
+        return fail(path, "must be equal to one of the allowed values");
     }
-    if let Some(Value::Array(branches)) = schema.get("anyOf") {
-        if !branches.iter().any(|branch| check(branch, value).is_ok()) {
-            return fail(path, "must match a schema in anyOf");
-        }
+    if let Some(Value::Array(branches)) = schema.get("anyOf")
+        && !branches.iter().any(|branch| check(branch, value).is_ok())
+    {
+        return fail(path, "must match a schema in anyOf");
     }
-    if let Some(Value::Array(branches)) = schema.get("oneOf") {
-        if branches
+    if let Some(Value::Array(branches)) = schema.get("oneOf")
+        && branches
             .iter()
             .filter(|branch| check(branch, value).is_ok())
             .count()
             != 1
-        {
-            return fail(path, "must match exactly one schema in oneOf");
-        }
+    {
+        return fail(path, "must match exactly one schema in oneOf");
     }
     if let Some(Value::Array(branches)) = schema.get("allOf") {
         for branch in branches {
             check_at(branch, value, path)?;
         }
     }
-    if let Some(not) = schema.get("not") {
-        if check(not, value).is_ok() {
-            return fail(path, "must not match the schema in not");
-        }
+    if let Some(not) = schema.get("not")
+        && check(not, value).is_ok()
+    {
+        return fail(path, "must not match the schema in not");
     }
     match value {
         Value::Number(_) => check_number(schema, value, path)?,
@@ -125,73 +123,74 @@ fn check_at(schema: &Value, value: &Value, path: &mut String) -> Result<(), Stri
 
 fn check_number(schema: &Map<String, Value>, value: &Value, path: &str) -> Result<(), String> {
     let n = number(value).unwrap_or(f64::NAN);
-    if let Some(minimum) = schema.get("minimum").and_then(number) {
-        if n < minimum {
-            return fail(
-                path,
-                format!("must be >= {}", js::number_to_string(minimum)),
-            );
-        }
+    if let Some(minimum) = schema.get("minimum").and_then(number)
+        && n < minimum
+    {
+        return fail(
+            path,
+            format!("must be >= {}", js::number_to_string(minimum)),
+        );
     }
-    if let Some(maximum) = schema.get("maximum").and_then(number) {
-        if n > maximum {
-            return fail(
-                path,
-                format!("must be <= {}", js::number_to_string(maximum)),
-            );
-        }
+    if let Some(maximum) = schema.get("maximum").and_then(number)
+        && n > maximum
+    {
+        return fail(
+            path,
+            format!("must be <= {}", js::number_to_string(maximum)),
+        );
     }
-    if let Some(minimum) = schema.get("exclusiveMinimum").and_then(number) {
-        if n <= minimum {
-            return fail(path, format!("must be > {}", js::number_to_string(minimum)));
-        }
+    if let Some(minimum) = schema.get("exclusiveMinimum").and_then(number)
+        && n <= minimum
+    {
+        return fail(path, format!("must be > {}", js::number_to_string(minimum)));
     }
-    if let Some(maximum) = schema.get("exclusiveMaximum").and_then(number) {
-        if n >= maximum {
-            return fail(path, format!("must be < {}", js::number_to_string(maximum)));
-        }
+    if let Some(maximum) = schema.get("exclusiveMaximum").and_then(number)
+        && n >= maximum
+    {
+        return fail(path, format!("must be < {}", js::number_to_string(maximum)));
     }
-    if let Some(divisor) = schema.get("multipleOf").and_then(number) {
-        if divisor != 0.0 && (n / divisor).fract() != 0.0 {
-            return fail(
-                path,
-                format!("must be a multiple of {}", js::number_to_string(divisor)),
-            );
-        }
+    if let Some(divisor) = schema.get("multipleOf").and_then(number)
+        && divisor != 0.0
+        && (n / divisor).fract() != 0.0
+    {
+        return fail(
+            path,
+            format!("must be a multiple of {}", js::number_to_string(divisor)),
+        );
     }
     Ok(())
 }
 
 fn check_string(schema: &Map<String, Value>, text: &str, path: &str) -> Result<(), String> {
     let length = js::utf16_len(text) as f64;
-    if let Some(minimum) = schema.get("minLength").and_then(number) {
-        if length < minimum {
-            return fail(
-                path,
-                format!(
-                    "must not have fewer than {} characters",
-                    js::number_to_string(minimum)
-                ),
-            );
-        }
+    if let Some(minimum) = schema.get("minLength").and_then(number)
+        && length < minimum
+    {
+        return fail(
+            path,
+            format!(
+                "must not have fewer than {} characters",
+                js::number_to_string(minimum)
+            ),
+        );
     }
-    if let Some(maximum) = schema.get("maxLength").and_then(number) {
-        if length > maximum {
-            return fail(
-                path,
-                format!(
-                    "must not have more than {} characters",
-                    js::number_to_string(maximum)
-                ),
-            );
-        }
+    if let Some(maximum) = schema.get("maxLength").and_then(number)
+        && length > maximum
+    {
+        return fail(
+            path,
+            format!(
+                "must not have more than {} characters",
+                js::number_to_string(maximum)
+            ),
+        );
     }
     if let Some(Value::String(pattern)) = schema.get("pattern") {
         // A pattern Rust's regex cannot compile is not checked.
-        if let Ok(regex) = Regex::new(pattern) {
-            if !regex.is_match(text) {
-                return fail(path, format!("must match pattern \"{pattern}\""));
-            }
+        if let Ok(regex) = Regex::new(pattern)
+            && !regex.is_match(text)
+        {
+            return fail(path, format!("must match pattern \"{pattern}\""));
         }
     }
     Ok(())
@@ -203,27 +202,27 @@ fn check_array(
     path: &mut String,
 ) -> Result<(), String> {
     let length = items.len() as f64;
-    if let Some(minimum) = schema.get("minItems").and_then(number) {
-        if length < minimum {
-            return fail(
-                path,
-                format!(
-                    "must not have fewer than {} items",
-                    js::number_to_string(minimum)
-                ),
-            );
-        }
+    if let Some(minimum) = schema.get("minItems").and_then(number)
+        && length < minimum
+    {
+        return fail(
+            path,
+            format!(
+                "must not have fewer than {} items",
+                js::number_to_string(minimum)
+            ),
+        );
     }
-    if let Some(maximum) = schema.get("maxItems").and_then(number) {
-        if length > maximum {
-            return fail(
-                path,
-                format!(
-                    "must not have more than {} items",
-                    js::number_to_string(maximum)
-                ),
-            );
-        }
+    if let Some(maximum) = schema.get("maxItems").and_then(number)
+        && length > maximum
+    {
+        return fail(
+            path,
+            format!(
+                "must not have more than {} items",
+                js::number_to_string(maximum)
+            ),
+        );
     }
     let tuple = match (schema.get("prefixItems"), schema.get("items")) {
         (Some(Value::Array(tuple)), _) | (None, Some(Value::Array(tuple))) => Some(tuple),
@@ -266,27 +265,27 @@ fn check_object(
     path: &mut String,
 ) -> Result<(), String> {
     let count = map.len() as f64;
-    if let Some(minimum) = schema.get("minProperties").and_then(number) {
-        if count < minimum {
-            return fail(
-                path,
-                format!(
-                    "must not have fewer than {} properties",
-                    js::number_to_string(minimum)
-                ),
-            );
-        }
+    if let Some(minimum) = schema.get("minProperties").and_then(number)
+        && count < minimum
+    {
+        return fail(
+            path,
+            format!(
+                "must not have fewer than {} properties",
+                js::number_to_string(minimum)
+            ),
+        );
     }
-    if let Some(maximum) = schema.get("maxProperties").and_then(number) {
-        if count > maximum {
-            return fail(
-                path,
-                format!(
-                    "must not have more than {} properties",
-                    js::number_to_string(maximum)
-                ),
-            );
-        }
+    if let Some(maximum) = schema.get("maxProperties").and_then(number)
+        && count > maximum
+    {
+        return fail(
+            path,
+            format!(
+                "must not have more than {} properties",
+                js::number_to_string(maximum)
+            ),
+        );
     }
     if let Some(Value::Array(required)) = schema.get("required") {
         for key in required.iter().filter_map(Value::as_str) {

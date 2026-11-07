@@ -363,7 +363,7 @@ fn report_id(now: SystemTime) -> String {
     let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default();
     let millis = u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX);
     let mut bytes = [0u8; 16];
-    if getrandom::getrandom(&mut bytes[6..]).is_err() {
+    if getrandom::fill(&mut bytes[6..]).is_err() {
         bytes[6..10].copy_from_slice(&since_epoch.subsec_nanos().to_be_bytes());
         bytes[10..14].copy_from_slice(&std::process::id().to_be_bytes());
     }
@@ -389,10 +389,11 @@ fn redacted_settings(config: &LoadedConfig) -> Value {
     if let Some(object) = settings.as_object_mut() {
         // Prompt text is conversation content, not configuration.
         for key in ["systemPrompt", "appendSystemPrompt"] {
-            if let Some(value) = object.get_mut(key) {
-                if !value.is_null() && value.as_array().is_none_or(|items| !items.is_empty()) {
-                    *value = Value::String(REDACTED.to_string());
-                }
+            if let Some(value) = object.get_mut(key)
+                && !value.is_null()
+                && value.as_array().is_none_or(|items| !items.is_empty())
+            {
+                *value = Value::String(REDACTED.to_string());
             }
         }
     }
@@ -478,14 +479,13 @@ fn is_sensitive_param(name: &str) -> bool {
 /// Strip URL user info and credential-like query values; other text passes
 /// through unchanged. `git:https://…`-style prefixes are preserved.
 fn redact_url(value: &str) -> String {
-    if let Some((prefix, rest)) = value.split_once(':') {
-        if is_scheme(prefix)
-            && rest
-                .split_once("://")
-                .is_some_and(|(scheme, _)| is_scheme(scheme))
-        {
-            return format!("{prefix}:{}", redact_url(rest));
-        }
+    if let Some((prefix, rest)) = value.split_once(':')
+        && is_scheme(prefix)
+        && rest
+            .split_once("://")
+            .is_some_and(|(scheme, _)| is_scheme(scheme))
+    {
+        return format!("{prefix}:{}", redact_url(rest));
     }
     let Ok(mut url) = reqwest::Url::parse(value) else {
         return value.to_string();
@@ -589,13 +589,13 @@ fn redact_credentials(text: &str) -> String {
     let mut redacted = String::with_capacity(text.len());
     let mut index = 0;
     while let Some(ch) = text[index..].chars().next() {
-        if !text[..index].ends_with(is_word_char) {
-            if let Some((kept, secret)) = credential_at(&text[index..]) {
-                redacted.push_str(&text[index..index + kept]);
-                redacted.push_str(REDACTED);
-                index += kept + secret;
-                continue;
-            }
+        if !text[..index].ends_with(is_word_char)
+            && let Some((kept, secret)) = credential_at(&text[index..])
+        {
+            redacted.push_str(&text[index..index + kept]);
+            redacted.push_str(REDACTED);
+            index += kept + secret;
+            continue;
         }
         redacted.push(ch);
         index += ch.len_utf8();

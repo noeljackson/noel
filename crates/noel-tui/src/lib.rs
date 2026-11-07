@@ -487,10 +487,10 @@ impl Selector {
     }
 
     pub fn select_query(&self, query: &str) -> Option<&SelectorItem> {
-        if let Ok(index) = query.parse::<usize>() {
-            if index > 0 {
-                return self.items.get(index - 1);
-            }
+        if let Ok(index) = query.parse::<usize>()
+            && index > 0
+        {
+            return self.items.get(index - 1);
         }
         self.items
             .iter()

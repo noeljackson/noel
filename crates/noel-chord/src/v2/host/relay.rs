@@ -273,10 +273,10 @@ impl Actor {
             // A link given for the address meanwhile (`route_link`) is the
             // path's: a different resolved one is closed, not left open
             // beside it.
-            if let Ok(resolved) = result {
-                if resolved.link.id() != adopted {
-                    resolved.link.close();
-                }
+            if let Ok(resolved) = result
+                && resolved.link.id() != adopted
+            {
+                resolved.link.close();
             }
             return;
         }
@@ -512,10 +512,10 @@ impl Actor {
                         let mut forwarded = message.clone();
                         set_origin(&mut forwarded, Some(relay));
                         // Old work of a reload counts only from a trusted link.
-                        if !self.links.get(&link).is_some_and(|l| l.trusted) {
-                            if let Message::Call { old, .. } = &mut forwarded {
-                                *old = false;
-                            }
+                        if !self.links.get(&link).is_some_and(|l| l.trusted)
+                            && let Message::Call { old, .. } = &mut forwarded
+                        {
+                            *old = false;
                         }
                         self.send(up, &forwarded);
                     }
