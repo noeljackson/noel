@@ -606,6 +606,66 @@ async fn a_relay_routes_holds_to_workers() {
     ));
 }
 
+/// #136: an address whose `resolve` failed is resolved again for its next
+/// holder (a new hold is a new request), as upstream's route does, instead
+/// of failing every later holder with the old error.
+#[tokio::test]
+async fn a_failed_route_address_resolves_again_for_a_new_holder() {
+    let cell = Cell::new(json!({"type": "integer"}), json!(1)).unwrap();
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let workers = Arc::new(Workers {
+        workers: std::sync::Mutex::new(std::collections::HashMap::new()),
+        resolves: AtomicUsize::new(0),
+    });
+    let relay = Host::new(HostOptions::default());
+    relay.route("session", WorkerRoute(workers.clone()));
+    let client = client();
+    connect(&relay, &client);
+
+    let first = client.get(Arc::new(counter()), json!({"session": "s3"}));
+    status(&first, |s| matches!(s, RefStatus::Failed { .. })).await;
+    assert_eq!(workers.resolves.load(Ordering::SeqCst), 1);
+
+    let worker = session_host("s3");
+    serve(&worker, &cell, &disposed);
+    workers
+        .workers
+        .lock()
+        .unwrap()
+        .insert("s3".to_owned(), worker);
+    let second = client.get(Arc::new(counter()), json!({"session": "s3"}));
+    assert_eq!(second.ready().await.unwrap(), "owner");
+    assert_eq!(workers.resolves.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        second.call("add", json!({"by": 1})).await.unwrap(),
+        json!(2)
+    );
+}
+
+/// #150: a reference keeps what its `bound` gave only while bound: one that
+/// went loading or gone hands a new subscriber no stale snapshot.
+#[tokio::test]
+async fn an_unbound_reference_keeps_no_stale_state() {
+    let cell = Cell::new(json!({"type": "integer"}), json!(7)).unwrap();
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let server = server(&cell, &disposed);
+    let client = client();
+    let (up, down) = Link::memory_pair();
+    server.accept(down, LinkOptions::new(json!({"kind": "device"})));
+    client.connect(up.clone(), LinkOptions::new(json!({"kind": "server"})));
+    let held = client.get(Arc::new(counter()), json!({"session": "s1"}));
+    held.ready().await.unwrap();
+    let mut live = held.subscribe("count");
+    assert_eq!(next(&mut live).await, StateUpdate::Snapshot(json!(7)));
+
+    // The link closes: the reference goes loading, its replica with it.
+    up.close();
+    status(&held, |s| matches!(s, RefStatus::Loading)).await;
+    let mut late = held.subscribe("count");
+    let stale = tokio::time::timeout(Duration::from_millis(200), late.next()).await;
+    assert!(stale.is_err(), "no snapshot while loading: {stale:?}");
+}
+
 /// Revoking a device ends the objects made for it (`gone
 /// forbidden/revoked`) and closes its link; other devices keep theirs.
 /// Through a relay, the revocation goes down the route and the worker ends

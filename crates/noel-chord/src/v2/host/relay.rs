@@ -30,15 +30,38 @@ pub(super) enum Holder {
 
 #[derive(Default)]
 pub(super) struct PathState {
-    link: Option<u64>,
+    phase: PathPhase,
     /// Whether it ever had a link.
     pub(super) linked: bool,
     holders: Vec<Holder>,
     /// A route path's address.
     address: Option<Address>,
-    resolving: bool,
-    /// Why its route could not reach it, until the next resolve.
-    failure: Option<ChordError>,
+}
+
+/// Where a path is (#136), as upstream's route keeps an address: at most
+/// one `resolve` at a time, and a failed address resolves again for its
+/// next holder (a new hold is a new request).
+#[derive(Default)]
+enum PathPhase {
+    /// No link and no `resolve` running.
+    #[default]
+    Unlinked,
+    /// The route's `resolve` runs.
+    Resolving,
+    /// Its link.
+    Linked(u64),
+    /// Its route could not reach it: its holders failed waiting, until
+    /// the next resolve.
+    Failed,
+}
+
+impl PathState {
+    fn link(&self) -> Option<u64> {
+        match self.phase {
+            PathPhase::Linked(link) => Some(link),
+            _ => None,
+        }
+    }
 }
 
 /// What a route's `resolve` gives: the link to the address and how to run
@@ -159,12 +182,17 @@ impl Actor {
     pub(super) fn path_attach(&mut self, key: &PathKey, holder: Holder) {
         let path = self.paths.entry(key.clone()).or_default();
         path.holders.push(holder);
-        if let Some(link) = path.link {
-            self.holder_attach(holder, link);
-        } else if let Some(failure) = path.failure.clone() {
-            self.holder_unreachable(holder, failure);
-        } else if matches!(key, PathKey::Route { .. }) && !path.resolving {
-            self.resolve(key);
+        match path.phase {
+            PathPhase::Linked(link) => self.holder_attach(holder, link),
+            PathPhase::Resolving => {}
+            // A route resolves for a new holder, a failed address too (a
+            // new hold is a new request); the parent path waits for its
+            // next link.
+            PathPhase::Unlinked | PathPhase::Failed => {
+                if matches!(key, PathKey::Route { .. }) {
+                    self.resolve(key);
+                }
+            }
         }
     }
 
@@ -178,9 +206,8 @@ impl Actor {
     /// `link` is the path's link now: every holder is held on it.
     pub(super) fn path_connected(&mut self, key: &PathKey, link: u64) {
         let path = self.paths.entry(key.clone()).or_default();
-        path.link = Some(link);
+        path.phase = PathPhase::Linked(link);
         path.linked = true;
-        path.failure = None;
         for holder in path.holders.clone() {
             self.holder_attach(holder, link);
         }
@@ -192,12 +219,12 @@ impl Actor {
         let Some((key, path)) = self
             .paths
             .iter_mut()
-            .find(|(_, path)| path.link == Some(link))
+            .find(|(_, path)| path.link() == Some(link))
         else {
             return;
         };
         let key = key.clone();
-        path.link = None;
+        path.phase = PathPhase::Unlinked;
         let holders = path.holders.clone();
         for holder in &holders {
             if let Holder::Relayed { link, origin, hold } = *holder {
@@ -217,10 +244,14 @@ impl Actor {
             return;
         };
         let path = self.paths.get_mut(key).expect("the path");
+        // At most one resolve at a time, and none for a linked path.
+        if matches!(path.phase, PathPhase::Resolving | PathPhase::Linked(_)) {
+            return;
+        }
         let Some(address) = path.address.clone() else {
             return;
         };
-        path.resolving = true;
+        path.phase = PathPhase::Resolving;
         let tx = self.tx.clone();
         let key = key.clone();
         tokio::spawn(async move {
@@ -233,27 +264,48 @@ impl Actor {
     /// holders fail waiting until the next resolve.
     pub(super) fn resolved(&mut self, key: PathKey, result: Result<Resolved, ChordError>) {
         let Some(path) = self.paths.get_mut(&key) else {
+            if let Ok(resolved) = result {
+                resolved.link.close();
+            }
             return;
         };
-        path.resolving = false;
+        if let Some(adopted) = path.link() {
+            // A link given for the address meanwhile (`route_link`) is the
+            // path's: a different resolved one is closed, not left open
+            // beside it.
+            if let Ok(resolved) = result {
+                if resolved.link.id() != adopted {
+                    resolved.link.close();
+                }
+            }
+            return;
+        }
         match result {
             Ok(Resolved { link, options }) => {
+                path.phase = PathPhase::Unlinked;
                 let id = link.id();
-                // The path has this link already (adopted meanwhile).
-                if path.link == Some(id) {
-                    return;
-                }
                 self.attach(link, Role::Route, options);
                 if self.links.contains_key(&id) {
                     self.path_connected(&key, id);
+                } else {
+                    let error =
+                        ChordError::new(Code::Unavailable, "the link closed before its handshake");
+                    self.path_failed(&key, error);
                 }
             }
-            Err(error) => {
-                path.failure = Some(error.clone());
-                for holder in path.holders.clone() {
-                    self.holder_unreachable(holder, error.clone());
-                }
-            }
+            Err(error) => self.path_failed(&key, error),
+        }
+    }
+
+    /// The path's route could not reach it: its holders fail waiting until
+    /// the next resolve.
+    fn path_failed(&mut self, key: &PathKey, error: ChordError) {
+        let Some(path) = self.paths.get_mut(key) else {
+            return;
+        };
+        path.phase = PathPhase::Failed;
+        for holder in path.holders.clone() {
+            self.holder_unreachable(holder, error.clone());
         }
     }
 
@@ -266,7 +318,7 @@ impl Actor {
         let path = self.paths.entry(key.clone()).or_default();
         path.address = Some(address);
         let id = resolved.link.id();
-        if path.link == Some(id) {
+        if path.link() == Some(id) {
             return;
         }
         self.attach(resolved.link, Role::Route, resolved.options);
