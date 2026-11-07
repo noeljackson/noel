@@ -1,10 +1,10 @@
 {
   "source": {
     "repository": "https://github.com/earendil-works/pi",
-    "ref": "b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb",
+    "ref": "main",
     "package": "packages/env",
-    "envCommit": "f13c00fb3a4d77ad3faa815057e31d614d42b3f1",
-    "daemon": "pi-env 1.2.0, built from packages/env/daemon at ref (release, musl)",
+    "envCommit": "c96e368e265f886820a68b651b2ec086ecf3906b",
+    "daemon": "pi-env 1.5.0, built from packages/env/daemon at ref (release, musl)",
     "script": "/ts-parity/pi-env-fixture.ts"
   },
   "format": {
@@ -39,7 +39,8 @@
               "cwd": "<cwd>",
               "driveCwds": {},
               "features": [
-                "listFiles"
+                "listFiles",
+                "process"
               ],
               "home": "<home>",
               "os": "<os>",
@@ -817,7 +818,8 @@
               "cwd": "<cwd>",
               "driveCwds": {},
               "features": [
-                "listFiles"
+                "listFiles",
+                "process"
               ],
               "home": "<home>",
               "os": "<os>",
@@ -1001,12 +1003,19 @@
           }
         },
         {
+          "send": {
+            "type": "cancel",
+            "id": 6,
+            "json": {}
+          }
+        },
+        {
           "receive": {
             "type": "error",
             "id": 6,
             "json": {
-              "code": "timeout",
-              "message": "timeout"
+              "code": "aborted",
+              "message": "aborted"
             }
           }
         },
@@ -1107,7 +1116,8 @@
               "cwd": "<cwd>",
               "driveCwds": {},
               "features": [
-                "listFiles"
+                "listFiles",
+                "process"
               ],
               "home": "<home>",
               "os": "<os>",
@@ -1296,7 +1306,8 @@
               "cwd": "<cwd>",
               "driveCwds": {},
               "features": [
-                "listFiles"
+                "listFiles",
+                "process"
               ],
               "home": "<home>",
               "os": "<os>",
@@ -1410,7 +1421,8 @@
               "cwd": "<cwd>",
               "driveCwds": {},
               "features": [
-                "listFiles"
+                "listFiles",
+                "process"
               ],
               "home": "<home>",
               "os": "<os>",

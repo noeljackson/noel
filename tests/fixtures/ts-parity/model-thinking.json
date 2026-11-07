@@ -1417,6 +1417,40 @@
         "low": "low",
         "medium": "medium",
         "high": "high",
+        "xhigh": null,
+        "max": "max"
+      },
+      "examples": [
+        "opencode/inkling-2-small-free",
+        "openrouter/thinkingmachines/inkling"
+      ],
+      "supported": [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "clamp": {
+        "off": "off",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "invalid": "off"
+      }
+    },
+    {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": "none",
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
         "xhigh": "xhigh",
         "max": null
       },
@@ -1731,40 +1765,6 @@
         "xhigh": "xhigh",
         "max": "max",
         "invalid": "high"
-      }
-    },
-    {
-      "reasoning": true,
-      "thinkingLevelMap": {
-        "off": "none",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": null,
-        "max": "max"
-      },
-      "examples": [
-        "openrouter/thinkingmachines/inkling",
-        "openrouter/thinkingmachines/inkling-small"
-      ],
-      "supported": [
-        "off",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "max"
-      ],
-      "clamp": {
-        "off": "off",
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "xhigh": "max",
-        "max": "max",
-        "invalid": "off"
       }
     },
     {
