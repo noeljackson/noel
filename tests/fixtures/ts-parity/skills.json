@@ -3772,13 +3772,15 @@
       {
         "input": "\"unterminated quote",
         "args": [
-          "unterminated quote"
+          "\"unterminated",
+          "quote"
         ]
       },
       {
         "input": "it's unterminated",
         "args": [
-          "its unterminated"
+          "it's",
+          "unterminated"
         ]
       },
       {
@@ -3792,13 +3794,15 @@
       {
         "input": "a\"b c\"d",
         "args": [
-          "ab cd"
+          "a\"b",
+          "c\"d"
         ]
       },
       {
         "input": "x=\"1 2\" y",
         "args": [
-          "x=1 2",
+          "x=\"1",
+          "2\"",
           "y"
         ]
       },
@@ -3806,7 +3810,7 @@
         "input": "back\\slash \\\"quote",
         "args": [
           "back\\slash",
-          "\\quote"
+          "\\\"quote"
         ]
       },
       {

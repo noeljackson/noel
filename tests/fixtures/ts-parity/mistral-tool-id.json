@@ -1,0 +1,75 @@
+{
+  "source": {
+    "repository": "https://github.com/earendil-works/pi",
+    "ref": "main",
+    "script": "/ts-parity/mistral-fixture.ts"
+  },
+  "provider": "mistral",
+  "auth": "api-key",
+  "request": {
+    "url": "https://api.mistral.ai/v1/chat/completions",
+    "method": "POST",
+    "headers": {
+      "accept": "text/event-stream",
+      "authorization": "Bearer <redacted>",
+      "content-type": "application/json",
+      "user-agent": "pi/1.5.0 (linux; node/v24.22.2; x64)",
+      "x-affinity": "session_ts_parity"
+    },
+    "body": {
+      "model": "devstral-medium-latest",
+      "stream": true,
+      "messages": [
+        {
+          "role": "assistant",
+          "prefix": false,
+          "tool_calls": [
+            {
+              "id": "1j55k0s7o",
+              "type": "function",
+              "function": {
+                "name": "read",
+                "arguments": "{\"path\":\"a.txt\"}"
+              },
+              "index": 0
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "name": "read",
+          "content": [
+            {
+              "type": "text",
+              "text": "file contents"
+            }
+          ],
+          "tool_call_id": "1j55k0s7o"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Read a file",
+            "parameters": {
+              "type": "object",
+              "required": [
+                "path"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              }
+            },
+            "strict": false
+          }
+        }
+      ],
+      "max_tokens": 257999,
+      "prompt_cache_key": "session_ts_parity"
+    }
+  }
+}
