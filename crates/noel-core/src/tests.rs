@@ -4861,3 +4861,114 @@ fn a_model_switch_saves_the_model_and_its_level_together() {
     assert_eq!(reopened.active_thinking_level.as_deref(), Some("high"));
     let _ = fs::remove_dir_all(base);
 }
+
+/// #181: clones of one store appending from many threads at once leave a
+/// journal of whole records, each once, that opens again.
+#[test]
+fn concurrent_appends_keep_every_record_whole() {
+    let base = std::env::temp_dir().join(format!("noel-concurrent-{}", new_session_id()));
+    let (store, _) = SessionStore::create(&base, base.clone()).unwrap();
+    let path = store.path().to_path_buf();
+    let before = fs::read_to_string(&path).unwrap().lines().count();
+    let threads = (0..8)
+        .map(|thread| {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for index in 0..25 {
+                    let todos = vec![TodoItem {
+                        content: format!("{thread}-{index}"),
+                        status: TodoStatus::Pending,
+                    }];
+                    store.record_todos(todos).unwrap();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let journal = fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = journal.lines().collect();
+    assert_eq!(lines.len(), before + 8 * 25);
+    for line in &lines {
+        serde_json::from_str::<Value>(line).expect("a whole record");
+    }
+    let mut seen = BTreeSet::new();
+    for line in &lines[before..] {
+        let record: Value = serde_json::from_str(line).unwrap();
+        assert!(seen.insert(record["todos"][0]["content"].as_str().unwrap().to_owned()));
+    }
+    drop(store);
+    SessionStore::open(path).expect("the journal opens again");
+    let _ = fs::remove_dir_all(base);
+}
+
+/// #181: what each setter journals replays to the same session: a session
+/// changed through every runtime setter and a run opens again equal to it.
+#[test]
+fn a_journal_replays_every_change_its_session_made() {
+    let base = std::env::temp_dir().join(format!("noel-replay-{}", new_session_id()));
+    let (store, state) = SessionStore::create(&base, base.clone()).unwrap();
+    let path = store.path().to_path_buf();
+    let mut runtime = Runtime::with_store(state, ReloadableSystems::default(), store);
+    runtime
+        .set_active_model_and_thinking_level(
+            Some(ModelRef {
+                provider: "faux".into(),
+                id: "faux-1".into(),
+            }),
+            Some("high".into()),
+        )
+        .unwrap();
+    runtime.set_active_account(Some("work".into())).unwrap();
+    runtime
+        .set_compaction_settings(Some(noel_config::CompactionSettings {
+            enabled: Some(false),
+            ..Default::default()
+        }))
+        .unwrap();
+    runtime
+        .set_disabled_tools(BTreeSet::from(["bash".to_owned()]))
+        .unwrap();
+    runtime
+        .set_todos(vec![TodoItem {
+            content: "replay".into(),
+            status: TodoStatus::InProgress,
+        }])
+        .unwrap();
+    runtime
+        .set_codemode_store(BTreeMap::from([("k".to_owned(), json!(1))]))
+        .unwrap();
+    runtime
+        .set_labels(BTreeSet::from(["label".to_owned()]))
+        .unwrap();
+    runtime.rename_session(Some("named".into())).unwrap();
+    let start = RunStart {
+        id: "run-1".into(),
+        request_id: Some("r-1".into()),
+        kind: SubmissionKind::Prompt,
+    };
+    runtime
+        .start_run(start, "hello".into(), Vec::new())
+        .unwrap();
+    runtime
+        .push_message(ConversationMessage {
+            role: MessageRole::Assistant,
+            content: "hi".into(),
+            thinking: String::new(),
+            media: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            aborted: false,
+        })
+        .unwrap();
+    runtime
+        .end_run("run-1", RunStatus::Completed, None)
+        .unwrap();
+    let expected = runtime.session().clone();
+    drop(runtime);
+    let (_, reopened) = SessionStore::open(path).unwrap();
+    assert_eq!(reopened, expected);
+    let _ = fs::remove_dir_all(base);
+}
