@@ -25,7 +25,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
 use noel_tools::spawn_tool_process;
@@ -208,6 +208,19 @@ pub struct HostOutcome {
 struct HostProcess {
     child: Child,
     stdin: ChildStdin,
+    pipe: Pipe,
+}
+
+/// The host's stdout, held by the host so a request never takes it away
+/// (#131).
+enum Pipe {
+    /// Between requests: the next line answers the next request.
+    Idle(BufReader<ChildStdout>),
+    /// A request is reading. Found at the start of a request, it means the
+    /// last one was cancelled mid-read, and its answer is still to come.
+    Busy,
+    /// Out of step or closed: the host must be started again.
+    Broken(String),
 }
 impl HostProcess {
     async fn spawn(
@@ -257,30 +270,41 @@ impl HostProcess {
         })?;
         group.finish();
         let stdin = child.stdin.take().expect("piped stdin");
-        Ok(Self { child, stdin })
+        let stdout = child.stdout.take().expect("piped stdout");
+        Ok(Self {
+            child,
+            stdin,
+            pipe: Pipe::Idle(BufReader::new(stdout)),
+        })
     }
 
     async fn request(&mut self, request: &HostRequest<'_>) -> Result<HostResponse, String> {
         let mut line = serde_json::to_string(request).map_err(|error| error.to_string())?;
         line.push('\n');
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(io_error)?;
-        self.stdin.flush().await.map_err(io_error)?;
-        // One line of JSON back per request, like v1's single response.
-        let mut stdout = self
-            .child
-            .stdout
-            .take()
-            .map(BufReader::new)
-            .ok_or_else(|| "extension closed its stdout".to_string())?;
-        let mut response = String::new();
-        stdout.read_line(&mut response).await.map_err(io_error)?;
-        if response.is_empty() {
-            return Err("extension exited without a response".to_string());
-        }
-        self.child.stdout = Some(stdout.into_inner());
+        // The pipe is Busy until the answer is read: a request dropped
+        // before then leaves it Busy, which the next request reads as
+        // broken.
+        let mut stdout = match std::mem::replace(&mut self.pipe, Pipe::Busy) {
+            Pipe::Idle(stdout) => stdout,
+            Pipe::Busy => return Err(self.broken("a cancelled request left its answer unread")),
+            Pipe::Broken(reason) => return Err(self.broken(&reason)),
+        };
+        let exchange = async {
+            self.stdin.write_all(line.as_bytes()).await?;
+            self.stdin.flush().await?;
+            // One line of JSON back per request, like v1's single response.
+            let mut response = String::new();
+            stdout.read_line(&mut response).await?;
+            Ok::<_, io::Error>(response)
+        };
+        let response = match exchange.await {
+            Ok(response) if response.is_empty() => {
+                return Err(self.broken("extension exited without a response"))
+            }
+            Ok(response) => response,
+            Err(error) => return Err(self.broken(&error.to_string())),
+        };
+        self.pipe = Pipe::Idle(stdout);
         let parsed: ExtensionResponse =
             serde_json::from_str(response.trim()).map_err(|error| error.to_string())?;
         Ok(HostResponse {
@@ -301,8 +325,51 @@ impl HostProcess {
         self.stdin.flush().await.map_err(io_error)
     }
 
+    /// Marks the pipe broken and returns why.
+    fn broken(&mut self, reason: &str) -> String {
+        self.pipe = Pipe::Broken(reason.to_owned());
+        reason.to_owned()
+    }
+
     fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Whether the host can answer a request: running, and its pipe idle.
+    fn usable(&mut self) -> bool {
+        matches!(self.pipe, Pipe::Idle(_)) && self.is_alive()
+    }
+}
+
+/// Spawns a v2 host and sends `init`, returning the host and the
+/// registrations it answered with.
+async fn launch(
+    extension_name: &str,
+    spec: &HostSpec,
+) -> Result<(HostProcess, Option<ExtensionRegistrationSet>), String> {
+    let mut process = HostProcess::spawn(&spec.path, extension_name, &spec.cwd, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = process
+        .request(&HostRequest {
+            protocol_version: EXTENSION_PROTOCOL_VERSION,
+            kind: "init",
+            command: None,
+            tool_call_id: None,
+            input: "",
+            cwd: &spec.cwd.display().to_string(),
+            session_id: Some(&spec.session_id),
+        })
+        .await;
+    match response {
+        Ok(response) => {
+            let set = registrations_from_response(extension_name, &response.parsed);
+            Ok((process, set))
+        }
+        Err(error) => {
+            let _ = process.child.kill().await;
+            Err(format!("extension {extension_name} init failed: {error}"))
+        }
     }
 }
 
@@ -323,6 +390,16 @@ pub struct ExtensionHosts {
     failures: BTreeMap<String, String>,
     /// The one-shot v1 tools, by tool name, for dispatch.
     v1_tools: BTreeMap<String, V1Tool>,
+    /// How each host was started, to start it again when it broke.
+    specs: BTreeMap<String, HostSpec>,
+}
+
+/// What a host's `init` was given.
+#[derive(Debug, Clone)]
+struct HostSpec {
+    path: PathBuf,
+    cwd: PathBuf,
+    session_id: String,
 }
 
 /// A v1 manifest tool and the extension it belongs to.
@@ -346,42 +423,25 @@ impl ExtensionHosts {
         cwd: &Path,
         session_id: &str,
     ) -> Result<(), String> {
-        let mut process = match HostProcess::spawn(path, extension_name, cwd, None).await {
-            Ok(process) => process,
-            Err(error) => {
-                // A spawn failure (bun missing, shim missing) is recorded
-                // like an init failure: later calls report it instead of
-                // "has no host", failing closed with the reason.
-                let message = error.to_string();
-                self.failures
-                    .insert(extension_name.to_string(), message.clone());
-                return Err(message);
-            }
+        let spec = HostSpec {
+            path: path.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            session_id: session_id.to_owned(),
         };
-        let response = process
-            .request(&HostRequest {
-                protocol_version: EXTENSION_PROTOCOL_VERSION,
-                kind: "init",
-                command: None,
-                tool_call_id: None,
-                input: "",
-                cwd: &cwd.display().to_string(),
-                session_id: Some(session_id),
-            })
-            .await;
-        match response {
-            Ok(response) => {
-                let set = registrations_from_response(extension_name, &response.parsed);
+        match launch(extension_name, &spec).await {
+            Ok((process, set)) => {
                 if let Some(set) = set {
                     self.registrations.insert(extension_name.to_string(), set);
                 }
                 self.hosts
                     .insert(extension_name.to_string(), Arc::new(Mutex::new(process)));
+                self.specs.insert(extension_name.to_string(), spec);
                 Ok(())
             }
-            Err(error) => {
-                let _ = process.child.kill().await;
-                let message = format!("extension {extension_name} init failed: {error}");
+            Err(message) => {
+                // A spawn or init failure is recorded: later calls report
+                // it instead of "has no host", failing closed with the
+                // reason.
                 self.failures
                     .insert(extension_name.to_string(), message.clone());
                 Err(message)
@@ -461,8 +521,21 @@ impl ExtensionHosts {
             .get(extension_name)
             .ok_or_else(|| format!("extension {extension_name} has no host"))?;
         let mut host = host.lock().await;
-        if !host.is_alive() {
-            return Err(format!("extension {extension_name} exited"));
+        if !host.usable() {
+            // Exited, or its pipe broke (a request cancelled mid-read, or
+            // one that failed): start it again, as `/reload` would.
+            let spec = self
+                .specs
+                .get(extension_name)
+                .ok_or_else(|| format!("extension {extension_name} exited"))?;
+            let (process, set) = launch(extension_name, spec)
+                .await
+                .map_err(|error| format!("extension {extension_name} exited; {error}"))?;
+            let _ = host.child.start_kill();
+            *host = process;
+            if let Some(set) = set {
+                self.registrations.insert(extension_name.to_string(), set);
+            }
         }
         let response = host
             .request(&HostRequest {
@@ -614,6 +687,7 @@ impl ExtensionHosts {
         }
         self.hosts.clear();
         self.registrations.clear();
+        self.specs.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -804,6 +878,44 @@ fn which_bun() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// #131: a gate request cancelled mid-read (its tool call was aborted)
+    /// leaves the host out of step; the next call gets an answer from a
+    /// fresh host instead of failing closed for the rest of the session.
+    #[tokio::test]
+    async fn a_cancelled_request_does_not_break_the_host() {
+        let cwd = std::env::temp_dir().join(format!("noel-ext-cancel-{}", std::process::id()));
+        fs::create_dir_all(&cwd).unwrap();
+        let path = cwd.join("gate.sh");
+        fs::write(
+            &path,
+            concat!(
+                "#!/bin/sh\n",
+                "while read line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"kind\":\"init\"'*) printf '%s\\n' '{\"output\":\"\",\"tools\":[],\"toolGate\":true}';;\n",
+                "    *slow*) sleep 5; printf '%s\\n' '{\"allow\":false,\"reason\":\"stale\"}';;\n",
+                "    *) printf '%s\\n' '{\"allow\":true}';;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        make_executable(&path);
+        let mut hosts = ExtensionHosts::new();
+        hosts.start("gate", &path, &cwd, "s1").await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            hosts.gate_tool_call("read", r#"{"path":"slow"}"#, &cwd),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the slow gate is cut off");
+        let next = hosts
+            .gate_tool_call("read", r#"{"path":"fine"}"#, &cwd)
+            .await;
+        assert_eq!(next, Ok(GateDecision::allow()));
+        let _ = fs::remove_dir_all(&cwd);
+    }
 
     /// Serializes the tests that change how bun and its shim are found
     /// (`NOEL_BUN_HOST`, `NOEL_BUN_BIN`, `NOEL_DIR`): the variables are
