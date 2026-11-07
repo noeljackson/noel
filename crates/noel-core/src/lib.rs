@@ -3908,6 +3908,11 @@ impl Runtime {
         let mut next = next;
         next.offline |= self.systems.offline;
         self.systems = next;
+        // The live v2 registrations stay overlaid (#159), for the
+        // extensions still loaded; the next run starts or stops hosts.
+        if let Ok(hosts) = self.extension_hosts.try_lock() {
+            overlay_live_registrations(&mut self.systems, &hosts);
+        }
         overlay_plugin_tools(&mut self.systems, &self.plugin_tools);
         // A reload reads context files again, a workspace's at the next run.
         self.workspace_context = None;
@@ -5637,7 +5642,18 @@ struct ExtensionCommandResponse {
 /// handshake response is the extension's whole registration set, like
 /// upstream's factory: what it does not register does not run.
 fn overlay_live_registrations(systems: &mut ReloadableSystems, hosts: &extensions::ExtensionHosts) {
-    let sets = hosts.registration_sets();
+    // Only the extensions loaded now: a host a reload removed stops at the
+    // next run, and its tools are not offered meanwhile.
+    let loaded: BTreeSet<&str> = systems
+        .extension_files
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect();
+    let sets = hosts
+        .registration_sets()
+        .into_iter()
+        .filter(|set| loaded.contains(set.extension_name.as_str()))
+        .collect::<Vec<_>>();
     if sets.is_empty() {
         return;
     }
@@ -10589,6 +10605,56 @@ mod tests {
         // The handshake's tool reached the provider's declarations.
         let first = calls.lock().expect("calls");
         assert!(first[0].tools.iter().any(|tool| tool.name == "counter"));
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    /// #159: a reload keeps the live v2 registrations offered, for the
+    /// extensions it still loads.
+    #[tokio::test]
+    async fn a_reload_keeps_the_live_registrations_of_loaded_extensions() {
+        let cwd =
+            std::env::temp_dir().join(format!("noel-extension-v2-reload-{}", new_session_id()));
+        fs::create_dir_all(&cwd).expect("create cwd");
+        let extension_path = cwd.join("hello.sh");
+        fs::write(
+            &extension_path,
+            concat!(
+                "#!/bin/sh\n",
+                "while read line; do\n",
+                "  printf '%s\\n' '{\"output\":\"\",\"tools\":[{\"name\":\"hello\",\"description\":\"Say hello\"}]}'\n",
+                "done\n",
+            ),
+        )
+        .expect("write extension");
+        make_executable(&extension_path);
+        fs::write(
+            cwd.join("hello.sh.noel-extension.json"),
+            serde_json::json!({ "protocolVersion": 2 }).to_string(),
+        )
+        .expect("write manifest");
+        let systems = |generation| ReloadableSystems {
+            config_generation: generation,
+            extension_files: vec![ResourceFile {
+                name: "hello".to_string(),
+                path: extension_path.clone(),
+                content: String::new(),
+            }],
+            ..ReloadableSystems::default()
+        };
+        let mut runtime = Runtime::new(SessionState::new("session-1", cwd.clone()), systems(0));
+        runtime.start_extension_hosts().await;
+        assert!(runtime.systems.extension_tools.contains_key("hello"));
+        runtime.reload(systems(1)).expect("reload");
+        assert!(runtime.systems.extension_tools.contains_key("hello"));
+        runtime
+            .reload(ReloadableSystems {
+                config_generation: 2,
+                ..ReloadableSystems::default()
+            })
+            .expect("reload without it");
+        assert!(!runtime.systems.extension_tools.contains_key("hello"));
+        let hosts = runtime.extension_hosts();
+        hosts.lock().await.shutdown(&cwd).await;
         let _ = fs::remove_dir_all(cwd);
     }
 

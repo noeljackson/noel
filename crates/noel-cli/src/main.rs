@@ -5458,7 +5458,8 @@ fn restyle_rows_with_markdown(
     // Fence state walks rows in display order: emphasis is suppressed and
     // rows are dimmed between opening and closing fences. The fence marker
     // lines themselves collapse to a dim language label.
-    let mut in_fence = false;
+    // The marker of the code block a row is in, which alone closes it.
+    let mut in_fence: Option<&'static str> = None;
     // Ordered-list state: an ordered item numbers itself from the list's
     // start marker plus its position (upstream's list renderer), so a
     // source that numbers every item `1.` still displays `1. 2. 3.`. A
@@ -5485,10 +5486,10 @@ fn restyle_rows_with_markdown(
         let Some(row_text) = source_line.get(row.start.byte..end) else {
             continue;
         };
-        if in_fence {
+        if let Some(marker) = in_fence {
             // Inside a code block: no emphasis, dim accent bar, indent.
-            if source_line.trim_start().starts_with("```") && starts_line {
-                in_fence = false;
+            if source_line.trim_start().starts_with(marker) && starts_line {
+                in_fence = None;
                 row.line = Line::from(Span::styled(String::new(), base));
                 continue;
             }
@@ -5569,7 +5570,7 @@ fn restyle_rows_with_markdown(
         };
         match &kind {
             markdown::BlockKind::Fence { language, .. } => {
-                in_fence = true;
+                in_fence = markdown::fence_marker(classify_target);
                 let label = if language.is_empty() {
                     "  ┆ code".to_string()
                 } else {

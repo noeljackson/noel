@@ -121,7 +121,8 @@ pub async fn poll_device_token(
             return Err(anyhow!("device auth failed with status {status}: {body}"));
         }
         if start.elapsed() >= timeout {
-            return Err(anyhow!("device auth timed out after 15 minutes"));
+            let minutes = timeout.as_secs().div_ceil(60);
+            return Err(anyhow!("device auth timed out after {minutes} minutes"));
         }
         tokio::time::sleep(Duration::from_secs(device.interval)).await;
     }
