@@ -222,11 +222,25 @@ fn kill(pid: u32, signal: &str) {
         .status();
 }
 
+#[cfg(target_os = "linux")]
 fn alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
         && !fs::read_to_string(format!("/proc/{pid}/stat"))
             .unwrap_or_default()
             .contains(") Z ")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn alive(pid: u32) -> bool {
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && !String::from_utf8_lossy(&output.stdout)
+                    .trim_start()
+                    .starts_with('Z')
+        })
 }
 
 fn wait_until(what: &str, done: impl Fn() -> bool) {

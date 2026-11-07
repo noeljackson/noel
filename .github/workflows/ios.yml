@@ -7,11 +7,14 @@ on:
     paths: ["apps/ios/**", "crates/noel-ffi/**", "crates/noel-client/**", "crates/noel-chord/**", "scripts/ios-build.sh", ".github/workflows/ios.yml"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   ios:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - name: Tools
         run: brew install xcodegen
       - name: noel-ffi, NoelKit and the app

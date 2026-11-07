@@ -59,7 +59,11 @@ attach() {
 }
 quit() {
   send_line "$1" "/quit"
-  wait_for "$1" "noel-exited=0"
+  for _ in $(seq 1 600); do
+    if [ "$(tmux display-message -p -t "$1" '#{alternate_on}')" = 0 ]; then return; fi
+    sleep 0.05
+  done
+  fail "$1" "noel did not leave the alternate screen"
 }
 
 mkdir -p "${work_dir}/agent" "${work_dir}/cwd"

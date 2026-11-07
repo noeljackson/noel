@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "advisories": {
+    "minimum_severity": "any",
+    "only_fixed": false
+  },
+  "exceptions": [
+    {
+      "kind": "osv",
+      "advisory_id": "RUSTSEC-2026-0374",
+      "package": "basic-toml",
+      "reason": "Askama 0.16.1 is the latest release and still uses basic-toml for compile-time configuration; no fixed release is available.",
+      "owner": "@noeljackson",
+      "expires": "2027-02-07"
+    },
+    {
+      "kind": "osv",
+      "advisory_id": "RUSTSEC-2024-0436",
+      "package": "paste",
+      "reason": "The latest GPUI 0.3.0 dependency stack still uses paste; no fixed release is available.",
+      "owner": "@noeljackson",
+      "expires": "2027-02-07"
+    },
+    {
+      "kind": "osv",
+      "advisory_id": "RUSTSEC-2026-0192",
+      "package": "ttf-parser",
+      "reason": "The latest GPUI 0.3.0 dependency stack still uses ttf-parser; no fixed release is available.",
+      "owner": "@noeljackson",
+      "expires": "2027-02-07"
+    },
+    {
+      "kind": "osv",
+      "advisory_id": "RUSTSEC-2026-0371",
+      "package": "zbus_names",
+      "reason": "The latest GPUI 0.3.0 Linux accessibility stack still uses zbus_names; no fixed release is available.",
+      "owner": "@noeljackson",
+      "expires": "2027-02-07"
+    },
+    {
+      "kind": "osv",
+      "advisory_id": "RUSTSEC-2026-0370",
+      "package": "zvariant",
+      "reason": "The latest GPUI 0.3.0 Linux accessibility stack still uses zvariant; no fixed release is available.",
+      "owner": "@noeljackson",
+      "expires": "2027-02-07"
+    },
+    {
+      "kind": "osv",
+      "advisory_id": "RUSTSEC-2026-0372",
+      "package": "zvariant_derive",
+      "reason": "The latest GPUI 0.3.0 Linux accessibility stack still uses zvariant_derive; no fixed release is available.",
+      "owner": "@noeljackson",
+      "expires": "2027-02-07"
+    }
+  ]
+}

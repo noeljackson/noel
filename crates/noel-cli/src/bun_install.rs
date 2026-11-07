@@ -159,7 +159,10 @@ pub async fn install_bun(
 /// The one binary inside the release zip (`bun-<target>/bun`).
 fn extract_single_binary(archive: &[u8]) -> Result<Vec<u8>> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))?;
-    let mut names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    let mut names = zip
+        .file_names()
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<Result<Vec<String>, _>>()?;
     names.sort();
     let name = names
         .iter()

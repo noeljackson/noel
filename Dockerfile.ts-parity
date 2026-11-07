@@ -1,4 +1,4 @@
-FROM node:24-bookworm AS reference
+FROM node:26-trixie AS reference
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
@@ -58,13 +58,13 @@ RUN set -eu; \
 # for Linux (static musl, release), with upstream's lock file. The pi-env
 # goldens record upstream's client talking to it, and `make env-interop` runs
 # upstream's packages/env tests against noel's daemon.
-FROM rust:1.99.0 AS pi-env-daemon
+FROM rust:1.99.1 AS pi-env-daemon
 COPY --from=reference /ts-reference/packages/env /pi-env
 RUN set -eu; \
     target="$(uname -m)-unknown-linux-musl"; \
-    rustup target add --toolchain 1.99.0 "${target}"; \
+    rustup target add --toolchain 1.99.1 "${target}"; \
     cd /pi-env/daemon; \
-    RUSTUP_TOOLCHAIN=1.99.0 cargo build --release --locked --target "${target}"; \
+    RUSTUP_TOOLCHAIN=1.99.1 cargo build --release --locked --target "${target}"; \
     install -m 0755 "target/${target}/release/pi-env" /pi-env/pi-env
 
 FROM reference

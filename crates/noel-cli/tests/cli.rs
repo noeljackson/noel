@@ -2183,6 +2183,7 @@ fn rpc_semantic_compaction_uses_active_local_provider_focus_and_persists_origina
                     Err(error) => panic!("local server: {error}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();

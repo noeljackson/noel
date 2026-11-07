@@ -1,6 +1,6 @@
-# Pinned toolchain for `make check-ci`. Keep the tag in sync with rust-toolchain.toml
-# and the dtolnay/rust-toolchain ref in .github/workflows.
-FROM rust:1.99.0
+# Pinned toolchain for `make check-ci`. Keep the tag, rust-toolchain.toml and
+# workflow toolchain inputs in sync.
+FROM rust:1.99.1
 
 RUN rustup component add clippy rustfmt \
     && apt-get update \
