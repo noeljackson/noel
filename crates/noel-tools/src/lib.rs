@@ -356,6 +356,16 @@ pub fn cap_tool_output(output: String) -> String {
             |error| format!("Full output could not be saved: {error}"),
             |path| format!("Full output: {}", path.display()),
         );
+    // #160: a first line past the limit leaves nothing to show; say so, as
+    // `read` does, instead of "lines 1-0".
+    if truncation.first_line_exceeds_limit {
+        let first = output.split('\n').next().unwrap_or_default();
+        return format!(
+            "[Line 1 is {}, exceeds {} limit. {saved}]",
+            format_size(first.len()),
+            format_size(DEFAULT_MAX_BYTES)
+        );
+    }
     let cause = if truncation.by_lines {
         String::new()
     } else {
@@ -1717,6 +1727,20 @@ mod tests {
         assert!(shown.starts_with("row 1\n") && shown.ends_with("\nrow 2000"));
         let saved = PathBuf::from(notice.strip_suffix(']').expect("notice end"));
         assert_eq!(fs::read_to_string(&saved).expect("saved output"), long);
+        let _ = fs::remove_file(saved);
+
+        // A first line past the byte limit: a notice, not "lines 1-0".
+        let wide = "x".repeat(DEFAULT_MAX_BYTES + 10);
+        let capped = cap_tool_output(wide.clone());
+        let notice = capped
+            .strip_prefix("[Line 1 is ")
+            .expect("first line notice");
+        let saved = notice
+            .split_once(" limit. Full output: ")
+            .and_then(|(_, path)| path.strip_suffix(']'))
+            .map(PathBuf::from)
+            .expect("saved path");
+        assert_eq!(fs::read_to_string(&saved).expect("saved output"), wide);
         let _ = fs::remove_file(saved);
     }
 
