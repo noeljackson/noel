@@ -1244,3 +1244,23 @@ fn queueing_a_message_keeps_the_saved_ids_of_the_others() {
     let (_, reopened) = SessionStore::open(path).unwrap();
     assert_eq!(reopened.saved_queue_items(), expected);
 }
+
+/// #140: a Start dropped without running does not leave its run running:
+/// the next submission finds it interrupted and ends it, as after a crash.
+#[tokio::test]
+async fn a_start_dropped_unrun_leaves_its_run_interrupted() {
+    let mut fixture = Fixture::new("dropped-start", AbortPolicy::KeepQueue);
+    let submission = input(SubmissionKind::Prompt, "first", Some("m-1"));
+    let Ok(Submitted::Started(start)) = fixture.controller.submit(submission).await else {
+        panic!("first starts a run");
+    };
+    let dropped = start.run_id().to_owned();
+    drop(start);
+    fixture.script([says("second answer")]);
+    let second = fixture.start("second", "m-2", Vec::new()).await;
+    let runs = &fixture.controller.runtime().session().runs;
+    let first = runs.iter().find(|run| run.id == dropped).unwrap();
+    assert_eq!(first.status, RunStatus::Aborted);
+    let last = runs.iter().find(|run| run.id == second).unwrap();
+    assert_eq!(last.status, RunStatus::Completed);
+}

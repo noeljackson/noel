@@ -3725,6 +3725,17 @@ impl Runtime {
         Ok(())
     }
 
+    /// Run `run_id` was accepted and never run (its start was dropped): it
+    /// is interrupted, as the journal already reads it, so a resume or the
+    /// next start ends it (#140). Nothing is saved.
+    pub fn interrupt_unrun(&mut self, run_id: &str) {
+        if let Some(run) = self.session.run_mut(run_id) {
+            if run.status == RunStatus::Running {
+                run.status = RunStatus::Interrupted;
+            }
+        }
+    }
+
     /// Records how run `run_id` ended. The status changes even if saving
     /// it fails, since this process is no longer running the run.
     pub fn finish_run(&mut self, run_id: &str, status: RunStatus) -> Result<(), SessionError> {
