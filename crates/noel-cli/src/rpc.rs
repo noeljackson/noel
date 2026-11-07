@@ -34,8 +34,7 @@ use noel_core::controller::{
     SessionController, Start, Submission, SubmitError, Submitted, WhenBusy,
 };
 use noel_core::{
-    expand_input, QueueItem, QueueMode, Runtime, SessionState, SessionStore, SubmissionKind,
-    TurnEvent,
+    expand_input, QueueItem, QueueMode, Runtime, SessionStore, SubmissionKind, TurnEvent,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -398,7 +397,10 @@ async fn command(controller: &mut SessionController<RpcHost>, line: &str) -> Opt
         Ok(Command::Compact {
             custom_instructions,
         }) => controller
-            .compact(custom_instructions.as_deref())
+            .compact(
+                custom_instructions.as_deref(),
+                &noel_core::CancellationToken::default(),
+            )
             .await
             .map(|record| Some(Data::Compaction((&record).into()))),
         Ok(Command::SetSessionName { name }) => {
@@ -536,11 +538,8 @@ fn new_session(controller: &mut SessionController<RpcHost>, parent_session: Opti
         } else {
             // Without a journal (`--no-session`), the same reset in memory.
             let current = runtime.session();
-            let mut session = SessionState::new(current.session_id.clone(), current.cwd.clone());
-            session.active_model = current.active_model.clone();
-            session.active_thinking_level = current.active_thinking_level.clone();
-            session.active_account = current.active_account.clone();
-            session.workspace = current.workspace.clone();
+            let session =
+                crate::session_commands::session_like(current, current.session_id.clone());
             runtime.replace_session(session, None);
         }
         Ok(Some(Data::Cancelled { cancelled: false }))

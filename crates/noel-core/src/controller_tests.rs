@@ -1264,3 +1264,36 @@ async fn a_start_dropped_unrun_leaves_its_run_interrupted() {
     let last = runs.iter().find(|run| run.id == second).unwrap();
     assert_eq!(last.status, RunStatus::Completed);
 }
+
+/// #175: a cancel ends a manual compaction whose summary never comes: it
+/// answers "Compaction cancelled" and leaves the history as it was.
+#[tokio::test]
+async fn a_cancelled_compaction_leaves_the_history() {
+    let mut fixture = Fixture::new("cancel-compaction", AbortPolicy::KeepQueue);
+    fixture.script([says("first answer"), says("second answer")]);
+    fixture.start("first", "m-1", Vec::new()).await;
+    fixture.start("second", "m-2", Vec::new()).await;
+    fixture.controller.configure(|runtime, _| {
+        runtime.systems.compaction.keep_recent_tokens = 1;
+    });
+    let before = fixture.controller.runtime().session().messages.clone();
+    fixture.script([hangs()]);
+    let cancel = crate::CancellationToken::default();
+    let canceller = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        })
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.controller.compact(None, &cancel),
+    )
+    .await
+    .expect("the cancel ends it");
+    canceller.await.unwrap();
+    assert_eq!(result.unwrap_err(), crate::controller::COMPACTION_CANCELLED);
+    assert_eq!(fixture.requests().len(), 3, "the summary was asked for");
+    assert_eq!(fixture.controller.runtime().session().messages, before);
+}
