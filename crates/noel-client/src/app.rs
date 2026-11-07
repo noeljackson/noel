@@ -65,7 +65,10 @@ pub enum Command {
 /// What the server tells a front end.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// Connected to the server, at first or again.
     Connected,
+    /// The link dropped; connecting again (#157).
+    Reconnecting,
     Status(String),
     Sessions(Vec<Value>),
     /// The selected session's view and every entry seen of its history.
@@ -90,6 +93,22 @@ pub async fn run(
     });
     let client = Client::connect(connector, report).await?;
     let _ = events.unbounded_send(Event::Connected);
+    // The link's state, as the client's supervisor keeps it.
+    let _connection = AbortOnDrop({
+        let mut connection = client.connection();
+        let events = events.clone();
+        tokio::spawn(async move {
+            while connection.changed().await.is_ok() {
+                let event = match *connection.borrow_and_update() {
+                    crate::Connection::Connected => Event::Connected,
+                    crate::Connection::Lost => Event::Reconnecting,
+                };
+                if events.unbounded_send(event).is_err() {
+                    return;
+                }
+            }
+        })
+    });
     follow_state(&client, "sessions", events.clone());
     follow_state(&client, "plugins", events.clone());
     let mut selected: Option<String> = None;
