@@ -75,18 +75,22 @@ pub(crate) fn new_session_like(
     runtime: &Runtime,
     config: &LoadedConfig,
 ) -> Result<(SessionStore, SessionState)> {
-    let (store, mut state) = SessionStore::create_with_workspace(
+    Ok(SessionStore::create_with_state(
         &config.paths.session_dir,
-        runtime.session().cwd.clone(),
-        runtime.session().workspace.clone(),
-    )?;
-    state.active_model = runtime.session().active_model.clone();
-    state.active_thinking_level = runtime.session().active_thinking_level.clone();
-    state.active_account = runtime.session().active_account.clone();
-    store.record_active_model(state.active_model.clone())?;
-    store.record_active_thinking_level(state.active_thinking_level.clone())?;
-    store.record_active_account(state.active_account.clone())?;
-    Ok((store, state))
+        session_like(runtime.session(), noel_core::new_session_id()),
+    )?)
+}
+
+/// A new, empty session `id` with `current`'s cwd, workspace, model,
+/// thinking level and account: what `/new` starts from, with a journal or
+/// without (`--no-session`).
+pub(crate) fn session_like(current: &SessionState, id: String) -> SessionState {
+    let mut session = SessionState::new(id, current.cwd.clone());
+    session.active_model = current.active_model.clone();
+    session.active_thinking_level = current.active_thinking_level.clone();
+    session.active_account = current.active_account.clone();
+    session.workspace = current.workspace.clone();
+    session
 }
 
 /// What a command leaves for the client to do.
@@ -107,7 +111,7 @@ pub(crate) enum CommandOutcome {
         account: String,
     },
     /// Open this selector.
-    Selector(TuiSelectorState),
+    Selector(Box<TuiSelectorState>),
     /// Attach to this session instead (a worker's answer to a switch).
     Session(String),
 }
@@ -125,10 +129,13 @@ pub(crate) fn open_selector(
         ui.push(TuiEntryKind::System, format!("no {kind}"));
         return Ok(CommandOutcome::Handled);
     }
-    let state =
+    let mut state =
         TuiSelectorState::new(kind, selector, query, None).with_model_thinking(config, runtime);
+    if kind == "branches" {
+        state.set_tree(crate::session_tree_rows(config)?);
+    }
     ui.push(TuiEntryKind::System, format!("{} selector", state.title));
-    Ok(CommandOutcome::Selector(state))
+    Ok(CommandOutcome::Selector(Box::new(state)))
 }
 
 /// Runs the session side of `line`, a slash command or a prompt.
@@ -402,7 +409,7 @@ pub(crate) async fn run(
             {
                 state.selected = index;
             }
-            return Ok(CommandOutcome::Selector(state));
+            return Ok(CommandOutcome::Selector(Box::new(state)));
         }
         _ if line.starts_with("/select ") => {
             let (kind, _) = split_once_text(line.trim_start_matches("/select ").trim());

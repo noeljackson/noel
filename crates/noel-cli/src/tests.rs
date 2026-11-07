@@ -2655,7 +2655,7 @@ fn temporary_panels_do_not_commit_hidden_transcript_rows() {
     let mut app = TuiApp::default();
     app.push(TuiEntryKind::Assistant, "long answer\n".repeat(50));
     let mut terminal = scrollback_test_terminal(40, 20);
-    app.selector = Some(TuiSelectorState::new(
+    app.overlay = Overlay::Selector(TuiSelectorState::new(
         "model",
         Selector::new("model", vec![]),
         "",
@@ -2663,15 +2663,15 @@ fn temporary_panels_do_not_commit_hidden_transcript_rows() {
     ));
     redraw_tui(&mut terminal, &mut app, &config).unwrap();
     terminal.backend().assert_scrollback_empty();
-    app.selector = None;
-    app.diff_panel = Some(DiffPanelState {
+    app.close_overlay(|o| matches!(o, Overlay::Selector(_)));
+    app.overlay = Overlay::DiffPanel(DiffPanelState {
         files: vec![],
         selected: 0,
         detail: None,
     });
     redraw_tui(&mut terminal, &mut app, &config).unwrap();
     terminal.backend().assert_scrollback_empty();
-    app.diff_panel = None;
+    app.close_overlay(|o| matches!(o, Overlay::DiffPanel(_)));
     redraw_tui(&mut terminal, &mut app, &config).unwrap();
     assert!(terminal.backend().scrollback().area.height > 0);
 }
@@ -3199,7 +3199,7 @@ fn buffer_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
 #[test]
 fn clear_visible_resets_transient_tui_state_only() {
     let mut app = TuiApp {
-        multiline: Some(vec!["one".to_string()]),
+        overlay: Overlay::Multiline(vec!["one".to_string()]),
         live_entry_index: Some(0),
         ..TuiApp::default()
     };
@@ -3212,8 +3212,8 @@ fn clear_visible_resets_transient_tui_state_only() {
 
     assert!(app.entries.is_empty());
     assert!(app.input.is_empty());
-    assert!(app.multiline.is_none());
-    assert!(app.selector.is_none());
+    assert!(app.multiline().is_none());
+    assert!(app.selector().is_none());
     assert!(app.live_entry_index.is_none());
     assert_eq!(input_layout(&app, 76).rows.len(), 1);
     assert_eq!(app.editor_state.history(), ["old prompt"]);
@@ -4275,7 +4275,7 @@ fn tiny_frames_and_multiline_drafts_never_place_cursor_on_editor_border() {
     assert!(rows[2].starts_with("│   second"));
     assert!(rows[3].starts_with("│   third"));
     terminal.backend_mut().assert_cursor_position((9, 3));
-    app.multiline = Some(Vec::new());
+    app.overlay = Overlay::Multiline(Vec::new());
     app.clear_input();
     assert_eq!(input_desired_height(&app, 40), 4);
     let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
@@ -4537,4 +4537,69 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         .write_to(&mut output, image::ImageFormat::Png)
         .expect("encode png");
     output.into_inner()
+}
+
+/// #108: the branch navigator folds a branch and moves to its parent and
+/// child, shows named branches only under its filter, and keeps its tree
+/// across the worker-to-client JSON.
+#[test]
+fn the_branch_navigator_folds_and_filters() {
+    let items = ["root", "child", "grandchild", "other"]
+        .into_iter()
+        .map(|value| SelectorItem {
+            label: value.to_owned(),
+            value: value.to_owned(),
+            active: false,
+        })
+        .collect();
+    let mut state = TuiSelectorState::new("branches", Selector::new("branches", items), "", None);
+    state.set_tree(BTreeMap::from([
+        ("root".to_owned(), (None, true)),
+        ("child".to_owned(), (Some("root".to_owned()), false)),
+        ("grandchild".to_owned(), (Some("child".to_owned()), true)),
+        ("other".to_owned(), (None, false)),
+    ]));
+    let shown = |state: &TuiSelectorState| -> Vec<String> {
+        state
+            .filtered_indices
+            .iter()
+            .map(|index| state.items[*index].label.clone())
+            .collect()
+    };
+    assert_eq!(shown(&state), ["root", "child", "grandchild", "other"]);
+
+    // Fold the root: its branch hides, and the row says it is folded.
+    state.fold_or_up();
+    assert_eq!(shown(&state), ["root [+]", "other"]);
+    // Unfold, then down to the child and up to the root again.
+    state.unfold_or_down();
+    state.unfold_or_down();
+    assert_eq!(state.selected_item().unwrap().value, "child");
+    state.fold_or_up();
+    assert_eq!(shown(&state), ["root", "child [+]", "other"]);
+    // Up from a folded child goes to its parent; the child stays folded.
+    state.fold_or_up();
+    assert_eq!(state.selected_item().unwrap().value, "root");
+    assert_eq!(shown(&state), ["root", "child [+]", "other"]);
+    state.unfold_or_down();
+    state.unfold_or_down();
+    assert_eq!(shown(&state), ["root", "child", "grandchild", "other"]);
+
+    // Named branches only, then all again.
+    state.set_tree_filter(TreeFilter::Named);
+    assert_eq!(shown(&state), ["root", "grandchild"]);
+    assert_eq!(state.title, "branches · named only");
+    state.set_tree_filter(TreeFilter::All);
+    assert_eq!(state.title, "branches");
+    assert_eq!(
+        TreeFilter::from_setting(Some("labeled-only")),
+        TreeFilter::Named
+    );
+    assert_eq!(TreeFilter::Named.setting(), "labeled-only");
+
+    // The tree survives the JSON a worker sends.
+    let again = TuiSelectorState::from_json(&state.to_json()).unwrap();
+    assert_eq!(again.tree.len(), 4);
+    assert_eq!(again.tree["grandchild"].parent.as_deref(), Some("child"));
+    assert!(again.tree["grandchild"].named);
 }

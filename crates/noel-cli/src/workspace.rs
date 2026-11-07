@@ -446,8 +446,16 @@ fn open(record: &SessionWorkspace, agent_dir: &Path) -> Result<Arc<dyn Execution
     let workspace = SshWorkspace::from_record(record)?;
     require_trusted(&workspace, agent_dir)?;
     let url = workspace.url();
-    if let Some(env) = opened().get(&url) {
-        return Ok(env.clone());
+    {
+        let mut opened = opened();
+        // A connection closed for good serves nothing more: open another
+        // (#175). One lost reconnects by itself and is kept.
+        let closed =
+            |env: &Arc<RemoteEnv>| env.connection().status() == noel_env::ConnectionStatus::Closed;
+        opened.retain(|_, env| !closed(env));
+        if let Some(env) = opened.get(&url) {
+            return Ok(env.clone());
+        }
     }
     let connection = ssh_connection(SshConnectOptions {
         target: workspace.target(&known_hosts_file(agent_dir)),

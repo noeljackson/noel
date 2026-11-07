@@ -845,7 +845,7 @@ mod tests {
 
         // The next request from the same snapshot reuses the saved tokens.
         let resolved = refresh(5_100).await.expect("resolve").expect("auth");
-        assert_eq!(resolved.expires(), 5_000 + 3600);
+        assert_eq!(resolved.expires(), Some(5_000 + 3600));
         assert_eq!(resolved.refresh_token(), Some("third-refresh"));
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
@@ -882,7 +882,7 @@ mod tests {
         .await
         .expect("resolve")
         .expect("auth");
-        assert_eq!(resolved.expires(), 4_000_000_000);
+        assert_eq!(resolved.expires(), Some(4_000_000_000));
         assert_eq!(stub.hits.load(Ordering::SeqCst), 0);
 
         let _ = std::fs::remove_dir_all(root);
@@ -922,7 +922,7 @@ mod tests {
         .await
         .expect("request path")
         .expect("auth");
-        assert_eq!(request_path.expires(), 1_600);
+        assert_eq!(request_path.expires(), Some(1_600));
         assert_eq!(stub.hits.load(Ordering::SeqCst), 0);
 
         let extended = refresh_auth_expiring_within(
@@ -939,7 +939,7 @@ mod tests {
         .expect("windowed refresh")
         .expect("auth");
         assert!(matches!(extended, RefreshOutcome::Refreshed(_)));
-        assert_eq!(extended.into_auth().expires(), 1_000 + 7200);
+        assert_eq!(extended.into_auth().expires(), Some(1_000 + 7200));
         assert_eq!(stub.hits.load(Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_dir_all(root);

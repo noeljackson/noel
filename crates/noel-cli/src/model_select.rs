@@ -185,8 +185,13 @@ pub(crate) fn switch_model(
     .flatten()
     .find_map(normalized_thinking_level)
     .unwrap_or(before);
-    runtime.set_active_model(Some(model.clone()))?;
-    set_thinking_level(runtime, config, level)
+    // The level clamped to the new model, saved with it in one write.
+    let clamped = match model_definition(config, model) {
+        Some(definition) => definition.clamp_thinking_level(level),
+        None => normalized_thinking_level(level).unwrap_or("off"),
+    };
+    runtime.set_active_model_and_thinking_level(Some(model.clone()), Some(clamped.to_string()))?;
+    Ok(clamped)
 }
 
 /// The model `/model <reference>` and a queued mid-turn switch name: an

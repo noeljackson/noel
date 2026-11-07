@@ -624,9 +624,12 @@ struct Request {
 }
 
 enum HoldState {
-    /// Live; its `bound` waits for a slot.
-    Binding,
+    /// Received; its object is not taken yet.
+    Placing,
+    /// Holds `object`; its `bound` waits for a slot.
+    Binding { object: ObjectKey },
     Bound {
+        object: ObjectKey,
         methods: Vec<String>,
         followed: Vec<Followed>,
     },
@@ -639,8 +642,19 @@ struct ServedHold {
     request: Request,
     principal: Value,
     limits: Limits,
-    object: Option<ObjectKey>,
+    /// Where it is, and the object it holds once it holds one (#175: the
+    /// object lives in the states that have one).
     state: HoldState,
+}
+
+impl HoldState {
+    /// The object a hold holds: while binding or bound.
+    fn object(&self) -> Option<&ObjectKey> {
+        match self {
+            HoldState::Binding { object } | HoldState::Bound { object, .. } => Some(object),
+            HoldState::Placing | HoldState::Refused { .. } => None,
+        }
+    }
 }
 
 struct RunningCall {
@@ -700,8 +714,6 @@ struct Consumer {
     holds: HashMap<u64, u64>,
     /// Call id to token, in flight.
     calls: HashMap<u64, u64>,
-    /// The peer's call window: 0 before its `hello`.
-    limit: u64,
     in_flight: u64,
     waiting: VecDeque<u64>,
 }
@@ -1081,7 +1093,6 @@ impl Actor {
             Ok(Received::Nothing) => {}
             Ok(Received::Opened) => {
                 let peer = link.channel.peer().to_owned();
-                link.consumer.limit = link.channel.peer_calls();
                 let (role, principal) = (link.role, link.principal.clone());
                 self.emit(HostEvent::Opened {
                     link: id,
@@ -1450,8 +1461,7 @@ impl Actor {
             request,
             principal,
             limits,
-            object: None,
-            state: HoldState::Binding,
+            state: HoldState::Placing,
         };
         self.links
             .get_mut(&link)
@@ -1586,8 +1596,7 @@ impl Actor {
         });
         let provider = self.provider(link, origin).expect("the provider");
         let served = provider.holds.get_mut(&hold).expect("the hold");
-        served.object = Some(key);
-        served.state = HoldState::Binding;
+        served.state = HoldState::Binding { object: key };
         if provider.free() {
             let entry = self.bound_entry(link, origin, hold);
             self.send_own(
@@ -1672,8 +1681,9 @@ impl Actor {
     fn bound_entry(&mut self, link: u64, origin: u64, hold: u64) -> BoundEntry {
         let compress = self.options.compress && self.links[&link].role != Role::Parent;
         let key = self.links[&link].providers[&origin].holds[&hold]
-            .object
-            .clone()
+            .state
+            .object()
+            .cloned()
             .expect("a live hold");
         let object = &self.objects[&key];
         let contract = object.contract.clone();
@@ -1729,7 +1739,12 @@ impl Actor {
             .provider(link, origin)
             .and_then(|p| p.holds.get_mut(&hold))
             .expect("the hold");
-        served.state = HoldState::Bound { methods, followed };
+        let object = served.state.object().cloned().expect("a binding hold");
+        served.state = HoldState::Bound {
+            object,
+            methods,
+            followed,
+        };
         BoundEntry {
             hold,
             variant: variant_index,
@@ -1978,6 +1993,7 @@ impl Actor {
 
     /// A hold ends: no longer subscribed, its object loses it.
     fn drop_hold(&mut self, link: u64, origin: u64, hold: u64, served: ServedHold) {
+        let object = served.state.object().cloned();
         if let HoldState::Bound { followed, .. } = served.state {
             for member in followed {
                 member.cell.unlisten(member.listener);
@@ -1989,7 +2005,7 @@ impl Actor {
             provider.waiting.retain(|id| *id != hold);
             provider.touched.retain(|id| *id != hold);
         }
-        if let Some(key) = served.object {
+        if let Some(key) = object {
             self.emit(HostEvent::Released {
                 link,
                 hold,
@@ -2067,7 +2083,7 @@ impl Actor {
         };
         let limits = served.limits;
         let principal = served.principal.clone();
-        let key = served.object.clone().expect("a bound hold");
+        let key = served.state.object().cloned().expect("a bound hold");
         let args = match args {
             None => Value::Null,
             Some(part) => match open_part(&part, limits) {
@@ -2543,8 +2559,11 @@ impl Actor {
             if !host_link.channel.is_open() {
                 return;
             }
+            // The peer's call window, as its `hello` gave it (#175: read
+            // from the channel, which alone knows it).
+            let window = host_link.channel.peer_calls();
             let consumer = &mut host_link.consumer;
-            if consumer.in_flight >= consumer.limit {
+            if consumer.in_flight >= window {
                 return;
             }
             let Some(token) = consumer.waiting.pop_front() else {

@@ -104,12 +104,32 @@ struct Pairing {
     address: String,
     expires: std::time::Instant,
     poll_hash: String,
-    token: Option<String>,
+    /// Approved: the device made for it and the token its poll gets.
+    approved: Option<(String, String)>,
 }
 
 struct State {
     devices: Vec<Device>,
     pairings: Vec<Pairing>,
+}
+
+impl State {
+    /// Drops the pairings that expired (#175). One approved whose token no
+    /// poll collected takes its device with it: nobody holds that token.
+    /// Whether devices changed, to save them.
+    fn prune(&mut self, now: std::time::Instant) -> bool {
+        let mut orphans = Vec::new();
+        self.pairings.retain(|pairing| {
+            let keep = pairing.expires > now;
+            if let (false, Some((device, _))) = (keep, &pairing.approved) {
+                orphans.push(device.clone());
+            }
+            keep
+        });
+        let before = self.devices.len();
+        self.devices.retain(|device| !orphans.contains(&device.id));
+        self.devices.len() != before
+    }
 }
 
 pub(crate) struct Remote {
@@ -174,12 +194,15 @@ impl Remote {
     fn publish(&self) {
         let mut state = lock(&self.state);
         let now = std::time::Instant::now();
-        state.pairings.retain(|pairing| pairing.expires > now);
+        if state.prune(now) {
+            let devices = state.devices.clone();
+            self.save(&devices);
+        }
         let mut value = json!({
             "devices": state.devices.iter().map(|device| json!({
                 "id": device.id, "label": device.label, "created": device.created,
             })).collect::<Vec<_>>(),
-            "pending": state.pairings.iter().filter(|pairing| pairing.token.is_none()).map(|pairing| json!({
+            "pending": state.pairings.iter().filter(|pairing| pairing.approved.is_none()).map(|pairing| json!({
                 "code": pairing.code, "label": pairing.label,
             })).collect::<Vec<_>>(),
             "fingerprint": self.fingerprint,
@@ -209,13 +232,21 @@ impl Remote {
     fn begin(&self, label: String, address: String) -> Option<(String, String)> {
         let mut state = lock(&self.state);
         let now = std::time::Instant::now();
-        state.pairings.retain(|pairing| pairing.expires > now);
-        let from_address = state
-            .pairings
-            .iter()
+        if state.prune(now) {
+            let devices = state.devices.clone();
+            self.save(&devices);
+        }
+        // Only pairings waiting for approval count (#175).
+        let waiting = || {
+            state
+                .pairings
+                .iter()
+                .filter(|pairing| pairing.approved.is_none())
+        };
+        let from_address = waiting()
             .filter(|pairing| pairing.address == address)
             .count();
-        if state.pairings.len() >= MAX_PENDING || from_address >= MAX_PER_ADDRESS {
+        if waiting().count() >= MAX_PENDING || from_address >= MAX_PER_ADDRESS {
             return None;
         }
         let code = loop {
@@ -237,7 +268,7 @@ impl Remote {
             address,
             expires: now + PAIRING_TTL,
             poll_hash: hash(&poll),
-            token: None,
+            approved: None,
         });
         Some((code, poll))
     }
@@ -247,15 +278,18 @@ impl Remote {
     fn poll(&self, poll: &str) -> Option<Option<String>> {
         let mut state = lock(&self.state);
         let now = std::time::Instant::now();
-        state.pairings.retain(|pairing| pairing.expires > now);
+        if state.prune(now) {
+            let devices = state.devices.clone();
+            self.save(&devices);
+        }
         let wanted = hash(poll);
         let index = state
             .pairings
             .iter()
             .position(|pairing| pairing.poll_hash == wanted)?;
-        match state.pairings[index].token.clone() {
+        match state.pairings[index].approved.clone() {
             None => Some(None),
-            Some(token) => {
+            Some((_, token)) => {
                 state.pairings.remove(index);
                 Some(Some(token))
             }
@@ -266,12 +300,15 @@ impl Remote {
     fn approve(&self, code: &str) -> Result<String, WireError> {
         let mut state = lock(&self.state);
         let now = std::time::Instant::now();
-        state.pairings.retain(|pairing| pairing.expires > now);
+        if state.prune(now) {
+            let devices = state.devices.clone();
+            self.save(&devices);
+        }
         let code = code.trim().to_uppercase();
         let Some(pairing) = state
             .pairings
             .iter_mut()
-            .find(|pairing| pairing.code == code && pairing.token.is_none())
+            .find(|pairing| pairing.code == code && pairing.approved.is_none())
         else {
             return Err(refused(
                 "pairing",
@@ -285,7 +322,7 @@ impl Remote {
             created: now_s(),
             hash: hash(&token),
         };
-        pairing.token = Some(token);
+        pairing.approved = Some((device.id.clone(), token));
         state.devices.push(device.clone());
         let devices = state.devices.clone();
         drop(state);
@@ -912,4 +949,51 @@ pub(crate) async fn connect(paired: &Paired) -> Result<Link> {
         .await
         .map_err(|error| anyhow!("the server refused the link: {error}"))?;
     Ok(noel_chord::v2::transport::websocket(socket))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairing(code: &str, expires: std::time::Instant, approved: Option<&str>) -> Pairing {
+        Pairing {
+            code: code.into(),
+            label: code.into(),
+            address: "a".into(),
+            expires,
+            poll_hash: String::new(),
+            approved: approved.map(|device| (device.to_owned(), "token".to_owned())),
+        }
+    }
+
+    fn device(id: &str) -> Device {
+        Device {
+            id: id.into(),
+            label: id.into(),
+            created: 0,
+            hash: String::new(),
+        }
+    }
+
+    /// #175: an approved pairing whose token no poll collected takes its
+    /// device when it expires; a delivered device stays.
+    #[test]
+    fn an_uncollected_approval_takes_its_device_when_it_expires() {
+        let now = std::time::Instant::now();
+        let later = now + Duration::from_secs(60);
+        let mut state = State {
+            devices: vec![device("kept"), device("orphan"), device("fresh")],
+            pairings: vec![
+                pairing("OLD1", now, Some("orphan")),
+                pairing("OLD2", now, None),
+                pairing("NEW1", later, Some("fresh")),
+            ],
+        };
+        assert!(state.prune(now));
+        let ids: Vec<&str> = state.devices.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["kept", "fresh"]);
+        let codes: Vec<&str> = state.pairings.iter().map(|p| p.code.as_str()).collect();
+        assert_eq!(codes, ["NEW1"]);
+        assert!(!state.prune(now));
+    }
 }
