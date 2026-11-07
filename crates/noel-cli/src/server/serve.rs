@@ -46,6 +46,7 @@ use noel_chord::v2::{ChordError, Link, WireError};
 use noel_client::{server_address, session_address};
 use noel_config::{load_config_with_project_trust, LoadedConfig, ENV_SESSION_DIR, THINKING_LEVELS};
 use noel_core::{ReloadableSystems, RunStatus, Runtime, SessionState, SessionStore};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -54,6 +55,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::http::StatusCode;
 
 use super::errors::{forbidden, no_session, refused, unavailable, unavailable_because};
+use super::protocol::{ForkArgs, WorkerStatus};
 use super::{
     build_id, derived_session_id, models_contract, own_exe, own_uid, owner, parse_control,
     peer_check, remove_stale_socket, sessions_contract, set_mode, valid_session_id,
@@ -481,17 +483,38 @@ struct Workers {
 #[derive(Default)]
 struct WorkersState {
     live: HashMap<String, LiveWorker>,
+    /// Workers being started or dialed (#144): the server is not idle
+    /// while one is, though it is not live yet.
+    starting: usize,
     /// The last generation started, by session.
     generations: HashMap<String, u64>,
-    /// How often the server resumed each run.
-    resumes: HashMap<String, u32>,
+    /// How often the server resumed a session's latest interrupted run:
+    /// one entry per session, replaced when another run is resumed (#144:
+    /// one per run, never pruned).
+    resumes: HashMap<String, (String, u32)>,
+}
+
+/// Counts a worker being started until dropped.
+struct Starting<'a>(&'a Mutex<WorkersState>);
+
+impl<'a> Starting<'a> {
+    fn new(state: &'a Mutex<WorkersState>) -> Self {
+        lock(state).starting += 1;
+        Self(state)
+    }
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        lock(self.0).starting -= 1;
+    }
 }
 
 struct LiveWorker {
     link: Link,
     generation: u64,
     /// Its last `status`.
-    status: Value,
+    status: WorkerStatus,
     /// It said it is exiting.
     leaving: bool,
 }
@@ -505,8 +528,10 @@ struct LiveStatus {
 }
 
 impl Workers {
+    /// Workers live or being started.
     fn count(&self) -> usize {
-        lock(&self.state).live.len()
+        let state = lock(&self.state);
+        state.live.len() + state.starting
     }
 
     fn statuses(&self) -> HashMap<String, LiveStatus> {
@@ -519,22 +544,29 @@ impl Workers {
                 (
                     id.clone(),
                     LiveStatus {
-                        busy: status.get("running").and_then(Value::as_bool) == Some(true),
-                        viewers: status.get("viewers").and_then(Value::as_u64).unwrap_or(0),
-                        run_id: status
-                            .get("runId")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
+                        busy: status.running,
+                        viewers: status.viewers,
+                        run_id: status.run_id.clone(),
                     },
                 )
             })
             .collect()
     }
 
+    /// The session's worker's link, unless it is closed or the worker said
+    /// it is exiting (#144: new holds went to a leaving worker).
     fn live_link(&self, id: &str) -> Option<Link> {
         let state = lock(&self.state);
         let worker = state.live.get(id)?;
-        (!worker.link.is_closed()).then(|| worker.link.clone())
+        (!worker.link.is_closed() && !worker.leaving).then(|| worker.link.clone())
+    }
+
+    /// Whether the session's worker said it is exiting.
+    fn leaving(&self, id: &str) -> bool {
+        lock(&self.state)
+            .live
+            .get(id)
+            .is_some_and(|worker| worker.leaving)
     }
 
     /// The session's worker, started if it has none. (Boxed: a worker's
@@ -545,12 +577,15 @@ impl Workers {
             if let Some(link) = workers.live_link(&id) {
                 return Ok(link);
             }
+            let _starting = Starting::new(&workers.state);
             let _spawning = workers.spawning.lock().await;
             if let Some(link) = workers.live_link(&id) {
                 return Ok(link);
             }
-            // A worker whose link dropped while it runs on is dialed again.
-            let pid = recorded_pid(&workers.dir, &id);
+            // A worker whose link dropped while it runs on is dialed again;
+            // one that is exiting is not: the next one starts once it let go
+            // of the journal.
+            let pid = recorded_pid(&workers.dir, &id).filter(|_| !workers.leaving(&id));
             if let Some(pid) = pid.filter(|pid| alive(*pid)) {
                 match workers.attach(&id, Some(pid), true).await {
                     Ok(link) => {
@@ -680,7 +715,15 @@ impl Workers {
             }
         }
         if let Some(run_id) = &resume {
-            *lock(&self.state).resumes.entry(run_id.clone()).or_insert(0) += 1;
+            let mut state = lock(&self.state);
+            let entry = state
+                .resumes
+                .entry(id.to_owned())
+                .or_insert_with(|| (run_id.clone(), 0));
+            if entry.0 != *run_id {
+                *entry = (run_id.clone(), 0);
+            }
+            entry.1 += 1;
         }
         eprintln!(
             "noel server: started worker {id} generation {generation} (pid {pid:?}){}",
@@ -703,9 +746,15 @@ impl Workers {
             .ok()?;
         let run = state.runs.last()?;
         if run.status != RunStatus::Interrupted {
+            // Nothing to resume: the count is for a run that ended.
+            lock(&self.state).resumes.remove(id);
             return None;
         }
-        let resumes = lock(&self.state).resumes.get(&run.id).copied().unwrap_or(0);
+        let resumes = lock(&self.state)
+            .resumes
+            .get(id)
+            .filter(|(run_id, _)| *run_id == run.id)
+            .map_or(0, |(_, count)| *count);
         if resumes >= RESUME_LIMIT {
             eprintln!(
                 "noel server: run {} of {id} stays interrupted: resumed {RESUME_LIMIT} times already",
@@ -779,7 +828,7 @@ impl Workers {
                 LiveWorker {
                     link: link.clone(),
                     generation,
-                    status: json!({}),
+                    status: WorkerStatus::default(),
                     leaving: false,
                 },
             );
@@ -812,7 +861,9 @@ impl Workers {
                 continue;
             };
             match message.get("type").and_then(Value::as_str) {
-                Some("status") => worker.status = message,
+                Some("status") => {
+                    worker.status = WorkerStatus::deserialize(&message).unwrap_or_default();
+                }
                 Some("shutdown") => worker.leaving = true,
                 _ => {}
             }
@@ -1122,8 +1173,13 @@ impl Sessions {
     /// `fork({requestId, sessionId})`: a copy of the session as its journal
     /// holds it, named by the `requestId`.
     fn fork(&self, args: &Value) -> Result<Value, WireError> {
-        let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
-        let source_id = text("sessionId");
+        let ForkArgs {
+            request_id,
+            session_id: source_id,
+            clone,
+        } = ForkArgs::deserialize(args)
+            .map_err(|error| WireError::from(ChordError::invalid("args", error.to_string())))?;
+        let source_id = source_id.as_str();
         if !valid_session_id(source_id) {
             return Err(refused("session", format!("no session {source_id}")));
         }
@@ -1131,9 +1187,8 @@ impl Sessions {
         let source = SessionStore::read(&source_path)
             .map_err(|_| refused("session", format!("no session {source_id}")))?;
         // A clone copies the session whole, keeping its parent.
-        let clone = args.get("clone").and_then(Value::as_bool) == Some(true);
         let _creating = lock(&self.creating);
-        let id = derived_session_id(if clone { "clone" } else { "fork" }, text("requestId"));
+        let id = derived_session_id(if clone { "clone" } else { "fork" }, &request_id);
         if self.session_dir.join(format!("{id}.jsonl")).exists() {
             return Ok(json!({"sessionId": id, "created": false}));
         }

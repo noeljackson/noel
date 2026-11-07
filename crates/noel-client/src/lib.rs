@@ -28,7 +28,7 @@ use noel_chord::v2::object::BoxFuture;
 use noel_chord::v2::{Code, Link, WireError};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 pub mod app;
 
@@ -187,9 +187,29 @@ pub enum Followed {
 #[derive(Clone)]
 pub struct Client {
     host: Host,
-    connector: Arc<dyn Connector>,
-    lost: Arc<Notify>,
+    /// The connection's state, which the supervisor owns (#137): it
+    /// reconnects whether or not anything follows a session.
+    connection: watch::Receiver<Connection>,
+    /// Stops the supervisor when the last clone goes, or on `close`.
+    supervisor: Arc<Supervisor>,
     report: Report,
+}
+
+/// Where the connection to the server is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connection {
+    Connected,
+    /// The link dropped; the supervisor is connecting again.
+    Lost,
+}
+
+/// The task that reconnects; aborted when the client goes.
+struct Supervisor(tokio::task::JoinHandle<()>);
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Client {
@@ -203,11 +223,12 @@ impl Client {
         report: Report,
         options: HostOptions,
     ) -> Result<Self> {
-        let lost = Arc::new(Notify::new());
-        let signal = lost.clone();
+        let (closed, mut closes) = tokio::sync::mpsc::unbounded_channel();
         let host = Host::new(options);
         host.observe(move |event| match event {
-            HostEvent::Closed { .. } => signal.notify_one(),
+            HostEvent::Closed { .. } => {
+                let _ = closed.send(());
+            }
             HostEvent::ProtocolError { error, .. }
                 if std::env::var_os("NOEL_CLIENT_DEBUG").is_some() =>
             {
@@ -216,33 +237,39 @@ impl Client {
             _ => {}
         });
         host.connect(connector.open(true, report.clone()).await?, server_link());
+        let (state, connection) = watch::channel(Connection::Connected);
+        let supervised = (host.clone(), connector, report.clone());
+        let supervisor = tokio::spawn(async move {
+            let (host, connector, report) = supervised;
+            while closes.recv().await.is_some() {
+                let _ = state.send(Connection::Lost);
+                let link = reconnect(&*connector, &report).await;
+                // Closes so far were the old link's: one after the new link
+                // is attached is the new link's (#137: a stale signal opened
+                // a second link).
+                while closes.try_recv().is_ok() {}
+                host.connect(link, server_link());
+                let _ = state.send(Connection::Connected);
+            }
+        });
         Ok(Self {
             host,
-            connector,
-            lost,
+            connection,
+            supervisor: Arc::new(Supervisor(supervisor)),
             report,
         })
     }
 
-    /// Closes the connection, releasing what it holds.
-    pub async fn close(&self) {
-        self.host.close().await;
+    /// The connection's state, as it changes.
+    pub fn connection(&self) -> watch::Receiver<Connection> {
+        self.connection.clone()
     }
 
-    /// Connects again after the server was lost, until it succeeds.
-    async fn reconnect(&self) {
-        let mut delay = Duration::from_millis(100);
-        loop {
-            match self.connector.open(false, self.report.clone()).await {
-                Ok(link) => {
-                    self.host.connect(link, server_link());
-                    return;
-                }
-                Err(error) => (self.report)(format!("reconnect: {error:#}")),
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(2));
-        }
+    /// Closes the connection, releasing what it holds.
+    pub async fn close(&self) {
+        // A close is not a lost link: nothing connects again.
+        self.supervisor.0.abort();
+        self.host.close().await;
     }
 
     /// A reference on the server's `noel.sessions`.
@@ -400,6 +427,9 @@ impl Client {
                 Err(error) => return error.into(),
             }
             first = false;
+            let mut connection = self.connection();
+            connection.mark_unchanged();
+            let mut lost = false;
             let mut statuses = chat.statuses();
             let mut live = true;
             loop {
@@ -428,10 +458,20 @@ impl Client {
                             _ => {}
                         }
                     }
-                    () = self.lost.notified() => {
-                        sink(Followed::ServerLost);
-                        self.reconnect().await;
-                        sink(Followed::Reconnected);
+                    changed = connection.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        // A change is a loss, even one already over: the
+                        // watch keeps only the latest state.
+                        let now = *connection.borrow_and_update();
+                        if !lost {
+                            sink(Followed::ServerLost);
+                        }
+                        lost = now == Connection::Lost;
+                        if !lost {
+                            sink(Followed::Reconnected);
+                        }
                     }
                 }
             }
@@ -442,6 +482,19 @@ impl Client {
             sink(Followed::ViewEnded(why));
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+}
+
+/// Opens a link to the server again, until it succeeds.
+async fn reconnect(connector: &dyn Connector, report: &Report) -> Link {
+    let mut delay = Duration::from_millis(100);
+    loop {
+        match connector.open(false, report.clone()).await {
+            Ok(link) => return link,
+            Err(error) => report(format!("reconnect: {error:#}")),
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
     }
 }
 
@@ -759,6 +812,36 @@ mod tests {
             }
             Box::pin(async move { Ok(ours) })
         }
+    }
+
+    /// #137: the client reconnects with nothing following a session, and
+    /// once: a lost link opens exactly one new one.
+    #[tokio::test]
+    async fn a_lost_link_is_reconnected_without_a_follower() {
+        let server = host_at(session_address("s1"));
+        let memory = Memory::new(&server);
+        let client = Client::connect(memory.clone(), quiet()).await.unwrap();
+        let mut connection = client.connection();
+        assert_eq!(*connection.borrow(), Connection::Connected);
+        memory.opens.lock().unwrap()[0].1.close();
+        // Lost, then connected again (the watch may show only the latter).
+        tokio::time::timeout(Duration::from_secs(5), connection.changed())
+            .await
+            .expect("a change")
+            .unwrap();
+        while *connection.borrow_and_update() != Connection::Connected {
+            tokio::time::timeout(Duration::from_secs(5), connection.changed())
+                .await
+                .expect("reconnected")
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let opens: Vec<bool> = memory.opens.lock().unwrap().iter().map(|o| o.0).collect();
+        assert_eq!(opens, [true, false]);
+        // A close is not a loss: nothing connects again.
+        client.close().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(memory.opens.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -381,7 +381,7 @@ pub(crate) async fn run(
             runtime.queue_message(message)?;
             ui.push(
                 TuiEntryKind::System,
-                format!("queued: {}", runtime.session().queued_messages.len()),
+                format!("queued: {}", runtime.session().queue.len()),
             );
         }
         _ if line.starts_with("/selector ") => {
@@ -415,7 +415,7 @@ pub(crate) async fn run(
                 ui.set_resume_pending(runtime.session().has_unfinished_turn());
                 if let Some(hint) = resume_hint(
                     runtime.session().has_unfinished_turn(),
-                    runtime.session().queued_messages.len(),
+                    runtime.session().queue.len(),
                 ) {
                     ui.push(TuiEntryKind::System, hint);
                 }

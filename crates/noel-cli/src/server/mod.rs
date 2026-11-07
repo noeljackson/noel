@@ -25,6 +25,7 @@ pub(crate) mod bridge;
 pub(crate) mod client;
 mod djs_plugins;
 pub(crate) mod plugins;
+pub(crate) mod protocol;
 pub(crate) mod remote;
 pub(crate) mod serve;
 mod view;

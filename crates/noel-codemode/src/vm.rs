@@ -114,14 +114,13 @@ pub enum VmMessage {
     },
 }
 
-/// A call's result (pi's `HostToWorkerMessage`): `payload` is the JSON result
-/// when `ok`, else the error message; a rejection's `Error` gets the own
-/// properties of the `properties` JSON object.
+/// A call's result (pi's `HostToWorkerMessage`): `outcome` is the JSON
+/// result (none for `undefined`), or the error message; a rejection's
+/// `Error` gets the own properties of the `properties` JSON object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmResult {
     pub id: u64,
-    pub ok: bool,
-    pub payload: Option<String>,
+    pub outcome: Result<Option<String>, String>,
     pub properties: Option<String>,
 }
 
@@ -177,16 +176,26 @@ struct Prepared {
 
 pub struct VmSession {
     vm: Vm,
-    prepared: Option<Prepared>,
+    phase: Phase,
     interrupt: Arc<AtomicBool>,
     outbox: Vec<VmMessage>,
     /// Where messages go as they happen, when set (see [`VmSession::stream_to`]).
     sink: Option<Box<dyn FnMut(VmMessage) + Send>>,
-    /// Off while the host globals and the prelude run (trusted, bounded code).
-    polling: bool,
-    /// While the prelude runs the clock reads 0 in UTC.
-    fixed_clock: bool,
-    ended: bool,
+}
+
+/// Where a VM session is (#156).
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Created, the prelude not set up yet (or restored from an image).
+    Starting,
+    /// The host globals and the prelude run: trusted, bounded code, so the
+    /// interrupt is not polled, and the clock reads 0 in UTC.
+    Preparing,
+    /// The script runs, or waits for calls.
+    Ready(Prepared),
+    /// The script finished, failed or the VM crashed: nothing more is
+    /// posted or delivered.
+    Ended,
 }
 
 impl VmSession {
@@ -237,13 +246,10 @@ impl VmSession {
         };
         let mut session = VmSession {
             vm,
-            prepared: None,
+            phase: Phase::Starting,
             interrupt,
             outbox: Vec::new(),
             sink,
-            polling: true,
-            fixed_clock: false,
-            ended: false,
         };
         if let Err(Crash(message)) = session.begin(data, prepared, key) {
             session.post(VmMessage::Crash { message });
@@ -255,7 +261,7 @@ impl VmSession {
     /// Settles call `result.id` in the VM and runs the script until it waits
     /// again or ends. Ignored once the session ended.
     pub fn deliver(&mut self, result: &VmResult) -> Vec<VmMessage> {
-        if self.ended {
+        if self.ended() {
             return Vec::new();
         }
         if let Err(Crash(message)) = self.apply(result) {
@@ -266,19 +272,24 @@ impl VmSession {
 
     /// Whether the script finished, failed or the VM crashed.
     pub fn ended(&self) -> bool {
-        self.ended
+        matches!(self.phase, Phase::Ended)
     }
 
     fn take(&mut self) -> Vec<VmMessage> {
         std::mem::take(&mut self.outbox)
     }
 
+    /// Posts `message`; one that ends the session (done, failed, crash)
+    /// is the last: later ones, such as a crash after `done`, are dropped.
     fn post(&mut self, message: VmMessage) {
+        if self.ended() {
+            return;
+        }
         if matches!(
             message,
             VmMessage::Done { .. } | VmMessage::Failed { .. } | VmMessage::Crash { .. }
         ) {
-            self.ended = true;
+            self.phase = Phase::Ended;
         }
         match &mut self.sink {
             Some(sink) => sink(message),
@@ -297,11 +308,9 @@ impl VmSession {
         let prepared = match cached {
             Some(prepared) => prepared,
             None => {
-                self.polling = false;
-                self.fixed_clock = true;
+                self.phase = Phase::Preparing;
                 let prepared = self.prepare(data);
-                self.polling = true;
-                self.fixed_clock = false;
+                self.phase = Phase::Starting;
                 let prepared = prepared?;
                 self.vm
                     .seal()
@@ -316,7 +325,7 @@ impl VmSession {
         self.call(prepared.set_origin, &[Arg::Value(Value::number(now_ms()))])?;
         let run = prepared.run;
         let api = prepared.api;
-        self.prepared = Some(prepared);
+        self.phase = Phase::Ready(prepared);
 
         let source = format!("{SCRIPT_PREFIX}{}\n}})", data.code);
         let compiled = self.vm.compile(
@@ -467,17 +476,18 @@ impl VmSession {
 
     /// Settles call `result.id` and runs the script until it waits again.
     fn apply(&mut self, result: &VmResult) -> Result<(), Crash> {
-        let Some(prepared) = &self.prepared else {
+        let Phase::Ready(prepared) = self.phase else {
             return Err(Crash("the VM has no script".to_owned()));
         };
         let (settle, api) = (prepared.settle, prepared.api);
+        let (ok, payload) = match &result.outcome {
+            Ok(value) => (true, value.as_deref()),
+            Err(message) => (false, Some(message.as_str())),
+        };
         let args = [
             Arg::Value(Value::number(result.id as f64)),
-            Arg::Value(Value::bool(result.ok)),
-            result
-                .payload
-                .as_deref()
-                .map_or(Arg::Value(Value::UNDEFINED), Arg::Text),
+            Arg::Value(Value::bool(ok)),
+            payload.map_or(Arg::Value(Value::UNDEFINED), Arg::Text),
             result
                 .properties
                 .as_deref()
@@ -490,7 +500,7 @@ impl VmSession {
     /// Fails a script that waits on nothing that can ever resume it (pi's
     /// `stalled`).
     fn drain(&mut self) -> Result<(), Crash> {
-        let Some(prepared) = &self.prepared else {
+        let Phase::Ready(prepared) = self.phase else {
             return Ok(());
         };
         let (stalled, api) = (prepared.stalled, prepared.api);
@@ -508,7 +518,8 @@ impl VmSession {
             self.set_clock();
             match self.vm.run(FUEL_PER_POLL) {
                 Status::OutOfFuel => {
-                    if self.polling && self.interrupt.load(Ordering::Relaxed) {
+                    let polling = !matches!(self.phase, Phase::Preparing);
+                    if polling && self.interrupt.load(Ordering::Relaxed) {
                         self.vm.abort();
                         return Err(Crash("Execution interrupted".to_owned()));
                     }
@@ -522,7 +533,10 @@ impl VmSession {
                         self.vm.abort();
                         return Err(Crash(format!("Unknown host function {fn_id}")));
                     }
-                    self.bridge(&args);
+                    if let Err(crash) = Bridge::parse(&args).map(|message| self.bridge(message)) {
+                        self.vm.abort();
+                        return Err(crash);
+                    }
                     self.vm
                         .resolve_host_call(call_id, Ok(Value::UNDEFINED))
                         .map_err(|error| Crash(format!("resolve: {error:?}")))?;
@@ -536,7 +550,7 @@ impl VmSession {
     }
 
     fn set_clock(&mut self) {
-        if self.fixed_clock {
+        if matches!(self.phase, Phase::Preparing) {
             self.vm.set_now(0.0);
             self.vm.set_time_zone_offset(0);
         } else {
@@ -561,17 +575,63 @@ impl VmSession {
         }
     }
 
-    /// The prelude's host bridge, called with primitives only.
-    fn bridge(&mut self, args: &[Prim]) {
+    /// Posts what the prelude's host bridge said.
+    fn bridge(&mut self, message: Bridge) {
+        let message = match message {
+            Bridge::Call {
+                id,
+                target,
+                name,
+                args,
+            } => VmMessage::Call {
+                id,
+                target,
+                name,
+                args,
+            },
+            Bridge::Output(item) => VmMessage::Output(item),
+            Bridge::Done { value, writes } => VmMessage::Done { value, writes },
+            Bridge::Failed { error } => VmMessage::Failed { error },
+        };
+        self.post(message);
+    }
+}
+
+/// A message of the prelude's host bridge, called with primitives only:
+/// `kind` first. A kind or a call id it cannot be is a broken bridge, which
+/// crashes the VM rather than being taken for something else.
+#[derive(Debug, PartialEq)]
+enum Bridge {
+    Call {
+        id: u64,
+        target: CallTarget,
+        name: String,
+        args: Option<String>,
+    },
+    Output(OutputItem),
+    Done {
+        value: Option<String>,
+        writes: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+impl Bridge {
+    fn parse(args: &[Prim]) -> Result<Self, Crash> {
         let arg = |index: usize| args.get(index).cloned().unwrap_or(Prim::Undefined);
         let kind = arg(0).text();
-        match kind.as_str() {
+        Ok(match kind.as_str() {
             "call" | "global" => {
                 let id = match arg(1) {
-                    Prim::Number(number) => number as u64,
-                    other => other.text().parse().unwrap_or(0),
+                    Prim::Number(number) if number >= 0.0 && number.fract() == 0.0 => number as u64,
+                    Prim::Text(text) => text
+                        .parse()
+                        .map_err(|_| Crash(format!("bridge: bad call id {text:?}")))?,
+                    other => return Err(Crash(format!("bridge: bad call id {other:?}"))),
                 };
-                self.post(VmMessage::Call {
+                Bridge::Call {
                     id,
                     target: if kind == "call" {
                         CallTarget::Tool
@@ -580,39 +640,31 @@ impl VmSession {
                     },
                     name: arg(2).text(),
                     args: arg(3).optional_text(),
-                });
-            }
-            "output" => {
-                let item = match arg(1).text().as_str() {
-                    "image" => OutputItem::Image {
-                        data: arg(2).text(),
-                        mime_type: arg(3).text(),
-                    },
-                    "console" => OutputItem::Text {
-                        text: arg(2).text(),
-                        console: true,
-                    },
-                    _ => OutputItem::Text {
-                        text: arg(2).text(),
-                        console: false,
-                    },
-                };
-                self.post(VmMessage::Output(item));
-            }
-            "done" => {
-                if arg(1) == Prim::Bool(true) {
-                    self.post(VmMessage::Done {
-                        value: arg(2).optional_text(),
-                        writes: arg(3).text(),
-                    });
-                } else {
-                    self.post(VmMessage::Failed {
-                        error: arg(2).text(),
-                    });
                 }
             }
-            _ => {}
-        }
+            "output" => Bridge::Output(match arg(1).text().as_str() {
+                "image" => OutputItem::Image {
+                    data: arg(2).text(),
+                    mime_type: arg(3).text(),
+                },
+                "console" => OutputItem::Text {
+                    text: arg(2).text(),
+                    console: true,
+                },
+                _ => OutputItem::Text {
+                    text: arg(2).text(),
+                    console: false,
+                },
+            }),
+            "done" if arg(1) == Prim::Bool(true) => Bridge::Done {
+                value: arg(2).optional_text(),
+                writes: arg(3).text(),
+            },
+            "done" => Bridge::Failed {
+                error: arg(2).text(),
+            },
+            other => return Err(Crash(format!("bridge: unknown message {other:?}"))),
+        })
     }
 }
 
@@ -732,19 +784,17 @@ mod tests {
     fn answer(name: &str, args: Option<&str>) -> VmResult {
         let args: serde_json::Value =
             serde_json::from_str(args.unwrap_or("{}")).unwrap_or(serde_json::Value::Null);
-        let (ok, payload) = match name {
-            "add" => (
-                true,
+        let outcome = match name {
+            "add" => Ok(Some(
                 json!({"sum": args["x"].as_i64().unwrap_or(0) + args["y"].as_i64().unwrap_or(0)})
                     .to_string(),
-            ),
-            "my-tool" => (true, args.to_string()),
-            _ => (false, format!("{name} failed on purpose")),
+            )),
+            "my-tool" => Ok(Some(args.to_string())),
+            _ => Err(format!("{name} failed on purpose")),
         };
         VmResult {
             id: 0,
-            ok,
-            payload: Some(payload),
+            outcome,
             properties: None,
         }
     }
@@ -809,6 +859,58 @@ mod tests {
             Some(VmMessage::Failed { error }) => serde_json::from_str(error).unwrap(),
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+
+    /// #156: the message that ends a session is its last; a crash the VM
+    /// reports after `done` (an engine error unwinding) is not posted, and
+    /// nothing is delivered after it.
+    #[test]
+    fn nothing_is_posted_after_the_end() {
+        let data = VmStart {
+            code: "return 1;".to_owned(),
+            tools: tools(),
+            ..VmStart::default()
+        };
+        let (mut session, messages) = VmSession::start(&data, Arc::default()).expect("a VM");
+        assert!(matches!(messages.last(), Some(VmMessage::Done { .. })));
+        assert!(session.ended());
+        session.post(VmMessage::Crash {
+            message: "late".to_owned(),
+        });
+        session.post(VmMessage::Output(text("late", false)));
+        assert_eq!(session.take(), []);
+        let result = VmResult {
+            id: 1,
+            outcome: Ok(None),
+            properties: None,
+        };
+        assert_eq!(session.deliver(&result), []);
+    }
+
+    /// #156: a bridge message the prelude cannot send is a crash, not a
+    /// call numbered 0 or a message ignored.
+    #[test]
+    fn a_broken_bridge_message_is_refused() {
+        let call = |id: Prim| {
+            Bridge::parse(&[
+                Prim::Text("call".into()),
+                id,
+                Prim::Text("add".into()),
+                Prim::Undefined,
+            ])
+        };
+        assert!(matches!(
+            call(Prim::Number(3.0)),
+            Ok(Bridge::Call { id: 3, .. })
+        ));
+        assert!(matches!(
+            call(Prim::Text("4".into())),
+            Ok(Bridge::Call { id: 4, .. })
+        ));
+        assert!(call(Prim::Text("x".into())).is_err());
+        assert!(call(Prim::Number(-1.0)).is_err());
+        assert!(call(Prim::Undefined).is_err());
+        assert!(Bridge::parse(&[Prim::Text("later".into())]).is_err());
     }
 
     #[test]
