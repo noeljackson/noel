@@ -90,7 +90,11 @@ Outcomes: **fixed** (with the test that fails before the fix), **refactored**
 | #131 | fixed: the host's stdout is `Pipe::Idle/Busy/Broken`, kept by the host; a broken or exited host is started again on its next call. Test `a_cancelled_request_does_not_break_the_host` |
 | #132 | fixed: the Bun host has a `Phase` (loading, factoryFailed, ready, shuttingDown); session_start runs at init, session_shutdown at shutdown, unknown kinds get an error; shutdown waits for the host. Test `bun_host_runs_session_start_and_shutdown_handlers` |
 | #135 | fixed: one `SseParser` per wire format serves the streaming and the batch path, and its `finish` returns the raw stop reason or upstream's error; exactly one `Stop`, last. The `StopReason` enum is not adopted: the raw reason is upstream's `rawStopReason` (non-parity register, "Provider Stream Endings"). Test `streams_end_with_their_provider_terminal_or_an_error` (fails before the fix) |
-| #163 (noel-ai) | refactored: tests in `tests.rs`, one module per provider; the other three files follow in group 8 |
+| #163 (noel-ai) | refactored: tests in `tests.rs`, one module per provider |
+| #163 | refactored: the inline tests of noel-cli `main.rs`, noel-core and noel-config `lib.rs` moved to sibling `tests.rs`; noel-core split into `turn`, `tool_calls`, `journal`, `session_export`, `model_tools`; noel-config into `settings`, `auth`, `resource_files`, `context_files`; noel-cli `main.rs` (13,144 lines) into `tui`, `provider`, `selectors`, `media`, `model_refresh`, `package_command`, `auth_commands`, `image_command` (3,021 left). Code moved unchanged |
+| #165 | refactored: the built-in tools' schemas and their argument parsing live together in `noel-core/src/model_tools.rs` (the parser is core's, not noel-tools'); test `tool_schemas_match_their_argument_parsers` checks each schema's properties and `required` against the parser |
+| #166 | refactored: `ExtensionTool.protocol` is `ExtensionToolProtocol`. The other literal comparisons read wire JSON, tool names or provider ids at their boundary; `steeringMode`, `followUpMode`, `transport` and the TUI settings strings are stored and never compared, so they stay strings (upstream's on-disk format) |
+| #167 | refactored: the worker's `run_command` (248 lines) is a handler per command (31 lines left); attach's `command` (211) keeps its match with its long arms as methods (110). `model_tool_definition` is a schema table in `model_tools`. `main::run`, `Runtime::from_config`, `execute_model_tool_call_with`, worker `start` and attach `run` are left as they are: each reads as one sequence of phases |
 | #164 | fixed: `noel.chat` call arguments and answers are serde types in `server/protocol.rs`, shared by attach and the worker; the wire is unchanged. Tests `calls_keep_their_wire_shape`, `an_answer_names_the_run_it_started` |
 | #133 | fixed: attach's run is `RunView { Idle, Starting, Running }` with one `advance`; a start never seen gives up after 10s; pending calls are a set of tokens, so the counter cannot drift. Test `the_run_view_follows_the_live_run_and_gives_up_on_an_unseen_start` |
 | #134 | fixed: the worker is `Slot { Idle, Working, Starting, Running }` and `Phase { Serving, Draining, Leaving }`; it exits only with an idle slot, a new server connection resets Draining, and Leaving refuses new work. Test `the_worker_exits_only_with_nothing_in_hand` |
@@ -123,4 +127,7 @@ Outcomes: **fixed** (with the test that fails before the fix), **refactored**
 
 ## Status
 
-Started 2026-11-07.
+Started and finished 2026-11-07. Merged in PRs #170 to #174, #176 and the
+group 8 PR. Every issue from #130 to #167 is closed, fixed or closed with its
+reason; #129 and #162 are closed. Items left for later are in #175. The
+Swift changes of #157 are not compiled here (no Xcode).

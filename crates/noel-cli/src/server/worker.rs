@@ -1134,6 +1134,9 @@ impl CommandUi for CommandOutput {
 /// the rows to show, then what the client does next (`run` it started,
 /// `selector` to open, `session` to attach to, `login` to run). A prompt
 /// starts a run, returned to be driven.
+/// A slash command or `!` line from a client: the entries it shows, what
+/// comes next, and the run it started, if any. Each kind of command has its
+/// handler; the rest go to the session commands.
 async fn run_command(
     controller: &mut SessionController<WorkerHost>,
     args: &Value,
@@ -1143,10 +1146,36 @@ async fn run_command(
         request_id,
         errors,
     } = CommandArgs::deserialize(args).unwrap_or_default();
-    let mut output = CommandOutput::default();
-    let mut next = Value::Null;
-    let mut start = None;
-    // The queue is the controller's; the session's own fields are not.
+    if let Some(answer) = queue_follow_up(controller, &line, &request_id) {
+        return answer;
+    }
+    if let Some(answer) = queue_listing(controller, &line) {
+        return answer;
+    }
+    if let Some(answer) = shell_command(controller, &line).await {
+        return answer;
+    }
+    if let Some(answer) = diff_command(controller, &line) {
+        return answer;
+    }
+    if let Some(answer) = quit_command(controller, &line).await {
+        return answer;
+    }
+    if let Some(answer) = bug_command(controller, &line, errors) {
+        return answer;
+    }
+    if let Some(answer) = undo_command(controller, &line) {
+        return answer;
+    }
+    session_command(controller, args, line).await
+}
+
+/// `/queue <text>`: a follow-up queued while the session runs or not.
+fn queue_follow_up(
+    controller: &mut SessionController<WorkerHost>,
+    line: &str,
+    request_id: &Option<String>,
+) -> Option<(Value, Option<Start>)> {
     if let Some(text) = line
         .strip_prefix("/queue ")
         .map(str::trim)
@@ -1165,12 +1194,21 @@ async fn run_command(
             Err(error) => error.to_string(),
         };
         refresh(controller);
-        return (
+        return Some((
             json!({"entries": [{"kind": "system", "text": answer}]}),
             None,
-        );
+        ));
     }
-    let queued = match line.as_str() {
+    None
+}
+
+/// `/queue`, `/queue-clear` and `/interrupt`.
+fn queue_listing(
+    controller: &mut SessionController<WorkerHost>,
+    line: &str,
+) -> Option<(Value, Option<Start>)> {
+    let mut output = CommandOutput::default();
+    let queued = match line {
         "/queue" => Some(Ok(queue_text(&controller.queue().items()))),
         "/queue-clear" | "/interrupt" => Some(controller.clear_queue().map(|items| {
             let cleared = format!("cleared {} queued message(s)", items.len());
@@ -1188,8 +1226,16 @@ async fn run_command(
             Err(error) => output.push(crate::TuiEntryKind::Error, error),
         }
         refresh(controller);
-        return (json!({"entries": output.entries}), None);
+        return Some((json!({"entries": output.entries}), None));
     }
+    None
+}
+
+/// `!command`.
+async fn shell_command(
+    controller: &mut SessionController<WorkerHost>,
+    line: &str,
+) -> Option<(Value, Option<Start>)> {
     // `!command`: a shell command in the session's environment, its output
     // shown and not sent to the model (the client resolves `!!`).
     if let Some(command) = line
@@ -1213,8 +1259,16 @@ async fn run_command(
                 json!({"kind": "error", "text": format!("failed bash\n$ {command}\n{error}")})
             }
         };
-        return (json!({"entries": [entry]}), None);
+        return Some((json!({"entries": [entry]}), None));
     }
+    None
+}
+
+/// `/diff`.
+fn diff_command(
+    controller: &mut SessionController<WorkerHost>,
+    line: &str,
+) -> Option<(Value, Option<Start>)> {
     // The diff panel: the edited files and each one's diff, read here.
     if line == "/diff" {
         let session = controller.runtime().session();
@@ -1230,15 +1284,23 @@ async fn run_command(
             })
         });
         let files = files.collect::<Vec<_>>();
-        return (
+        return Some((
             json!({"entries": [], "next": {"type": "diff", "files": files}}),
             None,
-        );
+        ));
     }
+    None
+}
+
+/// `/quit`, `/exit` and `/q`.
+async fn quit_command(
+    controller: &mut SessionController<WorkerHost>,
+    line: &str,
+) -> Option<(Value, Option<Start>)> {
     // A local `noel` quitting (docs/client-tui-plan.md): with no other
     // client and no run, the session ends as the in-process TUI's does,
     // its extensions told so; otherwise the client only detaches.
-    if matches!(line.as_str(), "/quit" | "/exit" | "/q") {
+    if matches!(line, "/quit" | "/exit" | "/q") {
         let (runtime, host) = controller.parts_mut();
         let alone = host.status.get().holds <= 1;
         let mut entries = Vec::new();
@@ -1264,10 +1326,19 @@ async fn run_command(
                     .map(|text| json!({"kind": "error", "text": text})),
             );
             host.status.update(|status| status.phase = Phase::Leaving);
-            return (json!({"entries": entries, "leaving": true}), None);
+            return Some((json!({"entries": entries, "leaving": true}), None));
         }
-        return (json!({"entries": entries}), None);
+        return Some((json!({"entries": entries}), None));
     }
+    None
+}
+
+/// `/bug`.
+fn bug_command(
+    controller: &mut SessionController<WorkerHost>,
+    line: &str,
+    errors: Option<Vec<String>>,
+) -> Option<(Value, Option<Start>)> {
     // `/bug`: the report goes into the session's directory, with the error
     // rows the client shows (`errors`).
     if line.split_whitespace().next() == Some("/bug") {
@@ -1275,13 +1346,21 @@ async fn run_command(
         let errors = errors.iter().map(String::as_str).collect::<Vec<_>>();
         let (runtime, host) = controller.parts();
         let dir = std::env::current_dir().unwrap_or_else(|_| runtime.session().cwd.clone());
-        let entry =
-            match crate::bug_report::report_into(runtime, &host.config, &line, &errors, &dir) {
-                Ok(text) => json!({"kind": "system", "text": text}),
-                Err(text) => json!({"kind": "error", "text": text}),
-            };
-        return (json!({"entries": [entry]}), None);
+        let entry = match crate::bug_report::report_into(runtime, &host.config, line, &errors, &dir)
+        {
+            Ok(text) => json!({"kind": "system", "text": text}),
+            Err(text) => json!({"kind": "error", "text": text}),
+        };
+        return Some((json!({"entries": [entry]}), None));
     }
+    None
+}
+
+/// `/undo`.
+fn undo_command(
+    controller: &mut SessionController<WorkerHost>,
+    line: &str,
+) -> Option<(Value, Option<Start>)> {
     if line == "/undo" {
         // The prompt goes back to the client's draft.
         let undone = controller.configure(|runtime, _| runtime.undo_last_turn());
@@ -1294,8 +1373,21 @@ async fn run_command(
             Err(error) => json!({"entries": [{"kind": "error", "text": error.to_string()}]}),
         };
         refresh(controller);
-        return (answer, None);
+        return Some((answer, None));
     }
+    None
+}
+
+/// A session switch, or a command `session_commands` runs, and what its
+/// outcome asks of the controller.
+async fn session_command(
+    controller: &mut SessionController<WorkerHost>,
+    args: &Value,
+    line: String,
+) -> (Value, Option<Start>) {
+    let mut output = CommandOutput::default();
+    let mut next = Value::Null;
+    let mut start = None;
     if let Some(switch) = selected_session(controller, &line) {
         match switch {
             Ok(session) => next = json!({"type": "session", "session": session}),

@@ -226,7 +226,7 @@ fn extension_tool(name: &str) -> (String, ExtensionTool) {
         parameters: json!({}),
         extension_name: "ext".to_string(),
         extension_path: PathBuf::from("ext"),
-        protocol: "json".to_string(),
+        protocol: crate::ExtensionToolProtocol::Json,
         replay_safe: false,
         prompt_snippet: None,
         prompt_guidelines: Vec::new(),
