@@ -1478,7 +1478,9 @@ fn diff_panel_key(
     app: &mut TuiApp,
     detail: impl Fn(&DiffFileEntry) -> DiffDetail,
 ) -> bool {
-    let Some(panel) = app.diff_panel.as_mut() else {
+    let (input_empty, owned_screen) = (app.input.trim().is_empty(), app.owned_screen);
+    let esc_closes = owned_screen || app.input.is_empty();
+    let Some(panel) = app.diff_panel_mut() else {
         return false;
     };
     if let Some(detail) = panel.detail.as_mut() {
@@ -1501,13 +1503,13 @@ fn diff_panel_key(
         KeyCode::Down => {
             panel.selected = (panel.selected + 1).min(panel.files.len().saturating_sub(1));
         }
-        KeyCode::Enter if key.modifiers.is_empty() && app.input.trim().is_empty() => {
+        KeyCode::Enter if key.modifiers.is_empty() && input_empty => {
             let detail = panel.files.get(panel.selected).map(&detail);
             if let Some(detail) = detail {
                 panel.detail = Some(detail);
             }
         }
-        KeyCode::Esc if app.owned_screen || app.input.is_empty() => app.diff_panel = None,
+        KeyCode::Esc if esc_closes => app.close_overlay(|o| matches!(o, Overlay::DiffPanel(_))),
         _ => return false,
     }
     true

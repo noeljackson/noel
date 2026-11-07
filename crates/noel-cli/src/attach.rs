@@ -1074,11 +1074,11 @@ impl Remote {
             name.as_deref()
                 .is_some_and(|name| bindings.matches(action, name))
         };
-        if app.selector.is_some() {
+        if app.selector().is_some() {
             self.selector_key(key, app, config);
             return Action::None;
         }
-        if app.diff_panel.is_some() {
+        if app.diff_panel().is_some() {
             let lines = &self.diff_lines;
             let handled = crate::diff_panel_key(&key, app, |entry| crate::DiffDetail {
                 path: entry.path.clone(),
@@ -1157,7 +1157,7 @@ impl Remote {
             KeyCode::Esc if app.turn_running => self.abort(),
             KeyCode::Esc => {
                 app.clear_input();
-                app.multiline = None;
+                app.close_overlay(|o| matches!(o, crate::Overlay::Multiline(_)));
             }
             KeyCode::Backspace => app.pop_input_char(),
             KeyCode::Delete => app.delete_input_char(),
@@ -1196,10 +1196,10 @@ impl Remote {
         if line.is_empty() {
             return Action::None;
         }
-        if let Some(lines) = app.multiline.as_mut() {
+        if let Some(lines) = app.multiline_mut() {
             if line == "." {
                 let prompt = lines.join("\n");
-                app.multiline = None;
+                app.close_overlay(|o| matches!(o, crate::Overlay::Multiline(_)));
                 self.prompt(app, prompt, steer);
             } else {
                 lines.push(line);
@@ -1275,7 +1275,9 @@ impl Remote {
                     Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
                 }
             }
-            "/diff" if app.diff_panel.is_some() => app.diff_panel = None,
+            "/diff" if app.diff_panel().is_some() => {
+                app.close_overlay(|o| matches!(o, crate::Overlay::DiffPanel(_)))
+            }
             "/changelog" => app.push(TuiEntryKind::System, crate::format_changelog()),
             "/themes" => app.push(TuiEntryKind::System, crate::format_themes(config)),
             "/theme" => self.theme_selector(app, config),
@@ -1293,7 +1295,7 @@ impl Remote {
                 }
             }
             "/multiline" => {
-                app.multiline = Some(Vec::new());
+                app.overlay = crate::Overlay::Multiline(Vec::new());
                 app.push(
                     TuiEntryKind::System,
                     "enter multiline prompt; submit . on its own line",
@@ -1360,7 +1362,7 @@ impl Remote {
         });
         if let Some(selector) = crate::TuiSelectorState::from_json(&selector) {
             app.push(TuiEntryKind::System, format!("{} selector", selector.title));
-            app.selector = Some(selector);
+            app.overlay = crate::Overlay::Selector(selector);
         }
     }
 
@@ -1513,33 +1515,31 @@ impl Remote {
     fn selector_key(&mut self, key: KeyEvent, app: &mut TuiApp, config: &mut LoadedConfig) {
         match key.code {
             KeyCode::Esc => {
-                let mut selector = app.selector.take().expect("selector");
+                let mut selector = app.take_selector().expect("selector");
                 if let Some(parent) = selector.parent.take() {
-                    app.selector = Some(*parent);
+                    app.overlay = crate::Overlay::Selector(*parent);
                 }
             }
-            KeyCode::Up => app.selector.as_mut().expect("selector").move_selection(-1),
-            KeyCode::Down => app.selector.as_mut().expect("selector").move_selection(1),
+            KeyCode::Up => app.selector_mut().expect("selector").move_selection(-1),
+            KeyCode::Down => app.selector_mut().expect("selector").move_selection(1),
             KeyCode::PageUp => app
-                .selector
-                .as_mut()
+                .selector_mut()
                 .expect("selector")
                 .move_selection(-(crate::SELECTOR_PAGE_STEP as isize)),
             KeyCode::PageDown => app
-                .selector
-                .as_mut()
+                .selector_mut()
                 .expect("selector")
                 .move_selection(crate::SELECTOR_PAGE_STEP as isize),
-            KeyCode::Home => app.selector.as_mut().expect("selector").jump_to_start(),
-            KeyCode::End => app.selector.as_mut().expect("selector").jump_to_end(),
-            KeyCode::Backspace => app.selector.as_mut().expect("selector").pop_query_char(),
+            KeyCode::Home => app.selector_mut().expect("selector").jump_to_start(),
+            KeyCode::End => app.selector_mut().expect("selector").jump_to_end(),
+            KeyCode::Backspace => app.selector_mut().expect("selector").pop_query_char(),
             KeyCode::Enter => {
-                let selector = app.selector.take().expect("selector");
+                let selector = app.take_selector().expect("selector");
                 let Some(item) = selector.selected_item().cloned() else {
                     app.push(TuiEntryKind::System, "no selector match");
                     // As locally: only the settings list stays open.
                     if selector.kind == "settings" {
-                        app.selector = Some(selector);
+                        app.overlay = crate::Overlay::Selector(selector);
                     }
                     return;
                 };
@@ -1547,7 +1547,7 @@ impl Remote {
                 // redraws it, unless it was closed meanwhile.
                 if selector.kind == "settings" {
                     self.run_command(format!("/select settings {}", item.value));
-                    app.selector = Some(selector);
+                    app.overlay = crate::Overlay::Selector(selector);
                     return;
                 }
                 if selector.kind == "provider" {
@@ -1561,7 +1561,7 @@ impl Remote {
                     match models {
                         Some(mut models) if !models.items.is_empty() => {
                             models.parent = Some(Box::new(selector));
-                            app.selector = Some(models);
+                            app.overlay = crate::Overlay::Selector(models);
                         }
                         _ => app.push(
                             TuiEntryKind::System,
@@ -1578,7 +1578,7 @@ impl Remote {
                 }
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.selector.as_mut().expect("selector").push_query_char(ch)
+                app.selector_mut().expect("selector").push_query_char(ch)
             }
             _ => {}
         }
@@ -1870,10 +1870,7 @@ impl Remote {
                 // A settings pick's list again, after the list was closed.
                 Some(_)
                     if line.starts_with("/select settings ")
-                        && app
-                            .selector
-                            .as_ref()
-                            .is_none_or(|open| open.kind != "settings") => {}
+                        && app.selector().is_none_or(|open| open.kind != "settings") => {}
                 Some(selector) => {
                     if let Some(layers) = next["selector"]["layers"].as_object() {
                         self.provider_layers = layers
@@ -1881,7 +1878,7 @@ impl Remote {
                             .map(|(provider, items)| (provider.clone(), items.clone()))
                             .collect();
                     }
-                    app.selector = Some(selector);
+                    app.overlay = crate::Overlay::Selector(selector);
                 }
                 None => app.push(
                     TuiEntryKind::Error,
@@ -1903,7 +1900,7 @@ impl Remote {
                         untracked: file["untracked"] == true,
                     });
                 }
-                app.diff_panel = Some(crate::DiffPanelState {
+                app.overlay = crate::Overlay::DiffPanel(crate::DiffPanelState {
                     files,
                     selected: 0,
                     detail: None,
