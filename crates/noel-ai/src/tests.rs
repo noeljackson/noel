@@ -77,10 +77,10 @@ fn openai_messages(request: &ProviderRequest) -> Vec<Value> {
 }
 
 fn parse_openai_responses_text(response: &Value) -> Option<String> {
-    if let Some(text) = response.get("output_text").and_then(Value::as_str) {
-        if !text.is_empty() {
-            return Some(text.to_string());
-        }
+    if let Some(text) = response.get("output_text").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        return Some(text.to_string());
     }
     let text = response
         .get("output")
@@ -3674,8 +3674,10 @@ fn bedrock_claude_opus_matches_ts_payload_shape() {
 
 #[test]
 fn cloudflare_ai_gateway_matches_ts_request_shape() {
-    std::env::set_var("CLOUDFLARE_ACCOUNT_ID", "acct_ts_parity");
-    std::env::set_var("CLOUDFLARE_GATEWAY_ID", "gateway_ts_parity");
+    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+    unsafe { std::env::set_var("CLOUDFLARE_ACCOUNT_ID", "acct_ts_parity") };
+    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+    unsafe { std::env::set_var("CLOUDFLARE_GATEWAY_ID", "gateway_ts_parity") };
     let fixture = serde_json::from_str::<Value>(include_str!(
         "../../../tests/fixtures/ts-parity/cloudflare-ai-gateway-kimi.json"
     ))

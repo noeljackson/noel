@@ -30,7 +30,7 @@ use base64::Engine;
 use noel_ai::{MediaInput, ModelRef};
 use noel_config::LoadedConfig;
 use noel_core::controller::{
-    AbortPolicy, Busy, CallInput, Enqueued, Event as ControllerEvent, Host, Image,
+    AbortPolicy, Busy, CallInput, ControllerError, Enqueued, Event as ControllerEvent, Host, Image,
     SessionController, Start, Submission, SubmitError, Submitted, WhenBusy,
 };
 use noel_core::{
@@ -60,12 +60,12 @@ pub(crate) async fn run(runtime: Runtime, config: LoadedConfig, offline: bool) -
     };
     let mut controller = SessionController::new(runtime, host, AbortPolicy::KeepQueue);
     while let Some(line) = lines.recv().await {
-        if let Some(start) = command(&mut controller, &line).await {
-            if !controller.run(start, &mut lines, busy_command).await {
-                // The stopped run's tools died with it; leave none behind.
-                noel_core::kill_running_tool_groups();
-                break;
-            }
+        if let Some(start) = command(&mut controller, &line).await
+            && !controller.run(start, &mut lines, busy_command).await
+        {
+            // The stopped run's tools died with it; leave none behind.
+            noel_core::kill_running_tool_groups();
+            break;
         }
     }
     Ok(())
@@ -313,7 +313,7 @@ fn enqueued(result: Result<Enqueued, SubmitError>) -> Reply {
 }
 
 /// `clear_queue`'s reply: what was queued.
-fn cleared(result: Result<Vec<QueueItem>, String>) -> Reply {
+fn cleared(result: Result<Vec<QueueItem>, ControllerError>) -> Reply {
     let (steering, follow_up): (Vec<_>, Vec<_>) = result?
         .into_iter()
         .partition(|item| item.id.mode == QueueMode::Steer);
@@ -349,7 +349,7 @@ async fn command(controller: &mut SessionController<RpcHost>, line: &str) -> Opt
         Ok(Command::ResumeRun { expected_run_id }) => {
             match controller.resume(expected_run_id).await {
                 Ok(start) => return Some(started(&request, start)),
-                Err(error) => Err(error),
+                Err(error) => Err(error.into()),
             }
         }
         Ok(Command::Steer(input)) => {
@@ -359,9 +359,10 @@ async fn command(controller: &mut SessionController<RpcHost>, line: &str) -> Opt
             QueueMode::FollowUp,
             submission(input, SubmissionKind::FollowUp),
         )),
-        Ok(Command::Abort { expected_run_id }) => {
-            controller.abort(expected_run_id.as_deref()).map(|()| None)
-        }
+        Ok(Command::Abort { expected_run_id }) => controller
+            .abort(expected_run_id.as_deref())
+            .map(|()| None)
+            .map_err(String::from),
         // No run, so no retry is waiting.
         Ok(Command::AbortRetry) => Ok(None),
         Ok(Command::SetAutoRetry { enabled }) => {
@@ -402,6 +403,7 @@ async fn command(controller: &mut SessionController<RpcHost>, line: &str) -> Opt
                 &noel_core::CancellationToken::default(),
             )
             .await
+            .map_err(String::from)
             .map(|record| Some(Data::Compaction((&record).into()))),
         Ok(Command::SetSessionName { name }) => {
             controller.configure(|runtime, _| set_session_name(runtime, name))
@@ -438,7 +440,7 @@ fn busy_command(line: String, busy: &mut Busy<'_, RpcHost>) {
                 busy.host().active().aborts.push(request.id.clone());
                 return;
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         },
         Ok(Command::AbortRetry) => {
             if busy.abort_retry() {

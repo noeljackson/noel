@@ -52,10 +52,10 @@ impl Drop for ToolProcessGroup {
     fn drop(&mut self) {
         // A group that kill_running_tool_groups already took is not
         // signalled again.
-        if let Some(pgid) = self.pgid.take() {
-            if running_groups().remove(&pgid) {
-                kill_group(pgid);
-            }
+        if let Some(pgid) = self.pgid.take()
+            && running_groups().remove(&pgid)
+        {
+            kill_group(pgid);
         }
     }
 }

@@ -158,10 +158,10 @@ async fn execute_refresh_with_fallback(
     now: u64,
 ) -> Result<RefreshedTokens> {
     let primary = execute_refresh(client, token_url, client_id, refresh_token, now).await;
-    if let (Some(fallback_url), Err(error)) = (fallback_url, &primary) {
-        if is_transport_failure(error) {
-            return execute_refresh(client, fallback_url, client_id, refresh_token, now).await;
-        }
+    if let (Some(fallback_url), Err(error)) = (fallback_url, &primary)
+        && is_transport_failure(error)
+    {
+        return execute_refresh(client, fallback_url, client_id, refresh_token, now).await;
     }
     primary
 }

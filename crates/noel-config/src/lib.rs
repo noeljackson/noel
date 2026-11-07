@@ -1161,23 +1161,22 @@ fn migrate_settings_value(value: &mut serde_json::Value) {
         return;
     };
 
-    if !settings.contains_key("steeringMode") {
-        if let Some(queue_mode) = settings.remove("queueMode") {
-            settings.insert("steeringMode".to_string(), queue_mode);
-        }
+    if !settings.contains_key("steeringMode")
+        && let Some(queue_mode) = settings.remove("queueMode")
+    {
+        settings.insert("steeringMode".to_string(), queue_mode);
     }
 
-    if !settings.contains_key("transport") {
-        if let Some(websockets) = settings
+    if !settings.contains_key("transport")
+        && let Some(websockets) = settings
             .get("websockets")
             .and_then(serde_json::Value::as_bool)
-        {
-            settings.insert(
-                "transport".to_string(),
-                serde_json::Value::String(if websockets { "websocket" } else { "sse" }.to_string()),
-            );
-            settings.remove("websockets");
-        }
+    {
+        settings.insert(
+            "transport".to_string(),
+            serde_json::Value::String(if websockets { "websocket" } else { "sse" }.to_string()),
+        );
+        settings.remove("websockets");
     }
 
     let Some(retry) = settings

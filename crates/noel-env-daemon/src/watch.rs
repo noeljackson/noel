@@ -623,12 +623,11 @@ impl FileWatcher<'_> {
     fn watched_spelling(&self, path: &str) -> String {
         let mut best: Option<(&str, &str)> = None;
         for (watched, installed) in &self.installed {
-            if let Some(canonical) = &installed.canonical {
-                if is_within(path, canonical)
-                    && best.is_none_or(|(_, longest)| canonical.len() > longest.len())
-                {
-                    best = Some((watched, canonical));
-                }
+            if let Some(canonical) = &installed.canonical
+                && is_within(path, canonical)
+                && best.is_none_or(|(_, longest)| canonical.len() > longest.len())
+            {
+                best = Some((watched, canonical));
             }
         }
         match best {

@@ -535,11 +535,10 @@ fn diff_array_region(
         (before_start, before_end),
         after,
         (after_start, after_end),
-    ) {
-        if !subsequence.is_empty() {
-            process_array_matches(before, after, path, batch, region(), &subsequence);
-            return;
-        }
+    ) && !subsequence.is_empty()
+    {
+        process_array_matches(before, after, path, batch, region(), &subsequence);
+        return;
     }
 
     let identity = identity_anchors(
@@ -557,15 +556,14 @@ fn diff_array_region(
         &before[before_start..before_end],
         &after[after_start..after_end],
         MAX_SEMANTIC_CELLS,
-    ) {
-        if !semantic.is_empty() {
-            let absolute: Vec<ArrayMatch> = semantic
-                .into_iter()
-                .map(|(b, a)| (before_start + b, after_start + a))
-                .collect();
-            process_array_matches(before, after, path, batch, region(), &absolute);
-            return;
-        }
+    ) && !semantic.is_empty()
+    {
+        let absolute: Vec<ArrayMatch> = semantic
+            .into_iter()
+            .map(|(b, a)| (before_start + b, after_start + a))
+            .collect();
+        process_array_matches(before, after, path, batch, region(), &absolute);
+        return;
     }
 
     if before_count == 1 && after_count == 1 {
@@ -588,11 +586,10 @@ fn diff_array(before: &[Value], after: &[Value], path: &[Seg], batch: &mut Batch
         && before.len() > 1
         && !equal_json(&before[0], &after[0])
         && !equal_json(&before[before.len() - 1], &after[after.len() - 1])
+        && let Some(order) = permutation(before, after)
     {
-        if let Some(order) = permutation(before, after) {
-            batch.emit(Op::Permute(path.to_vec(), order));
-            return;
-        }
+        batch.emit(Op::Permute(path.to_vec(), order));
+        return;
     }
     diff_array_region(
         before,

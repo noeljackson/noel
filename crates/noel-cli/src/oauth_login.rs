@@ -166,7 +166,7 @@ pub struct Pkce {
 
 fn random_urlsafe(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
-    getrandom::getrandom(&mut buffer).expect("system randomness unavailable");
+    getrandom::fill(&mut buffer).expect("system randomness unavailable");
     URL_SAFE_NO_PAD.encode(buffer)
 }
 

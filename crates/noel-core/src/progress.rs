@@ -197,10 +197,10 @@ impl ReplyProgress {
         if self.error.is_some() {
             return;
         }
-        if let Some(store) = &self.store {
-            if let Err(error) = store.record_progress(record) {
-                self.error = Some(error);
-            }
+        if let Some(store) = &self.store
+            && let Err(error) = store.record_progress(record)
+        {
+            self.error = Some(error);
         }
     }
 
@@ -368,10 +368,10 @@ impl ToolProgress {
         if self.error.is_some() {
             return;
         }
-        if let Some(store) = &self.store {
-            if let Err(error) = store.record_progress(&record) {
-                self.error = Some(error);
-            }
+        if let Some(store) = &self.store
+            && let Err(error) = store.record_progress(&record)
+        {
+            self.error = Some(error);
         }
     }
 }

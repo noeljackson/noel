@@ -37,8 +37,9 @@ use noel_chord::v2::{ChordError, WireError};
 use noel_client::session_address;
 use noel_config::{load_config_with_resources, project_is_trusted, LoadedConfig};
 use noel_core::controller::{
-    AbortPolicy, Busy, Enqueued, Event, Host as ControllerHost, Image, Repeat, SessionController,
-    Start, Submission, SubmissionState, SubmitError, Submitted, WhenBusy, Withdrawal,
+    AbortPolicy, Busy, ControllerError, Enqueued, Event, Host as ControllerHost, Image, Repeat,
+    SessionController, Start, Submission, SubmissionState, SubmitError, Submitted, WhenBusy,
+    Withdrawal,
 };
 use noel_core::plugins::{PluginTool, PluginToolHost, PluginToolOutput};
 use noel_core::{
@@ -105,7 +106,7 @@ impl<E: std::fmt::Display> From<E> for Fatal {
 
 pub(crate) async fn run(args: WorkerArgs) -> i32 {
     match start(args).await {
-        Ok(never) => match never {},
+        Ok(code) => code,
         Err(fatal) => {
             let mut message = json!({"type": "fatal", "message": fatal.message});
             if let Some(reason) = fatal.reason {
@@ -120,9 +121,8 @@ pub(crate) async fn run(args: WorkerArgs) -> i32 {
     }
 }
 
-enum Never {}
-
-async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
+/// Serves the session until the supervisor ends the worker: its exit code.
+async fn start(args: WorkerArgs) -> Result<i32, Fatal> {
     let session_id = args.session.clone();
     if !valid_session_id(&session_id) {
         return Err(Fatal::new(format!("invalid session id {session_id:?}")));
@@ -163,7 +163,9 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
     let _ = fs::remove_file(dir.worker_args(&session_id));
     for (key, value) in launched["env"].as_object().into_iter().flatten() {
         if let Some(value) = value.as_str() {
-            std::env::set_var(key, value);
+            // SAFETY: the worker sets its launch environment first, before
+            // it starts any task or thread that could read it.
+            unsafe { std::env::set_var(key, value) };
         }
     }
     let launch: Vec<String> = serde_json::from_value(launched["args"].clone()).unwrap_or_default();
@@ -174,10 +176,10 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
         serde_json::to_string(&launch).unwrap_or_default(),
     );
     // A relative directory is the opening `noel`'s, as there.
-    if state.cwd.is_relative() {
-        if let Some(base) = launched["cwd"].as_str() {
-            state.cwd = std::path::Path::new(base).join(&state.cwd);
-        }
+    if state.cwd.is_relative()
+        && let Some(base) = launched["cwd"].as_str()
+    {
+        state.cwd = std::path::Path::new(base).join(&state.cwd);
     }
     let cwd = state.cwd.clone();
     if let Err(error) = std::env::set_current_dir(&cwd) {
@@ -292,20 +294,24 @@ async fn start(args: WorkerArgs) -> Result<Never, Fatal> {
         args.generation,
         std::process::id()
     );
-    tokio::spawn(supervise(Supervision {
+    let supervisor = supervise(Supervision {
         status,
         parent,
         idle_limit,
         host,
         files: Files { socket, record },
         view: clients,
-    }));
-    drive(controller, inbox, args.resume).await;
-    // The controller only stops when every command sender is gone, which
-    // the served object keeps alive: wait for the supervisor to exit.
-    loop {
-        std::future::pending::<()>().await;
-    }
+    });
+    tokio::pin!(supervisor);
+    // The supervisor decides when the worker ends (#179): it returns the
+    // exit code, and the session loop is dropped here, its controller and
+    // journal with it, before `main` returns. The loop itself only ends
+    // when every command sender is gone, which the served object keeps
+    // alive: then the supervisor still decides.
+    Ok(tokio::select! {
+        code = &mut supervisor => code,
+        () = drive(controller, inbox, args.resume) => supervisor.await,
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -518,7 +524,8 @@ fn serve_chat(
 /// before entry `before`, and the entry before those.
 fn entries_method(
     view: &Arc<Mutex<View>>,
-) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static {
+) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static + use<>
+{
     let view = view.clone();
     move |args, _ctx| {
         let page = match args.get("before").and_then(Value::as_u64) {
@@ -540,7 +547,7 @@ fn participant(cell: &Cell, commands: &mpsc::UnboundedSender<Command>) -> Implem
     fn method(
         commands: &mpsc::UnboundedSender<Command>,
         make: fn(Value, Reply) -> Command,
-    ) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static
+    ) -> impl Fn(Value, CallContext) -> BoxFuture<Result<Value, WireError>> + Send + Sync + 'static + use<>
     {
         let commands = commands.clone();
         move |args, _ctx| {
@@ -662,7 +669,8 @@ struct Supervision {
 
 /// Reports status to the parent, and ends the worker: idle for the limit,
 /// asked to shut down with no run active, or by a signal.
-async fn supervise(supervision: Supervision) {
+/// Watches the worker until it should end; the exit code.
+async fn supervise(supervision: Supervision) -> i32 {
     use tokio::signal::unix::{signal, SignalKind};
     let Supervision {
         status,
@@ -690,7 +698,7 @@ async fn supervise(supervision: Supervision) {
             noel_core::kill_running_tool_groups();
             files.remove();
             host.close().await;
-            std::process::exit(128 + signal);
+            return 128 + signal;
         }
         let now = status.get();
         lock(&view).set_clients(now.holds);
@@ -710,7 +718,7 @@ async fn supervise(supervision: Supervision) {
             }
             files.remove();
             host.close().await;
-            std::process::exit(0);
+            return 0;
         }
     }
 }
@@ -1004,7 +1012,7 @@ impl PluginToolHost for ServerPluginTools {
 async fn compact(
     controller: &mut SessionController<WorkerHost>,
     focus: Option<&str>,
-) -> Result<noel_core::CompactionRecord, String> {
+) -> Result<noel_core::CompactionRecord, ControllerError> {
     let cancel = controller.host().compaction.clone().unwrap_or_default();
     let status = controller.host().status.clone();
     status.update(|status| status.compacting = true);
@@ -1020,16 +1028,15 @@ async fn idle_command(
 ) -> Option<Start> {
     // After `/quit` the session's extension hosts are shut down: nothing
     // new starts (#134); a client attaching again gets the next worker.
-    if controller.host().status.get().phase == Phase::Leaving {
-        if let Command::Submit(_, reply) | Command::Run(_, reply) | Command::Resume(_, reply) =
+    if controller.host().status.get().phase == Phase::Leaving
+        && let Command::Submit(_, reply) | Command::Run(_, reply) | Command::Resume(_, reply) =
             command
-        {
-            let _ = reply.send(Err(refused(
-                "closing",
-                "the session is closing; attach to it again to continue",
-            )));
-            return None;
-        }
+    {
+        let _ = reply.send(Err(refused(
+            "closing",
+            "the session is closing; attach to it again to continue",
+        )));
+        return None;
     }
     match command {
         Command::Submit(args, reply) => {
@@ -1745,7 +1752,7 @@ fn run_status(status: RunStatus) -> &'static str {
     }
 }
 
-fn withdrawn(result: Result<Withdrawal, String>) -> Result<Value, WireError> {
+fn withdrawn(result: Result<Withdrawal, ControllerError>) -> Result<Value, WireError> {
     let outcome = match result.map_err(|error| refused("withdraw", error))? {
         Withdrawal::Withdrawn => "withdrawn",
         Withdrawal::AlreadyPlaced => "already_placed",
@@ -1781,13 +1788,13 @@ fn configure(
 ) -> Result<Value, WireError> {
     let invalid = |error: anyhow::Error| refused("configure", error.to_string());
     let level = args.get("thinkingLevel").and_then(Value::as_str);
-    if let Some(level) = level {
-        if crate::normalized_thinking_level(level).is_none() {
-            return Err(refused(
-                "configure",
-                format!("Unknown thinking level: {level}"),
-            ));
-        }
+    if let Some(level) = level
+        && crate::normalized_thinking_level(level).is_none()
+    {
+        return Err(refused(
+            "configure",
+            format!("Unknown thinking level: {level}"),
+        ));
     }
     // Durable's `configure({compaction})`: replaces the conversation's
     // settings whole; `null` clears them (upstream 922c3ff2).

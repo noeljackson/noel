@@ -230,10 +230,10 @@ async fn foreground() -> Result<i32> {
         .unwrap_or_else(|| PathBuf::from("/"));
     let paths = crate::config_paths(home.clone(), None)?;
     let mut config = load_config_with_project_trust(paths, false)?;
-    if std::env::var_os(ENV_SESSION_DIR).is_none() {
-        if let Some(session_dir) = config.settings.session_dir.clone() {
-            config.paths = config.paths.with_session_dir(session_dir)?;
-        }
+    if std::env::var_os(ENV_SESSION_DIR).is_none()
+        && let Some(session_dir) = config.settings.session_dir.clone()
+    {
+        config.paths = config.paths.with_session_dir(session_dir)?;
     }
     let cli = <crate::Cli as Parser>::parse_from(["noel"]);
     crate::apply_cli_overrides(&cli, &home, &mut config)?;
@@ -780,10 +780,10 @@ impl Workers {
             .await
             .map_err(|error| unavailable(format!("connect {}: {error}", socket.display())))?;
         let peer = peer_check(&stream).map_err(unavailable)?;
-        if let (Some(expected), Some(peer)) = (pid, peer) {
-            if expected != peer {
-                return Err(unavailable(format!("pid {peer}, not {expected}")));
-            }
+        if let (Some(expected), Some(peer)) = (pid, peer)
+            && expected != peer
+        {
+            return Err(unavailable(format!("pid {peer}, not {expected}")));
         }
         let (read, mut write) = stream.into_split();
         let mut reader = BufReader::new(read);
@@ -906,10 +906,8 @@ impl Workers {
         .ok()
         .flatten()
         .unwrap_or(false);
-        if interrupted {
-            if let Err(error) = self.ensure(&id).await {
-                eprintln!("noel server: could not restart worker {id}: {error}");
-            }
+        if interrupted && let Err(error) = self.ensure(&id).await {
+            eprintln!("noel server: could not restart worker {id}: {error}");
         }
     }
 
@@ -1360,8 +1358,13 @@ impl Sessions {
         if let Some(id) = lock(&self.imported).get(&request) {
             return Ok(json!({"sessionId": id, "created": false}));
         }
-        let (_store, state) = SessionStore::import_path(&self.session_dir, &path)
-            .map_err(|error| refused("path", error.to_string()))?;
+        // A journal another process holds is `locked` (#178), so a client
+        // can tell it from a bad path without reading the words.
+        let (_store, state) =
+            SessionStore::import_path(&self.session_dir, &path).map_err(|error| match error {
+                noel_core::SessionError::Locked { .. } => refused("locked", error.to_string()),
+                error => refused("path", error.to_string()),
+            })?;
         let id = state.session_id;
         lock(&self.imported).insert(request, id.clone());
         self.listed(&id);
@@ -1496,10 +1499,10 @@ async fn refresh_directory(sessions: Arc<Sessions>, workers: Arc<Workers>) {
     loop {
         let live = workers.statuses();
         let scanner = sessions.clone();
-        if let Ok(value) = tokio::task::spawn_blocking(move || scanner.scan(&live)).await {
-            if let Err(error) = sessions.directory.update(value) {
-                eprintln!("noel server: directory: {error}");
-            }
+        if let Ok(value) = tokio::task::spawn_blocking(move || scanner.scan(&live)).await
+            && let Err(error) = sessions.directory.update(value)
+        {
+            eprintln!("noel server: directory: {error}");
         }
         tokio::select! {
             () = sessions.changed.notified() => {}
@@ -1518,10 +1521,10 @@ fn serve_models(host: &Host, config: &LoadedConfig, offline: bool) -> Result<()>
     let available = crate::model_select::available_models(config, offline);
     let mut listed = available.clone();
     for scoped in &config.model_scope {
-        if let Some(model) = crate::model_select::configured_model(config, &scoped.model) {
-            if !listed.iter().any(|listed| std::ptr::eq(*listed, model)) {
-                listed.push(model);
-            }
+        if let Some(model) = crate::model_select::configured_model(config, &scoped.model)
+            && !listed.iter().any(|listed| std::ptr::eq(*listed, model))
+        {
+            listed.push(model);
         }
     }
     let models = listed

@@ -559,27 +559,22 @@ pub(crate) async fn run_tool_call(
                     .gate_tool_call(&tool_call.name, &tool_call.arguments, &runtime.session.cwd)
                     .await
             };
-            if let Ok(decision) = &gate {
-                if !decision.allow {
-                    runtime.push_tool_result(
-                        &tool_call,
-                        decision.reason.clone(),
-                        Vec::new(),
-                        true,
-                    )?;
-                    on_event(&TurnEvent::ToolOutput {
-                        call: tool_call.clone(),
-                        output: decision.reason.clone(),
-                        images: Vec::new(),
-                        is_error: true,
-                        duration: Some(started.elapsed()),
-                    });
-                    on_event(&TurnEvent::ToolFinished {
-                        name: tool_call.name.clone(),
-                        is_error: true,
-                    });
-                    return Ok(());
-                }
+            if let Ok(decision) = &gate
+                && !decision.allow
+            {
+                runtime.push_tool_result(&tool_call, decision.reason.clone(), Vec::new(), true)?;
+                on_event(&TurnEvent::ToolOutput {
+                    call: tool_call.clone(),
+                    output: decision.reason.clone(),
+                    images: Vec::new(),
+                    is_error: true,
+                    duration: Some(started.elapsed()),
+                });
+                on_event(&TurnEvent::ToolFinished {
+                    name: tool_call.name.clone(),
+                    is_error: true,
+                });
+                return Ok(());
             }
         }
         // What the call prints, saved as it goes (spec §4.2).

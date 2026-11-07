@@ -398,17 +398,3 @@ pub(crate) fn print_auth_help(command: &str) {
         _ => {}
     }
 }
-
-pub(crate) fn main() -> Result<()> {
-    // Upstream's process markers, inherited by every command and tool noel
-    // starts: a generic one naming the agent, and its own, which noel sets
-    // under its name and under pi's for what was written for pi. Set before
-    // any other thread exists, because the environment is process-wide.
-    std::env::set_var("AI_AGENT", PRODUCT_NAME);
-    std::env::set_var("NOEL_CODING_AGENT", "true");
-    std::env::set_var("PI_CODING_AGENT", "true");
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run())
-}

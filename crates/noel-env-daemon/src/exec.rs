@@ -160,10 +160,10 @@ impl Spill {
                 return;
             }
         }
-        if let Some(file) = &mut self.file {
-            if let Err(error) = file.write_all(chunk) {
-                self.failed = Some(error.to_string());
-            }
+        if let Some(file) = &mut self.file
+            && let Err(error) = file.write_all(chunk)
+        {
+            self.failed = Some(error.to_string());
         }
     }
 
@@ -364,13 +364,12 @@ pub fn run(
             // A descendant may hold the pipes open after the process exited; stop waiting for it.
             break;
         }
-        if let Some(pending) = &mut pending {
-            if !pending.is_empty()
-                && now >= pending.next_send()
-                && unsent.load(Ordering::SeqCst) == 0
-            {
-                deliver(pending);
-            }
+        if let Some(pending) = &mut pending
+            && !pending.is_empty()
+            && now >= pending.next_send()
+            && unsent.load(Ordering::SeqCst) == 0
+        {
+            deliver(pending);
         }
         let mut wait = Duration::from_secs(3600);
         if let Some(deadline) = deadline.filter(|_| !timed_out) {
@@ -423,10 +422,10 @@ pub fn run(
     groups.lock().unwrap().remove(&pid);
     emit(&mut pending, 0, decoders[0].finish());
     emit(&mut pending, 1, decoders[1].finish());
-    if let Some(pending) = &mut pending {
-        if !pending.is_empty() {
-            deliver(pending);
-        }
+    if let Some(pending) = &mut pending
+        && !pending.is_empty()
+    {
+        deliver(pending);
     }
     let spill_path = spill.as_ref().and_then(|spill| spill.path.clone());
     let with_spill = |failure: Failure| match &spill_path {

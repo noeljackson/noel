@@ -311,14 +311,16 @@ pub fn shell_config(shell_path: Option<&str>) -> Result<ShellConfig, Failure> {
 ///
 /// Call only in a `pre_exec` closure.
 pub unsafe fn reset_signals() {
-    for signal in 1..32 {
-        if signal != libc::SIGKILL && signal != libc::SIGSTOP {
-            libc::signal(signal, libc::SIG_DFL);
+    unsafe {
+        for signal in 1..32 {
+            if signal != libc::SIGKILL && signal != libc::SIGSTOP {
+                libc::signal(signal, libc::SIG_DFL);
+            }
         }
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
     }
-    let mut mask: libc::sigset_t = std::mem::zeroed();
-    libc::sigemptyset(&mut mask);
-    libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
 }
 
 /// Arguments, environment and process setup as libuv applies them.

@@ -65,16 +65,14 @@ impl Provider for FauxProvider {
             .unwrap_or_default();
         let split_chars = env::var("NOEL_FAUX_STREAM_CHARS").ok().as_deref() == Some("1");
         for event in self.complete(request).await? {
-            if split_chars {
-                if let StreamEvent::Text(text) = event {
-                    for ch in text.chars() {
-                        if delay_ms > 0 {
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                        }
-                        on_event(StreamEvent::Text(ch.to_string()))?;
+            if split_chars && let StreamEvent::Text(text) = event {
+                for ch in text.chars() {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
-                    continue;
+                    on_event(StreamEvent::Text(ch.to_string()))?;
                 }
+                continue;
             }
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;

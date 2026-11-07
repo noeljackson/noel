@@ -13,10 +13,10 @@ pub(crate) fn start_model_refresh(config: &LoadedConfig, offline: bool, verbose:
     let paths = config.paths.clone();
     let auth = config.auth.clone();
     tokio::spawn(async move {
-        if let Err(error) = refresh_model_cache(paths, auth).await {
-            if verbose {
-                eprintln!("model refresh failed: {error}");
-            }
+        if let Err(error) = refresh_model_cache(paths, auth).await
+            && verbose
+        {
+            eprintln!("model refresh failed: {error}");
         }
     });
 }

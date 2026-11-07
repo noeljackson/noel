@@ -119,13 +119,13 @@ fn schema_text(
     let Some(object) = schema.as_object() else {
         return;
     };
-    if let Some(Value::String(reference)) = object.get("$ref") {
-        if let Some(target) = crate::declarations::resolve_schema_ref(reference, root) {
-            let pointer: *const Value = target;
-            if target.is_object() && !seen.contains(&pointer) {
-                seen.push(pointer);
-                schema_text(target, root, parts, seen);
-            }
+    if let Some(Value::String(reference)) = object.get("$ref")
+        && let Some(target) = crate::declarations::resolve_schema_ref(reference, root)
+    {
+        let pointer: *const Value = target;
+        if target.is_object() && !seen.contains(&pointer) {
+            seen.push(pointer);
+            schema_text(target, root, parts, seen);
         }
     }
     if let Some(Value::String(description)) = object.get("description") {

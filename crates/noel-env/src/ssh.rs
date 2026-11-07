@@ -491,11 +491,10 @@ pub async fn accept_host_key(target: &SshTarget, lines: &[String]) -> Result<(),
             let mut fields = line.split_whitespace();
             if let (Some(host), Some(kind), Some(key)) =
                 (fields.next(), fields.next(), fields.next())
+                && host == alias
             {
-                if host == alias {
-                    trusted.retain(|(known, _)| known != kind);
-                    trusted.push((kind.to_string(), key.to_string()));
-                }
+                trusted.retain(|(known, _)| known != kind);
+                trusted.push((kind.to_string(), key.to_string()));
             }
         }
         for (line, kind, key) in accepted {

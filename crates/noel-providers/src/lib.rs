@@ -276,22 +276,22 @@ pub enum ProviderBuildError {
 }
 
 fn env_credential(provider: &str) -> Option<Credential> {
-    if provider == "anthropic" {
-        if let Some(access_token) = first_env(&[
+    if provider == "anthropic"
+        && let Some(access_token) = first_env(&[
             "ANTHROPIC_OAUTH_TOKEN",
             "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
-        ]) {
-            return Some(Credential::ClaudeCodeOAuth { access_token });
-        }
+        ])
+    {
+        return Some(Credential::ClaudeCodeOAuth { access_token });
     }
-    if provider == "openai-codex" {
-        if let Some(access_token) = first_env(&["CODEX_ACCESS_TOKEN"]) {
-            return Some(Credential::ChatGptOAuth {
-                access_token,
-                account_id: first_env(&["CHATGPT_ACCOUNT_ID"]),
-            });
-        }
+    if provider == "openai-codex"
+        && let Some(access_token) = first_env(&["CODEX_ACCESS_TOKEN"])
+    {
+        return Some(Credential::ChatGptOAuth {
+            access_token,
+            account_id: first_env(&["CHATGPT_ACCOUNT_ID"]),
+        });
     }
     first_env(provider_env_names(provider)).map(Credential::ApiKey)
 }

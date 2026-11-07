@@ -834,7 +834,8 @@ fn account_picker_reads_auth_from_disk_not_the_snapshot() {
 #[test]
 fn account_selector_labels_env_pseudo_account() {
     let saved = std::env::var("OPENROUTER_API_KEY").ok();
-    std::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key");
+    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+    unsafe { std::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key") };
     let config = account_test_config(AuthData::default());
     let runtime = account_test_runtime("openrouter", None);
 
@@ -845,8 +846,10 @@ fn account_selector_labels_env_pseudo_account() {
     assert!(items[0].active);
 
     match saved {
-        Some(value) => std::env::set_var("OPENROUTER_API_KEY", value),
-        None => std::env::remove_var("OPENROUTER_API_KEY"),
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        Some(value) => unsafe { std::env::set_var("OPENROUTER_API_KEY", value) },
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
     }
 }
 
@@ -935,7 +938,8 @@ fn reload_keeps_the_trust_decision_and_cli_overrides() {
     // test's config: isolate like the CLI test harness does, and put
     // the isolation back afterwards.
     let saved_isolation = std::env::var_os(noel_config::ENV_TEST_ISOLATION);
-    std::env::set_var(noel_config::ENV_TEST_ISOLATION, "1");
+    // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+    unsafe { std::env::set_var(noel_config::ENV_TEST_ISOLATION, "1") };
     let root =
         std::env::temp_dir().join(format!("noel-cli-config-source-{}", unique_temp_suffix()));
     let agent = root.join("agent");
@@ -1029,8 +1033,10 @@ fn reload_keeps_the_trust_decision_and_cli_overrides() {
         Some(ResolvedAuth::ApiKey("cli-key".to_string()))
     );
     match saved_isolation {
-        Some(value) => std::env::set_var(noel_config::ENV_TEST_ISOLATION, value),
-        None => std::env::remove_var(noel_config::ENV_TEST_ISOLATION),
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        Some(value) => unsafe { std::env::set_var(noel_config::ENV_TEST_ISOLATION, value) },
+        // Test setup: the environment is process-wide, and writing it is unsafe since Rust 2024 while another thread may read it.
+        None => unsafe { std::env::remove_var(noel_config::ENV_TEST_ISOLATION) },
     }
     let _ = fs::remove_dir_all(root);
 }

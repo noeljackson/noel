@@ -291,13 +291,13 @@ fn stop_local_worker(session: &str) {
     let record = std::fs::read_to_string(dir.worker_record(session))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    if let Some(pid) = record.and_then(|record| record["pid"].as_i64()) {
-        if let Ok(pid) = i32::try_from(pid) {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-        }
+    if let Some(pid) = record.and_then(|record| record["pid"].as_i64())
+        && let Ok(pid) = i32::try_from(pid)
+    {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
     }
 }
 
@@ -419,9 +419,7 @@ async fn sessions_request(client: &Client, session: &str, cwd: &str, line: &str)
             match client.sessions_call("import", to_args(&args)).await {
                 // The export of a session a worker holds (this one) goes
                 // in through that worker.
-                Err(error) if format!("{error:#}").contains("in use by another noel process") => {
-                    Ok(Value::Null)
-                }
+                Err(error) if refused_with(&error, "locked") => Ok(Value::Null),
                 imported => imported,
             }
         }
@@ -483,6 +481,15 @@ fn tree_key(key: KeyEvent, app: &mut TuiApp, config: &mut LoadedConfig) -> bool 
         Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
     }
     true
+}
+
+/// Whether a call failed with the plugin error `code` a server refusal
+/// carries.
+fn refused_with(error: &anyhow::Error, code: &str) -> bool {
+    matches!(
+        error.downcast_ref::<noel_chord::v2::WireError>(),
+        Some(noel_chord::v2::WireError::Plugin(refusal)) if refusal.code == code
+    )
 }
 
 /// The session the server lists under `reference`: its id, the one id it
@@ -825,10 +832,10 @@ impl Remote {
             return;
         };
         for item in items.into_iter().flatten() {
-            if item["id"].as_u64().is_some_and(|id| id > seen) {
-                if let Some(text) = item["text"].as_str() {
-                    app.push(TuiEntryKind::System, text.to_owned());
-                }
+            if item["id"].as_u64().is_some_and(|id| id > seen)
+                && let Some(text) = item["text"].as_str()
+            {
+                app.push(TuiEntryKind::System, text.to_owned());
             }
         }
     }
@@ -957,10 +964,10 @@ impl Remote {
                 config.settings.theme.as_deref().unwrap_or("system"),
                 app.editor_state.history().len()
             );
-            if let Some((_, last)) = &self.last_run {
-                if matches!(last.as_str(), "aborted" | "failed" | "interrupted") {
-                    status.push_str(&format!(" · last run {last}"));
-                }
+            if let Some((_, last)) = &self.last_run
+                && matches!(last.as_str(), "aborted" | "failed" | "interrupted")
+            {
+                status.push_str(&format!(" · last run {last}"));
             }
             status
         };
@@ -1803,13 +1810,13 @@ impl Remote {
         {
             self.pending.remove(pending);
             let started = result.as_ref().ok().and_then(started_run);
-            if let Some(run_id) = started {
-                if self.run.running() != Some(run_id.as_str()) {
-                    self.run = RunView::Starting {
-                        run_id,
-                        since: Instant::now(),
-                    };
-                }
+            if let Some(run_id) = started
+                && self.run.running() != Some(run_id.as_str())
+            {
+                self.run = RunView::Starting {
+                    run_id,
+                    since: Instant::now(),
+                };
             }
         }
         if let Call::Withdraw { id, .. } = &call {

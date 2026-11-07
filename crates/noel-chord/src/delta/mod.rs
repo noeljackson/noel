@@ -334,10 +334,10 @@ fn check_bijection(permutation: &[usize]) -> Result<(), DeltaError> {
 fn validate(op: &Op) -> Result<(), DeltaError> {
     let check_safe = |path: &Path| {
         for seg in path {
-            if let Seg::Key(key) = seg {
-                if RESERVED_SEGMENTS.contains(&key.as_str()) {
-                    return Err(DeltaError::UnsafePath(key.clone()));
-                }
+            if let Seg::Key(key) = seg
+                && RESERVED_SEGMENTS.contains(&key.as_str())
+            {
+                return Err(DeltaError::UnsafePath(key.clone()));
             }
         }
         Ok(())

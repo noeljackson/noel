@@ -128,12 +128,13 @@ async fn status(
     want: impl Fn(&RefStatus) -> bool,
 ) -> RefStatus {
     let mut statuses = reference.statuses();
-    let found = tokio::time::timeout(Duration::from_secs(5), statuses.wait_for(|s| want(s)))
+    // Edition 2024 drops the watch guard at the end of the tail
+    // expression, so it is returned directly.
+    tokio::time::timeout(Duration::from_secs(5), statuses.wait_for(|s| want(s)))
         .await
         .expect("the status in time")
         .expect("the host")
-        .clone();
-    found
+        .clone()
 }
 
 #[tokio::test]
@@ -554,10 +555,10 @@ async fn a_relay_routes_holds_to_workers() {
         cell.replace(json!(value)).unwrap();
     }
     loop {
-        if let StateUpdate::Ops { value, .. } = next(&mut count).await {
-            if value == json!(11) {
-                break;
-            }
+        if let StateUpdate::Ops { value, .. } = next(&mut count).await
+            && value == json!(11)
+        {
+            break;
         }
     }
     let error = held.call("fail", Value::Null).await.unwrap_err();

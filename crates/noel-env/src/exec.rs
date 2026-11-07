@@ -155,10 +155,10 @@ impl Spill {
     }
 
     fn finish(&mut self) -> Option<String> {
-        if let Some((_, file)) = &mut self.file {
-            if let Err(error) = file.flush() {
-                self.fail(error.to_string());
-            }
+        if let Some((_, file)) = &mut self.file
+            && let Err(error) = file.flush()
+        {
+            self.fail(error.to_string());
         }
         self.file.as_ref().map(|(path, _)| path.clone())
     }

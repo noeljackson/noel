@@ -35,10 +35,10 @@ pub(crate) fn openai_responses_body(config: &ProviderConfig, request: &ProviderR
         return github_copilot_responses_body(config, request);
     }
     let mut input = openai_responses_input_with_developer_system(request);
-    if responses_tools_in_place(config) {
-        if let Some(item) = additional_tools_item(&request.tools, json!(false)) {
-            input.insert(0, item);
-        }
+    if responses_tools_in_place(config)
+        && let Some(item) = additional_tools_item(&request.tools, json!(false))
+    {
+        input.insert(0, item);
     }
     let mut body = json!({
         "model": config.model.id,
@@ -67,10 +67,10 @@ pub(crate) fn github_copilot_responses_body(
     request: &ProviderRequest,
 ) -> Value {
     let mut input = openai_responses_input_with_developer_system(request);
-    if responses_tools_in_place(config) {
-        if let Some(item) = additional_tools_item(&request.tools, Value::Null) {
-            input.insert(0, item);
-        }
+    if responses_tools_in_place(config)
+        && let Some(item) = additional_tools_item(&request.tools, Value::Null)
+    {
+        input.insert(0, item);
     }
     let mut body = json!({
         "model": config.model.id,
@@ -101,10 +101,10 @@ pub(crate) fn openai_codex_responses_body(
     request: &ProviderRequest,
 ) -> Value {
     let mut input = openai_responses_input(request);
-    if responses_tools_in_place(config) {
-        if let Some(item) = additional_tools_item(&request.tools, Value::Null) {
-            input.insert(0, item);
-        }
+    if responses_tools_in_place(config)
+        && let Some(item) = additional_tools_item(&request.tools, Value::Null)
+    {
+        input.insert(0, item);
     }
     let mut body = json!({
         "model": config.model.id,
@@ -157,13 +157,13 @@ pub(crate) fn openai_responses_input_with_developer_system(
     request: &ProviderRequest,
 ) -> Vec<Value> {
     let mut input = Vec::new();
-    if let Some(system_prompt) = request.system_prompt.as_deref() {
-        if !system_prompt.trim().is_empty() {
-            input.push(json!({
-                "role": "developer",
-                "content": system_prompt,
-            }));
-        }
+    if let Some(system_prompt) = request.system_prompt.as_deref()
+        && !system_prompt.trim().is_empty()
+    {
+        input.push(json!({
+            "role": "developer",
+            "content": system_prompt,
+        }));
     }
     input.extend(openai_responses_input(request));
     input
@@ -418,10 +418,10 @@ pub(crate) fn azure_openai_responses_url(base_url: &str) -> String {
 }
 
 pub(crate) fn azure_deployment_name(model_id: &str) -> String {
-    if let Ok(deployment) = env::var("AZURE_OPENAI_DEPLOYMENT_NAME") {
-        if !deployment.trim().is_empty() {
-            return deployment;
-        }
+    if let Ok(deployment) = env::var("AZURE_OPENAI_DEPLOYMENT_NAME")
+        && !deployment.trim().is_empty()
+    {
+        return deployment;
     }
     if let Ok(map) = env::var("AZURE_OPENAI_DEPLOYMENT_NAME_MAP") {
         for entry in map
@@ -429,10 +429,11 @@ pub(crate) fn azure_deployment_name(model_id: &str) -> String {
             .map(str::trim)
             .filter(|entry| !entry.is_empty())
         {
-            if let Some((model, deployment)) = entry.split_once('=') {
-                if model.trim() == model_id && !deployment.trim().is_empty() {
-                    return deployment.trim().to_string();
-                }
+            if let Some((model, deployment)) = entry.split_once('=')
+                && model.trim() == model_id
+                && !deployment.trim().is_empty()
+            {
+                return deployment.trim().to_string();
             }
         }
     }
@@ -632,10 +633,10 @@ pub(crate) fn parse_openai_responses_events(response: &Value) -> Option<Vec<Stre
     }
     if let Some(output) = response.get("output").and_then(Value::as_array) {
         for item in output {
-            if has_output_text.is_none() {
-                if let Some(text) = parse_openai_responses_item_text(item) {
-                    events.push(StreamEvent::Text(text));
-                }
+            if has_output_text.is_none()
+                && let Some(text) = parse_openai_responses_item_text(item)
+            {
+                events.push(StreamEvent::Text(text));
             }
             if let Some(tool_call) = parse_openai_responses_function_call(item) {
                 events.push(tool_call);
@@ -732,19 +733,19 @@ impl SseParser for OpenAiResponsesSseParser {
                 }
             }
             Some("response.output_text.delta") | Some("output_text.delta") => {
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    if !delta.is_empty() {
-                        self.streamed_items.insert(output_index(&event));
-                        on_event(StreamEvent::Text(delta.to_string()))?;
-                    }
+                if let Some(delta) = event.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
+                    self.streamed_items.insert(output_index(&event));
+                    on_event(StreamEvent::Text(delta.to_string()))?;
                 }
             }
             Some("response.output_item.done") | Some("output_item.done") => {
                 if let Some(item) = event.get("item") {
-                    if !self.streamed_items.contains(&output_index(&event)) {
-                        if let Some(text) = parse_openai_responses_item_text(item) {
-                            on_event(StreamEvent::Text(text))?;
-                        }
+                    if !self.streamed_items.contains(&output_index(&event))
+                        && let Some(text) = parse_openai_responses_item_text(item)
+                    {
+                        on_event(StreamEvent::Text(text))?;
                     }
                     if let Some(tool_call) = parse_openai_responses_function_call(item) {
                         on_event(tool_call)?;

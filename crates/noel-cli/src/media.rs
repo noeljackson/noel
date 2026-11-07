@@ -71,11 +71,11 @@ pub(crate) fn media_input_from_bytes(
     path: Option<String>,
     config: &LoadedConfig,
 ) -> Result<MediaInput> {
-    if images_auto_resize(config) {
-        if let Some(resized) = resize_image_if_needed(&bytes, &mime_type)? {
-            bytes = resized.bytes;
-            mime_type = resized.mime_type;
-        }
+    if images_auto_resize(config)
+        && let Some(resized) = resize_image_if_needed(&bytes, &mime_type)?
+    {
+        bytes = resized.bytes;
+        mime_type = resized.mime_type;
     }
     let (width, height) = image_dimensions(&bytes, &mime_type).unwrap_or((None, None));
     Ok(MediaInput {
