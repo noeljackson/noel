@@ -8226,12 +8226,12 @@ fn format_resource_line(kind: &str, resource: &ResourceFile) -> String {
 }
 
 fn format_queue(runtime: &Runtime) -> String {
-    if runtime.session().queued_messages.is_empty() {
+    if runtime.session().queue.is_empty() {
         return "queue is empty".to_string();
     }
     runtime
         .session()
-        .queued_messages
+        .queued_messages()
         .iter()
         .enumerate()
         .map(|(index, message)| format!("{}.\t{}", index + 1, message))
@@ -11397,7 +11397,7 @@ mod tests {
         assert!(hint.contains("mid-turn"));
         assert!(hint.contains("continuing automatically"));
 
-        session.queued_messages = vec!["follow up".to_string()];
+        session.queue = vec![noel_core::QueuedEntry::follow_up("follow up")];
         let hint = hint_of(&session).expect("mid-turn and queue hint");
         assert!(hint.contains("mid-turn"));
         // Durable's continue places the queue first.
@@ -11405,7 +11405,7 @@ mod tests {
     }
 
     fn hint_of(session: &SessionState) -> Option<String> {
-        resume_hint(session.has_unfinished_turn(), session.queued_messages.len())
+        resume_hint(session.has_unfinished_turn(), session.queue.len())
     }
 
     #[tokio::test]
