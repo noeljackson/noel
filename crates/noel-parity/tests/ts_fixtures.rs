@@ -321,14 +321,14 @@ fn provider_request_headers_are_redacted() {
 #[test]
 fn committed_fixtures_are_referenced_by_rust_parity_tests() {
     let expected = [
-        ("agent-tool-loop.json", "crates/noel-core/src/lib.rs"),
+        ("agent-tool-loop.json", "crates/noel-core/src/tests.rs"),
         ("anthropic-api-key.json", "crates/noel-ai/src/tests.rs"),
         (
             "anthropic-claude-code-oauth.json",
             "crates/noel-ai/src/tests.rs",
         ),
         ("anthropic-tools.json", "crates/noel-ai/src/tests.rs"),
-        ("auth-discovery.json", "crates/noel-config/src/lib.rs"),
+        ("auth-discovery.json", "crates/noel-config/src/tests.rs"),
         (
             "bedrock-claude-opus-4.6.json",
             "crates/noel-ai/src/tests.rs",
@@ -346,7 +346,7 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "chord-v2-messages.json",
             "crates/noel-chord/tests/chord_v2_messages.rs",
         ),
-        ("cli-contract.json", "crates/noel-cli/src/main.rs"),
+        ("cli-contract.json", "crates/noel-cli/src/tests.rs"),
         (
             "cloudflare-ai-gateway-kimi.json",
             "crates/noel-ai/src/tests.rs",
@@ -399,8 +399,8 @@ fn committed_fixtures_are_referenced_by_rust_parity_tests() {
             "crates/noel-env-daemon/tests/pi_env_golden.rs",
         ),
         ("rpc-protocol.json", "crates/noel-cli/tests/rpc_parity.rs"),
-        ("session-export.json", "crates/noel-core/src/lib.rs"),
-        ("settings.json", "crates/noel-config/src/lib.rs"),
+        ("session-export.json", "crates/noel-core/src/tests.rs"),
+        ("settings.json", "crates/noel-config/src/tests.rs"),
         ("skills.json", "crates/noel-config/src/skills.rs"),
         ("slash-commands.json", "crates/noel-tui/src/lib.rs"),
         (
