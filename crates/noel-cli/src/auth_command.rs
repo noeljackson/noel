@@ -270,7 +270,7 @@ impl Refresher<'_> {
         provider: &str,
         account: Option<&str>,
         window_seconds: u64,
-    ) -> Result<Option<ResolvedAuth>> {
+    ) -> Result<Option<oauth_refresh::RefreshOutcome>> {
         let window_seconds = if imported_login(&config.auth, provider, account).is_some() {
             oauth_refresh::REFRESH_WINDOW_SECONDS
         } else {
@@ -484,7 +484,7 @@ async fn check(
             .auth(config, &provider, account, MIN_OAUTH_VALIDITY_SECONDS)
             .await
         {
-            Ok(Some(auth)) => auth,
+            Ok(Some(outcome)) => outcome.into_auth(),
             Ok(None) => {
                 return Ok(CheckResult::not_ready(
                     &provider,
@@ -560,20 +560,22 @@ async fn print_credential(
         }
         let mut warning = None;
         let value = if bearer {
-            let Some(auth) = refresher
+            let Some(outcome) = refresher
                 .auth(config, provider, account, window)
                 .await
                 .map_err(|error| format!("{error:#}"))?
             else {
                 continue;
             };
+            let refreshed = matches!(outcome, oauth_refresh::RefreshOutcome::Refreshed(_));
+            let auth = outcome.into_auth();
             if expires_within(auth.expires(), refresher.now, window) {
                 // An imported login is left unrefreshed on purpose: print it,
                 // warning when it falls short of the requested lifetime.
                 let imported = imported_login(&config.auth, provider, account)
                     .filter(|_| !is_expired(auth.expires(), refresher.now));
                 if imported.is_none() {
-                    return Err(if credential_value(&auth) == credential_value(&stored) {
+                    return Err(if !refreshed {
                         format!("OAuth token for {provider} expires within the required lifetime and could not be refreshed")
                     } else {
                         format!(

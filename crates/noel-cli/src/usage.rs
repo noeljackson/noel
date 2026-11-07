@@ -735,8 +735,7 @@ async fn refresh_stored_oauth(
         if !crate::oauth_refresh::needs_refresh(&resolved, now, window) {
             continue;
         }
-        touched = true;
-        if let Err(error) = crate::oauth_refresh::refresh_expiring_auth(
+        let outcome = crate::oauth_refresh::refresh_auth_expiring_within(
             &client,
             &config.paths.auth_path,
             &config.auth,
@@ -744,13 +743,23 @@ async fn refresh_stored_oauth(
             Some(&target.account),
             token_endpoint_override,
             now,
+            window,
         )
-        .await
-        {
-            failures.insert(
-                (target.provider.clone(), target.account.clone()),
-                error.to_string(),
-            );
+        .await;
+        match outcome {
+            // The auth file holds a newer credential than the snapshot,
+            // refreshed here or by another process: read it again below.
+            Ok(Some(
+                crate::oauth_refresh::RefreshOutcome::Refreshed(_)
+                | crate::oauth_refresh::RefreshOutcome::Fresh(_),
+            )) => touched = true,
+            Ok(_) => {}
+            Err(error) => {
+                failures.insert(
+                    (target.provider.clone(), target.account.clone()),
+                    error.to_string(),
+                );
+            }
         }
     }
     let auth = if touched {
