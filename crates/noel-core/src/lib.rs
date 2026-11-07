@@ -2885,6 +2885,7 @@ impl Runtime {
         prompt: String,
         media: Vec<MediaInput>,
     ) -> Result<ConversationMessage, SessionError> {
+        tracing::debug!(run = %start.id, "run started");
         self.settle_unanswered_calls()?;
         let interrupted = self
             .session
@@ -2930,6 +2931,7 @@ impl Runtime {
     /// process stops too, the run is interrupted again. A run a close
     /// stopped is saved as open again, so that stop is a crash (#130).
     pub fn resume_run(&mut self, run_id: &str) -> Result<(), SessionError> {
+        tracing::debug!(run = run_id, "run resumed");
         let Some(run) = self.session.run_mut(run_id) else {
             return Ok(());
         };
@@ -2969,6 +2971,7 @@ impl Runtime {
         status: RunStatus,
         failure: Option<RunFailure>,
     ) -> Result<(), SessionError> {
+        tracing::debug!(run = run_id, ?status, "run ended");
         if let Some(run) = self.session.run_mut(run_id) {
             run.finish(status, failure.clone());
         }
@@ -3007,6 +3010,7 @@ impl Runtime {
 
     /// A close stops run `run_id`: its next resume is not a restart.
     pub fn close_run(&mut self, run_id: &str) -> Result<(), SessionError> {
+        tracing::debug!(run = run_id, "run closed");
         if let Some(run) = self.session.run_mut(run_id) {
             run.close();
         }
@@ -3020,6 +3024,7 @@ impl Runtime {
 
     /// Counts a crash restart of run `run_id`, and returns its restarts.
     pub fn count_restart(&mut self, run_id: &str) -> Result<u32, SessionError> {
+        tracing::debug!(run = run_id, "run crashed; counting a restart");
         if let Some(store) = &self.store {
             store.append(&SessionRecord::RunRestarted {
                 run_id: run_id.to_owned(),

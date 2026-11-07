@@ -20,6 +20,7 @@ mod auth_commands;
 mod bug_report;
 mod bun_install;
 mod clipboard;
+mod diagnostics;
 mod image_command;
 mod markdown;
 mod media;
@@ -359,6 +360,7 @@ fn main() -> std::process::ExitCode {
         std::env::set_var("NOEL_CODING_AGENT", "true");
         std::env::set_var("PI_CODING_AGENT", "true");
     }
+    diagnostics::init();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build();

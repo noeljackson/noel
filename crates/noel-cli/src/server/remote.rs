@@ -181,7 +181,7 @@ impl Remote {
             let listener = TcpListener::bind(address)
                 .await
                 .with_context(|| format!("listen on {address}"))?;
-            eprintln!(
+            tracing::info!(
                 "noel server: listening for paired devices on {address} (TLS, fingerprint {})",
                 remote.fingerprint
             );
@@ -212,7 +212,7 @@ impl Remote {
         }
         drop(state);
         if let Err(error) = self.directory.update(value) {
-            eprintln!("noel server: devices: {error}");
+            tracing::warn!("noel server: devices: {error}");
         }
     }
 
@@ -224,7 +224,7 @@ impl Remote {
             })
             .collect();
         if let Err(error) = write_private(&self.store, json!(records).to_string().as_bytes()) {
-            eprintln!("noel server: {}: {error:#}", self.store.display());
+            tracing::warn!("noel server: {}: {error:#}", self.store.display());
         }
     }
 
@@ -361,7 +361,7 @@ impl Remote {
             let (stream, peer) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    eprintln!("noel server: remote accept: {error}");
+                    tracing::warn!("noel server: remote accept: {error}");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -375,8 +375,8 @@ impl Remote {
                 .await;
                 match handled {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => eprintln!("noel server: remote {peer}: {error:#}"),
-                    Err(_) => eprintln!("noel server: remote {peer}: too slow"),
+                    Ok(Err(error)) => tracing::warn!("noel server: remote {peer}: {error:#}"),
+                    Err(_) => tracing::info!("noel server: remote {peer}: too slow"),
                 }
             });
         }
@@ -445,9 +445,10 @@ impl Remote {
                 };
                 let socket = tokio_tungstenite::accept_async(replayed).await?;
                 let principal = json!({"kind": "owner", "via": "remote", "device": device.id});
-                eprintln!(
+                tracing::info!(
                     "noel server: device {} ({}) connected",
-                    device.id, device.label
+                    device.id,
+                    device.label
                 );
                 self.host.accept(
                     noel_chord::v2::transport::websocket(socket),

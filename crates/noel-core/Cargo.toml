@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing.workspace = true
 getrandom.workspace = true
 noel-ai = { path = "../noel-ai" }
 noel-codemode = { path = "../noel-codemode" }

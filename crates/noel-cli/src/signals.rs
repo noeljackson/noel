@@ -18,6 +18,12 @@ fn tui_terminal() -> MutexGuard<'static, Option<bool>> {
     TUI_TERMINAL.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Whether the TUI holds the terminal now: diagnostics must not write to
+/// it then (#183).
+pub(crate) fn tui_owns_terminal() -> bool {
+    tui_terminal().is_some()
+}
+
 /// What a fatal signal does first, besides the process's own tool groups:
 /// plain `noel` as a client stops the session's worker when it is the only
 /// client, so the session's tools end with it.
