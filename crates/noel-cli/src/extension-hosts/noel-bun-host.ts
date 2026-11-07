@@ -98,6 +98,20 @@ const commands = new Map<string, CommandOptions>();
 const toolCallHandlers: Handler[] = [];
 const settledHandlers: Handler[] = [];
 const sessionStartHandlers: Handler[] = [];
+const sessionShutdownHandlers: Handler[] = [];
+
+/// Where the host is (#132). Requests are checked against it at the top of
+/// handle(): before `init` only `init` is answered, a failed factory answers
+/// every request with its error, and `shutdown` ends the read loop.
+type Phase =
+  | { kind: "loading" }
+  | { kind: "factoryFailed"; message: string }
+  | { kind: "ready" }
+  | { kind: "shuttingDown" };
+let phase: Phase = { kind: "loading" };
+
+/// Request kinds noel only notifies: no response line may be written.
+const NOTIFICATIONS = new Set(["reload", "shutdown", "agentSettled"]);
 
 let cwd = process.cwd();
 let sessionId: string | undefined;
@@ -145,8 +159,11 @@ function makeApi(): Record<string, unknown> {
           break;
         case "sessionStart":
         case "session_start":
-        case "session_shutdown":
           sessionStartHandlers.push(handler);
+          break;
+        case "sessionShutdown":
+        case "session_shutdown":
+          sessionShutdownHandlers.push(handler);
           break;
         default:
           // Upstream has ~40 events; the protocol carries these and
@@ -160,6 +177,8 @@ function makeApi(): Record<string, unknown> {
         if (at2 >= 0) settledHandlers.splice(at2, 1);
         const at3 = sessionStartHandlers.indexOf(handler);
         if (at3 >= 0) sessionStartHandlers.splice(at3, 1);
+        const at4 = sessionShutdownHandlers.indexOf(handler);
+        if (at4 >= 0) sessionShutdownHandlers.splice(at4, 1);
       };
     },
     log(message: unknown) {
@@ -220,7 +239,34 @@ function textOfToolResult(result: unknown): string {
   return textOf(result);
 }
 
+/// Runs lifecycle handlers; a handler's error is the extension's to report,
+/// not the session's: it is logged and the rest still run.
+async function runLifecycle(handlers: Handler[], event: unknown): Promise<void> {
+  for (const handler of handlers) {
+    try {
+      await handler(event, { cwd, sessionId });
+    } catch (error) {
+      console.error(`extension handler failed: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+}
+
 async function handle(request: WireRequest): Promise<WireResponse | null> {
+  const notification = NOTIFICATIONS.has(request.kind);
+  switch (phase.kind) {
+    case "factoryFailed":
+      return notification ? null : errorResponse(phase.message);
+    case "shuttingDown":
+      return notification ? null : errorResponse("the extension is shutting down");
+    case "loading":
+      if (request.kind !== "init") {
+        return notification ? null : errorResponse("the extension has not been initialized");
+      }
+      break;
+    case "ready":
+      if (request.kind === "init") return errorResponse("the extension is already initialized");
+      break;
+  }
   cwd = request.cwd || cwd;
   if (request.sessionId) sessionId = request.sessionId;
   const json = () => {
@@ -233,16 +279,20 @@ async function handle(request: WireRequest): Promise<WireResponse | null> {
   const input = request.kind === "tool" || request.kind === "toolCall" ? json() : request.input;
   switch (request.kind) {
     // Notifications: fire-and-forget by protocol (the host reads no
-    // response), so no response line may be written. `sessionStart` is
-    // also notified this way by some hosts; treat unknown kinds the
-    // same, silently.
+    // response), so no response line may be written.
     case "reload":
-    case "shutdown":
-    case "sessionStart":
       return null;
+    case "shutdown": {
+      phase = { kind: "shuttingDown" };
+      await runLifecycle(sessionShutdownHandlers, { type: "session_shutdown" });
+      return null;
+    }
     case "init": {
-      // The factory ran at startup (below); the handshake returns what it
-      // registered. A factory error is the extension's whole failure.
+      // The factory ran at startup (below); `init` names the session, so
+      // the session starts here, before the handshake returns what the
+      // factory registered.
+      phase = { kind: "ready" };
+      await runLifecycle(sessionStartHandlers, { type: "session_start", reason: "startup" });
       return { output: "ready", ...registrations() };
     }
     case "tool": {
@@ -312,12 +362,10 @@ async function handle(request: WireRequest): Promise<WireResponse | null> {
       await runHandlers(settledHandlers, {});
       return null;
     }
-    case "sessionStart": {
-      await runHandlers(sessionStartHandlers, {});
-      return null;
-    }
     default:
-      return null;
+      // Every kind but the notifications above expects an answer: one it
+      // does not know gets an error, not silence it would wait on.
+      return notification ? null : errorResponse(`unknown request kind ${request.kind}`);
   }
 }
 
@@ -337,6 +385,7 @@ async function main() {
   } catch (error) {
     factoryError = error instanceof Error ? error.message : String(error);
   }
+  if (factoryError !== undefined) phase = { kind: "factoryFailed", message: factoryError };
 
   const decoder = new TextDecoder();
   let buffer = "";
@@ -359,16 +408,13 @@ async function main() {
         write(errorResponse(`malformed request: ${line.slice(0, 100)}`));
         continue;
       }
-      if (request.kind === "init" && factoryError) {
-        write(errorResponse(factoryError));
-        continue;
-      }
       try {
         const response = await handle(request);
         if (response !== null) write(response);
       } catch (error) {
         write(errorResponse(error instanceof Error ? error.message : String(error)));
       }
+      if (phase.kind === "shuttingDown") process.exit(0);
     }
   }
 }

@@ -653,7 +653,9 @@ impl<H: Host> SessionController<H> {
                 }
             }
         }
-        runtime.resume_run(expected_run_id);
+        runtime
+            .resume_run(expected_run_id)
+            .map_err(|error| error.to_string())?;
         Ok(Start {
             run_id: expected_run_id.to_owned(),
             provider,
