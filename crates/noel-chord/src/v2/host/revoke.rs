@@ -30,7 +30,7 @@ impl Actor {
         for (link_id, link) in &self.links {
             for (origin, provider) in &link.providers {
                 for (hold, served) in &provider.holds {
-                    let label = match &served.object {
+                    let label = match served.state.object() {
                         Some(object) => {
                             let object = &self.objects[object];
                             if !revoked(&object.principal) {
