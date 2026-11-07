@@ -1866,7 +1866,20 @@ public func FfiConverterTypeSessionItem_lower(_ value: SessionItem) -> RustBuffe
 
 public enum NoelEvent: Equatable, Hashable {
     
+    /**
+     * Connected to the server, at first or again.
+     */
     case connected
+    /**
+     * The link dropped; connecting again.
+     */
+    case reconnecting
+    /**
+     * Connecting failed for good: this `Noel` does nothing more, and the
+     * app connects again with a new one.
+     */
+    case failed(message: String
+    )
     case status(text: String
     )
     case sessions(sessions: [SessionItem]
@@ -1901,16 +1914,21 @@ public struct FfiConverterTypeNoelEvent: FfiConverterRustBuffer {
         
         case 1: return .connected
         
-        case 2: return .status(text: try FfiConverterString.read(from: &buf)
+        case 2: return .reconnecting
+        
+        case 3: return .failed(message: try FfiConverterString.read(from: &buf)
         )
         
-        case 3: return .sessions(sessions: try FfiConverterSequenceTypeSessionItem.read(from: &buf)
+        case 4: return .status(text: try FfiConverterString.read(from: &buf)
         )
         
-        case 4: return .view(session: try FfiConverterString.read(from: &buf), entries: try FfiConverterSequenceTypeEntryItem.read(from: &buf), streaming: try FfiConverterOptionString.read(from: &buf)
+        case 5: return .sessions(sessions: try FfiConverterSequenceTypeSessionItem.read(from: &buf)
         )
         
-        case 5: return .plugins(plugins: try FfiConverterSequenceTypePluginItem.read(from: &buf)
+        case 6: return .view(session: try FfiConverterString.read(from: &buf), entries: try FfiConverterSequenceTypeEntryItem.read(from: &buf), streaming: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 7: return .plugins(plugins: try FfiConverterSequenceTypePluginItem.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1925,25 +1943,34 @@ public struct FfiConverterTypeNoelEvent: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case let .status(text):
+        case .reconnecting:
             writeInt(&buf, Int32(2))
+        
+        
+        case let .failed(message):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .status(text):
+            writeInt(&buf, Int32(4))
             FfiConverterString.write(text, into: &buf)
             
         
         case let .sessions(sessions):
-            writeInt(&buf, Int32(3))
+            writeInt(&buf, Int32(5))
             FfiConverterSequenceTypeSessionItem.write(sessions, into: &buf)
             
         
         case let .view(session,entries,streaming):
-            writeInt(&buf, Int32(4))
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(session, into: &buf)
             FfiConverterSequenceTypeEntryItem.write(entries, into: &buf)
             FfiConverterOptionString.write(streaming, into: &buf)
             
         
         case let .plugins(plugins):
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(7))
             FfiConverterSequenceTypePluginItem.write(plugins, into: &buf)
             
         }

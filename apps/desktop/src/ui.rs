@@ -138,6 +138,10 @@ impl NoelApp {
                 self.connected = true;
                 self.status = "connected".to_owned();
             }
+            Event::Reconnecting => {
+                self.connected = false;
+                self.status = "reconnecting".to_owned();
+            }
             Event::Status(status) => self.status = status,
             Event::Sessions(sessions) => self.sessions = sessions,
             Event::View {

@@ -37,19 +37,54 @@ final class ExecChannel: ByteChannel, @unchecked Sendable {
     func close() { closer() }
 }
 
+/// What `openChannel` waits for: set once, from the connecting task.
+private final class Opening: @unchecked Sendable {
+    private let lock = NSLock()
+    private let done = DispatchSemaphore(value: 0)
+    private var settled = false
+    private var channel: ByteChannel?
+
+    /// The first call settles it; later ones (an error after the channel
+    /// opened) change nothing.
+    func settle(_ channel: ByteChannel?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !settled else { return }
+        settled = true
+        self.channel = channel
+        done.signal()
+    }
+
+    /// The channel, or nil when it failed or did not open within `timeout`.
+    func wait(timeout: DispatchTime) -> ByteChannel? {
+        let result: ByteChannel?
+        if done.wait(timeout: timeout) == .timedOut {
+            settle(nil)
+        }
+        lock.lock()
+        result = channel
+        lock.unlock()
+        return result
+    }
+}
+
 /// noel-ffi calls `openChannel` from a background thread and waits for it.
 public final class SSHChannelOpener: ChannelOpener, @unchecked Sendable {
     private let endpoint: SSHEndpoint
+    /// How long a connect may take before the attempt fails and noel-ffi
+    /// tries again.
+    private let timeout: DispatchTimeInterval
 
-    public init(endpoint: SSHEndpoint) {
+    public init(endpoint: SSHEndpoint, timeout: DispatchTimeInterval = .seconds(20)) {
         self.endpoint = endpoint
+        self.timeout = timeout
     }
 
     public func openChannel(delivery: Delivery) -> ByteChannel? {
-        let opened = DispatchSemaphore(value: 0)
-        var channel: ByteChannel?
+        let opening = Opening()
         let endpoint = endpoint
-        Task {
+        let task = Task {
+            var connected: SSHClient?
             do {
                 let client = try await SSHClient.connect(
                     host: endpoint.host,
@@ -58,30 +93,34 @@ public final class SSHChannelOpener: ChannelOpener, @unchecked Sendable {
                     hostKeyValidator: .acceptAnything(),
                     reconnect: .never
                 )
+                connected = client
                 let command = "'\(endpoint.program)' bridge"
                 try await client.withExec(command) { inbound, outbound in
-                    channel = ExecChannel(
+                    opening.settle(ExecChannel(
                         writer: { data in
                             Task { try? await outbound.write(ByteBuffer(data: data)) }
                         },
                         closer: {
                             Task { try? await client.close() }
                         }
-                    )
-                    opened.signal()
+                    ))
                     for try await output in inbound {
                         if case let .stdout(chunk) = output {
                             delivery.receive(bytes: Data(buffer: chunk))
                         }
                     }
                 }
-                delivery.closed()
             } catch {
-                delivery.closed()
-                opened.signal()
+                opening.settle(nil)
             }
+            // The command ended or failed: the channel is done.
+            delivery.closed()
+            try? await connected?.close()
         }
-        opened.wait()
+        let channel = opening.wait(timeout: .now() + timeout)
+        if channel == nil {
+            task.cancel()
+        }
         return channel
     }
 }
