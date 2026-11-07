@@ -89,6 +89,8 @@ Outcomes: **fixed** (with the test that fails before the fix), **refactored**
 | #130 | fixed: Run's transitions live on `Run` (close, restart, reopen, finish), the same live and on replay; resuming a closed run journals `RunReopened`. Test `a_crash_after_resuming_a_closed_run_counts_a_restart` |
 | #131 | fixed: the host's stdout is `Pipe::Idle/Busy/Broken`, kept by the host; a broken or exited host is started again on its next call. Test `a_cancelled_request_does_not_break_the_host` |
 | #132 | fixed: the Bun host has a `Phase` (loading, factoryFailed, ready, shuttingDown); session_start runs at init, session_shutdown at shutdown, unknown kinds get an error; shutdown waits for the host. Test `bun_host_runs_session_start_and_shutdown_handlers` |
+| #135 | fixed: one `SseParser` per wire format serves the streaming and the batch path, and its `finish` returns the raw stop reason or upstream's error; exactly one `Stop`, last. The `StopReason` enum is not adopted: the raw reason is upstream's `rawStopReason` (non-parity register, "Provider Stream Endings"). Test `streams_end_with_their_provider_terminal_or_an_error` (fails before the fix) |
+| #163 (noel-ai) | refactored: tests in `tests.rs`, one module per provider; the other three files follow in group 8 |
 
 ## Status
 
