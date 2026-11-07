@@ -2206,6 +2206,28 @@ fn session_tree_items(config: &LoadedConfig, current: Option<&str>) -> Result<Ve
     Ok(items)
 }
 
+/// Each listed session's parent in the tree (one that is listed) and
+/// whether it is named: what the branch navigator folds and filters by.
+pub(crate) fn session_tree_rows(
+    config: &LoadedConfig,
+) -> Result<BTreeMap<String, (Option<String>, bool)>> {
+    let sessions = SessionStore::list(&config.paths.session_dir)?;
+    let listed: BTreeSet<&str> = sessions
+        .iter()
+        .map(|session| session.session_id.as_str())
+        .collect();
+    Ok(sessions
+        .iter()
+        .map(|session| {
+            let parent = session
+                .parent_session_id
+                .clone()
+                .filter(|parent| listed.contains(parent.as_str()));
+            (session.session_id.clone(), (parent, session.name.is_some()))
+        })
+        .collect())
+}
+
 /// One row of the tree selector: the label /tree shows, with the session id
 /// as the value Enter picks.
 fn session_tree_row(
