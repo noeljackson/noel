@@ -2365,20 +2365,20 @@ fn stored_oauth_threads_refresh_metadata_with_env_indirection() {
 
     let resolved = auth_for_provider(&auth, "openai-codex", None).expect("resolved");
     assert_eq!(resolved.refresh_token(), Some("indirected-refresh"));
-    assert_eq!(resolved.expires(), 4102444800);
+    assert_eq!(resolved.expires(), Some(4102444800));
 
     restore_env("CODEX_REFRESH_TOKEN", saved.1);
 }
 
 #[test]
 fn expiry_helpers_treat_zero_as_unknown() {
-    assert!(!is_expired(0, 1000));
-    assert!(!expires_within(0, 1000, 60));
-    assert!(is_expired(1000, 1000));
-    assert!(!is_expired(1001, 1000));
-    assert!(expires_within(1000, 999, 60));
-    assert!(!expires_within(1000, 100, 60));
-    assert!(expires_within(u64::MAX, u64::MAX - 1, 60));
+    assert!(!is_expired(None, 1000));
+    assert!(!expires_within(None, 1000, 60));
+    assert!(is_expired(Some(1000), 1000));
+    assert!(!is_expired(Some(1001), 1000));
+    assert!(expires_within(Some(1000), 999, 60));
+    assert!(!expires_within(Some(1000), 100, 60));
+    assert!(expires_within(Some(u64::MAX), u64::MAX - 1, 60));
 }
 
 fn fake_jwt(payload: &str) -> String {
