@@ -501,11 +501,18 @@ impl SseParser for OpenAiChatCompletionsSseParser {
                     self.tool_calls
                         .push((String::new(), String::new(), String::new()));
                 }
+                // The first id and name stand, as upstream keeps them: a
+                // provider may send them again with every chunk.
+                let entry = &mut self.tool_calls[index];
                 if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    self.tool_calls[index].0.push_str(id);
+                    if entry.0.is_empty() {
+                        entry.0 = id.to_owned();
+                    }
                 }
                 if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                    self.tool_calls[index].1.push_str(name);
+                    if entry.1.is_empty() {
+                        entry.1 = name.to_owned();
+                    }
                 }
                 if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
                 {
