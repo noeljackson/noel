@@ -3401,7 +3401,7 @@ impl Runtime {
                 continue;
             }
             started.push(extension.name.clone());
-            if hosts.host_running(&extension.name) {
+            if hosts.started_as(&extension.name, &extension.path, &cwd, &session_id) {
                 continue;
             }
             if let Err(error) = hosts

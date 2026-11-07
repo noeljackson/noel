@@ -385,27 +385,56 @@ fn io_error(error: io::Error) -> String {
 /// one-shot behavior and are not held here.
 #[derive(Default)]
 pub struct ExtensionHosts {
-    hosts: BTreeMap<String, Arc<Mutex<HostProcess>>>,
+    /// Each v2 extension's host, by extension name: how it was started and
+    /// where it is now.
+    entries: BTreeMap<String, HostEntry>,
     /// Registrations by extension name, from `init` and later responses.
     registrations: BTreeMap<String, ExtensionRegistrationSet>,
-    /// Failures to report instead of running tools: a host that could not
-    /// start never runs, fail closed.
-    failures: BTreeMap<String, String>,
     /// The one-shot v1 tools, by tool name, for dispatch.
     v1_tools: BTreeMap<String, V1Tool>,
-    /// How each host was started, to start it again when it broke.
-    specs: BTreeMap<String, HostSpec>,
+}
+
+/// One v2 extension's host.
+struct HostEntry {
+    /// How it was started, to start it again when it broke.
+    spec: HostSpec,
+    phase: HostPhase,
+}
+
+enum HostPhase {
+    /// Started; an exited or broken process is started again on its next
+    /// call.
+    Running(Arc<Mutex<HostProcess>>),
+    /// Could not start: calls report the reason instead of running, fail
+    /// closed. Not retried until the spec or the file changes.
+    Failed(String),
 }
 
 /// How long a host gets to run its shutdown handlers and exit.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What a host's `init` was given.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HostSpec {
     path: PathBuf,
     cwd: PathBuf,
     session_id: String,
+    /// The file's modification time when started, so a failed extension
+    /// that was edited is tried again.
+    modified: Option<std::time::SystemTime>,
+}
+
+impl HostSpec {
+    fn new(path: &Path, cwd: &Path, session_id: &str) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            session_id: session_id.to_owned(),
+            modified: std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok(),
+        }
+    }
 }
 
 /// A v1 manifest tool and the extension it belongs to.
@@ -422,6 +451,7 @@ impl ExtensionHosts {
     }
 
     /// Start a v2 host: spawn, send `init`, and adopt its registrations.
+    /// A host already started for `extension_name` is stopped first.
     pub async fn start(
         &mut self,
         extension_name: &str,
@@ -429,30 +459,79 @@ impl ExtensionHosts {
         cwd: &Path,
         session_id: &str,
     ) -> Result<(), String> {
-        let spec = HostSpec {
-            path: path.to_path_buf(),
-            cwd: cwd.to_path_buf(),
-            session_id: session_id.to_owned(),
-        };
+        let spec = HostSpec::new(path, cwd, session_id);
+        if let Some(old) = self.entries.remove(extension_name) {
+            if let HostPhase::Running(host) = old.phase {
+                let _ = host.lock().await.child.start_kill();
+            }
+        }
         match launch(extension_name, &spec).await {
             Ok((process, set)) => {
-                if let Some(set) = set {
-                    self.registrations.insert(extension_name.to_string(), set);
+                match set {
+                    Some(set) => {
+                        self.registrations.insert(extension_name.to_string(), set);
+                    }
+                    None => {
+                        self.registrations.remove(extension_name);
+                    }
                 }
-                self.hosts
-                    .insert(extension_name.to_string(), Arc::new(Mutex::new(process)));
-                self.specs.insert(extension_name.to_string(), spec);
+                self.entries.insert(
+                    extension_name.to_string(),
+                    HostEntry {
+                        spec,
+                        phase: HostPhase::Running(Arc::new(Mutex::new(process))),
+                    },
+                );
                 Ok(())
             }
             Err(message) => {
                 // A spawn or init failure is recorded: later calls report
                 // it instead of "has no host", failing closed with the
                 // reason.
-                self.failures
-                    .insert(extension_name.to_string(), message.clone());
+                self.registrations.remove(extension_name);
+                self.entries.insert(
+                    extension_name.to_string(),
+                    HostEntry {
+                        spec,
+                        phase: HostPhase::Failed(message.clone()),
+                    },
+                );
                 Err(message)
             }
         }
+    }
+
+    /// Whether `extension_name` was started (running or failed) as it
+    /// would be now: the same file, unchanged for a failed one, cwd and
+    /// session. Otherwise `start` should run (again).
+    pub fn started_as(
+        &self,
+        extension_name: &str,
+        path: &Path,
+        cwd: &Path,
+        session_id: &str,
+    ) -> bool {
+        let Some(entry) = self.entries.get(extension_name) else {
+            return false;
+        };
+        let spec = HostSpec::new(path, cwd, session_id);
+        match entry.phase {
+            HostPhase::Running(_) => {
+                entry.spec.path == spec.path
+                    && entry.spec.cwd == spec.cwd
+                    && entry.spec.session_id == spec.session_id
+            }
+            HostPhase::Failed(_) => entry.spec == spec,
+        }
+    }
+
+    fn running(&self) -> impl Iterator<Item = (&String, &Arc<Mutex<HostProcess>>)> {
+        self.entries
+            .iter()
+            .filter_map(|(name, entry)| match &entry.phase {
+                HostPhase::Running(host) => Some((name, host)),
+                HostPhase::Failed(_) => None,
+            })
     }
 
     /// Register the one-shot v1 tools for dispatch.
@@ -485,7 +564,7 @@ impl ExtensionHosts {
     /// failures to surface as diagnostics.
     pub async fn notify(&mut self, kind: &str, cwd: &Path) -> Vec<String> {
         let mut diagnostics = Vec::new();
-        for (name, host) in &self.hosts {
+        for (name, host) in self.running() {
             let mut host = host.lock().await;
             if !host.is_alive() {
                 continue;
@@ -519,22 +598,19 @@ impl ExtensionHosts {
         cwd: &Path,
         tool_call_id: Option<&str>,
     ) -> Result<HostOutcome, String> {
-        if let Some(failure) = self.failures.get(extension_name) {
-            return Err(failure.clone());
-        }
-        let host = self
-            .hosts
+        let entry = self
+            .entries
             .get(extension_name)
             .ok_or_else(|| format!("extension {extension_name} has no host"))?;
+        let host = match &entry.phase {
+            HostPhase::Failed(failure) => return Err(failure.clone()),
+            HostPhase::Running(host) => host,
+        };
         let mut host = host.lock().await;
         if !host.usable() {
             // Exited, or its pipe broke (a request cancelled mid-read, or
             // one that failed): start it again, as `/reload` would.
-            let spec = self
-                .specs
-                .get(extension_name)
-                .ok_or_else(|| format!("extension {extension_name} exited"))?;
-            let (process, set) = launch(extension_name, spec)
+            let (process, set) = launch(extension_name, &entry.spec)
                 .await
                 .map_err(|error| format!("extension {extension_name} exited; {error}"))?;
             let _ = host.child.start_kill();
@@ -690,7 +766,7 @@ impl ExtensionHosts {
         // A host runs its shutdown handlers and exits; end of input asks a
         // host that ignores the notification to exit too. One that has not
         // exited in time is killed.
-        for host in self.hosts.values() {
+        for (_, host) in self.running() {
             let mut host = host.lock().await;
             drop(host.stdin.take());
             let exited = tokio::time::timeout(SHUTDOWN_GRACE, host.child.wait()).await;
@@ -698,28 +774,28 @@ impl ExtensionHosts {
                 let _ = host.child.kill().await;
             }
         }
-        self.hosts.clear();
+        self.entries.clear();
         self.registrations.clear();
-        self.specs.clear();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hosts.is_empty() && self.v1_tools.is_empty()
-    }
-
-    /// Whether a host for `extension_name` is running (started, whatever
-    /// its init returned).
-    pub fn host_running(&self, extension_name: &str) -> bool {
-        self.hosts.contains_key(extension_name)
+        self.entries.is_empty() && self.v1_tools.is_empty()
     }
 
     /// Drop the hosts of extensions no longer loaded and their
     /// registrations, so a reload that removes a v2 extension stops
     /// offering its tools.
     pub fn retain_extensions(&mut self, keep: &[String]) {
-        self.hosts.retain(|name, _| keep.contains(name));
+        self.entries.retain(|name, entry| {
+            let kept = keep.contains(name);
+            if let (false, HostPhase::Running(host)) = (kept, &entry.phase) {
+                if let Ok(mut host) = host.try_lock() {
+                    let _ = host.child.start_kill();
+                }
+            }
+            kept
+        });
         self.registrations.retain(|name, _| keep.contains(name));
-        self.failures.retain(|name, _| keep.contains(name));
     }
 }
 
@@ -927,6 +1003,65 @@ mod tests {
             .gate_tool_call("read", r#"{"path":"fine"}"#, &cwd)
             .await;
         assert_eq!(next, Ok(GateDecision::allow()));
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    /// #139: a host that failed to start is not started again on every
+    /// run, its failure goes once a later start succeeds, and a host
+    /// started for another session is started again.
+    #[tokio::test]
+    async fn a_failed_host_waits_for_a_change_and_a_success_clears_it() {
+        let cwd = std::env::temp_dir().join(format!("noel-ext-failed-{}", std::process::id()));
+        fs::create_dir_all(&cwd).unwrap();
+        let path = cwd.join("ext.sh");
+        fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        make_executable(&path);
+        let mut hosts = ExtensionHosts::new();
+        assert!(hosts.start("ext", &path, &cwd, "s1").await.is_err());
+        assert!(
+            hosts.started_as("ext", &path, &cwd, "s1"),
+            "not retried as is"
+        );
+        let failed = hosts.call("ext", "command", "go", "", &cwd, None).await;
+        assert!(failed.is_err_and(|error| error.contains("init failed")));
+
+        fs::write(
+            &path,
+            concat!(
+                "#!/bin/sh\n",
+                "while read line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"kind\":\"init\"'*) printf '%s\\n' '{\"output\":\"\",\"tools\":[]}';;\n",
+                "    *) printf '%s\\n' '{\"output\":\"ran\"}';;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            !hosts.started_as("ext", &path, &cwd, "s1"),
+            "an edit retries"
+        );
+        hosts.start("ext", &path, &cwd, "s1").await.unwrap();
+        let outcome = hosts
+            .call("ext", "command", "go", "", &cwd, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.output, "ran");
+        assert!(hosts.started_as("ext", &path, &cwd, "s1"));
+        assert!(
+            !hosts.started_as("ext", &path, &cwd, "s2"),
+            "a new session restarts"
+        );
+        assert!(!hosts.started_as("ext", &cwd.join("other.sh"), &cwd, "s1"));
+        hosts.shutdown(&cwd).await;
+        assert!(hosts.is_empty());
         let _ = fs::remove_dir_all(&cwd);
     }
 
