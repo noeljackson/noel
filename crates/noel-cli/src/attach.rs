@@ -419,9 +419,7 @@ async fn sessions_request(client: &Client, session: &str, cwd: &str, line: &str)
             match client.sessions_call("import", to_args(&args)).await {
                 // The export of a session a worker holds (this one) goes
                 // in through that worker.
-                Err(error) if format!("{error:#}").contains("in use by another noel process") => {
-                    Ok(Value::Null)
-                }
+                Err(error) if refused_with(&error, "locked") => Ok(Value::Null),
                 imported => imported,
             }
         }
@@ -483,6 +481,15 @@ fn tree_key(key: KeyEvent, app: &mut TuiApp, config: &mut LoadedConfig) -> bool 
         Err(error) => app.push(TuiEntryKind::Error, format!("{error}")),
     }
     true
+}
+
+/// Whether a call failed with the plugin error `code` a server refusal
+/// carries.
+fn refused_with(error: &anyhow::Error, code: &str) -> bool {
+    matches!(
+        error.downcast_ref::<noel_chord::v2::WireError>(),
+        Some(noel_chord::v2::WireError::Plugin(refusal)) if refusal.code == code
+    )
 }
 
 /// The session the server lists under `reference`: its id, the one id it

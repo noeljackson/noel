@@ -1293,7 +1293,10 @@ async fn a_cancelled_compaction_leaves_the_history() {
     .await
     .expect("the cancel ends it");
     canceller.await.unwrap();
-    assert_eq!(result.unwrap_err(), crate::controller::COMPACTION_CANCELLED);
+    assert_eq!(
+        result.unwrap_err(),
+        crate::controller::ControllerError::CompactionCancelled
+    );
     assert_eq!(fixture.requests().len(), 3, "the summary was asked for");
     assert_eq!(fixture.controller.runtime().session().messages, before);
 }

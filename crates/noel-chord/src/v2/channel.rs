@@ -30,7 +30,19 @@ pub trait Codec: Send + Sync {
     fn name(&self) -> &'static str;
     fn encode(&self, message: &Message) -> Vec<u8>;
     /// An error for bytes that are no message of this codec.
-    fn decode(&self, bytes: &[u8]) -> Result<Message, String>;
+    fn decode(&self, bytes: &[u8]) -> Result<Message, DecodeError>;
+}
+
+/// Why received bytes are no message (#178: a type, not a string).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DecodeError {
+    /// The codec could not read them.
+    #[error("{0}")]
+    Codec(String),
+    /// They read as a message that breaks the protocol's rules (checked on
+    /// links that are not trusted).
+    #[error("{0}")]
+    Invalid(String),
 }
 
 /// The binary codec, the default.
@@ -46,8 +58,8 @@ impl Codec for BinaryCodec {
         binary::encode(message)
     }
 
-    fn decode(&self, bytes: &[u8]) -> Result<Message, String> {
-        binary::decode(bytes).map_err(|error| error.to_string())
+    fn decode(&self, bytes: &[u8]) -> Result<Message, DecodeError> {
+        binary::decode(bytes).map_err(|error| DecodeError::Codec(error.to_string()))
     }
 }
 
@@ -232,7 +244,9 @@ impl Channel {
         if matches!(self.state, State::Greeting { .. }) {
             return self.greet(bytes);
         }
-        let message = self.decode(bytes).map_err(ProtocolError)?;
+        let message = self
+            .decode(bytes)
+            .map_err(|error| ProtocolError(error.to_string()))?;
         match message {
             Message::Hello { .. } => Err(ProtocolError("handshake: a second hello".to_owned())),
             Message::Ping => {
@@ -244,10 +258,10 @@ impl Channel {
         }
     }
 
-    fn decode(&self, bytes: &[u8]) -> Result<Message, String> {
+    fn decode(&self, bytes: &[u8]) -> Result<Message, DecodeError> {
         let message = self.codec.decode(bytes)?;
         if !self.trusted {
-            message.check()?;
+            message.check().map_err(DecodeError::Invalid)?;
         }
         Ok(message)
     }

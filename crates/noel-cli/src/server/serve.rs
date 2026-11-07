@@ -1358,8 +1358,13 @@ impl Sessions {
         if let Some(id) = lock(&self.imported).get(&request) {
             return Ok(json!({"sessionId": id, "created": false}));
         }
-        let (_store, state) = SessionStore::import_path(&self.session_dir, &path)
-            .map_err(|error| refused("path", error.to_string()))?;
+        // A journal another process holds is `locked` (#178), so a client
+        // can tell it from a bad path without reading the words.
+        let (_store, state) =
+            SessionStore::import_path(&self.session_dir, &path).map_err(|error| match error {
+                noel_core::SessionError::Locked { .. } => refused("locked", error.to_string()),
+                error => refused("path", error.to_string()),
+            })?;
         let id = state.session_id;
         lock(&self.imported).insert(request, id.clone());
         self.listed(&id);

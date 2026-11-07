@@ -473,7 +473,7 @@ impl<H: Host> SessionController<H> {
 
     /// Before new work: a Start dropped without running left its run
     /// interrupted, as a crash would; a closed controller refuses.
-    fn settle_unrun(&mut self) -> Result<(), String> {
+    fn settle_unrun(&mut self) -> Result<(), ControllerError> {
         let gate = std::mem::replace(&mut self.live().gate, Gate::Open);
         match gate {
             Gate::Open => Ok(()),
@@ -483,7 +483,7 @@ impl<H: Host> SessionController<H> {
             }
             Gate::Closed => {
                 self.live().gate = Gate::Closed;
-                Err("the session closed; open it again".to_owned())
+                Err(ControllerError::Closed)
             }
         }
     }
@@ -545,7 +545,8 @@ impl<H: Host> SessionController<H> {
     /// its first submission, and anything else starts a run, saved with
     /// its prompt. Steering and follow-ups still queued join that run.
     pub async fn submit(&mut self, submission: Submission) -> Result<Submitted, SubmitError> {
-        self.settle_unrun().map_err(SubmitError::Refused)?;
+        self.settle_unrun()
+            .map_err(|error| SubmitError::Refused(error.to_string()))?;
         let submitted = self.submit_settled(submission).await?;
         if let Submitted::Started(start) = &submitted {
             let run_id = start.run_id.clone();
@@ -563,12 +564,12 @@ impl<H: Host> SessionController<H> {
         let media = live
             .host
             .media(&submission.images)
-            .map_err(SubmitError::Refused)?;
+            .map_err(|error| SubmitError::Refused(error.to_string()))?;
         let provider = live
             .host
             .provider(runtime)
             .await
-            .map_err(SubmitError::Refused)?;
+            .map_err(|error| SubmitError::Refused(error.to_string()))?;
         let run = RunStart {
             id: new_id(),
             request_id: submission.request_id,
@@ -599,21 +600,21 @@ impl<H: Host> SessionController<H> {
     }
 
     /// Withdraws a queued submission (spec §3.2).
-    pub fn withdraw(&mut self, submission_id: &str) -> Result<Withdrawal, String> {
+    pub fn withdraw(&mut self, submission_id: &str) -> Result<Withdrawal, ControllerError> {
         let Self { runtime, live } = self;
         let live = live.get_mut().expect("controller state");
         live.withdraw(submission_id, &runtime.session().runs)
     }
 
     /// Withdraws everything queued, and returns it.
-    pub fn clear_queue(&mut self) -> Result<Vec<QueueItem>, String> {
+    pub fn clear_queue(&mut self) -> Result<Vec<QueueItem>, ControllerError> {
         self.live().clear_queue()
     }
 
     /// An abort while no run is active ends an interrupted last run as
     /// aborted, so it is never resumed. `expected_run_id`, when given,
     /// must name that run.
-    pub fn abort(&mut self, expected_run_id: Option<&str>) -> Result<(), String> {
+    pub fn abort(&mut self, expected_run_id: Option<&str>) -> Result<(), ControllerError> {
         let policy = self.live().policy;
         self.abort_with(expected_run_id, policy)
     }
@@ -623,7 +624,7 @@ impl<H: Host> SessionController<H> {
         &mut self,
         expected_run_id: Option<&str>,
         policy: AbortPolicy,
-    ) -> Result<(), String> {
+    ) -> Result<(), ControllerError> {
         self.settle_unrun()?;
         let interrupted = self
             .runtime
@@ -634,14 +635,12 @@ impl<H: Host> SessionController<H> {
             .map(|run| run.id.clone());
         match (interrupted, expected_run_id) {
             (Some(run_id), Some(expected)) if run_id != expected => {
-                return Err(format!(
-                    "expectedRunId {expected} does not match the interrupted run {run_id}"
-                ))
+                return Err(ControllerError::NotTheInterruptedRun {
+                    expected: expected.to_owned(),
+                    interrupted: run_id,
+                })
             }
-            (Some(run_id), _) => self
-                .runtime
-                .finish_run(&run_id, RunStatus::Aborted)
-                .map_err(|error| error.to_string())?,
+            (Some(run_id), _) => self.runtime.finish_run(&run_id, RunStatus::Aborted)?,
             (None, _) => fence(expected_run_id, None)?,
         }
         if policy == AbortPolicy::WithdrawQueue {
@@ -651,40 +650,42 @@ impl<H: Host> SessionController<H> {
     }
 
     /// Accepts continuing the session's last run, if a stop interrupted it.
-    pub async fn resume(&mut self, expected_run_id: &str) -> Result<Start, String> {
+    pub async fn resume(&mut self, expected_run_id: &str) -> Result<Start, ControllerError> {
         self.settle_unrun()?;
         let start = self.resume_settled(expected_run_id).await?;
         self.accepted(expected_run_id);
         Ok(start)
     }
 
-    async fn resume_settled(&mut self, expected_run_id: &str) -> Result<Start, String> {
+    async fn resume_settled(&mut self, expected_run_id: &str) -> Result<Start, ControllerError> {
         let Some(run) = self.runtime.session().runs.last() else {
-            return Err(format!(
-                "expectedRunId {expected_run_id} does not match: the session has no run"
-            ));
+            return Err(ControllerError::NoRun {
+                expected: expected_run_id.to_owned(),
+            });
         };
         if run.id != expected_run_id {
-            return Err(format!(
-                "expectedRunId {expected_run_id} does not match the last run {}",
-                run.id
-            ));
+            return Err(ControllerError::NotTheLastRun {
+                expected: expected_run_id.to_owned(),
+                last: run.id.clone(),
+            });
         }
         if run.status != RunStatus::Interrupted {
-            return Err(format!("run {expected_run_id} is not interrupted"));
+            return Err(ControllerError::NotInterrupted(expected_run_id.to_owned()));
         }
         let crashed = !run.closed;
         let Self { runtime, live } = self;
         let live = live.get_mut().expect("controller state");
-        let provider = live.host.provider(runtime).await?;
+        let provider = live
+            .host
+            .provider(runtime)
+            .await
+            .map_err(ControllerError::Provider)?;
         // A stop that was not a close is a crash (Durable section 5.4): it
         // counts a restart, and a run at the limit ends instead; a model
         // request it cut off is a failed attempt.
         let mut call = Call::Resume { charged: None };
         if crashed {
-            let restarts = runtime
-                .count_restart(expected_run_id)
-                .map_err(|error| error.to_string())?;
+            let restarts = runtime.count_restart(expected_run_id)?;
             let limit = runtime.systems.restart_limit;
             let session = runtime.session();
             if restarts >= limit {
@@ -714,9 +715,7 @@ impl<H: Host> SessionController<H> {
                 }
             }
         }
-        runtime
-            .resume_run(expected_run_id)
-            .map_err(|error| error.to_string())?;
+        runtime.resume_run(expected_run_id)?;
         Ok(Start {
             run_id: expected_run_id.to_owned(),
             provider,
@@ -733,7 +732,8 @@ impl<H: Host> SessionController<H> {
         &mut self,
         request_id: Option<String>,
     ) -> Result<Submitted, SubmitError> {
-        self.settle_unrun().map_err(SubmitError::Refused)?;
+        self.settle_unrun()
+            .map_err(|error| SubmitError::Refused(error.to_string()))?;
         let submitted = self.continue_settled(request_id).await?;
         if let Submitted::Started(start) = &submitted {
             let run_id = start.run_id.clone();
@@ -762,7 +762,7 @@ impl<H: Host> SessionController<H> {
             .host
             .provider(runtime)
             .await
-            .map_err(SubmitError::Refused)?;
+            .map_err(|error| SubmitError::Refused(error.to_string()))?;
         let run = RunStart {
             id: new_id(),
             request_id: submission.request_id,
@@ -786,10 +786,14 @@ impl<H: Host> SessionController<H> {
         &mut self,
         focus: Option<&str>,
         cancel: &CancellationToken,
-    ) -> Result<CompactionRecord, String> {
+    ) -> Result<CompactionRecord, ControllerError> {
         let Self { runtime, live } = self;
         let live = live.get_mut().expect("controller state");
-        let provider = live.host.provider(runtime).await?;
+        let provider = live
+            .host
+            .provider(runtime)
+            .await
+            .map_err(ControllerError::Provider)?;
         live.host.event(Event::CompactionStarted);
         let compaction = runtime.compact_messages(
             provider.as_ref(),
@@ -797,11 +801,15 @@ impl<H: Host> SessionController<H> {
             focus.unwrap_or(""),
         );
         let result = tokio::select! {
-            result = compaction => result.map_err(|error| error.to_string()),
-            () = cancel.cancelled() => Err(COMPACTION_CANCELLED.to_owned()),
+            result = compaction => result.map_err(|error| ControllerError::Compaction(error.to_string())),
+            () = cancel.cancelled() => Err(ControllerError::CompactionCancelled),
         };
+        let message = result.as_ref().err().map(ToString::to_string);
         live.host.event(Event::CompactionEnded {
-            result: result.as_ref().map_err(String::as_str),
+            result: match (&result, &message) {
+                (Ok(record), _) => Ok(record),
+                (Err(_), message) => Err(message.as_deref().unwrap_or_default()),
+            },
         });
         result
     }
@@ -1013,19 +1021,19 @@ impl<H: Host> Busy<'_, H> {
         self.live.enqueue(mode, submission, &runs)
     }
 
-    pub fn withdraw(&mut self, submission_id: &str) -> Result<Withdrawal, String> {
+    pub fn withdraw(&mut self, submission_id: &str) -> Result<Withdrawal, ControllerError> {
         let runs = self.runs();
         self.live.withdraw(submission_id, &runs)
     }
 
-    pub fn clear_queue(&mut self) -> Result<Vec<QueueItem>, String> {
+    pub fn clear_queue(&mut self) -> Result<Vec<QueueItem>, ControllerError> {
         self.live.clear_queue()
     }
 
     /// Stops the run, which then settles as aborted. `expected_run_id`,
     /// when given, must name it. The policy decides what happens to the
     /// queue.
-    pub fn abort(&mut self, expected_run_id: Option<&str>) -> Result<(), String> {
+    pub fn abort(&mut self, expected_run_id: Option<&str>) -> Result<(), ControllerError> {
         let policy = self.live.policy;
         self.abort_with(expected_run_id, policy)
     }
@@ -1035,7 +1043,7 @@ impl<H: Host> Busy<'_, H> {
         &mut self,
         expected_run_id: Option<&str>,
         policy: AbortPolicy,
-    ) -> Result<(), String> {
+    ) -> Result<(), ControllerError> {
         fence(expected_run_id, Some(self.run_id()))?;
         if policy == AbortPolicy::WithdrawQueue
             && let Err(error) = self.live.clear_queue_saving()
@@ -1079,18 +1087,19 @@ fn lock<H>(live: &Mutex<Live<H>>) -> MutexGuard<'_, Live<H>> {
 }
 
 /// `expected_run_id`, when given, must name the active run.
-fn fence(expected_run_id: Option<&str>, active: Option<&str>) -> Result<(), String> {
+fn fence(expected_run_id: Option<&str>, active: Option<&str>) -> Result<(), ControllerError> {
     let Some(expected) = expected_run_id else {
         return Ok(());
     };
     match active {
         Some(active) if active == expected => Ok(()),
-        Some(active) => Err(format!(
-            "expectedRunId {expected} does not match the active run {active}"
-        )),
-        None => Err(format!(
-            "expectedRunId {expected} does not match: no run is active"
-        )),
+        Some(active) => Err(ControllerError::NotTheActiveRun {
+            expected: expected.to_owned(),
+            active: active.to_owned(),
+        }),
+        None => Err(ControllerError::NoActiveRun {
+            expected: expected.to_owned(),
+        }),
     }
 }
 
@@ -1194,7 +1203,8 @@ impl<H: Host> Live<H> {
             return Err(SubmitError::QueuedPrompt);
         }
         let active = self.run.as_ref().map(|run| run.id.as_str());
-        fence(submission.expected_run_id.as_deref(), active).map_err(SubmitError::Refused)?;
+        fence(submission.expected_run_id.as_deref(), active)
+            .map_err(|error| SubmitError::Refused(error.to_string()))?;
         if !submission.images.is_empty() {
             return Err(SubmitError::Refused(
                 "queued messages are text only; send images with a prompt that starts a run".into(),
@@ -1223,15 +1233,18 @@ impl<H: Host> Live<H> {
         Ok(Enqueued::Queued(id))
     }
 
-    fn withdraw(&mut self, submission_id: &str, runs: &[Run]) -> Result<Withdrawal, String> {
+    fn withdraw(
+        &mut self,
+        submission_id: &str,
+        runs: &[Run],
+    ) -> Result<Withdrawal, ControllerError> {
         let (withdrawn, items): (Vec<_>, Vec<_>) = self
             .queue
             .items()
             .into_iter()
             .partition(|item| item.id.submission_id == submission_id);
         if !withdrawn.is_empty() {
-            self.commit(items, withdrawn)
-                .map_err(|error| error.to_string())?;
+            self.commit(items, withdrawn)?;
             return Ok(Withdrawal::Withdrawn);
         }
         let state = if let Some(run) = runs.iter().rev().find(|run| run.id == submission_id) {
@@ -1241,7 +1254,7 @@ impl<H: Host> Live<H> {
             match past.map(|past| past.run_id.as_deref()) {
                 Some(Some(run_id)) => placed_state(run_id, runs),
                 Some(None) => SubmissionState::Withdrawn,
-                None => return Err(format!("no submission {submission_id} in this session")),
+                None => return Err(ControllerError::NoSubmission(submission_id.to_owned())),
             }
         };
         Ok(match state {
@@ -1250,8 +1263,8 @@ impl<H: Host> Live<H> {
         })
     }
 
-    fn clear_queue(&mut self) -> Result<Vec<QueueItem>, String> {
-        self.clear_queue_saving().map_err(|error| error.to_string())
+    fn clear_queue(&mut self) -> Result<Vec<QueueItem>, ControllerError> {
+        Ok(self.clear_queue_saving()?)
     }
 
     fn clear_queue_saving(&mut self) -> Result<Vec<QueueItem>, SessionError> {
@@ -1447,6 +1460,55 @@ pub(crate) fn mirror(session: &mut SessionState, event: &TurnEvent) {
         TurnEvent::TodosUpdated(todos) => session.todos.clone_from(todos),
         TurnEvent::CompactionFinished(record) => session.compactions.push(record.clone()),
         _ => {}
+    }
+}
+
+/// Why the controller refused a call (#178: a type callers can match,
+/// with the words the RPC and the wire have always given).
+#[derive(Debug, thiserror::Error)]
+pub enum ControllerError {
+    #[error("the session closed; open it again")]
+    Closed,
+    #[error("expectedRunId {expected} does not match the active run {active}")]
+    NotTheActiveRun { expected: String, active: String },
+    #[error("expectedRunId {expected} does not match: no run is active")]
+    NoActiveRun { expected: String },
+    #[error("expectedRunId {expected} does not match the interrupted run {interrupted}")]
+    NotTheInterruptedRun {
+        expected: String,
+        interrupted: String,
+    },
+    #[error("expectedRunId {expected} does not match: the session has no run")]
+    NoRun { expected: String },
+    #[error("expectedRunId {expected} does not match the last run {last}")]
+    NotTheLastRun { expected: String, last: String },
+    #[error("run {0} is not interrupted")]
+    NotInterrupted(String),
+    #[error("no submission {0} in this session")]
+    NoSubmission(String),
+    /// The host could not give a provider.
+    #[error("{0}")]
+    Provider(String),
+    #[error("{COMPACTION_CANCELLED}")]
+    CompactionCancelled,
+    #[error("{0}")]
+    Compaction(String),
+    #[error(transparent)]
+    Save(#[from] SessionError),
+}
+
+/// What the wire says for a refusal: its words.
+impl From<ControllerError> for String {
+    fn from(error: ControllerError) -> Self {
+        error.to_string()
+    }
+}
+
+/// Two refusals are the same when they say the same (a save error carries
+/// an `io::Error`, which has no equality).
+impl PartialEq for ControllerError {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_string() == other.to_string()
     }
 }
 
