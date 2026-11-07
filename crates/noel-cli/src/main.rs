@@ -2900,7 +2900,7 @@ fn unix_seconds() -> Option<u64> {
 /// `--provider`, else the saved default provider.
 fn infer_cli_provider(cli: &Cli, config: &LoadedConfig) -> Option<String> {
     resolve_cli(cli, config, offline_enabled(cli.offline))
-        .and_then(|resolved| resolved.model)
+        .and_then(|resolved| resolved.model().cloned())
         .map(|model| model.provider)
         .or_else(|| {
             cli.provider
@@ -10808,7 +10808,7 @@ mod tests {
                 &config,
                 false
             )
-            .and_then(|resolved| resolved.model)
+            .and_then(|resolved| resolved.model().cloned())
             .map(|model| model.id),
             Some("haiku".to_string())
         );
