@@ -41,6 +41,10 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::server::client::{connect, Client, Endpoint, Followed};
+use crate::server::protocol::{
+    started_run, to_args, AbortArgs, CommandArgs, ForkArgs, ImageArg, ImportArgs, SessionArgs,
+    SubmitArgs, WhenBusy, WithdrawArgs,
+};
 use crate::server::{new_request_id, valid_session_id};
 use crate::{
     Activity, TuiApp, TuiEntry, TuiEntryKind, TuiTerminal, QUIT_CONFIRM_WINDOW,
@@ -176,14 +180,22 @@ pub(crate) async fn run(
             Ok(None) if quit_ends => {
                 // As a local quit: the run is aborted, then the session ends
                 // unless another client holds it.
-                if remote.run.is_some() {
+                if remote.run.running().is_some() {
+                    let abort = AbortArgs {
+                        expected_run_id: None,
+                        keep_queue: true,
+                    };
                     let _ = client
-                        .chat_call(&session, "abort", json!({"keepQueue": true}), false)
+                        .chat_call(&session, "abort", to_args(&abort), false)
                         .await;
                 }
-                let args = json!({"line": "/quit", "requestId": new_request_id()});
+                let args = to_args(&CommandArgs {
+                    line: "/quit".to_owned(),
+                    request_id: Some(new_request_id()),
+                    errors: None,
+                });
                 if let Ok(answer) = client.chat_call(&session, "command", args, false).await {
-                    remote.command_answer(&mut app, "/quit", &answer);
+                    remote.command_answer(&mut app, "/quit", &answer, None);
                     // The session ends with its worker, which lets go of the
                     // journal: the next `noel` opens it as this one quit it.
                     // Released first: a hold left would start it again.
@@ -383,17 +395,20 @@ async fn sessions_request(client: &Client, session: &str, cwd: &str, line: &str)
             } else {
                 named(rest).await?
             };
-            let args = json!({
-                "requestId": new_request_id(),
-                "sessionId": source,
-                "clone": command == "/clone",
-            });
-            client.sessions_call("fork", args).await
+            let args = ForkArgs {
+                request_id: new_request_id(),
+                session_id: source,
+                clone: command == "/clone",
+            };
+            client.sessions_call("fork", to_args(&args)).await
         }
         "/import" => {
             let path = std::path::Path::new(cwd).join(rest);
-            let args = json!({"requestId": new_request_id(), "path": path});
-            match client.sessions_call("import", args).await {
+            let args = ImportArgs {
+                request_id: new_request_id(),
+                path,
+            };
+            match client.sessions_call("import", to_args(&args)).await {
                 // The export of a session a worker holds (this one) goes
                 // in through that worker.
                 Err(error) if format!("{error:#}").contains("in use by another noel process") => {
@@ -408,7 +423,7 @@ async fn sessions_request(client: &Client, session: &str, cwd: &str, line: &str)
                 return Ok(Value::Null);
             }
             client
-                .sessions_call("delete", json!({ "sessionId": target }))
+                .sessions_call("delete", to_args(&SessionArgs { session_id: target }))
                 .await
         }
     }
@@ -448,16 +463,28 @@ enum Incoming {
     Followed(Followed),
     /// What the client did on its own: started a server, sent a call again.
     Report(String),
-    /// A call's answer.
-    Answer(Call, Result<Value>),
+    /// A call's answer, with the generation of the `Remote` that sent it:
+    /// an answer for a session switched away from is dropped (#146).
+    Answer(Call, Result<Value>, u64),
+}
+
+/// Each `Remote` (each session attached to in turn) has its own generation.
+static GENERATIONS: AtomicU64 = AtomicU64::new(1);
+
+/// The row showing a `!` command run on the worker, and the call whose
+/// answer fills it (#146: any command's answer used to).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellRow {
+    index: usize,
+    pending: Pending,
 }
 
 /// The calls the TUI makes.
 enum Call {
     /// A submission, with its text.
-    Submit(String),
+    Submit(String, Pending),
     /// A slash command for the worker to run, with its line.
-    Command(String),
+    Command(String, Pending),
     /// A withdrawal of a queued submission, with its text; `recall` puts the
     /// text back into an empty draft.
     Withdraw {
@@ -468,7 +495,82 @@ enum Call {
     Abort,
     /// A session command `noel.sessions` answers, with its line: the session
     /// it made, the one it deleted, or `None` to leave it to the worker.
-    Sessions(String),
+    Sessions(String, Pending),
+}
+
+/// A call this TUI waits on that may start a run: "Working..." shows while
+/// any is pending, and each answer ends only its own (#133).
+type Pending = u64;
+
+/// This TUI's view of the session's run (#133): one state, where it was a
+/// counter, three Options and two flags that could disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunView {
+    Idle,
+    /// A call this TUI made started run `run_id`; the view has not shown it.
+    /// It gives up after [`STARTING_TIMEOUT`], should the view never show it.
+    Starting {
+        run_id: String,
+        since: Instant,
+    },
+    /// The view shows run `run_id` active, first seen at `since`.
+    Running {
+        run_id: String,
+        since: Instant,
+        saw_tools: bool,
+        /// An abort was sent for it.
+        aborting: bool,
+    },
+}
+
+/// How long a started run may go unseen in the view before the TUI stops
+/// showing "Working..." for it.
+const STARTING_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl RunView {
+    fn running(&self) -> Option<&str> {
+        match self {
+            Self::Running { run_id, .. } => Some(run_id),
+            _ => None,
+        }
+    }
+
+    /// The next state for a view whose active run is `live` (whether it has
+    /// run a tool) and whose last ended run is `last_run`.
+    fn advance(self, live: Option<&str>, tools: bool, last_run: Option<&str>) -> Self {
+        match (self, live) {
+            // The same run, still active.
+            (
+                Self::Running {
+                    run_id,
+                    since,
+                    saw_tools,
+                    aborting,
+                },
+                Some(live_id),
+            ) if run_id == live_id => Self::Running {
+                run_id,
+                since,
+                saw_tools: saw_tools || tools,
+                aborting,
+            },
+            // A run this TUI has not seen active before.
+            (_, Some(live_id)) => Self::Running {
+                run_id: live_id.to_owned(),
+                since: Instant::now(),
+                saw_tools: tools,
+                aborting: false,
+            },
+            // A started run not shown yet waits, unless it already ended
+            // (it is the last run) or the view never shows it.
+            (Self::Starting { run_id, since }, None)
+                if since.elapsed() < STARTING_TIMEOUT && last_run != Some(run_id.as_str()) =>
+            {
+                Self::Starting { run_id, since }
+            }
+            (_, None) => Self::Idle,
+        }
+    }
 }
 
 /// What a key or a command asks of the loop.
@@ -502,12 +604,8 @@ struct Remote {
     /// The session's history: the windows seen and the pages loaded.
     history: noel_client::Transcript,
     transcript: Transcript,
-    /// The active run and when this TUI first saw it.
-    run: Option<(String, Instant)>,
-    /// The active run has run a tool (the queue's hint says so).
-    saw_tools: bool,
-    /// The run an abort was sent for.
-    aborting: Option<String>,
+    /// The session's run as this TUI sees it.
+    run: RunView,
     /// The run this TUI interrupted, noted as locally once it ends.
     interrupted: Option<String>,
     /// The binary was rebuilt: the TUI restarts (dogfood).
@@ -527,12 +625,13 @@ struct Remote {
     switch_to: Option<String>,
     /// The model picker's provider layer: each provider's models.
     provider_layers: std::collections::HashMap<String, Value>,
-    /// Prompts sent to start a run, not answered yet.
-    submitting: usize,
-    /// A run a prompt started that the view has not shown yet.
-    starting: Option<String>,
+    /// Calls sent that may start a run, not answered yet.
+    pending: std::collections::BTreeSet<Pending>,
+    next_pending: Pending,
     /// The row of the `!` command running on the worker.
-    shell_row: Option<usize>,
+    shell_row: Option<ShellRow>,
+    /// This Remote's generation, which its calls' answers carry.
+    generation: u64,
     /// The diff panel's files' diffs, by path, as the worker read them.
     diff_lines: std::collections::HashMap<String, Vec<String>>,
 }
@@ -546,9 +645,7 @@ impl Remote {
             view: Value::Null,
             history: noel_client::Transcript::default(),
             transcript: Transcript::default(),
-            run: None,
-            saw_tools: false,
-            aborting: None,
+            run: RunView::Idle,
             interrupted: None,
             restart: false,
             retry_noted: None,
@@ -559,8 +656,9 @@ impl Remote {
             switch_to: None,
             diff_lines: std::collections::HashMap::new(),
             shell_row: None,
-            submitting: 0,
-            starting: None,
+            generation: GENERATIONS.fetch_add(1, Ordering::Relaxed),
+            pending: std::collections::BTreeSet::new(),
+            next_pending: 0,
             provider_layers: std::collections::HashMap::new(),
             last_submit: None,
             local: Arc::default(),
@@ -619,7 +717,11 @@ impl Remote {
                 );
             }
             Incoming::Report(message) => app.push(TuiEntryKind::System, message),
-            Incoming::Answer(call, result) => self.answer(app, call, result),
+            Incoming::Answer(call, result, generation) => {
+                if generation == self.generation {
+                    self.answer(app, call, result);
+                }
+            }
         }
     }
 
@@ -644,7 +746,7 @@ impl Remote {
         view["entries"] = Value::Array(self.history.merge(&view));
         let dirty = first_difference(&self.view, &view);
         self.view = view;
-        self.transcript.sync(app, &self.view, dirty);
+        self.sync_transcript(app, dirty);
         if let Some(count) = self.view["docs"]["noel.clients"]["count"].as_u64() {
             self.local.holds.store(count, Ordering::SeqCst);
         }
@@ -715,10 +817,14 @@ impl Remote {
         }
         self.last_run.clone_from(&now);
         let Some((run_id, status)) = now else { return };
-        if status == "aborted" && self.interrupted.as_deref() == Some(run_id.as_str()) {
+        // The run this TUI interrupted has ended, aborted or not: its note
+        // is due once, then forgotten.
+        if self.interrupted.as_deref() == Some(run_id.as_str()) {
             self.interrupted = None;
-            app.push(TuiEntryKind::System, "interrupted");
-            return;
+            if status == "aborted" {
+                app.push(TuiEntryKind::System, "interrupted");
+                return;
+            }
         }
         match status.as_str() {
             "failed" => app.push(
@@ -755,44 +861,37 @@ impl Remote {
             .flatten()
             .map(|item| item["content"].as_str().unwrap_or_default().to_owned())
             .collect();
-        match live["run"]["runId"].as_str() {
-            Some(run_id) => {
-                if self.run.as_ref().map(|(id, _)| id.as_str()) != Some(run_id) {
-                    self.run = Some((run_id.to_owned(), Instant::now()));
-                    self.saw_tools = false;
-                }
-                self.saw_tools |= live["tools"]
-                    .as_array()
-                    .is_some_and(|tools| !tools.is_empty());
+        let tools = live["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty());
+        let last_run = self.last_run.as_ref().map(|(run_id, _)| run_id.as_str());
+        let run = std::mem::replace(&mut self.run, RunView::Idle);
+        self.run = run.advance(live["run"]["runId"].as_str(), tools, last_run);
+        app.turn_running = matches!(self.run, RunView::Running { .. });
+        app.turn_saw_tools = matches!(
+            self.run,
+            RunView::Running {
+                saw_tools: true,
+                ..
             }
-            None => {
-                self.run = None;
-                self.aborting = None;
-            }
-        }
-        let seen = |id: &str| {
-            self.run.as_ref().is_some_and(|(run, _)| run == id)
-                || self.last_run.as_ref().is_some_and(|(run, _)| run == id)
-        };
-        if self.starting.as_deref().is_some_and(seen) {
-            self.starting = None;
-        }
-        app.turn_running = self.run.is_some();
-        app.turn_saw_tools = self.saw_tools;
+        );
         let queued = app.queued_messages.len();
         app.status = if let Some(why) = self.waiting {
             format!("{why}… · /quit to detach")
-        } else if self.run.is_none() && (self.submitting > 0 || self.starting.is_some()) {
-            // Sent, and not shown running yet: as the in-process TUI shows a
-            // prompt it is about to run.
-            "Working...".to_owned()
-        } else if let Some((_, started)) = &self.run {
-            let status = crate::activity_status(*started, &activity(live), queued);
-            if self.aborting.is_some() {
+        } else if let RunView::Running {
+            since, aborting, ..
+        } = &self.run
+        {
+            let status = crate::activity_status(*since, &activity(live), queued);
+            if *aborting {
                 status.replace("esc to interrupt", "aborting")
             } else {
                 status
             }
+        } else if !self.pending.is_empty() || matches!(self.run, RunView::Starting { .. }) {
+            // Sent, and not shown running yet: as the in-process TUI shows a
+            // prompt it is about to run.
+            "Working...".to_owned()
         } else {
             let agent = &docs["pi.agent"];
             let mut status = format!(
@@ -936,7 +1035,7 @@ impl Remote {
             }
             // A rebuilt `noel` (dogfood) restarts between turns, as the
             // in-process TUI does: never mid-run or mid-turn.
-            if self.run.is_none()
+            if self.run.running().is_none()
                 && !app.turn_running
                 && self.view["docs"]["noel.turn"]["unfinished"] != true
                 && auto_restart.should_restart()?
@@ -957,11 +1056,13 @@ impl Remote {
     /// still show.
     fn clear(&mut self, app: &mut TuiApp) {
         app.clear_visible();
+        // Its row is gone; the command's answer still shows as rows.
+        self.shell_row = None;
         self.transcript = Transcript {
             hidden: entries(&self.view).len(),
             ..Transcript::default()
         };
-        self.transcript.sync(app, &self.view, 0);
+        self.sync_transcript(app, 0);
     }
 
     // ─── keys ───────────────────────────────────────────────────────────────
@@ -1115,13 +1216,16 @@ impl Remote {
     fn prompt(&mut self, app: &mut TuiApp, text: String, steer: bool) {
         app.editor_state.record_history(text.clone());
         let when_busy = match (app.turn_running, steer) {
-            (false, _) => "reject",
-            (true, true) => "steer",
-            (true, false) => "followUp",
+            (false, _) => WhenBusy::Reject,
+            (true, true) => WhenBusy::Steer,
+            (true, false) => WhenBusy::FollowUp,
         };
         let images = std::mem::take(&mut app.input_media)
             .into_iter()
-            .map(|media| json!({"data": media.data_base64, "mimeType": media.mime_type}))
+            .map(|media| ImageArg {
+                data: media.data_base64,
+                mime_type: media.mime_type,
+            })
             .collect();
         self.submit(text, images, when_busy);
     }
@@ -1248,7 +1352,7 @@ impl Remote {
             "/queue" if app.turn_running => {
                 let text = line.trim_start_matches("/queue").trim();
                 if !text.is_empty() {
-                    self.submit(text.to_owned(), Vec::new(), "followUp");
+                    self.submit(text.to_owned(), Vec::new(), WhenBusy::FollowUp);
                 }
             }
             "/todos" if app.turn_running => app.todos_expanded = !app.todos_expanded,
@@ -1263,7 +1367,7 @@ impl Remote {
                     format!("cleared {cleared} pending follow-up(s)"),
                 );
             }
-            "/interrupt" if app.turn_running => self.call(Call::Abort, json!({"keepQueue": true})),
+            "/interrupt" if app.turn_running => self.abort(),
             "!!" if app.last_shell_command.is_none() => {
                 app.push(TuiEntryKind::System, "no previous shell command")
             }
@@ -1273,11 +1377,12 @@ impl Remote {
                     Some(command) if !app.turn_running && self.shell_row.is_none() => {
                         app.last_shell_command = Some(command.clone());
                         app.previews_expanded = false;
-                        self.shell_row = Some(app.push_placeholder(
+                        let index = app.push_placeholder(
                             TuiEntryKind::Tool,
                             crate::format_bash_running(&command),
-                        ));
-                        self.run_command(format!("!{command}"));
+                        );
+                        let pending = self.run_command(format!("!{command}"));
+                        self.shell_row = Some(ShellRow { index, pending });
                     }
                     Some(_) => app.push(
                         TuiEntryKind::System,
@@ -1330,21 +1435,60 @@ impl Remote {
                     .filter(|entry| entry.kind == TuiEntryKind::Error)
                     .map(|entry| entry.text.clone())
                     .collect::<Vec<_>>();
-                self.submitting += 1;
-                let args = json!({"line": line, "requestId": new_request_id(), "errors": errors});
-                self.call(Call::Command(line.to_owned()), args);
+                let pending = self.pend();
+                let args = to_args(&CommandArgs {
+                    line: line.to_owned(),
+                    request_id: Some(new_request_id()),
+                    errors: Some(errors),
+                });
+                self.call(Call::Command(line.to_owned(), pending), args);
             }
-            _ => self.run_command(line.to_owned()),
+            _ => {
+                self.run_command(line.to_owned());
+            }
         }
         Action::None
     }
 
     /// Runs `line` on the session's worker; the TUI shows it working until
     /// the answer, as the in-process TUI blocks on a command.
-    fn run_command(&mut self, line: String) {
-        self.submitting += 1;
-        let args = json!({"line": line, "requestId": new_request_id()});
-        self.call(Call::Command(line), args);
+    fn run_command(&mut self, line: String) -> Pending {
+        let pending = self.pend();
+        let args = to_args(&CommandArgs {
+            line: line.clone(),
+            request_id: Some(new_request_id()),
+            errors: None,
+        });
+        self.call(Call::Command(line, pending), args);
+        pending
+    }
+
+    /// The shell row, if `pending` is the command it shows.
+    fn take_shell_row(&mut self, pending: Pending) -> Option<usize> {
+        let row = self.shell_row.filter(|row| row.pending == pending)?;
+        self.shell_row = None;
+        Some(row.index)
+    }
+
+    /// Syncs the transcript, keeping the shell row's index right and its
+    /// placeholder live: the sync removes and re-indexes entries (#146).
+    fn sync_transcript(&mut self, app: &mut TuiApp, dirty: usize) {
+        let removed = self.transcript.sync(app, &self.view, dirty);
+        if let Some(row) = &mut self.shell_row {
+            if removed.contains(&row.index) {
+                self.shell_row = None;
+            } else {
+                row.index -= removed.iter().filter(|index| **index < row.index).count();
+                app.live_entry_index = Some(row.index);
+            }
+        }
+    }
+
+    /// A new pending call: "Working..." until its answer.
+    fn pend(&mut self) -> Pending {
+        self.next_pending += 1;
+        self.pending.insert(self.next_pending);
+        self.next_pending
     }
 
     /// A key while a selector is open: moving and filtering here, a pick on
@@ -1429,15 +1573,16 @@ impl Remote {
     /// Submits `text` with a new `requestId`, sent again with that id while
     /// it fails `unavailable`. A prompt that meets a run another client
     /// started meanwhile is queued after it, as Enter queues during a run.
-    fn submit(&mut self, text: String, images: Vec<Value>, when_busy: &'static str) {
-        if when_busy == "reject" {
-            self.submitting += 1;
-        }
+    fn submit(&mut self, text: String, images: Vec<ImageArg>, when_busy: WhenBusy) {
+        // Every submission is pending until its own answer: a steer or a
+        // follow-up no longer takes another call's count (#133).
+        let pending = self.pend();
         let (client, session, sender) = (
             self.client.clone(),
             self.session.clone(),
             self.sender.clone(),
         );
+        let generation = self.generation;
         let previous = self.last_submit.take();
         let calling = self.local.calling();
         self.last_submit = Some(tokio::spawn(async move {
@@ -1445,19 +1590,20 @@ impl Remote {
             if let Some(previous) = previous {
                 let _ = previous.await;
             }
-            let send = |when_busy: &str| {
-                let mut args =
-                    json!({"requestId": new_request_id(), "text": text, "whenBusy": when_busy});
-                if !images.is_empty() {
-                    args["images"] = json!(images);
-                }
-                client.chat_call(&session, "submit", args, true)
+            let send = |when_busy: WhenBusy| {
+                let args =
+                    SubmitArgs::input(new_request_id(), text.clone(), when_busy, images.clone());
+                client.chat_call(&session, "submit", to_args(&args), true)
             };
             let mut result = send(when_busy).await;
-            if when_busy == "reject" && refused_busy(&result) {
-                result = send("followUp").await;
+            if when_busy == WhenBusy::Reject && refused_busy(&result) {
+                result = send(WhenBusy::FollowUp).await;
             }
-            let _ = sender.send(Incoming::Answer(Call::Submit(text), result));
+            let _ = sender.send(Incoming::Answer(
+                Call::Submit(text, pending),
+                result,
+                generation,
+            ));
         }));
     }
 
@@ -1465,50 +1611,56 @@ impl Remote {
     /// `/delete <session>` through `noel.sessions`. A session is named as the
     /// picker names it: its id, a prefix of it, or its name.
     fn sessions_command(&mut self, line: String) {
-        self.submitting += 1;
+        let pending = self.pend();
         let (client, session, sender) = (
             self.client.clone(),
             self.session.clone(),
             self.sender.clone(),
         );
+        let generation = self.generation;
         let cwd = self.view["conversation"]["cwd"]
             .as_str()
             .unwrap_or("/")
             .to_owned();
         tokio::spawn(async move {
             let result = sessions_request(&client, &session, &cwd, &line).await;
-            let _ = sender.send(Incoming::Answer(Call::Sessions(line), result));
+            let _ = sender.send(Incoming::Answer(
+                Call::Sessions(line, pending),
+                result,
+                generation,
+            ));
         });
     }
 
     /// Continues the turn the saved context left unfinished: Durable's
     /// `continue` submission, which places what is queued first.
     fn continue_turn(&mut self) {
-        self.submitting += 1;
-        let args = json!({"requestId": new_request_id(), "type": "continue"});
-        self.call(Call::Submit(String::new()), args);
+        let pending = self.pend();
+        let args = to_args(&SubmitArgs::continuing(new_request_id()));
+        self.call(Call::Submit(String::new(), pending), args);
     }
 
     fn call(&mut self, call: Call, args: Value) {
         let method = match &call {
-            Call::Submit(_) => "submit",
-            Call::Command(_) => "command",
+            Call::Submit(..) => "submit",
+            Call::Command(..) => "command",
             Call::Withdraw { .. } => "withdraw",
             Call::Abort => "abort",
-            Call::Sessions(_) => unreachable!("sent by sessions_command"),
+            Call::Sessions(..) => unreachable!("sent by sessions_command"),
         };
         let (client, session, sender) = (
             self.client.clone(),
             self.session.clone(),
             self.sender.clone(),
         );
+        let generation = self.generation;
         // Commands keep their order with submissions (`/queue x`, then a
         // prompt); the rest go at once.
         let previous = match &call {
-            Call::Command(_) => self.last_submit.take(),
+            Call::Command(..) => self.last_submit.take(),
             _ => None,
         };
-        let ordered = matches!(&call, Call::Command(_));
+        let ordered = matches!(&call, Call::Command(..));
         let calling = self.local.calling();
         let task = tokio::spawn(async move {
             let _calling = calling;
@@ -1516,7 +1668,7 @@ impl Remote {
                 let _ = previous.await;
             }
             let result = client.chat_call(&session, method, args, false).await;
-            let _ = sender.send(Incoming::Answer(call, result));
+            let _ = sender.send(Incoming::Answer(call, result, generation));
         });
         if ordered {
             self.last_submit = Some(task);
@@ -1525,16 +1677,23 @@ impl Remote {
 
     /// Aborts the active run, once.
     fn abort(&mut self) {
-        let Some((run_id, _)) = &self.run else { return };
-        if self.aborting.as_ref() == Some(run_id) {
+        let RunView::Running {
+            run_id, aborting, ..
+        } = &mut self.run
+        else {
+            return;
+        };
+        if *aborting {
             return;
         }
-        self.aborting = Some(run_id.clone());
+        *aborting = true;
+        let run_id = run_id.clone();
         self.interrupted = Some(run_id.clone());
-        self.call(
-            Call::Abort,
-            json!({"expectedRunId": run_id, "keepQueue": true}),
-        );
+        let args = to_args(&AbortArgs {
+            expected_run_id: Some(run_id),
+            keep_queue: true,
+        });
+        self.call(Call::Abort, args);
     }
 
     /// Withdraws the last queued submission, to edit it.
@@ -1553,23 +1712,25 @@ impl Remote {
             return;
         }
         self.withdrawing.push(id.clone());
-        let args = json!({ "submissionId": id });
+        let args = to_args(&WithdrawArgs {
+            submission_id: id.clone(),
+        });
         self.call(Call::Withdraw { id, text, recall }, args);
     }
 
     fn answer(&mut self, app: &mut TuiApp, call: Call, result: Result<Value>) {
-        if matches!(
-            &call,
-            Call::Submit(_) | Call::Command(_) | Call::Sessions(_)
-        ) {
-            self.submitting = self.submitting.saturating_sub(1);
-            let started = result.as_ref().ok().and_then(|value| {
-                let next = &value["next"];
-                let from_command = (next["type"] == "run").then(|| next["runId"].as_str());
-                value["runId"].as_str().or(from_command.flatten())
-            });
+        if let Call::Submit(_, pending) | Call::Command(_, pending) | Call::Sessions(_, pending) =
+            &call
+        {
+            self.pending.remove(pending);
+            let started = result.as_ref().ok().and_then(started_run);
             if let Some(run_id) = started {
-                self.starting = Some(run_id.to_owned());
+                if self.run.running() != Some(run_id.as_str()) {
+                    self.run = RunView::Starting {
+                        run_id,
+                        since: Instant::now(),
+                    };
+                }
             }
         }
         if let Call::Withdraw { id, .. } = &call {
@@ -1579,17 +1740,20 @@ impl Remote {
             Ok(value) => value,
             Err(error) => {
                 let message = match &call {
-                    Call::Submit(text) => format!("not sent: {} ({error})", one_line(text)),
+                    Call::Submit(text, _) => format!("not sent: {} ({error})", one_line(text)),
                     Call::Abort => {
-                        self.aborting = None;
+                        if let RunView::Running { aborting, .. } = &mut self.run {
+                            *aborting = false;
+                        }
+                        self.interrupted = None;
                         format!("abort: {error}")
                     }
-                    Call::Sessions(line) => format!("{}: {error:#}", one_line(line)),
+                    Call::Sessions(line, _) => format!("{}: {error:#}", one_line(line)),
                     Call::Withdraw { text, .. } => {
                         format!("withdraw {}: {error}", one_line(text))
                     }
-                    Call::Command(line) => {
-                        if let Some(row) = self.shell_row.take() {
+                    Call::Command(line, pending) => {
+                        if let Some(row) = self.take_shell_row(*pending) {
                             app.replace_entry(row, format!("failed bash\n{error}"));
                             app.finish_live_entry();
                             return;
@@ -1602,20 +1766,25 @@ impl Remote {
             }
         };
         match call {
-            Call::Submit(_) => {}
+            Call::Submit(..) => {}
             // The worker's: deleting the session shown.
-            Call::Sessions(line) if value.is_null() => self.run_command(line),
-            Call::Sessions(line) if line.starts_with("/delete") => app.push(
+            Call::Sessions(line, _) if value.is_null() => {
+                self.run_command(line);
+            }
+            Call::Sessions(line, _) if line.starts_with("/delete") => app.push(
                 TuiEntryKind::System,
                 format!(
                     "deleted {}",
                     value["sessionId"].as_str().unwrap_or_default()
                 ),
             ),
-            Call::Sessions(_) => {
+            Call::Sessions(..) => {
                 self.switch_to = value["sessionId"].as_str().map(str::to_owned);
             }
-            Call::Command(line) => self.command_answer(app, &line, &value),
+            Call::Command(line, pending) => {
+                let shell_row = self.take_shell_row(pending);
+                self.command_answer(app, &line, &value, shell_row)
+            }
             Call::Withdraw { text, recall, .. } => match value["outcome"].as_str() {
                 Some("withdrawn") if recall && app.input.is_empty() => {
                     crate::recall_queued_message(app, text)
@@ -1642,10 +1811,16 @@ impl Remote {
 
 impl Remote {
     /// What the worker made of a command: its rows, then what to do next.
-    fn command_answer(&mut self, app: &mut TuiApp, line: &str, value: &Value) {
+    fn command_answer(
+        &mut self,
+        app: &mut TuiApp,
+        line: &str,
+        value: &Value,
+        shell_row: Option<usize>,
+    ) {
         let mut entries = value["entries"].as_array().cloned().unwrap_or_default();
         // A `!` command's result fills the row that showed it running.
-        if let Some(row) = self.shell_row.take() {
+        if let Some(row) = shell_row {
             let text = if entries.is_empty() {
                 String::new()
             } else {
@@ -2102,7 +2277,8 @@ impl Transcript {
     /// shown. Rows that change are changed in place: a text that grows is
     /// appended to, so a streaming reply stays one entry as it becomes the
     /// saved reply.
-    fn sync(&mut self, app: &mut TuiApp, view: &Value, dirty: usize) {
+    /// Returns the indexes of the entries it removed, as they were.
+    fn sync(&mut self, app: &mut TuiApp, view: &Value, dirty: usize) -> Vec<usize> {
         let entries = entries(view);
         let dirty = dirty.min(self.starts.len());
         let from = self.starts.get(dirty).copied().unwrap_or(self.committed);
@@ -2138,10 +2314,10 @@ impl Transcript {
             .map(|(_, index)| *index)
             .collect::<Vec<_>>();
         gone.sort_unstable();
-        for index in gone.into_iter().rev() {
-            app.remove_entry(index);
+        for index in gone.iter().rev() {
+            app.remove_entry(*index);
             for (_, shown) in &mut self.rows {
-                if *shown > index {
+                if *shown > *index {
                     *shown -= 1;
                 }
             }
@@ -2160,6 +2336,7 @@ impl Transcript {
                 Source::Entry => {}
             }
         }
+        gone
     }
 }
 
@@ -2189,6 +2366,58 @@ fn show(app: &mut TuiApp, index: usize, shown: &Row, row: &Row) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #133: the run's states and how the view moves them.
+    #[test]
+    fn the_run_view_follows_the_live_run_and_gives_up_on_an_unseen_start() {
+        let starting = RunView::Starting {
+            run_id: "r1".into(),
+            since: Instant::now(),
+        };
+        // Not shown yet: still starting.
+        let still = starting.clone().advance(None, false, None);
+        assert!(matches!(still, RunView::Starting { .. }));
+        // It ended before the view showed it running: idle.
+        assert_eq!(
+            starting.clone().advance(None, false, Some("r1")),
+            RunView::Idle
+        );
+        // Never shown: idle after the timeout, not "Working..." forever.
+        let stale = RunView::Starting {
+            run_id: "r1".into(),
+            since: Instant::now() - STARTING_TIMEOUT,
+        };
+        assert_eq!(stale.advance(None, false, None), RunView::Idle);
+        // Shown: running; an abort sent stays marked until the run ends.
+        let running = starting.advance(Some("r1"), false, None);
+        let RunView::Running { since, .. } = running else {
+            panic!("running")
+        };
+        let aborting = RunView::Running {
+            run_id: "r1".into(),
+            since,
+            saw_tools: false,
+            aborting: true,
+        };
+        assert_eq!(
+            aborting.clone().advance(Some("r1"), true, None),
+            RunView::Running {
+                run_id: "r1".into(),
+                since,
+                saw_tools: true,
+                aborting: true,
+            }
+        );
+        // Another run: its own state, not the aborted one's.
+        assert!(matches!(
+            aborting.clone().advance(Some("r2"), false, None),
+            RunView::Running {
+                aborting: false,
+                ..
+            }
+        ));
+        assert_eq!(aborting.advance(None, false, Some("r1")), RunView::Idle);
+    }
 
     fn view(entries: Value, live: Value) -> Value {
         json!({
@@ -2337,8 +2566,11 @@ mod tests {
             ]
         );
         assert!(app.live_tool_indices.is_empty());
-        // Compaction rewrites the entries: the rows follow.
-        transcript.sync(&mut app, &view(json!([user("summary")]), json!({})), 0);
+        // Compaction rewrites the entries: the rows follow, and the sync
+        // names the rows it removed, which a row held elsewhere (the shell
+        // row, #146) follows.
+        let removed = transcript.sync(&mut app, &view(json!([user("summary")]), json!({})), 0);
+        assert_eq!(removed, [1]);
         assert_eq!(shown(&app), [(TuiEntryKind::User, "summary")]);
         assert_eq!((transcript.rows.len(), transcript.committed), (1, 1));
     }
